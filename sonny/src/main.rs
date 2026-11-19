@@ -650,6 +650,9 @@ struct ProjectsOpen {
     seen: HashMap<String, (i64, Seen)>,
     /// Whether each lead runs as the superlead, read once a page.
     superleads: HashMap<String, bool>,
+    /// Whether the last read read every history it asked for: one that
+    /// did not is read again after [`STATUS_AGAIN`], though nothing moved.
+    whole: bool,
     /// Where the page and the pane beside it were drawn, for the mouse.
     page: Rect,
     side: Rect,
@@ -716,7 +719,7 @@ impl App {
         };
         let here = self.scope().lead;
         self.projects = Some(Box::new(ProjectsOpen {
-            view: projects::View::new(&here),
+            view: projects::View::new(&here).showing(&self.bot),
             client,
             follower,
             drain,
@@ -727,6 +730,7 @@ impl App {
             latest: self.status_read.clone(),
             seen: self.asks_seen.clone(),
             superleads: HashMap::new(),
+            whole: true,
             page: Rect::default(),
             side: Rect::default(),
             connected_at: Instant::now(),
@@ -764,6 +768,7 @@ impl App {
                     open.latest = read.latest;
                     open.seen = read.seen;
                     open.superleads = read.superleads;
+                    open.whole = read.whole;
                 }
                 // What moved is unknown: start over from a new snapshot.
                 _ => {
@@ -794,7 +799,7 @@ impl App {
         };
         let running = listed.iter().any(|bot| bot.running_turn.is_some());
         let moved = changes.moved;
-        if !whole && moved.is_empty() && !running && open.view.read {
+        if !whole && moved.is_empty() && !running && open.view.read && open.whole {
             open.listed = Some(listed);
             return;
         }
@@ -823,7 +828,7 @@ impl App {
                         moved_rows(&mut listed, &names, rows, &mut None);
                     }
                 }
-                let projects = read_projects(
+                let (projects, whole) = read_projects(
                     &client,
                     &store,
                     &listed,
@@ -841,6 +846,7 @@ impl App {
                     latest,
                     seen,
                     superleads,
+                    whole,
                 })
             }
             .await;
@@ -945,6 +951,8 @@ struct ProjectsRead {
     latest: HashMap<String, (Value, Latest)>,
     seen: HashMap<String, (i64, Seen)>,
     superleads: HashMap<String, bool>,
+    /// Whether every history it asked for was read.
+    whole: bool,
 }
 
 /// The pattern that names every project's agents: a project's are
@@ -954,7 +962,8 @@ const EVERY_PROJECT: &str = "*.*";
 /// Every project in `listed` (every agent [`EVERY_PROJECT`] names), each
 /// read as `/status` reads it: its counts, its most pressing state, its
 /// agents as the pane lists them, and when one last had a turn, which
-/// the listing says (`last.finished_ms`, or now while one runs).
+/// the listing says (`last.finished_ms`, or now while one runs); and
+/// whether every history it asked for was read.
 #[allow(clippy::too_many_arguments)]
 async fn read_projects(
     client: &Client,
@@ -966,7 +975,7 @@ async fn read_projects(
     latest: &mut HashMap<String, (Value, Latest)>,
     seen: &mut HashMap<String, (i64, Seen)>,
     superleads: &mut HashMap<String, bool>,
-) -> Option<Vec<projects::Project>> {
+) -> Option<(Vec<projects::Project>, bool)> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -983,6 +992,7 @@ async fn read_projects(
         })
         .collect();
     let mut found = Vec::with_capacity(leads.len());
+    let mut whole = true;
     let turns = HashMap::new();
     // Each agent under the lead it answers to, so a folder with two leads
     // counts each agent in one row: read once for every project.
@@ -1043,6 +1053,7 @@ async fn read_projects(
         let Ok(read) = read else {
             return None;
         };
+        whole &= read.whole;
         let folder = lead.workspace.clone().unwrap_or_default();
         let superlead = *superleads.entry(lead.name.clone()).or_insert_with(|| {
             seat_profile(&kept, &lead.name, true, std::path::Path::new(&folder)).as_deref()
@@ -1080,7 +1091,7 @@ async fn read_projects(
             agents,
         });
     }
-    Some(found)
+    Some((found, whole))
 }
 
 /// What `/status` read: its rows, what waits on the person, and which
@@ -23883,14 +23894,19 @@ fn task_lead(bot: &str, listed: Option<&[standing::Agent]>) -> String {
 
 /// The lead of its project `bot` answers to, through `makers` (each
 /// agent's maker by name): the lead its line of makers reaches, else the
-/// project's first lead. A lead is its own.
+/// project's first lead. A lead is its own. Its project is the longest
+/// start of its name with a first lead, as [`project_of`] finds it, so
+/// `shop.web.page` is `shop.web`'s where both projects are.
 fn lead_of(bot: &str, makers: &HashMap<&str, &str>) -> String {
-    let Some((project, _)) = bot.split_once('.') else {
+    let Some((first_dot, _)) = bot.split_once('.') else {
         return bot.to_owned();
     };
     if project::is_lead(bot) {
         return bot.to_owned();
     }
+    let project = (bot.match_indices('.').map(|(at, _)| &bot[..at]).rev())
+        .find(|start| makers.contains_key(format!("{start}.lead").as_str()))
+        .unwrap_or(first_dot);
     let first = format!("{project}.lead");
     let mut at = bot;
     // A ring of makers leads to no lead.
@@ -27886,6 +27902,18 @@ mod tests {
         assert_eq!(lead_of("shop.fix", &makers), "shop.lead");
         assert_eq!(lead_of("shop.invoice-check", &makers), "shop.lead.billing");
         assert_eq!(lead_of("shop.stray", &makers), "shop.lead");
+        // A project named with a dot, beside the one it starts with.
+        let makers: HashMap<&str, &str> = [
+            ("shop.lead", ""),
+            ("shop.web.lead", ""),
+            ("shop.web.page", "shop.web.lead"),
+            ("shop.web.page-check", "shop.web.page"),
+            ("shop.webby", "shop.lead"),
+        ]
+        .into();
+        assert_eq!(lead_of("shop.web.page", &makers), "shop.web.lead");
+        assert_eq!(lead_of("shop.web.page-check", &makers), "shop.web.lead");
+        assert_eq!(lead_of("shop.webby", &makers), "shop.lead");
     }
 
     #[tokio::test]
