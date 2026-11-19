@@ -2861,8 +2861,9 @@ impl Registry {
                 for path in patch.paths() {
                     writable(sandbox.clone(), &resolve(workspace, path), path).await?;
                 }
-                // A removal happens here, outside the sandbox: the name
-                // removed, a link too, must be one the bot may write.
+                // The name removed, a link too, must be one the bot may
+                // write: said before anything runs, as the sandbox would
+                // refuse it there.
                 for path in patch.removed() {
                     removable(sandbox.clone(), &resolve(workspace, path), path).await?;
                 }
@@ -2870,7 +2871,7 @@ impl Registry {
                     .as_ref()
                     .map_or(&[][..], |policy| &policy.unreadable);
                 let staged = patch.stage(workspace, hidden).await?;
-                // A process slot only while the sandbox's helper writes.
+                // A process slot only while the sandbox's helper runs.
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = match staged.writes() {
                     true => self.helper_slot(&sandbox, &mut slot).await?,

@@ -63,7 +63,7 @@ pub fn lead_by(record: &Value, maker: impl Fn(&Value) -> Option<Value>) -> Optio
     // A line of agents each made by the one before; a cycle the store
     // cannot hold, but a bound all the same.
     for _ in 0..256 {
-        if crate::project::is_lead(at["name"].as_str().unwrap_or_default()) {
+        if crate::project::is_lead_record(&at) {
             return Some(at);
         }
         if !at["created_by"].is_string() {

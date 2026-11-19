@@ -890,9 +890,10 @@ fn told(
     };
     // The memory of the lead's project, wherever the task works.
     let memory = agent_client::policy::memory_indexes(lead).map_err(|e| e.to_string())?;
-    let composed =
+    let composed = agent_client::policy::hiding(&agent_client::hidden::known(), || {
         agent_client::policy::instructions(dir, role.as_ref().filter(|r| !told_after(r)), &memory)
-            .map_err(|e| format!("{}: {e}", e.code()))?;
+    })
+    .map_err(|e| format!("{}: {e}", e.code()))?;
     let mut added = Vec::new();
     if let Some(role) = &role {
         if let Some(model) = role.model.as_ref().filter(|_| !named("--model")) {
@@ -1758,6 +1759,11 @@ fn confined_in(
         .stdin(Stdio::null());
     // None of the keys Agent keeps, as a bot's shell has none.
     for key in kept_keys() {
+        command.env_remove(key);
+    }
+    // git about `dir` alone: a hook's `GIT_DIR` and the like would name
+    // another repository.
+    for key in crate::git::LOCATING {
         command.env_remove(key);
     }
     let output = command.output().map_err(|e| format!("running git: {e}"))?;

@@ -1072,23 +1072,32 @@ struct Line {
 
 impl Line {
     /// `caller`'s, whose own folder is `here`: a lead's folder is its own,
-    /// and so is that of an agent no lead heads the line of. Read with the
-    /// daemon's CLI, as the start itself is made.
+    /// that of every agent in its line is the lead's, and an agent no lead
+    /// heads the line of has its own. Read with the daemon's CLI, as the
+    /// start itself is made: who leads goes by who made each agent, never
+    /// by its name or the folder its turn is in, so no agent passes for a
+    /// lead, whose folder's setup runs as the person.
     fn of(caller: &str, here: &Path) -> Line {
-        let mut side_of = None;
-        let (below, depth, lead) = match crate::project::is_lead(caller) {
-            true => (false, 0, None),
-            false => {
-                let record =
-                    crate::task::record_of_bot(caller).unwrap_or_else(|| json!({"name": caller}));
-                side_of = crate::side_copy(&record).map(str::to_owned);
-                let lead = crate::declared::lead_by(&record, |at| {
-                    crate::task::record_of_bot(at["created_by"].as_str()?)
-                });
-                // A lead's side chat starts its tasks as the lead does.
-                let below = !side_of.as_deref().is_some_and(crate::project::is_lead);
-                (below, record["depth"].as_u64().unwrap_or(0), lead)
-            }
+        let record = crate::task::record_of_bot(caller);
+        let lead = record.as_ref().and_then(|record| {
+            crate::declared::lead_by(record, |at| {
+                crate::task::record_of_bot(at["created_by"].as_str()?)
+            })
+        });
+        let lead_name = lead.as_ref().and_then(|lead| lead["name"].as_str());
+        let side_of = (record.as_ref())
+            .and_then(crate::side_copy)
+            .map(str::to_owned);
+        // The lead itself, or a side chat of it, which starts its tasks
+        // as the lead does.
+        let leads = lead_name.is_some()
+            && (record.as_ref().and_then(|r| r["name"].as_str()) == lead_name
+                || side_of.as_deref() == lead_name);
+        let depth = match leads {
+            true => 0,
+            false => (record.as_ref())
+                .and_then(|record| record["depth"].as_u64())
+                .unwrap_or(0),
         };
         let lead = lead.as_ref().and_then(|lead| {
             let name = lead["name"].as_str()?;
@@ -1097,15 +1106,15 @@ impl Line {
         });
         let project = project_of(lead.as_ref().map_or(caller, |(lead, _)| lead));
         let folder = match lead {
-            Some((_, folder)) if below => folder,
+            Some((_, folder)) if !leads => folder,
             _ => here.to_owned(),
         };
         Line {
-            lead: !below,
+            lead: leads,
             depth,
             folder,
             project,
-            side_of: side_of.filter(|_| below),
+            side_of: side_of.filter(|_| !leads),
         }
     }
 
@@ -1129,7 +1138,8 @@ impl Line {
             if by_id == me {
                 return true;
             }
-            if crate::project::is_lead(by) {
+            if crate::task::record_of_bot(by).is_some_and(|by| crate::project::is_lead_record(&by))
+            {
                 return false;
             }
             match crate::task::record_of_bot(by) {

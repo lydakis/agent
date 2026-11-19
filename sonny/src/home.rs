@@ -885,6 +885,25 @@ fn secret_in(config: &str) -> Option<String> {
             .iter()
             .any(|word| key.contains(word))
     }
+    // Text that carries a secret whatever its key: an `Authorization`
+    // header's value, given whole, or a URL with a password or a token
+    // in its query.
+    fn carries(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        let header = ["bearer ", "basic ", "token "].iter().any(|scheme| {
+            (lower.match_indices(scheme)).any(|(at, _)| {
+                (at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric())
+                    && lower[at + scheme.len()..].trim().len() >= 8
+            })
+        });
+        let url = url::Url::parse(text).is_ok_and(|url| {
+            url.password().is_some_and(|password| !password.is_empty())
+                || url
+                    .query_pairs()
+                    .any(|(key, value)| secretish(&key) && !value.is_empty())
+        });
+        header || url
+    }
     fn walk(table: &toml::Table, path: &str) -> Option<String> {
         for (key, value) in table {
             let here = match path {
@@ -903,6 +922,7 @@ fn secret_in(config: &str) -> Option<String> {
                 toml::Value::String(text) if secretish(key) && !text.is_empty() => {
                     return Some(here);
                 }
+                toml::Value::String(text) if carries(text) => return Some(here),
                 toml::Value::Array(items) => {
                     if let Some(found) = in_list(items, &here) {
                         return Some(found);
@@ -924,7 +944,7 @@ fn secret_in(config: &str) -> Option<String> {
                         _ => (text.as_str(), None),
                     };
                     let named = name.starts_with('-') && secretish(name.trim_start_matches('-'));
-                    let bearer = text.to_ascii_lowercase().starts_with("bearer ");
+                    let bearer = text.to_ascii_lowercase().starts_with("bearer ") || carries(text);
                     match given {
                         Some(given) if named && !given.is_empty() => return Some(here),
                         _ if bearer || (flag && !text.starts_with('-')) => return Some(here),
@@ -1100,6 +1120,26 @@ mod tests {
         assert_eq!(
             args(r#"["--header", "Bearer k"]"#).as_deref(),
             Some("sonny.mcp_servers.a.args[1]")
+        );
+        assert_eq!(
+            args(r#"["--header", "Authorization: Bearer abcdefgh123"]"#).as_deref(),
+            Some("sonny.mcp_servers.a.args[1]")
+        );
+        assert_eq!(
+            args(r#"["https://me:hunter22@example.com/mcp"]"#).as_deref(),
+            Some("sonny.mcp_servers.a.args[0]")
+        );
+        assert_eq!(
+            args(r#"["https://example.com/mcp?api_key=abc123"]"#).as_deref(),
+            Some("sonny.mcp_servers.a.args[0]")
+        );
+        assert!(
+            secret_in("[sonny.mcp_servers.x]\nurl = \"https://me:hunter22@example.com/mcp\"\n")
+                .is_some()
+        );
+        assert_eq!(
+            args(r#"["https://example.com/mcp?team=eng", "--port", "3"]"#),
+            None
         );
         assert_eq!(args(r#"["--token-file", "/run/t", "--port", "3"]"#), None);
         assert_eq!(args(r#"["--api-key", "--verbose"]"#), None);
