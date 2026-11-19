@@ -8,13 +8,13 @@
 //! none did. From then on the daemon's events keep it ([`needs::Needs`]),
 //! and nothing is read again on a timer.
 //!
-//! Every agent is followed only for the events a turn has a few of
-//! ([`WIDE`]): a call held for a verdict, a turn's start and end. A call's
-//! start and end, which come with every call any agent makes, are
-//! followed only for an agent with a call held for the person or a
-//! question asked ([`NARROW`]), from that event on, so nothing is missed
-//! between. The daemon has no unfollow: once none of those waits any
-//! more, the connection is made again from a new read.
+//! Every agent is followed for the events that can start a wait on the
+//! person ([`WIDE`]): a call held for a verdict, a call starting (a
+//! question is the ask tool's call), a turn's start and end. A call's end,
+//! as many again, is followed only for an agent with a call held for the
+//! person or a question asked ([`NARROW`]), from that event on, so nothing
+//! is missed between. The daemon has no unfollow: once none of those
+//! waits any more, the connection is made again from a new read.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,11 +28,13 @@ use tokio::sync::{Notify, watch};
 use crate::needs::{self, Seen};
 use crate::standing;
 
-/// The kinds of event every agent is followed for: those a turn has a few
-/// of, which [`needs::Needs::event`] reads.
-pub const WIDE: [&str; 9] = [
+/// The kinds of event every agent is followed for: those that can start
+/// a wait on the person, and a turn's few, which [`needs::Needs::event`]
+/// reads.
+pub const WIDE: [&str; 10] = [
     "approval_requested",
     "approval_asked",
+    "tool_started",
     "step_decided",
     "call_lifted",
     "lifted_ended",
@@ -42,10 +44,10 @@ pub const WIDE: [&str; 9] = [
     "deleted",
 ];
 
-/// The kinds of event an agent that waits on the person is followed for
-/// as well: its calls starting and ending, which let a held call go and
-/// ask and answer a question.
-pub const NARROW: [&str; 2] = ["tool_started", "tool_completed"];
+/// The kind of event an agent that waits on the person is followed for as
+/// well: its calls ending, which lets a held call go when it was denied,
+/// and takes a question's answer.
+pub const NARROW: [&str; 1] = ["tool_completed"];
 
 /// Every project but the window's, followed while the window is open.
 pub struct Elsewhere {
@@ -212,14 +214,15 @@ async fn follow_once(
     false
 }
 
-/// Whether `event` holds a call for the person, or is a question being
-/// asked (the ask tool's call put to its gate): after it, the agent's
-/// calls say when it no longer waits.
+/// Whether `event` holds a call for the person, or asks a question (the
+/// ask tool's call starting): after it, the agent's calls ending say when
+/// it no longer waits.
 fn waits_from(event: &Value) -> bool {
     match event["event"].as_str() {
         Some("approval_asked") => true,
         Some("approval_requested") => (event["data"]["calls"].as_array().into_iter().flatten())
-            .any(|call| needs::person_call(call) || call["name"] == crate::asks::TOOL),
+            .any(needs::person_call),
+        Some("tool_started") => event["data"]["name"] == crate::asks::TOOL,
         _ => false,
     }
 }
