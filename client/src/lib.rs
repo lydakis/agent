@@ -121,7 +121,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 93;
+pub const PROTOCOL: u64 = 94;
 static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 /// Name this process's connections as `program` (such as `window` or
 /// `reviewer`): each later [`Client::connect`] says it in its first line,
@@ -446,9 +446,6 @@ pub struct Client {
     identity: Option<String>,
     /// `ready.providers`: each binding's family and the efforts it takes.
     providers: Value,
-    /// `ready.speeds`: the tiers the person says models serve, by
-    /// `PROVIDER/MODEL` pattern, most specific first.
-    speeds: Vec<(String, Vec<String>)>,
     paused: Value,
     /// `ready.version`: the daemon's release.
     version: Option<String>,
@@ -457,6 +454,16 @@ pub struct Client {
     max_depth: Option<u64>,
     /// Requests this client keeps in flight at once, when bounded.
     in_flight: std::sync::OnceLock<Semaphore>,
+}
+
+/// A bot's `speeds` setting, as `inspect` gives it, by pattern, most
+/// specific first, for [`Client::speeds`].
+pub fn speeds_set(settings: &Value) -> Vec<(String, Vec<String>)> {
+    config::ranked(
+        (settings["speeds"].as_object().into_iter().flatten())
+            .map(|(pattern, tiers)| (pattern.clone(), names(tiers)))
+            .collect(),
+    )
 }
 
 /// A JSON list of names, as `ready` gives a model's tiers.
@@ -554,11 +561,6 @@ impl Client {
         let store = ready["store"]["lineage"].as_str().map(str::to_owned);
         let identity = ready["store"]["identity"].as_str().map(str::to_owned);
         let providers = ready["providers"].clone();
-        let speeds = config::ranked(
-            (ready["speeds"].as_object().into_iter().flatten())
-                .map(|(pattern, tiers)| (pattern.clone(), names(tiers)))
-                .collect(),
-        );
         let paused = ready["paused"].clone();
         let version = ready["version"].as_str().map(str::to_owned);
         let max_depth = ready["limits"]["depth"].as_u64();
@@ -632,7 +634,6 @@ impl Client {
                 store,
                 identity,
                 providers,
-                speeds,
                 paused,
                 version,
                 max_depth,
@@ -700,14 +701,13 @@ impl Client {
     }
 
     /// The tiers faster than standard the model at `path`,
-    /// `PROVIDER/MODEL`, serves, as the daemon decides it: the person's
-    /// most specific `[speeds]` pattern that matches, else the list its
-    /// provider announced. A bot's speed reaches only these; on any other
-    /// model its calls run at standard.
-    pub fn speeds(&self, path: &str) -> Vec<String> {
-        if let Some((_, tiers)) =
-            (self.speeds.iter()).find(|(pattern, _)| config::matches(pattern, path))
-        {
+    /// `PROVIDER/MODEL`, serves for a bot whose `speeds` setting is `set`
+    /// ([`speeds_set`]), as the daemon decides it: the most specific
+    /// pattern there that matches, else the list its provider announced.
+    /// A bot's speed reaches only these; on any other model its calls run
+    /// at standard.
+    pub fn speeds(&self, set: &[(String, Vec<String>)], path: &str) -> Vec<String> {
+        if let Some((_, tiers)) = (set.iter()).find(|(pattern, _)| config::matches(pattern, path)) {
             return tiers.clone();
         }
         let (provider, model) = path.split_once('/').unwrap_or(("", path));
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_model_s_speeds_are_the_person_s_then_its_provider_s() {
+    async fn a_model_s_speeds_are_the_bot_s_then_its_provider_s() {
         let (stream, _peer) = UnixStream::pair().unwrap();
         let (_, write) = stream.into_split();
         let client = Client {
@@ -949,27 +949,32 @@ mod tests {
             store: None,
             identity: None,
             providers: json!({"work": {"speeds": {"us.openai.gpt-6.1-sol": ["ultrafast"]}}}),
-            speeds: config::ranked(vec![
-                ("work/*".into(), vec!["fast".into()]),
-                ("work/*grok*".into(), vec!["ultrafast".into()]),
-                ("work/us.openai.gpt-6.1-sol".into(), Vec::new()),
-            ]),
             paused: Value::Null,
             version: None,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         };
-        assert_eq!(client.speeds("work/us.xai.grok-4.7"), ["ultrafast"]);
-        assert!(client.speeds("work/us.openai.gpt-6.1-sol").is_empty());
-        assert_eq!(client.speeds("work/other"), ["fast"]);
+        let set = speeds_set(&json!({"speeds": {
+            "work/*": ["fast"],
+            "work/*grok*": ["ultrafast"],
+            "work/us.openai.gpt-6.1-sol": [],
+        }}));
+        assert_eq!(client.speeds(&set, "work/us.xai.grok-4.7"), ["ultrafast"]);
+        assert!(client.speeds(&set, "work/us.openai.gpt-6.1-sol").is_empty());
+        assert_eq!(client.speeds(&set, "work/other"), ["fast"]);
         // Without a pattern, the provider's own list; else none.
-        let client = Client {
-            speeds: Vec::new(),
-            ..client
-        };
-        assert_eq!(client.speeds("work/us.openai.gpt-6.1-sol"), ["ultrafast"]);
-        assert!(client.speeds("work/us.xai.grok-4.7").is_empty());
-        assert!(client.speeds("home/us.openai.gpt-6.1-sol").is_empty());
+        let none = speeds_set(&json!({}));
+        assert!(none.is_empty());
+        assert_eq!(
+            client.speeds(&none, "work/us.openai.gpt-6.1-sol"),
+            ["ultrafast"]
+        );
+        assert!(client.speeds(&none, "work/us.xai.grok-4.7").is_empty());
+        assert!(
+            client
+                .speeds(&none, "home/us.openai.gpt-6.1-sol")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -984,7 +989,6 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
-            speeds: Vec::new(),
             paused: Value::Null,
             version: None,
             max_depth: None,
@@ -1020,7 +1024,6 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
-            speeds: Vec::new(),
             paused: Value::Null,
             version: None,
             max_depth: None,
@@ -1066,7 +1069,6 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
-            speeds: Vec::new(),
             paused: Value::Null,
             version: None,
             max_depth: None,
@@ -1110,7 +1112,6 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
-            speeds: Vec::new(),
             paused: Value::Null,
             version: None,
             max_depth: None,

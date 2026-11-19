@@ -399,6 +399,20 @@ pub struct Settings {
     /// Calls on another model, a summarizer or a fallback, go at standard.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<crate::provider::Speed>,
+    /// The tiers faster than standard each model serves, by `PROVIDER/MODEL`
+    /// pattern (`*` and `?` wildcards, the most specific winning), over the
+    /// daemon's catalog: its speed reaches only a model that serves it.
+    /// Its client sends the person's `[speeds]`, and sends them again as
+    /// they change; each turn reads them as it starts. A bot made by
+    /// another takes its creator's unless its client gives its own.
+    #[serde(default, skip_serializing_if = "crate::provider::Speeds::is_empty")]
+    pub speeds: crate::provider::Speeds,
+    /// The context window in tokens of each model, by `PROVIDER/MODEL`
+    /// pattern as `speeds` takes them, over its provider's listing: the
+    /// window its compaction thresholds are counted from. Its client sends
+    /// the person's `[context_windows]`, as `speeds`.
+    #[serde(default, skip_serializing_if = "crate::provider::Windows::is_empty")]
+    pub context_windows: crate::provider::Windows,
     /// How its shell, write and edit calls are confined, by Codex's
     /// sandbox modes; none runs them unconfined.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -594,6 +608,14 @@ impl Settings {
         // makes that folder and writes it outside any sandbox, so no bot
         // names one for the bots it makes.
         self.outputs = creator.outputs.clone();
+        // What its creator's models serve and hold, unless its client
+        // said.
+        if self.speeds.is_empty() {
+            self.speeds = creator.speeds.clone();
+        }
+        if self.context_windows.is_empty() {
+            self.context_windows = creator.context_windows.clone();
+        }
         if creator.never_asks() {
             self.approval_policy = creator.approval_policy;
         }
@@ -753,6 +775,11 @@ impl Settings {
         if crate::output::encoded_len(&self.env).unwrap_or(usize::MAX) > ENV_JSON {
             return refuse("env takes at most 16 KiB as JSON");
         }
+        if crate::output::encoded_len(&self.speeds).unwrap_or(usize::MAX) > ENV_JSON
+            || crate::output::encoded_len(&self.context_windows).unwrap_or(usize::MAX) > ENV_JSON
+        {
+            return refuse("speeds and context_windows each take at most 16 KiB as JSON");
+        }
         for (name, value) in &self.env {
             // A name a shell can set: a letter or `_`, then letters,
             // digits and `_`, and none of the daemon's own.
@@ -811,7 +838,8 @@ impl Settings {
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
             "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy,
-            "steps_only":self.steps_only})
+            "steps_only":self.steps_only,"speeds":self.speeds,
+            "context_windows":self.context_windows})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -832,7 +860,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 26] = [
+pub const SETTINGS: [&str; 28] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -859,6 +887,8 @@ pub const SETTINGS: [&str; 26] = [
     "env",
     "approval_policy",
     "steps_only",
+    "speeds",
+    "context_windows",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -21761,6 +21791,39 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_another_makes_takes_its_creator_s_speeds_and_windows_unless_given() {
+        let table = |set: Value| serde_json::from_value::<Settings>(set).unwrap();
+        let creator = table(json!({"speeds": {"a/*": ["fast"]}, "context_windows": {"a/b": 4096}}));
+        let child = Settings::default().under(&creator);
+        assert_eq!(
+            (child.speeds, child.context_windows),
+            (creator.speeds.clone(), creator.context_windows.clone())
+        );
+        let own = table(json!({"speeds": {"a/c": []}}));
+        let child = own.clone().under(&creator);
+        assert_eq!(child.speeds, own.speeds);
+        assert_eq!(child.context_windows, creator.context_windows);
+        assert!(own.beyond(&creator).is_none());
+        // A wrong table is refused as it is read, a large one by its size.
+        for wrong in [
+            json!({"speeds": {"ab": ["fast"]}}),
+            json!({"speeds": {"a/b": ["standard"]}}),
+            json!({"context_windows": {"a/b": 1023}}),
+            json!({"context_windows": {"a b/c": 4096}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Settings>(wrong.clone()).is_err(),
+                "{wrong}"
+            );
+        }
+        let many: serde_json::Map<String, Value> = (0..1000)
+            .map(|n| (format!("provider/model-{n}"), json!(4096)))
+            .collect();
+        let large = table(json!({"context_windows": many}));
+        assert_eq!(large.validate().unwrap_err().code, "invalid_setting");
+    }
+
+    #[test]
     fn every_setting_is_named() {
         // Every field, so a new one doesn't compile until it is listed.
         let all = Settings {
@@ -21793,6 +21856,8 @@ mod tests {
             env: [("A".to_owned(), "1".to_owned())].into(),
             approval_policy: Some(ApprovalPolicy::Never),
             steps_only: Some(vec!["*".into()]),
+            speeds: serde_json::from_value(json!({"a/b": ["fast"]})).unwrap(),
+            context_windows: serde_json::from_value(json!({"a/b": 2000})).unwrap(),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()
