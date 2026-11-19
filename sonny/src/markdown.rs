@@ -2275,12 +2275,14 @@ impl Markdown {
         // A table is drawn as its lines end: the line still coming waits
         // for its own end, so no column widens and narrows as it is typed.
         if let Some(gap) = self.held {
-            let gap = usize::from(gap && self.any && !self.last.is_empty());
-            let from = (self.last.len() + gap).saturating_sub(most);
+            // Rows already handed out, and their gap, are not shown again.
+            let rows = &self.last[self.given.min(self.last.len())..];
+            let gap = usize::from(gap && self.any && !self.gapped && !rows.is_empty());
+            let from = (rows.len() + gap).saturating_sub(most);
             if gap > from {
                 out.push(Line::from("  "));
             }
-            out.extend(self.last[from.saturating_sub(gap)..].iter().cloned());
+            out.extend(rows[from.saturating_sub(gap)..].iter().cloned());
             bullet(&mut out, from == 0 && first && !self.any);
             return out;
         }
@@ -2912,6 +2914,21 @@ mod tests {
         assert!(
             !reader.waiting,
             "a resolved footnote keeps the table waiting"
+        );
+        // A table held in an item shows only the rows not handed out.
+        let mut reader = Markdown::default();
+        let mut given = Vec::new();
+        for line in ["- Intro.", "", "  | A |", "  |---|"] {
+            given.extend(reader.feed(line, 40, false));
+        }
+        let shown = text(&reader.open_last("  | value |", 40, false, usize::MAX));
+        let given = text(&given);
+        assert!(given.iter().any(|row| row.contains("Intro")), "{given:?}");
+        assert!(
+            !shown
+                .iter()
+                .any(|row| given.contains(row) && row.contains("Intro")),
+            "{given:?} then {shown:?}"
         );
         // Quote marks deep on one line are read once each.
         let deep = format!("{} x", ">".repeat(20_000));
