@@ -751,14 +751,17 @@ impl App {
         if self.counts.is_none() {
             return;
         }
+        let project = &self.scope().project;
         let again = match &self.other_projects {
             None => true,
+            Some((open, _)) if open.project != *project => true,
             Some((open, at)) => open.ended() && at.elapsed() >= ELSEWHERE_AGAIN,
         };
         if again {
             let open = elsewhere::Elsewhere::start(
                 self.options.socket.clone(),
                 self.store(),
+                project.clone(),
                 self.woken.clone(),
             );
             self.other_projects = Some((open, Instant::now()));
@@ -794,7 +797,20 @@ impl App {
         if let Some(fleet) = &self.fleet {
             local.extend(fleet.waiting_past_status_of(&self.status_bots));
         }
+        // Each in its own project's place, as a superlead's list or a
+        // followed lead's question may be another project's.
         let elsewhere = self.elsewhere_waiting();
+        let local: Vec<(usize, String)> = match &self.other_projects {
+            Some((open, _)) => {
+                let shared = open.waiting.borrow();
+                (local.into_iter())
+                    .map(|bot| (shared.place(&bot).unwrap_or(elsewhere.here), bot))
+                    .collect()
+            }
+            None => (local.into_iter())
+                .map(|bot| (elsewhere.here, bot))
+                .collect(),
+        };
         let waiting = elsewhere::round(&local, &elsewhere);
         match elsewhere::next(&waiting, &self.bot) {
             None => self.notice = Some("no one needs you".into()),
