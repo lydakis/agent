@@ -529,6 +529,20 @@ line records `message_ended` (`status` `withdrawn` or `failed`, with the
 error), and one taken into a running turn the `steered` event on that
 turn; `queued`, `attached` and `held` name the message (`turn` null).
 
+Protocol 91 lets `submit` take `replaces`, the number of a message of the
+same bot from the same sender (the same `from` bot or `origin`, and
+`person`; anyone else's is `not_permitted`, a number the bot has not
+`turn_not_found`). Still in line (`queued`, `ready` or `attached`), it is
+withdrawn, as `interrupt` withdraws it and kept in history so, in the same
+store step that sends the new message: no turn takes it in between, and a
+send refused there leaves it in line. Taken in or ended already, it stays
+as it is and the new message goes as any other. The answer adds
+`replaced: {message, handle, status, turn}`, `status` being `withdrawn`,
+`taken` with the `turn` that took it in, or `failed`; a retry withdraws
+nothing and answers what became of it. An agent's `send_message` takes it
+as `replaces: BOT/N` and answers `replaced: BOT/N`, or `taken: BOT/N` with
+`taken_turn`; the CLI's `run --replaces BOT/N` sends it.
+
 Protocol 87 gives `messages` and `follow` one selector, the shape `bots`
 and `audit` already take, as Kubernetes lists and watches by one selector
 and Gmail lists one query across every thread. `bot` is a name, or a GLOB
@@ -2714,8 +2728,7 @@ one person's agents. The reading
 view removes insignificant JSON whitespace from multiline provider items so
 each occupies one JSONL record. Single-line items need no whitespace rewrite;
 whitespace inside text strings remains intact. Pages
-contain at most 64 KiB of text. Optional `limit` (4–65,536 bytes) requests a
-smaller page.
+contain at most 64 KiB of text; the tool takes no size argument.
 The runtime also limits the encoded tool result, including escaping and page
 metadata, to half the input-byte allowance remaining after the current turn
 and its mandatory prefix (summary and bare omission notice).

@@ -79,6 +79,50 @@ class AgentToolsTests(ModelFixture):
         listed = {m['message']: m for m in client.request('messages', bot='shop.fix', after=0)['result']['messages']}
         self.assertEqual(listed[message]['delivery'], 'queue')
 
+    def test_a_message_still_in_line_is_replaced_and_one_taken_in_is_followed(self):
+        import threading
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = threading.Event()
+        self.model.all_streaming.set()
+        self.addCleanup(self.model.release_headers.set)
+        client = self.client(TOOLS)
+        for bot in ('shop.lead', 'web.lead', 'shop.fix'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        busy = client.request('submit', bot='shop.fix', request_id='busy', prompt='gate')['result']['message']
+        self.model.requests.get(timeout=3)
+        self.run_calls(client, 'shop.lead', 'first',
+                       ('send_message', {'to': 'shop.fix', 'message': 'upload as picked', 'delivery': 'queue'}))
+        first = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
+        self.assertEqual(first['status'], 'queued', first)
+        self.run_calls(client, 'shop.lead', 'second',
+                       ('send_message', {'to': 'shop.fix', 'message': 'reversed order',
+                                         'delivery': 'queue', 'replaces': first['handle']}))
+        second = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
+        self.assertEqual(second['replaced'], first['handle'], second)
+        old, new = (int(sent['handle'].rsplit('/', 1)[1]) for sent in (first, second))
+        self.assertEqual(client.finished(old)['data']['status'], 'withdrawn')
+        # Another agent may not replace it, nor may it name another bot's.
+        self.run_calls(client, 'web.lead', 'theirs',
+                       ('send_message', {'to': 'shop.fix', 'message': 'mine instead',
+                                         'replaces': second['handle']}),
+                       ('send_message', {'to': 'web.lead', 'message': 'elsewhere',
+                                         'replaces': second['handle']}))
+        self.assertIn('not_permitted', self.output(client, 'web.lead', 'send_message-1'))
+        self.assertIn('invalid_tool_arguments', self.output(client, 'web.lead', 'send_message-2'))
+        listed = {m['message']: m for m in client.request('messages', bot='shop.fix', after=0)['result']['messages']}
+        self.assertEqual(listed[old]['status'], 'withdrawn')
+        self.assertEqual(len(listed), 3, listed)
+        # Once taken in, it stays, and the new one follows it.
+        self.model.release_headers.set()
+        client.finished(busy)
+        self.assertEqual(client.finished(new)['data']['status'], 'completed')
+        self.run_calls(client, 'shop.lead', 'third',
+                       ('send_message', {'to': 'shop.fix', 'message': 'one more thing',
+                                         'replaces': second['handle']}))
+        third = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
+        self.assertEqual((third['taken'], third['taken_turn']), (second['handle'], new), third)
+        client.finished(int(third['handle'].rsplit('/', 1)[1]))
+
     def test_agents_are_listed_by_project_and_the_calls_waiting_on_approval(self):
         client = self.client(TOOLS)
         for bot in ('shop.lead', 'shop.fix', 'web.lead'):
