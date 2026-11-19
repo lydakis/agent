@@ -58,7 +58,7 @@ class AnsweredToolTests(ModelFixture):
                              (dict(START, expire_ms=0), 'zero'),
                              (dict(START, expire_ms=3_600_001), 'long'),
                              ({k: v for k, v in START.items() if k != 'answered_by'} | {'expire_ms': 5}, 'alone'),
-                             ({k: v for k, v in START.items() if k != 'answered_by'} | {'lift': True}, 'lift')]:
+                             ({k: v for k, v in START.items() if k != 'answered_by'} | {'yields': True}, 'yields')]:
             refused = client.request('create', bot='Bad', workspace=str(self.path), declare=[tool])
             self.assertEqual(refused['error'], 'invalid_declare', detail)
 
@@ -128,7 +128,7 @@ class AnsweredToolTests(ModelFixture):
                 if any(i.get('role') == 'user' and i['content'][0]['text'].startswith('steer:')
                        for i in r['input'])]
 
-    def test_a_message_waits_for_a_call_its_tool_does_not_lift(self):
+    def test_a_message_waits_for_a_running_call(self):
         # Live for the hold, then parked: a steer lifts neither, and the
         # turn takes it once the answer is in, as Codex takes a message
         # once the running tool returns.
@@ -151,33 +151,33 @@ class AnsweredToolTests(ModelFixture):
                      and i['content'][0]['text'].startswith('steer:'))
         self.assertLess(answered, steer)
 
-    def test_a_message_lifts_a_call_its_tool_lifts(self):
-        tool = dict(START, lift=True)
+    def test_a_message_waits_for_a_call_its_client_may_yield(self):
+        # A tool whose client may yield its calls runs on as any other:
+        # live or parked, a steer never moves it, and the turn takes the
+        # steer once the call is answered.
+        tool = dict(START, yields=True)
         for hold in (60_000, 0):
             with self.subTest(hold=hold):
                 self.setUp()
                 client = self.client('echo', settings={'approval_hold_ms': hold})
                 created = client.request('create', bot='Lead', workspace=str(self.path), declare=[tool])['result']
-                self.assertTrue(created['declared'][0]['lift'])
+                self.assertTrue(created['declared'][0]['yields'])
                 self.model.call_script = [('start_task', {'name': 'fix'})]
                 turn = self.submit(client)
                 self.started(client, turn)
-                began = time.monotonic()
                 if not hold:
-                    # It holds live for its whole grace before it parks, so
-                    # a steer never lifts it sooner.
                     client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
-                    self.assertGreater(time.monotonic() - began, .15)
                 client.request('submit', bot='Lead', request_id='s', prompt='steer:look', delivery='steer')
-                lifted = client.receive(lambda m: m.get('event') == 'call_lifted' and m.get('turn') == turn)['data']
-                self.assertEqual((lifted['call_id'], lifted['waits_for']), ('script-0', 'answer'))
-                self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-                self.assertEqual(json.loads(self.output(client)), {
-                    'handle': lifted['handle'], 'background': True, 'steered': True, 'waits_for': 'answer'})
-                # Its client still answers it, and the answer ends the command.
+                time.sleep(1)
+                self.assertEqual(self.events(client, turn, 'call_lifted'), [])
                 self.assertIn('result', self.answer(client, turn, output='started fix'))
-                ended = client.receive(lambda m: m.get('event') == 'lifted_ended')['data']
-                self.assertEqual((ended['handle'], ended['outcome']), (lifted['handle'], 'answered'))
+                self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                self.assertEqual(self.output(client), 'started fix')
+                [*_, last] = self.steered(client, turn)
+                answered = next(n for n, i in enumerate(last) if i.get('call_id') == 'script-0' and 'output' in i)
+                steer = next(n for n, i in enumerate(last) if i.get('role') == 'user'
+                             and i['content'][0]['text'].startswith('steer:'))
+                self.assertLess(answered, steer)
                 client.close(kill=True)
 
     def test_a_call_is_taken_once_so_no_client_runs_it_twice(self):

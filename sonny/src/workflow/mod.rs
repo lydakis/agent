@@ -200,6 +200,7 @@ struct Told {
     instructions: String,
     model: Option<String>,
     tools: Option<Vec<String>>,
+    sandbox: Option<String>,
 }
 
 /// The runs going on in this host, by id.
@@ -952,6 +953,7 @@ fn compose(dir: &Path, roles: &Path, role: Option<&str>) -> Result<Told, String>
     Ok(Told {
         instructions: format!("{}\n\n{}", composed.text, told_text()),
         model: role.as_ref().and_then(|role| role.model.clone()),
+        sandbox: role.as_ref().and_then(|role| role.sandbox.clone()),
         tools: role.and_then(|role| role.tools),
     })
 }
@@ -1346,6 +1348,11 @@ impl Attempt {
             // environment, its maker's.
             let mut settings = crate::approvals::sandbox(&plan.mode, &dir, plan.state.as_deref());
             crate::approvals::within(&mut settings, &plan.held);
+            // Its profile's own sandbox, never looser than that: one looser
+            // makes nothing, and recovers only a worker this call made.
+            let refused = (told.sandbox.as_deref())
+                .and_then(|mode| agent_client::policy::with_sandbox(&mut settings, mode).err())
+                .map(|why| format!("invalid_setting: {why}"));
             if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
                 settings.insert("cache_ttl".into(), json!(ttl));
             }
@@ -1364,10 +1371,15 @@ impl Attempt {
                 "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
                 "settings": settings,
                 "request_id": request});
-            if let Err(error) = self.client.request("create", create).await {
-                if lost(&error) {
-                    return Err(Trouble::Lost);
-                }
+            let error = match refused {
+                Some(why) => Some(why),
+                None => match self.client.request("create", create).await {
+                    Ok(_) => None,
+                    Err(error) if lost(&error) => return Err(Trouble::Lost),
+                    Err(error) => Some(error.to_string()),
+                },
+            };
+            if let Some(error) = error {
                 // Made by this call before, told what its folder said then.
                 match self.client.request("inspect", json!({"bot": worker})).await {
                     Ok(made) if made["created_by_id"] == plan.caller_id => {}

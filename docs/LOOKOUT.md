@@ -243,7 +243,9 @@ every = "1m"   # how long after it exits it runs again: 30s, 5m, 1h; a minute un
 
 Every line the command prints is one event: plain text, or a JSON object
 with `text` and, if it has them, `id`, `topic` (what it is about: a
-channel, a thread), `from` (who wrote it there), `url` and `steer`. An
+channel, a thread), `from` (who wrote it there), `url` and `steer`.
+`text` is what subscribers read: an object without it is delivered whole,
+the line as its text, as plain text is. An
 object whose `text` is empty, as `{"topic": "12", "text": ""}`, is no
 event: it clears what the source last said of that topic, or of the
 source itself with no topic, as an MQTT message with an empty payload
@@ -435,7 +437,8 @@ value, a list of them, or one of the string matchers), `{"numeric": [">",
 holds, as sequence IDs and nanosecond times run) or `{"exists": true}` /
 `{"exists": false}`. `"$or": [P1,
 P2]` beside the fields takes either pattern. A plain-text line is the
-event `{"text": LINE}`. A filter is at most 4 KiB, 256 values and 6 levels
+event `{"text": LINE}`; an object without `text` is matched by the fields
+it printed. A filter is at most 4 KiB, 256 values and 6 levels
 deep; nothing in it runs, and it only ever narrows what is heard.
 
 The lookout checks a filter as each event comes, before the event waits

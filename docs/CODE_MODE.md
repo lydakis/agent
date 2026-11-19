@@ -155,8 +155,7 @@ it has are the mechanisms a client builds one from
   once; `step_result` records how it ended. Either way it reaches the
   audit trail. A step waiting on a gate adds one entry to the daemon's
   map of waiting steps (src/server/mod.rs:1212).
-- **Lifting.** A tool declared with `lift` may run on past its turn.
-- **Yielding (protocol 85).** Its client may hand such a call back with
+- **Yielding (protocol 85; declared `yields` since 92).** A tool's client may hand a call back with
   what it wrote so far (`yield_call`), as Codex's `exec` yields at
   `yield_time_ms`. The yield is a lift: the call becomes `proc:N`, waits on
   its answer with no deadline, and `wait` collects it or, with `terminate`,
@@ -194,7 +193,7 @@ configured ones; none is measured against the other harnesses:
 - **One host for every bot.** `sonny tool-host` is a companion. A script
   runs in it, not in a process per agent, and MCP connections are shared
   ([SONNY.md](SONNY.md#mcp-servers)).
-- **`exec` is a declared tool** with `answered_by`, `steps` and `lift`
+- **`exec` is a declared tool** with `answered_by`, `steps` and `yields`
   (sonny/src/exec.rs:144), so a waiting script costs the daemon a parked
   row, and each nested call is judged, not the script.
 - **Codex's one bound.** Up to 2,048 scripts are alive at once, running or
@@ -406,7 +405,7 @@ client.
 
 - **A declared list is stored once, by its content.** The daemon keeps
   each distinct list of declared tools, in order, with all it holds
-  (`inherit` counts, `answered_by`, `steps`, `lift`, `kind`), under a
+  (`inherit` counts, `answered_by`, `steps`, `yields`, `kind`), under a
   digest of its bytes. A bot's row holds the digest. A list never changes,
   so nothing a bot refers to moves under it.
 - **Everything a bot does today keeps its meaning.** `create` and
@@ -782,7 +781,7 @@ client when it lands:
 6. **Replay's daemon part:** a step's started and ended marks, a result
    kept until a host takes it, and a call handed to a new owner once.
 7. **The yield (slice Y), built in protocol 85.** `yield_call` lifts a
-   waiting call of a `lift` tool with its output so far, which the model
+   waiting call of a `yields` tool (`lift` until protocol 92) with its output so far, which the model
    reads beside `"yielded":true`; a yielded call has no deadline (schema
    106); `wait` takes `terminate`. Tested with a plain socket client
    (tests/test_yield.py): the handle and the output so far, live or parked,

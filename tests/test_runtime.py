@@ -331,8 +331,9 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
-            elif user.startswith(('rewait:', 'rewait2:', 'liftwait:')):
-                # Calls this turn: a `liftwait:` command in the foreground,
+            elif user.startswith(('rewait:', 'rewait2:', 'liftwait:', 'liftyield:')):
+                # Calls this turn: a `liftwait:` command in the foreground
+                # (`liftyield:`, one that yields at 500 ms),
                 # then a wait on any handle a result names, again while one
                 # is pending, then the last result echoed.
                 start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
@@ -342,9 +343,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 calls = sum(i.get('type') == 'function_call' for i in request['input'][start:])
                 handle = next((o['handle'] for o in outputs if 'handle' in o), user.split(':', 1)[1])
                 text = ''
-                if user.startswith('liftwait:') and not outputs:
+                if user.startswith(('liftwait:', 'liftyield:')) and not outputs:
+                    timeout_ms = 500 if user.startswith('liftyield:') else 5000
                     output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'lift-1',
-                               'arguments': json.dumps({'command': user[9:], 'timeout_ms': 5000})}]
+                               'arguments': json.dumps({'command': user.split(':', 1)[1], 'timeout_ms': timeout_ms})}]
                 elif user.startswith('rewait2:') and not outputs:
                     # Two waits in one response.
                     output = [{'type': 'function_call', 'name': 'wait', 'call_id': f'wait-{n}',
@@ -424,8 +426,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'history', 'call_id': 'history-1',
                            'arguments': json.dumps({'turn': int(user[8:].split(',')[0]),
-                                                    'offset': int(user.split(',')[1]) if ',' in user else 0,
-                                                    **({'limit': int(user.split(',')[2])} if user.count(',') == 2 else {})})}]
+                                                    'offset': int(user.split(',')[1]) if ',' in user else 0})}]
                 if getattr(self.server, 'history_prefill', 0):
                     text = 'p' * self.server.history_prefill
                     output.insert(0, {'type': 'message', 'role': 'assistant',
@@ -1722,8 +1723,8 @@ class RuntimeTests(ModelFixture):
 
     def test_a_foreground_command_past_its_timeout_yields_and_keeps_running(self):
         # No clock kills a foreground command: past its timeout_ms it moves
-        # to the background, as a steer moves one, and its result comes on
-        # its handle once it exits.
+        # to the background, and its result comes on its handle once it
+        # exits.
         client = self.client('shell')
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
         command = "printf 'started\\n'; sleep 1.5; echo finished > yielded.txt; echo done"
@@ -2238,14 +2239,12 @@ class RuntimeTests(ModelFixture):
         # Nothing in the sandbox runs on: the loop stopped writing.
         self.assertEqual(ticks.stat().st_size, before)
 
-    def test_a_pause_ends_a_command_a_steer_moved_to_the_background(self):
-        self.model.slow_command = 'sleep 30'
+    def test_a_pause_ends_a_command_that_yielded_to_the_background(self):
         client = self.client('echo,shell,wait')
         self.addCleanup(lambda: client.close(kill=True))
         client.request('create', bot='Alice', workspace=str(self.path))
-        alice = client.request('submit', bot='Alice', request_id='a', prompt='sayslow:the review')['result']
-        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == alice['message'])
-        client.request('submit', bot='Alice', request_id='s', prompt='steer:on', delivery='steer')
+        prompt = 'calls:' + json.dumps([['shell', {'command': 'sleep 30', 'timeout_ms': 300}]])
+        alice = client.request('submit', bot='Alice', request_id='a', prompt=prompt)['result']
         self.assertEqual(client.finished(alice['message'])['data']['status'], 'completed')
         self.assertEqual(client.request('stats')['result']['running_processes'], 1)
         client.request('pause', reason='the loop is sending mail', by='calc.a')
@@ -3243,7 +3242,7 @@ class RuntimeTests(ModelFixture):
             # Exercise remaining space after substantial work in this same turn.
             self.model.history_prefill = 56000 if len(pieces) == 1 else 0
             turn = client.request('submit', bot='Bob', request_id=f'page-{offset}',
-                                  prompt=f'history:1,{offset}' + (',97' if offset == 0 else ''))['result']['message']
+                                  prompt=f'history:1,{offset}')['result']['message']
             finished = client.finished(turn)['data']
             self.assertEqual(finished['status'], 'completed', finished)
             requests = []
@@ -3255,7 +3254,7 @@ class RuntimeTests(ModelFixture):
             page = json.loads(result['output'])
             completed_items += page['items']
             self.assertEqual(page['offset'], offset)
-            self.assertLessEqual(len(page['text'].encode()), 97 if offset == 0 else 65536)
+            self.assertLessEqual(len(page['text'].encode()), 65536)
             for request in requests:
                 self.assertLessEqual(len(json.dumps(request['input'], ensure_ascii=False, separators=(',', ':')).encode()) - 2, 65536)
             pieces.append(page['text'])

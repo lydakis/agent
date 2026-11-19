@@ -12219,6 +12219,64 @@ migration.
   14 ms against 16 to 58 ms. Key p99 at 100 windows is 18.5 ms against 9.8 ms
   in a single round.
 
+## A steer never cuts a running call (#1203)
+
+A note for a busy lead lifted the call it was running after 250 ms, so a
+call that ended a second later came back as a `steered` handle the model
+had to `wait` on. Now the note waits for the call to end or yield on its
+own time, as Codex's does.
+
+### A busy lead fed a note every 2 s
+
+One lead runs `sleep 1` commands back to back for 60 s, as a quick exec
+sends a message or starts a task, while a note is steered into it every
+2 s; the synthetic model waits on any handle it is given. Main (4cfd195)
+against this change, release builds, one 4-CPU Linux container:
+
+| Measure | Main | Change |
+| --- | ---: | ---: |
+| notes sent / taken | 30 / 30 | 30 / 30 |
+| commands run | 60 | 60 |
+| commands cut into a `steered` handle | 13 | 0 |
+| `wait` calls | 13 | 0 |
+| model rounds | 74 | 61 |
+| note to its delivery p50, ms | 222 | 221 |
+| note to its delivery max, ms | 262 | 420 |
+
+- **13 of 30 notes cut a command,** each costing a `wait` call and a model
+  round: 21% more rounds for the same work. On a lead with a 500k-token
+  conversation each of those rounds is a full read of it.
+- **A note still arrives promptly.** The median is unchanged; the worst
+  case is now the rest of the running call, bounded by its own yield
+  (a shell command's `timeout_ms`, an exec script's 30 s `yield_time_ms`).
+
+### Daemon screens
+
+The Perf workflow's daemon screens on this change against main (4cfd195),
+two alternating rounds, same container. Store work per turn is the same on
+both (the gate counts it); nothing passes the 15% warning line:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 32.03 | 35.16 | +9.7 |
+| admission | burst submit p99, ms | 4.31 | 4.36 | +1.2 |
+| completion | release to terminal p99, ms | 10.23 | 11.13 | +8.8 |
+| footprint | idle RSS, MiB | 16.6 | 17.5 | +5.8 |
+| footprint | per idle bot, KiB | 1.91 | 1.72 | -10.2 |
+| footprint | RSS after a turn each, MiB | 33.4 | 34.6 | +3.7 |
+| footprint | CPU per turn, ms | 0.804 | 0.823 | +2.4 |
+| lifecycle | CPU, s | 0.55 | 0.55 | +0.0 |
+| lifecycle | p95 turn, ms | 606.4 | 580.8 | -4.2 |
+| lifecycle | peak RSS, MiB | 26.5 | 26.2 | -1.2 |
+
+None of these screens runs a call its client answers or a steer, so the
+paths this changes never run in them; the moves are this container's
+spread. The change only removes work on a turn's path: no lift future
+racing each foreground command, no grace timer per steer. What it adds is
+an indexed read of `approvals(turn, step_of)` when an answered call's
+clock is stopped, and one `next_lapse` read when a turn parked on an
+answer resumes for a steer.
+
 ## A message replaced in line (#1200)
 
 `submit` with `replaces` withdraws a message still in line and sends the
@@ -12255,3 +12313,41 @@ A one-off store screen (release build, a file store, one group commit of
 `interrupt` does) then a plain submit, 74 to 81 µs. Replacing costs what
 withdrawing and sending already cost, plus one indexed read of the
 replaced message and a savepoint, within the rounds' spread.
+
+## Automations judged by their parts (#1207)
+
+A turn's end (`finish`) now denies a held step of a call a message lifted,
+which outlived its turn before. It looks for such steps, and for the steps of
+a yielded call that wait on, only when one of the turn's steps waits: every
+waiting step is in the store's in-memory list, so a turn with none (nearly
+every turn) runs neither query, where main ran the second one at every turn
+end. A client's `approve_step` naming one of the bot's own tools runs the
+same plan `run_step` does and writes one audit row; no screen sends one.
+
+The Perf workflow's matched screens on 75140fc against main (e83c185), two
+alternating rounds on one runner; the gate passed, store work per turn
+unchanged:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.330 | 0.335 | +1.5 |
+| lifecycle | p95 turn, ms | 573.7 | 574.0 | +0.1 |
+| lifecycle | peak RSS, MiB | 26.6 | 26.1 | -1.7 |
+| completion | release to terminal p99, ms | 6.49 | 6.59 | +1.5 |
+| admission | lone submit CPU, ms | 24.06 | 23.94 | -0.5 |
+| admission | burst submit p99, ms | 2.726 | 2.740 | +0.5 |
+| footprint | idle RSS, MiB | 17.5 | 17.4 | -0.5 |
+| footprint | per idle bot, KiB | 1.81 | 1.91 | +5.4 |
+| footprint | RSS after a turn each, MiB | 52.1 | 51.9 | -0.4 |
+| footprint | CPU per turn, ms | 0.679 | 0.661 | -2.5 |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 18.75 | +50.0 |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 4.37 | 4.32 | -1.3 |
+| sonny | quiet window CPU, ms/s | 0.38 | 0.57 | +50.0 |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | 0.0 |
+| sonny | sky replay CPU per 1k lines, ms | 7.75 | 7.65 | -1.4 |
+
+The two Sonny rows at +50% are one or two CPU ticks over a few seconds
+(10x1 sends 4,000 deltas to one lead, the quiet window draws nothing), in
+code this change does not touch (the lookout and the window); the gate
+warns only when the head's best run is worse than the base's worst, and it
+did not.
