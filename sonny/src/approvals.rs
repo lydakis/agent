@@ -2022,7 +2022,6 @@ mod tests {
             "remove_task",
             "new_project",
             "follows",
-            "automations",
             "workflow"
         ]);
         // `exec`, always there in code mode, is gated as the rest; the

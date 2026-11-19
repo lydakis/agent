@@ -1689,6 +1689,26 @@ brought each event, as an Ethereum subscription's notifications name their
 subscription. A window whose project is its agent alone hears its own
 follow. A window that loses the daemon, or whose follow says `pruned`,
 lists again.
+Protocol 93 decides an `approve_step` step that names one of the bot's own
+tools, other than its call's (one of the daemon's, or one its client declared
+that is judged whole rather than by steps), as the same call from the model
+would be, by the planner `run_step` shares: the bot's rules
+(`command_forbidden`, `command_needs_approval`), `approval_policy`, its
+sandbox and the way out of it (`escalation_refused`), and the gates that name
+that tool, not the gates of the call's tool (unless that tool sets
+`gate_daemon_steps`). A tool the bot may not call is `tool_not_available`.
+Nothing runs: the daemon records the step in the audit trail with its own
+facts, and its client does what was allowed, telling how it ended with
+`step_result`. A name that is not the bot's own, such as a script's MCP tool,
+is judged as before. A client judges a call whose parts amount to other tools
+this way, each part as its tool: Sonny's `automations` asks for an `if` as
+`shell` in the agent's sandbox, another agent as `send_message`, and an agent
+it starts as `start_task`. A step that waits on a verdict for a call a message
+lifted no longer outlives its turn: when the turn ends, interrupted or not, the
+step is denied (`step_decided`, `its turn ended`), its call's time runs again,
+and its client's `approve_step` is told; a call its client yielded is background
+work, whose steps wait on, listed under its handle. `list_agents` with
+`approvals` names that handle.
 Protocol version 14 adds `configure`, which changes what a bot's client
 chose for it when it was made: its `instructions` (up to 64 KiB, as on
 `create`), and its `model` with an optional `effort` (absent is the model's

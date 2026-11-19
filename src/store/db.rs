@@ -10558,6 +10558,12 @@ impl Database {
     /// gives: at once when it is allowed at once, under no gate or when
     /// its client only `record`s it (a step it would not put to a gate),
     /// and once decided otherwise.
+    ///
+    /// A step its client asks about that names one of the bot's own tools,
+    /// other than its call's, is decided instead as that call from the
+    /// model would be ([`Database::step_planned`]), with the daemon's own
+    /// facts: the same command in a script or in an automation's check is
+    /// judged alike.
     #[allow(clippy::too_many_arguments)]
     pub fn step_announce(
         &mut self,
@@ -10618,6 +10624,14 @@ impl Database {
         let id = format!("{call_id}/{step}");
         if self.request(turn, &id)?.is_some() {
             return fail_with("step_waiting", format!("step {step} is waiting already"));
+        }
+        // A step that names one of the bot's own tools, other than its
+        // call's, is decided as that call from the model would be, by the
+        // plan every caller shares; its client does what it allows.
+        if !record && tool != parent && own_step(&bot, tool) {
+            return self.step_planned(
+                bot, turn, call_id, step, &id, tool, arguments, &parent, lifted, now_ms,
+            );
         }
         let gates: Vec<CallGate> = bot
             .gates
@@ -10690,6 +10704,141 @@ impl Database {
         self.gate_step(
             &bot, turn, call_id, &id, tool, arguments, gates, lifted, now_ms,
         )
+    }
+    /// Decide step `id` of call `call_id`, which names the bot's own tool
+    /// `tool`, as the same call from the model would be ([`Bot::plan`]),
+    /// in the turn's folder under the bot's rules, as a daemon step of the
+    /// call is decided, and without running it: refused by the rules, the
+    /// sandbox or a bot that never asks; put to the gates that name `tool`
+    /// (and its call's, when that tool says they judge its daemon steps)
+    /// when the plan gates it; otherwise allowed and recorded, its row in
+    /// the audit trail finished when its client says how it ended.
+    #[allow(clippy::too_many_arguments)]
+    fn step_planned(
+        &mut self,
+        bot: Bot,
+        turn: i64,
+        call_id: &str,
+        step: &str,
+        id: &str,
+        tool: &str,
+        arguments: Value,
+        parent: &str,
+        lifted: bool,
+        now_ms: u64,
+    ) -> Result<Stepped> {
+        if !bot.may_call(tool) {
+            return Err(Error::with("tool_not_available", tool));
+        }
+        let capture = self.capture(turn, call_id)?;
+        let Some(workspace) = capture.workspace.as_deref() else {
+            return fail("workspace_required");
+        };
+        let text = arguments.to_string();
+        let call = ToolCall {
+            name: tool.to_owned(),
+            call_id: id.to_owned(),
+            arguments: text.clone(),
+            custom: false,
+            links: Default::default(),
+        };
+        let plan = bot.plan(&call, std::path::Path::new(workspace), &capture.rules);
+        let refusal = if plan.refused_unasked() {
+            Some((Error::with("approval_refused", NEVER_ASKS), true))
+        } else if let Some(error) = plan.ruled_out() {
+            Some((error, false))
+        } else if plan.escapes() && tool == "shell" {
+            Some((crate::tools::escalation_refused(), false))
+        } else {
+            None
+        };
+        let gates_parent = bot
+            .declared(parent)
+            .is_some_and(|declared| declared.gate_daemon_steps);
+        let mut gates: Vec<CallGate> = Vec::new();
+        for g in bot.gates.iter().filter(|g| {
+            g.tools
+                .iter()
+                .any(|t| (plan.gated && t == tool) || (gates_parent && t == parent))
+        }) {
+            if !gates.iter().any(|kept| kept.tag == g.tag) {
+                gates.push(CallGate {
+                    tag: g.tag.clone(),
+                    expire_ms: g.expire_ms,
+                });
+            }
+        }
+        let refusal = refusal.or_else(|| {
+            (!gates.is_empty() && bot.settings.never_asks())
+                .then(|| (Error::with("approval_refused", NEVER_ASKS), true))
+        });
+        let kind = bot
+            .declared(tool)
+            .and_then(|declared| declared.kind.as_deref());
+        let facts = audit::of_call(tool, kind, plan.in_sandbox());
+        if let Some((error, denied)) = refusal {
+            let tx = self.conn.savepoint()?;
+            audit::insert(
+                &tx,
+                now_ms as i64,
+                bot.bot_id,
+                &bot.name,
+                turn,
+                call_id,
+                Some(step),
+                tool,
+                audit::Facts {
+                    place: None,
+                    ..facts
+                },
+                "nobody",
+                "denied",
+                &text,
+            )?;
+            let mut decided = json!({"call_id":id,"step_of":call_id,"name":tool,
+                "decision":"deny","approvals":[],"error":error.code,"reason":error.detail});
+            previewed(&mut decided, tool, &text);
+            if denied {
+                decided["denied"] = json!(true);
+            }
+            event(&tx, &bot.name, Some(turn), "step_decided", decided)?;
+            tx.commit()?;
+            return Ok(Stepped {
+                step: Step::Decided(json!({"call_id":id,"decision":"deny",
+                    "reason":error.detail,"error":error.code,"approvals":[]})),
+                notify: None,
+                wake: false,
+                lifted: None,
+            });
+        }
+        if !gates.is_empty() {
+            let arguments = json!({"arguments":arguments,"audit":facts.to_json()});
+            return self.gate_step(
+                &bot, turn, call_id, id, tool, arguments, gates, lifted, now_ms,
+            );
+        }
+        let tx = self.conn.savepoint()?;
+        audit::insert(
+            &tx,
+            now_ms as i64,
+            bot.bot_id,
+            &bot.name,
+            turn,
+            call_id,
+            Some(step),
+            tool,
+            facts,
+            if plan.ruled() { "rule" } else { "nobody" },
+            "unknown",
+            &text,
+        )?;
+        tx.commit()?;
+        Ok(Stepped {
+            step: Step::Decided(json!({"call_id":id,"decision":"allow","approvals":[]})),
+            notify: None,
+            wake: false,
+            lifted: None,
+        })
     }
     /// Put a step to `gates`: its approval row, announced and listed as a
     /// gated call is, its call's time stopped while it waits. `arguments`
@@ -12892,28 +13041,67 @@ impl Database {
             )?;
         }
         // A call a message lifted waits on past its turn, as its background
-        // command, with the steps its client asks about.
-        let lifted: Vec<i64> = tx
+        // command, but a step of it that waited on a verdict when the message
+        // lifted it waits no longer than its turn: each is denied, as an
+        // answered call's are, and the call's time runs again, so nothing
+        // the turn asked about is decided once it is over. A call its
+        // client yielded is background work, whose steps wait on.
+        type Lifted = (String, String, String, String, Option<String>);
+        let lifted: Vec<Lifted> = tx
+            .prepare_cached(
+                "DELETE FROM approvals WHERE turn=?1 AND step_of IN
+                 (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL AND NOT yielded)
+                 RETURNING call_id,step_of,name,json_extract(arguments,'$.arguments'),
+                    json_extract(arguments,'$.audit')",
+            )?
+            .query_map([turn], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let now_ms = epoch_ms().max(0) as u64;
+        for (id, parent, name, arguments, facts) in &lifted {
+            audit_step(
+                &tx,
+                &bot,
+                turn,
+                parent,
+                id,
+                name,
+                facts.as_deref(),
+                "nobody",
+                "denied",
+                arguments,
+                now_ms,
+            )?;
+            let data = json!({"call_id":id,"step_of":parent,"name":name,"decision":"deny",
+                "reason":"its turn ended","approvals":[]});
+            event(&tx, &bot.name, Some(turn), "step_decided", data)?;
+        }
+        for parent in lifted.iter().map(|(_, parent, ..)| parent) {
+            resume_call(&tx, turn, parent, now_ms)?;
+        }
+        let background: Vec<i64> = tx
             .prepare_cached(
                 "SELECT a.id FROM approvals a WHERE a.turn=?1 AND a.step_of IN
                  (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL)",
             )?
             .query_map([turn], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let unstarted = match bot.gates.is_empty() {
-            true => 0,
-            false => tx.execute(
-                "DELETE FROM approvals WHERE turn=?1 AND process IS NULL AND (step_of IS NULL
-                 OR step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL))",
-                [turn],
-            )? as i64,
-        };
-        // Each step still waiting is gone with its turn: its `approve_step`
-        // is told to find so.
+        let unstarted = lifted.len() as i64
+            + match bot.gates.is_empty() {
+                true => 0,
+                false => tx.execute(
+                    "DELETE FROM approvals WHERE turn=?1 AND process IS NULL AND (step_of IS NULL
+                     OR step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL))",
+                    [turn],
+                )? as i64,
+            };
+        // Each step still waiting is gone with its turn, but a yielded
+        // call's: its `approve_step` is told to find so.
         let ended: Vec<i64> = self
             .steps
             .iter()
-            .filter(|(id, of)| **of == turn && !lifted.contains(id))
+            .filter(|(id, of)| **of == turn && !background.contains(id))
             .map(|(id, _)| *id)
             .collect();
         // As `unstep` does, with the turn's savepoint open.
@@ -17508,6 +17696,14 @@ fn step_started(
     Ok(())
 }
 /// Mark a daemon step refused: ended as it was decided, its name spent.
+/// Whether a client's step naming `tool` is decided by the bot's plan for
+/// that tool ([`Database::step_planned`]): one of the daemon's tools, or
+/// one its client declared that is judged whole, not by its steps,
+/// whether or not the bot may call it now.
+fn own_step(bot: &Bot, tool: &str) -> bool {
+    crate::tools::is_daemon_tool(tool)
+        || (bot.declared.iter()).any(|declared| declared.name == tool && !declared.steps)
+}
 fn step_refused(
     tx: &Connection,
     bot: &str,

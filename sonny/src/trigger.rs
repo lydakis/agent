@@ -3415,6 +3415,17 @@ fn own(places: &Places, name: &str, caller: &Caller) -> Option<Value> {
     theirs.then_some(row)
 }
 
+/// The automation `name` as its definition stands, and whether `caller`
+/// has a part in it ([`own`]): what an agent's removal or run of it acts
+/// on. None for one with no definition, or whose definition cannot be
+/// read.
+pub fn standing(places: &Places, name: &str, caller: &Caller) -> Option<(Trigger, bool)> {
+    valid_name(name).ok()?;
+    let (trigger, _) = read_trigger(&places.job(name)).ok()?;
+    let mine = own(places, name, caller).is_some();
+    Some((trigger, mine))
+}
+
 /// The first page, in name order, of the automations `caller` has a part
 /// in, as the agent's own tool lists them; the person's `sonny automation
 /// list` lists every one ([`list`]). Each one's row is read to tell.
