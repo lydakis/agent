@@ -230,6 +230,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::commons::PROJECTS,
         retire: "0.12.0",
     },
+    // What posting in a commons thread subscribed outlives a close, marked
+    // so in each follows file (0.10.2).
+    Migration {
+        id: crate::lookout::subs::COMMONS_OUTLIVE_CLOSE,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -247,6 +253,7 @@ pub fn at_start(store: &Path) {
 fn store_files(store: &Path) {
     crate::lookout::subs::agents_files(store);
     crate::lookout::subs::goals_gone(store);
+    crate::lookout::subs::commons_outlive_close(store);
     crate::git::drop_snapshot_indexes(store);
 }
 
@@ -401,6 +408,7 @@ mod tests {
             "upgrade::",
             "agents_files",
             "goals_gone",
+            "commons_outlive_close",
             "nested_gone",
             "woken_gone",
             "commons::projects",
@@ -430,6 +438,7 @@ mod tests {
         for id in [
             crate::lookout::subs::AGENTS,
             crate::lookout::subs::GOALS_GONE,
+            crate::lookout::subs::COMMONS_OUTLIVE_CLOSE,
             crate::git::NO_SNAPSHOTS,
         ] {
             assert!(done(&record, id), "{id}");
