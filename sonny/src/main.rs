@@ -1760,13 +1760,13 @@ async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
         })
         .collect();
     // A page with none older holds the first message, when every item on
-    // it came back whole.
+    // it came back whole: kept as the title it makes, not the whole brief.
     let whole =
         entries.len() == nodes.len() && entries.iter().all(|entry| entry["error"].is_null());
     let first = (page["next_from"].is_null() && !nodes.is_empty() && whole).then(|| {
         (flat.iter().rev())
             .find(|item| item["role"] == "user")
-            .map(text)
+            .map(|item| crate::title::of_message(&text(item)))
             .unwrap_or_default()
     });
     Some(Latest {
@@ -5363,8 +5363,8 @@ struct Latest {
     pr: Option<String>,
     /// The question it asked the person and has no answer to yet.
     ask: Option<asks::Ask>,
-    /// Its first message's first line, when the page read holds its
-    /// whole history: a title found with no read of its own.
+    /// Its first message's first line, cut as a title, when the page read
+    /// holds its whole history: a title found with no read of its own.
     #[serde(skip)]
     first: Option<String>,
 }
