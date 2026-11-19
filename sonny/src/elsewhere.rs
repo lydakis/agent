@@ -295,7 +295,11 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         .map_or(0, |since| since.as_millis() as u64);
     // From now: where things stand comes from the reads below, and an
     // event that lands while they run is applied after them.
-    let Some((mut client, mut events)) = follow_wide(socket, json!({"since_ms": now})).await else {
+    // Where the follow of every agent has reached: its kinds are none of
+    // [`NARROW`]'s, so each event of a [`WIDE`] kind is its, in order, while
+    // an agent's own follow may run ahead of it.
+    let mut wide_from = json!({"since_ms": now});
+    let Some((mut client, mut events)) = follow_wide(socket, wide_from.clone()).await else {
         return;
     };
     let Some(seeded) = seed(&client, store).await else {
@@ -334,6 +338,9 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             return;
         };
         let cursor = event["cursor"].clone();
+        if (event["event"].as_str()).is_some_and(|kind| WIDE.contains(&kind)) {
+            wide_from = json!({"after": cursor});
+        }
         let Some(bot) = event["bot"].as_str() else {
             continue;
         };
@@ -432,10 +439,10 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         // None followed narrowly waits, runs, marks any more or is to be
         // read at its turn's end: their events are no longer wanted, and
         // the daemon has no unfollow. A new connection follows every agent
-        // on from this event, with nothing read again.
+        // on from where its follow had reached, with nothing read again.
         if done_with(&narrow, &needs, &marked) {
             drop((client, events));
-            let Some(again) = follow_wide(socket, json!({"after": cursor})).await else {
+            let Some(again) = follow_wide(socket, wide_from.clone()).await else {
                 return;
             };
             (client, events) = again;

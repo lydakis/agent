@@ -786,8 +786,8 @@ impl App {
     }
 
     /// `alt+n`: the next agent that needs the person, this project's first
-    /// as the pane lists them and those the footer counts beside them
-    /// (questions forwarded from leads it follows), then the other
+    /// (as the pane lists them, the questions the footer counts beside
+    /// them, and any other the shared follow knows), then the other
     /// projects' as **Projects** lists them, from the one after this
     /// project's around ([`elsewhere::round`]).
     fn next_needing(&mut self) {
@@ -799,18 +799,29 @@ impl App {
             local.extend(fleet.waiting_past_status_of(&self.status_bots));
         }
         // Each in its own project's place, as a superlead's list or a
-        // followed lead's question may be another project's.
-        let elsewhere = self.elsewhere_waiting();
-        let local: Vec<(usize, String)> = match &self.other_projects {
+        // followed lead's question may be another project's; and every
+        // agent the shared follow knows waits, this project's too (a
+        // sibling lead's task is in no list of this window's), each once.
+        let (local, elsewhere) = match &self.other_projects {
             Some((open, _)) => {
                 let shared = open.waiting.borrow();
-                (local.into_iter())
-                    .map(|bot| (shared.place(&bot).unwrap_or(elsewhere.here), bot))
-                    .collect()
+                let here = shared
+                    .order
+                    .get(&self.scope().project)
+                    .copied()
+                    .unwrap_or(0);
+                let local = (local.into_iter())
+                    .map(|bot| (shared.place(&bot).unwrap_or(here), bot))
+                    .collect();
+                let agents = (shared.agents.iter())
+                    .map(|(place, _, bot)| (*place, bot.clone()))
+                    .collect();
+                (local, elsewhere::Waiting { here, agents })
             }
-            None => (local.into_iter())
-                .map(|bot| (elsewhere.here, bot))
-                .collect(),
+            None => (
+                (local.into_iter()).map(|bot| (0, bot)).collect::<Vec<_>>(),
+                elsewhere::Waiting::default(),
+            ),
         };
         let waiting = elsewhere::round(&local, &elsewhere);
         match elsewhere::next(&waiting, &self.bot) {
