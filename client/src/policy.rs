@@ -190,6 +190,28 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+std::thread_local! {
+    /// The folders kept from agents while [`hiding`] composes.
+    static HIDDEN: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `compose` on this thread with each file it reads refused when what
+/// was opened is in one of `hidden` ([`crate::hidden::holds`]), by their
+/// real paths: what a bot's folder links to there (an `AGENTS.md`, a
+/// skill, a profile) would otherwise be read into its instructions or
+/// another's, outside any sandbox.
+pub fn hiding<T>(hidden: &[PathBuf], compose: impl FnOnce() -> T) -> T {
+    struct Restore(Vec<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let before = std::mem::take(&mut self.0);
+            HIDDEN.with(|hidden| *hidden.borrow_mut() = before);
+        }
+    }
+    let _restore = Restore(HIDDEN.with(|held| held.replace(hidden.to_vec())));
+    compose()
+}
+
 /// The first `limit + 1` bytes at most: enough to know whether a file
 /// fits in `limit`. Nothing beyond that is ever read, so a runaway file
 /// fails before it fills memory.
@@ -200,6 +222,12 @@ fn read_head(path: &Path, limit: usize) -> Result<Vec<u8>, Failure> {
         reason: error.to_string(),
     };
     let file = std::fs::File::open(path).map_err(unreadable)?;
+    if HIDDEN.with(|hidden| crate::hidden::holds(&hidden.borrow(), &file)) {
+        return Err(Failure::Unreadable {
+            path: path.to_path_buf(),
+            reason: "it is kept unreadable from agents".into(),
+        });
+    }
     let mut bytes = Vec::new();
     file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
@@ -1560,6 +1588,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Discovery reports canonical paths (macOS aliases /var to /private/var).
         std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn instructions_never_take_a_file_kept_from_agents() {
+        let root = temp("hidden");
+        let keys = root.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("env"), "KEY=secret").unwrap();
+        let workspace = root.join("work");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::os::unix::fs::symlink(keys.join("env"), workspace.join("AGENTS.md")).unwrap();
+        let read = instructions_leaving_out(&workspace, None, &[]).unwrap();
+        assert!(read.text.contains("KEY=secret"));
+        let kept = hiding(std::slice::from_ref(&keys), || {
+            instructions_leaving_out(&workspace, None, &[]).unwrap()
+        });
+        assert!(!kept.text.contains("KEY=secret"), "{}", kept.text);
+        assert!(hiding(&[keys], || instructions(&workspace, None, &[])).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

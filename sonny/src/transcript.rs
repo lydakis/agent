@@ -1028,7 +1028,7 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     // Numbered in the window as well as timed: fences laid out in the
     // same millisecond keep files of their own.
     static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = std::env::temp_dir().join("sonny-pages");
+    let dir = crate::html::pages();
     let name = format!(
         "{}-{}-{}.html",
         std::process::id(),
@@ -1111,7 +1111,7 @@ pub(crate) fn kept_page(
 /// Whether `link` is an HTML page a ```html fence kept, which a click
 /// opens in the browser, as a page is used, rather than in the pane.
 pub fn browser_page(link: &str) -> bool {
-    let dir = std::env::temp_dir().join("sonny-pages");
+    let dir = crate::html::pages();
     crate::links::file_url(&dir).is_some_and(|dir| {
         link.strip_prefix(&dir)
             .is_some_and(|name| name.starts_with('/') && name.ends_with(".html"))
@@ -1122,8 +1122,7 @@ pub fn browser_page(link: &str) -> bool {
 /// holds, so drawing it again keeps the same file.
 fn kept_path(what: &impl std::hash::Hash, extension: &str) -> Option<std::path::PathBuf> {
     use std::hash::{Hash, Hasher};
-    let dir = std::env::temp_dir().join("sonny-pages");
-    std::fs::create_dir_all(&dir).ok()?;
+    let dir = crate::html::pages_made().ok()?;
     let mut hasher = std::hash::DefaultHasher::new();
     (what, extension).hash(&mut hasher);
     Some(dir.join(format!("{:016x}.{extension}", hasher.finish())))
@@ -2565,16 +2564,23 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
         (_, Some(command), _) => {
             let first = command.lines().next().unwrap_or_default().trim().to_owned();
             let outside = arguments["sandbox_permissions"] == "require_escalated";
-            let question = match outside {
-                true => format!("Run {first} outside the sandbox?"),
-                false => format!("Run {first}?"),
+            // Another tool that takes a command is named, with what else
+            // it is given: the command alone would read as the shell's.
+            let (by, detail) = match name {
+                "shell" => (String::new(), lines(command)),
+                _ => (
+                    format!(" with {name}"),
+                    lines(command)
+                        .into_iter()
+                        .chain(rest(&["command"]))
+                        .collect(),
+                ),
             };
-            words(
-                question,
-                first.clone(),
-                format!("run {first}"),
-                lines(command),
-            )
+            let question = match outside {
+                true => format!("Run {first}{by} outside the sandbox?"),
+                false => format!("Run {first}{by}?"),
+            };
+            words(question, first.clone(), format!("run {first}{by}"), detail)
         }
         ("read", _, Some(path)) => {
             let path = shown(path, workspace);
@@ -4859,7 +4865,7 @@ mod tests {
 
     #[test]
     fn a_kept_html_page_opens_in_the_browser_and_other_kept_files_in_the_pane() {
-        let dir = std::env::temp_dir().join("sonny-pages");
+        let dir = crate::html::pages();
         let url = |name: &str| crate::links::file_url(&dir.join(name)).unwrap();
         assert!(browser_page(&url("1-2.html")));
         // A drawing's kept source or picture, and a page anywhere else,
@@ -4867,7 +4873,8 @@ mod tests {
         assert!(!browser_page(&url("0123.svg")));
         assert!(!browser_page(&url("0123.png")));
         assert!(!browser_page("file:///w/site/index.html"));
-        let beside = crate::links::file_url(&std::env::temp_dir().join("sonny-pages2/a.html"));
+        let beside =
+            crate::links::file_url(&crate::html::pages().with_extension("x").join("a.html"));
         assert!(!browser_page(&beside.unwrap()));
     }
 

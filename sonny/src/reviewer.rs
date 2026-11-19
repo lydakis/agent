@@ -1410,15 +1410,44 @@ async fn intent(
             call.starts_daemon = starts_daemon(&call.tool, &call.arguments, confined);
         }
     }
-    let instructions = match &workspace {
-        Some(workspace) => {
+    // An agent another agent made was given its folder's AGENTS.md as the
+    // folder read then, which its maker may have written: each file counts
+    // as the person's only as its line's first agent was given it, and is
+    // still. A line whose first agent is gone has none.
+    let mut first = Some(inspected.clone());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(maker) = (first.as_ref())
+        .filter(|agent| agent["depth"].as_u64().unwrap_or(0) > 0)
+        .map(|agent| agent["created_by"].as_str().map(str::to_owned))
+    {
+        first = match maker {
+            Some(maker) if seen.insert(maker.clone()) => {
+                client.request("inspect", json!({"bot": maker})).await.ok()
+            }
+            _ => None,
+        };
+    }
+    let instructions = match (&workspace, first) {
+        (Some(workspace), Some(first)) => {
             let given = inspected["instructions"]
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
             let workspace = workspace.clone();
             tokio::task::spawn_blocking(move || {
-                agent_client::policy::given_agents_files(&workspace, &given)
+                let files = agent_client::policy::given_agents_files(&workspace, &given);
+                if same_bot(&first, &inspected) {
+                    return files;
+                }
+                let (Some(folder), Some(given)) =
+                    (first["workspace"].as_str(), first["instructions"].as_str())
+                else {
+                    return Vec::new();
+                };
+                let firsts = agent_client::policy::given_agents_files(Path::new(folder), given);
+                (files.into_iter())
+                    .filter(|file| firsts.contains(file))
+                    .collect()
             })
             .await
             .map_err(|_| Unjudged::Failed)?
@@ -1426,7 +1455,7 @@ async fn intent(
             .map(|(path, text)| (path.to_string_lossy().into_owned(), text))
             .collect()
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     Ok(Intent {
         note: shared.note.clone(),
@@ -1784,9 +1813,26 @@ async fn delegated(
     }
 }
 
+/// Whether `a` and `b`, bots as `inspect` gives them, are one bot: by its
+/// store-wide id, which a recycled name doesn't share.
+fn same_bot(a: &Value, b: &Value) -> bool {
+    a["bot_id"]
+        .as_i64()
+        .is_some_and(|id| b["bot_id"].as_i64() == Some(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bot_is_the_same_only_by_its_id() {
+        let lead = json!({"name": "shop.lead", "bot_id": 1});
+        let child = json!({"name": "shop.fix", "bot_id": 2, "created_by": "shop.lead"});
+        assert!(same_bot(&lead, &lead.clone()));
+        assert!(!same_bot(&lead, &child));
+        assert!(!same_bot(&json!({}), &json!({})));
+    }
 
     #[test]
     fn only_a_call_that_would_leave_its_sandbox_for_the_agent_s_home_waits_for_the_person() {

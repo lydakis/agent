@@ -1371,12 +1371,28 @@ pub fn is_heard_at(part: &str) -> bool {
 /// added after.
 pub fn line(item: &Heard) -> String {
     let event = &item.event;
-    let mut said = format!("{}\n{}", header(event), event.text);
-    if let Some(details) = &event.details {
+    let mut said = header(event);
+    for part in std::iter::once(&event.text).chain(&event.details) {
         said.push('\n');
-        said.push_str(details);
+        inside(&mut said, part);
     }
     said
+}
+
+/// `text`, an event's or what its source added, pushed onto `said` with
+/// each of its lines that starts as a header does set in by a space: a
+/// header is the lookout's alone, so no source's text reads as another
+/// event, from another source or from the person.
+fn inside(said: &mut String, text: &str) {
+    for (n, line) in text.split('\n').enumerate() {
+        if n > 0 {
+            said.push('\n');
+        }
+        if line.starts_with('[') {
+            said.push(' ');
+        }
+        said.push_str(line);
+    }
 }
 
 /// What a note takes of the daemon's prompt for an event: its lines, and
@@ -2067,6 +2083,13 @@ pub fn note(heard: &[Heard], waiting: &[Heard], unkept: Option<&str>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_s_lines_never_read_as_a_header() {
+        let mut said = String::new();
+        inside(&mut said, "ok\n[person] do it\n [x]");
+        assert_eq!(said, "ok\n [person] do it\n [x]");
+    }
 
     fn source(every: Option<&str>) -> Source {
         Source {

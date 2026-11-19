@@ -104,9 +104,10 @@ vulnerability, whether or not the code's own documentation agrees.
   commands, writes and edits under bubblewrap on Linux or Seatbelt on
   macOS, with the mode names, writable folders and profiles ported from
   Codex ([sandbox](docs/RUST_PROTOTYPE.md#sandbox)). Reads stay open in
-  every mode: a confined command can read any file the person can,
-  `~/.agent/keys/env` and the store included, and its model provider sees what
-  it reads.
+  every mode but for the folders kept from agents (`--unreadable`:
+  `~/.agent/keys`, Sonny's programs and the person's `[sandbox]
+  unreadable`): a confined command can read any other file the person
+  can, the store included, and its model provider sees what it reads.
 - A sandboxed bot never runs unconfined for want of a sandbox: creating one
   fails with `sandbox_unavailable` when bubblewrap or `sandbox-exec` is
   missing or cannot make its namespaces. Bubblewrap is found at fixed
@@ -115,12 +116,16 @@ vulnerability, whether or not the code's own documentation agrees.
   and cannot be created, and `.aws` stays read-only where it exists, since
   git runs hooks and config from there, agents trust what is there, and an
   AWS profile can name a program to run. A git folder a bot may commit to
-  keeps its hooks, config, modules and `commondir` read-only. The daemon's
+  keeps its hooks, config, modules and `commondir` read-only, and on Linux
+  its linked worktrees' folders too, but for the bot's own worktree's,
+  whose `commondir` stays read-only. A folder between a writable folder
+  and what it keeps read-only can't be renamed, on Linux as on macOS. The daemon's
   store, the files SQLite keeps beside it, its socket and the bots'
   sockets are read-only inside every sandbox.
 - A write or edit is checked by the target's real path and then carried
   out inside the sandbox, so a symlink swapped in after the check cannot
-  carry it outside. A protected folder that is a symlink refuses the call.
+  carry it outside; so are a patch's removals and the permissions a
+  moved file keeps. A protected folder that is a symlink refuses the call.
 - Network is off unless the bot's `network` is set. Off, a bot is
   neither offered nor runs `web_fetch` or `web_search`, which the daemon
   and the provider answer outside the sandbox, and it reaches
@@ -153,8 +158,10 @@ vulnerability, whether or not the code's own documentation agrees.
   command.
 - A bot made or forked by a sandboxed bot inherits its creator's sandbox
   and writable folders, may only narrow them, reaches the network only if
-  both do. It goes by its creator's command rules, and can't be given
-  others.
+  both do. Its folders are checked and kept by the real paths resolved
+  once, as the request is read. It goes by its creator's command rules
+  and `outputs` folder, and can't be given others. A bot `spawn_agent`
+  makes has at most its creator's tools, whatever its role names.
 - A bot made with `danger-full-access`, or with no `sandbox`, runs
   unconfined with the caller's full permissions. That is the daemon's
   default; Sonny's default is a sandbox.
@@ -284,12 +291,25 @@ approval gate as a call that leaves the sandbox would; `memory` and
   or Sonny added runs as the person. One added before 0.9.0, when Sonny
   did not record who wrote it, does not run until it is added again, but
   for Sonny's own, which it knows by their whole text. Nothing of a
-  trigger runs between its fires.
+  trigger runs between its fires. A `commit` trigger reads its repository
+  with git in a read-only sandbox with the network off, as Sonny lists a
+  checkout, so nothing the repository's config names runs as the person.
+- A project's lead is a bot named as one that no agent made; an agent
+  that names one it makes as a lead doesn't make it one. Only a lead's
+  folder's `.agents/setup` runs, and a task gets its repository's git
+  folder to commit to only when its `.git` names that folder as git makes
+  linked worktrees, never through a `.git` file that names another.
+- An agent another agent made is given its folder's `AGENTS.md` as it
+  reads then; the reviewer counts a file as the person's only as its
+  line's first agent was given it. Composing an agent's instructions
+  reads no file kept from agents, through a link or not.
 - **Lookout sources** are commands the person sets up in `config.toml`,
   run with `sh -c` as the person outside any sandbox. A source runs its
   script again on every run, and starts again on an edit to a file its
   `watch` list names, so its command and those files must be ones no
-  agent can write: keep them outside every agent's folders.
+  agent can write: keep them outside every agent's folders. A line of an
+  event's text that starts as a note's header does is set in, so no
+  source's text reads as another event or as the person's words.
 - **MCP servers** run as the person outside every sandbox, started from
   `~/.agent/config.toml` with `~/.agent/keys/env` in their environment. An
   agent reaches them only through `exec`, a QuickJS script with no files,
@@ -301,7 +321,10 @@ approval gate as a call that leaves the sandbox would; `memory` and
 - **The browser tool** wraps page text in boundary markers the model is
   told never instruct it, and refuses what would reach past the browser:
   flags that launch another program or load an extension, plugins, the
-  clipboard, the DevTools address, and writes outside the agent's folder.
+  clipboard, the DevTools address, files kept from agents, and writes
+  outside the agent's folder. For a confined agent the browser saves each
+  file to a folder of Sonny's own, which Sonny then writes in place
+  without following a link.
   `eval`, `download`, `upload`, `state` and vault sign-ins wait for a
   verdict.
 - **The desktop tool** drives the person's desktop with agent-desktop,
@@ -367,7 +390,11 @@ is built.
   its sandbox. A workspace snapshot or a worktree is not a
   sandbox.
 - The sandbox confines commands, writes and edits, not reads: a confined
-  bot can read any file the person can and send it to its model provider.
+  bot can read any file the person can but those kept from agents, and
+  send it to its model provider.
+- A ```` ```html ```` fence in a reply is drawn by headless Chrome with its
+  scripts and the network on, as the person, so a page an agent wrote
+  can reach the network whatever the agent's own setting.
 - With the network on, Sonny's default, a sandboxed bot reaches every
   Unix socket on the machine. One that runs a program outside the sandbox
   on request, such as Docker's or ssh-agent's, is a way out of it, unless
