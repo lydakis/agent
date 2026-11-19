@@ -12218,3 +12218,40 @@ migration.
 - **Keys.** The worst key at 32 windows is 12 to
   14 ms against 16 to 58 ms. Key p99 at 100 windows is 18.5 ms against 9.8 ms
   in a single round.
+
+## A message replaced in line (#1200)
+
+`submit` with `replaces` withdraws a message still in line and sends the
+new one in one store step. A submit without it does no new store work: the
+same job, with one bool more.
+
+### Hot-path screens
+
+The CI Perf job (`bench/perf_gate.py`, Ubuntu 24.04 runner, 2026-11-19)
+on b3e3122 against 4cfd195, screened alternately. No bench sends
+`replaces`, so these screen the plain path; the gate's store-work count
+passed.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.575 | 0.56 | -2.6% |
+| lifecycle | p95 turn, ms | 578.238 | 577.35 | -0.2% |
+| lifecycle | peak RSS, MiB | 25.973 | 26.535 | +2.2% |
+| completion | release to terminal p99, ms | 11.664 | 11.917 | +2.2% |
+| admission | lone submit CPU, ms | 35.024 | 35.696 | +1.9% |
+| admission | burst submit p99, ms | 4.405 | 4.386 | -0.4% |
+| footprint | idle RSS, MiB | 17.428 | 17.623 | +1.1% |
+| footprint | per idle bot, KiB | 1.856 | 1.874 | +1.0% |
+| footprint | RSS after a turn each, MiB | 41.908 | 40.494 | -3.4% |
+| footprint | CPU per turn, ms | 1.032 | 1.024 | -0.8% |
+
+Every change is under the gate's 15% line.
+
+### The replacing submit
+
+A one-off store screen (release build, a file store, one group commit of
+2,000 each, three rounds, 2026-11-19): a plain queued submit took 26 to
+33 µs; a replacing one, 74 to 93 µs; a withdraw (`end_queued`, as
+`interrupt` does) then a plain submit, 74 to 81 µs. Replacing costs what
+withdrawing and sending already cost, plus one indexed read of the
+replaced message and a savepoint, within the rounds' spread.
