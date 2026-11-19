@@ -5366,6 +5366,10 @@ struct App {
     /// with their [`rows_mark`] once counted; the count holds it while it
     /// runs, so there is one copy.
     listed: Option<Vec<standing::Agent>>,
+    /// The lead a task's window lists the agents of, with the agent it was
+    /// found for, as the last count's listing said: kept while a count
+    /// holds the listing, so a read beside it lists for the same lead.
+    listed_lead: Option<(String, String)>,
     rows_mark: Option<u64>,
     folded: Option<(bool, u64)>,
     refold: bool,
@@ -7390,6 +7394,7 @@ impl App {
             kept_rows: Built::default(),
             follower: None,
             listed: None,
+            listed_lead: None,
             rows_mark: None,
             folded: None,
             refold: false,
@@ -11551,7 +11556,11 @@ impl App {
                 self.counted_local = None;
             }
             match counted.listed {
-                Some((listed, mark)) => (self.listed, self.rows_mark) = (Some(listed), Some(mark)),
+                Some((listed, mark)) => {
+                    let lead = task_lead(&self.bot, Some(&listed));
+                    self.listed_lead = Some((self.bot.clone(), lead));
+                    (self.listed, self.rows_mark) = (Some(listed), Some(mark));
+                }
                 // A read failed: what moved is unknown, so start over.
                 None => self.follower = None,
             }
@@ -14384,7 +14393,10 @@ impl App {
             Some(project) => (project.clone(), self.bot.clone()),
             None => (
                 self.bot.split('.').next().unwrap_or(&self.bot).to_owned(),
-                task_lead(&self.bot, self.listed.as_deref()),
+                match (&self.listed, &self.listed_lead) {
+                    (None, Some((bot, lead))) if *bot == self.bot => lead.clone(),
+                    (listed, _) => task_lead(&self.bot, listed.as_deref()),
+                },
             ),
         };
         let glob = if self.bot.contains('.') || self.project.is_some() {
@@ -25101,6 +25113,11 @@ mod tests {
             counted,
             ["calc.lead", "calc.lead.docs", "calc.notes"].into()
         );
+        assert_eq!(app.scope().lead, "calc.lead.docs");
+        // While a count holds the listing, a read beside it lists for the
+        // same lead.
+        let held = app.listed.take();
+        assert!(held.is_some());
         assert_eq!(app.scope().lead, "calc.lead.docs");
         std::fs::remove_dir_all(&dir).unwrap();
     }
