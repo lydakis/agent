@@ -848,13 +848,30 @@ fn wrap_rows(
             Line::from([vec![goes_on(opens, false)], first.spans].concat())
         }
     };
-    let rest = [vec![goes_on(rest.width(), true)], rest.spans].concat();
     // A band behind the line, as the person's messages have, fills each
     // of its rows.
     let band = match line.style.bg {
         Some(bg) => Style::new().bg(bg),
         None => Style::new(),
     };
+    // A line that fits is its one row.
+    let wide: usize = line.spans.iter().map(|span| span.content.width()).sum();
+    if wide <= room {
+        let cut = line.alignment == Some(CUT);
+        let style = line.style;
+        let mut spans = first.spans;
+        spans.extend(
+            (line.spans.into_iter())
+                .filter(|span| !span.content.is_empty())
+                .map(|span| Span::styled(span.content, style.patch(span.style))),
+        );
+        return vec![Line {
+            alignment: cut.then_some(CUT),
+            style: band,
+            ..Line::from(spans)
+        }];
+    }
+    let rest = [vec![goes_on(rest.width(), true)], rest.spans].concat();
     // Each row, and whether it goes on with a word cut in the row above.
     let mut rows: Vec<(Vec<Span<'static>>, bool)> =
         vec![(first.spans, line.alignment == Some(CUT))];
