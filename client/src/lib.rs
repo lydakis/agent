@@ -121,7 +121,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 94;
+pub const PROTOCOL: u64 = 96;
 static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 /// Name this process's connections as `program` (such as `window` or
 /// `reviewer`): each later [`Client::connect`] says it in its first line,
