@@ -9,7 +9,9 @@
 //! line comes, as Words and Codex read one, and its rows are handed out as
 //! soon as a new line leaves them as they were. A fence that is still open
 //! is read a line at a time, so a long one costs its length once.
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    BrokenLink, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
+};
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -81,6 +83,8 @@ struct Block {
     /// read on from no line inside one.
     paragraph: bool,
     across: Vec<Range<usize>>,
+    /// It points at a link or footnote not defined yet.
+    broken: bool,
     /// A fence at the top level, open where the text ends: its marks and
     /// language.
     fence: Option<Fence>,
@@ -224,11 +228,21 @@ fn draw_after(
         top_note: false,
         top_paragraph: false,
         across: Vec::new(),
+        top_notes: 0,
         skip,
         loose: None,
         items: Vec::new(),
     };
-    let mut events = Parser::new_ext(source, options()).into_offset_iter();
+    // Links to a label not defined yet, not as written alone: `[a][b]`.
+    let broken = std::cell::RefCell::new(Vec::new());
+    let note = |link: BrokenLink<'_>| {
+        if link.link_type != LinkType::Shortcut {
+            broken.borrow_mut().push(link.span.start);
+        }
+        None
+    };
+    let mut events =
+        Parser::new_with_broken_link_callback(source, options(), Some(note)).into_offset_iter();
     for (event, range) in events.by_ref() {
         // The definitions read before are read again only for what they
         // define: they are not drawn.
@@ -241,7 +255,11 @@ fn draw_after(
         .map(|(_, link)| link.span.clone())
         .filter(|span| span.start >= skip)
         .collect();
-    (draw.blocks, links)
+    let mut blocks = draw.blocks;
+    for block in &mut blocks {
+        block.broken |= (broken.borrow().iter()).any(|at| (block.start..block.end).contains(at));
+    }
+    (blocks, links)
 }
 
 /// Where a block that ended at `end` ends as lines do: past its line's end.
@@ -316,6 +334,8 @@ struct Draw<'a> {
     top_paragraph: bool,
     /// Its marks that run across lines.
     across: Vec<Range<usize>>,
+    /// The footnotes it points at that are defined.
+    top_notes: usize,
     /// Where the text drawn starts: before it, definitions read earlier,
     /// drawn only for what they define.
     skip: usize,
@@ -419,6 +439,7 @@ impl Draw<'_> {
             }
             Event::InlineHtml(html) => self.inline_html(&html),
             Event::FootnoteReference(name) => {
+                self.top_notes += 1;
                 let number = self.notes.number(&name);
                 self.spans
                     .push(Span::styled(format!("[{number}]"), self.style().dim()));
@@ -482,23 +503,26 @@ impl Draw<'_> {
             let items = std::mem::take(&mut self.items);
             let paragraph = std::mem::take(&mut self.top_paragraph);
             let across = std::mem::take(&mut self.across);
+            let notes = std::mem::take(&mut self.top_notes);
             let holds = std::mem::take(&mut self.top_holds);
             if start < self.skip {
                 self.rows.clear();
                 self.offsets.clear();
                 return;
             }
+            // Past its last words, not the blank lines a list's range takes
+            // in after them: those go before the next block.
+            let end = line_end(
+                self.source,
+                match self.last_end > start {
+                    true => self.last_end,
+                    false => range.end,
+                },
+            );
+            let broken = footnote_marks(&self.source[start..end]) > notes;
             self.blocks.push(Block {
                 start,
-                // Past its last words, not the blank lines a list's range
-                // takes in after them: those go before the next block.
-                end: line_end(
-                    self.source,
-                    match self.last_end > start {
-                        true => self.last_end,
-                        false => range.end,
-                    },
-                ),
+                end,
                 gap,
                 rows: std::mem::take(&mut self.rows),
                 offsets: std::mem::take(&mut self.offsets),
@@ -507,6 +531,7 @@ impl Draw<'_> {
                 items,
                 paragraph,
                 across,
+                broken,
                 fence,
             });
         }
@@ -1422,6 +1447,14 @@ impl Markdown {
         let Some(open) = blocks.pop() else {
             return;
         };
+        // A block pointing at a link or footnote not defined yet waits for
+        // it, and what comes after with it: its words go out as they read
+        // once it is, or when the reply ends.
+        let waits = (blocks.iter())
+            .position(|block| block.broken)
+            .unwrap_or(blocks.len());
+        let waiting = waits < blocks.len() || open.broken;
+        blocks.truncate(waits);
         let mut drained = 0;
         if let Some(ended) = blocks.last().map(|block| block.end) {
             drained = ended;
@@ -1444,6 +1477,11 @@ impl Markdown {
             self.source.drain(..ended);
             (self.given, self.gapped) = (0, false);
             self.last.clear();
+        }
+        if waiting {
+            self.last.clear();
+            self.held = None;
+            return;
         }
         // A fence open at the top level is read a line at a time from here.
         if let Some(fence) = open.fence {
@@ -1718,6 +1756,21 @@ fn draw_defined(
     (blocks, links.collect())
 }
 
+/// How many footnotes `text` points at, as `[^name]` with no `:` after it.
+fn footnote_marks(text: &str) -> usize {
+    (text.match_indices("[^"))
+        .filter(|(at, _)| {
+            let rest = &text[at + 2..];
+            let name = rest.find(']').map(|end| &rest[..end]);
+            name.is_some_and(|name| {
+                !name.is_empty()
+                    && !name.contains(char::is_whitespace)
+                    && !rest[name.len() + 1..].starts_with(':')
+            })
+        })
+        .count()
+}
+
 /// Whether a line starts with a letter, at most three spaces in: words
 /// that start no block of their own.
 fn starts_with_word(line: &str) -> bool {
@@ -1853,6 +1906,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         top_note: false,
         top_paragraph: false,
         across: Vec::new(),
+        top_notes: 0,
         skip: 0,
         loose: None,
         items: Vec::new(),
@@ -2052,6 +2106,8 @@ mod tests {
             "[x]: /x\n- a\n\n- b [x][x]\n- c\n  lazy\n  - nested\n\n    deep\n- [ ] task\n\nEnd.",
             "7) seven\n8) eight\n- other list\n- again\n\n  10. inner\n  11. inner",
             "Words\n2. not a list\n    not code\nword *em\nphasis* and `co\nde` end\nmore words\nlast",
+            "- a\n\n- b [x][x]\n- c\n\n```\ncode\n```\n\n[x]: /x\n\nEnd.",
+            "A note.[^n] And `[^code]`.\n\nB\n\n[^n]: The note.\n\nC [^gone]",
         ];
         for reply in replies {
             for markdown in [
