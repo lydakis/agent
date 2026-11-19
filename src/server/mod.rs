@@ -227,10 +227,12 @@ pub struct Request {
     workspace_error: Option<Error>,
 }
 impl Request {
-    // Resolve explicit workspaces on the session's read side, before it
-    // enters the shared dispatcher. The resolved name is also the one
-    // checked for a bot caller. Keep errors for the normal validation
-    // point, after authorization and request ordering.
+    // Resolve explicit workspaces, and the folders a new bot may write, on
+    // the session's read side, before it enters the shared dispatcher. The
+    // resolved names are the ones checked for a bot caller and the ones
+    // kept: resolved again later, a folder swapped for a link since the
+    // check would be kept by where the link points. Keep errors for the
+    // normal validation point, after authorization and request ordering.
     fn workspace_slot(&mut self) -> Option<&mut String> {
         match &mut self.command {
             Command::Create { workspace, .. }
@@ -240,14 +242,65 @@ impl Request {
         }
     }
 
-    fn resolve_workspace(&mut self) {
-        if let Some(path) = self.workspace_slot() {
-            match workspace(path) {
-                Ok(real) => *path = real,
+    /// The folders a new bot may write, as its request names them.
+    fn writable_slot(&mut self) -> Option<&mut Vec<String>> {
+        match &mut self.command {
+            Command::Create { settings, .. } if !settings.writable.is_empty() => {
+                Some(&mut settings.writable)
+            }
+            _ => None,
+        }
+    }
+
+    /// The paths to resolve, given away to be resolved off the runtime
+    /// thread: [`Request::resolved`] puts them back.
+    fn unresolved(&mut self) -> (Option<String>, Option<Vec<String>>) {
+        let workspace = self.workspace_slot().cloned();
+        let writable = self.writable_slot().map(std::mem::take);
+        (workspace, writable)
+    }
+
+    fn resolved(&mut self, (workspace, writable): Resolved) {
+        if let Some(found) = workspace {
+            match found {
+                Ok(real) => *self.workspace_slot().expect("a request named it") = real,
                 Err(error) => self.workspace_error = Some(error),
             }
         }
+        if let Some((found, given)) = writable {
+            let slot = match &mut self.command {
+                Command::Create { settings, .. } => &mut settings.writable,
+                _ => unreachable!("only a create names writable folders"),
+            };
+            match found {
+                Ok(real) => *slot = real,
+                Err(error) => {
+                    *slot = given;
+                    self.workspace_error.get_or_insert(error);
+                }
+            }
+        }
     }
+
+    fn resolve_workspace(&mut self) {
+        let paths = resolve(self.unresolved());
+        self.resolved(paths);
+    }
+}
+/// What [`resolve`] found for a request's paths: its folder, and its
+/// writable folders with them as given.
+type Resolved = (
+    Option<Result<String>>,
+    Option<(Result<Vec<String>>, Vec<String>)>,
+);
+/// A request's folder and writable folders, each by its real path.
+fn resolve((given, writable): (Option<String>, Option<Vec<String>>)) -> Resolved {
+    let folder = given.map(|path| workspace(&path));
+    let writable = writable.map(|mut paths| {
+        let given = paths.clone();
+        (writable_real(&mut paths).map(|()| paths), given)
+    });
+    (folder, writable)
 }
 /// A declared call's answer: text, or parts in the order the model reads
 /// them, text and pictures, as a provider's own tool results take them.
@@ -1759,7 +1812,10 @@ fn workspace(path: &str) -> Result<String> {
 /// A new bot's sandbox, made ready to keep: refused where none can run, so
 /// a bot that asked for one never runs unconfined, and each folder it may
 /// write named by its real path, as the sandbox sees it.
-fn confine(settings: &mut Settings) -> Result<()> {
+/// A `create`'s writable folders are resolved as the request is read
+/// ([`Request::resolved`]), and kept as they were checked; a change's,
+/// `resolve`, here.
+fn confine(settings: &mut Settings, resolve: bool) -> Result<()> {
     use agent_runtime::sandbox::Mode;
     if matches!(
         settings.sandbox,
@@ -1767,13 +1823,8 @@ fn confine(settings: &mut Settings) -> Result<()> {
     ) {
         agent_runtime::sandbox::available()?;
     }
-    for path in &mut settings.writable {
-        let real = std::fs::canonicalize(&*path)
-            .map_err(|_| Error::with("path_not_found", path.clone()))?;
-        *path = real
-            .to_str()
-            .ok_or(Error::with("path_not_utf8", path.clone()))?
-            .to_owned();
+    if resolve {
+        writable_real(&mut settings.writable)?;
     }
     settings.writable.sort();
     settings.writable.dedup();
@@ -1788,6 +1839,18 @@ fn confine(settings: &mut Settings) -> Result<()> {
     }
     settings.unix_sockets.sort();
     settings.unix_sockets.dedup();
+    Ok(())
+}
+/// Each of `paths` by its real path, as the sandbox sees it.
+fn writable_real(paths: &mut [String]) -> Result<()> {
+    for path in paths {
+        let real = std::fs::canonicalize(&*path)
+            .map_err(|_| Error::with("path_not_found", path.clone()))?;
+        *path = real
+            .to_str()
+            .ok_or(Error::with("path_not_utf8", path.clone()))?
+            .to_owned();
+    }
     Ok(())
 }
 /// What a `configure` gives, by its names: what a change while a turn runs
@@ -5191,7 +5254,7 @@ impl Service {
                     .any(|key| named.iter().any(|name| name == key));
                 if sandboxed {
                     merged =
-                        tokio::task::spawn_blocking(move || confine(&mut merged).map(|()| merged))
+                        tokio::task::spawn_blocking(move || confine(&mut merged, true).map(|()| merged))
                             .await
                             .map_err(|_| Error::new("sandbox_unavailable"))??;
                 }
@@ -5773,7 +5836,7 @@ impl Service {
                 // Checking for a sandbox and resolving folders touch the
                 // filesystem: off the runtime thread.
                 let settings =
-                    tokio::task::spawn_blocking(move || confine(&mut settings).map(|()| settings))
+                    tokio::task::spawn_blocking(move || confine(&mut settings, false).map(|()| settings))
                         .await
                         .map_err(|_| Error::new("sandbox_unavailable"))??;
                 if let Some(level) = &effort {

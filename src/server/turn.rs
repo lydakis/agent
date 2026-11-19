@@ -6127,16 +6127,20 @@ impl Turn {
                     {
                         own.extend(over);
                     }
-                    // A caller kept to some of its tools (a fork's `allow`)
-                    // makes agents kept to them too: `create` takes no
-                    // `allow`, so their tools are those it may call.
-                    if let Some(allowed) = me["allowed"].as_array() {
-                        let tools: Vec<Value> = (create["tools"].as_array().into_iter().flatten())
-                            .filter(|tool| allowed.contains(tool))
-                            .cloned()
-                            .collect();
-                        create["tools"] = json!(tools);
-                    }
+                    // Its tools are this agent's at most, whatever a role or
+                    // the call names, so every gate it inherits names them
+                    // as this one's do. A caller kept to some of its tools
+                    // (a fork's `allow`) makes agents kept to them too:
+                    // `create` takes no `allow`, so their tools are those
+                    // it may call.
+                    let own = me["tools"].as_array();
+                    let allowed = me["allowed"].as_array();
+                    let tools: Vec<Value> = (create["tools"].as_array().into_iter().flatten())
+                        .filter(|tool| own.is_some_and(|own| own.contains(tool)))
+                        .filter(|tool| allowed.is_none_or(|allowed| allowed.contains(tool)))
+                        .cloned()
+                        .collect();
+                    create["tools"] = json!(tools);
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
                     // This call made again, after its folder's files or this

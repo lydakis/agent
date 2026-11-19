@@ -590,6 +590,10 @@ impl Settings {
         use crate::sandbox::Mode;
         self.rules = creator.rules.clone();
         self.env = creator.env.clone();
+        // Where its cut outputs go is where its creator's do: the daemon
+        // makes that folder and writes it outside any sandbox, so no bot
+        // names one for the bots it makes.
+        self.outputs = creator.outputs.clone();
         if creator.never_asks() {
             self.approval_policy = creator.approval_policy;
         }
@@ -621,8 +625,9 @@ impl Settings {
     /// `creator`'s settings makes, [`Settings::under`] would not keep as
     /// asked: a sandbox looser than its creator's, said, so the bot is
     /// refused rather than made otherwise than asked. Those left unasked
-    /// take its creator's, and its `rules` and `env` are its creator's
-    /// whatever it asks, as no client picks them for a bot another makes.
+    /// take its creator's, and its `rules`, `env` and `outputs` are its
+    /// creator's whatever it asks, as no client picks them for a bot
+    /// another makes.
     pub fn beyond(&self, creator: &Settings) -> Option<String> {
         let held = self.clone().under(creator);
         let creator_sandbox = || {

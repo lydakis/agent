@@ -810,7 +810,8 @@ impl Bucket {
     fn shortfall(&self, cost: f64) -> Duration {
         match self.per_minute {
             Some(limit) if self.available < cost => {
-                Duration::from_secs_f64(((cost - self.available) / limit * 60.0).max(0.0))
+                Duration::try_from_secs_f64(((cost - self.available) / limit * 60.0).max(0.0))
+                    .unwrap_or(LONGEST_DELAY)
             }
             _ => Duration::ZERO,
         }
@@ -1226,8 +1227,15 @@ impl Pace {
     ) -> [bool; DIMS] {
         let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         let number = |name: &str| get(name).and_then(|v| v.trim().parse::<f64>().ok());
+        // A level is between none left and the limit: a reply's headers are
+        // whatever its sender wrote, and one far below zero would hold the
+        // pool past any delay a `Duration` holds.
         let pair = |limit: &str, remaining: &str| match (number(limit), number(remaining)) {
-            (Some(limit), Some(remaining)) => Some((limit, remaining)),
+            (Some(limit), Some(remaining))
+                if limit.is_finite() && limit > 0.0 && remaining.is_finite() =>
+            {
+                Some((limit, remaining.clamp(0.0, limit)))
+            }
             _ => None,
         };
         // The allowance refills continuously, so the reset header is only

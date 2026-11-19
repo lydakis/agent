@@ -3,7 +3,7 @@
 use super::FILE_BYTES;
 use crate::{
     Error, Result, fail,
-    sandbox::{Policy, WRITE},
+    sandbox::{PATCH, Policy, WRITE},
 };
 use serde_json::Value;
 use std::{
@@ -127,13 +127,36 @@ async fn confined(
     content: &[u8],
     held: Option<&mut crate::sandbox::Hold>,
 ) -> Result<()> {
-    let Some(helper) = policy.helper.as_deref().and_then(Path::to_str) else {
-        return fail("sandbox_unavailable");
-    };
     let Some(target) = path.to_str() else {
         return fail("path_not_utf8");
     };
-    let (mut command, ended) = crate::sandbox::command(policy, helper, &[WRITE, target], false)?;
+    helper(policy, &[WRITE, target], content, held).await
+}
+
+/// Apply a patch's `changes` in one run of the sandbox's helper, as
+/// [`write`] writes one file: its writes, removals and permissions all
+/// inside the sandbox, so none follows a link swapped in after the check.
+pub(super) async fn patch(
+    policy: &Policy,
+    changes: &[crate::sandbox::Change],
+    held: Option<&mut crate::sandbox::Hold>,
+) -> Result<()> {
+    let given = serde_json::to_vec(changes)?;
+    helper(policy, &[PATCH], &given, held).await
+}
+
+/// The agent binary run as the sandbox's helper with `args`, given
+/// `content` on stdin.
+async fn helper(
+    policy: &Policy,
+    args: &[&str],
+    content: &[u8],
+    held: Option<&mut crate::sandbox::Hold>,
+) -> Result<()> {
+    let Some(helper) = policy.helper.as_deref().and_then(Path::to_str) else {
+        return fail("sandbox_unavailable");
+    };
+    let (mut command, ended) = crate::sandbox::command(policy, helper, args, false)?;
     command
         .env_clear()
         .stdin(Stdio::piped())
