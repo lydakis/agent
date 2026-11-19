@@ -653,6 +653,38 @@ struct ProjectsOpen {
     /// Where the page and the pane beside it were drawn, for the mouse.
     page: Rect,
     side: Rect,
+    /// When its connection was made, so one lost is made again no oftener
+    /// than every [`STATUS_AGAIN`].
+    connected_at: Instant,
+}
+
+/// A connection of **Projects**' own, following every project's agents,
+/// with the task that takes its events to the follow; the window woken
+/// when the connection goes.
+async fn projects_connect(
+    socket: &std::path::Path,
+    woken: &Arc<tokio::sync::Notify>,
+) -> Option<(
+    Arc<Client>,
+    Arc<std::sync::Mutex<standing::Follower>>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (client, mut events) = Client::connect(socket).await.ok()?;
+    let follower = Arc::new(std::sync::Mutex::new(standing::Follower::start(
+        client.clone(),
+        EVERY_PROJECT.into(),
+        woken.clone(),
+    )));
+    let (heard, woken) = (follower.clone(), woken.clone());
+    let drain = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let Ok(mut follower) = heard.lock() {
+                follower.heard(&event);
+            }
+        }
+        woken.notify_one();
+    });
+    Some((client, follower, drain))
 }
 
 impl Drop for ProjectsOpen {
@@ -676,23 +708,12 @@ impl App {
     /// on the footer's `elsewhere`. Its follow of every project starts on
     /// a connection of its own and ends with the page.
     async fn open_projects(&mut self) {
-        let Ok((client, mut events)) = Client::connect(&self.options.socket).await else {
+        let Some((client, follower, drain)) =
+            projects_connect(&self.options.socket, &self.woken).await
+        else {
             self.notice = Some("could not list the projects".into());
             return;
         };
-        let follower = Arc::new(std::sync::Mutex::new(standing::Follower::start(
-            client.clone(),
-            EVERY_PROJECT.into(),
-            self.woken.clone(),
-        )));
-        let heard = follower.clone();
-        let drain = tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                if let Ok(mut follower) = heard.lock() {
-                    follower.heard(&event);
-                }
-            }
-        });
         let here = self.scope().lead;
         self.projects = Some(Box::new(ProjectsOpen {
             view: projects::View::new(&here),
@@ -708,6 +729,7 @@ impl App {
             superleads: HashMap::new(),
             page: Rect::default(),
             side: Rect::default(),
+            connected_at: Instant::now(),
         }));
     }
 
@@ -718,6 +740,21 @@ impl App {
         let Some(open) = &mut self.projects else {
             return;
         };
+        // Its connection went, as when the daemon did: a new one, followed
+        // from a new snapshot, at most every few seconds.
+        if open.drain.is_finished() && open.connected_at.elapsed() >= STATUS_AGAIN {
+            open.connected_at = Instant::now();
+            if let Some((client, follower, drain)) =
+                projects_connect(&self.options.socket, &self.woken).await
+            {
+                if let Some(job) = open.job.take() {
+                    job.abort();
+                }
+                (open.client, open.follower, open.drain) = (client, follower, drain);
+                open.listed = None;
+                open.read_at = None;
+            }
+        }
         let now = now_ms();
         if let Some(job) = open.job.take_if(|job| job.is_finished()) {
             match job.await {
@@ -827,9 +864,7 @@ impl App {
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => open.view.key(&key, now),
             Event::Paste(text) => {
-                if let Some(query) = &mut open.view.finding {
-                    query.extend(text.chars().filter(|c| !c.is_control()));
-                }
+                open.view.paste(&text, now);
                 return;
             }
             Event::Mouse(mouse) => {
@@ -949,15 +984,23 @@ async fn read_projects(
         .collect();
     let mut found = Vec::with_capacity(leads.len());
     let turns = HashMap::new();
+    // Each agent under the lead it answers to, so a folder with two leads
+    // counts each agent in one row: read once for every project.
+    let makers: HashMap<&str, &str> = (listed.iter())
+        .map(|agent| (agent.name.as_str(), agent.maker()))
+        .collect();
+    let mut under: HashMap<String, Vec<standing::Agent>> = HashMap::new();
+    for bot in listed {
+        under
+            .entry(lead_of(&bot.name, &makers))
+            .or_default()
+            .push(bot.clone());
+    }
     for lead in leads {
         let Some(name) = project::lead_project(&lead.name) else {
             continue;
         };
-        let prefix = format!("{name}.");
-        let theirs: Vec<standing::Agent> = (listed.iter())
-            .filter(|bot| bot.name.starts_with(&prefix))
-            .cloned()
-            .collect();
+        let theirs: Vec<standing::Agent> = under.remove(&lead.name).unwrap_or_default();
         // Each read keeps only its own agents' reads: the project's are
         // lent to it and taken back.
         let mut read_here: HashMap<String, (Value, Latest)> = (theirs.iter())
@@ -23817,13 +23860,26 @@ fn task_lead(bot: &str, listed: Option<&[standing::Agent]>) -> String {
     if project::is_lead(bot) {
         return bot.to_owned();
     }
-    let first = format!("{project}.lead");
     let Some(listed) = listed else {
-        return first;
+        return format!("{project}.lead");
     };
     let makers: HashMap<&str, &str> = (listed.iter())
         .map(|agent| (agent.name.as_str(), agent.maker()))
         .collect();
+    lead_of(bot, &makers)
+}
+
+/// The lead of its project `bot` answers to, through `makers` (each
+/// agent's maker by name): the lead its line of makers reaches, else the
+/// project's first lead. A lead is its own.
+fn lead_of(bot: &str, makers: &HashMap<&str, &str>) -> String {
+    let Some((project, _)) = bot.split_once('.') else {
+        return bot.to_owned();
+    };
+    if project::is_lead(bot) {
+        return bot.to_owned();
+    }
+    let first = format!("{project}.lead");
     let mut at = bot;
     // A ring of makers leads to no lead.
     for _ in 0..=makers.len() {
@@ -27801,6 +27857,23 @@ mod tests {
         app.zen = Some("the rounding".into());
         app.key(key(KeyCode::Right)).await;
         assert!(!app.pane_keys);
+    }
+
+    #[test]
+    fn each_agent_counts_under_the_lead_it_answers_to_where_a_folder_has_two() {
+        let makers: HashMap<&str, &str> = [
+            ("shop.lead", ""),
+            ("shop.lead.billing", ""),
+            ("shop.fix", "shop.lead"),
+            ("shop.invoice", "shop.lead.billing"),
+            ("shop.invoice-check", "shop.invoice"),
+            ("shop.stray", ""),
+        ]
+        .into();
+        assert_eq!(lead_of("shop.lead.billing", &makers), "shop.lead.billing");
+        assert_eq!(lead_of("shop.fix", &makers), "shop.lead");
+        assert_eq!(lead_of("shop.invoice-check", &makers), "shop.lead.billing");
+        assert_eq!(lead_of("shop.stray", &makers), "shop.lead");
     }
 
     #[tokio::test]
