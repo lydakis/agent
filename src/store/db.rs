@@ -399,6 +399,20 @@ pub struct Settings {
     /// Calls on another model, a summarizer or a fallback, go at standard.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<crate::provider::Speed>,
+    /// The tiers faster than standard each model serves, by `PROVIDER/MODEL`
+    /// pattern (`*` and `?` wildcards, the most specific winning), over the
+    /// daemon's catalog: its speed reaches only a model that serves it.
+    /// Its client sends the person's `[speeds]`, and sends them again as
+    /// they change; each turn reads them as it starts. A bot made by
+    /// another takes its creator's unless its client gives its own.
+    #[serde(default, skip_serializing_if = "crate::provider::Speeds::is_empty")]
+    pub speeds: crate::provider::Speeds,
+    /// The context window in tokens of each model, by `PROVIDER/MODEL`
+    /// pattern as `speeds` takes them, over its provider's listing: the
+    /// window its compaction thresholds are counted from. Its client sends
+    /// the person's `[context_windows]`, as `speeds`.
+    #[serde(default, skip_serializing_if = "crate::provider::Windows::is_empty")]
+    pub context_windows: crate::provider::Windows,
     /// How its shell, write and edit calls are confined, by Codex's
     /// sandbox modes; none runs them unconfined.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -473,7 +487,16 @@ pub struct Settings {
     /// nothing. Unset, every tool is shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steps_only: Option<Vec<String>>,
+    /// The name its client groups it under: the bots its daemon tools list
+    /// when they name none (`NAMESPACE.*`), and the start of a name with
+    /// no dot that it gives a bot it makes (`NAMESPACE.NAME`). A bot made
+    /// by another takes its creator's unless its client sets one. Unset,
+    /// those tools list every bot and take names whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
+/// The most bytes a bot's `namespace` takes.
+pub const NAMESPACE_BYTES: usize = 128;
 /// The most names a bot's `steps_only` lists.
 pub const STEPS_ONLY_NAMES: usize = 256;
 /// Why a call that would need approval fails on a bot that never asks.
@@ -594,6 +617,14 @@ impl Settings {
         // makes that folder and writes it outside any sandbox, so no bot
         // names one for the bots it makes.
         self.outputs = creator.outputs.clone();
+        // What its creator's models serve and hold, unless its client
+        // said.
+        if self.speeds.is_empty() {
+            self.speeds = creator.speeds.clone();
+        }
+        if self.context_windows.is_empty() {
+            self.context_windows = creator.context_windows.clone();
+        }
         if creator.never_asks() {
             self.approval_policy = creator.approval_policy;
         }
@@ -750,8 +781,24 @@ impl Settings {
                 return refuse("rules take at most 256 KiB as JSON");
             }
         }
+        // The start of a bot's name, which a pattern follows with `.*`:
+        // a bot name's characters.
+        if self.namespace.as_ref().is_some_and(|namespace| {
+            namespace.is_empty()
+                || namespace.len() > NAMESPACE_BYTES
+                || !namespace
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        }) {
+            return refuse("namespace is 1 to 128 of A-Z a-z 0-9 . _ -");
+        }
         if crate::output::encoded_len(&self.env).unwrap_or(usize::MAX) > ENV_JSON {
             return refuse("env takes at most 16 KiB as JSON");
+        }
+        if crate::output::encoded_len(&self.speeds).unwrap_or(usize::MAX) > ENV_JSON
+            || crate::output::encoded_len(&self.context_windows).unwrap_or(usize::MAX) > ENV_JSON
+        {
+            return refuse("speeds and context_windows each take at most 16 KiB as JSON");
         }
         for (name, value) in &self.env {
             // A name a shell can set: a letter or `_`, then letters,
@@ -811,7 +858,8 @@ impl Settings {
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
             "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy,
-            "steps_only":self.steps_only})
+            "steps_only":self.steps_only,"speeds":self.speeds,
+            "context_windows":self.context_windows,"namespace":self.namespace})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -832,7 +880,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 26] = [
+pub const SETTINGS: [&str; 29] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -859,6 +907,9 @@ pub const SETTINGS: [&str; 26] = [
     "env",
     "approval_policy",
     "steps_only",
+    "speeds",
+    "context_windows",
+    "namespace",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -3642,7 +3693,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 107;
+    pub const SCHEMA: i32 = 108;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -5467,6 +5518,10 @@ impl Database {
                 // tools, unless its own client chose one.
                 if settings.steps_only.is_none() {
                     settings.steps_only = creator.steps_only;
+                }
+                // And its creator's namespace, unless its client named one.
+                if settings.namespace.is_none() {
+                    settings.namespace = creator.namespace;
                 }
                 settings
             }
@@ -20475,6 +20530,18 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
 
+    // Schema 108: the group a bot's daemon tools list and name bots in is
+    // its `namespace` setting, which its client sets. The bots made before
+    // were grouped by their name up to its first dot: each keeps that.
+    if from < 108 {
+        conn.execute(
+            "UPDATE bots SET settings=json_set(COALESCE(settings,'{}'),'$.namespace',
+                     substr(name,1,instr(name,'.')-1))
+             WHERE instr(name,'.')>1 AND json_type(settings,'$.namespace') IS NULL",
+            [],
+        )?;
+    }
+
     Ok(())
 }
 /// 103 -> 104: a turn parked on a call's verdict says who holds the call
@@ -21787,6 +21854,39 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_another_makes_takes_its_creator_s_speeds_and_windows_unless_given() {
+        let table = |set: Value| serde_json::from_value::<Settings>(set).unwrap();
+        let creator = table(json!({"speeds": {"a/*": ["fast"]}, "context_windows": {"a/b": 4096}}));
+        let child = Settings::default().under(&creator);
+        assert_eq!(
+            (child.speeds, child.context_windows),
+            (creator.speeds.clone(), creator.context_windows.clone())
+        );
+        let own = table(json!({"speeds": {"a/c": []}}));
+        let child = own.clone().under(&creator);
+        assert_eq!(child.speeds, own.speeds);
+        assert_eq!(child.context_windows, creator.context_windows);
+        assert!(own.beyond(&creator).is_none());
+        // A wrong table is refused as it is read, a large one by its size.
+        for wrong in [
+            json!({"speeds": {"ab": ["fast"]}}),
+            json!({"speeds": {"a/b": ["standard"]}}),
+            json!({"context_windows": {"a/b": 1023}}),
+            json!({"context_windows": {"a b/c": 4096}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Settings>(wrong.clone()).is_err(),
+                "{wrong}"
+            );
+        }
+        let many: serde_json::Map<String, Value> = (0..1000)
+            .map(|n| (format!("provider/model-{n}"), json!(4096)))
+            .collect();
+        let large = table(json!({"context_windows": many}));
+        assert_eq!(large.validate().unwrap_err().code, "invalid_setting");
+    }
+
+    #[test]
     fn every_setting_is_named() {
         // Every field, so a new one doesn't compile until it is listed.
         let all = Settings {
@@ -21819,6 +21919,9 @@ mod tests {
             env: [("A".to_owned(), "1".to_owned())].into(),
             approval_policy: Some(ApprovalPolicy::Never),
             steps_only: Some(vec!["*".into()]),
+            speeds: serde_json::from_value(json!({"a/b": ["fast"]})).unwrap(),
+            context_windows: serde_json::from_value(json!({"a/b": 2000})).unwrap(),
+            namespace: Some("shop".into()),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()

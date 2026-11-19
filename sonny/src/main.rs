@@ -73,6 +73,7 @@ mod picker;
 mod place;
 mod plan;
 mod project;
+mod projects;
 mod prompt;
 mod reactions;
 mod recall;
@@ -565,6 +566,9 @@ struct StatusView<'a> {
     fill: bool,
     /// What the window's other reads of histories read, or read now.
     readers: Option<&'a Readers>,
+    /// The calls waiting on the person, read once for many projects'
+    /// reads (**Projects**); else each read lists them.
+    held: Option<&'a [needs::Held]>,
 }
 
 /// What a window's reads of its agents' histories (its count, its card,
@@ -623,6 +627,471 @@ impl Drop for Reading<'_> {
         }
         self.0.landed.notify_waiters();
     }
+}
+
+/// **Projects** while open: the page, and its follow of every project's
+/// agents on a connection of its own, which ends as the page closes, so a
+/// closed page costs nothing. Each read is `/status`'s read of each
+/// project, made only once the follow says an agent moved (or, while one
+/// runs, again at most every [`STATUS_AGAIN`]), as `/status` reads.
+struct ProjectsOpen {
+    view: projects::View,
+    client: Arc<Client>,
+    follower: Arc<std::sync::Mutex<standing::Follower>>,
+    /// Takes the connection's events to the follow.
+    drain: tokio::task::JoinHandle<()>,
+    /// Every project's agents, as the follow keeps them.
+    listed: Option<Vec<standing::Agent>>,
+    job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
+    read_at: Option<Instant>,
+    /// What was read of each agent's history and question, as `/status`
+    /// keeps it, for the next read.
+    latest: HashMap<String, (Value, Latest)>,
+    seen: HashMap<String, (i64, Seen)>,
+    /// Whether each lead runs as the superlead, read once a page.
+    superleads: HashMap<String, bool>,
+    /// Whether the last read read every history it asked for: one that
+    /// did not is read again after [`STATUS_AGAIN`], though nothing moved.
+    whole: bool,
+    /// Where the page and the pane beside it were drawn, for the mouse.
+    page: Rect,
+    side: Rect,
+    /// When its connection was made, so one lost is made again no oftener
+    /// than every [`STATUS_AGAIN`].
+    connected_at: Instant,
+}
+
+/// A connection of **Projects**' own, following every project's agents,
+/// with the task that takes its events to the follow; the window woken
+/// when the connection goes.
+async fn projects_connect(
+    socket: &std::path::Path,
+    woken: &Arc<tokio::sync::Notify>,
+) -> Option<(
+    Arc<Client>,
+    Arc<std::sync::Mutex<standing::Follower>>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (client, mut events) = Client::connect(socket).await.ok()?;
+    let follower = Arc::new(std::sync::Mutex::new(standing::Follower::start(
+        client.clone(),
+        EVERY_PROJECT.into(),
+        woken.clone(),
+    )));
+    let (heard, woken) = (follower.clone(), woken.clone());
+    let drain = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let Ok(mut follower) = heard.lock() {
+                follower.heard(&event);
+            }
+        }
+        woken.notify_one();
+    });
+    Some((client, follower, drain))
+}
+
+impl Drop for ProjectsOpen {
+    fn drop(&mut self) {
+        self.drain.abort();
+        if let Some(job) = &self.job {
+            job.abort();
+        }
+    }
+}
+
+impl App {
+    /// Whether **Projects** shows here: not in zen, in a side chat or in
+    /// an agent shown beside, where each keeps the person where they are.
+    fn projects_here(&self) -> bool {
+        self.zen.is_none() && self.options.side.is_none() && !self.options.embedded
+    }
+
+    /// **Projects** in the conversation's place, the pick on the project
+    /// the window is in: `←` with nothing typed, `/projects`, or a click
+    /// on the footer's `elsewhere`. Its follow of every project starts on
+    /// a connection of its own and ends with the page.
+    async fn open_projects(&mut self) {
+        let Some((client, follower, drain)) =
+            projects_connect(&self.options.socket, &self.woken).await
+        else {
+            self.notice = Some("could not list the projects".into());
+            return;
+        };
+        let here = self.scope().lead;
+        self.projects = Some(Box::new(ProjectsOpen {
+            view: projects::View::new(&here).showing(&self.bot),
+            client,
+            follower,
+            drain,
+            listed: None,
+            job: None,
+            read_at: None,
+            // What this window read of its own project's agents is read.
+            latest: self.status_read.clone(),
+            seen: self.asks_seen.clone(),
+            superleads: HashMap::new(),
+            whole: true,
+            page: Rect::default(),
+            side: Rect::default(),
+            connected_at: Instant::now(),
+        }));
+    }
+
+    /// While **Projects** is open, every project read again once its
+    /// follow says an agent moved, and while one runs at most every
+    /// [`STATUS_AGAIN`], as `/status` reads its own: never oftener.
+    async fn projects_tick(&mut self) {
+        let Some(open) = &mut self.projects else {
+            return;
+        };
+        // Its connection went, as when the daemon did: a new one, followed
+        // from a new snapshot, at most every few seconds.
+        if open.drain.is_finished() && open.connected_at.elapsed() >= STATUS_AGAIN {
+            open.connected_at = Instant::now();
+            if let Some((client, follower, drain)) =
+                projects_connect(&self.options.socket, &self.woken).await
+            {
+                if let Some(job) = open.job.take() {
+                    job.abort();
+                }
+                (open.client, open.follower, open.drain) = (client, follower, drain);
+                open.listed = None;
+                open.read_at = None;
+            }
+        }
+        let now = now_ms();
+        if let Some(job) = open.job.take_if(|job| job.is_finished()) {
+            match job.await {
+                Ok(Some(read)) => {
+                    open.view.set(read.projects, now);
+                    open.listed = Some(read.listed);
+                    open.latest = read.latest;
+                    open.seen = read.seen;
+                    open.superleads = read.superleads;
+                    open.whole = read.whole;
+                }
+                // What moved is unknown: start over from a new snapshot.
+                _ => {
+                    open.listed = None;
+                    if let Ok(mut follower) = open.follower.lock() {
+                        *follower = standing::Follower::start(
+                            open.client.clone(),
+                            EVERY_PROJECT.into(),
+                            self.woken.clone(),
+                        );
+                    }
+                }
+            }
+        }
+        if open.job.is_some() || open.read_at.is_some_and(|at| at.elapsed() < STATUS_AGAIN) {
+            return;
+        }
+        let changes = (open.follower.lock())
+            .map(|follower| follower.take())
+            .unwrap_or_default();
+        let whole = changes.snapshot.is_some();
+        let listed = match changes.snapshot {
+            Some(snapshot) => snapshot,
+            None => match open.listed.take() {
+                Some(listed) => listed,
+                None => return,
+            },
+        };
+        let running = listed.iter().any(|bot| bot.running_turn.is_some());
+        let moved = changes.moved;
+        if !whole && moved.is_empty() && !running && open.view.read && open.whole {
+            open.listed = Some(listed);
+            return;
+        }
+        open.read_at = Some(Instant::now());
+        let (client, woken) = (open.client.clone(), self.woken.clone());
+        let store = self.options.store.clone();
+        let (bot, asks, approvals) = (self.bot.clone(), self.asks.clone(), self.approvals.clone());
+        let mut latest = std::mem::take(&mut open.latest);
+        let mut seen = std::mem::take(&mut open.seen);
+        let mut superleads = std::mem::take(&mut open.superleads);
+        open.job = Some(tokio::spawn(async move {
+            let read = async {
+                let mut listed = listed;
+                if !moved.is_empty() {
+                    let names: Vec<String> = moved.iter().cloned().collect();
+                    let rows = standing::rows(&client, &names).await.ok()?;
+                    moved_rows(&mut listed, &moved, rows, &mut None);
+                }
+                // A running agent's row is read again each time, as its
+                // history (a question asked partway) moves with no event.
+                if running {
+                    let ask = json!({"name": EVERY_PROJECT, "active": true, "limit": 256});
+                    let rows = standing::every(&client, ask).await.ok()?;
+                    if rows_differ(&listed, &rows) {
+                        let names = rows.iter().map(|row| row.name.clone()).collect();
+                        moved_rows(&mut listed, &names, rows, &mut None);
+                    }
+                }
+                let (projects, whole) = read_projects(
+                    &client,
+                    &store,
+                    &listed,
+                    &bot,
+                    &asks,
+                    &approvals,
+                    &mut latest,
+                    &mut seen,
+                    &mut superleads,
+                )
+                .await?;
+                Some(ProjectsRead {
+                    projects,
+                    listed,
+                    latest,
+                    seen,
+                    superleads,
+                    whole,
+                })
+            }
+            .await;
+            woken.notify_one();
+            read
+        }));
+    }
+
+    /// A key, a click or the wheel while **Projects** is open: it has the
+    /// keys, as a pane that has them keeps them.
+    async fn projects_event(&mut self, event: Event) {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let now = now_ms();
+        let Some(open) = &mut self.projects else {
+            return;
+        };
+        let act = match event {
+            Event::Resize(width, _) => {
+                self.width = width as usize;
+                return;
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => open.view.key(&key, now),
+            Event::Paste(text) => {
+                open.view.paste(&text, now);
+                return;
+            }
+            Event::Mouse(mouse) => {
+                let at = (mouse.column, mouse.row).into();
+                match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if open.page.contains(at) =>
+                    {
+                        open.view.scroll(mouse.kind == MouseEventKind::ScrollDown);
+                        return;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) if open.page.contains(at) => {
+                        open.view.click((mouse.row - open.page.y) as usize, now)
+                    }
+                    // A name in the pane goes to its agent, as anywhere.
+                    MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right)) => {
+                        let right = button == MouseButton::Right;
+                        let link = (self.opens_at.iter())
+                            .find(|(row, columns, _)| {
+                                mouse.row == *row && columns.contains(&mouse.column)
+                            })
+                            .and_then(|(_, _, opens)| clicked(opens, right));
+                        if let Some(link) = link {
+                            self.projects = None;
+                            self.follow(&link);
+                        }
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        match act {
+            projects::Act::Stay => {}
+            projects::Act::Close => self.projects = None,
+            projects::Act::Go(lead) => {
+                self.projects = None;
+                self.switch_picked(lead);
+            }
+        }
+    }
+
+    /// Where **Projects** and the pane beside it go in `area`: two
+    /// columns where the window has room for the conversation and a pane
+    /// beside it, as the margin is laid; else the page alone.
+    fn projects_split(&self, area: Rect) -> (Rect, Option<Rect>) {
+        let prose = kept(area.width);
+        let Some(pane) = pane::margin_width(area.width, prose) else {
+            return (self.centred(area), None);
+        };
+        let chat = Rect {
+            x: area.x + GUTTER,
+            width: (area.width - pane - 1).saturating_sub(2 * GUTTER),
+            ..area
+        };
+        let side = Rect {
+            x: area.right() - pane + 1,
+            width: pane - 1,
+            ..area
+        };
+        (chat, Some(side))
+    }
+}
+
+/// Now, in ms since the epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// What a read of every project found.
+struct ProjectsRead {
+    projects: Vec<projects::Project>,
+    listed: Vec<standing::Agent>,
+    latest: HashMap<String, (Value, Latest)>,
+    seen: HashMap<String, (i64, Seen)>,
+    superleads: HashMap<String, bool>,
+    /// Whether every history it asked for was read.
+    whole: bool,
+}
+
+/// The pattern that names every project's agents: a project's are
+/// `PROJECT.NAME`.
+const EVERY_PROJECT: &str = "*.*";
+
+/// Every project in `listed` (every agent [`EVERY_PROJECT`] names), each
+/// read as `/status` reads it: its counts, its most pressing state, its
+/// agents as the pane lists them, and when one last had a turn, which
+/// the listing says (`last.finished_ms`, or now while one runs); and
+/// whether every history it asked for was read.
+#[allow(clippy::too_many_arguments)]
+async fn read_projects(
+    client: &Client,
+    store: &std::path::Path,
+    listed: &[standing::Agent],
+    bot: &str,
+    asks: &[asks::Ask],
+    approvals: &[Value],
+    latest: &mut HashMap<String, (Value, Latest)>,
+    seen: &mut HashMap<String, (i64, Seen)>,
+    superleads: &mut HashMap<String, bool>,
+) -> Option<(Vec<projects::Project>, bool)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    // The calls waiting on the person, listed once for every project.
+    let held = needs::listing(client, None).await.ok();
+    let kept = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_path_buf());
+    let leads: Vec<&standing::Agent> = (listed.iter())
+        .filter(|bot| {
+            project::is_lead(&bot.name)
+                && bot.maker().is_empty()
+                && bot.expire_ms.is_none()
+                && !project::is_internal(&bot.name)
+        })
+        .collect();
+    let mut found = Vec::with_capacity(leads.len());
+    let mut whole = true;
+    let turns = HashMap::new();
+    // Each agent under the lead it answers to, so a folder with two leads
+    // counts each agent in one row: read once for every project.
+    let makers: HashMap<&str, &str> = (listed.iter())
+        .map(|agent| (agent.name.as_str(), agent.maker()))
+        .collect();
+    let mut under: HashMap<String, Vec<standing::Agent>> = HashMap::new();
+    for bot in listed {
+        under
+            .entry(lead_of(&bot.name, &makers))
+            .or_default()
+            .push(bot.clone());
+    }
+    for lead in leads {
+        let Some(name) = project::lead_project(&lead.name) else {
+            continue;
+        };
+        let theirs: Vec<standing::Agent> = under.remove(&lead.name).unwrap_or_default();
+        // Each read keeps only its own agents' reads: the project's are
+        // lent to it and taken back.
+        let mut read_here: HashMap<String, (Value, Latest)> = (theirs.iter())
+            .filter_map(|bot| latest.remove_entry(&bot.name))
+            .collect();
+        let mut seen_here: HashMap<String, (i64, Seen)> = (theirs.iter())
+            .filter_map(|bot| seen.remove_entry(&bot.name))
+            .collect();
+        let scope = background::Scope {
+            project: name.to_owned(),
+            lead: lead.name.clone(),
+            glob: format!("{name}.*"),
+        };
+        let view = StatusView {
+            bot,
+            asks,
+            approvals,
+            turn_model: None,
+            places: Default::default(),
+            aside: &|_| false,
+            details: false,
+            fill: false,
+            readers: None,
+            held: held.as_deref(),
+        };
+        let read = read_status_of(
+            client,
+            store,
+            scope,
+            &theirs,
+            &turns,
+            &mut read_here,
+            &mut seen_here,
+            view,
+            None,
+        )
+        .await;
+        latest.extend(read_here);
+        seen.extend(seen_here);
+        let Ok(read) = read else {
+            return None;
+        };
+        whole &= read.whole;
+        let folder = lead.workspace.clone().unwrap_or_default();
+        let superlead = *superleads.entry(lead.name.clone()).or_insert_with(|| {
+            seat_profile(&kept, &lead.name, true, std::path::Path::new(&folder)).as_deref()
+                == Some("superlead")
+        });
+        // When one of its agents last had a turn: now while one runs.
+        let last = (theirs.iter())
+            .filter_map(|bot| match bot.running_turn {
+                Some(_) => Some(now),
+                None => (bot.last.as_ref()).and_then(|last| last.finished_ms.or(last.started_ms)),
+            })
+            .max()
+            .unwrap_or(0);
+        // A lead's own title, else its project's.
+        let title = (read.rows.iter())
+            .find(|row| row.bot == lead.name)
+            .map(|row| row.title.clone())
+            .filter(|title| !title.is_empty())
+            .or(read.title.clone())
+            .unwrap_or_default();
+        let called = match lead.name.ends_with(".lead") {
+            true => name.to_owned(),
+            false => spoken(&lead.name),
+        };
+        let agents = status::agents(if title.is_empty() { &called } else { &title }, &read.rows);
+        found.push(projects::Project {
+            lead: lead.name.clone(),
+            name: called,
+            title,
+            folder,
+            superlead,
+            counts: status::counts(&read.rows),
+            state: projects::pressing(&read.rows),
+            last,
+            agents,
+        });
+    }
+    Some((found, whole))
 }
 
 /// What `/status` read: its rows, what waits on the person, and which
@@ -730,7 +1199,10 @@ async fn read_status_of(
     // What waits on the person, read as every surface reads it: the
     // calls listed for them now, and each agent's open question below.
     let mut needs = needs::Needs::default();
-    let held = needs::listing(client, None).await;
+    let held = match view.held {
+        Some(held) => Ok(held.to_vec()),
+        None => needs::listing(client, None).await,
+    };
     if let Ok(held) = &held {
         needs.held(held.clone(), |_| true);
     }
@@ -2938,6 +3410,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             details: true,
             fill: false,
             readers: None,
+            held: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
@@ -3582,9 +4055,20 @@ pub(crate) fn made(
     if let Some(ms) = config.hold_ms {
         settings.insert("hold_ms".into(), json!(ms));
     }
+    // The agents of its project, which its agent tools list and name.
+    if let Some(namespace) = asked["bot"].as_str().and_then(project::namespace) {
+        settings.insert("namespace".into(), json!(namespace));
+    }
     // The command rules in ~/.agent/rules, which the daemon applies.
     if let Some(rules) = rules::given() {
         settings.insert("rules".into(), json!(rules));
+    }
+    // The tiers and windows the person says models have; the tool host
+    // sends them again as they change ([`tool_host`]).
+    for (key, table) in agent_client::config::model_tables(&config) {
+        if !table.is_null() {
+            settings.insert(key.into(), table);
+        }
     }
     asked["settings"] = Value::Object(settings);
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
@@ -4437,13 +4921,14 @@ fn unknown_command(prompt: &str) -> Option<String> {
 /// the slash: name and what it does, in the Sonny Rulebook's order (talk,
 /// agents, this agent, work without you, every project, Sonny). Each
 /// has one name.
-const COMMANDS: [(&str, &str); 26] = [
+const COMMANDS: [(&str, &str); 27] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/zen", "Talk about one thing and keep the rest for later"),
     ("/reply", "Quote one of the agent's replies to answer it"),
     ("/react", "React to one of the agent's replies"),
     ("/copy", "Copy the last reply as Markdown"),
     ("/status", "Show this project's agents"),
+    ("/projects", "Show every project and go to one"),
     ("/switch", "Open any agent in this window"),
     ("/new", "Start a lead or a task here"),
     (
@@ -4489,7 +4974,7 @@ const ZEN_ENDS: &str = "End zen and hear what was kept";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
-const SHORTCUTS: [(&str, &str); 21] = [
+const SHORTCUTS: [(&str, &str); 22] = [
     ("enter", "send, or steer the running turn"),
     ("tab", "queue for after the running turn"),
     ("↑↓", "earlier prompts, past the first or last row"),
@@ -4503,6 +4988,7 @@ const SHORTCUTS: [(&str, &str); 21] = [
     ("home end", "first turn, newest turn"),
     ("pgup pgdn", "scroll"),
     ("tab", "with nothing typed, keys to the pane"),
+    ("←", "with nothing typed, every project"),
     ("ctrl+\\", "keys to the pane and back"),
     ("ctrl+[ ctrl+]", "hide the pane, show it again"),
     ("ctrl+g", "open the pane's agent in the main view"),
@@ -5347,6 +5833,9 @@ struct App {
     boost: Option<String>,
     /// The tier faster than standard its calls are served at, if any.
     speed: Option<String>,
+    /// The tiers its `speeds` setting, the person's `[speeds]`, says
+    /// models serve, most specific first.
+    speeds_set: Vec<(String, Vec<String>)>,
     /// How big the conversation was after its last model round, as the
     /// next round reads it, once known.
     context: Option<u64>,
@@ -5745,6 +6234,9 @@ struct App {
     /// The follow of this window's project that keeps `listed` current,
     /// on the window's own connection.
     follower: Option<standing::Follower>,
+    /// **Projects**, while open: in the conversation's place, with its
+    /// own follow of every project.
+    projects: Option<Box<ProjectsOpen>>,
     /// The project's agents as last read, kept current by `follower`,
     /// with their [`rows_mark`] once counted; the count holds it while it
     /// runs, so there is one copy.
@@ -7603,6 +8095,7 @@ impl App {
             effort: record["effort"].as_str().map(str::to_owned),
             boost: None,
             speed: speed(record),
+            speeds_set: agent_client::speeds_set(&record["settings"]),
             context: None,
             window: None,
             compacted: None,
@@ -7778,6 +8271,7 @@ impl App {
             counted_local: None,
             kept_rows: Built::default(),
             follower: None,
+            projects: None,
             listed: None,
             listed_lead: None,
             rows_mark: None,
@@ -8282,6 +8776,7 @@ impl App {
             self.recheck_task_answers().await;
             self.settle_task_asks().await;
             self.count_agents().await;
+            self.projects_tick().await;
             self.read_references().await;
             self.read_names().await;
             self.warm_reads().await;
@@ -8896,7 +9391,7 @@ impl App {
     /// The speeds `/model` steps through for `model`: standard, and each
     /// tier faster than it the model serves.
     fn speeds_of(&self, model: &str) -> Vec<&'static str> {
-        let serves = self.client.speeds(model);
+        let serves = self.client.speeds(&self.speeds_set, model);
         (SPEEDS.into_iter())
             .filter(|speed| *speed == "standard" || serves.iter().any(|s| s == speed))
             .collect()
@@ -8933,7 +9428,7 @@ impl App {
 
     /// The tiers faster than standard the bot's model serves.
     fn speeds(&self) -> Vec<String> {
-        self.client.speeds(&self.model)
+        self.client.speeds(&self.speeds_set, &self.model)
     }
 
     /// The speed the bot's calls run at: its own where its model serves
@@ -8959,6 +9454,7 @@ impl App {
             self.set_workspace(workspace);
         }
         self.speed = speed(record);
+        self.speeds_set = agent_client::speeds_set(&record["settings"]);
         self.mode = approvals::mode(record);
     }
 
@@ -12085,6 +12581,7 @@ impl App {
                 details: false,
                 fill: false,
                 readers: Some(&readers),
+                held: None,
             };
             let Ok(read) = read_status_of(
                 &client,
@@ -14592,6 +15089,7 @@ impl App {
                 details: true,
                 fill: fill.is_some(),
                 readers: Some(&readers),
+                held: None,
             };
             let Some(fill) = fill else {
                 let alerts = read_alerts(&client, &logs, temp_due).await;
@@ -14892,6 +15390,7 @@ impl App {
             details: true,
             fill: false,
             readers: Some(&self.readers),
+            held: None,
         };
         let read = read_status(
             &self.client,
@@ -14956,6 +15455,7 @@ impl App {
                         details: true,
                         fill: false,
                         readers: Some(&readers),
+                        held: None,
                     };
                     let turns = HashMap::new();
                     let read =
@@ -17098,6 +17598,11 @@ impl App {
             key.code = code;
             key.modifiers -= KeyModifiers::CONTROL;
         }
+        // **Projects** has the keys, the mouse and the wheel while open.
+        if self.projects.is_some() {
+            self.projects_event(event).await;
+            return;
+        }
         // Tab takes the guess at the next message into the composer, as
         // Claude Code and Codex take theirs; it is not sent. Tab does what
         // it does otherwise when none shows.
@@ -17520,6 +18025,15 @@ impl App {
                     KeyCode::Delete => self.input.delete(),
                     KeyCode::Left if ctrl || alt => self.input.word_left(),
                     KeyCode::Right if ctrl || alt => self.input.word_right(),
+                    // With nothing typed, out to every project.
+                    KeyCode::Left
+                        if self.input.is_empty()
+                            && self.react_to.is_none()
+                            && !self.new_brief()
+                            && self.projects_here() =>
+                    {
+                        self.open_projects().await
+                    }
                     KeyCode::Left => self.input.left(),
                     KeyCode::Right => self.input.right(),
                     KeyCode::Home => self.input.home(),
@@ -17808,6 +18322,22 @@ impl App {
                 self.notice = Some("/status is for the agent itself, not a side chat".into());
             } else {
                 self.status().await;
+            }
+            return;
+        }
+        if prompt == "/projects" {
+            self.input.clear();
+            match () {
+                _ if self.options.side.is_some() => {
+                    self.notice = Some("/projects is for the agent itself, not a side chat".into())
+                }
+                _ if self.zen.is_some() => {
+                    self.notice = Some("/projects shows once zen ends".into())
+                }
+                _ if self.options.embedded => {
+                    self.notice = Some("/projects shows in the main window".into())
+                }
+                _ => self.open_projects().await,
             }
             return;
         }
@@ -20935,7 +21465,54 @@ impl App {
                      linked: &mut Vec<(u16, u16, ratatui::buffer::Cell)>| {
             // The rows that move stay at the bottom, as a chat's composer
             // does, and the conversation sits right above them.
-            let (area, pane) = self.split(frame.area());
+            // **Projects** in the conversation's place, and the picked
+            // project's agents in the pane's: no other pane is drawn.
+            let (area, pane, side) = match self.projects.is_some() {
+                true => {
+                    let (area, side) = self.projects_split(frame.area());
+                    (area, None, side)
+                }
+                false => {
+                    let (area, pane) = self.split(frame.area());
+                    (area, pane, None)
+                }
+            };
+            if let (Some(at), Some(open)) = (side, &mut self.projects) {
+                open.side = at;
+                let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
+                let drawn = (open.view.picked())
+                    .map(|project| status::agents_drawn(&project.agents, &self.bot, width))
+                    .unwrap_or_default();
+                for (row, (line, goes)) in drawn.into_iter().enumerate() {
+                    let y = at.y + row as u16;
+                    if y >= at.bottom() {
+                        break;
+                    }
+                    // A name is a link, as everywhere: where it is drawn
+                    // in the agents' color.
+                    if let Some(bot) = goes {
+                        let mut x = at.x;
+                        for span in &line.spans {
+                            let w = span.content.width() as u16;
+                            if span.style.fg == Some(Color::Blue) {
+                                opens_at.push((y, x..x + w, format!("{}{bot}", links::AGENT)));
+                            }
+                            x += w;
+                        }
+                    }
+                    let row = Rect { y, height: 1, ..at };
+                    frame.render_widget(Paragraph::new(line), row);
+                }
+                if area.width > 0 {
+                    let line = Rect {
+                        x: area.right() + GUTTER,
+                        width: 1,
+                        ..at
+                    };
+                    let rule = vec![Line::from("│").dim(); line.height as usize];
+                    frame.render_widget(Paragraph::new(rule), line);
+                }
+            }
             if let (Some(at), Some(open)) = (pane, &mut self.pane) {
                 // Paths in a file are read from its folder first.
                 let base = open.folder().unwrap_or(&workspace).to_owned();
@@ -20977,19 +21554,30 @@ impl App {
             let file = |word: &str| {
                 links::file_line(&workspace, word).or_else(|| self.names.borrow_mut().link(word))
             };
+            // **Projects** from the top of the conversation's place.
+            if let Some(open) = &mut self.projects {
+                let page = history;
+                open.page = page;
+                let lines = open
+                    .view
+                    .lines(page.width as usize, page.height as usize, now_ms());
+                frame.render_widget(Paragraph::new(lines), page);
+            }
             let history = ratatui::layout::Rect {
                 y: history.bottom().saturating_sub(rows as u16),
                 width: column,
                 height: (rows as u16).min(history.height),
                 ..history
             };
-            self.screen.render(history, frame.buffer_mut(), file);
-            if let Some(eyes) = &mut self.eyes
-                && let Some(y) = self.screen.drawn_at(screen::Tag::Eyes)
-            {
-                banner::draw_eyes(frame.buffer_mut(), history.x, y, eyes.look(Instant::now()));
+            if self.projects.is_none() {
+                self.screen.render(history, frame.buffer_mut(), file);
+                if let Some(eyes) = &mut self.eyes
+                    && let Some(y) = self.screen.drawn_at(screen::Tag::Eyes)
+                {
+                    banner::draw_eyes(frame.buffer_mut(), history.x, y, eyes.look(Instant::now()));
+                }
+                linked.extend(self.screen.link_cells(frame.buffer_mut()));
             }
-            linked.extend(self.screen.link_cells(frame.buffer_mut()));
             let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
             // The conversation's column and no wider, as the composer and
@@ -21043,6 +21631,15 @@ impl App {
                     .collect();
                 // Over the rows above the composer's band.
                 over(frame, list::lines(&items, pick, width, gap.y as usize), gap);
+            }
+            // Finding in **Projects**: what is typed, where the
+            // conversation's find has it.
+            if let Some(query) = (self.projects.as_ref()).and_then(|open| open.view.finding.clone())
+            {
+                let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
+                frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + 5 + query.width() as u16, composer.y));
+                return;
             }
             if let Some(query) = &self.finding {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
@@ -21420,7 +22017,7 @@ impl App {
             };
             composer_at = first_row.map(|first| (text, first, width.min(measure())));
             // Keys in the pane: no cursor where they do not go.
-            if !self.pane_keys {
+            if !self.pane_keys && self.projects.is_none() {
                 frame.set_cursor_position((
                     composer.x + (cursor_col as u16).min(composer.width.saturating_sub(1)),
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
@@ -21594,18 +22191,29 @@ impl App {
             // Muted while the pane has the keys: typing goes there.
             let lead = match answering {
                 Some(_) => Span::raw("? ").bold().fg(Color::Yellow),
-                None if self.pane_keys => Span::raw("› ").dim(),
+                None if self.pane_keys || self.projects.is_some() => Span::raw("› ").dim(),
                 None => Span::raw("› ").bold(),
             };
             let mut spans = vec![lead];
             spans.extend(hint);
-            // Where the keys are, while nothing else is asked.
+            // Where the keys are, while nothing else is asked: the way out
+            // to every project, then the keys. Too long, `← projects` goes
+            // first.
             if answering.is_none()
                 && self.asks.is_empty()
                 && self.react_to.is_none()
                 && !self.new_brief()
                 && self.calls_waiting().0 == 0
             {
+                let used: usize = spans.iter().map(|span| span.content.width()).sum();
+                let out = " · ← projects".width();
+                if self.projects_here()
+                    && self.projects.is_none()
+                    && used + out + " · ? shortcuts".width() <= width
+                {
+                    spans.push(Span::raw(" · ").dim());
+                    spans.extend(hint::spans("← projects"));
+                }
                 spans.push(Span::raw(" · ").dim());
                 spans.extend(hint::spans("? shortcuts"));
             }
@@ -23212,13 +23820,31 @@ fn task_lead(bot: &str, listed: Option<&[standing::Agent]>) -> String {
     if project::is_lead(bot) {
         return bot.to_owned();
     }
-    let first = format!("{project}.lead");
     let Some(listed) = listed else {
-        return first;
+        return format!("{project}.lead");
     };
     let makers: HashMap<&str, &str> = (listed.iter())
         .map(|agent| (agent.name.as_str(), agent.maker()))
         .collect();
+    lead_of(bot, &makers)
+}
+
+/// The lead of its project `bot` answers to, through `makers` (each
+/// agent's maker by name): the lead its line of makers reaches, else the
+/// project's first lead. A lead is its own. Its project is the longest
+/// start of its name with a first lead, as [`project_of`] finds it, so
+/// `shop.web.page` is `shop.web`'s where both projects are.
+fn lead_of(bot: &str, makers: &HashMap<&str, &str>) -> String {
+    let Some((first_dot, _)) = bot.split_once('.') else {
+        return bot.to_owned();
+    };
+    if project::is_lead(bot) {
+        return bot.to_owned();
+    }
+    let project = (bot.match_indices('.').map(|(at, _)| &bot[..at]).rev())
+        .find(|start| makers.contains_key(format!("{start}.lead").as_str()))
+        .unwrap_or(first_dot);
+    let first = format!("{project}.lead");
     let mut at = bot;
     // A ring of makers leads to no lead.
     for _ in 0..=makers.len() {
@@ -24961,6 +25587,7 @@ mod tests {
             details: true,
             fill: false,
             readers: None,
+            held: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let read = read_status(
@@ -27159,6 +27786,35 @@ mod tests {
         assert_eq!(bar("Pushing."), None);
     }
 
+    #[test]
+    fn each_agent_counts_under_the_lead_it_answers_to_where_a_folder_has_two() {
+        let makers: HashMap<&str, &str> = [
+            ("shop.lead", ""),
+            ("shop.lead.billing", ""),
+            ("shop.fix", "shop.lead"),
+            ("shop.invoice", "shop.lead.billing"),
+            ("shop.invoice-check", "shop.invoice"),
+            ("shop.stray", ""),
+        ]
+        .into();
+        assert_eq!(lead_of("shop.lead.billing", &makers), "shop.lead.billing");
+        assert_eq!(lead_of("shop.fix", &makers), "shop.lead");
+        assert_eq!(lead_of("shop.invoice-check", &makers), "shop.lead.billing");
+        assert_eq!(lead_of("shop.stray", &makers), "shop.lead");
+        // A project named with a dot, beside the one it starts with.
+        let makers: HashMap<&str, &str> = [
+            ("shop.lead", ""),
+            ("shop.web.lead", ""),
+            ("shop.web.page", "shop.web.lead"),
+            ("shop.web.page-check", "shop.web.page"),
+            ("shop.webby", "shop.lead"),
+        ]
+        .into();
+        assert_eq!(lead_of("shop.web.page", &makers), "shop.web.lead");
+        assert_eq!(lead_of("shop.web.page-check", &makers), "shop.web.lead");
+        assert_eq!(lead_of("shop.webby", &makers), "shop.lead");
+    }
+
     #[tokio::test]
     async fn the_menu_lists_resume_only_while_paused_and_zen_says_it_ends_it() {
         let mut app = app(zen_daemon().await);
@@ -27169,7 +27825,7 @@ mod tests {
                 .collect()
         };
         let all = listed(&app);
-        assert_eq!(all.len(), 25);
+        assert_eq!(all.len(), 26);
         assert_eq!(
             all[0],
             ("/side", "Start a side chat with a copy of this agent")

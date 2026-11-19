@@ -245,7 +245,8 @@ async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
 const CONFIG_EVERY: Duration = Duration::from_secs(5);
 
 /// Keep Sonny's agents on what `config.toml` gives an agent when it is
-/// made: each model's fallback and whether senders are named, and on the
+/// made: each model's fallback, the tiers and context windows models
+/// have, and whether senders are named, and on the
 /// command rules in `~/.agent/rules`. Read at first and whenever either
 /// changes. The daemon takes the rules alone from an agent at work, for
 /// its next round; the rest it is asked again until it is idle, since
@@ -401,6 +402,12 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     if record["settings"]["trailer"] != trailer {
         settings.insert("trailer".into(), trailer);
     }
+    // The tiers and windows the person says models have, for its next
+    // turn.
+    settings.extend(agent_client::config::model_tables_changed(
+        given.config,
+        &record["settings"],
+    ));
     // Code mode on or off, as the config says.
     let steps_only = crate::exec::steps_only(given.config);
     if record["settings"]["steps_only"] != steps_only {
@@ -494,6 +501,57 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::LazyLock;
+
+    /// `[speeds]` and `[context_windows]` go to every agent as they
+    /// change, for its next turn, and come off when the file drops them.
+    #[test]
+    fn an_agent_follows_the_config_s_speeds_and_windows() {
+        static NONE: LazyLock<HashSet<i64>> = LazyLock::new(HashSet::new);
+        let mut config = agent_client::config::Config::default();
+        let agent = |settings: Value| {
+            let mut settings = settings;
+            settings["trailer"] = json!(["sender", "time"]);
+            settings["steps_only"] = json!(["*"]);
+            json!({"provider": "openai", "model": "gpt-6.2-astra", "settings": settings,
+                "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
+        };
+        fn given(config: &agent_client::config::Config) -> Given<'_> {
+            Given {
+                config,
+                rules: None,
+                live: &NONE,
+            }
+        }
+        assert_eq!(configured(&agent(json!({})), &given(&config)), None);
+        // As `inspect` gives a table none set.
+        let unset = json!({"speeds": {}, "context_windows": {}});
+        assert_eq!(configured(&agent(unset), &given(&config)), None);
+        config.speeds.insert(
+            "openai/gpt-6.2-*".into(),
+            vec!["ultrafast".into(), "fast".into()],
+        );
+        config.context_windows.insert("openai/*".into(), 400_000);
+        let sent = json!({"speeds": {"openai/gpt-6.2-*": ["fast", "ultrafast"]},
+            "context_windows": {"openai/*": 400_000}});
+        assert_eq!(
+            configured(&agent(json!({})), &given(&config)).map(Value::Object),
+            Some(json!({"settings": sent}))
+        );
+        // Once it has them, nothing; its own order is the daemon's.
+        assert_eq!(configured(&agent(sent.clone()), &given(&config)), None);
+        // One table changed, that one alone.
+        config.context_windows.insert("openai/*".into(), 272_000);
+        assert_eq!(
+            configured(&agent(sent.clone()), &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"context_windows": {"openai/*": 272_000}}}))
+        );
+        // Dropped from the file, taken off.
+        let config = agent_client::config::Config::default();
+        assert_eq!(
+            configured(&agent(sent), &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"speeds": null, "context_windows": null}}))
+        );
+    }
 
     #[test]
     fn an_agent_follows_what_config_gives_its_model() {

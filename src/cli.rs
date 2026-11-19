@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --replaces --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs --namespace",
         startup: true,
     },
     Command {
@@ -269,7 +269,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --protect --protect-existing --protect-path --wall --unreadable --own-copy --own-copy-file --context-window --speeds --fallbacks --models --provider-config --await-owner",
+        flags: "--shell-exclude --protect --protect-existing --protect-path --wall --unreadable --own-copy --own-copy-file --fallbacks --models --provider-config --await-owner",
         settings: "",
         startup: true,
     },
@@ -480,14 +480,6 @@ fn print_flags(flags: &str) {
                 "PATH",
                 "Keep PATH, by its absolute path, read-only in every sandbox, and from being made when missing; repeatable",
             ),
-            "--context-window" => (
-                "PATTERN=TOKENS",
-                "The context window of each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards), over its provider's listing; the most specific pattern wins; repeatable; clients pass [context_windows] from ~/.agent/config.toml",
-            ),
-            "--speeds" => (
-                "PATTERN=TIERS",
-                "The tiers faster than standard (fast, ultrafast, comma-separated, or none) each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards) serves, over the built-in list; a bot's speed reaches only models that serve it, others run at standard; the most specific pattern wins; repeatable; clients pass [speeds] from ~/.agent/config.toml",
-            ),
             "--fallbacks" => (
                 "PATTERN=PROVIDER/MODEL",
                 "The model a request a safety classifier declined goes to, that request alone, for each bot that names none of its own whose turn's PROVIDER/MODEL path matches PATTERN (* and ? wildcards); the most specific pattern wins; repeatable; clients pass [fallbacks] from ~/.agent/config.toml",
@@ -597,6 +589,10 @@ fn print_flags(flags: &str) {
             "--hold" => (
                 "DURATION",
                 "How long a new bot's turn waits on a cause a person can fix (a sign-in, a usage limit, a provider down) before it fails; up to 365d, 0 fails at once; default hold in config.toml, else 5d",
+            ),
+            "--namespace" => (
+                "NAME",
+                "The group a new bot's agent tools list (NAME.*) and name the agents it makes in (NAME.AGENT); default its creator's, else none",
             ),
             "--unix-socket" => (
                 "PATH",
@@ -827,8 +823,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--unreadable"
                     | "--own-copy"
                     | "--own-copy-file"
-                    | "--context-window"
-                    | "--speeds"
                     | "--fallbacks"
             )
         {
@@ -1017,6 +1011,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--trailer",
             "--quiet-background",
             "--hold",
+            "--namespace",
             "--unix-socket",
             "--approval",
             "--approve",
