@@ -86,10 +86,8 @@ jsonschema = { version = "0.61.1", default-features = false }
 
 # jemalloc in the static Linux builds, as Codex ships them (codex-rs/cli,
 # codex-rs/app-server): musl's own allocator serializes every thread on one
-# lock. The Mac and glibc builds keep the system allocator, and so does
-# aarch64 musl for now: jemalloc's C build fails with musl-gcc on the arm
-# runner (#1192).
-[target.'cfg(all(target_os = "linux", target_env = "musl", target_arch = "x86_64"))'.dependencies]
+# lock. The Mac and glibc builds keep the system allocator.
+[target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 tikv-jemallocator = "=0.7.0"
 
 [dev-dependencies]

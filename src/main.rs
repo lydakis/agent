@@ -25,7 +25,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
     not(feature = "heap-profile"),
     target_os = "linux",
     target_env = "musl",
-    target_arch = "x86_64"
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
