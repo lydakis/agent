@@ -22,7 +22,10 @@ from pathlib import Path
 # Clauses a listing formats in by name, each planned with every value it
 # takes: keep in step with `list`, `usage`, `turns` and `messages` in
 # src/store/db.rs.
-OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)"),
+OPTIONAL = {'{glob}': ('', " AND t.bot GLOB :pattern AND t.bot >= :prefix AND t.bot < :prefix || CAST(x'ff' AS TEXT)",
+                       " AND t.bot GLOB :pattern AND t.bot >= :prefix AND t.bot < :prefix || CAST(x'ff' AS TEXT)"
+                       ' AND t.started_ms < :until',
+                       ' AND t.bot IN (SELECT value FROM json_each(:names)) AND +t.started_ms < :until'),
             '{from}': ('name > ?1', "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3",
                        'name > ?1 AND name IN (SELECT value FROM json_each(?6))'),
             '{maker}': ('', ' AND created_by_id = ?4'),
@@ -100,8 +103,10 @@ def main():
         count = 0
         for number in re.findall(r'\?(\d*)', statement):
             count = max(count, int(number)) if number else count + 1
+        # `:name`, as `usage` names its own.
+        named = {name: 1 for name in re.findall(r'(?<![\w:]):([a-z_]+)', statement)}
         try:
-            rows = conn.execute('EXPLAIN QUERY PLAN ' + statement, tuple([1] * count)).fetchall()
+            rows = conn.execute('EXPLAIN QUERY PLAN ' + statement, named or tuple([1] * count)).fetchall()
         except sqlite3.Error as error:
             print(f'cannot plan: {statement[:100]} -> {error}')
             return 1

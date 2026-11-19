@@ -574,6 +574,10 @@ enum Command {
         /// Unix epoch; absent is all of them.
         #[serde(default)]
         since_ms: i64,
+        /// Only turns started before this, in Unix ms; absent is up to now.
+        until_ms: Option<i64>,
+        /// Only these bots, 1 to 256 names, as `bots` takes them.
+        names: Option<Vec<String>>,
         /// Sum `series` in buckets this wide from `since_ms`; absent
         /// leaves the series out.
         bucket_ms: Option<i64>,
@@ -6002,13 +6006,22 @@ impl Service {
             Command::Usage {
                 name,
                 since_ms,
+                until_ms,
+                names,
                 bucket_ms,
                 limit,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
                     (reader.read("usage", move |db| {
-                        db.usage(name.as_deref(), since_ms, bucket_ms, limit.unwrap_or(64))
+                        db.usage(&agent_runtime::store::UsageQuery {
+                            name: name.as_deref(),
+                            names: names.as_deref(),
+                            since_ms,
+                            until_ms,
+                            bucket_ms,
+                            limit: limit.unwrap_or(64),
+                        })
                     }))
                     .await
                 })
