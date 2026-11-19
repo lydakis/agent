@@ -907,6 +907,31 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         std::fs::read_to_string(dir.join("notes/b.md")).unwrap(),
         "x\n"
     );
+    // Inside the sandbox, a patch keeps a file's mode and removes what it
+    // deletes, in one helper.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(dir.join("run.sh"), "one\n").unwrap();
+    std::fs::write(dir.join("gone.md"), "x\n").unwrap();
+    std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o750)).unwrap();
+    let both = "*** Begin Patch\n*** Update File: run.sh\n@@\n-one\n+two\n\
+                *** Delete File: gone.md\n*** End Patch";
+    let both = tools
+        .prepare("apply_patch", &json!({ "input": both }).to_string())
+        .unwrap();
+    tools
+        .execute(both, &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("run.sh")).unwrap(),
+        "two\n"
+    );
+    let mode = std::fs::metadata(dir.join("run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o750);
+    assert!(!dir.join("gone.md").exists());
     // A link in a kept folder is not removed for pointing at a file the bot
     // may write.
     std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();

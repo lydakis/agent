@@ -587,8 +587,7 @@ pub fn bigger(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
     let background = background();
     let out = {
         use std::hash::{Hash, Hasher};
-        let dir = std::env::temp_dir().join("sonny-pages");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let dir = crate::html::pages_made()?;
         let mut hasher = std::hash::DefaultHasher::new();
         (&svg, background, "bigger").hash(&mut hasher);
         dir.join(format!("{:016x}.png", hasher.finish()))

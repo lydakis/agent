@@ -367,32 +367,46 @@ enum Write {
 }
 
 impl Staged {
-    /// Whether committing writes any file, through the sandbox's helper
-    /// when the bot has one; a patch that only deletes writes none.
+    /// Whether committing changes any file, through the sandbox's helper
+    /// when the bot has one.
     pub fn writes(&self) -> bool {
-        self.writes
-            .iter()
-            .any(|write| matches!(write, Write::Put(..)))
+        !self.writes.is_empty()
     }
 
-    /// Write the changes, in `sandbox` when the bot has one, its
-    /// placeholders `held`.
+    /// Make the changes: in `sandbox` when the bot has one, all in one run
+    /// of its helper, its placeholders `held`, so the kernel decides what
+    /// each write, removal and permission change reaches.
     pub async fn commit(
         self,
         sandbox: Option<Arc<Policy>>,
-        mut held: Option<&mut crate::sandbox::Hold>,
+        held: Option<&mut crate::sandbox::Hold>,
     ) -> Result<String> {
+        if let Some(policy) = sandbox {
+            use std::os::unix::fs::PermissionsExt;
+            let changes: Vec<_> = (self.writes.into_iter())
+                .map(|write| match write {
+                    Write::Put(path, content, permissions) => crate::sandbox::Change::Put {
+                        path,
+                        content,
+                        mode: permissions.map(|permissions| permissions.mode() & 0o7777),
+                    },
+                    Write::Remove(path) => crate::sandbox::Change::Remove { path },
+                })
+                .collect();
+            if !changes.is_empty() {
+                files::patch(&policy, changes, held).await?;
+            }
+            return Ok(self.summary);
+        }
+        // Unconfined, the bot may write whatever the daemon may.
         for write in self.writes {
             match write {
                 Write::Put(target, contents, permissions) => {
-                    let held = held.as_deref_mut();
-                    files::write(&target, contents.as_bytes(), sandbox.clone(), held).await?;
+                    files::write(&target, contents.as_bytes(), None, None).await?;
                     if let Some(permissions) = permissions {
                         tokio::fs::set_permissions(&target, permissions).await?;
                     }
                 }
-                // The sandbox's helper only writes. A removal was checked
-                // against the bot's roots before anything ran.
                 Write::Remove(target) => tokio::fs::remove_file(&target).await?,
             }
         }

@@ -65,6 +65,12 @@ pub struct Root {
     /// hold still has bubblewrap hold them ([`locks`]).
     #[serde(default)]
     pub locks: Vec<PathBuf>,
+    /// On Linux, folders inside one of `read_only` that it may write again:
+    /// in a git folder it may commit to, the bot's own linked worktree's
+    /// folder in `worktrees`, which stays read-only for every other
+    /// worktree. Its `commondir` stays in `read_only`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opened: Vec<PathBuf>,
 }
 
 /// What a sandboxed command may do: write its roots, and reach the network
@@ -155,6 +161,19 @@ impl Policy {
             .filter(|socket| Some(socket) != daemon.socket.as_ref())
             .collect();
         daemons.dedup();
+        // The folder its own linked worktree keeps in its repository's git
+        // folder, which it writes as it commits: of the checkout its folder
+        // is in, as git finds it, the nearest `.git` above.
+        let own = (workspace.into_iter())
+            .flat_map(Path::ancestors)
+            .map(|folder| folder.join(".git"))
+            .find_map(|dot| {
+                std::fs::symlink_metadata(&dot)
+                    .ok()
+                    .map(|found| (dot, found))
+            })
+            .filter(|(_, found)| found.is_file())
+            .and_then(|(file, _)| gitdir(&file));
         let mut roots = Vec::new();
         for path in paths {
             // One gone since it was named is skipped, as Codex skips it:
@@ -165,7 +184,7 @@ impl Policy {
             {
                 continue;
             }
-            roots.push(root(&path, daemon, &others)?);
+            roots.push(root(&path, daemon, &others, own.as_deref())?);
         }
         Ok(Some(Policy {
             roots,
@@ -280,13 +299,20 @@ impl Policy {
                 .rev()
                 .find(|root| path.starts_with(&root.path))
                 .is_some_and(|root| {
-                    !root
-                        .read_only
-                        .iter()
+                    // The deepest of what it keeps and what it opens again
+                    // inside that decides, as the mounts do.
+                    let kept = (root.read_only.iter())
                         .chain(&root.missing)
                         .chain(&root.left)
                         .chain(&root.others)
-                        .any(|kept| path.starts_with(kept))
+                        .filter(|kept| path.starts_with(kept))
+                        .map(|kept| depth(kept))
+                        .max();
+                    let opened = (root.opened.iter())
+                        .filter(|opened| path.starts_with(opened))
+                        .map(|opened| depth(opened))
+                        .max();
+                    kept.is_none_or(|kept| opened.is_some_and(|opened| opened > kept))
                 })
     }
 }
@@ -406,19 +432,75 @@ impl Mode {
 /// can't carry it out.
 pub const WRITE: &str = "--agent-run-as-write";
 
-/// The confined write [`WRITE`] asks for, run inside the sandbox: make the
-/// folders above `path`, then replace its content with stdin's. Only a
-/// regular file is written.
-pub fn write(path: &Path) -> Result<()> {
-    use std::io::{Read, Write};
-    let denied = |error: std::io::Error| match error.raw_os_error() {
+/// The argument that makes the agent binary apply a patch's changes, read
+/// as JSON on stdin ([`Change`]), in order, inside the bot's sandbox: its
+/// writes, removals and kept permissions, all in one run, so nothing the
+/// patch does is done by the daemon outside the sandbox, as Codex runs
+/// `apply_patch` inside its own.
+pub const PATCH: &str = "--agent-run-as-patch";
+
+/// One change [`PATCH`] makes.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Change {
+    /// A file's new contents, and for a move the permission bits of the
+    /// file it came from, set on the file opened.
+    Put {
+        path: PathBuf,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+    },
+    /// A name taken away, a link itself rather than what it names.
+    Remove { path: PathBuf },
+}
+
+/// The confined patch [`PATCH`] asks for, run inside the sandbox.
+pub fn patch() -> Result<()> {
+    use std::io::Read;
+    let mut given = Vec::new();
+    std::io::stdin().read_to_end(&mut given)?;
+    let changes: Vec<Change> = serde_json::from_slice(&given)
+        .map_err(|error| crate::Error::with("invalid_patch", error.to_string()))?;
+    for change in changes {
+        match change {
+            Change::Put {
+                path,
+                content,
+                mode,
+            } => put(&path, content.as_bytes(), mode)?,
+            Change::Remove { path } => {
+                std::fs::remove_file(&path).map_err(|error| denied(&path, error))?
+            }
+        }
+    }
+    Ok(())
+}
+
+fn denied(path: &Path, error: std::io::Error) -> crate::Error {
+    match error.raw_os_error() {
         Some(libc::EACCES | libc::EPERM | libc::EROFS) => {
             crate::Error::with("write_denied", path.display().to_string())
         }
         _ => crate::Error::with("io_error", error.to_string()),
-    };
+    }
+}
+
+/// The confined write [`WRITE`] asks for, run inside the sandbox: make the
+/// folders above `path`, then replace its content with stdin's. Only a
+/// regular file is written.
+pub fn write(path: &Path) -> Result<()> {
+    use std::io::Read;
     let mut content = Vec::new();
     std::io::stdin().read_to_end(&mut content)?;
+    put(path, &content, None)
+}
+
+/// Make the folders above `path`, then replace its content with
+/// `content`, and its permission bits with `mode`, on the file opened.
+fn put(path: &Path, content: &[u8], mode: Option<u32>) -> Result<()> {
+    use std::io::Write;
+    let denied = |error: std::io::Error| denied(path, error);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(denied)?;
     }
@@ -440,7 +522,12 @@ pub fn write(path: &Path) -> Result<()> {
         return crate::fail("file_not_regular");
     }
     file.set_len(0).map_err(denied)?;
-    file.write_all(&content).map_err(denied)?;
+    file.write_all(content).map_err(denied)?;
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(denied)?;
+    }
     Ok(())
 }
 
@@ -854,7 +941,7 @@ impl std::fmt::Debug for Capabilities {
 /// The root at `path`, with what stays read-only inside it: the protected
 /// folders at its top, a worktree's own git folder when it is inside the
 /// root, and the daemon's store and socket.
-fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
+fn root(path: &Path, daemon: &Daemon, others: &[known::Known], own: Option<&Path>) -> Result<Root> {
     // A root is kept by its real path. One reached through a link now had
     // a link swapped in since, perhaps by a bot that may write the folder
     // above it, and would carry the sandbox wherever the link points.
@@ -895,9 +982,11 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
             left: Vec::new(),
             locks: Vec::new(),
             others: Vec::new(),
+            opened: Vec::new(),
         });
     }
     let mut read_only = Vec::new();
+    let mut opened = Vec::new();
     let mut missing = Vec::new();
     let mut left = Vec::new();
     let names = (daemon.protected.iter().map(|name| (name, true)))
@@ -942,13 +1031,51 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
                 Err(_) => {}
             }
         }
-        // Each linked worktree's folder names the repository's folder for
-        // it the same way. One without it was made since, and serves only a
-        // checkout the bot made to name it. Nothing this deep is removed
-        // after a command, as the root's own `commondir` is: its folder
-        // could be swapped for a link elsewhere before the removal follows.
-        for entry in std::fs::read_dir(path.join("worktrees"))
+        // On Linux the linked worktrees' folders stay read-only whole, but
+        // for the bot's own, which it writes as it commits, its `commondir`
+        // kept: a folder inside one bound read-only can't be renamed, as
+        // one beside a file bound read-only can, which would take that
+        // file's binding with it and leave a `commondir` of the bot's in
+        // its place, read by the person's git in that worktree. One mount
+        // for them all, and two for its own, however many there are.
+        let worktrees = path.join("worktrees");
+        match std::fs::symlink_metadata(&worktrees) {
+            Ok(found) if found.file_type().is_symlink() => return linked(&worktrees),
+            Ok(found) if found.is_dir() && cfg!(target_os = "linux") => {
+                read_only.push(worktrees.clone());
+                if let Some(own) = own.filter(|own| own.parent() == Some(worktrees.as_path())) {
+                    match std::fs::symlink_metadata(own) {
+                        Ok(found) if found.file_type().is_symlink() => return linked(own),
+                        Ok(found) if found.is_dir() => {
+                            let kept = own.join("commondir");
+                            match std::fs::symlink_metadata(&kept) {
+                                Ok(found) if found.file_type().is_symlink() => {
+                                    return linked(&kept);
+                                }
+                                Ok(_) => {
+                                    opened.push(own.to_owned());
+                                    read_only.push(kept);
+                                }
+                                // A worktree's folder names its repository;
+                                // one that doesn't stays read-only.
+                                Err(_) => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Elsewhere each linked worktree's folder names the repository's
+        // folder for it the same way, its folder anchored by Seatbelt. One
+        // without it was made since, and serves only a checkout the bot made
+        // to name it. Nothing this deep is removed after a command, as the
+        // root's own `commondir` is: its folder could be swapped for a link
+        // elsewhere before the removal follows.
+        for entry in std::fs::read_dir(&worktrees)
             .into_iter()
+            .filter(|_| !cfg!(target_os = "linux"))
             .flatten()
             .flatten()
         {
@@ -1031,6 +1158,7 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
         left,
         locks,
         others,
+        opened,
     })
 }
 
@@ -1274,14 +1402,26 @@ mod linux {
         args.extend(["--ro-bind", "/", "/", "--dev", "/dev"].map(String::from));
         for root in &policy.roots {
             args.extend(["--bind".into(), path(&root.path), path(&root.path)]);
-            // Each folder between the root and a folder it may not read,
-            // bound on itself so no command renames it: moved, it would
-            // take the folder out from under its mask and its name, as
-            // Seatbelt anchors them. First, under what is kept read-only.
+            // Each folder between the root and a folder it may not read, or
+            // one it keeps, bound on itself so no command renames it: moved,
+            // it would take the folder out from under its mask or binding
+            // and its name, as Seatbelt anchors them. None inside what is
+            // bound already, which can't be renamed. First, under what is
+            // kept read-only.
+            let bound = |folder: &Path| {
+                (root.read_only.iter())
+                    .chain(&root.opened)
+                    .any(|kept| folder.starts_with(kept))
+            };
             let mut anchored: Vec<&Path> = (policy.unreadable.iter())
+                .chain(&root.read_only)
+                .chain(&root.missing)
+                .chain(&root.others)
                 .filter(|hidden| hidden.starts_with(&root.path))
                 .flat_map(|hidden| hidden.ancestors().skip(1))
-                .filter(|folder| folder.starts_with(&root.path) && *folder != root.path)
+                .filter(|folder| {
+                    folder.starts_with(&root.path) && *folder != root.path && !bound(folder)
+                })
                 .collect();
             anchored.sort();
             anchored.dedup();
@@ -1289,10 +1429,15 @@ mod linux {
             for folder in anchored {
                 args.extend(["--bind".into(), path(folder), path(folder)]);
             }
-            let mut kept: Vec<&PathBuf> = root.read_only.iter().collect();
-            kept.sort_by_key(|path| depth(path));
-            for kept in kept {
-                args.extend(["--ro-bind".into(), path(kept), path(kept)]);
+            // Shallowest first, so a folder opened again inside one kept
+            // read-only is bound over it, and what it keeps over that.
+            let mut kept: Vec<(&PathBuf, &str)> = (root.read_only.iter())
+                .map(|kept| (kept, "--ro-bind"))
+                .chain(root.opened.iter().map(|opened| (opened, "--bind")))
+                .collect();
+            kept.sort_by_key(|(path, _)| depth(path));
+            for (kept, how) in kept {
+                args.extend([how.into(), path(kept), path(kept)]);
             }
             // Another daemon's, while they are there: one gone since is
             // skipped rather than stopping the command.
@@ -3138,7 +3283,12 @@ mod tests {
         // and config, here or in a linked worktree's folder.
         assert!(!policy.can_write(&git.join("commondir")));
         assert!(!policy.can_write(&git.join("worktrees/wt/commondir")));
-        assert!(policy.can_write(&git.join("worktrees/wt/index.lock")));
+        // A linked worktree's folder is its own bot's to write, on Linux
+        // none other's: this bot works in the main checkout.
+        assert_eq!(
+            policy.can_write(&git.join("worktrees/wt/index.lock")),
+            !cfg!(target_os = "linux")
+        );
         // A link where git keeps what it runs is that place's to keep,
         // wherever it points: it may not be removed.
         std::fs::create_dir_all(git.join("hooks")).unwrap();
@@ -3543,6 +3693,7 @@ mod tests {
                     left: Vec::new(),
                     locks: Vec::new(),
                     others: Vec::new(),
+                    opened: Vec::new(),
                     path: path.clone(),
                 }
             })
@@ -3704,6 +3855,87 @@ mod tests {
                 .collect();
             going.into_iter().for_each(|going| going.join().unwrap());
             assert!(!git.exists(), "one of them removes it");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A bot working in a linked worktree, given its repository's git
+    /// folder to commit to, writes its own worktree's folder there and no
+    /// other's, and can't rename one to put a `commondir` of its own in its
+    /// place: the person's git in that worktree would run what it names.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_worktree_writes_its_own_folder_in_the_git_folder_and_no_other() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let git = base.join("repo/.git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("config"), "").unwrap();
+        for name in ["mine", "theirs"] {
+            std::fs::create_dir_all(git.join("worktrees").join(name)).unwrap();
+            std::fs::write(
+                git.join("worktrees").join(name).join("commondir"),
+                "../..\n",
+            )
+            .unwrap();
+            let checkout = base.join(name);
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", git.join("worktrees").join(name).display()),
+            )
+            .unwrap();
+        }
+        let base = std::fs::canonicalize(&base).unwrap();
+        let git = base.join("repo/.git");
+        let mine = base.join("mine");
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&mine),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &protecting(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(policy.can_write(&git.join("objects/ab/cdef")));
+        assert!(policy.can_write(&git.join("worktrees/mine/index.lock")));
+        assert!(!policy.can_write(&git.join("worktrees/mine/commondir")));
+        assert!(!policy.can_write(&git.join("worktrees/theirs/index.lock")));
+        assert!(!policy.can_write(&git.join("worktrees/theirs/commondir")));
+        assert!(!policy.can_write(&git.join("worktrees/new/commondir")));
+        // A folder inside the checkout writes its checkout's own too.
+        std::fs::create_dir_all(mine.join("src")).unwrap();
+        let nested = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&mine.join("src")),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &protecting(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(nested.can_write(&git.join("worktrees/mine/index.lock")));
+        assert!(!nested.can_write(&git.join("worktrees/theirs/index.lock")));
+        if available().is_ok() {
+            let worktrees = git.join("worktrees");
+            let script = "cd \"$1\" && { mv theirs gone || true; } && { mv mine gone || true; } \
+                && { echo x > mine/commondir || true; } && echo ok > mine/HEAD";
+            let folder = worktrees.to_str().unwrap();
+            let (mut sandboxed, _ended) =
+                command(&policy, "sh", &["-c", script, "sh", folder], false).unwrap();
+            let status = sandboxed.current_dir(&mine).status().await.unwrap();
+            assert!(status.success(), "its own worktree's HEAD is its to write");
+            assert!(
+                worktrees.join("theirs/commondir").exists(),
+                "no other is renamed"
+            );
+            assert!(!worktrees.join("gone").exists());
+            assert_eq!(
+                std::fs::read_to_string(worktrees.join("mine/commondir")).unwrap(),
+                "../..\n"
+            );
         }
         let _ = std::fs::remove_dir_all(&base);
     }

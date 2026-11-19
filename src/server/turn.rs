@@ -609,6 +609,18 @@ fn shaped_other<'p>(
     provider.shaped(settings.max_output_tokens, settings.cache_hour(), None)
 }
 
+/// Of `asked`, the tools an agent `me` makes is given: those `me` has, and
+/// of them, those it may call.
+fn kept_tools(asked: &Value, me: &Value) -> Vec<Value> {
+    let own = me["tools"].as_array();
+    let allowed = me["allowed"].as_array();
+    (asked.as_array().into_iter().flatten())
+        .filter(|tool| own.is_some_and(|own| own.contains(tool)))
+        .filter(|tool| allowed.is_none_or(|allowed| allowed.contains(tool)))
+        .cloned()
+        .collect()
+}
+
 impl Turn {
     pub async fn execute(&self, mut cancelled: watch::Receiver<Option<&'static str>>) -> Exit {
         // Only an explicit interrupt or shutdown cancels, naming its error. A
@@ -6127,16 +6139,13 @@ impl Turn {
                     {
                         own.extend(over);
                     }
-                    // A caller kept to some of its tools (a fork's `allow`)
-                    // makes agents kept to them too: `create` takes no
-                    // `allow`, so their tools are those it may call.
-                    if let Some(allowed) = me["allowed"].as_array() {
-                        let tools: Vec<Value> = (create["tools"].as_array().into_iter().flatten())
-                            .filter(|tool| allowed.contains(tool))
-                            .cloned()
-                            .collect();
-                        create["tools"] = json!(tools);
-                    }
+                    // Its tools are this agent's at most, whatever a role or
+                    // the call names, so every gate it inherits names them
+                    // as this one's do. A caller kept to some of its tools
+                    // (a fork's `allow`) makes agents kept to them too:
+                    // `create` takes no `allow`, so their tools are those
+                    // it may call.
+                    create["tools"] = json!(kept_tools(&create["tools"], &me));
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
                     // This call made again, after its folder's files or this
@@ -6267,7 +6276,10 @@ impl Turn {
             (None, false) => (None, agent_client::policy::PREAMBLE.to_owned()),
             (None, true) => {
                 let folder = workspace.clone();
-                tokio::task::spawn_blocking(move || {
+                // None of the folders kept from its sandbox is read for it,
+                // through a link its folder holds.
+                let hidden = self.registry.daemon().unreadable.clone();
+                tokio::task::spawn_blocking(move || agent_client::policy::hiding(&hidden, || {
                     let folder = std::path::Path::new(&folder);
                     let failed = |error: agent_client::policy::Failure| {
                         Error::with(error.code(), error.to_string())
@@ -6292,7 +6304,7 @@ impl Turn {
                         agent_client::policy::instructions(folder, role.as_ref(), &memory)
                             .map_err(failed)?;
                     Ok::<_, Error>((role, composed.text))
-                })
+                }))
                 .await
                 .map_err(|_| Error::new("profile_unreadable"))??
             }
@@ -8607,6 +8619,17 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_agent_makes_agents_with_at_most_its_own_tools() {
+        use super::{json, kept_tools};
+        let asked = json!(["read", "shell", "apply_patch"]);
+        let me = json!({"tools": ["read", "shell"]});
+        assert_eq!(kept_tools(&asked, &me), [json!("read"), json!("shell")]);
+        let me = json!({"tools": ["read", "shell"], "allowed": ["read"]});
+        assert_eq!(kept_tools(&asked, &me), [json!("read")]);
+        assert!(kept_tools(&asked, &json!({})).is_empty());
+    }
+
     /// The streams the store keeps reach its writer packed, so the writer
     /// only inserts them; what is not worth packing goes on whole.
     #[tokio::test]
