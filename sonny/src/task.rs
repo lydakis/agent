@@ -409,8 +409,8 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // now: the ones the lead or the person picked from, even uncommitted,
     // never a worktree's copy as of its last commit, nor a folder inside.
     let roles = here;
-    let mut flags = match told(&place.told, roles, here, &info, &flags) {
-        Ok(flags) => flags,
+    let (mut flags, role_sandbox) = match told(&place.told, roles, here, &info, &flags) {
+        Ok(told) => told,
         Err(error) => return failed(&place, false, error),
     };
     with_cache(&mut flags);
@@ -431,6 +431,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             }
         }
         (None, None) => {}
+    }
+    // The profile's own sandbox, never looser than the one it would get.
+    if let Some(mode) = &role_sandbox
+        && let Err(why) = agent_client::policy::with_sandbox(&mut sandbox, mode)
+    {
+        return failed(&place, false, format!("invalid_setting: {why}"));
     }
     for (key, value) in sandbox {
         // Asked for as the gate's `--approval never`.
@@ -841,14 +847,15 @@ fn with_cache(flags: &mut Vec<String>) {
 /// for a task in `dir` given as `--instructions`, with what every task is
 /// told (`task.md`, or the task profile the project `info` or the config
 /// names) after it, and the role's model and tools unless the flags name
-/// their own. Roles are found from `roles`. Other flags pass as they are.
+/// their own; and the role's sandbox. Roles are found from `roles`. Other
+/// flags pass as they are.
 fn told(
     dir: &Path,
     roles: &Path,
     lead: &Path,
     info: &Value,
     flags: &[&String],
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<String>), String> {
     let mut kept = Vec::new();
     let (mut agents, mut profile) = (false, None);
     let mut flags = flags.iter().map(|flag| flag.as_str());
@@ -863,7 +870,7 @@ fn told(
         }
     }
     if !agents && profile.is_none() {
-        return Ok(kept);
+        return Ok((kept, None));
     }
     // A value flag is --flag VALUE or --flag=VALUE.
     let named = |flag: &str| {
@@ -890,9 +897,10 @@ fn told(
     };
     // The memory of the lead's project, wherever the task works.
     let memory = agent_client::policy::memory_indexes(lead).map_err(|e| e.to_string())?;
-    let composed =
+    let composed = agent_client::policy::hiding(&agent_client::hidden::known(), || {
         agent_client::policy::instructions(dir, role.as_ref().filter(|r| !told_after(r)), &memory)
-            .map_err(|e| format!("{}: {e}", e.code()))?;
+    })
+    .map_err(|e| format!("{}: {e}", e.code()))?;
     let mut added = Vec::new();
     if let Some(role) = &role {
         if let Some(model) = role.model.as_ref().filter(|_| !named("--model")) {
@@ -907,7 +915,7 @@ fn told(
         crate::project::as_task(roles, info, &composed.text)?,
     ]);
     kept.extend(added);
-    Ok(kept)
+    Ok((kept, role.and_then(|role| role.sandbox)))
 }
 
 /// `brief` with each path in the folder `from` turned into the same path
@@ -1758,6 +1766,11 @@ fn confined_in(
         .stdin(Stdio::null());
     // None of the keys Agent keeps, as a bot's shell has none.
     for key in kept_keys() {
+        command.env_remove(key);
+    }
+    // git about `dir` alone: a hook's `GIT_DIR` and the like would name
+    // another repository.
+    for key in crate::git::LOCATING {
         command.env_remove(key);
     }
     let output = command.output().map_err(|e| format!("running git: {e}"))?;
@@ -3149,6 +3162,7 @@ mod tests {
                 &project.borrow(),
                 &flags.iter().collect::<Vec<_>>(),
             )
+            .map(|(flags, _)| flags)
         };
         let person = |flags: &[String]| {
             let at = flags.iter().position(|f| f == "--instructions").unwrap();
@@ -3164,6 +3178,26 @@ mod tests {
         let flags = told(&["--profile", "reviewer"]).unwrap();
         assert_eq!(flags[..4], ["--model", "a/b", "--tools", "shell,read"]);
         assert!(person(&flags).contains("Review it."));
+        // Its sandbox comes back beside the flags, for the task's settings.
+        std::fs::write(
+            dir.join(".agents/agents/reader.md"),
+            "---\nextends: reviewer\nsandbox: read-only\n---\nRead it.\n",
+        )
+        .unwrap();
+        let sandbox = |flags: &[&str]| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            let flags: Vec<&String> = flags.iter().collect();
+            super::told(&dir, &dir, &dir, &project.borrow(), &flags)
+                .unwrap()
+                .1
+        };
+        assert_eq!(
+            sandbox(&["--profile", "reader"]).as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(sandbox(&["--profile", "reviewer"]), None);
+        assert_eq!(sandbox(&["--agents"]), None);
+        std::fs::remove_file(dir.join(".agents/agents/reader.md")).unwrap();
         // The task's own picks win over the role's.
         let flags = told(&["--profile", "reviewer", "--model", "x/y"]).unwrap();
         assert_eq!(flags[..4], ["--model", "x/y", "--tools", "shell,read"]);

@@ -25,8 +25,8 @@ use agent_runtime::{
         Window, listed_command, unserved,
     },
     tools::{
-        Agents, Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill,
-        Stopper,
+        Agents, Cord, Files, HISTORY_PAGE_BYTES, Outcome, POLL_YIELD_MS, Place, Prepared,
+        ReadSource, Registry, Spill, Stopper,
     },
 };
 use bytes::Bytes;
@@ -607,6 +607,18 @@ fn shaped_other<'p>(
     settings: &Settings,
 ) -> Result<std::borrow::Cow<'p, Provider>> {
     provider.shaped(settings.max_output_tokens, settings.cache_hour(), None)
+}
+
+/// Of `asked`, the tools an agent `me` makes is given: those `me` has, and
+/// of them, those it may call.
+fn kept_tools(asked: &Value, me: &Value) -> Vec<Value> {
+    let own = me["tools"].as_array();
+    let allowed = me["allowed"].as_array();
+    (asked.as_array().into_iter().flatten())
+        .filter(|tool| own.is_some_and(|own| own.contains(tool)))
+        .filter(|tool| allowed.is_none_or(|allowed| allowed.contains(tool)))
+        .cloned()
+        .collect()
 }
 
 impl Turn {
@@ -5003,11 +5015,8 @@ impl Turn {
                     turn: wanted,
                     handle,
                     offset,
-                    limit,
                 }) => {
-                    match Box::pin(self.history(&call.call_id, bot, wanted, handle, offset, limit))
-                        .await
-                    {
+                    match Box::pin(self.history(&call.call_id, bot, wanted, handle, offset)).await {
                         Ok(outcome) => outcome,
                         Err(error) => failure(error),
                     }
@@ -5839,7 +5848,6 @@ impl Turn {
         wanted: Option<i64>,
         handle: Option<String>,
         offset: u64,
-        limit: usize,
     ) -> Result<Outcome> {
         let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
         // A handle names its bot and the store's number for the turn.
@@ -5876,7 +5884,7 @@ impl Turn {
         let mut page = self
             .store
             .read("history_read", move |db| {
-                db.history_read(&bot, wanted, offset, limit.min(budget))
+                db.history_read(&bot, wanted, offset, HISTORY_PAGE_BYTES.min(budget))
             })
             .await?;
         loop {
@@ -5924,6 +5932,7 @@ impl Turn {
                 delivery,
                 interrupt,
                 quotes,
+                replaces,
                 request_id,
             } => {
                 let mut delivery = delivery;
@@ -5952,7 +5961,7 @@ impl Turn {
                 let sent = request(json!({"op":"submit","bot":to,"request_id":request_id,
                     "prompt":message,"delivery":delivery,
                     "from":{"bot":self.bot,"turn":self.turn},
-                    "quotes":(!quotes.is_empty()).then_some(quotes)}))
+                    "quotes":(!quotes.is_empty()).then_some(quotes),"replaces":replaces}))
                 .await?;
                 let mut interrupted = Value::Null;
                 if let Some(turn) = running
@@ -5971,6 +5980,21 @@ impl Turn {
                 }
                 if !interrupted.is_null() {
                     answer["interrupted_turn"] = interrupted;
+                }
+                // What became of the message this one replaces.
+                let replaced = &sent["replaced"];
+                match replaced["status"].as_str() {
+                    None => {}
+                    Some("taken") => {
+                        answer["taken"] = replaced["handle"].clone();
+                        answer["taken_turn"] = replaced["turn"].clone();
+                    }
+                    // Still in line only for a retry of a send that
+                    // replaced nothing.
+                    Some("queued" | "ready" | "attached") => {
+                        answer["waiting"] = replaced["handle"].clone();
+                    }
+                    Some(_) => answer["replaced"] = replaced["handle"].clone(),
                 }
                 answer
             }
@@ -6101,7 +6125,7 @@ impl Turn {
                     let folder = (made.get("workspace"))
                         .and_then(Value::as_str)
                         .map_or_else(|| workspace.to_path_buf(), std::path::PathBuf::from);
-                    let mut create = self
+                    let (mut create, looser) = self
                         .spawned(
                             &me,
                             &folder,
@@ -6109,6 +6133,7 @@ impl Turn {
                             (instructions, agents, profile),
                             model,
                             effort,
+                            settings.as_ref().is_some_and(|s| s.contains_key("sandbox")),
                         )
                         .await?;
                     // What it asked for over what it would inherit: the
@@ -6127,16 +6152,13 @@ impl Turn {
                     {
                         own.extend(over);
                     }
-                    // A caller kept to some of its tools (a fork's `allow`)
-                    // makes agents kept to them too: `create` takes no
-                    // `allow`, so their tools are those it may call.
-                    if let Some(allowed) = me["allowed"].as_array() {
-                        let tools: Vec<Value> = (create["tools"].as_array().into_iter().flatten())
-                            .filter(|tool| allowed.contains(tool))
-                            .cloned()
-                            .collect();
-                        create["tools"] = json!(tools);
-                    }
+                    // Its tools are this agent's at most, whatever a role or
+                    // the call names, so every gate it inherits names them
+                    // as this one's do. A caller kept to some of its tools
+                    // (a fork's `allow`) makes agents kept to them too:
+                    // `create` takes no `allow`, so their tools are those
+                    // it may call.
+                    create["tools"] = json!(kept_tools(&create["tools"], &me));
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
                     // This call made again, after its folder's files or this
@@ -6152,6 +6174,15 @@ impl Turn {
                                     .is_some_and(|field| {
                                         field != "workspace" && !asked.iter().any(|a| a == field)
                                     }) => {}
+                        // Refused for the profile's sandbox, in its words.
+                        Err(error)
+                            if error.code == "invalid_setting"
+                                && (error.detail.as_deref())
+                                    .is_some_and(|why| why.starts_with("sandbox:"))
+                                && let Some(why) = looser =>
+                        {
+                            return Err(Error::with("invalid_setting", why));
+                        }
                         made => {
                             made?;
                         }
@@ -6242,7 +6273,10 @@ impl Turn {
     /// or its own; instructions as `run --new` gives them (the text given,
     /// the preamble, or with `agents` or a profile, those a client composes
     /// for the folder, in the profile's role); the role's tools or its own,
-    /// search kept to a model that has it.
+    /// search kept to a model that has it; its settings, in the role's
+    /// sandbox unless the call names one (`sandbox_asked`), with why the
+    /// daemon will refuse a new agent in it when it is looser.
+    #[allow(clippy::too_many_arguments)]
     async fn spawned(
         &self,
         me: &Value,
@@ -6251,7 +6285,8 @@ impl Turn {
         (given, agents, profile): (Option<String>, bool, Option<String>),
         model: Option<String>,
         effort: Option<String>,
-    ) -> Result<Value> {
+        sandbox_asked: bool,
+    ) -> Result<(Value, Option<String>)> {
         // The folder this turn works in, which may be its own for the turn.
         let Some(workspace) = workspace.to_str().map(str::to_owned) else {
             return Err(Error::with(
@@ -6267,7 +6302,10 @@ impl Turn {
             (None, false) => (None, agent_client::policy::PREAMBLE.to_owned()),
             (None, true) => {
                 let folder = workspace.clone();
-                tokio::task::spawn_blocking(move || {
+                // None of the folders kept from its sandbox is read for it,
+                // through a link its folder holds.
+                let hidden = self.registry.daemon().unreadable.clone();
+                tokio::task::spawn_blocking(move || agent_client::policy::hiding(&hidden, || {
                     let folder = std::path::Path::new(&folder);
                     let failed = |error: agent_client::policy::Failure| {
                         Error::with(error.code(), error.to_string())
@@ -6292,7 +6330,7 @@ impl Turn {
                         agent_client::policy::instructions(folder, role.as_ref(), &memory)
                             .map_err(failed)?;
                     Ok::<_, Error>((role, composed.text))
-                })
+                }))
                 .await
                 .map_err(|_| Error::new("profile_unreadable"))??
             }
@@ -6320,6 +6358,10 @@ impl Turn {
         // inherits covers them; a grammar tool reaches a family without
         // grammars as a function taking its text. Search goes where the
         // model has none.
+        let sandbox = role.as_ref().and_then(|role| {
+            let sandbox = role.sandbox.clone()?;
+            Some((role.name.clone(), sandbox))
+        });
         let tools: Vec<String> = match role.and_then(|role| role.tools) {
             Some(tools) => tools,
             None => {
@@ -6332,16 +6374,35 @@ impl Turn {
                     .collect()
             }
         };
-        let settings = (self.settings.get())
+        let mut settings = (self.settings.get())
             .map(serde_json::to_value)
             .transpose()?
             .unwrap_or_else(|| json!({}));
-        Ok(
+        // The profile's sandbox over this agent's, never looser. One looser
+        // is asked for as it is, so the daemon refuses a new agent and a
+        // resend still finds the one it made; why is said in the profile's
+        // words.
+        let mut looser = None;
+        if let (Some((role, sandbox)), false, Some(own)) =
+            (sandbox, sandbox_asked, settings.as_object_mut())
+            && let Err(why) = agent_client::policy::with_sandbox(own, &sandbox)
+        {
+            own.insert("sandbox".into(), json!(sandbox));
+            // Folders and network go with workspace-write alone.
+            if sandbox != "workspace-write" {
+                for key in ["writable", "network", "unix_sockets"] {
+                    own.remove(key);
+                }
+            }
+            looser = Some(format!("profile {role}: {why}"));
+        }
+        Ok((
             json!({"bot":name,"workspace":workspace,"model":model,"effort":effort,
             "instructions":instructions,"tools":tools,"settings":settings,
             "compaction_instructions":me["compaction_instructions"],
             "compaction_model":compaction_model}),
-        )
+            looser,
+        ))
     }
 
     /// This bot's project's agents, as a name pattern: those named as it
@@ -8607,6 +8668,17 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_agent_makes_agents_with_at_most_its_own_tools() {
+        use super::{json, kept_tools};
+        let asked = json!(["read", "shell", "apply_patch"]);
+        let me = json!({"tools": ["read", "shell"]});
+        assert_eq!(kept_tools(&asked, &me), [json!("read"), json!("shell")]);
+        let me = json!({"tools": ["read", "shell"], "allowed": ["read"]});
+        assert_eq!(kept_tools(&asked, &me), [json!("read")]);
+        assert!(kept_tools(&asked, &json!({})).is_empty());
+    }
+
     /// The streams the store keeps reach its writer packed, so the writer
     /// only inserts them; what is not worth packing goes on whole.
     #[tokio::test]

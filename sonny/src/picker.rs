@@ -24,16 +24,35 @@ pub struct Row {
 impl Row {
     pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
-            label: label.into(),
-            detail: detail.into(),
+            label: shown(label.into()),
+            detail: shown(detail.into()),
             badge: None,
         }
     }
 
     pub fn badge(mut self, badge: impl Into<String>) -> Self {
-        self.badge = Some(badge.into());
+        self.badge = Some(shown(badge.into()));
         self
     }
+}
+
+/// `text` as a row shows it: each character a terminal acts on rather
+/// than shows (a control, a bidirectional override) escaped, so what a
+/// row read from a file names can't hide or restyle what is picked.
+fn shown(text: String) -> String {
+    let acted_on = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    };
+    if !text.chars().any(acted_on) {
+        return text;
+    }
+    text.chars()
+        .flat_map(|c| match acted_on(c) {
+            true => c.escape_default().collect::<Vec<_>>(),
+            false => vec![c],
+        })
+        .collect()
 }
 
 /// What the person picked: a row's index, or with `typed` allowed, what

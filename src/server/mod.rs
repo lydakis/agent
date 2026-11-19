@@ -23,8 +23,8 @@ use agent_runtime::{
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
         Answer, Binding, Bot, Decision, Delivery, ENV_JSON, FOLDERS_JSON, Fork, Gate, MAX_GATES,
-        Publication, RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting,
-        Wake,
+        Publication, RULES_JSON, Replaced, Settings, Started, Step, Stepped, Store, TurnOptions,
+        Waiting, Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Prepared, Registry, ToolList,
@@ -194,9 +194,20 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             model,
             effort,
             delivery,
+            replaces,
             ..
         } => (
-            output::encoded_len(&(id, bot, bot, request_id, model, effort, delivery)),
+            // The handle of a replaced message names the bot once more.
+            output::encoded_len(&(
+                id,
+                bot,
+                bot,
+                replaces.and(Some(bot)),
+                request_id,
+                model,
+                effort,
+                delivery,
+            )),
             output::encoded_len(&(bot, request_id)),
             0,
             Ok(0),
@@ -227,10 +238,12 @@ pub struct Request {
     workspace_error: Option<Error>,
 }
 impl Request {
-    // Resolve explicit workspaces on the session's read side, before it
-    // enters the shared dispatcher. The resolved name is also the one
-    // checked for a bot caller. Keep errors for the normal validation
-    // point, after authorization and request ordering.
+    // Resolve explicit workspaces, and the folders a new bot may write, on
+    // the session's read side, before it enters the shared dispatcher. The
+    // resolved names are the ones checked for a bot caller and the ones
+    // kept: resolved again later, a folder swapped for a link since the
+    // check would be kept by where the link points. Keep errors for the
+    // normal validation point, after authorization and request ordering.
     fn workspace_slot(&mut self) -> Option<&mut String> {
         match &mut self.command {
             Command::Create { workspace, .. }
@@ -240,14 +253,65 @@ impl Request {
         }
     }
 
-    fn resolve_workspace(&mut self) {
-        if let Some(path) = self.workspace_slot() {
-            match workspace(path) {
-                Ok(real) => *path = real,
+    /// The folders a new bot may write, as its request names them.
+    fn writable_slot(&mut self) -> Option<&mut Vec<String>> {
+        match &mut self.command {
+            Command::Create { settings, .. } if !settings.writable.is_empty() => {
+                Some(&mut settings.writable)
+            }
+            _ => None,
+        }
+    }
+
+    /// The paths to resolve, given away to be resolved off the runtime
+    /// thread: [`Request::resolved`] puts them back.
+    fn unresolved(&mut self) -> (Option<String>, Option<Vec<String>>) {
+        let workspace = self.workspace_slot().cloned();
+        let writable = self.writable_slot().map(std::mem::take);
+        (workspace, writable)
+    }
+
+    fn resolved(&mut self, (workspace, writable): Resolved) {
+        if let Some(found) = workspace {
+            match found {
+                Ok(real) => *self.workspace_slot().expect("a request named it") = real,
                 Err(error) => self.workspace_error = Some(error),
             }
         }
+        if let Some((found, given)) = writable {
+            let slot = match &mut self.command {
+                Command::Create { settings, .. } => &mut settings.writable,
+                _ => unreachable!("only a create names writable folders"),
+            };
+            match found {
+                Ok(real) => *slot = real,
+                Err(error) => {
+                    *slot = given;
+                    self.workspace_error.get_or_insert(error);
+                }
+            }
+        }
     }
+
+    fn resolve_workspace(&mut self) {
+        let paths = resolve(self.unresolved());
+        self.resolved(paths);
+    }
+}
+/// What [`resolve`] found for a request's paths: its folder, and its
+/// writable folders with them as given.
+type Resolved = (
+    Option<Result<String>>,
+    Option<(Result<Vec<String>>, Vec<String>)>,
+);
+/// A request's folder and writable folders, each by its real path.
+fn resolve((given, writable): (Option<String>, Option<Vec<String>>)) -> Resolved {
+    let folder = given.map(|path| workspace(&path));
+    let writable = writable.map(|mut paths| {
+        let given = paths.clone();
+        (writable_real(&mut paths).map(|()| paths), given)
+    });
+    (folder, writable)
 }
 /// A declared call's answer: text, or parts in the order the model reads
 /// them, text and pictures, as a provider's own tool results take them.
@@ -559,6 +623,9 @@ enum Command {
         /// A JSON Schema the turn's reply follows, which the provider
         /// enforces as structured output; absent leaves it free text.
         output_schema: Option<Value>,
+        /// A message of this bot's, from this same sender, that this one
+        /// replaces: withdrawn if still in line, else left as it is.
+        replaces: Option<i64>,
     },
     Interrupt {
         bot: String,
@@ -1759,7 +1826,10 @@ fn workspace(path: &str) -> Result<String> {
 /// A new bot's sandbox, made ready to keep: refused where none can run, so
 /// a bot that asked for one never runs unconfined, and each folder it may
 /// write named by its real path, as the sandbox sees it.
-fn confine(settings: &mut Settings) -> Result<()> {
+/// A `create`'s writable folders are resolved as the request is read
+/// ([`Request::resolved`]), and kept as they were checked; a change's,
+/// `resolve`, here.
+fn confine(settings: &mut Settings, resolve: bool) -> Result<()> {
     use agent_runtime::sandbox::Mode;
     if matches!(
         settings.sandbox,
@@ -1767,13 +1837,8 @@ fn confine(settings: &mut Settings) -> Result<()> {
     ) {
         agent_runtime::sandbox::available()?;
     }
-    for path in &mut settings.writable {
-        let real = std::fs::canonicalize(&*path)
-            .map_err(|_| Error::with("path_not_found", path.clone()))?;
-        *path = real
-            .to_str()
-            .ok_or(Error::with("path_not_utf8", path.clone()))?
-            .to_owned();
+    if resolve {
+        writable_real(&mut settings.writable)?;
     }
     settings.writable.sort();
     settings.writable.dedup();
@@ -1788,6 +1853,18 @@ fn confine(settings: &mut Settings) -> Result<()> {
     }
     settings.unix_sockets.sort();
     settings.unix_sockets.dedup();
+    Ok(())
+}
+/// Each of `paths` by its real path, as the sandbox sees it.
+fn writable_real(paths: &mut [String]) -> Result<()> {
+    for path in paths {
+        let real = std::fs::canonicalize(&*path)
+            .map_err(|_| Error::with("path_not_found", path.clone()))?;
+        *path = real
+            .to_str()
+            .ok_or(Error::with("path_not_utf8", path.clone()))?
+            .to_owned();
+    }
     Ok(())
 }
 /// What a `configure` gives, by its names: what a change while a turn runs
@@ -2150,8 +2227,8 @@ enum Pending {
         reserved: bool,
         /// Why no turn may start, as the refusal names it.
         held: Option<&'static str>,
-        answer: Answer<(i64, Started)>,
-        answered: Option<Result<(i64, Started)>>,
+        answer: Answer<(i64, Started, Option<Replaced>)>,
+        answered: Option<Result<(i64, Started, Option<Replaced>)>>,
     },
     /// The bot's record, and the cursor of its `created` event.
     Create {
@@ -4127,14 +4204,15 @@ impl Service {
         request_id: String,
         delivery: Delivery,
         held: Option<&'static str>,
-        result: Result<(i64, Started)>,
+        result: Result<(i64, Started, Option<Replaced>)>,
     ) -> Result<Value> {
         // While draining or paused no turn starts: `reject` work is refused,
         // and queued work waits durably for the next daemon or `resume`.
-        let (identity, started) = result.map_err(|error| match (error.code.as_str(), held) {
-            ("active_agent_limit", Some(held)) => Error::new(held),
-            _ => error,
-        })?;
+        let (identity, started, replaced) =
+            result.map_err(|error| match (error.code.as_str(), held) {
+                ("active_agent_limit", Some(held)) => Error::new(held),
+                _ => error,
+            })?;
         let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
         if started.fresh && started.status == "running" {
             // A steer queued behind it in the window is its steer once
@@ -4171,16 +4249,20 @@ impl Service {
         if started.fresh && started.carried {
             self.kept.insert(bot.clone());
         }
-        if started.status == "ready" {
+        // A withdrawn message that was ready gave its place to the next.
+        if started.status == "ready" || replaced.as_ref().is_some_and(|r| r.status == "withdrawn") {
             self.ready_hint = true;
         }
         // The message's number, and the turn's when it opened one.
         let turn = started.opened.then_some(started.turn);
-        Ok(
-            json!({"bot":bot,"bot_id":identity,"message":started.turn,"turn":turn,
+        let mut answer = json!({"bot":bot,"bot_id":identity,"message":started.turn,"turn":turn,
             "request_id":request_id,"duplicate":!started.fresh,"status":started.status,
-            "cursor":cursor,"handle":format!("{bot}/{}", started.turn)}),
-        )
+            "cursor":cursor,"handle":format!("{bot}/{}", started.turn)});
+        if let Some(replaced) = replaced {
+            answer["replaced"] = json!({"message":replaced.message,"status":replaced.status,
+                "turn":replaced.turn,"handle":format!("{bot}/{}", replaced.message)});
+        }
+        Ok(answer)
     }
 
     /// Look for attached messages due no later than `at`.
@@ -5190,10 +5272,11 @@ impl Service {
                 let sandboxed = (agent_runtime::store::SANDBOX.iter())
                     .any(|key| named.iter().any(|name| name == key));
                 if sandboxed {
-                    merged =
-                        tokio::task::spawn_blocking(move || confine(&mut merged).map(|()| merged))
-                            .await
-                            .map_err(|_| Error::new("sandbox_unavailable"))??;
+                    merged = tokio::task::spawn_blocking(move || {
+                        confine(&mut merged, true).map(|()| merged)
+                    })
+                    .await
+                    .map_err(|_| Error::new("sandbox_unavailable"))??;
                 }
                 Some(merged)
             }
@@ -5772,10 +5855,11 @@ impl Service {
                 turn::shaped(served, &settings)?;
                 // Checking for a sandbox and resolving folders touch the
                 // filesystem: off the runtime thread.
-                let settings =
-                    tokio::task::spawn_blocking(move || confine(&mut settings).map(|()| settings))
-                        .await
-                        .map_err(|_| Error::new("sandbox_unavailable"))??;
+                let settings = tokio::task::spawn_blocking(move || {
+                    confine(&mut settings, false).map(|()| settings)
+                })
+                .await
+                .map_err(|_| Error::new("sandbox_unavailable"))??;
                 if let Some(level) = &effort {
                     family.check_effort(level)?;
                 }
@@ -7413,8 +7497,12 @@ impl Service {
                 images,
                 wait_ms,
                 output_schema,
+                replaces,
             } => {
                 name("request_id", &request_id)?;
+                if replaces.is_some_and(|message| message < 1) {
+                    return fail_with("invalid_replaces", "replaces names a message, 1 or more");
+                }
                 let images = images_checked(
                     images.unwrap_or_default(),
                     |images| images.iter().collect(),
@@ -7586,10 +7674,13 @@ impl Service {
                 // A steer arms the running turn inside its committing job,
                 // as `end_queued` does, so no round boundary before the
                 // answer finds it waiting behind a cleared flag.
+                // Withdrawing a message in line may expose steers behind it,
+                // as `end_queued` does, whatever this one's delivery.
+                let steering = matches!(delivery, Delivery::Steer | Delivery::Attach);
                 let steers = self
                     .active
                     .get(&bot)
-                    .filter(|_| matches!(delivery, Delivery::Steer | Delivery::Attach))
+                    .filter(|_| steering || replaces.is_some())
                     .map(|active| active.steers.clone());
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
@@ -7597,17 +7688,31 @@ impl Service {
                     .store
                     .queue("begin", move |db| {
                         let identity = db.identity(&b, bot_id)?;
-                        let started =
+                        let begin = |db: &mut agent_runtime::store::Database| {
                             db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
                                 validate_provider(&providers, bot, model)
-                            })?;
-                        if started.fresh
-                            && matches!(started.status, "queued" | "attached")
+                            })
+                        };
+                        // The replaced message is withdrawn and this one
+                        // sent in one step: no turn takes it in between, and
+                        // a refused send leaves it in line.
+                        let (started, replaced) = match replaces {
+                            None => (begin(db)?, None),
+                            Some(message) => db.atomic(|db| {
+                                let replaced = db.replace(&b, message, &r, &options)?;
+                                Ok((begin(db)?, Some(replaced)))
+                            })?,
+                        };
+                        let withdrawn = replaced.as_ref().is_some_and(|r| r.status == "withdrawn");
+                        if (withdrawn
+                            || (steering
+                                && started.fresh
+                                && matches!(started.status, "queued" | "attached")))
                             && let Some(steers) = &steers
                         {
                             steers.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Ok((identity, started))
+                        Ok((identity, started, replaced))
                     })
                     .await;
                 let answer = match queued {
@@ -9156,6 +9261,7 @@ mod tests {
             images: None,
             wait_ms: None,
             output_schema: None,
+            replaces: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins
@@ -10288,6 +10394,40 @@ mod tests {
             request_id: None,
             starts_line: false,
         }
+    }
+    #[test]
+    fn a_new_bot_s_folders_are_kept_as_they_were_checked() {
+        let dir = std::fs::canonicalize(scratch("checked")).unwrap();
+        let (workspace, kept) = (dir.join("workspace"), dir.join("kept"));
+        for folder in [&workspace, &kept] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        let mut command = create("b", &workspace);
+        let Command::Create { settings, .. } = &mut command else {
+            unreachable!()
+        };
+        settings.writable = vec![dir.join("./kept").to_str().unwrap().to_owned()];
+        let mut request = Request {
+            id: Value::Null,
+            command,
+            workspace_error: None,
+        };
+        request.resolve_workspace();
+        assert!(request.workspace_error.is_none());
+        // The folder checked is swapped for a link after the check.
+        std::fs::rename(&kept, dir.join("old")).unwrap();
+        std::os::unix::fs::symlink("/etc", &kept).unwrap();
+        let Command::Create { mut settings, .. } = request.command else {
+            unreachable!()
+        };
+        let mut again = (*settings).clone();
+        confine(&mut settings, false).unwrap();
+        assert_eq!(settings.writable, [kept.to_str().unwrap()]);
+        // Resolved again, it would be where the link points.
+        confine(&mut again, true).unwrap();
+        let etc = std::fs::canonicalize("/etc").unwrap();
+        assert_eq!(again.writable, [etc.to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("agent-{name}-{}", std::process::id()));

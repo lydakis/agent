@@ -424,8 +424,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'history', 'call_id': 'history-1',
                            'arguments': json.dumps({'turn': int(user[8:].split(',')[0]),
-                                                    'offset': int(user.split(',')[1]) if ',' in user else 0,
-                                                    **({'limit': int(user.split(',')[2])} if user.count(',') == 2 else {})})}]
+                                                    'offset': int(user.split(',')[1]) if ',' in user else 0})}]
                 if getattr(self.server, 'history_prefill', 0):
                     text = 'p' * self.server.history_prefill
                     output.insert(0, {'type': 'message', 'role': 'assistant',
@@ -3243,7 +3242,7 @@ class RuntimeTests(ModelFixture):
             # Exercise remaining space after substantial work in this same turn.
             self.model.history_prefill = 56000 if len(pieces) == 1 else 0
             turn = client.request('submit', bot='Bob', request_id=f'page-{offset}',
-                                  prompt=f'history:1,{offset}' + (',97' if offset == 0 else ''))['result']['message']
+                                  prompt=f'history:1,{offset}')['result']['message']
             finished = client.finished(turn)['data']
             self.assertEqual(finished['status'], 'completed', finished)
             requests = []
@@ -3255,7 +3254,7 @@ class RuntimeTests(ModelFixture):
             page = json.loads(result['output'])
             completed_items += page['items']
             self.assertEqual(page['offset'], offset)
-            self.assertLessEqual(len(page['text'].encode()), 97 if offset == 0 else 65536)
+            self.assertLessEqual(len(page['text'].encode()), 65536)
             for request in requests:
                 self.assertLessEqual(len(json.dumps(request['input'], ensure_ascii=False, separators=(',', ':')).encode()) - 2, 65536)
             pieces.append(page['text'])

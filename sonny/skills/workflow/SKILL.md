@@ -21,6 +21,11 @@ run a workflow over that list. For larger work, run several in turn, one per
 phase (understand, design, change, review), and read each result before you
 write the next.
 
+When the pieces are alike (one change across many files, one write-up per
+source), make one first: run a single agent on one piece, check what it made
+yourself, and fix the prompt until that piece is right. Then run the rest with
+the checked piece in their prompt as the example.
+
 The language is Claude Code's dynamic workflow language, name for name, so a
 script written for one runs on the other.
 

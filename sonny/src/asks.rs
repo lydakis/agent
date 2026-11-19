@@ -298,7 +298,7 @@ pub fn tool() -> Value {
         "name": TOOL,
         "description": "Put a decision in front of the person: a fork in the road, an architectural \
             choice, or a step that cannot be undone, where their pick changes what you build. Sonny \
-            shows it where you ask it; say what each option does to their goal. Check `sonny ask \
+            shows it where you ask it. Check `sonny ask \
             list` first: an answer there may settle yours. Ask once, one decision per call, and do \
             not repeat it in your reply. When their pick approves an \
             action, say what in covers: their yes covers that action, target and revision alone, so \
@@ -333,7 +333,7 @@ pub fn tool() -> Value {
                         "properties": {
                             "label": {"type": "string", "description": "The option, in a few words."},
                             "explanation": {"type": "string",
-                                "description": "What happens if the person picks it, in one sentence."}
+                                "description": "What the person will see or get if they pick it, in their own words, in one sentence."}
                         },
                         "required": ["label", "explanation"],
                         "additionalProperties": false
@@ -1311,12 +1311,11 @@ pub(crate) fn fire(
         ),
         _ if step => format!(
             "{STEP}{question}{STEP_WAITS} so do not go ahead with what needs it. Go on with what \
-             does not depend on it, and say in one line what it holds up, so they see it again. \
-             {tail}"
+             does not depend on it. {tail}"
         ),
         _ => format!(
             "{WAIT}{question}{WAIT_WAITS} person, so do not go ahead with it. Go on with what does \
-             not depend on it, and say in one line what it holds up, so they see it again. {tail}"
+             not depend on it. {tail}"
         ),
     }
 }
@@ -2726,6 +2725,22 @@ mod tests {
     }
 
     #[test]
+    fn an_option_says_what_the_person_sees_or_gets_once() {
+        // George, 11-19: picks on cards whose options said how a change
+        // works left him asking what it does for him.
+        let tool = tool();
+        let explanation = tool["parameters"]["properties"]["options"]["items"]["properties"]
+            ["explanation"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(explanation.contains("What the person will see or get if they pick it"));
+        assert!(explanation.contains("in their own words"));
+        // Said there alone, not again in the tool's description.
+        let description = tool["description"].as_str().unwrap();
+        assert!(!description.contains("each option"));
+    }
+
+    #[test]
     fn a_step_only_the_person_can_take_is_an_ask_with_its_command_and_no_options() {
         let tool = tool();
         let required = tool["parameters"]["required"].as_array().unwrap();
@@ -2902,6 +2917,13 @@ mod tests {
         let step = fire("Sign in to npm", Unanswered::Wait, None, "", true);
         assert!(step.contains("your step went: \"Sign in to npm\""));
         assert!(step.contains("do not go ahead with what needs it"));
+        // The card, the composer and the pane already show an open ask
+        // (George, 11-19): a reminder wakes the agent without asking it
+        // for a line about what is held up.
+        for fired in [&wait, &step] {
+            assert!(fired.contains("Go on with what does not depend on it. This is Sonny"));
+            assert!(!fired.contains("one line"));
+        }
     }
 
     #[test]
@@ -2956,6 +2978,13 @@ mod tests {
         .unwrap();
         assert_eq!((step.question.as_str(), step.step), ("npm login", true));
         assert_eq!(said(&step), "Waits for you to run it; a reminder at 01:55.");
+        // A reminder set before its fire dropped the line about what is
+        // held up reads back the same.
+        let old = format!(
+            "{WAIT}{question}{WAIT_WAITS} person, so do not go ahead with it. Go on with what \
+             does not depend on it, and say in one line what it holds up, so they see it again."
+        );
+        assert_eq!(reminder(gate, when, &old), Some(wait.clone()));
         // A name with a quote in it, as the gate writes it.
         let quoted = reminder("'/s' ask open 'it'\\''s' 3 'c'", when, &later).unwrap();
         assert_eq!(quoted.asker, "it's");

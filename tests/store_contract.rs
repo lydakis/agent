@@ -23516,3 +23516,148 @@ fn glob_matches_as_the_store_does() {
         assert_eq!(glob(pattern, name), stored, "{pattern} on {name}");
     }
 }
+
+#[test]
+fn a_message_in_line_is_replaced_by_its_sender_alone_and_one_taken_in_stays() {
+    let mut db = db();
+    for bot in ["Bob", "Carol", "Dan"] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+    }
+    let sent = |db: &mut Database, bot: &str, request: &str| {
+        db.begin(
+            bot,
+            request,
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    let (bob, dan) = (sent(&mut db, "Bob", "b"), sent(&mut db, "Dan", "d"));
+    let from = |sender: &str, turn: i64, delivery| TurnOptions {
+        delivery,
+        from: Some((sender.into(), turn)),
+        ..TurnOptions::default()
+    };
+    let running = sent(&mut db, "Carol", "c");
+    let first = db
+        .begin(
+            "Carol",
+            "b1",
+            "upload as picked",
+            true,
+            &from("Bob", bob, Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // Another sender, another bot's message, and a person may not.
+    for (bot, options) in [
+        ("Carol", from("Dan", dan, Delivery::Queue)),
+        ("Carol", TurnOptions::default()),
+        ("Dan", from("Bob", bob, Delivery::Queue)),
+    ] {
+        let refused = db.replace(bot, first, "x", &options).unwrap_err();
+        assert!(
+            matches!(refused.code.as_str(), "not_permitted" | "turn_not_found"),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(db.turn_status("Carol", first).unwrap(), "queued");
+    // A send refused after the withdraw leaves the message in line.
+    let refused = db.atomic(|db| {
+        db.replace("Carol", first, "b2", &from("Bob", bob, Delivery::Queue))?;
+        db.begin(
+            "Carol",
+            "b2",
+            "reversed order",
+            true,
+            &from("Bob", bob, Delivery::Queue),
+            |_, _| agent_runtime::fail("provider_not_found"),
+        )
+    });
+    assert_eq!(refused.unwrap_err().code, "provider_not_found");
+    assert_eq!(db.turn_status("Carol", first).unwrap(), "queued");
+    // Its sender replaces it: withdrawn, kept in history, and the new one
+    // waits in its place.
+    let replaced = db
+        .replace("Carol", first, "b2", &from("Bob", bob, Delivery::Queue))
+        .unwrap();
+    assert_eq!(
+        (replaced.status.as_str(), replaced.turn),
+        ("withdrawn", None)
+    );
+    let second = db
+        .begin(
+            "Carol",
+            "b2",
+            "reversed order",
+            true,
+            &from("Bob", bob, Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(second.status, "queued");
+    assert_eq!(db.turn_status("Carol", first).unwrap(), "withdrawn");
+    // A retry of the same send withdraws nothing and answers the same.
+    let again = db
+        .replace("Carol", first, "b2", &from("Bob", bob, Delivery::Queue))
+        .unwrap();
+    assert_eq!(again.status, "withdrawn");
+    // A steer the running turn took in stays: the new one follows it.
+    let steer = db
+        .begin(
+            "Carol",
+            "b3",
+            "and the tests",
+            true,
+            &from("Bob", bob, Delivery::Steer),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.absorb(
+        running,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let taken = db
+        .replace("Carol", steer, "b4", &from("Bob", bob, Delivery::Steer))
+        .unwrap();
+    assert_eq!(
+        (taken.status.as_str(), taken.turn),
+        ("taken", Some(running))
+    );
+    assert_eq!(db.turn_status("Carol", steer).unwrap(), "taken");
+    // A bot deleted and made again under its name is another sender.
+    db.create("Eve", Some("/synthetic"), binding()).unwrap();
+    let eve = sent(&mut db, "Eve", "e");
+    let note = db
+        .begin(
+            "Carol",
+            "e1",
+            "a note",
+            true,
+            &from("Eve", eve, Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(eve, vec![assistant("done")], &[], None).unwrap();
+    db.finish(eve, None).unwrap();
+    db.delete_bot("Eve").unwrap();
+    db.create("Eve", Some("/synthetic"), binding()).unwrap();
+    let again = sent(&mut db, "Eve", "e2");
+    let refused = db
+        .replace("Carol", note, "e3", &from("Eve", again, Delivery::Queue))
+        .unwrap_err();
+    assert_eq!(refused.code, "not_permitted");
+    assert_eq!(db.turn_status("Carol", note).unwrap(), "queued");
+}

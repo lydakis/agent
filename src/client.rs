@@ -133,6 +133,8 @@ struct Options {
     images: Vec<String>,
     /// `run --quote`: turns whose words the prompt quotes.
     quotes: Vec<Value>,
+    /// `run --replaces`: the message, `BOT/N`, this prompt replaces.
+    replaces: Option<(String, i64)>,
     turn: Option<i64>,
     keep_turns: Option<usize>,
     /// `follow --all`: every bot on one connection.
@@ -221,6 +223,7 @@ fn parse(args: &[String]) -> Result<Options> {
         budget_counts: None,
         images: Vec::new(),
         quotes: Vec::new(),
+        replaces: None,
         turn: None,
         keep_turns: None,
         all: false,
@@ -547,6 +550,15 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--image" => options.images.push(value),
                     "--quote" => options.quotes.push(quote(&value)?),
+                    "--replaces" => {
+                        let parsed = value.rsplit_once('/').and_then(|(bot, message)| {
+                            let message = message.parse::<i64>().ok().filter(|m| *m > 0)?;
+                            (!bot.is_empty()).then(|| (bot.to_owned(), message))
+                        });
+                        options.replaces = Some(
+                            parsed.ok_or_else(|| Error::with("usage", "--replaces needs BOT/N"))?,
+                        );
+                    }
                     "--turn-budget-tokens" => {
                         options.turn_budget_tokens = Some(value.parse().map_err(|_| {
                             Error::with("usage", "--turn-budget-tokens needs an integer")
@@ -2096,6 +2108,17 @@ fn run(options: &Options) -> Result<i32> {
         );
     }
     let bot = options.bot.clone().unwrap_or_else(|| unique("bot"));
+    // Only a message sent to this same bot, which a new bot has none of.
+    let replaces = match &options.replaces {
+        None => None,
+        Some((to, message)) if *to == bot && !created => Some(*message),
+        Some((to, message)) => {
+            return fail_with(
+                "usage",
+                format!("--replaces names a message sent to --bot {bot}, not {to}/{message}"),
+            );
+        }
+    };
     // One key for the creation and the submission, so resending the same
     // command gets the bot and the turn it made the first time.
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
@@ -2155,6 +2178,14 @@ fn run(options: &Options) -> Result<i32> {
                 .collect(),
         };
         let mut settings = options.settings.clone();
+        // The role's sandbox, unless --sandbox names one; the daemon keeps
+        // it no looser than its creator's.
+        if let Some(sandbox) = role.as_ref().and_then(|r| r.sandbox.as_deref())
+            && !settings.contains_key("sandbox")
+        {
+            agent_client::policy::with_sandbox(&mut settings, sandbox)
+                .map_err(|why| Error::with("invalid_setting", why))?;
+        }
         if options.approval.as_deref() == Some("never") {
             settings.insert("approval_policy".into(), json!("never"));
         }
@@ -2255,6 +2286,7 @@ fn run(options: &Options) -> Result<i32> {
                 "effort":if created { Value::Null } else { json!(options.effort) },
                 "delivery":delivery,"expected_turn":options.turn,"from":from,
                 "quotes":(!options.quotes.is_empty()).then_some(&options.quotes),
+                "replaces":replaces,
                 "budget_tokens":options.turn_budget_tokens,
                 "budget_counts":options.turn_budget_tokens.and(options.budget_counts),
                 "wait_ms":wait_ms}),
@@ -2297,8 +2329,15 @@ fn run(options: &Options) -> Result<i32> {
         renderer.event(&mut connection, &live)?;
     }
     if options.pretty {
+        // What became of the message it replaces.
+        let replaced = &submitted["replaced"];
+        let replacing = match (replaced["status"].as_str(), replaced["handle"].as_str()) {
+            (Some("taken"), Some(handle)) => format!(" (after {handle}, already taken in)"),
+            (Some("withdrawn" | "failed"), Some(handle)) => format!(" (replacing {handle})"),
+            _ => String::new(),
+        };
         eprintln!(
-            "agent: {bot}/{turn}{}{}",
+            "agent: {bot}/{turn}{}{}{replacing}",
             if created { " (new bot)" } else { "" },
             workspace
                 .as_deref()
@@ -2758,7 +2797,7 @@ fn audit(options: &Options) -> Result<i32> {
         left -= rows.len();
         for row in rows {
             if options.pretty {
-                say!("{}", audit_line(row));
+                say!("{}", visible(&audit_line(row)));
             } else {
                 if !first {
                     say_raw!(",");
@@ -2856,14 +2895,15 @@ fn approvals(options: &Options) -> Result<i32> {
         }
         for call in &calls {
             if options.pretty {
-                say!(
+                let line = format!(
                     "{} turn {} {}",
                     call["bot"].as_str().unwrap_or(""),
                     call["turn"],
                     call_line(call)
                 );
+                say!("{}", visible(&line));
                 for line in answer_lines(call, &options.target) {
-                    say!("{line}");
+                    say!("{}", visible(&line));
                 }
             } else {
                 if !first {
@@ -3148,7 +3188,7 @@ fn pages(options: &Options, op: &str, row: impl Fn(&Value) -> String) -> Result<
         left -= turns.len();
         for turn in turns {
             if options.pretty {
-                say!("{}", row(turn));
+                say!("{}", visible(&row(turn)));
             } else {
                 if !first {
                     say_raw!(",");
@@ -3206,7 +3246,7 @@ fn list(options: &Options) -> Result<i32> {
         left -= bots.len();
         for bot in bots {
             if options.pretty {
-                say!(
+                let line = format!(
                     "{:<24} {:<11} {}/{}  {}",
                     bot["name"].as_str().unwrap_or(""),
                     bot["status"].as_str().unwrap_or(""),
@@ -3214,6 +3254,7 @@ fn list(options: &Options) -> Result<i32> {
                     bot["model"].as_str().unwrap_or(""),
                     bot["workspace"].as_str().unwrap_or("")
                 );
+                say!("{}", visible(&line));
             } else {
                 if !first {
                     say_raw!(",");
