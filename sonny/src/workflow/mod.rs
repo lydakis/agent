@@ -200,6 +200,7 @@ struct Told {
     instructions: String,
     model: Option<String>,
     tools: Option<Vec<String>>,
+    sandbox: Option<String>,
 }
 
 /// The runs going on in this host, by id.
@@ -950,6 +951,7 @@ fn compose(dir: &Path, roles: &Path, role: Option<&str>) -> Result<Told, String>
     Ok(Told {
         instructions: format!("{}\n\n{}", composed.text, told_text()),
         model: role.as_ref().and_then(|role| role.model.clone()),
+        sandbox: role.as_ref().and_then(|role| role.sandbox.clone()),
         tools: role.and_then(|role| role.tools),
     })
 }
@@ -1344,6 +1346,12 @@ impl Attempt {
             // environment, its maker's.
             let mut settings = crate::approvals::sandbox(&plan.mode, &dir, plan.state.as_deref());
             crate::approvals::within(&mut settings, &plan.held);
+            // Its profile's own sandbox, never looser than that.
+            if let Some(mode) = &told.sandbox
+                && let Err(why) = agent_client::policy::with_sandbox(&mut settings, mode)
+            {
+                return failed(format!("{worker} was not made: invalid_setting: {why}"));
+            }
             if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
                 settings.insert("cache_ttl".into(), json!(ttl));
             }

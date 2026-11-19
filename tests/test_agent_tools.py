@@ -235,6 +235,36 @@ class AgentToolsTests(ModelFixture):
         asked = client.request('inspect', bot='shop.asked')['result']
         self.assertEqual((helper['tools'], asked['tools']), (['echo', 'spawn_agent'], ['echo']))
 
+    def test_a_profile_starts_its_agent_in_its_sandbox_and_never_looser(self):
+        agents = self.path / '.agents' / 'agents'
+        agents.mkdir(parents=True)
+        (agents / 'reviewer.md').write_text('---\nsandbox: read-only\n---\nReview it.\n')
+        (agents / 'careful.md').write_text('---\nextends: reviewer\n---\nBe careful.\n')
+        (agents / 'loose.md').write_text('---\nsandbox: danger-full-access\n---\nDo anything.\n')
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path),
+                       settings={'sandbox': 'workspace-write', 'network': True,
+                                 'writable': [str(self.path)]})
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'review', 'message': 'q', 'profile': 'reviewer'}),
+                       ('spawn_agent', {'name': 'careful', 'message': 'q', 'profile': 'careful'}),
+                       ('spawn_agent', {'name': 'loose', 'message': 'q', 'profile': 'loose'}),
+                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'profile': 'loose',
+                                        'settings': {'sandbox': 'read-only'}}))
+        # Read-only: nothing written, no network, its maker's folders gone.
+        for name in ('shop.review', 'shop.careful'):
+            settings = client.request('inspect', bot=name)['result']['settings']
+            self.assertEqual((settings['sandbox'], settings.get('network', False), settings.get('writable') or []),
+                             ('read-only', False, []), settings)
+        # Looser than its maker is refused, saying so; nothing is made.
+        refused = self.output(client, 'shop.lead', 'spawn_agent-3')
+        self.assertIn('invalid_setting', refused)
+        self.assertIn("profile loose: sandbox: the profile's danger-full-access is looser than workspace-write", refused)
+        self.assertEqual(client.request('inspect', bot='shop.loose')['error'], 'bot_not_found')
+        # The call's own sandbox stands over the profile's.
+        asked = client.request('inspect', bot='shop.asked')['result']['settings']
+        self.assertEqual(asked['sandbox'], 'read-only', asked)
+
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
         client.request('create', bot='shop.lead', workspace=str(self.path))

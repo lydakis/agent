@@ -286,9 +286,12 @@ pub struct Front {
     pub description: Option<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
-    /// A profile this one builds on: its body comes first, its model and
-    /// tools stand where this one names none, and its skills are carried
-    /// with this one's.
+    /// The sandbox its agent starts in, by the daemon's names
+    /// ([`SANDBOXES`]), as a Codex role's `config_file` sets `sandbox_mode`.
+    pub sandbox: Option<String>,
+    /// A profile this one builds on: its body comes first, its model,
+    /// tools and sandbox stand where this one names none, and its skills
+    /// are carried with this one's.
     pub extends: Option<String>,
     /// Skills whose whole text a profile carries, as a Claude Code
     /// subagent's `skills` preloads them.
@@ -391,6 +394,10 @@ pub fn front_matter(text: &str) -> (Front, &str) {
             }
             "model" => {
                 front.model = Some(scalar(&mut lines));
+                continue;
+            }
+            "sandbox" => {
+                front.sandbox = Some(scalar(&mut lines));
                 continue;
             }
             "extends" => {
@@ -973,9 +980,10 @@ fn scan(
 }
 
 /// A role a bot is started in: the body of `.agents/agents/<name>.md`, and
-/// the model and tools its front matter names, if any. A profile that
-/// `extends` another has that one's body first and its model and tools
-/// where it names none; the skills either names follow, each whole.
+/// the model, tools and sandbox its front matter names, if any. A profile
+/// that `extends` another has that one's body first and its model, tools
+/// and sandbox where it names none; the skills either names follow, each
+/// whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub name: String,
@@ -983,6 +991,9 @@ pub struct Profile {
     pub path: Option<PathBuf>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
+    /// One of [`SANDBOXES`] once composed ([`profile_with`] refuses any
+    /// other); [`with_sandbox`] puts a bot's settings in it.
+    pub sandbox: Option<String>,
     pub body: String,
 }
 impl Profile {
@@ -994,9 +1005,48 @@ impl Profile {
             path,
             model: front.model.filter(|m| !m.is_empty()),
             tools: front.tools,
+            sandbox: front.sandbox.filter(|s| !s.is_empty()),
             body: body.trim().to_owned(),
         }
     }
+}
+
+/// The sandboxes a profile's `sandbox` names, strictest first: the
+/// daemon's names for them, which are Codex's `sandbox_mode`'s.
+pub const SANDBOXES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
+
+/// `settings`, a new bot's as `create` takes them, in the sandbox
+/// `sandbox` a profile names, one of [`SANDBOXES`]: theirs where it is
+/// as strict, else the profile's, which in `read-only` writes no folder
+/// and reaches no network or socket. One looser than theirs is refused,
+/// saying both, as the daemon refuses a bot looser than its maker; no
+/// sandbox in them is the loosest.
+pub fn with_sandbox(
+    settings: &mut serde_json::Map<String, serde_json::Value>,
+    sandbox: &str,
+) -> Result<(), String> {
+    let theirs = settings.get("sandbox").and_then(|s| s.as_str());
+    let rank = |mode: Option<&str>| {
+        (SANDBOXES.iter())
+            .position(|known| Some(*known) == mode)
+            .unwrap_or(SANDBOXES.len() - 1)
+    };
+    let (mine, held) = (rank(Some(sandbox)), rank(theirs));
+    if mine > held {
+        return Err(format!(
+            "sandbox: the profile's {sandbox} is looser than {}",
+            theirs.unwrap_or("none")
+        ));
+    }
+    if mine < held {
+        settings.insert("sandbox".into(), sandbox.into());
+        if sandbox != "workspace-write" {
+            for key in ["writable", "network", "unix_sockets"] {
+                settings.remove(key);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A profile name is one file name, nothing that could reach another folder,
@@ -1068,6 +1118,7 @@ fn profile_in(
     role.name = name.to_owned();
     role.model = None;
     role.tools = None;
+    role.sandbox = None;
     let mut bodies = Vec::new();
     let shipped = skills;
     let mut skills: Vec<String> = Vec::new();
@@ -1077,6 +1128,15 @@ fn profile_in(
         }
         role.model = profile.model.clone().or(role.model);
         role.tools = profile.tools.clone().or(role.tools);
+        if let Some(sandbox) = &profile.sandbox {
+            if !SANDBOXES.contains(&sandbox.as_str()) {
+                return Err(Failure::Invalid {
+                    path: (profile.path.clone()).unwrap_or_else(|| profile.name.clone().into()),
+                    reason: format!("sandbox {sandbox:?} is not one of {}", SANDBOXES.join(", ")),
+                });
+            }
+            role.sandbox = Some(sandbox.clone());
+        }
         for skill in front.skills.iter().flatten() {
             if !skills.contains(skill) {
                 skills.push(skill.clone());
@@ -1554,6 +1614,93 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_profile_names_its_sandbox_which_extends_carries_and_never_loosens() {
+        let root = temp("sandbox");
+        let agents = root.join(".agents/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("reviewer.md"),
+            "---\nsandbox: read-only # no writes\ntools: [read, history]\n---\nReview it.",
+        )
+        .unwrap();
+        let reviewer = profile(&root, "reviewer").unwrap().unwrap();
+        assert_eq!(reviewer.sandbox.as_deref(), Some("read-only"));
+        // A variant takes it where it names none, and its own stands.
+        std::fs::write(
+            agents.join("careful.md"),
+            "---\nextends: reviewer\n---\nBe careful.",
+        )
+        .unwrap();
+        let careful = profile(&root, "careful").unwrap().unwrap();
+        assert_eq!(careful.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(careful.tools, reviewer.tools);
+        std::fs::write(
+            agents.join("careful.md"),
+            "---\nextends: reviewer\nsandbox: workspace-write\n---\nBe careful.",
+        )
+        .unwrap();
+        let careful = profile(&root, "careful").unwrap().unwrap();
+        assert_eq!(careful.sandbox.as_deref(), Some("workspace-write"));
+        // A name the daemon does not know is refused, saying where.
+        std::fs::write(
+            agents.join("reviewer.md"),
+            "---\nsandbox: readonly\n---\nReview it.",
+        )
+        .unwrap();
+        for name in ["reviewer", "careful"] {
+            let refused = profile(&root, name).unwrap_err();
+            assert_eq!(refused.code(), "profile_invalid");
+            assert!(
+                refused
+                    .to_string()
+                    .contains("reviewer.md: sandbox \"readonly\""),
+                "{refused}"
+            );
+        }
+        // An empty one names none.
+        std::fs::write(
+            agents.join("reviewer.md"),
+            "---\nsandbox: ''\n---\nReview it.",
+        )
+        .unwrap();
+        assert_eq!(profile(&root, "reviewer").unwrap().unwrap().sandbox, None);
+
+        let settings = |value: serde_json::Value| value.as_object().unwrap().clone();
+        // Stricter than the maker's: read-only drops what it can't use.
+        let mut held = settings(serde_json::json!({"sandbox": "workspace-write",
+            "writable": ["/r/.git"], "network": true, "unix_sockets": ["/d.sock"], "speed": "fast"}));
+        with_sandbox(&mut held, "read-only").unwrap();
+        assert_eq!(
+            serde_json::Value::Object(held),
+            serde_json::json!({"sandbox": "read-only", "speed": "fast"})
+        );
+        // As strict: theirs stands, folders and all.
+        let working =
+            settings(serde_json::json!({"sandbox": "workspace-write", "writable": ["/r/.git"]}));
+        let mut same = working.clone();
+        with_sandbox(&mut same, "workspace-write").unwrap();
+        assert_eq!(same, working);
+        // None is the loosest, so any profile's applies.
+        let mut free = settings(serde_json::json!({"sandbox": null, "network": true}));
+        with_sandbox(&mut free, "workspace-write").unwrap();
+        assert_eq!(free["sandbox"], "workspace-write");
+        assert_eq!(free["network"], true);
+        let mut free = settings(serde_json::json!({}));
+        with_sandbox(&mut free, "danger-full-access").unwrap();
+        assert_eq!(free, settings(serde_json::json!({})));
+        // Looser is refused, never tightened in silence.
+        let mut reading = settings(serde_json::json!({"sandbox": "read-only"}));
+        let why = with_sandbox(&mut reading, "workspace-write").unwrap_err();
+        assert_eq!(
+            why,
+            "sandbox: the profile's workspace-write is looser than read-only"
+        );
+        assert_eq!(reading["sandbox"], "read-only");
+        let mut working = working;
+        assert!(with_sandbox(&mut working, "danger-full-access").is_err());
+    }
+
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("agent-policy-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1836,6 +1983,7 @@ mod tests {
             path: None,
             model: None,
             tools: None,
+            sandbox: None,
             body: "r".repeat(20_000),
         };
         // Few: listed whole.

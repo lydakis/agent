@@ -6109,6 +6109,7 @@ impl Turn {
                             (instructions, agents, profile),
                             model,
                             effort,
+                            settings.as_ref().is_some_and(|s| s.contains_key("sandbox")),
                         )
                         .await?;
                     // What it asked for over what it would inherit: the
@@ -6242,7 +6243,9 @@ impl Turn {
     /// or its own; instructions as `run --new` gives them (the text given,
     /// the preamble, or with `agents` or a profile, those a client composes
     /// for the folder, in the profile's role); the role's tools or its own,
-    /// search kept to a model that has it.
+    /// search kept to a model that has it; its settings, in the role's
+    /// sandbox unless the call names one (`sandbox_asked`).
+    #[allow(clippy::too_many_arguments)]
     async fn spawned(
         &self,
         me: &Value,
@@ -6251,6 +6254,7 @@ impl Turn {
         (given, agents, profile): (Option<String>, bool, Option<String>),
         model: Option<String>,
         effort: Option<String>,
+        sandbox_asked: bool,
     ) -> Result<Value> {
         // The folder this turn works in, which may be its own for the turn.
         let Some(workspace) = workspace.to_str().map(str::to_owned) else {
@@ -6320,6 +6324,10 @@ impl Turn {
         // inherits covers them; a grammar tool reaches a family without
         // grammars as a function taking its text. Search goes where the
         // model has none.
+        let sandbox = role.as_ref().and_then(|role| {
+            let sandbox = role.sandbox.clone()?;
+            Some((role.name.clone(), sandbox))
+        });
         let tools: Vec<String> = match role.and_then(|role| role.tools) {
             Some(tools) => tools,
             None => {
@@ -6332,10 +6340,17 @@ impl Turn {
                     .collect()
             }
         };
-        let settings = (self.settings.get())
+        let mut settings = (self.settings.get())
             .map(serde_json::to_value)
             .transpose()?
             .unwrap_or_else(|| json!({}));
+        // The profile's sandbox over this agent's, never looser.
+        if let (Some((role, sandbox)), false, Some(own)) =
+            (sandbox, sandbox_asked, settings.as_object_mut())
+        {
+            agent_client::policy::with_sandbox(own, &sandbox)
+                .map_err(|why| Error::with("invalid_setting", format!("profile {role}: {why}")))?;
+        }
         Ok(
             json!({"bot":name,"workspace":workspace,"model":model,"effort":effort,
             "instructions":instructions,"tools":tools,"settings":settings,

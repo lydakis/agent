@@ -2155,6 +2155,14 @@ fn run(options: &Options) -> Result<i32> {
                 .collect(),
         };
         let mut settings = options.settings.clone();
+        // The role's sandbox, unless --sandbox names one; the daemon keeps
+        // it no looser than its creator's.
+        if let Some(sandbox) = role.as_ref().and_then(|r| r.sandbox.as_deref())
+            && !settings.contains_key("sandbox")
+        {
+            agent_client::policy::with_sandbox(&mut settings, sandbox)
+                .map_err(|why| Error::with("invalid_setting", why))?;
+        }
         if options.approval.as_deref() == Some("never") {
             settings.insert("approval_policy".into(), json!("never"));
         }

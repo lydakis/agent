@@ -1,6 +1,6 @@
 ---
 name: sonny-config
-description: Where Sonny and its agent daemon keep their settings, every key of ~/.agent/config.toml with its values and default, a project's own file, and which folders an agent's sandbox writes. Read before changing or explaining a setting, or when the sandbox keeps a command out of a folder it needs, instead of looking it up elsewhere.
+description: Where Sonny and its agent daemon keep their settings, every key of ~/.agent/config.toml with its values and default, a project's own file, and which folders an agent's sandbox writes, and how a profile sets the model, tools and sandbox an agent starts with. Read before changing or explaining a setting, or when the sandbox keeps a command out of a folder it needs, instead of looking it up elsewhere.
 ---
 
 # Sonny's settings
@@ -96,6 +96,32 @@ each setting is; what to set is the person's call.
   `sonny rules check -- COMMAND` shows what the rules decide. The files
   are Starlark, as in Codex (`host_executable` works; `network_rule`
   is refused).
+
+## A profile
+
+`.agents/agents/NAME.md`, in a project's folder or the home folder, is a
+role an agent starts in: `start_task`'s and `spawn_agent`'s `profile`, a
+workflow's `agent_type`. Its front matter takes `description`, `model`,
+`tools`, `sandbox`, `extends` and `skills`; its body is what the agent is
+told. `sandbox` is `read-only`, `workspace-write` or `danger-full-access`,
+and the agent starts in it when it is as strict as the sandbox the agent
+would get or stricter, unless the call names a sandbox; a looser one is
+refused. `extends: NAME` builds on another profile and takes its model,
+tools and sandbox where this one names none. A reviewer that reads and
+reports:
+
+```markdown
+---
+description: Reviews a change and reports what is wrong
+sandbox: read-only
+---
+Review the change your message names and report each problem with its file and line.
+```
+
+`read-only` writes no file and reaches no network, yet its commands still
+run this machine's programs as the person, with their sign-ins. For a
+review that needs no commands, also give it `tools: [read, history]`: an
+agent without `shell` runs nothing.
 
 ## The browser's profile
 
