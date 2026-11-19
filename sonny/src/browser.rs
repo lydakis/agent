@@ -314,16 +314,26 @@ impl Reach {
     /// `path` as a file the browser writes, as [`output`](Self::output)
     /// says; over a link that carries files back, a file of Sonny's own
     /// here instead, noted in `carried` beside `path`, the agent's own.
+    ///
+    /// For a confined agent here too, a file of Sonny's own, noted beside
+    /// where it goes once the command is done ([`land_staged`]): the browser
+    /// writes as the person, following whatever link the agent puts in the
+    /// path's place, however long after the check, while Sonny writes it
+    /// in place following none.
     fn saved(&self, path: &str, carried: &mut Vec<(String, PathBuf)>) -> Result<String, String> {
-        if !self.carry {
+        if !self.carry && self.roots.is_none() {
             return self.output(path);
         }
         // One already named here (`diff`'s `-o`, read as a flag first).
         if carried.iter().any(|(_, file)| file.as_os_str() == path) {
             return Ok(path.to_owned());
         }
-        let file = carried_file(path)?;
-        carried.push((path.to_owned(), file.clone()));
+        let goes = match self.carry {
+            true => path.to_owned(),
+            false => self.output(path)?,
+        };
+        let file = carried_file(&goes)?;
+        carried.push((goes, file.clone()));
         Ok(file.to_string_lossy().into_owned())
     }
 
@@ -380,13 +390,16 @@ impl Reach {
                 part => normal.push(part),
             }
         }
+        // Through its real folder, so a link inside the folder that points
+        // out of it is out of it, and the browser is handed that real path.
+        let real = real(&normal);
+        // Never one kept from agents: the browser would read it for one.
+        if self.roots.is_some() && hidden(&real) {
+            return Err(format!("{path} is kept unreadable from agents"));
+        }
         let Some(roots) = &self.roots else {
             return Ok(normal.to_string_lossy().into_owned());
         };
-        // Through its real folder, so a link inside the folder that points
-        // out of it is out of it, and the browser is handed that real path,
-        // so a link changed after the check is not followed.
-        let real = real(&normal);
         let inside = roots.iter().any(|root| {
             let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
             real.starts_with(&root)
@@ -423,10 +436,62 @@ impl Reach {
             return Err(format!("{url} is a file on another machine"));
         }
         let path = (parsed.to_file_path()).map_err(|()| format!("{url} names no file"))?;
+        // Anywhere but what is kept from agents, which the browser, run as
+        // the person, would show a confined one.
+        if self.roots.is_some() && hidden(&real(&path)) {
+            return Err(format!("{url} is kept unreadable from agents"));
+        }
         url::Url::from_file_path(real(&path))
             .map(String::from)
             .map_err(|()| format!("{url} names no file"))
     }
+}
+
+/// Whether `real`, a real path, is, or is in, a folder kept from agents
+/// ([`agent_client::hidden`]).
+fn hidden(real: &Path) -> bool {
+    (agent_client::hidden::known().iter()).any(|folder| real.starts_with(folder))
+}
+
+/// What the browser saved to `staged`, a file of Sonny's own, written to
+/// `goes`, a path in one of `reach`'s folders, and taken away: each folder
+/// below that one opened, or made, without following a link, and the file
+/// itself never written through one, so no link the agent put in the way
+/// since the check leads the write out of its folders.
+fn land_staged(reach: &Reach, goes: &str, staged: &Path) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let landed = (|| {
+        let goes = Path::new(goes);
+        let root = (reach.roots.iter().flatten())
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .filter(|root| goes.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .ok_or_else(|| format!("{} is outside your folder", goes.display()))?;
+        let rest: Vec<&std::ffi::OsStr> = (goes.strip_prefix(&root).map_err(|e| e.to_string())?)
+            .components()
+            .map(|part| part.as_os_str())
+            .collect();
+        let Some((name, folders)) = rest.split_last() else {
+            return Err(format!("{} is a folder", goes.display()));
+        };
+        let folder = crate::git::folders(&root, folders, true).map_err(|e| e.to_string())?;
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|e| e.to_string())?;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `name` is NUL-terminated and outlives the call.
+        let fd = unsafe { libc::openat(folder.as_raw_fd(), name.as_ptr(), flags, 0o644) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: `fd` was just opened, and nothing else owns it.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut from = std::fs::File::open(staged).map_err(|e| e.to_string())?;
+        std::io::copy(&mut from, &mut file).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(staged);
+    landed
 }
 
 /// The real path of `path`: of its deepest folder that exists, with the
@@ -465,8 +530,9 @@ struct Checked {
     /// What `find` does to what it finds, which agent-browser confirms
     /// by `find`'s own action only.
     subaction: Option<String>,
-    /// Over a link that carries them back: each file it saves, as its
-    /// agent named it, and the file of Sonny's that holds it here.
+    /// Over a link that carries them back, or for a confined agent here:
+    /// each file it saves, as its agent named it (here, as checked), and
+    /// the file of Sonny's that holds it until it goes there.
     carried: Vec<(String, PathBuf)>,
     /// A recording's `start` or `stop`, whose file is written at its stop.
     record: Option<&'static str>,
@@ -616,9 +682,11 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                 ));
             }
             args.extend([flag, value]);
-        } else if flag == "--screenshot-dir" && reach.carry {
+        } else if flag == "--screenshot-dir" && (reach.carry || reach.roots.is_some()) {
+            // A folder the browser writes as the person, which no file of
+            // Sonny's stands in for.
             return Err(format!(
-                "{flag} is not taken over a link: give each screenshot a path"
+                "{flag} is not taken for a confined agent or over a link: give each screenshot a path"
             ));
         } else if ["--screenshot-dir", "-o", "--output"].contains(&flag.as_str()) {
             let file = reach.saved(&value(&mut words)?, &mut carried)?;
@@ -2412,6 +2480,18 @@ async fn drive(
                     Err(e) => said.push_str(&format!("\n{path}: not saved: {e}")),
                 }
             }
+        } else {
+            for (goes, file) in carried(&session, command, ok) {
+                said = said.replace(&*file.to_string_lossy(), &goes);
+                let landed = tokio::task::spawn_blocking({
+                    let (reach, goes) = (reach.clone(), goes.clone());
+                    move || land_staged(&reach, &goes, &file)
+                });
+                match landed.await.map_err(|e| e.to_string()).and_then(|r| r) {
+                    Ok(()) => {}
+                    Err(e) => said.push_str(&format!("\n{goes}: not saved: {e}")),
+                }
+            }
         }
         // The file the host named is gone once read: the picture is shown,
         // as many as one result holds.
@@ -3033,8 +3113,13 @@ mod tests {
     #[test]
     fn files_stay_in_the_agent_s_folder() {
         let real = scratch("files");
-        let shot = args("screenshot shots/page.png", &real).unwrap();
-        assert_eq!(shot[1], real.join("shots/page.png").to_string_lossy());
+        // The browser writes a file of Sonny's own, which goes to the
+        // agent's folder once the command is done.
+        let shot = checked("screenshot shots/page.png", &reach(&real)).unwrap();
+        let goes = real.join("shots/page.png").to_string_lossy().into_owned();
+        assert_eq!(shot.carried.len(), 1);
+        assert_eq!(shot.carried[0].0, goes);
+        assert_eq!(shot.args[1], shot.carried[0].1.to_string_lossy());
         for line in [
             "screenshot /etc/page.png",
             "screenshot ../page.png",
@@ -3123,11 +3208,14 @@ mod tests {
         assert!(checked("open https://example.com", &lent).is_ok());
         assert!(checked("pdf page.pdf", &lent).is_err());
         assert!(checked("open file:///etc/passwd", &Reach::lent(true)).is_err());
-        // The browser is handed the real path, not the link.
+        // It goes to the real path, not through the link.
         std::os::unix::fs::symlink(real.join("shots"), real.join("in")).unwrap();
         std::fs::create_dir_all(real.join("shots")).unwrap();
-        let shot = args("screenshot in/page.png", &real).unwrap();
-        assert_eq!(shot[1], real.join("shots/page.png").to_string_lossy());
+        let shot = checked("screenshot in/page.png", &reach(&real)).unwrap();
+        assert_eq!(
+            shot.carried[0].0,
+            real.join("shots/page.png").to_string_lossy()
+        );
     }
 
     #[test]
@@ -3158,6 +3246,7 @@ mod tests {
         let diff = checked("diff snapshot -o d.txt", &lent).unwrap();
         assert_eq!(diff.carried.len(), 1, "{:?}", diff.carried);
         assert!(checked("screenshot --screenshot-dir shots", &lent).is_err());
+        assert!(checked("screenshot p.png --screenshot-dir shots", &reach(&real)).is_err());
         // A recording's file goes back at its stop, which may be a later
         // call's; a failed command's files go.
         let start = checked("record start r.webm", &lent).unwrap();
@@ -3174,11 +3263,32 @@ mod tests {
         std::fs::write(&failed.carried[0].1, "x").unwrap();
         assert!(carried("s1", &failed, false).is_empty());
         assert!(!failed.carried[0].1.exists());
-        // Here, each is written where the agent may write, and only there.
+        // Here, each is written where the agent may write, and only there,
+        // by Sonny, through no link.
         let writer = reach(&real);
-        for line in ["screenshot shots/page.png", "pdf p.pdf"] {
-            assert!(checked(line, &writer).unwrap().carried.is_empty());
+        for (line, file) in [
+            ("screenshot shots/page.png", "shots/page.png"),
+            ("pdf p.pdf", "p.pdf"),
+        ] {
+            let saved = checked(line, &writer).unwrap();
+            assert_eq!(saved.carried.len(), 1, "{line}");
+            let (goes, staged) = &saved.carried[0];
+            assert_eq!(*goes, real.join(file).to_string_lossy());
+            std::fs::write(staged, "saved").unwrap();
+            land_staged(&writer, goes, staged).unwrap();
+            assert_eq!(std::fs::read_to_string(real.join(file)).unwrap(), "saved");
+            assert!(!staged.exists());
         }
+        std::os::unix::fs::symlink("/etc", real.join("away")).unwrap();
+        std::os::unix::fs::symlink("/etc/sonny-y", real.join("link.png")).unwrap();
+        for goes in ["away/sonny-y", "link.png"] {
+            let staged = carried_file("x").unwrap();
+            std::fs::write(&staged, "no").unwrap();
+            let goes = real.join(goes).to_string_lossy().into_owned();
+            assert!(land_staged(&writer, &goes, &staged).is_err(), "{goes}");
+            assert!(!staged.exists());
+        }
+        assert!(!Path::new("/etc/sonny-y").exists());
         use base64::Engine;
         let data = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
         let answer = json!([
@@ -3228,10 +3338,11 @@ mod tests {
         ] {
             assert!(args(line, &real).is_err(), "{line} ran");
         }
-        let shot = args("screenshot body out", &real).unwrap();
+        let shot = checked("screenshot body out", &reach(&real)).unwrap();
+        assert_eq!(shot.carried[0].0, real.join("out").to_string_lossy());
         assert_eq!(
-            shot,
-            ["screenshot", "body", &real.join("out").to_string_lossy()]
+            shot.args,
+            ["screenshot", "body", &shot.carried[0].1.to_string_lossy()]
         );
         let shot = checked("screenshot body", &reach(&real)).unwrap();
         assert_eq!(shot.args.len(), 3);

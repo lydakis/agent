@@ -200,14 +200,13 @@ impl Sender {
     /// on reads never hold the room the others need, each holds at most its
     /// share, and its reader still reaches the lease renewals behind them.
     pub async fn send(&self, mut message: Inbound) -> std::result::Result<(), Gone> {
-        if let Inbound::Request(_, Ok(request), _, _) = &mut message
-            && let Some(path) = request.workspace_slot()
-        {
-            let given = path.clone();
-            match tokio::task::spawn_blocking(move || super::workspace(&given)).await {
-                Ok(Ok(real)) => *path = real,
-                Ok(Err(error)) => request.workspace_error = Some(error),
-                Err(_) => request.workspace_error = Some(Error::new("workspace_lookup_failed")),
+        if let Inbound::Request(_, Ok(request), _, _) = &mut message {
+            let given = request.unresolved();
+            if given.0.is_some() || given.1.is_some() {
+                match tokio::task::spawn_blocking(move || super::resolve(given)).await {
+                    Ok(found) => request.resolved(found),
+                    Err(_) => request.workspace_error = Some(Error::new("workspace_lookup_failed")),
+                }
             }
         }
         self.enqueue(message).await

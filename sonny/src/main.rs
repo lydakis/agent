@@ -3169,8 +3169,10 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         None => std::env::current_dir().map_err(|e| e.to_string())?,
     };
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
-    let composed =
-        agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
+    let composed = agent_client::policy::hiding(&agent_client::hidden::known(), || {
+        agent_client::policy::instructions(&workspace, None, &memory)
+    })
+    .map_err(|e| e.to_string())?;
     let info = crate::project::read(&workspace)?;
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
