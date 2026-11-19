@@ -26,7 +26,7 @@ pub use db::{
     Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON, Replaced,
     Resumed, Room, SANDBOX, SETTINGS, Served, Settings, Shared, Spend, Started, Step, StepAsk,
     StepOpened, Stepped, Strip, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, TurnBudget, TurnOptions,
-    Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
+    UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;

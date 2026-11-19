@@ -300,10 +300,16 @@ pub fn read(conn: &Connection, query: &Query) -> Result<Value> {
         sql.push_str(" AND bot GLOB ?");
         args.push(Sql::Text(bot.clone()));
     }
+    // Who approved, written out as its word from the vocabulary (checked
+    // above, so nothing else reaches the text), so the index of the calls
+    // a person decided serves a read of them.
+    if let Some(approved) = &query.approved {
+        let approved = word("approved", &APPROVERS, approved)?;
+        sql.push_str(&format!(" AND approved='{approved}'"));
+    }
     let text = [
         ("kind", &query.kind),
         ("place", &query.place),
-        ("approved", &query.approved),
         ("access", &query.access),
         ("outcome", &query.outcome),
         ("tool", &query.tool),

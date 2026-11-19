@@ -5921,6 +5921,29 @@ struct Watch {
     stop: Option<String>,
     /// Whether `/status`'s rows have landed since it opened.
     listed: bool,
+    /// The card as last laid out, with what it was laid out from: a frame
+    /// that changed none of it, as a key typed into the composer, draws it
+    /// again without laying out every row.
+    drawn: std::cell::RefCell<Option<(CardFrom, Card)>>,
+}
+
+/// `/status`'s card: its lines, whether a group folds, and the marks the
+/// keys and clicks pick from.
+type Card = (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>);
+
+/// What [`watch_card`] lays the card out from, besides the rows, which
+/// are read whole at `read`.
+#[derive(Clone, PartialEq)]
+struct CardFrom {
+    read: Instant,
+    since: u64,
+    width: usize,
+    project: String,
+    alerts: usize,
+    open: Vec<status::Group>,
+    helpers: Vec<String>,
+    more: bool,
+    pick: Option<usize>,
 }
 
 impl Watch {
@@ -14827,6 +14850,7 @@ impl App {
             run: None,
             stop: None,
             listed: false,
+            drawn: Default::default(),
         });
         self.open_pane(pane::Pane::card("status", PICK_KEYS));
     }
@@ -14867,6 +14891,7 @@ impl App {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
     }
@@ -14942,6 +14967,7 @@ impl App {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
     }
@@ -14972,6 +14998,7 @@ impl App {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         self.open_pane(pane::Pane::card("audit", STATUS_KEYS));
     }
@@ -15048,6 +15075,7 @@ impl App {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         self.open_pane(pane::Pane::card("memory", STATUS_KEYS));
     }
@@ -15079,6 +15107,7 @@ impl App {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
     }
@@ -15105,6 +15134,7 @@ impl App {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
     }
@@ -15115,14 +15145,15 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        let (query, window) = view.query(now);
-        let read = self.client.request("usage", query).await;
+        let (ask, window) = view.ask(now);
+        let socket = self.options.socket.clone();
+        let read = usage::read(self.client.clone(), socket, ask, self.store()).await;
         // The price sheet as its file says now, so an edit shows at the
         // next read; a sheet that does not parse prices nothing.
         let prices = agent_client::config::load()
             .and_then(|config| agent_client::config::prices(&config))
             .unwrap_or_default();
-        view.loaded(window, read.map_err(|error| error.to_string()), prices);
+        view.loaded(window, read, prices);
     }
 
     /// Whether the scheduler runs, read beside the window while
@@ -15208,18 +15239,24 @@ impl App {
             watch.read = Instant::now();
             return;
         }
+        // Where the tasks' done marks and roles are, only for a read due.
+        let store = (self.watch.as_ref())
+            .and_then(|watch| watch.usage.as_ref())
+            .is_some_and(usage::View::due)
+            .then(|| self.store());
+        let socket = self.options.socket.clone();
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.usage
         {
-            if view.due() {
+            if let Some(store) = store {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64;
-                let (query, window) = view.query(now);
+                let (ask, window) = view.ask(now);
                 let selection = view.selection();
                 self.card_read = Some(tokio::spawn(async move {
-                    let read = client.request("usage", query).await;
+                    let read = usage::read(client, socket, ask, store).await;
                     // The price sheet as its file says now, so an edit shows
                     // at the next read; a sheet that does not parse prices
                     // nothing.
@@ -15227,7 +15264,6 @@ impl App {
                         .and_then(|config| agent_client::config::prices(&config))
                         .unwrap_or_default();
                     woken.notify_one();
-                    let read = read.map_err(|error| error.to_string());
                     CardRead::Usage(selection, window, read, prices)
                 }));
             }
@@ -23105,12 +23141,33 @@ fn card_picks(watch: &Watch, width: usize) -> Vec<Picked> {
 /// agent, which a click opens in the pane (this window's own closes
 /// `/status`), and each folding group's heading, which a click opens or
 /// folds.
-fn watch_card(
-    watch: &Watch,
-    width: usize,
-) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
+fn watch_card(watch: &Watch, width: usize) -> Card {
     // Each running turn's time counts on from when the rows were read.
     let since = watch.read.elapsed().as_secs();
+    let from = CardFrom {
+        read: watch.read,
+        since,
+        width,
+        project: watch.project.clone(),
+        alerts: watch.alerts.len(),
+        open: watch.open.clone(),
+        helpers: watch.helpers.clone(),
+        more: watch.more,
+        pick: watch.pick,
+    };
+    if let Some((drawn, card)) = &*watch.drawn.borrow()
+        && *drawn == from
+    {
+        return card.clone();
+    }
+    let card = lay_out_card(watch, width, since);
+    *watch.drawn.borrow_mut() = Some((from, card.clone()));
+    card
+}
+
+/// [`watch_card`] laid out from every row, its running times `since`
+/// seconds on from their read.
+fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
     let rows = &watch.rows;
     let card = |details| {
         status::card_after(
@@ -30533,6 +30590,7 @@ mod tests {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         app.press("run/run1").await;
         assert_eq!(app.watch.as_ref().unwrap().run.as_deref(), Some("run1"));
@@ -36290,6 +36348,7 @@ mod tests {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         };
         // The folder's other lead opens by its own name, not its label.
         let (lines, _, marks) = watch_card(&watch, 80);
@@ -36333,6 +36392,8 @@ mod tests {
         // An agent a row waits on opens too, each one named.
         let mut watch = watch;
         watch.rows[2].state = "waiting on lead, first lead".into();
+        // Rows read again come with a new time read.
+        watch.read = Instant::now() + Duration::from_millis(1);
         let (lines, _, marks) = watch_card(&watch, 80);
         let neg = (lines.iter())
             .position(|line| line.to_string().contains("neg · waiting on"))
@@ -36789,6 +36850,7 @@ mod tests {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let pick = |app: &App| app.watch.as_ref().unwrap().pick;
@@ -36861,6 +36923,7 @@ mod tests {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let watch = |app: &App| {
@@ -36978,6 +37041,7 @@ mod tests {
             run: None,
             stop: None,
             listed: true,
+            drawn: Default::default(),
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);

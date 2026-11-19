@@ -18147,7 +18147,16 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
         .unwrap();
     }
 
-    let usage = db.usage(Some("p.*"), since, Some(hour), 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: Some("p.*"),
+            names: None,
+            since_ms: since,
+            until_ms: None,
+            bucket_ms: Some(hour),
+            limit: 64,
+        })
+        .unwrap();
     assert_eq!(
         (
             usage["turns"].as_i64(),
@@ -18202,12 +18211,72 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
     assert_eq!(series, [(since, 1000), (since + hour, 600)]);
 
     // Every bot, the one that spent most listed and the rest summed.
-    let usage = db.usage(None, 0, None, 1).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 1,
+        })
+        .unwrap();
     assert_eq!(usage["turns"], 5);
     assert_eq!(usage["bots"][0]["bot"], "q.lead");
     assert_eq!(usage["other_bots"]["bots"], 2);
     assert_eq!(usage["other_bots"]["input_tokens"], 2100);
     assert!(usage.get("series").is_none());
+
+    // The bots named, up to a time: p.task's turn and q.lead's are past
+    // it, p.lead's first before the window.
+    let names = [
+        "p.lead".to_owned(),
+        "p.task".to_owned(),
+        "q.lead".to_owned(),
+    ];
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: Some(&names[..2]),
+            since_ms: since,
+            until_ms: Some(since + hour),
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
+    assert_eq!(
+        (usage["turns"].as_i64(), usage["input_tokens"].as_i64()),
+        (Some(1), Some(1000))
+    );
+    assert_eq!(usage["bots"][0]["bot"], "p.lead");
+    assert_eq!(usage["models"][0]["turns"], 1);
+    assert_eq!(usage["until_ms"], since + hour);
+    // Names and a pattern narrow together.
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: Some("q.*"),
+            names: Some(&names),
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
+    assert_eq!(usage["turns"], 1);
+    for (names, until) in [(&names[..0], None), (&names[..1], Some(since - 1))] {
+        let refused = db
+            .usage(&agent_runtime::store::UsageQuery {
+                name: None,
+                names: Some(names),
+                since_ms: since,
+                until_ms: until,
+                bucket_ms: None,
+                limit: 64,
+            })
+            .unwrap_err()
+            .code;
+        assert!(["invalid_bot_filter", "invalid_usage_window"].contains(&refused.as_str()));
+    }
 
     for (since, bucket) in [
         (0, Some(hour)),
@@ -18215,12 +18284,30 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
         (now - 2000 * hour, Some(hour)),
     ] {
         assert_eq!(
-            db.usage(None, since, bucket, 64).unwrap_err().code,
+            db.usage(&agent_runtime::store::UsageQuery {
+                name: None,
+                names: None,
+                since_ms: since,
+                until_ms: None,
+                bucket_ms: bucket,
+                limit: 64
+            })
+            .unwrap_err()
+            .code,
             "invalid_usage_window"
         );
     }
     assert_eq!(
-        db.usage(Some(""), 0, None, 64).unwrap_err().code,
+        db.usage(&agent_runtime::store::UsageQuery {
+            name: Some(""),
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64
+        })
+        .unwrap_err()
+        .code,
         "invalid_bot_filter"
     );
     drop(raw);
@@ -18303,7 +18390,16 @@ fn usage_files_each_call_under_the_model_that_spent_it_with_its_cache_writes() {
     .unwrap();
     db.finish(turn, None).unwrap();
 
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     assert_eq!(usage["turns"], 1);
     assert_eq!(
         usage["input_tokens"], 2750,
@@ -18374,7 +18470,16 @@ fn schema_85_files_each_earlier_turn_whole_under_its_own_model() {
     conn.older("DROP TABLE turn_models; PRAGMA user_version=84;")
         .unwrap();
     let db = Database::initialize(conn).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     assert_eq!(usage["turns"], 2);
     assert_eq!(
         usage["models"],
@@ -18422,7 +18527,16 @@ fn spend_is_kept_by_model_and_the_speed_that_served_it() {
             .unwrap();
     }
     db.finish(turn, None).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     let rows: Vec<_> = (usage["models"].as_array().unwrap().iter())
         .map(|m| {
             (
@@ -18476,7 +18590,16 @@ fn calls_are_timed_by_the_model_that_answered_and_the_daemon_by_turn() {
             .unwrap();
     }
     db.finish(turn, None).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     let model = &usage["models"][0];
     assert_eq!(
         [
@@ -18579,7 +18702,16 @@ fn each_turn_counts_its_calls_and_their_time_once() {
     clocked_turn(&path, &mut db, 2_000, "1");
     // A turn with no timed call is left out of the time.
     clocked_turn(&path, &mut db, 0, "2");
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     let time = &usage["time"];
     // The two calls ran together: 1 s, not 1.5.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
@@ -18677,7 +18809,16 @@ fn a_trimmed_row_a_fallback_and_summaries_leave_a_turns_time_as_it_ran() {
         ..Usage::default()
     };
     db.compaction_usage_after(turn, Some(&summary)).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     let time = &usage["time"];
     // The command counts with no time and leaves the read's whole.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
@@ -18759,7 +18900,16 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
     )
     .unwrap();
     let db = Database::initialize(conn).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     let time = &usage["time"];
     // Two calls together in the second turn, 1 s; the third and fourth
     // turns' commands alone, 1 s each, their processes notwithstanding;
@@ -18824,7 +18974,16 @@ fn schema_95_starts_earlier_spend_untimed() {
     )
     .unwrap();
     let mut db = Database::initialize(conn).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     assert_eq!(
         [
             &usage["output_tokens"],
@@ -18855,7 +19014,16 @@ fn schema_95_starts_earlier_spend_untimed() {
     db.append(turn, vec![assistant("again")], &[], Some(&usage))
         .unwrap();
     db.finish(turn, None).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     assert_eq!(
         [
             &usage["timed_rounds"],
@@ -18915,7 +19083,16 @@ fn schema_90_files_earlier_spend_at_standard() {
     )
     .unwrap();
     let mut db = Database::initialize(conn).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     assert_eq!(
         usage["models"],
         json!([{"model":"openai/synthetic-model","speed":"standard","turns":1,"input_tokens":500,
@@ -18944,7 +19121,16 @@ fn schema_90_files_earlier_spend_at_standard() {
     db.append(turn, vec![assistant("fast")], &[], Some(&fast))
         .unwrap();
     db.finish(turn, None).unwrap();
-    let usage = db.usage(None, 0, None, 64).unwrap();
+    let usage = db
+        .usage(&agent_runtime::store::UsageQuery {
+            name: None,
+            names: None,
+            since_ms: 0,
+            until_ms: None,
+            bucket_ms: None,
+            limit: 64,
+        })
+        .unwrap();
     assert_eq!(usage["models"][1]["speed"], "fast");
     drop(db);
     let _ = std::fs::remove_file(&path);
