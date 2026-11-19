@@ -191,7 +191,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Past timeout_ms (default 120 s, up to a day) a command moves to the background and keeps running: the result is its proc handle, yielded=true and its last lines. With background=true only timeout_ms ends it, killed with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; once the daemon's background commands fill its process bound, starting one more kills a command of the agent holding the most: the one it started or waited on least recently, never one of its 8 most recent (a smaller bound's number). With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Past timeout_ms (default 120 s, up to a day) a command moves to the background and keeps running: the result is its proc handle, yielded=true and its last lines. With background=true only timeout_ms ends it, killed with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A message that arrives while a command runs is taken once it ends or yields. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; once the daemon's background commands fill its process bound, starting one more kills a command of the agent holding the most: the one it started or waited on least recently, never one of its 8 most recent (a smaller bound's number). With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
@@ -323,7 +323,7 @@ impl Tool {
                 "additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, a command or call that yielded, or a call a message moved to the background while it waited on its approval). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
  With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. With terminate: true, every handle, each a proc:N, is stopped first, as write_stdin with kill=true stops it, and the wait returns how each ended. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"},"terminate":{"type":"boolean"}},
@@ -386,17 +386,14 @@ pub struct Declared {
     /// wants.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gate_daemon_steps: bool,
-    /// Whether a steer lifts a call still waiting for its answer to the
-    /// background once it has waited the grace a foreground command gets,
-    /// as it lifts that command: for a tool whose calls may run long, a
-    /// script say, or wait on a person. Left out, the call is answered
-    /// first and the steer is taken at the next boundary, as Codex takes a
-    /// message once the running tool returns. A call one of whose steps
-    /// waits on a gate is lifted either way, as a gated call is. Its
-    /// client may also hand such a call back itself, with its output so
-    /// far (`yield_call`), as Codex's exec yields.
+    /// Whether its client may hand a call still waiting for its answer
+    /// back to the model, with its output so far (`yield_call`), as
+    /// Codex's exec yields: for a tool whose calls may run long, a script
+    /// say. A steer never moves a running call; it is taken once the call
+    /// is answered or yielded, as Codex takes a message once the running
+    /// tool returns.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub lift: bool,
+    pub yields: bool,
     /// What kind of tool it is, one of the audit trail's kinds, which its
     /// calls' rows there name; none when its client says nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -747,10 +744,10 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                     );
                 }
             }
-            None if tool.expire_ms.is_some() || tool.steps || tool.lift => {
+            None if tool.expire_ms.is_some() || tool.steps || tool.yields => {
                 return fail_with(
                     "invalid_declare",
-                    format!("{name}: expire_ms, steps and lift go with answered_by"),
+                    format!("{name}: expire_ms, steps and yields go with answered_by"),
                 );
             }
             None => {}
@@ -931,8 +928,8 @@ pub struct Place {
     /// `WAITING`, then `COUNTED` while it holds its place, then `LEFT`.
     state: Arc<std::sync::atomic::AtomicU8>,
     count: Arc<std::sync::atomic::AtomicUsize>,
-    /// The command's newest output, which a client may look at once a
-    /// steer moves it to the background.
+    /// The command's newest output, which a client may look at once it
+    /// yields to the background.
     peek: Peek,
 }
 const WAITING: u8 = 0;
@@ -3253,7 +3250,7 @@ impl Registry {
         Stopper { stop, listed }
     }
 
-    /// `run`, a command a steer moved to the background, ended when its
+    /// `run`, a command that yielded to the background, ended when its
     /// agent kills it by `stopper`'s handle, as one started there is.
     pub fn until_stopped<F>(
         &self,
@@ -3448,7 +3445,7 @@ impl Registry {
         false
     }
 
-    /// `run`, a command a steer moved to the background, ended as the pull
+    /// `run`, a command that yielded to the background, ended as the pull
     /// cord is pulled, as one started there is.
     pub fn until_pulled<F>(&self, run: F) -> impl Future<Output = Result<Outcome>> + use<F>
     where

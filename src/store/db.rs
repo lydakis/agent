@@ -2238,11 +2238,14 @@ pub enum CallAnswer {
     /// Its client's answer, or `tool_unserved` once its time ran out.
     Given(Outcome),
     /// Still waiting until `expires_ms`, or with no deadline while a step
-    /// of it waits on a gate; `notify` fires when an answer is held for the
-    /// turn, or the call's time runs again.
+    /// of it waits on a gate or runs; `notify` fires when an answer is held
+    /// for the turn, or the call's time runs again. `gated` while a step of
+    /// it waits on a gate: it then waits on someone, not on work, so a
+    /// message for the turn lifts it.
     Pending {
         notify: Arc<Notify>,
         expires_ms: Option<u64>,
+        gated: bool,
     },
     /// Its client yielded it: its handle answers it, recorded by the
     /// yield, and the call waits on as that command.
@@ -4347,8 +4350,8 @@ impl Database {
     /// The bot's turn parked on a wait of its own while a steer waits for
     /// it, with the newest queued steer: the steer wakes it. A `wait`'s
     /// handles are reported pending; a call waiting on its verdict, or on
-    /// its client's answer when that lifts (see `wake`), is lifted to the
-    /// background. The daemon's load gate
+    /// its client's answer while a step of it waits on a gate (see
+    /// `wake`), is lifted to the background. The daemon's load gate
     /// or a closed pool is not the bot's own wait, so neither is woken.
     pub fn steered_park(&self, name: &str) -> Result<Option<(i64, i64)>> {
         let parked: Option<i64> = self
@@ -10225,10 +10228,22 @@ impl Database {
                 unserved("a later call's gate lapsed before the answer".into()),
             ),
             None => CallAnswer::Pending {
+                gated: paused && self.step_gated(turn, call_id)?,
                 notify: self.live.entry(turn).or_default().notify.clone(),
                 expires_ms,
             },
         })
+    }
+    /// Whether a step of call `call_id` waits on a gate, which stops the
+    /// call's time as a step that runs does.
+    fn step_gated(&self, turn: i64, call_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM approvals INDEXED BY approvals_steps
+                 WHERE turn=? AND step_of=?)",
+            )?
+            .query_row(params![turn, call_id], |r| r.get(0))?)
     }
     /// Whether a call of the turn was moved to the background: its
     /// process row stays while the turn's rows are kept, after its answers
@@ -10359,7 +10374,7 @@ impl Database {
     /// as a message lifts it ([`Database::lift`]), so the model reads its
     /// handle, `yielded`, and `so_far`, and the call waits on its answer,
     /// with no deadline, as that command. Only a call of a tool declared
-    /// `lift`. The handle answers the call with the yield: the reply names
+    /// `yields`. The handle answers the call with the yield: the reply names
     /// it, and the turn waiting on the call is woken by `notify` while it
     /// runs and by `resume` while it is parked.
     pub fn yield_call(
@@ -10393,14 +10408,14 @@ impl Database {
         let Some(name) = name else {
             return fail("no_pending_call");
         };
-        let lifts = self
+        let yields = self
             .inspect(bot)?
             .declared(&name)
-            .is_some_and(|tool| tool.lift);
-        if !lifts {
+            .is_some_and(|tool| tool.yields);
+        if !yields {
             return fail_with(
-                "call_not_liftable",
-                format!("{name} is not declared lift: only its answer ends the call"),
+                "call_not_yieldable",
+                format!("{name} is not declared yields: only its answer ends the call"),
             );
         }
         let Some((process, _)) = self.lift(turn, call_id, None, Some(so_far), &[], now_ms)? else {
@@ -10724,13 +10739,11 @@ impl Database {
         ])?;
         let approval = tx.last_insert_rowid();
         tag_approval(&tx, approval, turn, &gates)?;
-        let paused = tx
-            .prepare_cached(
-                "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
-                 WHERE turn=? AND call_id=? AND paused_ms IS NULL",
-            )?
-            .execute(params![now_ms as i64, turn, call_id])?
-            == 1;
+        tx.prepare_cached(
+            "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
+             WHERE turn=? AND call_id=? AND paused_ms IS NULL",
+        )?
+        .execute(params![now_ms as i64, turn, call_id])?;
         let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
         let data = json!({"calls":[{"call_id":id,"step_of":call_id,"request":1,
             "announced_ms":now_ms,"gates":tags,"name":tool,"node":0}]});
@@ -10762,9 +10775,9 @@ impl Database {
         self.approvals += 1;
         self.steps.insert(approval, turn);
         // The call now waits on a verdict, which a message for its turn
-        // lifts: the turn hears so, live or parked, if one waits.
-        let steered =
-            paused && !lifted && bot.running_turn == Some(turn) && self.joining_steer(&bot.name)?;
+        // lifts: the turn hears so, live or parked, if one waits, its time
+        // stopped by this step or already by one that runs.
+        let steered = !lifted && bot.running_turn == Some(turn) && self.joining_steer(&bot.name)?;
         Ok(Stepped {
             step: Step::Pending {
                 approval,
@@ -13661,30 +13674,28 @@ impl Database {
         // Parked on an answer: the answer, its client's yield, its
         // deadline, or a later gated call's lapse resumes it.
         if let Some((_, status, Some(call_id))) = parked {
-            let answer: Option<(String, bool, i64, bool)> = self
+            let answer: Option<(bool, i64, bool)> = self
                 .conn
                 .prepare_cached(
-                    "SELECT name,output IS NOT NULL OR yielded,expires_ms,paused_ms IS NOT NULL
+                    "SELECT output IS NOT NULL OR yielded,expires_ms,paused_ms IS NOT NULL
                      FROM answers WHERE turn=? AND call_id=?",
                 )?
                 .query_row(params![turn, call_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })
                 .optional()?;
-            let Some((tool, answered, expires_ms, paused)) = answer else {
+            let Some((answered, expires_ms, paused)) = answer else {
                 return Ok(Wake::Resume);
             };
             // A message that joins the turn lifts the call it waits on, as
-            // it lifts a `wait`, when a step of the call waits on a gate or
-            // its tool lifts: the turn resumes to take it. Any other call
-            // is answered first.
+            // it ends a `wait`, while a step of the call waits on a gate:
+            // the turn resumes to take it. A running call is answered or
+            // yielded first, never moved.
             if status == "waiting"
                 && !answered
+                && paused
+                && self.step_gated(turn, &call_id)?
                 && self.joining_steer(name)?
-                && (paused
-                    || (self.inspect(name)?)
-                        .declared(&tool)
-                        .is_some_and(|tool| tool.lift))
             {
                 return Ok(Wake::Resume);
             }

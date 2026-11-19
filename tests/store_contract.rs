@@ -4154,7 +4154,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
             grammar: None,
             steps: false,
             gate_daemon_steps: false,
-            lift: false,
+            yields: false,
             inherit: Inherit::All,
             kind: None,
         };
@@ -5831,7 +5831,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     // The lead's own tool, which a bot it creates does not take.
@@ -5846,7 +5846,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     let declared = [react.clone()];
@@ -5956,7 +5956,7 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     let (lead, _) = db
@@ -6023,7 +6023,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6120,7 +6120,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6198,7 +6198,7 @@ fn a_reader_lists_waiting_calls_past_the_answers_the_writer_held_at_its_last_com
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6287,7 +6287,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -18963,7 +18963,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -20528,7 +20528,7 @@ fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: Some("mcp".into()),
     };
@@ -20747,7 +20747,7 @@ fn a_daemon_step_cut_short_still_names_the_files_it_changes() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: Some("mcp".into()),
     };
@@ -22114,7 +22114,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -22225,7 +22225,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -22696,7 +22696,7 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -23058,7 +23058,7 @@ fn schema_105_bots_that_message_with_tools_make_and_close_agents_too() {
 /// A call its client yields is lifted with its output so far, and waits on
 /// its answer with no deadline: past its tool's own time it still waits,
 /// its answer is taken, and it ends answered, the turn still reading the
-/// yield after its answer is collected. A tool not declared `lift` does not
+/// yield after its answer is collected. A tool not declared `yields` does not
 /// yield.
 #[test]
 fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
@@ -23073,13 +23073,13 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: true,
+        yields: true,
         inherit: Inherit::All,
         kind: None,
     };
     let quick = Declared {
         name: "note".into(),
-        lift: false,
+        yields: false,
         steps: false,
         ..exec.clone()
     };
@@ -23119,9 +23119,9 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
     }
     let now = epoch_now();
     let Err(refused) = db.yield_call("Lead", turn, "note-1", &result("so far"), now) else {
-        panic!("a call of a tool that does not lift yielded");
+        panic!("a call of a tool that does not yield yielded");
     };
-    assert_eq!(refused.code, "call_not_liftable");
+    assert_eq!(refused.code, "call_not_yieldable");
     let yielded = db
         .yield_call("Lead", turn, "exec-1", &result("built 3 of 9"), now)
         .unwrap();
