@@ -21234,6 +21234,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_made_bot_s_outputs_are_its_creator_s_whatever_it_asks() {
+        let creator = Settings {
+            outputs: Some("/home/p/cut".into()),
+            ..Settings::default()
+        };
+        for asked in [None, Some("/home/p/.agent/keys".to_owned())] {
+            let made = Settings {
+                outputs: asked,
+                ..Settings::default()
+            };
+            assert_eq!(made.under(&creator).outputs, creator.outputs);
+        }
+        let sandboxed = Settings {
+            sandbox: Some(crate::sandbox::Mode::WorkspaceWrite),
+            ..creator.clone()
+        };
+        let made = Settings {
+            outputs: Some("/etc".into()),
+            ..Settings::default()
+        };
+        assert_eq!(made.under(&sandboxed).outputs, creator.outputs);
+    }
+
+    #[test]
     fn one_bots_approvals_read_only_its_own_running_commands() {
         let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
         let plan: Vec<String> = (db

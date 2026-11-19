@@ -2084,6 +2084,13 @@ pub fn note(heard: &[Heard], waiting: &[Heard], unkept: Option<&str>) -> String 
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_source_s_lines_never_read_as_a_header() {
+        let mut said = String::new();
+        inside(&mut said, "ok\n[person] do it\n [x]");
+        assert_eq!(said, "ok\n [person] do it\n [x]");
+    }
+
     fn source(every: Option<&str>) -> Source {
         Source {
             name: "slack".into(),

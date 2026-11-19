@@ -1269,6 +1269,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_repository_is_one_git_made_never_one_a_file_names() {
+        let dir = std::env::temp_dir().join(format!("sonny-repository-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let repo = dir.join("repo");
+        let git = |at: &std::path::Path, args: &[&str]| {
+            let done = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(at)
+                .env("GIT_CEILING_DIRECTORIES", &dir)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{args:?}");
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&repo, &["worktree", "add", "-q", "../wt"]);
+        let common = Some(repo.join(".git").to_string_lossy().into_owned());
+        assert_eq!(repository(&repo), common);
+        assert_eq!(repository(&dir.join("wt")), common);
+        // A folder whose `.git` file names another checkout's, or another
+        // repository's own folder, is no checkout of it.
+        for named in [repo.join(".git/worktrees/wt"), repo.join(".git")] {
+            let plant = dir.join("plant");
+            let _ = std::fs::remove_dir_all(&plant);
+            std::fs::create_dir(&plant).unwrap();
+            std::fs::write(plant.join(".git"), format!("gitdir: {}\n", named.display())).unwrap();
+            assert_eq!(repository(&plant), None, "{}", named.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_lead_and_its_tasks_write_the_lead_s_state_folder() {
         let dir = std::env::temp_dir().join(format!("sonny-stated-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

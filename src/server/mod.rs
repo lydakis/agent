@@ -10354,6 +10354,39 @@ mod tests {
             starts_line: false,
         }
     }
+    #[test]
+    fn a_new_bot_s_folders_are_kept_as_they_were_checked() {
+        let dir = std::fs::canonicalize(scratch("checked")).unwrap();
+        let (workspace, kept) = (dir.join("workspace"), dir.join("kept"));
+        for folder in [&workspace, &kept] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        let mut command = create("b", &workspace);
+        let Command::Create { settings, .. } = &mut command else {
+            unreachable!()
+        };
+        settings.writable = vec![dir.join("./kept").to_str().unwrap().to_owned()];
+        let mut request = Request {
+            id: Value::Null,
+            command,
+            workspace_error: None,
+        };
+        request.resolve_workspace();
+        assert!(request.workspace_error.is_none());
+        // The folder checked is swapped for a link after the check.
+        std::fs::rename(&kept, dir.join("old")).unwrap();
+        std::os::unix::fs::symlink("/etc", &kept).unwrap();
+        let Command::Create { mut settings, .. } = request.command else {
+            unreachable!()
+        };
+        let mut again = (*settings).clone();
+        confine(&mut settings, false).unwrap();
+        assert_eq!(settings.writable, [kept.to_str().unwrap()]);
+        // Resolved again, it would be where the link points.
+        confine(&mut again, true).unwrap();
+        assert_eq!(again.writable, ["/etc"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("agent-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

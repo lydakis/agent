@@ -1591,6 +1591,25 @@ mod tests {
     }
 
     #[test]
+    fn instructions_never_take_a_file_kept_from_agents() {
+        let root = temp("hidden");
+        let keys = root.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("env"), "KEY=secret").unwrap();
+        let workspace = root.join("work");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::os::unix::fs::symlink(keys.join("env"), workspace.join("AGENTS.md")).unwrap();
+        let read = instructions_leaving_out(&workspace, None, &[]).unwrap();
+        assert!(read.text.contains("KEY=secret"));
+        let kept = hiding(std::slice::from_ref(&keys), || {
+            instructions_leaving_out(&workspace, None, &[]).unwrap()
+        });
+        assert!(!kept.text.contains("KEY=secret"), "{}", kept.text);
+        assert!(hiding(&[keys], || instructions(&workspace, None, &[])).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn profiles_lists_client_roles_and_their_variants_and_what_each_is_built_on() {
         let root = temp("listed");
         let agents = root.join(".agents/agents");

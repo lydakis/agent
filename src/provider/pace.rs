@@ -2618,6 +2618,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn headers_out_of_any_range_are_not_taken() {
+        let pace = Pace::default();
+        let family = crate::codec::Family::Responses;
+        for (limit, remaining) in [("10", "NaN"), ("inf", "5"), ("-10", "5"), ("0", "0")] {
+            pace.seed(
+                &headers(&[
+                    ("x-ratelimit-limit-requests", limit),
+                    ("x-ratelimit-remaining-requests", remaining),
+                    ("x-ratelimit-limit-tokens", limit),
+                    ("x-ratelimit-remaining-tokens", remaining),
+                ]),
+                family,
+            );
+            assert_eq!(pace.snapshot().0, None, "{limit} {remaining}");
+        }
+        // Less than none left is none; more than the limit, the limit.
+        pace.seed(
+            &headers(&[
+                ("x-ratelimit-limit-requests", "10"),
+                ("x-ratelimit-remaining-requests", "-1e40"),
+            ]),
+            family,
+        );
+        assert_eq!(pace.snapshot().1, 0.0);
+        pace.seed(
+            &headers(&[
+                ("x-ratelimit-limit-tokens", "1000"),
+                ("x-ratelimit-remaining-tokens", "1e40"),
+            ]),
+            family,
+        );
+        assert_eq!(pace.snapshot().3, 1000.0);
+        // Neither the status nor the next call fails on what came before.
+        let _ = pace.status();
+        let call = tokio::time::timeout(Duration::from_secs(120), sent(&pace, 100)).await;
+        assert!(call.is_ok_and(|call| call.is_ok()));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn headers_wake_waiters_before_completion_without_double_refunding() {
         let pace = Pace::default();
         let family = crate::codec::Family::Responses;

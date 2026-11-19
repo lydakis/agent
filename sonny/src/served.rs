@@ -1071,8 +1071,8 @@ struct Line {
 }
 
 impl Line {
-    /// `caller`'s, whose own folder is `here`: a lead's folder, and that of
-    /// every agent in its line, is the lead's own, and an agent no lead
+    /// `caller`'s, whose own folder is `here`: a lead's folder is its own,
+    /// that of every agent in its line is the lead's, and an agent no lead
     /// heads the line of has its own. Read with the daemon's CLI, as the
     /// start itself is made: who leads goes by who made each agent, never
     /// by its name or the folder its turn is in, so no agent passes for a
@@ -1106,8 +1106,8 @@ impl Line {
         });
         let project = project_of(lead.as_ref().map_or(caller, |(lead, _)| lead));
         let folder = match lead {
-            Some((_, folder)) => folder,
-            None => here.to_owned(),
+            Some((_, folder)) if !leads => folder,
+            _ => here.to_owned(),
         };
         Line {
             lead: leads,

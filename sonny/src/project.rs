@@ -1193,6 +1193,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_lead_is_one_no_agent_made_whatever_its_name() {
+        assert!(is_lead_record(&serde_json::json!({"name": "shop.lead"})));
+        assert!(is_lead_record(
+            &serde_json::json!({"name": "shop.lead.ui", "created_by": null})
+        ));
+        assert!(!is_lead_record(
+            &serde_json::json!({"name": "shop.lead", "created_by": "shop.fix"})
+        ));
+        assert!(!is_lead_record(&serde_json::json!({"name": "shop.fix"})));
+    }
+
+    #[test]
     fn sonny_s_own_bots_share_no_name_with_a_folder_s() {
         let base = internal("reviewer.auto");
         assert!(is_internal(&base) && is_internal(&format!("{base}.4.123.0")));

@@ -3111,8 +3111,13 @@ mod tests {
     #[test]
     fn files_stay_in_the_agent_s_folder() {
         let real = scratch("files");
-        let shot = args("screenshot shots/page.png", &real).unwrap();
-        assert_eq!(shot[1], real.join("shots/page.png").to_string_lossy());
+        // The browser writes a file of Sonny's own, which goes to the
+        // agent's folder once the command is done.
+        let shot = checked("screenshot shots/page.png", &reach(&real)).unwrap();
+        let goes = real.join("shots/page.png").to_string_lossy().into_owned();
+        assert_eq!(shot.carried.len(), 1);
+        assert_eq!(shot.carried[0].0, goes);
+        assert_eq!(shot.args[1], shot.carried[0].1.to_string_lossy());
         for line in [
             "screenshot /etc/page.png",
             "screenshot ../page.png",
@@ -3201,11 +3206,14 @@ mod tests {
         assert!(checked("open https://example.com", &lent).is_ok());
         assert!(checked("pdf page.pdf", &lent).is_err());
         assert!(checked("open file:///etc/passwd", &Reach::lent(true)).is_err());
-        // The browser is handed the real path, not the link.
+        // It goes to the real path, not through the link.
         std::os::unix::fs::symlink(real.join("shots"), real.join("in")).unwrap();
         std::fs::create_dir_all(real.join("shots")).unwrap();
-        let shot = args("screenshot in/page.png", &real).unwrap();
-        assert_eq!(shot[1], real.join("shots/page.png").to_string_lossy());
+        let shot = checked("screenshot in/page.png", &reach(&real)).unwrap();
+        assert_eq!(
+            shot.carried[0].0,
+            real.join("shots/page.png").to_string_lossy()
+        );
     }
 
     #[test]
@@ -3252,11 +3260,32 @@ mod tests {
         std::fs::write(&failed.carried[0].1, "x").unwrap();
         assert!(carried("s1", &failed, false).is_empty());
         assert!(!failed.carried[0].1.exists());
-        // Here, each is written where the agent may write, and only there.
+        // Here, each is written where the agent may write, and only there,
+        // by Sonny, through no link.
         let writer = reach(&real);
-        for line in ["screenshot shots/page.png", "pdf p.pdf"] {
-            assert!(checked(line, &writer).unwrap().carried.is_empty());
+        for (line, file) in [
+            ("screenshot shots/page.png", "shots/page.png"),
+            ("pdf p.pdf", "p.pdf"),
+        ] {
+            let saved = checked(line, &writer).unwrap();
+            assert_eq!(saved.carried.len(), 1, "{line}");
+            let (goes, staged) = &saved.carried[0];
+            assert_eq!(*goes, real.join(file).to_string_lossy());
+            std::fs::write(staged, "saved").unwrap();
+            land_staged(&writer, goes, staged).unwrap();
+            assert_eq!(std::fs::read_to_string(real.join(file)).unwrap(), "saved");
+            assert!(!staged.exists());
         }
+        std::os::unix::fs::symlink("/etc", real.join("away")).unwrap();
+        std::os::unix::fs::symlink("/etc/sonny-y", real.join("link.png")).unwrap();
+        for goes in ["away/sonny-y", "link.png"] {
+            let staged = carried_file("x").unwrap();
+            std::fs::write(&staged, "no").unwrap();
+            let goes = real.join(goes).to_string_lossy().into_owned();
+            assert!(land_staged(&writer, &goes, &staged).is_err(), "{goes}");
+            assert!(!staged.exists());
+        }
+        assert!(!Path::new("/etc/sonny-y").exists());
         use base64::Engine;
         let data = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
         let answer = json!([
@@ -3306,10 +3335,11 @@ mod tests {
         ] {
             assert!(args(line, &real).is_err(), "{line} ran");
         }
-        let shot = args("screenshot body out", &real).unwrap();
+        let shot = checked("screenshot body out", &reach(&real)).unwrap();
+        assert_eq!(shot.carried[0].0, real.join("out").to_string_lossy());
         assert_eq!(
-            shot,
-            ["screenshot", "body", &real.join("out").to_string_lossy()]
+            shot.args,
+            ["screenshot", "body", &shot.carried[0].1.to_string_lossy()]
         );
         let shot = checked("screenshot body", &reach(&real)).unwrap();
         assert_eq!(shot.args.len(), 3);
