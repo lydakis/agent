@@ -2405,8 +2405,67 @@ fn draw_defined(
     (blocks, links.collect())
 }
 
-/// How many footnotes `text` points at, as `[^name]` with no `:` after it.
+/// How many footnotes `text` points at, as `[^name]` with no `:` after it,
+/// outside code and escapes: written there, a mark points at nothing.
 fn footnote_marks(text: &str) -> usize {
+    if !text.contains("[^") {
+        return 0;
+    }
+    let mut fence: Option<Fence> = None;
+    let mut count = 0;
+    for line in text.split('\n') {
+        let marks = contained(line);
+        if let Some(open) = &fence {
+            if open.closed_by(marks) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = Fence::opened_by(marks) {
+            fence = Some(open);
+            continue;
+        }
+        if line.contains("[^") {
+            count += line_footnote_marks(&outside_code(line));
+        }
+    }
+    count
+}
+
+/// `line` with its code spans and escaped characters blanked.
+fn outside_code(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(['`', '\\']) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        if rest.starts_with('\\') {
+            let escaped = rest[1..].chars().next().map_or(0, char::len_utf8);
+            out.push(' ');
+            rest = &rest[1 + escaped..];
+            continue;
+        }
+        let ticks = rest.bytes().take_while(|b| *b == b'`').count();
+        let fence = &rest[..ticks];
+        let after = &rest[ticks..];
+        // The span ends at the same run of backticks, no longer.
+        let close = (after.match_indices(fence))
+            .find(|(at, _)| !after[at + ticks..].starts_with('`') && !after[..*at].ends_with('`'));
+        match close {
+            Some((at, _)) => rest = &after[at + ticks..],
+            None => {
+                out.push_str(fence);
+                rest = after;
+            }
+        }
+        out.push(' ');
+    }
+    out.push_str(rest);
+    out
+}
+
+/// [`footnote_marks`] in one line of words.
+fn line_footnote_marks(text: &str) -> usize {
     (text.match_indices("[^"))
         .filter(|(at, _)| {
             // A name holds no space or bracket, so the search stops at the
@@ -2664,6 +2723,10 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         let digits = words.bytes().take_while(u8::is_ascii_digit).count();
         match first {
             Some('#' | '>' | '|' | '=') => true,
+            Some('_') => {
+                words.chars().all(|c| c == '_' || c == ' ')
+                    && words.chars().filter(|c| *c == '_').count() >= 3
+            }
             Some(mark @ ('-' | '+' | '*')) => {
                 second.is_none_or(|c| c == ' ')
                     || (words.chars().all(|c| c == mark || c == ' ')
@@ -2824,6 +2887,14 @@ mod tests {
         // Footnote marks no bracket closes are read once each.
         assert_eq!(footnote_marks(&"[^a".repeat(50_000)), 0);
         assert_eq!(footnote_marks("See [^1] and [^a b] and [^n]: x"), 1);
+        assert_eq!(footnote_marks("Use `[^name]` or \\[^x] for one."), 0);
+        assert_eq!(footnote_marks("```md\n[^a]\n```\nSee [^b]."), 1);
+        // A thematic break of underscores in a cell is words.
+        let words: String = inline("___", Style::new())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(words, "___");
         // Quote marks deep on one line are read once each.
         let deep = format!("{} x", ">".repeat(20_000));
         assert!(!whole(&reply, &deep, 40).is_empty());
