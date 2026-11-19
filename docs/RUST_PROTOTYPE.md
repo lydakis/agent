@@ -715,6 +715,7 @@ when it sets either.
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
 | `rules` (none) | The bot's [command rules](#command-rules), as its client read them: `prefix_rules`, `host_executables`, or `invalid` with why they couldn't be read. A bot another made takes its creator's, always. At most 256 KiB as JSON. | none |
+| `namespace` (`--namespace`) | The group its client puts the bot in: its daemon tools list `NAMESPACE.*` when they name no bots, and `spawn_agent` names a bot it makes `NAMESPACE.NAME` when the name has no dot. 1 to 128 of `A-Z a-z 0-9 . _ -`, as a bot name. A bot made by another takes its creator's unless its client sets one; a fork keeps its source's. Sonny sets each agent's to its name up to the first dot. Schema 108 gives every bot made before its name up to the first dot, the group the daemon used to read from the name. Protocol 96. | none: those tools list every bot and take names whole |
 | `env` (none) | Variables its commands get beside the daemon's environment, as a map of name to value, as Codex's `shell_environment_policy.set` sets them for every shell: a client names a fact for its bots' shells, such as Sonny's `SONNY_STATE`. Names are a letter or `_`, then letters, digits and `_`; `AGENT_` ones are the daemon's own and refused. A bot another made takes its creator's, always, and a change reaches the bots it made, as `rules` do, so no bot plants a variable (`PATH`, `LD_PRELOAD`) that changes what a command approved to leave its sandbox runs. `inspect` shows the values, so they hold no secrets. At most 16 KiB as JSON. Protocol 53. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
@@ -2977,8 +2978,8 @@ running turn only of the caller or a bot it made, and the message then
 waits for a turn of its own (`queue`); and `pause_agents` names the caller
 as who pulled the cord. A message's `request_id` is the call's own unless
 the model names one, so a call made again after a restart sends nothing
-new. `list_agents` lists the caller's project's bots by default (its name up
-to the first dot, then `*`), and with `approvals` the calls waiting on a
+new. `list_agents` lists the caller's namespace's bots by default (its
+`namespace` setting, then `.*`; every bot when it has none), and with `approvals` the calls waiting on a
 gate instead. A store from before schema 100 gives the three to every bot
 that has `wait` and `history`; the approval modes never gate them.
 

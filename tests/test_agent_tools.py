@@ -19,6 +19,11 @@ def calls(*called):
     return 'calls:' + json.dumps([[name, arguments] for name, arguments in called])
 
 
+def grouped(bot, **settings):
+    """A bot's settings as Sonny makes them: its namespace is its name up to the first dot."""
+    return {'namespace': bot.split('.', 1)[0], **settings}
+
+
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AgentToolsTests(ModelFixture):
     def output(self, client, bot, call_id):
@@ -34,7 +39,7 @@ class AgentToolsTests(ModelFixture):
     def test_a_message_reads_as_the_calling_turn_and_its_retry_sends_nothing_new(self):
         client = self.client(TOOLS)
         for bot in ('shop.lead', 'shop.fix'):
-            client.request('create', bot=bot, workspace=str(self.path))
+            client.request('create', bot=bot, workspace=str(self.path), settings=grouped(bot))
         turn = self.run_calls(client, 'shop.lead', 'go',
                               ('send_message', {'to': 'shop.fix', 'message': 'hi'}))
         sent = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
@@ -55,7 +60,7 @@ class AgentToolsTests(ModelFixture):
     def test_a_message_may_not_interrupt_an_agent_the_caller_did_not_make(self):
         client = self.client(TOOLS)
         for bot in ('shop.lead', 'shop.other'):
-            client.request('create', bot=bot, workspace=str(self.path))
+            client.request('create', bot=bot, workspace=str(self.path), settings=grouped(bot))
         busy = client.request('submit', bot='shop.other', request_id='busy', prompt='wait')['result']['message']
         self.run_calls(client, 'shop.lead', 'go',
                        ('send_message', {'to': 'shop.other', 'message': 'stop', 'interrupt': True}))
@@ -66,8 +71,8 @@ class AgentToolsTests(ModelFixture):
 
     def test_an_interrupt_stops_the_turn_of_an_agent_the_caller_made_and_queues_the_message(self):
         client = self.client(TOOLS)
-        lead = client.request('create', bot='shop.lead', workspace=str(self.path))['result']
-        client.request('create', bot='shop.fix', workspace=str(self.path),
+        lead = client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))['result']
+        client.request('create', bot='shop.fix', workspace=str(self.path), settings=grouped('shop.fix'),
                        created_by='shop.lead', created_by_id=lead['bot_id'])
         busy = client.request('submit', bot='shop.fix', request_id='busy', prompt='wait')['result']['message']
         self.model.requests.get(timeout=3)
@@ -89,7 +94,7 @@ class AgentToolsTests(ModelFixture):
         self.addCleanup(self.model.release_headers.set)
         client = self.client(TOOLS)
         for bot in ('shop.lead', 'web.lead', 'shop.fix'):
-            client.request('create', bot=bot, workspace=str(self.path))
+            client.request('create', bot=bot, workspace=str(self.path), settings=grouped(bot))
         busy = client.request('submit', bot='shop.fix', request_id='busy', prompt='gate')['result']['message']
         self.model.requests.get(timeout=3)
         self.run_calls(client, 'shop.lead', 'first',
@@ -128,7 +133,7 @@ class AgentToolsTests(ModelFixture):
     def test_agents_are_listed_by_project_and_the_calls_waiting_on_approval(self):
         client = self.client(TOOLS)
         for bot in ('shop.lead', 'shop.fix', 'web.lead'):
-            client.request('create', bot=bot, workspace=str(self.path))
+            client.request('create', bot=bot, workspace=str(self.path), settings=grouped(bot))
         self.run_calls(client, 'shop.lead', 'go',
                        ('list_agents', {}),
                        ('list_agents', {'name': '*.lead'}),
@@ -144,8 +149,8 @@ class AgentToolsTests(ModelFixture):
 
     def test_a_call_waiting_on_a_gate_is_listed_with_its_arguments_and_tags(self):
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path))
-        client.request('create', bot='shop.fix', workspace=str(self.path), tools=['shell'],
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
+        client.request('create', bot='shop.fix', workspace=str(self.path), settings=grouped('shop.fix'), tools=['shell'],
                        approve=['shell'], approver='manual')
         held = client.request('submit', bot='shop.fix', request_id='held',
                               prompt=calls(('shell', {'command': 'echo held-call'})))['result']['message']
@@ -159,7 +164,7 @@ class AgentToolsTests(ModelFixture):
 
     def test_the_cord_names_the_agent_that_pulled_it(self):
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
         turn = client.request('submit', bot='shop.lead', request_id='go',
                               prompt=calls(('pause_agents', {'reason': 'emails going out'})))['result']['message']
         paused = client.receive(lambda m: m.get('event') == 'paused')['pause']
@@ -176,7 +181,7 @@ class AgentToolsTests(ModelFixture):
 
     def test_an_agent_made_with_spawn_agent_works_in_the_callers_project_folder_and_tools(self):
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path), settings={'speed': 'fast'})
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead', speed='fast'))
         turn = self.run_calls(client, 'shop.lead', 'go',
                               ('spawn_agent', {'name': 'review', 'message': 'look it over'}))
         made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
@@ -188,8 +193,9 @@ class AgentToolsTests(ModelFixture):
         review = client.request('inspect', bot='shop.review')['result']
         self.assertEqual((review['created_by'], review['workspace'], review['tools'], review['model']),
                          ('shop.lead', lead['workspace'], lead['tools'], lead['model']))
-        # Its speed too, as its other settings.
-        self.assertEqual(review['settings']['speed'], 'fast', review['settings'])
+        # Its speed and namespace too, as its other settings.
+        self.assertEqual((review['settings']['speed'], review['settings']['namespace']), ('fast', 'shop'),
+                         review['settings'])
         listed = client.request('messages', bot='shop.review', after=0)['result']['messages']
         self.assertEqual(listed[0]['from'], {'bot': 'shop.lead', 'turn': turn}, listed[0])
         # The same call made again makes and sends nothing new.
@@ -201,7 +207,7 @@ class AgentToolsTests(ModelFixture):
 
     def test_a_whole_name_stays_whole_and_an_effort_asked_for_is_kept(self):
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
         self.run_calls(client, 'shop.lead', 'go',
                        ('spawn_agent', {'name': 'other.look', 'message': 'q', 'effort': 'low'}))
         made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
@@ -212,7 +218,7 @@ class AgentToolsTests(ModelFixture):
     def test_a_new_agent_takes_what_run_new_takes(self):
         (self.path / 'AGENTS.md').write_text('Folder rule: tabs.\n')
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path), tools=TOOLS.split(','))
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'), tools=TOOLS.split(','))
         self.run_calls(client, 'shop.lead', 'go',
                        ('spawn_agent', {'name': 'plain', 'message': 'q'}),
                        ('spawn_agent', {'name': 'told', 'message': 'q', 'agents': True}),
@@ -238,7 +244,7 @@ class AgentToolsTests(ModelFixture):
     def test_a_spawn_sent_again_after_its_folder_changed_keeps_the_agent_it_made(self):
         (self.path / 'AGENTS.md').write_text('First rule.\n')
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
         spawn = ('spawn_agent', {'name': 'look', 'message': 'q', 'agents': True, 'request_id': 'once'})
         self.run_calls(client, 'shop.lead', 'go', spawn)
         (self.path / 'AGENTS.md').write_text('Second rule.\n')
@@ -263,7 +269,7 @@ class AgentToolsTests(ModelFixture):
 
     def test_a_new_agent_takes_the_running_turns_own_effort(self):
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path), effort='low')
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'), effort='low')
         turn = client.request('submit', bot='shop.lead', request_id='go', effort='high',
                               prompt=calls(('spawn_agent', {'name': 'look', 'message': 'q'})))['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -272,7 +278,7 @@ class AgentToolsTests(ModelFixture):
 
     def test_a_caller_kept_to_some_tools_makes_agents_kept_to_them(self):
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
         client.request('fork', source='shop.lead', bot='shop.narrow', allow=['echo', 'spawn_agent'])
         self.run_calls(client, 'shop.narrow', 'go',
                        ('spawn_agent', {'name': 'helper', 'message': 'q'}),
@@ -290,8 +296,8 @@ class AgentToolsTests(ModelFixture):
         (agents / 'loose.md').write_text('---\nsandbox: danger-full-access\n---\nDo anything.\n')
         client = self.client(TOOLS)
         made = client.request('create', bot='shop.lead', workspace=str(self.path),
-                              settings={'sandbox': 'workspace-write', 'network': True,
-                                        'writable': [str(self.path)]})
+                              settings=grouped('shop.lead', sandbox='workspace-write', network=True,
+                                               writable=[str(self.path)]))
         self.assertIn('result', made, made)
         self.run_calls(client, 'shop.lead', 'go',
                        ('spawn_agent', {'name': 'review', 'message': 'q', 'profile': 'reviewer'}),
@@ -327,7 +333,7 @@ class AgentToolsTests(ModelFixture):
 
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
         self.run_calls(client, 'shop.lead', 'go',
                        ('spawn_agent', {'name': 'ask', 'message': 'q', 'fork': True, 'profile': 'task'}),
                        ('spawn_agent', {'name': 'odd', 'message': 'q', 'profile': 'nobody'}),
@@ -342,7 +348,7 @@ class AgentToolsTests(ModelFixture):
 
     def test_a_closed_agent_leaves_the_list_until_a_message_opens_it(self):
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
         self.run_calls(client, 'shop.lead', 'go',
                        ('spawn_agent', {'name': 'fix', 'message': 'hi'}))
         made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
@@ -366,10 +372,10 @@ class AgentToolsTests(ModelFixture):
 
     def test_closing_stops_a_running_turn_and_is_refused_for_an_agent_the_caller_did_not_make(self):
         client = self.client(TOOLS)
-        lead = client.request('create', bot='shop.lead', workspace=str(self.path))['result']
-        client.request('create', bot='shop.fix', workspace=str(self.path),
+        lead = client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))['result']
+        client.request('create', bot='shop.fix', workspace=str(self.path), settings=grouped('shop.fix'),
                        created_by='shop.lead', created_by_id=lead['bot_id'])
-        client.request('create', bot='shop.other', workspace=str(self.path))
+        client.request('create', bot='shop.other', workspace=str(self.path), settings=grouped('shop.other'))
         busy = client.request('submit', bot='shop.fix', request_id='busy', prompt='wait')['result']['message']
         self.model.requests.get(timeout=3)
         self.run_calls(client, 'shop.lead', 'go',
@@ -385,11 +391,11 @@ class AgentToolsTests(ModelFixture):
 
     def test_a_pattern_closes_the_quiet_agents_the_caller_made_and_refuses_the_rest(self):
         client = self.client(TOOLS)
-        lead = client.request('create', bot='shop.lead', workspace=str(self.path))['result']
+        lead = client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))['result']
         for name in ('shop.fix', 'shop.look', 'shop.busy'):
-            client.request('create', bot=name, workspace=str(self.path),
+            client.request('create', bot=name, workspace=str(self.path), settings=grouped(name),
                            created_by='shop.lead', created_by_id=lead['bot_id'])
-        client.request('create', bot='shop.other', workspace=str(self.path))
+        client.request('create', bot='shop.other', workspace=str(self.path), settings=grouped('shop.other'))
         busy = client.request('submit', bot='shop.busy', request_id='busy', prompt='wait')['result']['message']
         self.model.requests.get(timeout=3)
         self.run_calls(client, 'shop.lead', 'go',
