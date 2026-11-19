@@ -148,6 +148,8 @@ struct Fence {
     mark: char,
     length: usize,
     lang: String,
+    /// The spaces before its opening marks, taken off each line in it.
+    indent: usize,
 }
 
 impl Fence {
@@ -165,7 +167,19 @@ impl Fence {
             mark,
             length,
             lang: language(info),
+            indent: line.len() - trimmed.len(),
         })
+    }
+
+    /// `line` inside it, less as many of its first spaces as the fence
+    /// is indented.
+    fn strip<'a>(&self, line: &'a str) -> &'a str {
+        let spaces = line
+            .bytes()
+            .take(self.indent)
+            .take_while(|b| *b == b' ')
+            .count();
+        &line[spaces..]
     }
 
     /// Whether `line` closes it.
@@ -481,10 +495,13 @@ impl Draw<'_> {
                     self.spans.push(Span::styled(text.into_string(), style));
                 }
             },
-            Event::Code(code) => {
-                let style = self.style().fg(Color::Cyan);
-                self.spans.push(Span::styled(code.into_string(), style));
-            }
+            Event::Code(code) => match &mut self.image {
+                Some((_, alt)) => alt.push_str(&code),
+                None => {
+                    let style = self.style().fg(Color::Cyan);
+                    self.spans.push(Span::styled(code.into_string(), style));
+                }
+            },
             Event::InlineMath(tex) | Event::DisplayMath(tex) => {
                 let style = self.style().italic();
                 let math = crate::math::unicode(tex.trim());
@@ -536,7 +553,8 @@ impl Draw<'_> {
         self.here = start;
         self.starts = vec![start];
         let first = std::mem::replace(self.firsts.last_mut().expect("a level"), false);
-        let gap = blank_between(self.source, self.last_end.max(self.skip), start);
+        let gap = (self.holders.is_empty() || !first)
+            && blank_between(self.source, self.last_end.max(self.skip), start);
         if self.holders.is_empty() {
             self.top = Some((start, gap, None));
             self.items.clear();
@@ -645,8 +663,12 @@ impl Draw<'_> {
                 self.begin(range.start);
                 let fence = match kind {
                     CodeBlockKind::Fenced(_) => {
+                        // Its indent counts from where its line starts.
+                        let from = self.source[..range.start]
+                            .rfind('\n')
+                            .map_or(0, |at| at + 1);
                         let line = self.source[range.start..].trim_start_matches([' ', '\t']);
-                        Fence::opened_by(line)
+                        Fence::opened_by(&self.source[from..]).or_else(|| Fence::opened_by(line))
                     }
                     CodeBlockKind::Indented => None,
                 };
@@ -1265,8 +1287,9 @@ fn path(at: &Where, src: &str) -> Option<std::path::PathBuf> {
 /// ```math fence, as a `$$` line has always drawn.
 #[derive(Clone, Default)]
 struct Rewrite {
-    /// The fence open, so math marks inside code stay code.
-    fence: Option<Fence>,
+    /// The fence open, so math marks inside code stay code, and whether
+    /// it opened in a quote or a list item.
+    fence: Option<(Fence, bool)>,
     /// Inside display math: what closes it, `$$` or `\]`.
     math: Option<&'static str>,
 }
@@ -1274,8 +1297,12 @@ struct Rewrite {
 impl Rewrite {
     /// `line` as Markdown reads it: one line, or a math fence's lines.
     fn line(&mut self, line: &str, out: &mut String) {
-        if let Some(fence) = &self.fence {
-            if fence.closed_by(line) {
+        if let Some((fence, inside)) = &self.fence {
+            let marks = match inside {
+                true => contained(line),
+                false => line,
+            };
+            if fence.closed_by(marks) {
                 self.fence = None;
             }
             push_line(out, line);
@@ -1293,7 +1320,9 @@ impl Rewrite {
             }
             return;
         }
-        if let Some(fence) = Fence::opened_by(line) {
+        let fence = (Fence::opened_by(line).map(|fence| (fence, false)))
+            .or_else(|| Fence::opened_by(contained(line)).map(|fence| (fence, true)));
+        if let Some(fence) = fence {
             self.fence = Some(fence);
             push_line(out, line);
             return;
@@ -1322,6 +1351,29 @@ impl Rewrite {
             }
         }
         push_line(out, &parens(line));
+    }
+}
+
+/// `line` past the quote marks and list marks that start it: a fence in a
+/// quote or a list item opens and closes there.
+fn contained(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        let words = rest.trim_start_matches(' ');
+        if let Some(after) = words.strip_prefix('>') {
+            rest = after;
+            continue;
+        }
+        let digits = words.bytes().take_while(u8::is_ascii_digit).count();
+        let mark = match words.as_bytes().get(digits) {
+            Some(b'-' | b'*' | b'+') if digits == 0 => 1,
+            Some(b'.' | b')') if digits > 0 => digits + 1,
+            _ => return words,
+        };
+        match words[mark..].starts_with(' ') {
+            true => rest = &words[mark..],
+            false => return words,
+        }
     }
 }
 
@@ -1572,6 +1624,7 @@ impl Markdown {
                 }
                 return;
             }
+            let line = open.fence.strip(line);
             match &mut open.picture {
                 Some(source) => push_line(source, line),
                 None => {
@@ -1697,7 +1750,11 @@ impl Markdown {
                 .and_then(|start| self.source.get(start..))
                 .unwrap_or("");
             let body = opened.split_once('\n').map_or("", |(_, body)| body);
-            let picture = drawn(&fence.lang, self.at.document).then(|| body.to_owned());
+            let body = body.lines().fold(String::new(), |mut out, line| {
+                push_line(&mut out, fence.strip(line));
+                out
+            });
+            let picture = drawn(&fence.lang, self.at.document).then(|| body.clone());
             let mut code = match picture {
                 Some(_) => None,
                 None => crate::highlight::Code::language(&fence.lang),
@@ -2184,7 +2241,7 @@ impl Markdown {
         if let Some(open) = &self.fence {
             if open.picture.is_none() && !partial.is_empty() {
                 let mut code = open.code.clone();
-                let spans = code_line(&mut code, partial);
+                let spans = code_line(&mut code, open.fence.strip(partial));
                 out = wrap_lines(
                     Line::from(spans),
                     width,
@@ -2584,6 +2641,9 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
     let indent = &text[..text.len() - text.trim_start().len()];
     let words = text.trim_start();
     // Words read as words, never as a block's marks.
+    // Where a backslash keeps a block's mark as words: before the dot or
+    // parenthesis after a number, a backslash before a digit being shown.
+    let mut escape = 0;
     let block = {
         let mut chars = words.chars();
         let first = chars.next();
@@ -2598,6 +2658,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             }
             Some('`' | '~') => words.starts_with("```") || words.starts_with("~~~"),
             Some(_) => {
+                escape = digits;
                 digits > 0
                     && matches!(words.as_bytes().get(digits), Some(b'.' | b')'))
                     && words.as_bytes().get(digits + 1).is_none_or(|b| *b == b' ')
@@ -2614,10 +2675,10 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         spans.push(Span::styled(words.trim_end().to_owned(), base));
         return spans;
     }
-    let source = match block {
-        true => format!("\\{}", parens(words)),
-        false => parens(words).into_owned(),
-    };
+    let mut source = parens(words).into_owned();
+    if block {
+        source.insert(escape, '\\');
+    }
     let at = Where::default();
     let mut notes = Notes::default();
     let mut cells = Cells::default();
@@ -2708,6 +2769,32 @@ mod tests {
         (spans().find(|span| span.content.trim_end() == words))
             .or_else(|| spans().find(|span| span.content.contains(words)))
             .unwrap_or_else(|| panic!("no {words:?} in {:?}", text(rows)))
+    }
+
+    #[test]
+    fn code_reads_as_commonmark_reads_it_in_every_container() {
+        let reply = Markdown::default();
+        // An indented fence's lines lose as many spaces as it has.
+        let fence = "  ```python\n  print(1)\n  ```";
+        let drawn = whole(&reply, fence, 40);
+        assert!(drawn.iter().any(|row| row == "    print(1)"), "{drawn:?}");
+        assert_eq!(streamed(Markdown::default(), fence, 40), drawn);
+        // Math marks inside code in a quote stay as written.
+        let quoted = "> ```text\n> \\(x\\)\n> ```";
+        let drawn = whole(&reply, quoted, 40);
+        assert!(drawn.iter().any(|row| row.contains("\\(x\\)")), "{drawn:?}");
+        // Code in a picture's words stays in them.
+        let picture = whole(&reply, "See ![the `build` result](out.png) now.", 60);
+        assert!(picture.concat().contains("the build result"), "{picture:?}");
+        // Numbered words in a cell read as they are written.
+        let words: String = inline("1. Install", Style::new())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(words, "1. Install");
+        // Quote marks deep on one line are read once each.
+        let deep = format!("{} x", ">".repeat(20_000));
+        assert!(!whole(&reply, &deep, 40).is_empty());
     }
 
     #[test]
