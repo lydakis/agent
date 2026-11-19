@@ -25745,6 +25745,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_closed_agent_leaves_the_counts_on_its_close_and_comes_back_with_a_message() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lead = json!({"name": "shop.lead", "bot_id": 1, "head": 1});
+        let fix = |closed: bool| {
+            let mut row = json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                "last": {"turn": 4, "status": "completed"}, "created_by": "shop.lead"});
+            if closed {
+                row["closed_ms"] = json!(1_700_000_000_000_i64);
+            }
+            row
+        };
+        let closed = Arc::new(AtomicBool::new(false));
+        let shut = closed.clone();
+        let snapshot = json!([fix(false), lead]);
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" if ask["names"].is_null() && ask["active"].is_null() => {
+                assert_eq!(ask["open"], true, "{ask}");
+                json!({"bots": snapshot, "cursor": 7, "next_after": null})
+            }
+            "follow" => json!({"following": ask["bot"]}),
+            // Read by name, a closed agent's row says when it closed.
+            "bots" if ask["names"].is_array() => {
+                json!({"bots": [fix(shut.load(Ordering::SeqCst))], "next_after": null})
+            }
+            "bots" => json!({"bots": [], "next_after": null}),
+            "history_nodes" => json!({"nodes": [], "next_from": null}),
+            "history_items" => json!({"items": []}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let dir = std::env::temp_dir().join(unique("sonny-closed-counts"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.options.store = dir.join("state.sqlite");
+        let counted = async |app: &mut App| {
+            app.counted_at = None;
+            app.count_agents().await;
+            if let Some(job) = &app.counting {
+                while !job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            app.counted_at = Some(Instant::now());
+            app.count_agents().await;
+        };
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        counted(&mut app).await;
+        let names = |app: &App| -> Vec<String> {
+            (app.listed.iter().flatten())
+                .map(|bot| bot.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&app), ["shop.fix", "shop.lead"]);
+        assert_eq!(app.counts.as_ref().unwrap().idle, 2);
+        // Closed: the follow's one `closed` event takes it off.
+        closed.store(true, Ordering::SeqCst);
+        let event = json!({"event": "closed", "bot": "shop.fix", "following": "shop.*"});
+        assert!(app.follower.as_mut().unwrap().heard(&event));
+        counted(&mut app).await;
+        assert_eq!(names(&app), ["shop.lead"]);
+        assert_eq!(app.counts.as_ref().unwrap().idle, 1);
+        // A message opens it again, and it is back.
+        closed.store(false, Ordering::SeqCst);
+        let event = json!({"event": "queued", "bot": "shop.fix", "following": "shop.*"});
+        assert!(app.follower.as_mut().unwrap().heard(&event));
+        counted(&mut app).await;
+        assert_eq!(names(&app), ["shop.fix", "shop.lead"]);
+        assert_eq!(app.counts.as_ref().unwrap().idle, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_kept_row_is_built_again_once_its_own_calls_change() {
         use std::sync::atomic::{AtomicBool, Ordering};
         // Two idle tasks the count keeps, and one running, so the window
