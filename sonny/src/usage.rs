@@ -19,6 +19,9 @@ use ratatui::{
     text::{Line, Span},
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -190,6 +193,8 @@ pub struct View {
     /// Rows scrolled past on its own screen, inline; the pane scrolls
     /// itself.
     pub scroll: usize,
+    /// What the Tasks section read before, kept for the next read.
+    seen: Arc<Mutex<Seen>>,
 }
 
 struct Read {
@@ -213,6 +218,7 @@ impl View {
             at: None,
             prices: Vec::new(),
             scroll: 0,
+            seen: Arc::default(),
         }
     }
 
@@ -241,6 +247,7 @@ impl View {
             name: (!self.all).then(|| self.scope.glob.clone()),
             since: window.0,
             now,
+            seen: self.seen.clone(),
         };
         (ask, window)
     }
@@ -1011,15 +1018,13 @@ impl<'a> Made<'a> {
     fn of(row: &'a Value) -> Option<Self> {
         let bot = row["bot"].as_str()?;
         let count = |key: &str| row[key].as_u64().unwrap_or(0);
-        // Its first message is the work its maker gave it, never a step in.
-        let first = &row["first_message"];
         Some(Self {
             bot,
             work_ms: count("work_ms"),
             running: row["running"] == true,
             last_turn: row["last_turn"].as_i64(),
-            messages: count("person_messages").saturating_sub((first["person"] == true) as u64),
-            quotes: count("person_quotes").saturating_sub((first["quotes_person"] == true) as u64),
+            messages: count("person_messages"),
+            quotes: count("person_quotes"),
             calls: count("person_calls"),
             side: crate::side_copy(&json!({
                 "name": bot, "created_by": row["created_by"], "expire_ms": row["expire_ms"],
@@ -1200,36 +1205,163 @@ fn meter(part: u64, of: u64, room: usize) -> Vec<Span<'static>> {
 }
 
 /// What `/usage` reads for a selection: its `usage` request, and the
-/// tasks it covers, `made` from `since` to `now` and the period before.
+/// tasks it covers from `since` to `now` and over the period before, with
+/// what it kept from the reads before.
 pub struct Ask {
     pub usage: Value,
     name: Option<String>,
     since: i64,
     now: i64,
+    seen: Arc<Mutex<Seen>>,
 }
 
+/// What the Tasks section keeps between reads of one scope, so a read asks
+/// the daemon only for what changed: each task's turns while its last turn
+/// stays the same, and the messages a replay of the scope's events has
+/// brought so far.
+#[derive(Default)]
+pub struct Seen {
+    name: Option<String>,
+    turns: HashMap<String, Turns>,
+    sent: Vec<Sent>,
+    /// The last event replayed, and from when the replay started.
+    cursor: Option<i64>,
+    from_ms: i64,
+}
+
+/// A task's turns, each `(started_ms, finished_ms)`, from `from_ms` on, read
+/// while its last turn was `last`; and the turn its first message opened.
+struct Turns {
+    bot_id: i64,
+    last: Option<i64>,
+    from_ms: i64,
+    first: Option<i64>,
+    list: Vec<(i64, Option<i64>)>,
+}
+
+/// A message an event named: its event's cursor, its task, and whether a
+/// person wrote it or it quotes a person's own words.
+struct Sent {
+    cursor: i64,
+    bot: String,
+    message: i64,
+    person: bool,
+    quoted: bool,
+}
+
+/// The events that name a message as it is sent or taken in, with who
+/// wrote it and whose words it quotes.
+const SENT: [&str; 3] = ["accepted", "queued", "attached"];
+
 /// The usage `ask` names, read with `client`, with what its tasks did kept
-/// under `tasks`, their done marks and roles read beside `store`.
+/// under `tasks`: the tasks from `bots`, their turns from `turns`, the
+/// messages they took in from a replay of their events (on a connection of
+/// its own to `socket`), the calls the person decided from `audit`, and
+/// their done marks and roles beside `store`.
 pub async fn read(
-    client: &agent_client::Client,
+    window: Arc<agent_client::Client>,
+    socket: PathBuf,
     ask: Ask,
-    store: std::path::PathBuf,
+    store: PathBuf,
 ) -> Result<Value, String> {
-    let mut usage =
-        (client.request("usage", ask.usage.clone()).await).map_err(|error| error.to_string())?;
-    let name = ask.name.as_deref();
-    let made = made(client, name, ask.since, ask.now).await?;
+    let fail = |error: agent_client::Error| error.to_string();
+    let mut usage = (window.request("usage", ask.usage.clone()).await).map_err(fail)?;
     let span = (ask.now - ask.since).max(1);
-    let before = made_before(client, name, ask.since - span, ask.since).await;
+    let before = (ask.since - span).max(0);
+    let name = ask.name.clone();
+    // The tasks' reads go on a connection of their own, so their many
+    // replies never crowd the window's.
+    let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
+        return Ok(usage);
+    };
+    let tasks = listed(&client, name.as_deref(), before).await?;
+    // A cache is for one scope.
+    let known = {
+        let mut seen = ask.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.name != name {
+            *seen = Seen {
+                name: name.clone(),
+                ..Seen::default()
+            };
+        }
+        tasks
+            .iter()
+            .map(|task| {
+                let kept = seen.turns.get(&task.bot).filter(|kept| {
+                    kept.bot_id == task.bot_id && kept.last == task.last && !task.running
+                        && kept.from_ms <= before
+                });
+                let first = seen
+                    .turns
+                    .get(&task.bot)
+                    .filter(|kept| kept.bot_id == task.bot_id)
+                    .and_then(|kept| kept.first);
+                (kept.is_some(), first)
+            })
+            .collect::<Vec<_>>()
+    };
+    // Each task's turns not kept, read side by side, as many at once as
+    // the daemon has readers for.
+    let mut reads = tokio::task::JoinSet::new();
+    let at_once = Arc::new(tokio::sync::Semaphore::new(
+        std::thread::available_parallelism().map_or(4, |n| n.get()) * 2,
+    ));
+    for (task, (kept, first)) in tasks.iter().zip(known) {
+        if kept {
+            continue;
+        }
+        let (client, bot, at_once) = (client.clone(), task.bot.clone(), at_once.clone());
+        reads.spawn(async move {
+            let _turn = at_once.acquire_owned().await;
+            let read = turns_of(&client, &bot, before, first).await;
+            (bot, read)
+        });
+    }
+    let mut read = HashMap::new();
+    while let Some(done) = reads.join_next().await {
+        let (bot, turns) = done.map_err(|error| error.to_string())?;
+        read.insert(bot, turns?);
+    }
+    let replay = replayed(&socket, name.as_deref(), before, &ask.seen).await;
+    let boundary = first_cursor(&socket, name.as_deref(), ask.since).await;
+    // Without every message, a task the person stepped into would read as
+    // one that finished without them: no section rather than a wrong one.
+    let (Some(replay), Some(boundary)) = (replay, boundary) else {
+        return Ok(usage);
+    };
+    let calls = (
+        person_calls(&client, ask.since, ask.now).await,
+        person_calls(&client, before, ask.since).await,
+    );
+    let (now, since) = (ask.now, ask.since);
+    let seen = ask.seen.clone();
     let tasks = tokio::task::spawn_blocking(move || {
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        for task in &tasks {
+            if let Some((first, list)) = read.remove(&task.bot) {
+                let turns = Turns {
+                    bot_id: task.bot_id,
+                    last: task.last,
+                    from_ms: before,
+                    first,
+                    list,
+                };
+                seen.turns.insert(task.bot.clone(), turns);
+            }
+        }
+        let (this, last) = (
+            rows(&tasks, &seen, (since, now), now, (boundary, None), &calls.0),
+            rows(&tasks, &seen, (before, since), now, (0, Some(boundary)), &calls.1),
+        );
         let mut tasks = Tasks::tally(
-            &made,
+            &this,
             |bot, last, running| {
                 crate::resolved::holds(crate::resolved::read(&store, bot), last, running)
             },
             |bot| crate::task::noted_profile(&store, bot),
         );
-        tasks.before = before.map(|made| Tasks::before(&made));
+        // The period before only when all of it was there to read.
+        tasks.before = (replay <= before && calls.1.is_some()).then(|| Tasks::before(&last));
         tasks
     })
     .await
@@ -1238,43 +1370,270 @@ pub async fn read(
     Ok(usage)
 }
 
-/// The period before's, or none when it could not be read: the share is
-/// then shown alone.
-async fn made_before(
-    client: &agent_client::Client,
-    name: Option<&str>,
-    since: i64,
-    until: i64,
-) -> Option<Vec<Value>> {
-    made(client, name, since.max(0), until).await.ok()
+/// A task as `bots` lists it.
+struct Listed {
+    bot: String,
+    bot_id: i64,
+    running: bool,
+    last: Option<i64>,
+    created_by: Value,
+    expire_ms: Value,
 }
 
-/// Every page of `made` from `since` to `until`.
-async fn made(
+/// Every agent another made in scope `name` (all of them with none) that
+/// ran since `since`.
+async fn listed(
     client: &agent_client::Client,
     name: Option<&str>,
     since: i64,
-    until: i64,
-) -> Result<Vec<Value>, String> {
-    let mut all = Vec::new();
-    let mut after: Option<String> = None;
+) -> Result<Vec<Listed>, String> {
+    let mut tasks = Vec::new();
+    let mut after = json!("");
     loop {
-        let mut query = json!({"since_ms": since, "until_ms": until.max(since + 1)});
+        let mut query = json!({"after": after, "limit": 256});
         if let Some(name) = name {
             query["name"] = json!(name);
         }
-        if let Some(after) = &after {
-            query["after"] = json!(after);
+        let page = (client.request("bots", query).await).map_err(|error| error.to_string())?;
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            let ran = bot["running_turn"].is_i64()
+                || (bot["last"]["finished_ms"].as_i64()).is_some_and(|ended| ended >= since);
+            if bot["created_by"].is_null() || !ran {
+                continue;
+            }
+            tasks.push(Listed {
+                bot: bot["name"].as_str().unwrap_or_default().to_owned(),
+                bot_id: bot["bot_id"].as_i64().unwrap_or_default(),
+                running: bot["running_turn"].is_i64(),
+                last: bot["running_turn"].as_i64().or(bot["last"]["turn"].as_i64()),
+                created_by: bot["created_by"].clone(),
+                expire_ms: bot["expire_ms"].clone(),
+            });
         }
-        let mut page = (client.request("made", query).await).map_err(|error| error.to_string())?;
-        if let Some(rows) = page["made"].as_array_mut() {
-            all.append(rows);
-        }
-        match page["next_after"].as_str() {
-            Some(next) if Some(next) != after.as_deref() => after = Some(next.to_owned()),
-            _ => return Ok(all),
+        match &page["next_after"] {
+            Value::Null => return Ok(tasks),
+            next => after = next.clone(),
         }
     }
+}
+
+/// `bot`'s turns started since `since`, newest first, and the turn its
+/// first message opened (`first`, when known already).
+#[allow(clippy::type_complexity)]
+async fn turns_of(
+    client: &agent_client::Client,
+    bot: &str,
+    since: i64,
+    first: Option<i64>,
+) -> Result<(Option<i64>, Vec<(i64, Option<i64>)>), String> {
+    let fail = |error: agent_client::Error| error.to_string();
+    let mut list = Vec::new();
+    let mut before: Option<Value> = None;
+    'pages: loop {
+        let mut query = json!({"bot": bot, "newest": true, "limit": 256});
+        if let Some(before) = &before {
+            query["before"] = before.clone();
+        }
+        let page = client.request("turns", query).await.map_err(fail)?;
+        for turn in page["turns"].as_array().into_iter().flatten() {
+            let Some(started) = turn["started_ms"].as_i64() else {
+                continue;
+            };
+            if started < since {
+                break 'pages;
+            }
+            list.push((started, turn["finished_ms"].as_i64()));
+        }
+        match &page["next_before"] {
+            Value::Null => break,
+            next => before = Some(next.clone()),
+        }
+    }
+    let first = match first {
+        Some(first) => Some(first),
+        None => {
+            let page = (client.request("turns", json!({"bot": bot, "after": 0, "limit": 1})))
+                .await
+                .map_err(fail)?;
+            page["turns"][0]["turn"].as_i64()
+        }
+    };
+    Ok((first, list))
+}
+
+/// The follow of scope `name`'s message events from `since`, or after the
+/// event `after`.
+fn follow(name: Option<&str>, from: Result<i64, i64>) -> Value {
+    let mut follow = json!({"bot": name.unwrap_or("*"), "kinds": SENT});
+    match from {
+        Ok(since) => follow["since_ms"] = json!(since),
+        Err(after) => follow["after"] = json!(after),
+    }
+    follow
+}
+
+/// Replay scope `name`'s message events from `since`, after what `seen`
+/// holds when it holds them from then: the time it holds them from, or
+/// none when the replay was cut.
+async fn replayed(
+    socket: &std::path::Path,
+    name: Option<&str>,
+    since: i64,
+    seen: &Arc<Mutex<Seen>>,
+) -> Option<i64> {
+    let (from, after) = {
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.cursor {
+            Some(cursor) if seen.from_ms <= since => (seen.from_ms, Some(cursor)),
+            _ => {
+                seen.sent.clear();
+                seen.cursor = None;
+                seen.from_ms = since;
+                (since, None)
+            }
+        }
+    };
+    let (client, mut events) = agent_client::Client::connect(socket).await.ok()?;
+    let follow = follow(name, after.ok_or(since));
+    client.request("follow", follow).await.ok()?;
+    let mut sent = Vec::new();
+    let mut last = after;
+    while let Some(event) = events.recv().await {
+        match event["event"].as_str() {
+            Some("follow_live") => break,
+            Some("lagged" | "follow_lagged" | "pruned") => return None,
+            Some(kind) if SENT.contains(&kind) => {
+                let Some(cursor) = event["cursor"].as_i64() else {
+                    continue;
+                };
+                last = Some(cursor);
+                let data = &event["data"];
+                let person = data["from"].is_null() && data["origin"].is_null();
+                let quoted = !data["from"].is_null()
+                    && (data["quotes"].as_array().into_iter().flatten()).any(|quote| {
+                        quote["from"].is_null()
+                            && quote["origin"].is_null()
+                            && quote["reply"] != true
+                    });
+                let message = event["message"].as_i64().or(event["turn"].as_i64());
+                if let (Some(bot), Some(message)) = (event["bot"].as_str(), message) {
+                    sent.push(Sent {
+                        cursor,
+                        bot: bot.to_owned(),
+                        message,
+                        person,
+                        quoted,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    seen.sent.append(&mut sent);
+    seen.cursor = last.or(Some(0));
+    Some(from)
+}
+
+/// The cursor of scope `name`'s first message event at or after `since`;
+/// none when there is none yet.
+async fn first_cursor(socket: &std::path::Path, name: Option<&str>, since: i64) -> Option<i64> {
+    let (client, mut events) = agent_client::Client::connect(socket).await.ok()?;
+    client.request("follow", follow(name, Ok(since))).await.ok()?;
+    while let Some(event) = events.recv().await {
+        match event["event"].as_str() {
+            Some(kind) if SENT.contains(&kind) => return event["cursor"].as_i64(),
+            Some("follow_live") => return Some(i64::MAX),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The calls a person decided from `since` to `until`, by agent; none when
+/// they could not all be read.
+async fn person_calls(
+    client: &agent_client::Client,
+    since: i64,
+    until: i64,
+) -> Option<HashMap<String, u64>> {
+    let mut calls = HashMap::new();
+    let mut before: Option<Value> = None;
+    loop {
+        let mut query = json!({"approved": "person", "since_ms": since, "until_ms": until, "limit": 500});
+        if let Some(before) = &before {
+            query["before"] = before.clone();
+        }
+        let page = client.request("audit", query).await.ok()?;
+        for row in page["rows"].as_array().into_iter().flatten() {
+            if let Some(bot) = row["bot"].as_str() {
+                *calls.entry(bot.to_owned()).or_default() += 1;
+            }
+        }
+        match &page["next_before"] {
+            Value::Null => return Some(calls),
+            next => before = Some(next.clone()),
+        }
+    }
+}
+
+/// Each task that started a turn from `window.0` to `window.1`, as
+/// [`Tasks::tally`] takes it: its turns' time (to `now` for one running),
+/// the person's messages and quoted words among the events from cursor
+/// `cursors.0` to `cursors.1`, and the calls they decided.
+fn rows(
+    tasks: &[Listed],
+    seen: &Seen,
+    window: (i64, i64),
+    now: i64,
+    cursors: (i64, Option<i64>),
+    calls: &Option<HashMap<String, u64>>,
+) -> Vec<Value> {
+    let mut sent: HashMap<&str, (u64, u64)> = HashMap::new();
+    // A message counts where it was first named: sent, then taken in.
+    let mut named = std::collections::HashSet::new();
+    let (low, high) = cursors;
+    for message in &seen.sent {
+        let first = seen.turns.get(&message.bot).and_then(|turns| turns.first);
+        // Its brief is the work its maker gave it, never a step in.
+        if !named.insert((message.bot.as_str(), message.message))
+            || message.cursor < low
+            || high.is_some_and(|high| message.cursor >= high)
+            || first == Some(message.message)
+        {
+            continue;
+        }
+        let counts = sent.entry(message.bot.as_str()).or_default();
+        counts.0 += message.person as u64;
+        counts.1 += message.quoted as u64;
+    }
+    let mut rows = Vec::new();
+    for task in tasks {
+        let Some(turns) = seen.turns.get(&task.bot) else {
+            continue;
+        };
+        let worked: Vec<_> = (turns.list.iter())
+            .filter(|(started, _)| (window.0..window.1).contains(started))
+            .collect();
+        if worked.is_empty() {
+            continue;
+        }
+        let work_ms: i64 = (worked.iter())
+            .map(|(started, ended)| ended.unwrap_or(now).min(now) - started)
+            .sum();
+        let (messages, quotes) = sent.get(task.bot.as_str()).copied().unwrap_or_default();
+        let calls = (calls.as_ref())
+            .and_then(|calls| calls.get(&task.bot))
+            .copied()
+            .unwrap_or(0);
+        rows.push(json!({
+            "bot": task.bot, "turns": worked.len(), "work_ms": work_ms.max(0),
+            "running": task.running && window.1 >= now, "last_turn": task.last,
+            "person_messages": messages, "person_quotes": quotes, "person_calls": calls,
+            "created_by": task.created_by, "expire_ms": task.expire_ms,
+        }));
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -1306,7 +1665,7 @@ mod tests {
         json!({
             "bot": bot, "turns": 2, "work_ms": work_min * 60_000, "running": running,
             "last_turn": 9, "person_messages": wrote, "person_quotes": quoted, "person_calls": calls,
-            "created_by": "p.lead", "expire_ms": null, "first_message": null,
+            "created_by": "p.lead", "expire_ms": null,
         })
     }
 
@@ -1327,27 +1686,98 @@ mod tests {
         // A side chat of a task: made by it, expiring.
         let mut side = made("p.tidy.side-a1", 5, false, 1, 0, 0);
         (side["created_by"], side["expire_ms"]) = (json!("p.tidy"), json!(3_600_000));
-        // A task whose brief its maker wrote as the person: not a step in.
-        let mut briefed = made("p.briefed", 5, false, 1, 1, 0);
-        briefed["first_message"] = json!({"person": true, "quotes_person": false});
-        let rows = [&made_rows[..], &[side, briefed]].concat();
+        let rows = [&made_rows[..], &[side]].concat();
         let tasks = Tasks::tally(
             &rows,
             |bot, _, _| bot == "p.fix-login" || bot == "p.migrate",
             |bot| (bot == "p.migrate" || bot == "p.tidy").then(|| "backend".to_owned()),
         );
-        assert_eq!((tasks.worked, tasks.working, tasks.ended), (7, 1, 6));
+        assert_eq!((tasks.worked, tasks.working, tasks.ended), (6, 1, 5));
         assert_eq!(tasks.alone, 2);
-        // The running task's message is not counted until it ends; the
-        // briefed task's quote of the person, after its brief, is.
-        assert_eq!((tasks.messages, tasks.quotes, tasks.calls), (1, 2, 2));
+        // The running task's message is not counted until it ends.
+        assert_eq!((tasks.messages, tasks.quotes, tasks.calls), (1, 1, 2));
         assert_eq!(tasks.done, 2);
-        assert_eq!(tasks.lengths, [(1, 3), (1, 2), (0, 1)]);
+        assert_eq!(tasks.lengths, [(1, 2), (1, 2), (0, 1)]);
         assert_eq!(
             tasks.roles,
-            [("no role".to_owned(), 1, 4), ("backend".to_owned(), 1, 2)]
+            [("no role".to_owned(), 1, 3), ("backend".to_owned(), 1, 2)]
         );
-        assert_eq!(Tasks::before(&rows), (2, 6));
+        assert_eq!(Tasks::before(&rows), (2, 5));
+    }
+
+    #[test]
+    fn each_period_counts_its_turns_and_what_the_person_did_in_them() {
+        let listed = |bot: &str, running: bool| Listed {
+            bot: bot.to_owned(),
+            bot_id: 1,
+            running,
+            last: Some(9),
+            created_by: json!("p.lead"),
+            expire_ms: Value::Null,
+        };
+        let tasks = [listed("p.a", false), listed("p.b", true), listed("p.old", false)];
+        let mut seen = Seen::default();
+        // Each task's turns, `(started, finished)`, and the turn its brief
+        // opened.
+        let turns = |first, list: &[(i64, Option<i64>)]| Turns {
+            bot_id: 1,
+            last: Some(9),
+            from_ms: 0,
+            first: Some(first),
+            list: list.to_vec(),
+        };
+        seen.turns.insert("p.a".into(), turns(1, &[(150, Some(170)), (110, Some(120))]));
+        seen.turns.insert("p.b".into(), turns(2, &[(180, None)]));
+        seen.turns.insert("p.old".into(), turns(3, &[(50, Some(60))]));
+        let sent = |cursor, bot: &str, message, person, quoted| Sent {
+            cursor,
+            bot: bot.into(),
+            message,
+            person,
+            quoted,
+        };
+        seen.sent = vec![
+            // The briefs, as the person wrote them: never a step in.
+            sent(5, "p.old", 3, true, false),
+            sent(10, "p.a", 1, true, false),
+            sent(12, "p.b", 2, true, false),
+            // The old task's step in, in the period before.
+            sent(8, "p.old", 4, true, false),
+            // A's lead passed on the person's words, queued then taken in:
+            // one message.
+            sent(20, "p.a", 5, false, true),
+            sent(21, "p.a", 5, false, true),
+            // B's lead wrote on its own.
+            sent(22, "p.b", 6, false, false),
+        ];
+        let calls = Some(HashMap::from([("p.b".to_owned(), 2)]));
+        let this = rows(&tasks, &seen, (100, 200), 200, (10, None), &calls);
+        let shown: Vec<_> = (this.iter())
+            .map(|row| {
+                (
+                    row["bot"].as_str().unwrap(),
+                    row["turns"].as_u64().unwrap(),
+                    row["work_ms"].as_i64().unwrap(),
+                    row["running"] == true,
+                    row["person_messages"].as_u64().unwrap(),
+                    row["person_quotes"].as_u64().unwrap(),
+                    row["person_calls"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("p.a", 2, 30, false, 0, 1, 0),
+                // Running: its turn counts to now.
+                ("p.b", 1, 20, true, 0, 0, 2),
+            ]
+        );
+        let last = rows(&tasks, &seen, (0, 100), 200, (0, Some(10)), &None);
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0]["bot"], "p.old");
+        assert_eq!(last[0]["person_messages"], 1);
+        assert_eq!(last[0]["running"], false);
     }
 
     #[test]

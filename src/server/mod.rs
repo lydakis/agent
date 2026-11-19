@@ -581,20 +581,6 @@ enum Command {
         /// `other_bots`; 64 when absent.
         limit: Option<usize>,
     },
-    /// The bots other bots made that worked in a window, a page by name,
-    /// with who stepped into their turns.
-    Made {
-        /// A GLOB of bot names, as `bots` takes it; absent is every bot.
-        name: Option<String>,
-        /// Only turns started at or after this, in milliseconds since the
-        /// Unix epoch; absent is all of them.
-        #[serde(default)]
-        since_ms: i64,
-        /// And before this; absent is up to now.
-        until_ms: Option<i64>,
-        /// The page after this bot name, the last page's `next_after`.
-        after: Option<String>,
-    },
     Submit {
         bot: String,
         /// The identity `bot` had when this request was first made; a retry
@@ -1199,7 +1185,6 @@ impl Command {
                 | Command::Turns { .. }
                 | Command::Messages { .. }
                 | Command::Usage { .. }
-                | Command::Made { .. }
                 | Command::Events { .. }
                 | Command::HistoryNodes { .. }
                 | Command::HistoryItems { .. }
@@ -1279,7 +1264,6 @@ impl Command {
             Command::Turns { .. } => "turns",
             Command::Messages { .. } => "messages",
             Command::Usage { .. } => "usage",
-            Command::Made { .. } => "made",
             Command::Submit { .. } => "submit",
             Command::Interrupt { .. } => "interrupt",
             Command::Events { .. } => "events",
@@ -6036,20 +6020,6 @@ impl Service {
                 self.observe(session, output, id, async move {
                     (reader.read("usage", move |db| {
                         db.usage(name.as_deref(), since_ms, bucket_ms, limit.unwrap_or(64))
-                    }))
-                    .await
-                })
-            }
-            Command::Made {
-                name,
-                since_ms,
-                until_ms,
-                after,
-            } => {
-                let reader = store.reader();
-                self.observe(session, output, id, async move {
-                    (reader.read("made", move |db| {
-                        db.made(name.as_deref(), since_ms, until_ms, after.as_deref())
                     }))
                     .await
                 })

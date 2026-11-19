@@ -14435,7 +14435,8 @@ impl App {
             .unwrap_or_default()
             .as_millis() as i64;
         let (ask, window) = view.ask(now);
-        let read = usage::read(&self.client, ask, self.store()).await;
+        let socket = self.options.socket.clone();
+        let read = usage::read(self.client.clone(), socket, ask, self.store()).await;
         // The price sheet as its file says now, so an edit shows at the
         // next read; a sheet that does not parse prices nothing.
         let prices = agent_client::config::load()
@@ -14532,6 +14533,7 @@ impl App {
             .and_then(|watch| watch.usage.as_ref())
             .is_some_and(usage::View::due)
             .then(|| self.store());
+        let socket = self.options.socket.clone();
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.usage
         {
@@ -14543,7 +14545,7 @@ impl App {
                 let (ask, window) = view.ask(now);
                 let selection = view.selection();
                 self.card_read = Some(tokio::spawn(async move {
-                    let read = usage::read(&client, ask, store).await;
+                    let read = usage::read(client, socket, ask, store).await;
                     // The price sheet as its file says now, so an edit shows
                     // at the next read; a sheet that does not parse prices
                     // nothing.
