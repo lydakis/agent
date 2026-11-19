@@ -117,7 +117,7 @@ Closing its window leaves the daemon and running turns alive.
 | List agents and open their conversations | `/status` |
 | Go to another project's lead | `/projects`, or ← with nothing typed |
 | Go to the project's agent above or below | Alt-← or Alt-→ with nothing typed |
-| Go to the next agent that needs you, in any project | Alt-N, or click `? N elsewhere` in the footer for every project |
+| Go to the next agent that needs you, in any project | Alt-N, or click `← ? N` in the footer for every project |
 | Switch this window to another agent | `/switch` |
 | Create an agent with a profile and workspace | `/new [NAME]` |
 | Ask a copy of this agent a separate question | `/side [QUESTION]` |

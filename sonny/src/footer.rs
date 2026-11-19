@@ -32,7 +32,8 @@ pub enum Slot {
     Working,
     /// The agents at rest: the first to go.
     Idle,
-    /// What needs the person in the other projects, said with its word.
+    /// What needs the person in the other projects, drawn `← ? N`: the
+    /// arrow to **Projects** and the count, one item.
     Elsewhere,
     /// The context while under half of it is used: good to know.
     RoomyContext,
@@ -316,29 +317,25 @@ mod tests {
         let with_elsewhere = || {
             let mut items = busy();
             let mut forms = count(crate::status::sign("needs you"), 3, true);
-            forms[0].push(Span::raw(" elsewhere").dim());
+            forms[0].insert(0, Span::raw("← ").dim());
             items.push(Item::new(Slot::Elsewhere, forms).opens("projects"));
             items
         };
-        let rows: Vec<String> = [120, 100, 52, 44].map(|w| row(with_elsewhere(), w)).into();
+        let rows: Vec<String> = [120, 100, 44, 38].map(|w| row(with_elsewhere(), w)).into();
         assert!(
-            rows[0].ends_with("? 1  ✗ 1  ● 2  ○ 4  ? 3 elsewhere  37% left  "),
+            rows[0].ends_with("? 1  ✗ 1  ● 2  ○ 4  ← ? 3  37% left  "),
             "{}",
             rows[0]
         );
         // The idle count goes first, then the working one, then it, whole.
         assert!(
-            rows[1].ends_with("? 1  ✗ 1  ● 2  ? 3 elsewhere  37% left  "),
+            rows[1].ends_with("? 1  ✗ 1  ● 2  ← ? 3  37% left  "),
             "{}",
             rows[1]
         );
-        assert!(
-            rows[2].ends_with("? 1  ✗ 1  ? 3 elsewhere  37%  "),
-            "{}",
-            rows[2]
-        );
+        assert!(rows[2].ends_with("? 1  ✗ 1  ← ? 3  37%  "), "{}", rows[2]);
         assert!(rows[3].ends_with("? 1  ✗ 1  37%  "), "{}", rows[3]);
-        for (row, w) in rows.iter().zip([120, 100, 52, 44]) {
+        for (row, w) in rows.iter().zip([120, 100, 44, 38]) {
             assert_eq!(row.width(), w, "{row}");
         }
         let (_, opens) = lay(with_elsewhere(), 120);

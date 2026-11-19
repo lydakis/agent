@@ -1,5 +1,5 @@
-//! What needs the person in the other projects: the footer's
-//! `? 1 elsewhere`, and where `alt+n` goes once this project has no one.
+//! What needs the person in the other projects: the footer's `← ? 1`,
+//! and where `alt+n` goes once this project has no one.
 //!
 //! One follow for every window of a store: the first window to open takes
 //! a lock beside the store and follows; the others hear what it found on
@@ -40,11 +40,15 @@ use crate::needs::{self, Seen};
 use crate::standing;
 
 /// The kinds of event every agent is followed for: those that can start
-/// a wait on the person, and an agent's closing or deletion.
-pub const WIDE: [&str; 5] = [
+/// a wait on the person, a call lifted out of its turn and its end (a
+/// step of it held for the person waits past the turn), and an agent's
+/// closing or deletion.
+pub const WIDE: [&str; 7] = [
     "approval_requested",
     "approval_asked",
     "tool_started",
+    "call_lifted",
+    "lifted_ended",
     "closed",
     "deleted",
 ];
@@ -53,11 +57,9 @@ pub const WIDE: [&str; 5] = [
 /// well, which [`needs::Needs::event`] reads: its calls ending or decided,
 /// which let a held call go or take a question's answer, the person's
 /// words, and its turn's end.
-pub const NARROW: [&str; 7] = [
+pub const NARROW: [&str; 5] = [
     "tool_completed",
     "step_decided",
-    "call_lifted",
-    "lifted_ended",
     "accepted",
     "steered",
     "turn_finished",
@@ -128,7 +130,9 @@ impl Elsewhere {
 }
 
 /// The lock the window that follows holds, and the socket it tells the
-/// others on, beside `store`.
+/// others on: beside `store`, or, where that path is too long for a Unix
+/// socket, the short one the client finds for a daemon's
+/// ([`agent_client::socket::default_socket`]).
 fn beside(store: &Path) -> (PathBuf, PathBuf) {
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
     let at = |end: &str| {
@@ -136,7 +140,10 @@ fn beside(store: &Path) -> (PathBuf, PathBuf) {
         path.push(end);
         PathBuf::from(path)
     };
-    (at(".elsewhere.lock"), at(".elsewhere.sock"))
+    let lock = at(".elsewhere.lock");
+    let told = agent_client::socket::default_socket(&at(".elsewhere"))
+        .unwrap_or_else(|_| at(".elsewhere.sock"));
+    (lock, told)
 }
 
 /// Follow, where no window of the store does; else hear the one that does,
@@ -273,7 +280,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>, woken
     };
     let Seeded {
         mut needs,
-        order,
+        mut order,
         named_as_sides,
         mut seen_of,
         running,
@@ -304,15 +311,33 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>, woken
             return;
         };
         let cursor = event["cursor"].clone();
-        let Some(bot) = event["bot"].as_str().filter(|bot| theirs(bot)) else {
+        let Some(bot) = event["bot"].as_str() else {
             continue;
         };
         let bot = bot.to_owned();
-        let done = marks(&event, &bot, &order);
+        let ours = theirs(&bot);
+        // A side chat needs no one, but it may mark its source done.
+        let side = (!ours).then(|| crate::side_source(&bot)).flatten();
+        let done = marks(&event, &bot, &order).map(|done| match side {
+            Some(source) if done == bot => source.to_owned(),
+            _ => done,
+        });
+        if !ours && done.is_none() && !marked.contains_key(&bot) {
+            continue;
+        }
+        // A lead the start did not list: its project is placed after the
+        // others, so its agents are told as its own.
+        if ours
+            && crate::project::is_lead(&bot)
+            && let Some(project) = crate::project::lead_project(&bot)
+            && !order.contains_key(project)
+        {
+            order.insert(project.to_owned(), order.len());
+        }
         // A call held for the person, a question asked, or agents marked
         // done: its calls and its turn's end from here on, to see it let
         // go, answered or over.
-        if !narrow.contains_key(&bot) && (waits_from(&event) || done.is_some()) {
+        if !narrow.contains_key(&bot) && (ours && waits_from(&event) || done.is_some()) {
             let asked = json!({"bot": bot, "after": cursor, "kinds": NARROW});
             if client.request("follow", asked).await.is_err() {
                 return;
@@ -322,9 +347,9 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>, woken
         if let Some(done) = done {
             marked.entry(bot.clone()).or_default().push(done);
         }
-        let mut changed = needs.event(&event);
+        let mut changed = ours && needs.event(&event);
         // Closed, it needs no one, as `/status` lists it no more.
-        if event["event"] == "closed" {
+        if ours && event["event"] == "closed" {
             changed |= needs.waits(&bot);
             needs.forget(&bot);
             seen_of.remove(&bot);
@@ -454,7 +479,17 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
             running.push(bot.name.clone());
             continue;
         }
+        // A fork that has run no turn of its own yet keeps its source's
+        // history, and any question open in it: read it whole.
         let Some(turn) = bot.last.as_ref().map(|last| last.turn) else {
+            let Some(seen) = needs::scan(client, &bot.name, None).await else {
+                continue;
+            };
+            let open = seen.clone().open(store, &bot.name, false);
+            if open.is_some() {
+                seen_of.insert(bot.name.clone(), seen);
+            }
+            needs.asked(&bot.name, open);
             continue;
         };
         let was = kept.get(&bot.name);
@@ -580,16 +615,23 @@ fn tell_waiting(
 }
 
 /// Every agent that needs the person, in the order `alt+n` goes round
-/// them from the window's project: `local`, its own as the pane lists
-/// them, then `elsewhere`'s by their projects' places in **Projects**,
-/// from the one after the window's around to the one before it. The same
-/// round from every project, so `alt+n` reaches each.
+/// them from the window's project: `local`, its own, then `elsewhere`'s by
+/// their projects' places in **Projects**, from the one after the
+/// window's around to the one before it; in each project its lead first,
+/// then by name. The same round from every agent of every project, so
+/// `alt+n` reaches each.
 pub fn round<'a>(local: &'a [String], elsewhere: &'a Waiting) -> Vec<&'a str> {
-    let (after, before): (Vec<_>, Vec<_>) =
-        (elsewhere.agents.iter()).partition(|(place, _)| *place > elsewhere.here);
-    (local.iter().map(String::as_str))
-        .chain(after.into_iter().map(|(_, bot)| bot.as_str()))
-        .chain(before.into_iter().map(|(_, bot)| bot.as_str()))
+    let here = elsewhere.here;
+    let mut all: Vec<(bool, usize, bool, &str)> = (local.iter())
+        .map(|bot| (here, bot.as_str()))
+        .chain((elsewhere.agents.iter()).map(|(place, bot)| (*place, bot.as_str())))
+        .map(|(place, bot)| (place < here, place, !crate::project::is_lead(bot), bot))
+        .collect();
+    all.sort();
+    let mut seen = HashSet::new();
+    (all.into_iter())
+        .map(|(_, _, _, bot)| bot)
+        .filter(|bot| seen.insert(*bot))
         .collect()
 }
 
@@ -660,6 +702,34 @@ mod tests {
         assert_eq!(shared.outside("shop.web").here, 3);
         assert_eq!(project_in("shop.web.page", &projects), "shop.web");
         assert_eq!(project_in("new.lead", &projects), "new");
+    }
+
+    /// The socket the others hear on fits a Unix socket's address, however
+    /// long the store's path.
+    #[test]
+    fn the_shared_socket_fits_beside_a_long_store() {
+        let short = std::env::temp_dir().join("s/state.sqlite");
+        let (lock, told) = beside(&short);
+        assert!(
+            lock.to_string_lossy()
+                .ends_with("state.sqlite.elsewhere.lock")
+        );
+        assert!(
+            told.to_string_lossy()
+                .ends_with("state.sqlite.elsewhere.sock")
+        );
+        let long = std::env::temp_dir()
+            .join("a".repeat(120))
+            .join("state.sqlite");
+        let (lock, told) = beside(&long);
+        assert!(
+            lock.to_string_lossy()
+                .ends_with("state.sqlite.elsewhere.lock")
+        );
+        assert!(
+            std::os::unix::net::SocketAddr::from_pathname(&told).is_ok(),
+            "{told:?}"
+        );
     }
 
     #[test]
@@ -860,29 +930,34 @@ mod tests {
         assert_eq!(next(&[], "tally.lead"), None);
     }
 
-    /// One waiting in each of three projects, A, B and C as **Projects**
-    /// lists them: from each, `alt+n` goes to the next, and so to all.
+    /// Agents waiting in three projects, A, B and C as **Projects** lists
+    /// them, two in B: from each agent's window, `alt+n` goes to the next,
+    /// and so to all, whatever order a window's own are in.
     #[test]
     fn alt_n_reaches_every_project_from_any() {
-        let places = [("a.fix", 0), ("b.fix", 1), ("c.fix", 2)];
-        let from = |here: usize| {
+        let places = [("a.lead", 0), ("b.ask", 1), ("b.lead", 1), ("c.fix", 2)];
+        let from = |at: &str| {
+            let here = places.iter().find(|(bot, _)| *bot == at).unwrap().1;
             let elsewhere = Waiting {
                 here,
                 agents: (places.iter())
-                    .filter(|(_, at)| *at != here)
-                    .map(|(bot, at)| (*at, (*bot).to_owned()))
+                    .filter(|(_, place)| *place != here)
+                    .map(|(bot, place)| (*place, (*bot).to_owned()))
                     .collect(),
             };
-            let local = vec![places[here].0.to_owned()];
-            let round: Vec<String> = round(&local, &elsewhere)
-                .into_iter()
-                .map(str::to_owned)
+            let local: Vec<String> = (places.iter())
+                .filter(|(_, place)| *place == here)
+                .map(|(bot, _)| (*bot).to_owned())
                 .collect();
-            let round: Vec<&str> = round.iter().map(String::as_str).collect();
-            next(&round, places[here].0).map(str::to_owned)
+            let round: Vec<&str> = round(&local, &elsewhere);
+            next(&round, at).map(str::to_owned)
         };
-        assert_eq!(from(0).as_deref(), Some("b.fix"));
-        assert_eq!(from(1).as_deref(), Some("c.fix"));
-        assert_eq!(from(2).as_deref(), Some("a.fix"));
+        let mut at = "a.lead".to_owned();
+        let mut went = Vec::new();
+        for _ in 0..places.len() {
+            at = from(&at).unwrap();
+            went.push(at.clone());
+        }
+        assert_eq!(went, ["b.lead", "b.ask", "c.fix", "a.lead"]);
     }
 }

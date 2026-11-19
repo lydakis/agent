@@ -709,7 +709,7 @@ impl App {
 
     /// **Projects** in the conversation's place, the pick on the project
     /// the window is in: `←` with nothing typed, `/projects`, or a click
-    /// on the footer's `elsewhere`. Its follow of every project starts on
+    /// on the footer's `← ? N`. Its follow of every project starts on
     /// a connection of its own and ends with the page.
     async fn open_projects(&mut self) {
         let Some((client, follower, drain)) =
@@ -801,6 +801,7 @@ impl App {
             Some(to) if to == self.bot => {}
             Some(to) => {
                 let to = to.to_owned();
+                self.carry_draft = true;
                 self.switch_window(to);
             }
         }
@@ -3880,9 +3881,15 @@ async fn run() -> Result<(), String> {
         if let Some(first) = &first {
             args.extend(["--send-file".into(), first.display().to_string()]);
         }
+        let draft = (app.carry_draft && !app.input.trim().is_empty())
+            .then(|| attach::draft(&app.input, &app.pictures))
+            .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
+        if let Some(draft) = &draft {
+            args.extend(["--draft-file".into(), draft.display().to_string()]);
+        }
         let error = std::process::Command::new(me).args(&args).exec();
-        if let Some(first) = &first {
-            let _ = std::fs::remove_file(first);
+        for kept in [&first, &draft].into_iter().flatten() {
+            let _ = std::fs::remove_file(kept);
         }
         return Err(format!("could not open {other}: {error}"));
     }
@@ -6068,6 +6075,9 @@ struct App {
     /// Another agent, which this window opens on instead once it quits:
     /// `/switch NAME`, or one `/new` made.
     switch_to: Option<String>,
+    /// What is typed goes with the window to the agent it switches to:
+    /// `alt+n` works with words typed, which it never drops.
+    carry_draft: bool,
     /// The Sonny installed while this window was open, which it reopens on
     /// once it quits ([`update::installed_since`]).
     reopen_on: Option<PathBuf>,
@@ -6113,7 +6123,8 @@ struct App {
     /// What needs the person in every project, followed by one window of
     /// the store for all, and when it started.
     other_projects: Option<(elsewhere::Elsewhere, Instant)>,
-    /// The footer's `elsewhere`, which beats as the needs-you count does.
+    /// The `?` of the footer's `← ? N`, which beats as the needs-you count
+    /// does.
     elsewhere_pulse: std::cell::Cell<look::Pulse>,
     /// The reply text the current model call has streamed.
     said: String,
@@ -8270,6 +8281,7 @@ impl App {
             paused,
             quit: false,
             switch_to: None,
+            carry_draft: false,
             reopen_on: None,
             started: Instant::now(),
             fleet: None,
@@ -22942,8 +22954,10 @@ impl App {
             let forms = footer::count(status::sign(started::IDLE), counts.idle, true);
             items.push(Item::new(Slot::Idle, forms).opens("status"));
         }
-        // What needs the person in the other projects: its `?` beats as
-        // this project's does, and it gives way whole, its word with it.
+        // What needs the person in the other projects, as `← ? N`: the
+        // muted arrow, then the count drawn as this project's. It is one
+        // item, drawn whatever is typed; only its `?` beats, and it gives
+        // way whole.
         let elsewhere = self.elsewhere_waiting().agents.len();
         let mut pulse = self.elsewhere_pulse.get();
         pulse.see(elsewhere, Instant::now());
@@ -22951,9 +22965,9 @@ impl App {
         if elsewhere > 0 {
             let mut forms = footer::count(status::sign("needs you"), elsewhere, true);
             if pulse.on(Instant::now()) {
-                forms.iter_mut().flatten().for_each(footer::beat);
+                footer::beat(&mut forms[0][0]);
             }
-            forms[0].push(Span::raw(" elsewhere").dim());
+            forms[0].insert(0, Span::raw("← ").dim());
             items.push(Item::new(Slot::Elsewhere, forms).opens("projects"));
         }
         // How full the next round is, as what is left of its window: no
