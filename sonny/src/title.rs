@@ -95,27 +95,56 @@ pub fn noted(store: &Path, bot: &str, id: i64) -> Option<String> {
         .filter(|title| !title.is_empty())
 }
 
-/// The agents, by name and id, whose first line was asked for: each one
-/// is read once, whichever of a window's reads gets to it first.
-static ASKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, i64)>>> =
-    std::sync::LazyLock::new(Default::default);
+/// The agents, by name and id, whose first line was asked for, each
+/// with whether its read ended: each is read once, whichever of a
+/// window's reads gets to it first, and the others wait for that one.
+static ASKED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, i64), bool>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Woken as each read of a first line ends.
+static READ_ENDED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
 
 /// Whether `bot`'s first line was asked for already.
 pub fn asked(bot: &str, id: i64) -> bool {
     let asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
-    asked.contains(&(bot.to_owned(), id))
+    asked.contains_key(&(bot.to_owned(), id))
 }
 
-/// Take `bot`'s first line to read: false where it was asked for already.
-pub fn ask(bot: &str, id: i64) -> bool {
-    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
-    asked.insert((bot.to_owned(), id))
+/// Take `bot`'s first line to read: true for the read that takes it,
+/// false once another read of it ended, which this one waits for.
+pub async fn ask(bot: &str, id: i64) -> bool {
+    let key = (bot.to_owned(), id);
+    loop {
+        let ended = READ_ENDED.notified();
+        tokio::pin!(ended);
+        ended.as_mut().enable();
+        {
+            let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+            match asked.get(&key) {
+                None => {
+                    asked.insert(key, false);
+                    return true;
+                }
+                Some(true) => return false,
+                Some(false) => {}
+            }
+        }
+        ended.await;
+    }
 }
 
-/// `bot`'s first line could not be read: the next read asks again.
-pub fn unasked(bot: &str, id: i64) {
+/// `bot`'s first line was read, and noted where it has words; or, where
+/// the read failed, the next read asks again.
+pub fn answered(bot: &str, id: i64, read: bool) {
     let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
-    asked.remove(&(bot.to_owned(), id));
+    match read {
+        true => asked.insert((bot.to_owned(), id), true),
+        false => asked.remove(&(bot.to_owned(), id)),
+    };
+    drop(asked);
+    READ_ENDED.notify_waiters();
 }
 
 /// The title a project's file gives it (`project::read`'s `title`).

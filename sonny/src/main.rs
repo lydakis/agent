@@ -1576,7 +1576,19 @@ async fn read_title(client: &Client, store: &std::path::Path, bot: &standing::Ag
     let Some(id) = bot.bot_id.filter(|_| bot.head.is_some()) else {
         return true;
     };
-    if !crate::title::ask(name, id) || crate::title::noted(store, name, id).is_some() {
+    if !crate::title::ask(name, id).await {
+        return true;
+    }
+    // A read let go before it ends, its card closed, is asked again.
+    struct Reading<'a>(&'a str, i64, bool);
+    impl Drop for Reading<'_> {
+        fn drop(&mut self) {
+            crate::title::answered(self.0, self.1, self.2);
+        }
+    }
+    let mut reading = Reading(name, id, false);
+    if crate::title::noted(store, name, id).is_some() {
+        reading.2 = true;
         return true;
     }
     let first = async {
@@ -1596,19 +1608,15 @@ async fn read_title(client: &Client, store: &std::path::Path, bot: &standing::Ag
             .map(|item| text(&item));
         Some(first.unwrap_or_default())
     };
-    match first.await {
-        Some(first) => {
-            let title = crate::title::of_message(&first);
-            if !title.is_empty() {
-                let _ = crate::title::note(store, name, id, &title);
-            }
-            true
-        }
-        None => {
-            crate::title::unasked(name, id);
-            false
+    let first = first.await;
+    if let Some(first) = &first {
+        let title = crate::title::of_message(first);
+        if !title.is_empty() {
+            let _ = crate::title::note(store, name, id, &title);
         }
     }
+    reading.2 = first.is_some();
+    reading.2
 }
 
 async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
