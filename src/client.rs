@@ -511,6 +511,12 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.settings.insert("outputs".to_owned(), json!(path));
                         options.settings_flags.push(flag.to_owned());
                     }
+                    "--namespace" => {
+                        options
+                            .settings
+                            .insert("namespace".to_owned(), json!(value));
+                        options.settings_flags.push(flag.to_owned());
+                    }
                     "--unix-socket" => {
                         let path = std::path::absolute(&value)?;
                         let path = path

@@ -458,6 +458,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             _ => {}
         }
     }
+    // The agents of its project, which its agent tools list and name.
+    if let Some(namespace) = crate::project::namespace(name) {
+        flags.extend(["--namespace".to_owned(), namespace.to_owned()]);
+    }
     // A path in the lead's folder would have the task write there instead
     // of in its copy, where nothing keeps it apart from the lead's work.
     let mut brief = vec![start.brief.clone()];

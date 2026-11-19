@@ -6007,7 +6007,7 @@ impl Turn {
                 after,
                 limit,
             } => {
-                let name = name.or_else(|| self.project_agents());
+                let name = name.or_else(|| self.namespace_agents());
                 let page = request(json!({"op":"bots","name":name,"active":running,
                     "open":!closed,"limit":limit,"after":after.as_str()}))
                 .await?;
@@ -6043,7 +6043,7 @@ impl Turn {
                 limit,
                 ..
             } => {
-                let name = name.or_else(|| self.project_agents());
+                let name = name.or_else(|| self.namespace_agents());
                 let page = request(json!({"op":"approvals","after":after.as_i64().unwrap_or(0),
                     "limit":limit}))
                 .await?;
@@ -6264,12 +6264,11 @@ impl Turn {
     }
 
     /// The whole name of an agent this one makes named `name`: a name
-    /// with no dot is in this one's project, the part of its name before
-    /// the first dot; one with a dot is whole already. A bot whose name
-    /// has no dot has no project.
+    /// with no dot is in this one's namespace, as its client set it; one
+    /// with a dot, or made by a bot with no namespace, is whole already.
     fn spawned_name(&self, name: &str) -> String {
-        match self.bot.split_once('.') {
-            Some((project, _)) if !name.contains('.') => format!("{project}.{name}"),
+        match &self.settings().namespace {
+            Some(namespace) if !name.contains('.') => format!("{namespace}.{name}"),
             _ => name.to_owned(),
         }
     }
@@ -6412,11 +6411,10 @@ impl Turn {
         ))
     }
 
-    /// This bot's project's agents, as a name pattern: those named as it
-    /// is up to the first dot, or every agent for a name with none.
-    fn project_agents(&self) -> Option<String> {
-        let (project, _) = self.bot.split_once('.')?;
-        Some(format!("{project}.*"))
+    /// The bots in this one's namespace, as a name pattern, or every bot
+    /// for one with none.
+    fn namespace_agents(&self) -> Option<String> {
+        (self.settings().namespace.as_ref()).map(|namespace| format!("{namespace}.*"))
     }
 
     async fn history_audit(
