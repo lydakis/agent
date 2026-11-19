@@ -3590,6 +3590,13 @@ pub(crate) fn made(
     if let Some(rules) = rules::given() {
         settings.insert("rules".into(), json!(rules));
     }
+    // The tiers and windows the person says models have; the tool host
+    // sends them again as they change ([`tool_host`]).
+    for (key, table) in agent_client::config::model_tables(&config) {
+        if !table.is_null() {
+            settings.insert(key.into(), table);
+        }
+    }
     asked["settings"] = Value::Object(settings);
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
@@ -5351,6 +5358,9 @@ struct App {
     boost: Option<String>,
     /// The tier faster than standard its calls are served at, if any.
     speed: Option<String>,
+    /// The tiers its `speeds` setting, the person's `[speeds]`, says
+    /// models serve, most specific first.
+    speeds_set: Vec<(String, Vec<String>)>,
     /// How big the conversation was after its last model round, as the
     /// next round reads it, once known.
     context: Option<u64>,
@@ -7607,6 +7617,7 @@ impl App {
             effort: record["effort"].as_str().map(str::to_owned),
             boost: None,
             speed: speed(record),
+            speeds_set: agent_client::speeds_set(&record["settings"]),
             context: None,
             window: None,
             compacted: None,
@@ -8900,7 +8911,7 @@ impl App {
     /// The speeds `/model` steps through for `model`: standard, and each
     /// tier faster than it the model serves.
     fn speeds_of(&self, model: &str) -> Vec<&'static str> {
-        let serves = self.client.speeds(model);
+        let serves = self.client.speeds(&self.speeds_set, model);
         (SPEEDS.into_iter())
             .filter(|speed| *speed == "standard" || serves.iter().any(|s| s == speed))
             .collect()
@@ -8937,7 +8948,7 @@ impl App {
 
     /// The tiers faster than standard the bot's model serves.
     fn speeds(&self) -> Vec<String> {
-        self.client.speeds(&self.model)
+        self.client.speeds(&self.speeds_set, &self.model)
     }
 
     /// The speed the bot's calls run at: its own where its model serves
@@ -8963,6 +8974,7 @@ impl App {
             self.set_workspace(workspace);
         }
         self.speed = speed(record);
+        self.speeds_set = agent_client::speeds_set(&record["settings"]);
         self.mode = approvals::mode(record);
     }
 

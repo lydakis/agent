@@ -570,8 +570,8 @@ impl Finished {
 }
 
 /// The provider as a bot's settings shape its calls: its output bound,
-/// cache lifetime and speed. The bot's defaults borrow it
-/// unchanged.
+/// cache lifetime, speed and the tiers its `speeds` say models serve. The
+/// bot's defaults borrow it unchanged.
 pub fn shaped<'p>(
     provider: &'p Provider,
     settings: &Settings,
@@ -580,6 +580,7 @@ pub fn shaped<'p>(
         settings.max_output_tokens,
         settings.cache_hour(),
         settings.speed(),
+        &settings.speeds,
     )
 }
 
@@ -590,7 +591,12 @@ fn shaped_other<'p>(
     provider: &'p Provider,
     settings: &Settings,
 ) -> Result<std::borrow::Cow<'p, Provider>> {
-    provider.shaped(settings.max_output_tokens, settings.cache_hour(), None)
+    provider.shaped(
+        settings.max_output_tokens,
+        settings.cache_hour(),
+        None,
+        &agent_runtime::provider::Speeds::default(),
+    )
 }
 
 /// Of `asked`, the tools an agent `me` makes is given: those `me` has, and
@@ -2975,8 +2981,13 @@ impl Turn {
         }
         let shaped = shaped(provider, self.settings())?;
         let provider: &Provider = &shaped;
-        self.window
-            .get_or_init(|| agent_runtime::provider::context_window(provider, model));
+        self.window.get_or_init(|| {
+            agent_runtime::provider::context_window(
+                provider,
+                &self.settings().context_windows,
+                model,
+            )
+        });
         let workspace = PathBuf::from(&context.workspace);
         // What this turn's commands and children get.
         let environment = commands_environment(
@@ -6053,8 +6064,14 @@ impl Turn {
                         if start.len() < arguments.len() {
                             start.push('…');
                         }
-                        json!({"bot":call["bot"],"turn":call["turn"],"tool":call["name"],
-                            "arguments":start,"waiting_on":call["gates"]})
+                        let mut row = json!({"bot":call["bot"],"turn":call["turn"],
+                            "tool":call["name"],"arguments":start,"waiting_on":call["gates"]});
+                        // One a message lifted, or its client yielded, waits
+                        // on past its turn, under the handle it answers.
+                        if call["handle"].is_string() {
+                            row["handle"] = call["handle"].clone();
+                        }
+                        row
                     })
                     .collect();
                 json!({"approvals":calls,"next_after":page["next_after"]})
