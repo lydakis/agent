@@ -232,14 +232,11 @@ async fn follow(
         if let Some(waited) = narrow.get_mut(&bot) {
             *waited |= needs.waits(&bot) || event["event"] == "turn_finished";
         }
-        // None followed narrowly waits, runs or marks any more: their
-        // events are no longer wanted, and the daemon has no unfollow. A
-        // new connection follows every agent on from this event, with
-        // nothing read again.
-        if !narrow.is_empty()
-            && (narrow.iter()).all(|(bot, waited)| *waited && !needs.waits(bot))
-            && marked.is_empty()
-        {
+        // None followed narrowly waits, runs, marks any more or is to be
+        // read at its turn's end: their events are no longer wanted, and
+        // the daemon has no unfollow. A new connection follows every agent
+        // on from this event, with nothing read again.
+        if done_with(&narrow, &needs, &marked) {
             drop((client, events));
             let Some(again) = follow_wide(&socket, json!({"after": cursor})).await else {
                 return;
@@ -248,6 +245,20 @@ async fn follow(
             narrow.clear();
         }
     }
+}
+
+/// Whether none of the agents followed narrowly is wanted any more: each
+/// has waited or run to its turn's end, and none waits now, is to be read
+/// when its turn ends (the person's words went past its question), or
+/// marked another done.
+fn done_with(
+    narrow: &HashMap<String, bool>,
+    needs: &needs::Needs,
+    marked: &HashMap<String, Vec<String>>,
+) -> bool {
+    !narrow.is_empty()
+        && (narrow.iter()).all(|(bot, waited)| *waited && !needs.waits(bot) && !needs.unsure(bot))
+        && marked.is_empty()
 }
 
 /// A connection of its own following every agent for [`WIDE`], from
@@ -621,6 +632,28 @@ mod tests {
         );
         drop(open);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A question the person's words went past is read again at its
+    /// turn's end, so its agent's turn's end is followed till then.
+    #[test]
+    fn an_agent_whose_question_is_unsure_is_followed_to_its_turn_end() {
+        let event = |kind: &str, data: Value| json!({"bot": "site.fix", "turn": 1, "event": kind, "data": data});
+        let mut needs = needs::Needs::default();
+        let asked = json!({"call_id": "c1", "name": crate::asks::TOOL});
+        needs.event(&event("tool_started", asked));
+        let narrow: HashMap<String, bool> = [("site.fix".to_owned(), true)].into();
+        let marked = HashMap::new();
+        assert!(!done_with(&narrow, &needs, &marked));
+        // A reaction or words of the person's: answered or not, the
+        // history says once the turn ends.
+        needs.event(&event("accepted", json!({"text": "ok"})));
+        assert!(!needs.waits("site.fix"));
+        assert!(!done_with(&narrow, &needs, &marked));
+        needs.event(&event("turn_finished", json!({})));
+        assert_eq!(needs.due().len(), 1);
+        needs.asked("site.fix", None);
+        assert!(done_with(&narrow, &needs, &marked));
     }
 
     #[test]
