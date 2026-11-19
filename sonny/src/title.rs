@@ -1,12 +1,14 @@
 //! An agent's title: a few words the person knows its work by, beside its
-//! name, which stays the handle. A task's is set by `start_task`; one the
-//! person starts with `/new` takes its first message's first line; a lead
-//! with none of its own takes its project's, which the project file keeps
-//! where the person can change it. The daemon keeps none: Sonny notes each
-//! beside the store, as it notes the profile a task was started as.
+//! name, which stays the handle. Every agent's is its first message's first
+//! line, as Codex names a thread from its first message: a task's brief or
+//! a `/new` agent's message noted as it starts, any other (a helper, a task
+//! started before titles) read once from its history and noted. A lead with
+//! none of its own takes its project's, which the project file keeps where
+//! the person can change it. The daemon keeps none: Sonny notes each beside
+//! the store, as it notes the profile a task was started as.
 use std::path::{Path, PathBuf};
 
-/// The most characters a task's title takes.
+/// The most characters a title takes.
 pub const MOST: usize = 60;
 
 /// Where Sonny keeps the title each agent was started with: beside the
@@ -74,33 +76,46 @@ impl Noted {
     }
 }
 
-/// A `start_task` title as given, or why it is not one: words on one line,
-/// [`MOST`] characters at most.
-pub fn checked(title: &str) -> Result<String, String> {
-    let title = title.trim();
-    if title.is_empty() {
-        return Err("a task starts with a title: a few words the person knows the work by".into());
-    }
-    if title.contains(['\n', '\r']) {
-        return Err("a title is one line".into());
-    }
-    let count = title.chars().count();
-    if count > MOST {
-        return Err(format!(
-            "a title takes {MOST} characters at most, and this one has {count}"
-        ));
-    }
-    Ok(title.to_owned())
-}
-
-/// The title of an agent the person starts with its first message,
-/// `message`: that message's first line with words on it.
-pub fn first_line(message: &str) -> String {
-    (message.lines())
+/// The title of an agent whose first message is `message`: that
+/// message's first line with words on it, cut at a word to [`MOST`].
+pub fn of_message(message: &str) -> String {
+    let line = (message.lines())
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .to_owned()
+        .unwrap_or("");
+    cut(line, MOST)
+}
+
+/// The title noted for `bot`, the agent of id `id`, read from its file.
+pub fn noted(store: &Path, bot: &str, id: i64) -> Option<String> {
+    let text = std::fs::read_to_string(file(store, bot)).ok()?;
+    let (noted, title) = text.split_once('\n')?;
+    (noted.trim().parse::<i64>().ok()? == id)
+        .then(|| title.trim().to_owned())
+        .filter(|title| !title.is_empty())
+}
+
+/// The agents, by name and id, whose first line was asked for: each one
+/// is read once, whichever of a window's reads gets to it first.
+static ASKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, i64)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether `bot`'s first line was asked for already.
+pub fn asked(bot: &str, id: i64) -> bool {
+    let asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    asked.contains(&(bot.to_owned(), id))
+}
+
+/// Take `bot`'s first line to read: false where it was asked for already.
+pub fn ask(bot: &str, id: i64) -> bool {
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    asked.insert((bot.to_owned(), id))
+}
+
+/// `bot`'s first line could not be read: the next read asks again.
+pub fn unasked(bot: &str, id: i64) {
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    asked.remove(&(bot.to_owned(), id));
 }
 
 /// The title a project's file gives it (`project::read`'s `title`).
@@ -191,21 +206,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_title_is_words_on_one_line_of_sixty_characters_at_most() {
-        assert_eq!(
-            checked("  Round half cents to even ").as_deref(),
-            Ok("Round half cents to even")
-        );
-        assert!(checked("   ").is_err());
-        assert!(checked("Round half cents\nto even").is_err());
-        let sixty = "a".repeat(MOST);
-        assert_eq!(checked(&sixty), Ok(sixty.clone()));
-        assert!(checked(&format!("{sixty}b")).unwrap_err().contains("61"));
-        // Characters, not bytes.
-        assert!(checked(&"é".repeat(MOST)).is_ok());
-    }
-
-    #[test]
     fn a_title_is_cut_at_a_word() {
         let title = "Check the README against the code";
         assert_eq!(cut(title, 40), title);
@@ -219,12 +219,19 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_started_by_the_person_takes_its_first_line() {
+    fn an_agent_takes_its_first_message_s_first_line_cut_at_a_word() {
         assert_eq!(
-            first_line("\n  Tally the invoices  \nby month"),
+            of_message("\n  Tally the invoices  \nby month"),
             "Tally the invoices"
         );
-        assert_eq!(first_line(""), "");
+        assert_eq!(of_message(""), "");
+        let long = "Round every half cent to the nearest even cent in the ledger and the invoices";
+        let title = of_message(long);
+        assert_eq!(
+            title,
+            "Round every half cent to the nearest even cent in the…"
+        );
+        assert!(title.chars().count() <= MOST);
     }
 
     #[test]

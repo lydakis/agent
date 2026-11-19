@@ -817,14 +817,20 @@ async fn read_status_of(
             continue;
         }
         listed_here.insert(name);
+        // Its title as noted, else, with none, its first line read once.
+        let mut title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
+        let untitled = title.is_none()
+            && bot.head.is_some()
+            && (bot.bot_id).is_some_and(|id| !crate::title::asked(name, id));
         // An idle agent no event moved, built as the last count built it.
         if let Some((rows_kept, again)) = &mut reuse
             && bot.running_turn.is_none()
             && name != view.bot
             && !again.contains(name)
+            && !untitled
             && let Some(row) = rows_kept
                 .remove(&name_key(name))
-                .filter(|row| row.bot == name)
+                .filter(|row| row.bot == name && row.title == title.as_deref().unwrap_or(""))
         {
             read.push(name.to_owned());
             idle.push(name.to_owned());
@@ -835,13 +841,19 @@ async fn read_status_of(
         // the card fills, beside it: a row not read yet says what the
         // listing does.
         let head = json!([bot.bot_id, bot.head]);
-        let unread = !is_read(bot, &head, status_read, asks_seen);
-        if unread {
+        let stale = !is_read(bot, &head, status_read, asks_seen);
+        if stale || untitled {
             match view.fill {
                 true => unread_here.push(name.to_owned()),
                 false => {
-                    fresh = true;
-                    whole &= read_agent(client, bot, status_read, asks_seen, view.readers).await;
+                    if stale {
+                        fresh = true;
+                        whole &=
+                            read_agent(client, bot, status_read, asks_seen, view.readers).await;
+                    }
+                    if untitled && read_title(client, &store, bot).await {
+                        title = (bot.bot_id).and_then(|id| crate::title::noted(&store, name, id));
+                    }
                 }
             }
         }
@@ -962,7 +974,7 @@ async fn read_status_of(
         needs.asked(name, ask.clone().filter(|_| !resolved));
         read.push(name.to_owned());
         // One not read yet says nothing of its question.
-        if !running && !(unread && view.fill) {
+        if !running && !(stale && view.fill) {
             idle.push(name.to_owned());
         }
         if let Some(ask) = &ask {
@@ -1013,7 +1025,6 @@ async fn read_status_of(
             false => seat_profile(&store, name, false, std::path::Path::new("")),
         }
         .unwrap_or_default();
-        let title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
         rows.push(status::Row {
             name: short(name, &project, &lead),
             bot: name.to_owned(),
@@ -1214,7 +1225,8 @@ async fn fill_status(
                 continue;
             };
             fresh = true;
-            if !read_agent(client, bot, status_read, asks_seen, view.readers).await {
+            let read = read_agent(client, bot, status_read, asks_seen, view.readers).await;
+            if !(read & read_title(client, options_store, bot).await) {
                 failed.insert(name.clone());
             }
         }
@@ -1555,6 +1567,50 @@ pub(crate) fn keep_beside(file: &std::path::Path, bytes: &[u8]) {
 
 /// `bot`'s latest step, question and pull request; none when a read
 /// failed, which an empty history is not.
+/// Note `bot`'s title from its first message's first line, read once
+/// from its history: an agent none was noted for as it started, as a
+/// helper is, or a task started before tasks had titles. False where the
+/// read failed, which the next read tries again.
+async fn read_title(client: &Client, store: &std::path::Path, bot: &standing::Agent) -> bool {
+    let name = bot.name.as_str();
+    let Some(id) = bot.bot_id.filter(|_| bot.head.is_some()) else {
+        return true;
+    };
+    if !crate::title::ask(name, id) || crate::title::noted(store, name, id).is_some() {
+        return true;
+    }
+    let first = async {
+        let asked = json!({"bot": name, "limit": 4, "oldest_first": true});
+        let page = client.request("history_nodes", asked).await.ok()?;
+        let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        let read = client
+            .request("history_items", json!({"bot": name, "nodes": nodes}))
+            .await
+            .ok()?;
+        // Oldest first, as the nodes were asked for.
+        let first = (read["items"].as_array().into_iter().flatten())
+            .flat_map(|entry| responses(&entry["item"]))
+            .find(|item| item["role"] == "user")
+            .map(|item| text(&item));
+        Some(first.unwrap_or_default())
+    };
+    match first.await {
+        Some(first) => {
+            let title = crate::title::of_message(&first);
+            if !title.is_empty() {
+                let _ = crate::title::note(store, name, id, &title);
+            }
+            true
+        }
+        None => {
+            crate::title::unasked(name, id);
+            false
+        }
+    }
+}
+
 async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
     let page = client
         .request("history_nodes", json!({"bot": bot, "limit": 4}))
@@ -9810,7 +9866,7 @@ impl App {
         let task = started::Task {
             bot,
             name,
-            title: arguments["title"].as_str().unwrap_or("").trim().to_owned(),
+            title: crate::title::of_message(arguments["brief"].as_str().unwrap_or("")),
             state: "starting".into(),
         };
         // Its name opens it at once, where it was drawn before it was made.
@@ -9851,7 +9907,7 @@ impl App {
             served::START => (
                 started::STARTED,
                 self.started_bot(arguments, output),
-                arguments["title"].as_str().unwrap_or(""),
+                crate::title::of_message(arguments["brief"].as_str().unwrap_or("")),
             ),
             "spawn_agent" => {
                 // One the daemon refused started nothing.
@@ -9863,7 +9919,7 @@ impl App {
                 (
                     started::STARTED,
                     self.started_bot(arguments, output),
-                    arguments["message"].as_str().unwrap_or(""),
+                    arguments["message"].as_str().unwrap_or("").to_owned(),
                 )
             }
             "send_message" => {
@@ -9885,7 +9941,7 @@ impl App {
                 (
                     started::SENT,
                     to.to_owned(),
-                    arguments["message"].as_str().unwrap_or(""),
+                    arguments["message"].as_str().unwrap_or("").to_owned(),
                 )
             }
             // A workflow it started has a row of its own.
@@ -9906,7 +9962,7 @@ impl App {
             verb,
             name: self.hint_name(&bot),
             bot,
-            title: started::first(title),
+            title: started::first(&title),
         };
         self.turn_hints.set.push(going);
     }
@@ -19734,7 +19790,7 @@ impl App {
                         }
                         // Its title is its first message's first line,
                         // noted by its id.
-                        let first = crate::title::first_line(&brief);
+                        let first = crate::title::of_message(&brief);
                         let asked = json!({"bot": lead.bot});
                         let noted = match self.client.request("inspect", asked).await {
                             Ok(record) => match record["bot_id"].as_i64() {
@@ -19825,7 +19881,6 @@ impl App {
         let start = task::Start {
             name: short.clone(),
             // Its title is its first message's first line.
-            title: crate::title::first_line(&brief),
             brief,
             // Named even when every task runs as it, so its model and
             // tools apply; its words are told once.
@@ -25056,6 +25111,10 @@ mod tests {
                         turns.fetch_add(1, Ordering::SeqCst);
                         json!({"turns": [], "next_before": null})
                     }
+                    // Its first line, for its title: none.
+                    "history_nodes" if asked["oldest_first"] == true => {
+                        json!({"nodes": [], "next_from": null})
+                    }
                     "history_nodes" => {
                         read.fetch_add(1, Ordering::SeqCst);
                         json!({"nodes": [], "next_from": null})
@@ -25194,6 +25253,10 @@ mod tests {
                     };
                     let last = if ran.load(Ordering::SeqCst) { 9 } else { 2 };
                     json!({"bots": [bot(1, 1), bot(2, last)], "next_after": null})
+                }
+                // Its first line, for its title: none.
+                "history_nodes" if asked["oldest_first"] == true => {
+                    json!({"nodes": [], "next_from": null})
                 }
                 "history_nodes" => {
                     read.fetch_add(1, Ordering::SeqCst);
@@ -25437,6 +25500,10 @@ mod tests {
                     "bots" => json!({"bots": [{"name": "shop.t1", "bot_id": 1, "head": 1,
                 "status": "completed", "running_turn": null,
                 "last": {"turn": 1, "status": "completed"}}], "next_after": null}),
+                    // Its first line, for its title: none.
+                    "history_nodes" if asked["oldest_first"] == true => {
+                        json!({"nodes": [], "next_from": null})
+                    }
                     "history_nodes" => {
                         read.fetch_add(1, Ordering::SeqCst);
                         json!({"nodes": [], "next_from": null})
@@ -25560,6 +25627,90 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(app.counts, Some(counts));
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_title_takes_its_first_line_once_and_a_noted_one_is_kept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let firsts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let asked = firsts.clone();
+        let snapshot = json!([
+            {"name": "titled.helper", "bot_id": 2, "head": 5, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.kept", "bot_id": 3, "head": 4, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.lead", "bot_id": 1, "head": null},
+        ]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted_reads = reads.clone();
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
+            "follow" => json!({"following": ask["bot"]}),
+            "history_nodes" if ask["oldest_first"] == true => {
+                asked
+                    .lock()
+                    .unwrap()
+                    .push(ask["bot"].as_str().unwrap().to_owned());
+                json!({"nodes": [{"node": 1, "turn": 1}], "next_from": null})
+            }
+            "history_nodes" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [], "next_from": null})
+            }
+            "history_items" if ask["nodes"] == json!([1]) => json!({"items": [{"node": 1,
+                "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "\nFix the flaky login test\nIt fails one run in ten."}]}}]}),
+            "history_items" => json!({"items": []}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let dir = std::env::temp_dir().join(unique("sonny-first-line"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        crate::title::note(&store, "titled.kept", 3, "Keep the cache warm").unwrap();
+        let mut app = app(client);
+        app.bot = "titled.lead".into();
+        app.options.store = store.clone();
+        let counted = async |app: &mut App| {
+            app.counted_at = None;
+            app.count_agents().await;
+            if let Some(job) = &app.counting {
+                while !job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            app.counted_at = Some(Instant::now());
+            app.count_agents().await;
+        };
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        counted(&mut app).await;
+        // The helper's first line, cut from its first message, noted once.
+        assert_eq!(
+            crate::title::noted(&store, "titled.helper", 2).as_deref(),
+            Some("Fix the flaky login test")
+        );
+        assert_eq!(*firsts.lock().unwrap(), ["titled.helper"]);
+        // Read again after it moved: its title is not.
+        app.follower.as_ref().unwrap().moved("titled.helper");
+        counted(&mut app).await;
+        assert_eq!(*firsts.lock().unwrap(), ["titled.helper"]);
+        // A title noted as it started is never read, nor replaced.
+        assert_eq!(
+            crate::title::noted(&store, "titled.kept", 3).as_deref(),
+            Some("Keep the cache warm")
+        );
+        // The rows the count keeps carry the titles.
+        let mut titles = crate::title::Titles::read(&store);
+        assert_eq!(
+            titles.named("titled.helper", Some(2), None).as_deref(),
+            Some("Fix the flaky login test")
+        );
+        assert!(reads.load(Ordering::SeqCst) > 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -28903,7 +29054,7 @@ mod tests {
         // started and sent under it.
         app.daemon(turn_event("accepted", 1, json!({"node": 7})))
             .await;
-        let start = json!({"name": "readme", "title": "Say how cents round", "brief": "Say how cents round\nmore"});
+        let start = json!({"name": "readme", "brief": "Say how cents round\nmore"});
         app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
         let send = json!({"to": "calc.fix", "message": "Check div too.\nThanks"});
         app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
@@ -29343,7 +29494,7 @@ mod tests {
         app.pending.clear();
         app.daemon(turn_event("accepted", 2, json!({"node": 9})))
             .await;
-        let start = json!({"name": "readme", "title": "Say how cents round", "brief": "Say how cents round"});
+        let start = json!({"name": "readme", "brief": "Say how cents round"});
         let started = json!({"name": served::START, "call_id": "s1"});
         app.daemon(turn_event("tool_started", 2, started)).await;
         app.commit_call("s1", Some(2), served::START, &start, "calc.readme/1", false);
@@ -29401,7 +29552,7 @@ mod tests {
             .await;
         app.daemon(turn_event("accepted", 5, json!({"node": 19})))
             .await;
-        let start = json!({"name": "docs", "title": "Write the docs", "brief": "Write the docs"});
+        let start = json!({"name": "docs", "brief": "Write the docs"});
         app.commit_call("s5", Some(5), served::START, &start, "calc.docs/1", false);
         // As reconnecting leaves it: still following the turn that ended.
         app.running.as_mut().unwrap().turn = 4;
@@ -31645,7 +31796,7 @@ mod tests {
         );
         app.read_tasks_through().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ● many  working");
+        assert_eq!(rows[1], "  ● Fix many  many  working");
     }
 
     #[tokio::test]
@@ -31720,13 +31871,13 @@ mod tests {
         let arguments = json!({"name": "add", "brief": "Fix add"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.add/1", false);
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ● add  working");
+        assert_eq!(drawn(&mut app)[1], "  ● Fix add  add  working");
         // Idle, the stopped message never ran: the turn before it says
         // what the task did.
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         app.tasks_read = None;
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ○ add  idle");
+        assert_eq!(drawn(&mut app)[1], "  ○ Fix add  add  idle");
     }
 
     #[tokio::test]
@@ -31766,8 +31917,8 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let start = |app: &mut App, name: &str| {
-            let arguments = json!({"name": name, "title": format!("Fix {name}"),
-                "brief": format!("Fix {name} now")});
+            let arguments =
+                json!({"name": name, "brief": format!("Fix {name}\nNow, with a test.")});
             let output = format!("calc.{name}/1");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         };
@@ -32084,8 +32235,8 @@ mod tests {
         }
         app.read_tasks_through().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ○ quiet  no reply");
-        assert_eq!(rows[2], "  ✗ bad    failed");
+        assert_eq!(rows[1], "  ○ Fix quiet  quiet  no reply");
+        assert_eq!(rows[2], "  ✗ Fix bad    bad    failed");
     }
 
     #[test]
@@ -32227,7 +32378,7 @@ mod tests {
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ? ask  needs you");
+        assert_eq!(drawn(&mut app)[1], "  ? Fix ask  ask  needs you");
         // Its history is read once for the turn it ended.
         app.tasks_read = None;
         app.read_tasks_through().await;

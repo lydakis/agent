@@ -5480,8 +5480,8 @@ mod tests {
         // How a lead in Sonny starts a task.
         let task = clean(
             "start_task",
-            serde_json::json!({"name": "fix", "title": "Fix the failing tests",
-                "brief": "Fix the tests.", "setup": true}),
+            serde_json::json!({"name": "fix", "brief": "Fix the failing tests\nThey fail on main.",
+                "setup": true}),
             "Started calc.fix: {\"handle\":\"calc.fix/3\"}",
         );
         assert_eq!(task, ["• Started fix", "  └ Fix the failing tests"]);
