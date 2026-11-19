@@ -590,6 +590,10 @@ impl Settings {
         use crate::sandbox::Mode;
         self.rules = creator.rules.clone();
         self.env = creator.env.clone();
+        // Where its cut outputs go is where its creator's do: the daemon
+        // makes that folder and writes it outside any sandbox, so no bot
+        // names one for the bots it makes.
+        self.outputs = creator.outputs.clone();
         if creator.never_asks() {
             self.approval_policy = creator.approval_policy;
         }
@@ -621,8 +625,9 @@ impl Settings {
     /// `creator`'s settings makes, [`Settings::under`] would not keep as
     /// asked: a sandbox looser than its creator's, said, so the bot is
     /// refused rather than made otherwise than asked. Those left unasked
-    /// take its creator's, and its `rules` and `env` are its creator's
-    /// whatever it asks, as no client picks them for a bot another makes.
+    /// take its creator's, and its `rules`, `env` and `outputs` are its
+    /// creator's whatever it asks, as no client picks them for a bot
+    /// another makes.
     pub fn beyond(&self, creator: &Settings) -> Option<String> {
         let held = self.clone().under(creator);
         let creator_sandbox = || {
@@ -1436,6 +1441,16 @@ pub struct Binding<'a> {
     pub request_id: Option<&'a str>,
     /// The bot starts a line of its own, at depth 0, though it has a creator.
     pub starts_line: bool,
+}
+/// What became of the message a submission replaces: withdrawn by it
+/// while still in line, or how it had ended already.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replaced {
+    pub message: i64,
+    /// `withdrawn`, `failed` (it never reached the bot), or `taken`.
+    pub status: String,
+    /// The turn that took it in, when one did.
+    pub turn: Option<i64>,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -4115,6 +4130,7 @@ impl Database {
             self.files_gone.len(),
             self.calls_ended.len(),
         );
+        let announced = self.outcomes.len();
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -4126,6 +4142,7 @@ impl Database {
             self.stepped.truncate(stepped);
             self.files_gone.truncate(files);
             self.calls_ended.truncate(ended);
+            self.outcomes.truncate(announced);
             self.restore_steps(gone);
             self.recount_pending()?;
         }
@@ -8858,6 +8875,80 @@ impl Database {
             )],
             outcome,
         ))
+    }
+    /// Withdraw message `message` of bot `name` for the submission
+    /// `request_id` that replaces it, if it is still in line; a message
+    /// already taken in, or ended, stays as it is and says how. Only its
+    /// own sender may replace it: the same bot, or client, and person.
+    /// A retry of the submission withdraws nothing.
+    pub fn replace(
+        &mut self,
+        name: &str,
+        message: i64,
+        request_id: &str,
+        options: &TurnOptions,
+    ) -> Result<Replaced> {
+        type Row = (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            bool,
+        );
+        let sender = options.from.as_ref().map(|(bot, _)| bot);
+        // The sending bot by identity too: one deleted and made again under
+        // its name is another sender. A client's or person's has none.
+        let row: Option<Row> = self
+            .conn
+            .prepare_cached(
+                "SELECT status,turn,from_bot,origin,person,
+                    EXISTS(SELECT 1 FROM messages WHERE bot=?2 AND request_id=?3),
+                    from_id IS (SELECT id FROM bots WHERE name=?4)
+                 FROM messages WHERE id=?1 AND bot=?2",
+            )?
+            .query_row(params![message, name, request_id, sender], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .optional()?;
+        let Some((status, turn, from_bot, origin, person, resent, same_bot)) = row else {
+            return Err(
+                Error::with("turn_not_found", format!("{name} has no message {message}"))
+                    .facts(json!({"bot":name,"message":message})),
+            );
+        };
+        if from_bot.as_ref().or(origin.as_ref()) != sender.or(options.origin.as_ref())
+            || person != options.person
+            || !same_bot
+        {
+            return Err(Error::with(
+                "not_permitted",
+                format!("{name}/{message} has another sender; only its sender may replace it"),
+            )
+            .facts(json!({"bot":name,"message":message})));
+        }
+        if !resent && matches!(status.as_str(), "queued" | "ready" | "attached") {
+            self.end_queued(message, &Error::new("cancelled"))?;
+            return Ok(Replaced {
+                message,
+                status: "withdrawn".to_owned(),
+                turn: None,
+            });
+        }
+        Ok(Replaced {
+            message,
+            status,
+            turn,
+        })
     }
     /// Deliver a bounded prefix of queued steers into the running turn,
     /// and attached messages with them unless `attached` is false (a reply
@@ -21247,6 +21338,30 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_made_bot_s_outputs_are_its_creator_s_whatever_it_asks() {
+        let creator = Settings {
+            outputs: Some("/home/p/cut".into()),
+            ..Settings::default()
+        };
+        for asked in [None, Some("/home/p/.agent/keys".to_owned())] {
+            let made = Settings {
+                outputs: asked,
+                ..Settings::default()
+            };
+            assert_eq!(made.under(&creator).outputs, creator.outputs);
+        }
+        let sandboxed = Settings {
+            sandbox: Some(crate::sandbox::Mode::WorkspaceWrite),
+            ..creator.clone()
+        };
+        let made = Settings {
+            outputs: Some("/etc".into()),
+            ..Settings::default()
+        };
+        assert_eq!(made.under(&sandboxed).outputs, creator.outputs);
+    }
 
     #[test]
     fn one_bots_approvals_read_only_its_own_running_commands() {

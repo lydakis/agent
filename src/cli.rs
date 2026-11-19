@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --replaces --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
@@ -398,6 +398,10 @@ fn print_flags(flags: &str) {
             "--quote" => (
                 "BOT/N",
                 "Copy exactly message N, as its number shows it, after this prompt, with who wrote it; BOT/N:reply copies the reply of the turn that took it in; repeat for more",
+            ),
+            "--replaces" => (
+                "BOT/N",
+                "Withdraw message N, one this sender sent to --bot, if it still waits in line, and send this prompt in its place; once it was taken in, this prompt goes after it",
             ),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),

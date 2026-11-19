@@ -26,8 +26,8 @@ use tokio::sync::Notify;
 
 /// The events that move where an agent stands, as a `bots` row says it:
 /// its status, running turn, what it waits on and how its last turn
-/// ended; an approval held for the person; an agent made or gone.
-pub const KINDS: [&str; 17] = [
+/// ended; an approval held for the person; an agent made, closed or gone.
+pub const KINDS: [&str; 18] = [
     "created",
     "forked",
     "queued",
@@ -44,6 +44,7 @@ pub const KINDS: [&str; 17] = [
     "call_lifted",
     "lifted_ended",
     "step_decided",
+    "closed",
     "deleted",
 ];
 
@@ -91,19 +92,25 @@ impl Agent {
 }
 
 /// `row`, a `bots` row, as a window keeps it; none for a row that is not
-/// one.
+/// one, or for an agent closed, which a window's project leaves out as
+/// Codex's thread list leaves archived threads out, until a message
+/// opens it again.
 pub fn kept(row: Value) -> Option<Agent> {
+    if !row["closed_ms"].is_null() {
+        return None;
+    }
     serde_json::from_value(row).ok()
 }
 
-/// Every agent `pattern` names, every page, with the events' cursor read
-/// before the first page: following from it misses no change.
+/// Every agent `pattern` names but those closed, every page, with the
+/// events' cursor read before the first page: following from it misses no
+/// change.
 pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<Agent>, i64)> {
     let mut listed = Vec::new();
     let mut after: Option<String> = None;
     let mut cursor = None;
     loop {
-        let mut ask = json!({"name": pattern, "limit": 256});
+        let mut ask = json!({"name": pattern, "limit": 256, "open": true});
         if let Some(after) = &after {
             ask["after"] = json!(after);
         }
@@ -123,7 +130,7 @@ pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<A
 }
 
 /// The rows of `names`, read by name, 256 a request: the agents that
-/// moved. One that is gone is not among them.
+/// moved. One that is gone, or closed, is not among them.
 pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec<Agent>> {
     let mut rows = Vec::new();
     for chunk in names.chunks(256) {
@@ -308,7 +315,9 @@ mod tests {
     /// A daemon that lists any pattern's one agent, named for how many
     /// times it was listed, with the cursor it was listed at, and keeps
     /// every follow asked of it.
-    async fn listing_daemon() -> (Arc<Client>, Arc<Mutex<Vec<Value>>>) {
+    /// A daemon that lists one agent a snapshot under the pattern's
+    /// prefix, and keeps the `follow` asks and the `bots` asks it was sent.
+    async fn listing_daemon() -> (Arc<Client>, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<Value>>>) {
         let dir = std::env::temp_dir().join(format!(
             "sonny-standing-{}-{}",
             std::process::id(),
@@ -322,6 +331,8 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let follows = Arc::new(Mutex::new(Vec::new()));
         let asked_follows = follows.clone();
+        let listings = Arc::new(Mutex::new(Vec::new()));
+        let asked_listings = listings.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -338,6 +349,7 @@ mod tests {
                 let id = asked["id"].clone();
                 let said = match asked["op"].as_str() {
                     Some("bots") => {
+                        asked_listings.lock().unwrap().push(asked.clone());
                         let prefix = asked["name"].as_str().unwrap().trim_end_matches('*');
                         let row = json!({"name": format!("{prefix}{listed}"), "head": 1});
                         listed += 1;
@@ -357,7 +369,7 @@ mod tests {
             }
         });
         let (client, _events) = Client::connect(&socket).await.unwrap();
-        (client, follows)
+        (client, follows, listings)
     }
 
     /// An agent `name` at history `head`, as a window keeps it.
@@ -382,12 +394,13 @@ mod tests {
     #[tokio::test]
     async fn a_follow_on_the_windows_connection_names_what_it_moved_and_snapshots_again_after_a_gap()
      {
-        let (client, follows) = listing_daemon().await;
+        let (client, follows, listings) = listing_daemon().await;
         let woken = Arc::new(Notify::new());
         let mut follower = Follower::start(client, "shop.*".into(), woken.clone());
         // The snapshot, then the follow from the cursor it was listed at.
         let first = next_snapshot(&follower, &woken).await;
         assert_eq!(first, vec![agent("shop.0", 1)]);
+        let snapshot = listings.lock().unwrap()[0].clone();
         while follows.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
         }
@@ -396,6 +409,13 @@ mod tests {
             asked,
             json!({"id": asked["id"], "op": "follow", "bot": "shop.*", "after": 40, "kinds": KINDS})
         );
+        // The snapshot leaves closed agents out, as the follow hears them
+        // close.
+        assert_eq!(
+            snapshot,
+            json!({"id": snapshot["id"], "op": "bots", "name": "shop.*", "limit": 256, "open": true})
+        );
+        assert!(KINDS.contains(&"closed"));
         // What the follow brought is its own; the window's agent's events
         // are the window's, even of a kind the follow takes.
         let brought = json!({"event": "turn_finished", "bot": "shop.fix", "following": "shop.*"});
@@ -422,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_project_of_the_windows_agent_alone_is_heard_through_its_own_follow() {
-        let (client, follows) = listing_daemon().await;
+        let (client, follows, _) = listing_daemon().await;
         let woken = Arc::new(Notify::new());
         let mut follower = Follower::start(client, "solo".into(), woken.clone());
         assert_eq!(
@@ -435,5 +455,13 @@ mod tests {
         // No second follow of its name, which would take the window's place.
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(follows.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_closed_agent_is_left_out_and_shows_again_once_open() {
+        let closed = json!({"name": "shop.fix", "head": 3, "closed_ms": 1700000000000_i64});
+        assert_eq!(kept(closed), None);
+        let open = json!({"name": "shop.fix", "head": 4});
+        assert_eq!(kept(open), Some(agent("shop.fix", 4)));
     }
 }
