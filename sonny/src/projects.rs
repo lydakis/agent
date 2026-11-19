@@ -103,6 +103,8 @@ pub struct View {
     projects: Vec<Project>,
     /// The lead of the project the window is in.
     here: String,
+    /// The agent the window shows: its lead, or one of its tasks.
+    window: String,
     pick: Option<Pick>,
     /// Whether the idle projects are listed in place of their fold.
     fold_open: bool,
@@ -143,9 +145,17 @@ impl View {
     pub fn new(here: &str) -> Self {
         View {
             here: here.to_owned(),
+            window: here.to_owned(),
             pick: Some(Pick::Project(here.to_owned())),
             ..Default::default()
         }
+    }
+
+    /// The page in a window that shows `bot`, one of its project's tasks:
+    /// going to the project's lead goes there, not back.
+    pub fn showing(mut self, bot: &str) -> Self {
+        self.window = bot.to_owned();
+        self
     }
 
     /// The projects as read now. The pick stays on its project; where
@@ -376,7 +386,7 @@ impl View {
                 }
                 Some(Shown::Project(at, _)) => {
                     let lead = self.projects[at].lead.clone();
-                    match lead == self.here {
+                    match lead == self.window {
                         true => Act::Close,
                         false => Act::Go(lead),
                     }
@@ -803,6 +813,13 @@ mod tests {
         );
         let mut view = rulebook();
         assert_eq!(view.key(&key(KeyCode::Right), NOW), Act::Close);
+        // From one of its tasks' windows, its lead is gone to.
+        let mut task = rulebook();
+        task.window = "tally.readme".into();
+        assert_eq!(
+            task.key(&key(KeyCode::Right), NOW),
+            Act::Go("tally.lead".into())
+        );
         // → on the fold opens it, ← inside it folds it again.
         for _ in 0..3 {
             view.key(&key(KeyCode::Down), NOW);
