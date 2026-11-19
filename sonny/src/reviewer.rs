@@ -1410,15 +1410,44 @@ async fn intent(
             call.starts_daemon = starts_daemon(&call.tool, &call.arguments, confined);
         }
     }
-    let instructions = match &workspace {
-        Some(workspace) => {
+    // An agent another agent made was given its folder's AGENTS.md as the
+    // folder read then, which its maker may have written: each file counts
+    // as the person's only as its line's first agent was given it, and is
+    // still. A line whose first agent is gone has none.
+    let mut first = Some(inspected.clone());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(maker) = (first.as_ref())
+        .filter(|agent| agent["depth"].as_u64().unwrap_or(0) > 0)
+        .map(|agent| agent["created_by"].as_str().map(str::to_owned))
+    {
+        first = match maker {
+            Some(maker) if seen.insert(maker.clone()) => {
+                client.request("inspect", json!({"bot": maker})).await.ok()
+            }
+            _ => None,
+        };
+    }
+    let instructions = match (&workspace, first) {
+        (Some(workspace), Some(first)) => {
             let given = inspected["instructions"]
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
             let workspace = workspace.clone();
             tokio::task::spawn_blocking(move || {
-                agent_client::policy::given_agents_files(&workspace, &given)
+                let files = agent_client::policy::given_agents_files(&workspace, &given);
+                if first["id"] == inspected["id"] {
+                    return files;
+                }
+                let (Some(folder), Some(given)) =
+                    (first["workspace"].as_str(), first["instructions"].as_str())
+                else {
+                    return Vec::new();
+                };
+                let firsts = agent_client::policy::given_agents_files(Path::new(folder), given);
+                (files.into_iter())
+                    .filter(|file| firsts.contains(file))
+                    .collect()
             })
             .await
             .map_err(|_| Unjudged::Failed)?
@@ -1426,7 +1455,7 @@ async fn intent(
             .map(|(path, text)| (path.to_string_lossy().into_owned(), text))
             .collect()
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     Ok(Intent {
         note: shared.note.clone(),

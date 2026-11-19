@@ -6271,7 +6271,10 @@ impl Turn {
             (None, false) => (None, agent_client::policy::PREAMBLE.to_owned()),
             (None, true) => {
                 let folder = workspace.clone();
-                tokio::task::spawn_blocking(move || {
+                // None of the folders kept from its sandbox is read for it,
+                // through a link its folder holds.
+                let hidden = self.registry.daemon().unreadable.clone();
+                tokio::task::spawn_blocking(move || agent_client::policy::hiding(&hidden, || {
                     let folder = std::path::Path::new(&folder);
                     let failed = |error: agent_client::policy::Failure| {
                         Error::with(error.code(), error.to_string())
@@ -6296,7 +6299,7 @@ impl Turn {
                         agent_client::policy::instructions(folder, role.as_ref(), &memory)
                             .map_err(failed)?;
                     Ok::<_, Error>((role, composed.text))
-                })
+                }))
                 .await
                 .map_err(|_| Error::new("profile_unreadable"))??
             }

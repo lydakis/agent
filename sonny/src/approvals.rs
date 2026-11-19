@@ -996,15 +996,42 @@ fn without_nested(record: &Value) -> Option<Map<String, Value>> {
 /// named as the daemon knows a git folder, `.git` or `NAME.git`: in one
 /// named otherwise, such as a separate git folder, its hooks and config
 /// would not be kept, so a commit there asks instead.
+///
+/// Only the repository the checkout's own `.git` is: a folder there, never
+/// a link, or a linked worktree's file naming its folder in a repository's
+/// `worktrees` that names this checkout back, as git makes them. A `.git`
+/// file an agent wrote can name any repository's git folder, which would
+/// then be given, writable, to the agents made here.
 pub fn repository(dir: &std::path::Path) -> Option<String> {
-    let found = crate::task::git(
-        dir,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .ok()
-    .filter(|path| !path.is_empty())?;
-    let real = std::fs::canonicalize(found).ok()?;
-    real.to_str()
+    use std::path::Path;
+    let top = crate::task::git(dir, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .filter(|path| !path.is_empty())?;
+    let top = std::fs::canonicalize(top).ok()?;
+    let dot = top.join(".git");
+    let found = std::fs::symlink_metadata(&dot).ok()?;
+    let real = |path: &Path| std::fs::canonicalize(path).ok();
+    let common = if found.is_dir() {
+        dot
+    } else if found.is_file() {
+        let named = std::fs::read_to_string(&dot).ok()?;
+        let admin = real(&top.join(named.trim().strip_prefix("gitdir:")?.trim()))?;
+        let worktrees = admin.parent()?;
+        if worktrees.file_name()? != "worktrees" {
+            return None;
+        }
+        let common = worktrees.parent()?.to_owned();
+        let back = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+        let shared = std::fs::read_to_string(admin.join("commondir")).ok()?;
+        if real(Path::new(back.trim()))? != dot || real(&admin.join(shared.trim()))? != common {
+            return None;
+        }
+        common
+    } else {
+        return None;
+    };
+    common
+        .to_str()
         .filter(|path| path.ends_with(".git"))
         .map(str::to_owned)
 }
