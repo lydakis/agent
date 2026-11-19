@@ -19,7 +19,22 @@ use ratatui::{
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
-use crate::table::Cells;
+/// What drawing the open block again keeps from the last time, by text:
+/// its tables' cells, its tables drawn and its code colored.
+#[derive(Default, Clone)]
+pub(crate) struct Cells {
+    read: crate::table::Cells,
+    tables: std::collections::HashMap<(String, usize, usize), Vec<Line<'static>>>,
+    code: std::collections::HashMap<(String, String), Vec<Vec<Span<'static>>>>,
+}
+
+impl Cells {
+    fn clear(&mut self) {
+        self.read.clear();
+        self.tables.clear();
+        self.code.clear();
+    }
+}
 use crate::transcript::{
     Picture, bars, fence_picture, html_tag, html_words, picture_file, picture_words, pictures,
     relead, width_hint, wrap, wrap_lines,
@@ -922,17 +937,29 @@ impl Draw<'_> {
         if !self.end && line_end(self.source, range.end) >= self.source.len() {
             return;
         }
-        let rows: Vec<String> = (self.source[range.clone()].lines())
-            .map(|line| {
-                let mut line = line.trim();
-                for _ in 0..self.quotes {
-                    line = line.strip_prefix('>').unwrap_or(line).trim_start();
-                }
-                line.to_owned()
-            })
-            .filter(|line| !line.is_empty())
-            .collect();
-        let drawn = crate::table::draw(&rows, self.inner(), self.cells);
+        let key = (
+            self.source[range.clone()].to_owned(),
+            self.quotes,
+            self.inner(),
+        );
+        let drawn = match self.cells.tables.get(&key) {
+            Some(drawn) => drawn.clone(),
+            None => {
+                let rows: Vec<String> = (self.source[range.clone()].lines())
+                    .map(|line| {
+                        let mut line = line.trim();
+                        for _ in 0..self.quotes {
+                            line = line.strip_prefix('>').unwrap_or(line).trim_start();
+                        }
+                        line.to_owned()
+                    })
+                    .filter(|line| !line.is_empty())
+                    .collect();
+                let drawn = crate::table::draw(&rows, self.inner(), &mut self.cells.read);
+                self.cells.tables.insert(key, drawn.clone());
+                drawn
+            }
+        };
         // Its rows are drawn from all its lines at once: they stand at the
         // last, so a fold leaves the table whole on the side it ends.
         let last = self.source[..range.end].trim_end();
@@ -956,13 +983,32 @@ impl Draw<'_> {
             self.code_lines(None, text);
             return;
         }
-        let code = crate::highlight::Code::language(lang);
-        self.code_lines(code, text);
+        // Colored once while its block is drawn again.
+        let key = (lang.to_owned(), text.to_owned());
+        let lines = match self.cells.code.get(&key) {
+            Some(lines) => lines.clone(),
+            None => {
+                let mut code = crate::highlight::Code::language(lang);
+                let lines: Vec<_> = (text.lines())
+                    .map(|line| code_line(&mut code, line))
+                    .collect();
+                self.cells.code.insert(key, lines.clone());
+                lines
+            }
+        };
+        self.colored_lines(lines);
     }
 
     fn code_lines(&mut self, mut code: Option<crate::highlight::Code>, text: &str) {
-        for line in text.lines() {
-            let spans = code_line(&mut code, line);
+        let lines = text
+            .lines()
+            .map(|line| code_line(&mut code, line))
+            .collect();
+        self.colored_lines(lines);
+    }
+
+    fn colored_lines(&mut self, lines: Vec<Vec<Span<'static>>>) {
+        for spans in lines {
             self.words_hung(spans);
             self.here = self.source[self.here..]
                 .find('\n')
@@ -1489,11 +1535,19 @@ impl Markdown {
     /// bullet.
     pub fn feed(&mut self, text: &str, width: usize, first: bool) -> Vec<Line<'static>> {
         *self.shown.get_mut() = None;
-        let mut lines = String::new();
-        self.rewrite.line(text, &mut lines);
         let mut out = Vec::new();
-        for line in lines.lines() {
-            self.read(line, width, &mut out);
+        // A line with no fence, math or `\(` in it reads as it is written.
+        if self.rewrite.fence.is_none()
+            && self.rewrite.math.is_none()
+            && !text.contains(['$', '\\', '`', '~', '\n'])
+        {
+            self.read(text, width, &mut out);
+        } else {
+            let mut lines = String::new();
+            self.rewrite.line(text, &mut lines);
+            for line in lines.lines() {
+                self.read(line, width, &mut out);
+            }
         }
         bullet(&mut out, first);
         out
@@ -1528,12 +1582,38 @@ impl Markdown {
         if self.prose_read(line, width, out) || self.nest_read(line, width, out) {
             return;
         }
-        if self.table && table_row(line) {
+        // A row of a table going on, in a block that holds its rows until
+        // it ends anyway, is only kept: the block is read when a line
+        // that is no row comes.
+        let held_row = |line: &str| line.trim_start_matches([' ', '>']).starts_with('|');
+        let last = self.source.trim_end_matches('\n');
+        let last = &last[last.rfind('\n').map_or(0, |at| at + 1)..];
+        if (self.table && table_row(line))
+            || (self.held.is_some() && !self.waiting && held_row(line) && held_row(last))
+        {
             push_line(&mut self.source, line);
             return;
         }
         // A blank line ends a table: it is drawn once, and goes out.
         let table_ends = self.table && line.trim().is_empty();
+        if table_ends
+            && !self.source.contains("[^")
+            && (self.defs.is_empty() || links_inline(&self.source))
+            && let Some(gap) = self.held
+        {
+            let rows: Vec<String> = (self.source.lines())
+                .map(|line| line.trim().to_owned())
+                .filter(|line| !line.is_empty())
+                .collect();
+            let rows = crate::table::draw(&rows, width.max(10), &mut self.cells.get_mut().read);
+            self.give(&rows, gap && !self.gapped, out);
+            self.source.clear();
+            push_line(&mut self.source, line);
+            (self.given, self.gapped, self.held, self.table) = (0, false, None, false);
+            self.last.clear();
+            self.cells.get_mut().clear();
+            return;
+        }
         if !self.item_read(line, out) {
             push_line(&mut self.source, line);
         }
@@ -1630,8 +1710,14 @@ impl Markdown {
         }
         // Rows from the line where a mark still open starts may change when
         // it closes: they wait for it.
+        // A block holds its rows while a table in it is still open: one
+        // that ended draws as it will stay.
+        let holds = open.holds
+            && (open.tables.checked_sub(drained))
+                .and_then(|end| self.source.get(end..))
+                .is_none_or(|after| after.trim().is_empty());
         let from = (open.items.last())
-            .filter(|item| !open.holds || open.tables <= item.cut)
+            .filter(|item| !holds || open.tables <= item.cut)
             .map_or(open.start, |item| item.cut);
         let mut sure = match first_open(&self.source[from - drained..]) {
             None => usize::MAX,
@@ -1647,9 +1733,7 @@ impl Markdown {
         // A list at the top level reads on from its last item, as the list
         // that item starts: the items before it are done.
         // A table in an item before it is done with it.
-        if let Some(item) =
-            (open.items.last()).filter(|item| !open.holds || open.tables <= item.cut)
-        {
+        if let Some(item) = (open.items.last()).filter(|item| !holds || open.tables <= item.cut) {
             let cut = item.cut - drained;
             if item.rows > self.given {
                 let gap = gap && !self.gapped;
@@ -1675,7 +1759,7 @@ impl Markdown {
         }
         // The open block's rows a new line left as they were will not
         // change: they go out.
-        let settled = match open.holds {
+        let settled = match holds {
             true => 0,
             false => (self.last.iter().zip(&rows))
                 .take_while(|(was, is)| was == is)
@@ -1689,16 +1773,16 @@ impl Markdown {
             self.given = settled;
         }
         self.last = rows;
-        self.held = open.holds.then_some(gap);
-        self.table = open.holds && open.items.is_empty() && {
+        self.held = holds.then_some(gap);
+        self.table = holds && open.items.is_empty() && {
             let text = (open.start.checked_sub(drained)).and_then(|at| self.source.get(at..));
             text.is_some_and(|text| table_row(text) && text.lines().nth(1).is_some_and(table_row))
         };
         self.prose = (open.paragraph && !self.at.document && sure == usize::MAX).then_some(gap);
         self.nest = (open.lead)
-            .filter(|_| !self.at.document && !open.holds && sure == usize::MAX)
+            .filter(|_| !self.at.document && !holds && sure == usize::MAX)
             .map(|lead| (gap, lead));
-        self.list = (!open.holds && sure == usize::MAX)
+        self.list = (!holds && sure == usize::MAX)
             .then(|| tight_item(&self.source))
             .flatten()
             .map(|(indent, mark, number)| (gap, indent, mark, number));
@@ -1718,6 +1802,101 @@ impl Markdown {
             self.last.drain(..self.given);
             self.given = 0;
         }
+        if !holds && sure == usize::MAX && !self.at.document {
+            self.shorten_item(width);
+        }
+    }
+
+    /// A list's last item read on from its last paragraph, past a blank
+    /// line: what is before it, all out, is kept as an item's first words
+    /// alone, so the item is not drawn again whole for each line. Kept only
+    /// when the rows still to come read as they did.
+    fn shorten_item(&mut self, width: usize) {
+        let text = self.source.trim_start_matches('\n');
+        let skipped = self.source.len() - text.len();
+        let Some(first) = text.lines().next() else {
+            return;
+        };
+        let Some((indent, ..)) = item_mark(first) else {
+            return;
+        };
+        let content = first.len()
+            - first[indent + 1..]
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')')
+                .len();
+        let content =
+            content + first[content..].len() - first[content..].trim_start_matches(' ').len();
+        if content >= first.len()
+            || ["]:", "[^", "```", "~~~", "\n<", "\\\n"]
+                .iter()
+                .any(|mark| text.contains(mark))
+        {
+            return;
+        }
+        // The first line of the last paragraph after a blank line, every
+        // line from it inside the item, and no item beside it.
+        let mut chunk = None;
+        let mut blank = false;
+        let mut at = first.len() + 1;
+        for line in text[first.len().min(text.len())..]
+            .split_inclusive('\n')
+            .skip(1)
+        {
+            let words = line.trim();
+            if words.is_empty() {
+                blank = true;
+            } else {
+                let lead = line.len() - line.trim_start_matches(' ').len();
+                if lead < content {
+                    return;
+                }
+                if blank {
+                    chunk = Some(at);
+                }
+                blank = false;
+            }
+            at += line.len();
+        }
+        // Tried once, as the paragraph's first line comes.
+        let last = text.trim_end_matches('\n');
+        let last = last.rfind('\n').map_or(0, |at| at + 1);
+        let Some(chunk) = chunk.filter(|chunk| *chunk > first.len() + 2 && *chunk == last) else {
+            return;
+        };
+        let mut shorter = String::with_capacity(content + 3 + text.len() - chunk);
+        shorter.push_str(&first[..content]);
+        shorter.push_str("x\n\n");
+        let kept = shorter.len();
+        shorter.push_str(&text[chunk..]);
+        let (blocks, _) = draw_defined(
+            &self.defs,
+            &shorter,
+            width,
+            &self.at,
+            &mut self.notes.clone(),
+            self.cells.get_mut(),
+            false,
+        );
+        let [block] = blocks.as_slice() else {
+            return;
+        };
+        let stub = block
+            .offsets
+            .iter()
+            .take_while(|offset| **offset < kept)
+            .count();
+        let after = block.rows.len().saturating_sub(stub);
+        let before = self.last.len().saturating_sub(after);
+        if stub > block.rows.len()
+            || self.last.len() < after
+            || self.given < before
+            || self.last[before..] != block.rows[stub..]
+        {
+            return;
+        }
+        self.given = stub + self.given - before;
+        self.last = block.rows.clone();
+        self.source.replace_range(skipped.., &shorter);
     }
 
     /// A line that goes on with a reply's paragraph as words, or starts
@@ -1733,7 +1912,11 @@ impl Markdown {
             Some(gap) => {
                 let rows = self.last.split_off(self.given.min(self.last.len()));
                 if !rows.is_empty() {
-                    self.give(&rows, gap && !self.gapped, out);
+                    if gap && !self.gapped && self.any {
+                        out.push(Line::from("  "));
+                    }
+                    out.extend(rows);
+                    self.any = true;
                     self.gapped = true;
                 }
                 // A blank line before it ends the paragraph: it starts one.
@@ -1816,13 +1999,7 @@ impl Markdown {
     fn nested_words(&self, line: &str) -> bool {
         let text = self.source.strip_suffix('\n').unwrap_or(&self.source);
         let last = &text[text.rfind('\n').map_or(0, |at| at + 1)..];
-        !last.trim().is_empty()
-            && line
-                .trim_start()
-                .chars()
-                .next()
-                .is_some_and(char::is_alphabetic)
-            && self.alone(line)
+        !last.trim().is_empty() && opens_words(line.trim_start()) && self.alone(line)
     }
 
     /// Whether `line` can be read on its own as words going on with a
@@ -1837,13 +2014,15 @@ impl Markdown {
     /// otherwise until words join it, no footnote, no link to a label that
     /// may be defined elsewhere.
     fn alone(&self, line: &str) -> bool {
+        let text = self.source.trim_end_matches('\n');
+        let last = &text[text.rfind('\n').map_or(0, |at| at + 1)..];
         !self.at.document
             && !self.waiting
-            && !self.source.contains("![")
-            && !self.source.trim_end_matches('\n').ends_with('\\')
+            && !last.contains("![")
+            && !last.ends_with('\\')
             && !line.contains("[^")
             && !line.contains("][")
-            && !(line.contains('[') && !self.defs.is_empty())
+            && (self.defs.is_empty() || links_inline(line))
     }
 
     /// The line still coming drawn on its own, after the open block's rows
@@ -2282,7 +2461,25 @@ fn prose_rows(line: &str, width: usize) -> Vec<Line<'static>> {
 /// that start no block of their own.
 fn starts_with_word(line: &str) -> bool {
     let words = line.trim_start_matches(' ');
-    line.len() - words.len() <= 3 && words.chars().next().is_some_and(char::is_alphabetic)
+    line.len() - words.len() <= 3 && opens_words(words)
+}
+
+/// Whether words start no block: a letter, an opening bracket or quote,
+/// or a code span's backtick.
+fn opens_words(words: &str) -> bool {
+    match words.chars().next() {
+        Some(c) if c.is_alphabetic() => true,
+        Some('(' | '"' | '\'' | '“' | '‘') => true,
+        Some('`') => !words.starts_with("```"),
+        _ => false,
+    }
+}
+
+/// Whether every link in `line` says where it goes: none names a label
+/// defined elsewhere.
+fn links_inline(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    (0..bytes.len()).all(|at| bytes[at] != b']' || bytes.get(at + 1) == Some(&b'('))
 }
 
 /// The list item `source` starts with, after its blank lines, numbered
@@ -2357,6 +2554,11 @@ pub(crate) fn rows(markdown: &Markdown, text: &str, width: usize) -> Vec<(usize,
     out
 }
 
+/// The characters that can start or end a mark inside a line.
+const INLINE_MARKS: [char; 16] = [
+    '\\', '`', '*', '_', '[', ']', '<', '>', '&', '!', '~', '$', '|', '\t', '\r', '^',
+];
+
 /// Inline marks in a line of words, as a paragraph reads them: what a
 /// table's cell and a question's line are drawn with.
 pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
@@ -2380,6 +2582,15 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             None => false,
         }
     };
+    // Words with no mark in them read as they are.
+    if !block && !words.is_empty() && !words.contains(INLINE_MARKS) {
+        let mut spans = Vec::with_capacity(2);
+        if !indent.is_empty() {
+            spans.push(Span::styled(indent.to_owned(), base));
+        }
+        spans.push(Span::styled(words.trim_end().to_owned(), base));
+        return spans;
+    }
     let source = match block {
         true => format!("\\{}", parens(words)),
         false => parens(words).into_owned(),
@@ -2467,9 +2678,12 @@ mod tests {
         text(&rows)
     }
 
+    /// The span holding `words`: one that is just them, or else one they
+    /// are among, as a row is a span for each style.
     fn styled<'a>(rows: &'a [Line<'static>], words: &str) -> &'a Span<'static> {
-        (rows.iter().flat_map(|row| &row.spans))
-            .find(|span| span.content == words)
+        let spans = || rows.iter().flat_map(|row| &row.spans);
+        (spans().find(|span| span.content.trim_end() == words))
+            .or_else(|| spans().find(|span| span.content.contains(words)))
             .unwrap_or_else(|| panic!("no {words:?} in {:?}", text(rows)))
     }
 

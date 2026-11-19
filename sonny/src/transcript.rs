@@ -858,6 +858,9 @@ fn wrap_rows(
     // Each row, and whether it goes on with a word cut in the row above.
     let mut rows: Vec<(Vec<Span<'static>>, bool)> =
         vec![(first.spans, line.alignment == Some(CUT))];
+    // Words go onto the span they follow when it is a word of the same
+    // style on the same row: a row is a span for each style, not a word.
+    let mut joins = false;
     let mut used = 0;
     for span in line.spans {
         let style = line.style.patch(span.style);
@@ -869,6 +872,7 @@ fn wrap_rows(
                 rows.push((rest.clone(), false));
                 room = rest_room;
                 used = 0;
+                joins = false;
                 if word.trim().is_empty() {
                     continue;
                 }
@@ -908,12 +912,19 @@ fn wrap_rows(
                 rows.push((rest.clone(), true));
                 room = rest_room;
                 used = 0;
+                joins = false;
                 word = &word[cut..];
                 wide = wide.saturating_sub(cols);
             }
             used += wide;
-            (rows.last_mut().unwrap().0).push(Span::styled(word.to_owned(), style));
+            let row = &mut rows.last_mut().unwrap().0;
+            match row.last_mut() {
+                Some(last) if joins && last.style == style => last.content.to_mut().push_str(word),
+                _ => row.push(Span::styled(word.to_owned(), style)),
+            }
+            joins = true;
         }
+        joins = false;
     }
     rows.into_iter()
         .map(|(spans, cut)| Line {
