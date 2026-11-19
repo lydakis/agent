@@ -21,29 +21,52 @@ pub struct Kept<T> {
     value: T,
 }
 
-/// What a file or folder's metadata says of its last change: a folder's
-/// changes as an entry in it comes, goes or is renamed, which is how all
-/// that writes the files read here writes one: whole beside its place,
-/// then renamed there. The inode's own change time is in it too: a
-/// permission put right changes nothing else, and what read as nothing
-/// under the old one must be read again.
+/// What a file or folder's metadata says of its last change, as Git's
+/// stat data says it of an index entry: its device and inode, size, and
+/// modified and changed times, any of which moving is a change. A
+/// folder's changes as an entry in it comes, goes or is renamed, which is
+/// how all that writes the files read here writes one: whole beside its
+/// place, then renamed there, so each write is a new inode, told apart
+/// even where file times move in 10 ms steps. The inode's own change time
+/// is in it too: a permission put right changes nothing else, and what
+/// read as nothing under the old one must be read again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Stamp {
     modified: std::time::SystemTime,
     len: u64,
+    device: u64,
     inode: u64,
     changed: (i64, i64),
 }
 
 pub fn stamp(path: &Path) -> Option<Stamp> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
-    Some(Stamp {
-        modified: meta.modified().ok()?,
-        len: meta.len(),
-        inode: meta.ino(),
-        changed: (meta.ctime(), meta.ctime_nsec()),
-    })
+    Stamp::of(&std::fs::metadata(path).ok()?)
+}
+
+impl Stamp {
+    /// What `meta`, as a folder's listing gives it, says of the file.
+    pub fn of(meta: &std::fs::Metadata) -> Option<Stamp> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Stamp {
+            modified: meta.modified().ok()?,
+            len: meta.len(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+
+    /// As text, for a stamp kept in a file and compared from another
+    /// process: equal only for equal stamps.
+    pub fn text(&self) -> String {
+        let modified =
+            (self.modified.duration_since(std::time::UNIX_EPOCH)).map_or(0, |at| at.as_nanos());
+        let (changed_s, changed_ns) = self.changed;
+        format!(
+            "{}:{}:{}:{modified}:{changed_s}.{changed_ns}",
+            self.device, self.inode, self.len
+        )
+    }
 }
 
 /// A change this recent may share its time with a later one the clock
@@ -129,6 +152,41 @@ fn now_s() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_moved_into_place_is_a_new_stamp_at_the_same_size_and_time() {
+        let dir = std::env::temp_dir().join(format!("kept-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("follows.json");
+        let tick = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let written = |text: &str| {
+            agent_client::files::replace_mode(&path, text.as_bytes(), 0o600).unwrap();
+            (std::fs::File::options().write(true))
+                .open(&path)
+                .unwrap()
+                .set_modified(tick)
+                .unwrap();
+            stamp(&path).unwrap()
+        };
+        let first = written("aaaa");
+        let second = written("bbbb");
+        // Its size and time say nothing changed; its inode does, as Git's
+        // stat data tells a racy write apart.
+        assert_eq!((first.len, first.modified), (second.len, second.modified));
+        assert_ne!(first.inode, second.inode);
+        assert_ne!(first, second);
+        assert_ne!(first.text(), second.text());
+        // Only the inode differing is enough, whatever the clock did.
+        let moved = Stamp {
+            inode: first.inode + 1,
+            ..first
+        };
+        assert_ne!(moved, first);
+        assert_ne!(moved.text(), first.text());
+        assert_eq!(first.text(), first.text());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_config_that_could_not_be_read_is_read_again() {

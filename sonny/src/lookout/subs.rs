@@ -684,18 +684,19 @@ fn taken_file(store: &Path) -> PathBuf {
 }
 
 /// What the lookout took of one subscriber's file: the file's revision,
-/// its modification time in nanoseconds since the epoch, or none for a
-/// file it saw go; and when it took it, in milliseconds since the epoch.
+/// its stamp (device, inode, size and times, as Git's stat data), or none
+/// for a file it saw go; and when it took it, in milliseconds since the
+/// epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Took {
-    pub revision: Option<u64>,
+    pub revision: Option<crate::kept::Stamp>,
     pub at_ms: u128,
 }
 
 /// Each subscriber file's revision as it is now, looked at before the
 /// files are read: a write after the look leaves the file newer than what
 /// is kept, so it is taken again at the next read, never missed.
-pub(super) fn revisions(store: &Path) -> std::collections::HashMap<String, u64> {
+pub(super) fn revisions(store: &Path) -> std::collections::HashMap<String, crate::kept::Stamp> {
     let Ok(entries) = std::fs::read_dir(dir(store)) else {
         return Default::default();
     };
@@ -708,9 +709,10 @@ pub(super) fn revisions(store: &Path) -> std::collections::HashMap<String, u64> 
         .collect()
 }
 
-fn revision(path: &Path) -> Option<u64> {
-    let at = std::fs::metadata(path).ok()?.modified().ok()?;
-    Some(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64)
+/// A file's revision: a write renamed into place is a new inode, so two
+/// writes within one tick of the file clock are still two.
+fn revision(path: &Path) -> Option<crate::kept::Stamp> {
+    crate::kept::stamp(path)
 }
 
 /// Bring what the lookout took up to the files' `revisions`, as of `now`:
@@ -718,7 +720,7 @@ fn revision(path: &Path) -> Option<u64> {
 /// then.
 pub(super) fn take(
     taken: &mut std::collections::HashMap<String, Took>,
-    revisions: &std::collections::HashMap<String, u64>,
+    revisions: &std::collections::HashMap<String, crate::kept::Stamp>,
     now: u128,
 ) -> bool {
     let mut changed = false;
@@ -751,7 +753,8 @@ pub(super) fn take(
 pub(super) fn took(store: &Path, taken: &std::collections::HashMap<String, Took>) {
     let body: serde_json::Map<String, Value> = (taken.iter())
         .map(|(name, took)| {
-            let took = json!({"revision_ns": took.revision, "at_ms": took.at_ms as u64});
+            let revision = took.revision.as_ref().map(crate::kept::Stamp::text);
+            let took = json!({"revision": revision, "at_ms": took.at_ms as u64});
             (name.clone(), took)
         })
         .collect();
@@ -772,8 +775,8 @@ pub fn taken(store: &Path, subscriber: &str) -> Value {
     let now = revision(&file(store, subscriber));
     // A subscriber with no file and nothing taken has nothing to hear.
     let same = match now {
-        Some(now) => took["revision_ns"].as_u64() == Some(now),
-        None => took["revision_ns"].is_null(),
+        Some(now) => took["revision"].as_str() == Some(now.text().as_str()),
+        None => took["revision"].is_null(),
     };
     json!({
         "running": running,
@@ -2536,6 +2539,45 @@ mod tests {
         change(&store, "shop.lead", None, None, Some("prs"), &[]).unwrap();
         change(&store, "shop.lead", None, None, Some("tasks"), &[]).unwrap();
         assert_eq!(all(&store).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_writes_in_one_tick_of_the_file_clock_are_two_revisions() {
+        let dir = std::env::temp_dir().join(format!("subs-revision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("state.sqlite");
+        let sub = |name: &str| Sub::from_json(&json!({"name": name, "agents": ["shop.fix"]}));
+        // Each write's time set to the same instant, as a file clock that
+        // moves in 10 ms steps gives two writes within one step.
+        let tick = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let written = |name: &str| {
+            write(&store, "shop.lead", &[sub(name).unwrap()]).unwrap();
+            (std::fs::File::options().write(true))
+                .open(file(&store, "shop.lead"))
+                .unwrap()
+                .set_modified(tick)
+                .unwrap();
+            revisions(&store)
+        };
+        let mut taken = std::collections::HashMap::new();
+        let first = written("aaaa");
+        assert!(take(&mut taken, &first, 1));
+        assert!(!take(&mut taken, &revisions(&store), 2));
+        // The same length at the same time: still a new revision, as the
+        // write moved a new file into place.
+        let second = written("bbbb");
+        assert_ne!(first, second);
+        assert!(take(&mut taken, &second, 3));
+        assert_eq!(read(&store, "shop.lead"), [sub("bbbb").unwrap()]);
+        // Kept beside the store as text, it names that revision.
+        took(&store, &taken);
+        let kept: Value =
+            serde_json::from_str(&std::fs::read_to_string(taken_file(&store)).unwrap()).unwrap();
+        assert_eq!(
+            kept["shop.lead"]["revision"],
+            json!(second["shop.lead"].text())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

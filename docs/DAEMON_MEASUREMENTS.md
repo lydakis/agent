@@ -12314,6 +12314,44 @@ A one-off store screen (release build, a file store, one group commit of
 withdrawing and sending already cost, plus one indexed read of the
 replaced message and a savepoint, within the rounds' spread.
 
+## Automations judged by their parts (#1207)
+
+A turn's end (`finish`) now denies a held step of a call a message lifted,
+which outlived its turn before. It looks for such steps, and for the steps of
+a yielded call that wait on, only when one of the turn's steps waits: every
+waiting step is in the store's in-memory list, so a turn with none (nearly
+every turn) runs neither query, where main ran the second one at every turn
+end. A client's `approve_step` naming one of the bot's own tools runs the
+same plan `run_step` does and writes one audit row; no screen sends one.
+
+The Perf workflow's matched screens on 75140fc against main (e83c185), two
+alternating rounds on one runner; the gate passed, store work per turn
+unchanged:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.330 | 0.335 | +1.5 |
+| lifecycle | p95 turn, ms | 573.7 | 574.0 | +0.1 |
+| lifecycle | peak RSS, MiB | 26.6 | 26.1 | -1.7 |
+| completion | release to terminal p99, ms | 6.49 | 6.59 | +1.5 |
+| admission | lone submit CPU, ms | 24.06 | 23.94 | -0.5 |
+| admission | burst submit p99, ms | 2.726 | 2.740 | +0.5 |
+| footprint | idle RSS, MiB | 17.5 | 17.4 | -0.5 |
+| footprint | per idle bot, KiB | 1.81 | 1.91 | +5.4 |
+| footprint | RSS after a turn each, MiB | 52.1 | 51.9 | -0.4 |
+| footprint | CPU per turn, ms | 0.679 | 0.661 | -2.5 |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 18.75 | +50.0 |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 4.37 | 4.32 | -1.3 |
+| sonny | quiet window CPU, ms/s | 0.38 | 0.57 | +50.0 |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | 0.0 |
+| sonny | sky replay CPU per 1k lines, ms | 7.75 | 7.65 | -1.4 |
+
+The two Sonny rows at +50% are one or two CPU ticks over a few seconds
+(10x1 sends 4,000 deltas to one lead, the quiet window draws nothing), in
+code this change does not touch (the lookout and the window); the gate
+warns only when the head's best run is worse than the base's worst, and it
+did not.
+
 ## Speeds and context windows as bot settings (#1208)
 
 `[speeds]` and `[context_windows]` became bot settings that each turn

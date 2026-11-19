@@ -3215,15 +3215,18 @@ async fn run() -> Result<(), String> {
     }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), whatever set its instructions before; a file of
-    // the folder's it cannot use is left out, and said.
+    // the folder's it cannot use is left out, and said. Only here, as the
+    // window opens, as Codex reads its instructions once as a session
+    // starts: they lead every request, so a change while the lead works
+    // would cost its next call the whole prompt cache.
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
             .or(bot["workspace"].as_str().map(std::path::Path::new))
     {
         let chosen = project::chosen(&app.options.store, &name);
-        app.holds = bot["instructions"].as_str().unwrap_or_default().to_owned();
-        match project::review(dir, &app.holds, chosen.as_deref()) {
+        let holds = bot["instructions"].as_str().unwrap_or_default();
+        match project::review(dir, holds, chosen.as_deref()) {
             Ok((taken, left_out)) => {
                 app.warnings.extend(left_out);
                 app.instruct = taken;
@@ -5078,8 +5081,9 @@ struct Counted {
     /// read again, with their [`rows_mark`]; none when a read failed, so
     /// the window takes a fresh snapshot.
     listed: Option<(Vec<standing::Agent>, u64)>,
-    /// This window's agent's own tasks, as the margin lists them, when read.
-    own: Option<Vec<status::Own>>,
+    /// The project's agents, as the pane lists them above the margin,
+    /// when read.
+    agents: Option<status::Agents>,
     /// The rows the count built, for the next; none builds every row again.
     kept: Option<Built>,
 }
@@ -5755,6 +5759,10 @@ struct App {
     /// with their [`rows_mark`] once counted; the count holds it while it
     /// runs, so there is one copy.
     listed: Option<Vec<standing::Agent>>,
+    /// The lead a task's window lists the agents of, with the agent it was
+    /// found for, as the last count's listing said: kept while a count
+    /// holds the listing, so a read beside it lists for the same lead.
+    listed_lead: Option<(String, String)>,
     rows_mark: Option<u64>,
     folded: Option<(bool, u64)>,
     refold: bool,
@@ -5865,10 +5873,6 @@ struct App {
     restored: Option<trigger::Restored>,
     /// The folder the next message moves the bot to: its lead moved away.
     move_to: Option<String>,
-    /// The instructions the lead holds, as this window last saw or sent
-    /// them: at each idle point its folder's are composed again and sent
-    /// when they differ.
-    holds: String,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
     /// Connecting again beside the loop, and reading what happened while
@@ -7786,6 +7790,7 @@ impl App {
             kept_rows: Built::default(),
             follower: None,
             listed: None,
+            listed_lead: None,
             rows_mark: None,
             folded: None,
             refold: false,
@@ -7830,7 +7835,6 @@ impl App {
             upgrades: None,
             restored: None,
             move_to: None,
-            holds: String::new(),
             retry: None,
             reattaching: None,
             upgraded: false,
@@ -8514,34 +8518,6 @@ impl App {
         self.words_only = view == View::Words;
     }
 
-    /// A lead takes its folder's instructions at each idle point: composed
-    /// again as a turn ends, and sent by the [`App::configure`] that
-    /// follows when they changed. A file of the folder's it cannot use is
-    /// left out, and said, and the lead told.
-    fn folder_instructions(&mut self) {
-        if self.project.is_none() || self.options.side.is_some() {
-            return;
-        }
-        let chosen = project::chosen(&self.options.store, &self.bot);
-        let dir = std::path::Path::new(&self.workspace);
-        match project::review(dir, &self.holds, chosen.as_deref()) {
-            Ok((None, _)) => {}
-            Ok((Some(text), left_out)) => {
-                self.instruct = Some(text);
-                self.notice = project::warnings_notice(&left_out, true);
-                let (client, bot) = (self.client.clone(), self.bot.clone());
-                self.write(async move {
-                    let told = project::tell_warnings(&client, &bot, &left_out).await;
-                    let said = told
-                        .err()
-                        .map(|error| format!("the lead's instructions: {error}"));
-                    Wrote::Said(said)
-                });
-            }
-            Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
-        }
-    }
-
     /// `write` sent to the daemon beside the loop, once the writes made
     /// before it are done, as Codex sends its ops one after another: the
     /// window goes on meanwhile, and what came of each is applied in the
@@ -8823,9 +8799,6 @@ impl App {
             Ok(_) => {
                 if let Some(declare) = &declare {
                     self.declared = declare.clone();
-                }
-                if let Some(text) = text {
-                    self.holds = text;
                 }
                 if let Some((model, effort)) = switch {
                     // A lead's project file says what it runs, for the next
@@ -11951,15 +11924,19 @@ impl App {
                 self.counted_local = None;
             }
             match counted.listed {
-                Some((listed, mark)) => (self.listed, self.rows_mark) = (Some(listed), Some(mark)),
+                Some((listed, mark)) => {
+                    let lead = task_lead(&self.bot, Some(&listed));
+                    self.listed_lead = Some((self.bot.clone(), lead));
+                    (self.listed, self.rows_mark) = (Some(listed), Some(mark));
+                }
                 // A read failed: what moved is unknown, so start over.
                 None => self.follower = None,
             }
             if let Some(tasks) = counted.tasks {
                 self.tasks_read(tasks);
             }
-            if let Some(own) = counted.own {
-                self.margin.set_tasks(own);
+            if let Some(agents) = counted.agents {
+                self.margin.set_agents(agents, &self.bot);
             }
             self.kept_rows = counted.kept.unwrap_or_default();
             if let Some((latest, seen)) = counted.reads {
@@ -12027,6 +12004,7 @@ impl App {
         self.counted_at = Some(Instant::now());
         let (client, woken) = (self.client.clone(), self.woken.clone());
         let (store, bot) = (self.options.store.clone(), self.bot.clone());
+        let lone = self.project.is_none();
         // What was read of each agent's history and question goes with the
         // count, which gives it back however it ends.
         let (mut latest, mut seen) = (
@@ -12049,7 +12027,7 @@ impl App {
                 reads: Some(reads),
                 tasks: None,
                 listed: None,
-                own: None,
+                agents: None,
                 kept: None,
             };
             if take {
@@ -12079,13 +12057,23 @@ impl App {
                 }
             }
             let rows = kept_mark.unwrap_or_else(|| rows_mark(&listed));
+            // A task's window counts its lead's agents, the lead found in
+            // the listing it counts, the first snapshot too.
+            let scope = match lone {
+                true => background::Scope {
+                    lead: task_lead(&bot, Some(&listed)),
+                    ..scope
+                },
+                false => scope,
+            };
             // The listing is current from here: a read that fails keeps it
             // and counts again.
             let unread = |listed, reads| Counted {
                 listed: Some((listed, rows)),
                 ..failed(reads)
             };
-            let Some(mark) = standing(&client, rows, local).await else {
+            // Counted again once the lead it lists for changes.
+            let Some(mark) = standing(&client, rows ^ name_key(&scope.lead), local).await else {
                 return Some(unread(listed, (latest, seen)));
             };
             if was == Some(mark) {
@@ -12095,7 +12083,7 @@ impl App {
                     reads: Some((latest, seen)),
                     tasks: None,
                     listed: Some((listed, rows)),
-                    own: None,
+                    agents: None,
                     kept: Some(kept_rows),
                 });
             }
@@ -12140,7 +12128,7 @@ impl App {
             if let Some(bots) = &bots {
                 kept_rows.bots = bots.clone();
             }
-            let own = status::own(&built, &bot);
+            let agents = status::agents(read.title.as_ref().unwrap_or(&read.project), &built);
             // The tasks' lines, each made once for a row kept, and handed
             // over only once they say something new.
             let tasks =
@@ -12162,7 +12150,7 @@ impl App {
                 reads: Some((latest, seen)),
                 tasks,
                 listed: Some((listed, rows)),
-                own: Some(own),
+                agents: Some(agents),
                 kept: Some(kept_rows),
             })
         }));
@@ -14055,7 +14043,6 @@ impl App {
                     "interrupted" => "idle",
                     _ => "error",
                 });
-                self.folder_instructions();
                 self.configure();
                 // Only this view knows whether the turn said anything, so it
                 // rings for the end of every turn of its own; the project's
@@ -14860,13 +14847,17 @@ impl App {
     }
 
     /// The agents `/status` and `/background` cover: the project's, and
-    /// its lead; a lone agent's only.
+    /// its lead; a lone agent's only. A task's window covers its lead's,
+    /// so it lists them as the lead's window does.
     fn scope(&self) -> background::Scope {
         let (project, lead) = match &self.project {
             Some(project) => (project.clone(), self.bot.clone()),
             None => (
                 self.bot.split('.').next().unwrap_or(&self.bot).to_owned(),
-                self.bot.clone(),
+                match (&self.listed, &self.listed_lead) {
+                    (None, Some((bot, lead))) if *bot == self.bot => lead.clone(),
+                    (listed, _) => task_lead(&self.bot, listed.as_deref()),
+                },
             ),
         };
         let glob = if self.bot.contains('.') || self.project.is_some() {
@@ -14927,7 +14918,9 @@ impl App {
         self.counts = Some(status::counts(&read.rows));
         self.status_counted(status::bots(&read.rows));
         self.tasks_read(status::tasks(&mut read.rows));
-        self.margin.set_tasks(status::own(&read.rows, &self.bot));
+        let project = read.title.as_ref().unwrap_or(&read.project);
+        self.margin
+            .set_agents(status::agents(project, &read.rows), &self.bot);
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
@@ -23215,6 +23208,39 @@ fn clicked(link: &str, right: bool) -> Option<String> {
 }
 
 /// A bot's name in its project: `lead`, or what follows the project's dot.
+/// The lead a window of `bot` lists the agents of: `bot` itself when it
+/// is a lead or a lone agent, else the lead its line of makers leads to in
+/// `listed`, or its project's first lead until the listing says.
+fn task_lead(bot: &str, listed: Option<&[standing::Agent]>) -> String {
+    let Some((project, _)) = bot.split_once('.') else {
+        return bot.to_owned();
+    };
+    if project::is_lead(bot) {
+        return bot.to_owned();
+    }
+    let first = format!("{project}.lead");
+    let Some(listed) = listed else {
+        return first;
+    };
+    let makers: HashMap<&str, &str> = (listed.iter())
+        .map(|agent| (agent.name.as_str(), agent.maker()))
+        .collect();
+    let mut at = bot;
+    // A ring of makers leads to no lead.
+    for _ in 0..=makers.len() {
+        match makers.get(at) {
+            Some(maker) if project::lead_project(maker) == Some(project) => {
+                return (*maker).to_owned();
+            }
+            // Another project's lead: listed from its own project.
+            Some(maker) if project::is_lead(maker) => break,
+            Some(maker) if !maker.is_empty() => at = maker,
+            _ => break,
+        }
+    }
+    first
+}
+
 fn short(bot: &str, project: &str, lead: &str) -> String {
     if bot == lead {
         return "lead".into();
@@ -23705,6 +23731,33 @@ mod tests {
             }
         }
         mine
+    }
+
+    #[test]
+    fn a_tasks_window_lists_the_agents_of_the_lead_its_line_leads_to() {
+        let agent = |name: &str, maker: &str| standing::Agent {
+            name: name.into(),
+            created_by: Some(maker.into()).filter(|m: &String| !m.is_empty()),
+            ..Default::default()
+        };
+        let listed = [
+            agent("calc.lead", ""),
+            agent("calc.lead.docs", ""),
+            agent("calc.halves", "calc.lead"),
+            agent("calc.halves-a", "calc.halves"),
+            agent("calc.notes", "calc.lead.docs"),
+            agent("calc.loose", "shop.lead"),
+        ];
+        let lead = |bot| task_lead(bot, Some(&listed));
+        // A lead and a lone agent list their own.
+        assert_eq!(lead("calc.lead.docs"), "calc.lead.docs");
+        assert_eq!(lead("solo"), "solo");
+        // A task and its helper, the lead their line leads to.
+        assert_eq!(lead("calc.halves-a"), "calc.lead");
+        assert_eq!(lead("calc.notes"), "calc.lead.docs");
+        // Another project's lead, or no listing yet: the first lead.
+        assert_eq!(lead("calc.loose"), "calc.lead");
+        assert_eq!(task_lead("calc.notes", None), "calc.lead");
     }
 
     #[test]
@@ -25577,6 +25630,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_of_another_lead_counts_that_leads_agents_from_the_first_snapshot() {
+        // Idle, so no history is read: the count is the listing alone.
+        let bot = |name: &str, id: i64, maker: Option<&str>| {
+            json!({"name": name, "bot_id": id, "last": {"turn": 1, "status": "completed"},
+                "created_by": maker})
+        };
+        let snapshot = json!([
+            bot("calc.lead", 1, None),
+            bot("calc.lead.docs", 2, None),
+            bot("calc.halves", 3, Some("calc.lead")),
+            bot("calc.notes", 4, Some("calc.lead.docs")),
+        ]);
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" if ask["names"].is_null() && ask["active"].is_null() => {
+                json!({"bots": snapshot, "cursor": 7, "next_after": null})
+            }
+            "follow" => json!({"following": ask["bot"]}),
+            "bots" => json!({"bots": [], "next_after": null}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc.notes".into();
+        let dir = std::env::temp_dir().join(unique("sonny-task-lead-count"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.options.store = dir.join("state.sqlite");
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        app.counted_at = None;
+        app.count_agents().await;
+        while !app.counting.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        app.counted_at = Some(Instant::now());
+        app.count_agents().await;
+        // Its own lead's agents, on the first count, and the folder's other
+        // lead as a row of its own: not the first lead's task.
+        let counted: std::collections::BTreeSet<&str> =
+            app.status_bots.iter().map(String::as_str).collect();
+        assert_eq!(
+            counted,
+            ["calc.lead", "calc.lead.docs", "calc.notes"].into()
+        );
+        assert_eq!(app.scope().lead, "calc.lead.docs");
+        // While a count holds the listing, a read beside it lists for the
+        // same lead.
+        let held = app.listed.take();
+        assert!(held.is_some());
+        assert_eq!(app.scope().lead, "calc.lead.docs");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn every_window_starts_from_what_its_leads_windows_kept() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let histories = Arc::new(AtomicUsize::new(0));
@@ -26351,6 +26460,52 @@ mod tests {
                 .await;
             assert!(app.suggesting.is_none(), "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_lead_keeps_its_instructions_through_its_turns_so_its_next_call_reads_the_cache() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({})
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-lead-holds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "Run the tests.\n").unwrap();
+        let mut app = app(client);
+        app.project = Some("shop".into());
+        app.workspace = dir.display().to_string();
+        // What its folder tells it changes while it works, as a rule
+        // edited or a fact saved to its memory does.
+        std::fs::write(dir.join("AGENTS.md"), "Run the tests twice.\n").unwrap();
+        for turn in 1..=3 {
+            app.daemon(turn_event("accepted", turn, json!({}))).await;
+            app.daemon(turn_event(
+                "turn_finished",
+                turn,
+                json!({"status": "completed"}),
+            ))
+            .await;
+            app.beside_done().await;
+        }
+        // Its instructions lead every request: sent again between two
+        // calls, they would cost the next one the whole prompt cache.
+        // They are taken as a window opens, as Codex reads its own once.
+        assert!(app.instruct.is_none());
+        let configured: Vec<Value> = (asked.lock().unwrap().iter())
+            .filter(|request| request["op"] == "configure")
+            .cloned()
+            .collect();
+        assert!(
+            configured
+                .iter()
+                .all(|request| request.get("instructions").is_none()),
+            "{configured:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

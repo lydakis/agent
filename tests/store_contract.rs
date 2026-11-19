@@ -23679,3 +23679,253 @@ fn a_message_in_line_is_replaced_by_its_sender_alone_and_one_taken_in_stays() {
     assert_eq!(refused.code, "not_permitted");
     assert_eq!(db.turn_status("Carol", note).unwrap(), "queued");
 }
+
+static STEPPING: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| vec!["shell".into(), "send_message".into()]);
+
+/// A bot whose declared `run` takes steps, judged by an `auto` gate on
+/// `run`, `shell` and its declared `start_task`, under a workspace sandbox
+/// when `sandboxed`, with `rules`.
+fn stepping_bot(db: &mut Database, sandboxed: bool, rules: Option<agent_runtime::rules::Policy>) {
+    let run = Declared {
+        name: "run".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: Some(600_000),
+        grammar: None,
+        steps: true,
+        gate_daemon_steps: false,
+        yields: false,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    let start = Declared {
+        name: "start_task".into(),
+        steps: false,
+        ..run.clone()
+    };
+    let gate = Gate {
+        tag: "auto".into(),
+        tools: vec!["run".into(), "shell".into(), "start_task".into()],
+        expire_ms: None,
+    };
+    let mut settings = Settings {
+        rules,
+        ..Default::default()
+    };
+    if sandboxed {
+        settings.sandbox = Some(agent_runtime::sandbox::Mode::WorkspaceWrite);
+    }
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            tools: &STEPPING,
+            declared: Some(&ToolList::new(vec![run, start]).unwrap()),
+            gate: Some(&gate),
+            settings,
+            ..binding()
+        },
+    )
+    .unwrap();
+}
+
+/// A turn of `Lead` with its `run` call `c1` waiting for its answer.
+fn running_call(db: &mut Database) -> i64 {
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "run".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+        links: Default::default(),
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
+    turn
+}
+
+#[test]
+fn a_step_naming_the_bots_own_tool_is_decided_by_its_plan() {
+    use agent_runtime::store::Step;
+    let mut db = db();
+    stepping_bot(&mut db, true, None);
+    let turn = running_call(&mut db);
+    let now = epoch_now();
+    let ask = |db: &mut Database, step: &str, tool: &str, arguments: Value| {
+        db.step_announce(
+            "Lead",
+            turn,
+            "c1",
+            step,
+            tool,
+            arguments,
+            false,
+            Default::default(),
+            now,
+        )
+        .unwrap()
+        .step
+    };
+    // A command its sandbox holds runs unjudged, as the same call from the
+    // model would, though the gate names the call's own tool.
+    let Step::Decided(inside) = ask(&mut db, "1", "shell", json!({"command": "test -f done"}))
+    else {
+        panic!("a confined command waited");
+    };
+    assert_eq!(inside["decision"], "allow", "{inside}");
+    // One that leaves the sandbox waits for the gate that names shell.
+    let Step::Pending { .. } = ask(
+        &mut db,
+        "2",
+        "shell",
+        json!({"command": "make", "sandbox_permissions": "require_escalated"}),
+    ) else {
+        panic!("an escalated command was not put to its gate");
+    };
+    // A declared tool judged whole waits as its call from the model does.
+    let Step::Pending { .. } = ask(&mut db, "3", "start_task", json!({"name": "watch"})) else {
+        panic!("a start was not put to its gate");
+    };
+    // An agent tool the gate does not name runs unjudged.
+    let Step::Decided(sent) = ask(
+        &mut db,
+        "4",
+        "send_message",
+        json!({"to": "Other", "message": "hi"}),
+    ) else {
+        panic!("a message waited");
+    };
+    assert_eq!(sent["decision"], "allow", "{sent}");
+    // A tool the bot may not call is refused.
+    let refused = db.step_announce(
+        "Lead",
+        turn,
+        "c1",
+        "5",
+        "spawn_agent",
+        json!({}),
+        false,
+        Default::default(),
+        now,
+    );
+    assert_eq!(
+        refused.err().map(|e| e.code),
+        Some("tool_not_available".to_owned())
+    );
+    // The waiting ones are listed under the tool each amounts to.
+    let listed = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
+    let names: Vec<&str> = (listed["approvals"].as_array().unwrap().iter())
+        .filter_map(|call| call["name"].as_str())
+        .collect();
+    assert_eq!(names, ["shell", "start_task"], "{listed}");
+    // A name not the bot's own is judged by its call's gates, as before.
+    let Step::Pending { .. } = ask(&mut db, "6", "mcp__s__t", json!({})) else {
+        panic!("a client's own step was not put to its call's gate");
+    };
+}
+
+#[test]
+fn a_rule_refuses_a_step_naming_shell_as_it_refuses_the_command() {
+    use agent_runtime::store::Step;
+    let mut db = db();
+    let forbidden = json!({"prefix_rules": [{"pattern": ["rm"], "decision": "forbidden"}]});
+    stepping_bot(
+        &mut db,
+        true,
+        Some(serde_json::from_value(forbidden).unwrap()),
+    );
+    let turn = running_call(&mut db);
+    let Step::Decided(denied) = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "shell",
+            json!({"command": "rm -rf x"}),
+            false,
+            Default::default(),
+            epoch_now(),
+        )
+        .unwrap()
+        .step
+    else {
+        panic!("a forbidden command waited");
+    };
+    assert_eq!(denied["decision"], "deny", "{denied}");
+    assert_eq!(denied["error"], "command_forbidden", "{denied}");
+    // Its row in the audit trail says so, under shell.
+    let trail = db.audit(&Default::default()).unwrap();
+    assert_eq!(trail["rows"][0]["tool"], "shell", "{trail}");
+    assert_eq!(trail["rows"][0]["outcome"], "denied", "{trail}");
+}
+
+#[test]
+fn a_held_step_of_a_lifted_call_ends_with_its_turn() {
+    use agent_runtime::store::Step;
+    // Lifted by a message, ended by the turn or by its interruption, or
+    // yielded by its client, whose steps wait on.
+    for (yielded, error) in [(false, None), (false, Some("cancelled")), (true, None)] {
+        let mut db = db();
+        stepping_bot(&mut db, false, None);
+        let turn = running_call(&mut db);
+        let now = epoch_now();
+        let Step::Pending { .. } = db
+            .step_announce(
+                "Lead",
+                turn,
+                "c1",
+                "0",
+                "send",
+                json!({}),
+                false,
+                Default::default(),
+                now,
+            )
+            .unwrap()
+            .step
+        else {
+            panic!("a gated step was decided at once");
+        };
+        let so_far = result("so far");
+        let (process, _) = db
+            .lift(turn, "c1", None, yielded.then_some(&so_far), &[], now)
+            .unwrap()
+            .unwrap();
+        let error = error.map(agent_runtime::Error::new);
+        db.finish(turn, error.as_ref()).unwrap();
+        let listed = db.approvals(None, None, 0, None, 64).unwrap();
+        if yielded {
+            assert_eq!(
+                listed["approvals"][0]["handle"],
+                format!("proc:{process}").as_str(),
+                "{listed}"
+            );
+            continue;
+        }
+        assert_eq!(listed["approvals"], json!([]), "{listed}");
+        let events = db.events("Lead", 0, 256).unwrap();
+        let decided = (events["events"].as_array().unwrap().iter())
+            .find(|e| e["event"] == "step_decided")
+            .unwrap_or_else(|| panic!("no step_decided: {events}"));
+        assert_eq!(decided["data"]["decision"], "deny", "{decided}");
+        assert_eq!(decided["data"]["reason"], "its turn ended", "{decided}");
+        // The call waits on for its client's answer, its time running.
+        let calls = db.tool_calls("sonny", 0, 10).unwrap();
+        assert_eq!(calls["calls"][0]["call_id"], "c1", "{calls}");
+    }
+}
