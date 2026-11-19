@@ -23,8 +23,8 @@ use agent_runtime::{
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
         Answer, Binding, Bot, Decision, Delivery, ENV_JSON, FOLDERS_JSON, Fork, Gate, MAX_GATES,
-        Publication, RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting,
-        Wake,
+        Publication, RULES_JSON, Replaced, Settings, Started, Step, Stepped, Store, TurnOptions,
+        Waiting, Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Prepared, Registry, ToolList,
@@ -194,9 +194,20 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             model,
             effort,
             delivery,
+            replaces,
             ..
         } => (
-            output::encoded_len(&(id, bot, bot, request_id, model, effort, delivery)),
+            // The handle of a replaced message names the bot once more.
+            output::encoded_len(&(
+                id,
+                bot,
+                bot,
+                replaces.and(Some(bot)),
+                request_id,
+                model,
+                effort,
+                delivery,
+            )),
             output::encoded_len(&(bot, request_id)),
             0,
             Ok(0),
@@ -612,6 +623,9 @@ enum Command {
         /// A JSON Schema the turn's reply follows, which the provider
         /// enforces as structured output; absent leaves it free text.
         output_schema: Option<Value>,
+        /// A message of this bot's, from this same sender, that this one
+        /// replaces: withdrawn if still in line, else left as it is.
+        replaces: Option<i64>,
     },
     Interrupt {
         bot: String,
@@ -2213,8 +2227,8 @@ enum Pending {
         reserved: bool,
         /// Why no turn may start, as the refusal names it.
         held: Option<&'static str>,
-        answer: Answer<(i64, Started)>,
-        answered: Option<Result<(i64, Started)>>,
+        answer: Answer<(i64, Started, Option<Replaced>)>,
+        answered: Option<Result<(i64, Started, Option<Replaced>)>>,
     },
     /// The bot's record, and the cursor of its `created` event.
     Create {
@@ -4190,14 +4204,15 @@ impl Service {
         request_id: String,
         delivery: Delivery,
         held: Option<&'static str>,
-        result: Result<(i64, Started)>,
+        result: Result<(i64, Started, Option<Replaced>)>,
     ) -> Result<Value> {
         // While draining or paused no turn starts: `reject` work is refused,
         // and queued work waits durably for the next daemon or `resume`.
-        let (identity, started) = result.map_err(|error| match (error.code.as_str(), held) {
-            ("active_agent_limit", Some(held)) => Error::new(held),
-            _ => error,
-        })?;
+        let (identity, started, replaced) =
+            result.map_err(|error| match (error.code.as_str(), held) {
+                ("active_agent_limit", Some(held)) => Error::new(held),
+                _ => error,
+            })?;
         let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
         if started.fresh && started.status == "running" {
             // A steer queued behind it in the window is its steer once
@@ -4234,16 +4249,20 @@ impl Service {
         if started.fresh && started.carried {
             self.kept.insert(bot.clone());
         }
-        if started.status == "ready" {
+        // A withdrawn message that was ready gave its place to the next.
+        if started.status == "ready" || replaced.as_ref().is_some_and(|r| r.status == "withdrawn") {
             self.ready_hint = true;
         }
         // The message's number, and the turn's when it opened one.
         let turn = started.opened.then_some(started.turn);
-        Ok(
-            json!({"bot":bot,"bot_id":identity,"message":started.turn,"turn":turn,
+        let mut answer = json!({"bot":bot,"bot_id":identity,"message":started.turn,"turn":turn,
             "request_id":request_id,"duplicate":!started.fresh,"status":started.status,
-            "cursor":cursor,"handle":format!("{bot}/{}", started.turn)}),
-        )
+            "cursor":cursor,"handle":format!("{bot}/{}", started.turn)});
+        if let Some(replaced) = replaced {
+            answer["replaced"] = json!({"message":replaced.message,"status":replaced.status,
+                "turn":replaced.turn,"handle":format!("{bot}/{}", replaced.message)});
+        }
+        Ok(answer)
     }
 
     /// Look for attached messages due no later than `at`.
@@ -7478,8 +7497,12 @@ impl Service {
                 images,
                 wait_ms,
                 output_schema,
+                replaces,
             } => {
                 name("request_id", &request_id)?;
+                if replaces.is_some_and(|message| message < 1) {
+                    return fail_with("invalid_replaces", "replaces names a message, 1 or more");
+                }
                 let images = images_checked(
                     images.unwrap_or_default(),
                     |images| images.iter().collect(),
@@ -7651,10 +7674,13 @@ impl Service {
                 // A steer arms the running turn inside its committing job,
                 // as `end_queued` does, so no round boundary before the
                 // answer finds it waiting behind a cleared flag.
+                // Withdrawing a message in line may expose steers behind it,
+                // as `end_queued` does, whatever this one's delivery.
+                let steering = matches!(delivery, Delivery::Steer | Delivery::Attach);
                 let steers = self
                     .active
                     .get(&bot)
-                    .filter(|_| matches!(delivery, Delivery::Steer | Delivery::Attach))
+                    .filter(|_| steering || replaces.is_some())
                     .map(|active| active.steers.clone());
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
@@ -7662,17 +7688,31 @@ impl Service {
                     .store
                     .queue("begin", move |db| {
                         let identity = db.identity(&b, bot_id)?;
-                        let started =
+                        let begin = |db: &mut agent_runtime::store::Database| {
                             db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
                                 validate_provider(&providers, bot, model)
-                            })?;
-                        if started.fresh
-                            && matches!(started.status, "queued" | "attached")
+                            })
+                        };
+                        // The replaced message is withdrawn and this one
+                        // sent in one step: no turn takes it in between, and
+                        // a refused send leaves it in line.
+                        let (started, replaced) = match replaces {
+                            None => (begin(db)?, None),
+                            Some(message) => db.atomic(|db| {
+                                let replaced = db.replace(&b, message, &r, &options)?;
+                                Ok((begin(db)?, Some(replaced)))
+                            })?,
+                        };
+                        let withdrawn = replaced.as_ref().is_some_and(|r| r.status == "withdrawn");
+                        if (withdrawn
+                            || (steering
+                                && started.fresh
+                                && matches!(started.status, "queued" | "attached")))
                             && let Some(steers) = &steers
                         {
                             steers.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Ok((identity, started))
+                        Ok((identity, started, replaced))
                     })
                     .await;
                 let answer = match queued {
@@ -9221,6 +9261,7 @@ mod tests {
             images: None,
             wait_ms: None,
             output_schema: None,
+            replaces: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins
