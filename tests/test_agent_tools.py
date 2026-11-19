@@ -3,6 +3,8 @@ pause_agents, spawn_agent and close_agent, made as the calling bot."""
 import hashlib
 import json
 import os
+import shutil
+import sys
 import time
 import unittest
 
@@ -278,6 +280,50 @@ class AgentToolsTests(ModelFixture):
         helper = client.request('inspect', bot='shop.helper')['result']
         asked = client.request('inspect', bot='shop.asked')['result']
         self.assertEqual((helper['tools'], asked['tools']), (['echo', 'spawn_agent'], ['echo']))
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_profile_starts_its_agent_in_its_sandbox_and_never_looser(self):
+        agents = self.path / '.agents' / 'agents'
+        agents.mkdir(parents=True)
+        (agents / 'reviewer.md').write_text('---\nsandbox: read-only\n---\nReview it.\n')
+        (agents / 'careful.md').write_text('---\nextends: reviewer\n---\nBe careful.\n')
+        (agents / 'loose.md').write_text('---\nsandbox: danger-full-access\n---\nDo anything.\n')
+        client = self.client(TOOLS)
+        made = client.request('create', bot='shop.lead', workspace=str(self.path),
+                              settings={'sandbox': 'workspace-write', 'network': True,
+                                        'writable': [str(self.path)]})
+        self.assertIn('result', made, made)
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'review', 'message': 'q', 'profile': 'reviewer'}),
+                       ('spawn_agent', {'name': 'careful', 'message': 'q', 'profile': 'careful'}),
+                       ('spawn_agent', {'name': 'loose', 'message': 'q', 'profile': 'loose'}),
+                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'profile': 'loose',
+                                        'settings': {'sandbox': 'workspace-write'}}))
+        # Read-only: nothing written, no network, its maker's folders gone.
+        for name in ('shop.review', 'shop.careful'):
+            settings = client.request('inspect', bot=name)['result']['settings']
+            self.assertEqual((settings['sandbox'], settings.get('network', False), settings.get('writable') or []),
+                             ('read-only', False, []), settings)
+        # Looser than its maker is refused, saying so; nothing is made.
+        refused = self.output(client, 'shop.lead', 'spawn_agent-3')
+        self.assertIn('invalid_setting', refused)
+        self.assertIn("profile loose: sandbox: the profile's danger-full-access is looser than workspace-write", refused)
+        self.assertEqual(client.request('inspect', bot='shop.loose')['error'], 'bot_not_found')
+        # The call's own sandbox stands over the profile's.
+        asked = client.request('inspect', bot='shop.asked')['result']['settings']
+        self.assertEqual(asked['sandbox'], 'workspace-write', asked)
+        # Sent again after its profile went looser: the agent it made stands,
+        # as when its folder's files change; only the message, from another
+        # turn, is another request.
+        spawn = ('spawn_agent', {'name': 'once', 'message': 'q', 'profile': 'reviewer', 'request_id': 'once'})
+        self.run_calls(client, 'shop.lead', 'first', spawn)
+        (agents / 'reviewer.md').write_text('---\nsandbox: danger-full-access\n---\nReview it.\n')
+        self.run_calls(client, 'shop.lead', 'again', spawn)
+        events = client.request('events', bot='shop.lead', after=0, limit=256)['result']['events']
+        node = [e for e in events if e['event'] == 'tool_completed'][-1]['data']['node']
+        again = node_item(client, 'shop.lead', node)['result']['output']
+        self.assertIn('from differs from the request that sent message', again)
+        self.assertEqual(client.request('inspect', bot='shop.once')['result']['settings']['sandbox'], 'read-only')
 
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
