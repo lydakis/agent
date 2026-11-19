@@ -240,6 +240,7 @@ async fn follow(
             && (narrow.iter()).all(|(bot, waited)| *waited && !needs.waits(bot))
             && marked.is_empty()
         {
+            drop((client, events));
             let Some(again) = follow_wide(&socket, json!({"after": cursor})).await else {
                 return;
             };
