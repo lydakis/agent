@@ -13046,18 +13046,24 @@ impl Database {
         // answered call's are, and the call's time runs again, so nothing
         // the turn asked about is decided once it is over. A call its
         // client yielded is background work, whose steps wait on.
+        // Only a turn with a step waiting has one to end or keep: every
+        // step's approval is in `steps` while it waits.
+        let stepping = self.steps.values().any(|of| *of == turn);
         type Lifted = (String, String, String, String, Option<String>);
-        let lifted: Vec<Lifted> = tx
-            .prepare_cached(
-                "DELETE FROM approvals WHERE turn=?1 AND step_of IN
+        let lifted: Vec<Lifted> = match stepping {
+            false => Vec::new(),
+            true => tx
+                .prepare_cached(
+                    "DELETE FROM approvals WHERE turn=?1 AND step_of IN
                  (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL AND NOT yielded)
                  RETURNING call_id,step_of,name,json_extract(arguments,'$.arguments'),
                     json_extract(arguments,'$.audit')",
-            )?
-            .query_map([turn], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+                )?
+                .query_map([turn], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+        };
         let now_ms = epoch_ms().max(0) as u64;
         for (id, parent, name, arguments, facts) in &lifted {
             audit_step(
@@ -13080,13 +13086,16 @@ impl Database {
         for parent in lifted.iter().map(|(_, parent, ..)| parent) {
             resume_call(&tx, turn, parent, now_ms)?;
         }
-        let background: Vec<i64> = tx
-            .prepare_cached(
-                "SELECT a.id FROM approvals a WHERE a.turn=?1 AND a.step_of IN
-                 (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL)",
-            )?
-            .query_map([turn], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+        let background: Vec<i64> = match stepping {
+            false => Vec::new(),
+            true => tx
+                .prepare_cached(
+                    "SELECT a.id FROM approvals a WHERE a.turn=?1 AND a.step_of IN
+                     (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL)",
+                )?
+                .query_map([turn], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?,
+        };
         let unstarted = lifted.len() as i64
             + match bot.gates.is_empty() {
                 true => 0,

@@ -46,8 +46,12 @@ is asked so); another agent it wakes, or that gets each run's answer, is
 `send_message`; an agent it starts is `start_task`, refused as a start is to a
 confined agent no one reviews. An add that only wakes the agent asks nothing,
 nor does a removal of one of its own; a removal of another's asks that one's
-parts, and a run the parts of the one it runs. A step refused refuses the call
-with its reason, and nothing is added.
+parts, and a run the parts of the one it runs. Whose automation it is goes by
+the agent's id in its store, never its name, which an agent of another store
+sharing this HOME can have. A step refused refuses the call with its reason,
+and nothing is added. A removal, run or replacement acts only on the
+definition its parts were asked about: one replaced, or added, while they were
+asked about is refused as `automation_changed`, to be asked about again.
 A row whose last run sent a turn says how that turn ended, as the daemon
 has it: `last.turn_status`, and `last.turn_error` when it did not complete,
 so an agent sees the failure the person sees in `/background`. It does not

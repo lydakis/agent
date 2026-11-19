@@ -1927,10 +1927,22 @@ async fn automate(
     place: Place,
 ) -> Answer {
     let bot = str_of(&call["bot"]);
-    let parts = match looks(&call["arguments"]) {
-        true => Vec::new(),
+    let (parts, reviewed) = match looks(&call["arguments"]) {
+        true => (Vec::new(), None),
         false => automation_parts(client, &bot, &call["arguments"]).await?,
     };
+    // What it removes, runs or replaces is the definition its parts were
+    // read from, or nothing: the tool refuses one that changed since.
+    let mut call = call.clone();
+    match reviewed {
+        Some(reviewed) => call["arguments"][crate::trigger::REVIEWED] = json!(reviewed),
+        None => {
+            if let Some(arguments) = call["arguments"].as_object_mut() {
+                arguments.remove(crate::trigger::REVIEWED);
+            }
+        }
+    }
+    let call = &call;
     if parts.is_empty() {
         return answer(client, call, me, store, socket, place).await;
     }
@@ -2066,15 +2078,18 @@ fn added_parts(me: &str, add: &Value) -> Vec<Part> {
 }
 
 /// The parts of the automation `trigger` stands as, for a removal or run
-/// of it by the agent `me` (or the agent `me` copies), as its add would
-/// have asked them: an `if` command the agent did not write runs where
-/// its writer's do, outside the agent's sandbox.
-fn standing_parts(me: &[&str], trigger: &crate::trigger::Trigger) -> Vec<Part> {
+/// of it by `caller`, as its add would have asked them: an `if` command
+/// the caller did not write runs where its writer's do, outside the
+/// caller's sandbox. The caller is who the automation pins, by id in its
+/// store, not by name: another store sharing this HOME can have an agent
+/// of the same name.
+fn standing_parts(caller: &crate::trigger::Caller, trigger: &crate::trigger::Trigger) -> Vec<Part> {
     use crate::trigger::{Target, Writer};
-    let mine = |name: &str| me.contains(&name);
+    let ours = caller.store.as_deref() == Some(trigger.store_id.as_str());
+    let mine = |id: i64| ours && caller.id == Some(id);
     let mut parts = Vec::new();
     if let Some(command) = &trigger.gate {
-        let written = matches!(&trigger.gate_by, Some(Writer::Agent(by, _)) if mine(by));
+        let written = matches!(&trigger.gate_by, Some(Writer::Agent(_, by)) if mine(*by));
         parts.push(Part::check(command, trigger.dir.as_deref(), !written));
     }
     match &trigger.target {
@@ -2089,12 +2104,12 @@ fn standing_parts(me: &[&str], trigger: &crate::trigger::Trigger) -> Vec<Part> {
             effort.as_deref(),
             &trigger.message,
         )),
-        Target::Bot { name, .. } if !mine(name) => {
+        Target::Bot { name, id } if !mine(*id) => {
             parts.push(Part::message(name, "the agent it wakes", &trigger.message))
         }
         Target::Bot { .. } => {}
     }
-    if let Some((to, _)) = trigger.reply_to.as_ref().filter(|(to, _)| !mine(to)) {
+    if let Some((to, _)) = trigger.reply_to.as_ref().filter(|(_, id)| !mine(*id)) {
         parts.push(Part::message(to, "the agent it answers", ANSWERS));
     }
     parts
@@ -2104,43 +2119,57 @@ fn standing_parts(me: &[&str], trigger: &crate::trigger::Trigger) -> Vec<Part> {
 /// removes or runs one, each once: an add's own, and when it replaces one
 /// that is not the agent's, that one's too; a removal of one that is not
 /// the agent's, its parts; a run, the parts of the one it runs. Only a
-/// removal, a run or a replacement reads the daemon, for who the agent is.
+/// removal, a run or a replacement reads the daemon, for who the agent is,
+/// and with the parts comes the definition they were read from
+/// ([`crate::trigger::Reviewed`]), which the call then acts on only as it
+/// stands: one replaced, or added, while its parts were asked about is
+/// not what was asked about.
 async fn automation_parts(
     client: &Client,
     bot: &str,
     arguments: &Value,
-) -> Result<Vec<Part>, (&'static str, String)> {
+) -> Result<(Vec<Part>, Option<crate::trigger::Reviewed>), (&'static str, String)> {
     let named = |key: &str| arguments[key].as_str().filter(|name| !name.is_empty());
     let add = &arguments["add"];
+    // The name an add replaces: its own, its agent's, or, run from the
+    // agent's shell, the agent's that shell runs as.
+    let replaced = |me: &[String]| {
+        (add["name"].as_str())
+            .or(add["start"]["name"].as_str())
+            .or(add["agent"].as_str())
+            .or(me.last().map(String::as_str))
+            .unwrap_or(bot)
+            .to_owned()
+    };
     let (mut parts, acted, run) = match (add.is_object(), named("remove"), named("run")) {
-        (true, ..) => {
-            let replaced = (add["replace"] == true)
-                .then(|| {
-                    (add["name"].as_str())
-                        .or(add["start"]["name"].as_str())
-                        .or(add["agent"].as_str())
-                        .unwrap_or(bot)
-                })
-                .map(str::to_owned);
-            (added_parts(bot, add), replaced, false)
-        }
-        (false, Some(name), _) => (Vec::new(), Some(name.to_owned()), false),
-        (false, None, Some(name)) => (Vec::new(), Some(name.to_owned()), true),
+        (true, ..) => (
+            added_parts(bot, add),
+            (add["replace"] == true).then_some(None),
+            false,
+        ),
+        (false, Some(name), _) => (Vec::new(), Some(Some(name.to_owned())), false),
+        (false, None, Some(name)) => (Vec::new(), Some(Some(name.to_owned())), true),
         _ => (Vec::new(), None, false),
     };
+    let mut reviewed = None;
     if let Some(name) = acted {
         let (me, id) = automation_caller(client, bot).await?;
+        let name = name.unwrap_or_else(|| replaced(&me));
         let caller = crate::trigger::Caller {
             id,
             store: client.store().map(str::to_owned),
         };
         let places = crate::trigger::Places::home().map_err(|e| ("automation_refused", e))?;
-        let names: Vec<&str> = me.iter().map(String::as_str).collect();
-        if let Some((trigger, mine)) = crate::trigger::standing(&places, &name, &caller)
+        let standing = crate::trigger::standing(&places, &name, &caller);
+        if let Some((trigger, mine)) = &standing
             && (run || !mine)
         {
-            parts.extend(standing_parts(&names, &trigger));
+            parts.extend(standing_parts(&caller, trigger));
         }
+        reviewed = Some(crate::trigger::Reviewed {
+            generation: standing.map(|(trigger, _)| trigger.generation),
+            name,
+        });
     }
     let mut once: Vec<Part> = Vec::with_capacity(parts.len());
     for part in parts {
@@ -2148,7 +2177,7 @@ async fn automation_parts(
             once.push(part);
         }
     }
-    Ok(once)
+    Ok((once, reviewed))
 }
 
 /// The names the agent `bot` acts as, its own and that of the agent a side
@@ -3720,23 +3749,38 @@ mod tests {
             shadow: false,
             live: false,
         };
-        assert_eq!(standing_parts(&["watch"], &trigger), []);
+        let caller = |store: &str, id: i64| crate::trigger::Caller {
+            id: Some(id),
+            store: Some(store.into()),
+        };
+        let watch = caller("00ab", 7);
+        assert_eq!(standing_parts(&watch, &trigger), []);
         // Another agent's: the message to it.
         assert_eq!(
-            standing_parts(&["lead"], &trigger),
+            standing_parts(&caller("00ab", 8), &trigger),
             [Part::message("watch", "the agent it wakes", "Check.")]
         );
-        // An if the agent wrote runs in its sandbox; anyone else's outside.
+        // So is an agent of the same id in another store sharing this HOME.
+        assert_eq!(
+            standing_parts(&caller("00cd", 7), &trigger),
+            [Part::message("watch", "the agent it wakes", "Check.")]
+        );
+        // An if the agent wrote runs in its sandbox; anyone else's outside,
+        // the same name's in another store too.
         trigger.gate = Some("make check".into());
         trigger.dir = Some(PathBuf::from("/work"));
         trigger.gate_by = Some(Writer::Agent("watch".into(), 7));
         assert_eq!(
-            standing_parts(&["watch"], &trigger),
+            standing_parts(&watch, &trigger),
             [Part::check("make check", Some(Path::new("/work")), false)]
+        );
+        assert_eq!(
+            standing_parts(&caller("00cd", 7), &trigger)[0].arguments["sandbox_permissions"],
+            "require_escalated"
         );
         trigger.gate_by = Some(Writer::Person);
         assert_eq!(
-            standing_parts(&["watch"], &trigger)[0].arguments["sandbox_permissions"],
+            standing_parts(&watch, &trigger)[0].arguments["sandbox_permissions"],
             "require_escalated"
         );
         trigger.gate = None;
@@ -3748,7 +3792,7 @@ mod tests {
             fresh: false,
         };
         assert_eq!(
-            standing_parts(&["watch"], &trigger),
+            standing_parts(&watch, &trigger),
             [Part::start("check", "openai/gpt", None, "Check.")]
         );
     }
