@@ -1350,7 +1350,8 @@ async fn read_agent(
         Both::Apart
     };
     match both {
-        Both::Read(latest, seen) => {
+        Both::Read(read) => {
+            let (latest, seen) = *read;
             status_read.insert(name.to_owned(), (head.clone(), latest));
             match (seen, ended) {
                 (Some(seen), Some(last)) => {
@@ -1672,7 +1673,7 @@ fn latest_of(listed: &[Value], entries: &[Value]) -> Latest {
 enum Both {
     /// `bot`'s latest, and its question gone on from what was read, none
     /// when a whole scan it took failed.
-    Read(Latest, Option<Seen>),
+    Read(Box<(Latest, Option<Seen>)>),
     /// Read them apart: the nodes since are too many, or too few to hold
     /// its newest.
     Apart,
@@ -1727,7 +1728,7 @@ async fn read_both(client: &Client, bot: &str, last: i64, from: i64, was: &Seen)
         Some(seen) => Some(seen),
         None => needs::scan(client, bot, last).await,
     };
-    Both::Read(latest, seen)
+    Both::Read(Box::new((latest, seen)))
 }
 
 /// Open `bot`, a lead of `project`, in that project's own home, the
