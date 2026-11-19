@@ -107,6 +107,26 @@ chat keeps to its agent, and `/new` is for the main window only.
 
 ![/switch listing every agent, then narrowed by typing fix, in Flexoki dark and light](../docs/sonny/switch-picker.png)
 
+### Projects
+
+`/projects`, or `←` with nothing typed, shows every project in the
+conversation's place, and the pane beside it shows the picked project's
+agents, so you go from one lead to another without a multiplexer. A row is
+a project, and a project is its lead: the mark of its most pressing agent,
+its title (its name where it has none), and its counts as the footer writes
+them. The project you are in is bold. A project whose folder is inside
+another's hangs under it, and a superlead's row says a muted `superlead`.
+Rows keep the order of their titles, so none moves when an agent starts or
+ends a turn. Projects none of whose agents had a turn in seven days fold to
+`▸ N idle projects`. `↑` `↓` pick, `enter` or `→` goes to the picked
+project's lead as `/switch` does, `←` goes to the project that holds it,
+`ctrl+f` narrows the rows by title and name, and `esc` puts back the
+conversation and what the pane showed. The empty composer says
+`← projects`. Zen, a side chat and an agent shown beside keep you where you
+are: `←` there does nothing.
+
+![Projects at 150, 120, 60 and 44 columns: a superlead with two projects under it, a third outside it, four idle projects folded; the pane shows the picked project's agents where there is room](../docs/sonny/projects-projects.png)
+
 ### Creating an agent
 
 `/new [NAME]`, in a lead's window, starts an agent from its folder in three
