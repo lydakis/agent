@@ -8887,15 +8887,20 @@ impl Database {
             Option<String>,
             Option<String>,
             bool,
+            bool,
         );
+        let sender = options.from.as_ref().map(|(bot, _)| bot);
+        // The sending bot by identity too: one deleted and made again under
+        // its name is another sender. A client's or person's has none.
         let row: Option<Row> = self
             .conn
             .prepare_cached(
                 "SELECT status,turn,from_bot,origin,person,
-                    EXISTS(SELECT 1 FROM messages WHERE bot=?2 AND request_id=?3)
+                    EXISTS(SELECT 1 FROM messages WHERE bot=?2 AND request_id=?3),
+                    from_id IS (SELECT id FROM bots WHERE name=?4)
                  FROM messages WHERE id=?1 AND bot=?2",
             )?
-            .query_row(params![message, name, request_id], |r| {
+            .query_row(params![message, name, request_id, sender], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
@@ -8903,21 +8908,20 @@ impl Database {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             })
             .optional()?;
-        let Some((status, turn, from_bot, origin, person, resent)) = row else {
+        let Some((status, turn, from_bot, origin, person, resent, same_bot)) = row else {
             return Err(
                 Error::with("turn_not_found", format!("{name} has no message {message}"))
                     .facts(json!({"bot":name,"message":message})),
             );
         };
-        let sender = options
-            .from
-            .as_ref()
-            .map(|(bot, _)| bot)
-            .or(options.origin.as_ref());
-        if from_bot.as_ref().or(origin.as_ref()) != sender || person != options.person {
+        if from_bot.as_ref().or(origin.as_ref()) != sender.or(options.origin.as_ref())
+            || person != options.person
+            || !same_bot
+        {
             return Err(Error::with(
                 "not_permitted",
                 format!("{name}/{message} has another sender; only its sender may replace it"),

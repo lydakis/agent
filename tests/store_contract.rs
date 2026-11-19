@@ -23636,4 +23636,28 @@ fn a_message_in_line_is_replaced_by_its_sender_alone_and_one_taken_in_stays() {
         ("taken", Some(running))
     );
     assert_eq!(db.turn_status("Carol", steer).unwrap(), "taken");
+    // A bot deleted and made again under its name is another sender.
+    db.create("Eve", Some("/synthetic"), binding()).unwrap();
+    let eve = sent(&mut db, "Eve", "e");
+    let note = db
+        .begin(
+            "Carol",
+            "e1",
+            "a note",
+            true,
+            &from("Eve", eve, Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(eve, vec![assistant("done")], &[], None).unwrap();
+    db.finish(eve, None).unwrap();
+    db.delete_bot("Eve").unwrap();
+    db.create("Eve", Some("/synthetic"), binding()).unwrap();
+    let again = sent(&mut db, "Eve", "e2");
+    let refused = db
+        .replace("Carol", note, "e3", &from("Eve", again, Delivery::Queue))
+        .unwrap_err();
+    assert_eq!(refused.code, "not_permitted");
+    assert_eq!(db.turn_status("Carol", note).unwrap(), "queued");
 }
