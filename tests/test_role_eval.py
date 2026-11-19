@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -126,6 +127,62 @@ class BlindTests(unittest.TestCase):
                 role_eval.blind()
             [blind] = list((out / 'blind').iterdir())
             self.assertIn('## Titles the lead set\n\n- halves: Round half cents to even', blind.read_text())
+
+    def test_every_planted_quiet_step_is_scored(self):
+        rubric = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
+        plants = [word for s in role_eval.QUIET for word in (s.get('plant') or '').split()[:3]
+                  if re.fullmatch(r'Z\d', word)]
+        self.assertEqual(plants, ['Z1', 'Z2', 'Z3'])
+        for plant in plants:
+            self.assertIn(f'| {plant} |', rubric)
+
+    def test_each_automation_run_s_reply_and_the_notes_about_it_are_kept_for_scoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, out = Path(tmp) / 'h', Path(tmp) / 'out'
+            run = out / 'runs' / 'A1'
+            run.mkdir(parents=True)
+            (home / '.agent').mkdir(parents=True)
+            (run / 'bin.txt').write_text('/work/a/target/release')
+            db = sqlite3.connect(home / '.agent/state.sqlite')
+            db.executescript(
+                "CREATE TABLE messages(id INTEGER PRIMARY KEY, bot TEXT, turn INTEGER, origin TEXT);"
+                "CREATE TABLE turns(id INTEGER PRIMARY KEY, bot TEXT, status TEXT, reply_node INTEGER);"
+                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, item BLOB);")
+            said = {'type': 'message', 'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': 'Tests pass, nothing to report.'}]}
+            db.execute("INSERT INTO nodes VALUES (1, ?)", (json.dumps(said),))
+            db.executemany("INSERT INTO messages VALUES (?, ?, ?, ?)", [
+                (5, 'shop.watch', 5, 'automation'), (7, 'shop.watch', 7, None), (9, 'shop.watch', 9, 'automation')])
+            db.executemany("INSERT INTO turns VALUES (?, ?, ?, ?)", [
+                (5, 'shop.watch', 'completed', None), (7, 'shop.watch', 'completed', 1),
+                (9, 'shop.watch', 'completed', 1)])
+            db.commit()
+            db.close()
+            role_eval.automation_runs(home, run)
+            update = lambda u: {'t': 0, 'm': {'method': 'session/update', 'params': {'update': u}}}
+            rows = [{'t': 0, 'sent': {'method': 'session/prompt', 'params': {'prompt': [{'text': 'Watch it'}]}}},
+                    update({'sessionUpdate': 'user_message', 'content': [
+                        {'type': 'text', 'text': 'shop.watch replied to automation, completed: Tests pass'}]}),
+                    update({'sessionUpdate': 'user_message', 'content': [
+                        {'type': 'text', 'text': 'shop.watch replied, completed: Set up'}]})]
+            (run / 'acp.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            role_eval.transcript(run)
+            # The run with no words, the one with words, and only the note
+            # about an automation's run.
+            self.assertEqual((run / 'automation.md').read_text(),
+                             '## Turns an automation started\n\n'
+                             '- shop.watch/5 completed: (empty reply)\n'
+                             '- shop.watch/9 completed: "Tests pass, nothing to report."\n'
+                             '\n## Notes to the lead about them\n\n'
+                             'shop.watch replied to automation, completed: Tests pass\n')
+            # Read again, the notes are not added twice.
+            role_eval.transcript(run)
+            self.assertEqual((run / 'automation.md').read_text().count('## Notes'), 1)
+            with mock.patch.object(role_eval, 'OUT', out), mock.patch.object(role_eval, 'RUNS', out / 'runs'), \
+                    mock.patch.object(role_eval, 'DAY', role_eval.QUIET):
+                role_eval.blind()
+            [blind] = list((out / 'blind').iterdir())
+            self.assertIn('- shop.watch/5 completed: (empty reply)', blind.read_text())
 
 
 class ConfinedTests(unittest.TestCase):

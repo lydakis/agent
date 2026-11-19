@@ -357,7 +357,21 @@ LIVE = [
      'plant': 'N2 arithmetic: answered in words, no live block (calls count)'},
 ]
 
-DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION, 'live': LIVE}
+# A task that watches for a failure with an automation of its own, while
+# nothing fails: each run that finds nothing for the lead should end with
+# an empty reply, which the lookout drops, so the lead hears nothing of it
+# (task.md). Every two minutes, not every fifteen, so a run sees a few.
+QUIET = [
+    {'say': "I'm in meetings for a while. Start a task that runs the tests every two minutes, with an "
+            "automation of its own, and tells you only when they fail.",
+     'plant': 'Z1 Z2 a task watches with its own automation; the tests pass, so no run finds anything'},
+    {'gap': 6 * 60},  # the automation fires a few times, finding nothing
+    {'say': "Back. Anything I need to know? You can take the test check off now.",
+     'plant': 'Z3 nothing failed, and the check comes off'},
+]
+
+DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION, 'live': LIVE,
+        'quiet': QUIET}
 DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
 # More `[sonny]` settings for a run's config, such as `code_mode`, so two
 # arms of one build can differ in a setting alone.
@@ -984,6 +998,7 @@ def run(arm, n, bins, model, spec=None):
             main += [f'--- main:{path}', shown.stdout or '(none)']
         (out / 'main.txt').write_text('\n'.join(main) + '\n')
         messages(home, out)
+        automation_runs(home, out)
         if DAY is BURST:
             try:
                 burst_ledger.ledger(out, agent, repo, env, events(), timeline,
@@ -1017,6 +1032,27 @@ def messages(home, out):
                       "WHERE m.from_bot IS NOT NULL ORDER BY m.id").fetchall()
     lines = [f"### {sender}/{turn} -> {bot}\n\n{(prompt or '').strip()[:1200]}\n" for bot, sender, turn, prompt in rows]
     (out / 'messages.md').write_text('\n'.join(lines) or '(none)\n')
+
+
+def automation_runs(home, out):
+    """Every turn an automation started, from the run's store, for the
+    quiet day: whose turn, how it ended and its reply, as the lookout reads
+    one (the last message with words), so an empty one shows as such."""
+    store = home / '.agent/state.sqlite'
+    if not store.exists():
+        return
+    db = sqlite3.connect(f'file:{store}?mode=ro', uri=True)
+    rows = db.execute("SELECT t.bot, t.id, t.status, CAST(n.item AS TEXT) FROM messages m "
+                      "JOIN turns t ON t.id = m.turn LEFT JOIN nodes n ON n.id = t.reply_node "
+                      "WHERE m.origin IN ('automation', 'trigger') ORDER BY t.id").fetchall()
+    db.close()
+    lines = []
+    for bot, turn, status, item in rows:
+        parts = (json.loads(item).get('content') or []) if item else []
+        reply = ''.join(c.get('text', '') for c in parts if isinstance(c, dict)).strip()
+        lines.append(f"- {bot}/{turn} {status}: {json.dumps(reply[:600]) if reply else '(empty reply)'}")
+    (out / 'automation.md').write_text('## Turns an automation started\n\n'
+                                       + ('\n'.join(lines) if lines else '(none)') + '\n')
 
 
 def failures(out):
@@ -1076,6 +1112,19 @@ def transcript(out):
         lines += ['', '**Lead to the person:**', '', said or '(nothing)', '']
     (out / 'transcript.md').write_text('\n'.join(lines))
     titles(parts, out)
+    automation_notes(parts, out)
+
+
+def automation_notes(parts, out):
+    """The notes that woke the lead about a turn an automation started
+    (`TASK replied to automation`), after the turns themselves, for Z2."""
+    runs = out / 'automation.md'
+    if not runs.exists():
+        return
+    text = runs.read_text().split('\n## Notes to the lead')[0]
+    notes = [p['start'].strip() for p in parts if p['kind'] == 'note' and 'to automation' in p['start']]
+    text += '\n## Notes to the lead about them\n\n' + ('\n\n'.join(notes) if notes else '(none)') + '\n'
+    runs.write_text(text)
 
 
 def titles(parts, out):
@@ -1127,6 +1176,9 @@ def blind():
         # T1 scores each task's title as the lead set it.
         if (RUNS / run_name / 'titles.md').exists():
             text += '\n\n## Titles the lead set\n\n' + (RUNS / run_name / 'titles.md').read_text()
+        # Z1 and Z2 score the automation's runs and what reached the lead.
+        if DAY is QUIET and (RUNS / run_name / 'automation.md').exists():
+            text += '\n\n' + (RUNS / run_name / 'automation.md').read_text()
         # C1 scores what main ended up holding: carry it under the same name.
         if (RUNS / run_name / 'main.txt').exists():
             text += '\n### MAIN AT THE END (scoring only)\n\n```\n' + (RUNS / run_name / 'main.txt').read_text() + '```\n'
