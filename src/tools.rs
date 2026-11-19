@@ -50,6 +50,8 @@ pub use terminal::POLL_YIELD_MS;
 const AUDIT_ROWS: usize = 50;
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
+/// The most a history tool page holds; it shrinks to fit context.
+pub const HISTORY_PAGE_BYTES: usize = 64 * 1024;
 /// Retained output per stream. Past this a stream keeps its first and last
 /// `KEPT_END` bytes and the command runs on.
 pub const ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -222,9 +224,9 @@ impl Tool {
                 "required":["input"],"additionalProperties":false}),
             ),
             Tool::History => (
-                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Or give handle alone, a message's number as run, wait and the listing give it (BOT/N), to read the turn that took that message in. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns. With query, bot may also be a pattern of * ? and [...], case-sensitive, such as * for every agent or proj.* for some: it searches every agent it matches at once, newest first; each match then names its bot and its handle. With audit instead, reads the audit trail: every agent's tool calls and their steps, or with bot one agent's, newest first, each with its time, turn, call, tool, kind, place, who approved it, access, outcome and the start of its arguments; audit's fields filter it, and next_before passed as before pages older rows.",
+                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Or give handle alone, a message's number as run, wait and the listing give it (BOT/N), to read the turn that took that message in. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns. With query, bot may also be a pattern of * ? and [...], case-sensitive, such as * for every agent or proj.* for some: it searches every agent it matches at once, newest first; each match then names its bot and its handle. With audit instead, reads the audit trail: every agent's tool calls and their steps, or with bot one agent's, newest first, each with its time, turn, call, tool, kind, place, who approved it, access, outcome and the start of its arguments; audit's fields filter it, and next_before passed as before pages older rows.",
                 json!({"type":"object","properties":{"bot":{"type":"string","minLength":1,"maxLength":128},
-                "turn":{"type":"integer","minimum":1},"handle":{"type":"string","minLength":1,"maxLength":256},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536},
+                "turn":{"type":"integer","minimum":1},"handle":{"type":"string","minLength":1,"maxLength":256},"offset":{"type":"integer","minimum":0},
                 "query":{"type":"string","minLength":1,"maxLength":256},"before":{"type":"integer","minimum":1},
                 "audit":{"type":"object","properties":{"kind":{"enum":crate::store::audit::KINDS},
                 "place":{"enum":crate::store::audit::PLACES},"approved":{"enum":crate::store::audit::APPROVERS},
@@ -1361,7 +1363,6 @@ pub enum Prepared {
         /// turn that took that message in.
         handle: Option<String>,
         offset: u64,
-        limit: usize,
     },
     /// The audit trail, every agent's or `query.bot`'s. Resolved by the
     /// runtime, never by the registry.
@@ -2089,7 +2090,6 @@ impl Registry {
             handle: Option<String>,
             #[serde(default)]
             offset: u64,
-            limit: Option<usize>,
             query: Option<String>,
             before: Option<i64>,
             audit: Option<AuditArgs>,
@@ -2102,7 +2102,6 @@ impl Registry {
                     ("turn", self.turn.is_some()),
                     ("handle", self.handle.is_some()),
                     ("offset", self.offset != 0),
-                    ("limit", self.limit.is_some()),
                 ]
                 .into_iter()
                 .filter_map(|(name, given)| given.then_some(name))
@@ -2338,7 +2337,6 @@ impl Registry {
                         before: args.before,
                     });
                 }
-                let limit = args.limit.unwrap_or(64 * 1024);
                 // Only another agent's turns are listed: a bot's own are in
                 // its context, and the context note numbers those left out.
                 if args.turn.is_some_and(|turn| turn < 1)
@@ -2349,7 +2347,6 @@ impl Registry {
                         .as_ref()
                         .is_some_and(|handle| handle.len() > 256)
                     || args.before.is_some()
-                    || !(4..=64 * 1024).contains(&limit)
                 {
                     return fail("invalid_tool_arguments");
                 }
@@ -2358,7 +2355,6 @@ impl Registry {
                     turn: args.turn,
                     handle: args.handle,
                     offset: args.offset,
-                    limit,
                 }
             }
             Tool::WebSearch => {
@@ -5897,12 +5893,8 @@ mod tests {
             _ => panic!("{args} was accepted"),
         };
         assert_eq!(
-            detail(r#"{"query":"x","limit":10}"#),
-            "query takes no limit"
-        );
-        assert_eq!(
-            detail(r#"{"query":"x","turn":2,"offset":5,"limit":10}"#),
-            "query takes no turn, offset or limit"
+            detail(r#"{"query":"x","turn":2,"offset":5}"#),
+            "query takes no turn or offset"
         );
         assert_eq!(detail(r#"{"query":"x","before":0}"#), "before is 1 or more");
         assert_eq!(
@@ -5914,6 +5906,45 @@ mod tests {
                 .prepare("history", r#"{"query":"x","before":3}"#)
                 .is_ok()
         );
+    }
+    #[test]
+    fn history_takes_no_limit_in_any_mode() {
+        let history = Registry::new("history").unwrap();
+        let schema = Tool::History.schema();
+        assert!(
+            schema.parameters["properties"].get("limit").is_none(),
+            "{}",
+            schema.parameters
+        );
+        assert!(
+            !schema.description.contains("limit"),
+            "{}",
+            schema.description
+        );
+        for args in [
+            r#"{"turn":1,"limit":10}"#,
+            r#"{"bot":"Bob","turn":1,"offset":4,"limit":65536}"#,
+            r#"{"handle":"Bob/3","limit":10}"#,
+            r#"{"bot":"Bob","limit":10}"#,
+            r#"{"query":"x","limit":10}"#,
+            r#"{"audit":{},"limit":10}"#,
+        ] {
+            assert!(
+                matches!(
+                    history.prepare("history", args),
+                    Err(error) if error.code == "invalid_tool_arguments"
+                ),
+                "{args} was accepted"
+            );
+        }
+        assert!(matches!(
+            history.prepare("history", r#"{"turn":1,"offset":4}"#),
+            Ok(Prepared::History {
+                turn: Some(1),
+                offset: 4,
+                ..
+            })
+        ));
     }
     #[cfg(unix)]
     #[test]

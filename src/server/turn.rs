@@ -25,8 +25,8 @@ use agent_runtime::{
         Window, listed_command, unserved,
     },
     tools::{
-        Agents, Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill,
-        Stopper,
+        Agents, Cord, Files, HISTORY_PAGE_BYTES, Outcome, POLL_YIELD_MS, Place, Prepared,
+        ReadSource, Registry, Spill, Stopper,
     },
 };
 use bytes::Bytes;
@@ -5003,11 +5003,8 @@ impl Turn {
                     turn: wanted,
                     handle,
                     offset,
-                    limit,
                 }) => {
-                    match Box::pin(self.history(&call.call_id, bot, wanted, handle, offset, limit))
-                        .await
-                    {
+                    match Box::pin(self.history(&call.call_id, bot, wanted, handle, offset)).await {
                         Ok(outcome) => outcome,
                         Err(error) => failure(error),
                     }
@@ -5839,7 +5836,6 @@ impl Turn {
         wanted: Option<i64>,
         handle: Option<String>,
         offset: u64,
-        limit: usize,
     ) -> Result<Outcome> {
         let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
         // A handle names its bot and the store's number for the turn.
@@ -5876,7 +5872,7 @@ impl Turn {
         let mut page = self
             .store
             .read("history_read", move |db| {
-                db.history_read(&bot, wanted, offset, limit.min(budget))
+                db.history_read(&bot, wanted, offset, HISTORY_PAGE_BYTES.min(budget))
             })
             .await?;
         loop {
