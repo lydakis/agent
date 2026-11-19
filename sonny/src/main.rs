@@ -635,6 +635,8 @@ struct StatusRead {
     needs: needs::Needs,
     /// Whether the calls waiting on someone were listed.
     listed: bool,
+    /// The agents read, and those idle among them; a count leaves out the
+    /// rows it kept.
     read: Vec<String>,
     idle: Vec<String>,
     /// Whether any agent's history was read, not taken from what was kept.
@@ -747,6 +749,9 @@ async fn read_status_of(
             .map(|(bot, mark)| (bot, mark.finish()))
             .collect::<HashMap<String, u64>>()
     });
+    // A count keeps rows, and asks nothing of who was read: those lists
+    // are for what adopts what a read found.
+    let counting = kept_rows.is_some();
     let mut reuse = kept_rows.and_then(|(kept, again)| {
         let rows = std::mem::take(&mut kept.rows);
         let was = std::mem::replace(&mut kept.held, held_marks.clone());
@@ -774,7 +779,7 @@ async fn read_status_of(
         true => background::source_icons(),
         false => HashMap::new(),
     };
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(listed.len());
     // Each lead's project file read once a refresh; a task's profile
     // is the one noted when it started.
     let mut profiles: HashMap<String, Option<String>> = HashMap::new();
@@ -826,8 +831,10 @@ async fn read_status_of(
                 .remove(&name_key(name))
                 .filter(|row| row.bot == name)
         {
-            read.push(name.to_owned());
-            idle.push(name.to_owned());
+            if !counting {
+                read.push(name.to_owned());
+                idle.push(name.to_owned());
+            }
             rows.push(row);
             continue;
         }
@@ -12035,6 +12042,9 @@ impl App {
     /// store counts too. While `/status` is open, its own reads count them.
     async fn count_agents(&mut self) {
         if let Some(job) = self.counting.take_if(|job| job.is_finished()) {
+            // The next count waits its seconds from this one's end, so a
+            // window whose count runs long never counts back to back.
+            self.counted_at = Some(Instant::now());
             let Ok(Some(counted)) = job.await else {
                 // The listing went with it: start over.
                 self.follower = None;
@@ -12238,7 +12248,6 @@ impl App {
             woken.notify_one();
             let whole = read.whole && read.listed;
             let mut built = read.rows;
-            let counts = status::counts(&built);
             // The agents counted, made again only once they are not those
             // the last count counted.
             let bots = match built.len() == kept_rows.bots.len()
@@ -12251,6 +12260,8 @@ impl App {
                 kept_rows.bots = bots.clone();
             }
             let agents = status::agents(read.title.as_ref().unwrap_or(&read.project), &built);
+            // Its counts are the footer's, as `status::counts` gives them.
+            let counts = agents.counts;
             // The tasks' lines, each made once for a row kept, and handed
             // over only once they say something new.
             let tasks =
@@ -23344,13 +23355,19 @@ fn task_lead(bot: &str, listed: Option<&[standing::Agent]>) -> String {
     let Some(listed) = listed else {
         return first;
     };
-    let makers: HashMap<&str, &str> = (listed.iter())
-        .map(|agent| (agent.name.as_str(), agent.maker()))
-        .collect();
+    // The listing is in name order: each maker found by halves, else
+    // looked for along it, with nothing built of it.
+    let makers = |name: &str| {
+        let at = (listed
+            .binary_search_by(|agent| agent.name.as_str().cmp(name))
+            .ok())
+        .or_else(|| listed.iter().position(|agent| agent.name == name))?;
+        Some(listed[at].maker())
+    };
     let mut at = bot;
     // A ring of makers leads to no lead.
-    for _ in 0..=makers.len() {
-        match makers.get(at) {
+    for _ in 0..=listed.len() {
+        match makers(at) {
             Some(maker) if project::lead_project(maker) == Some(project) => {
                 return (*maker).to_owned();
             }

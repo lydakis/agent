@@ -619,9 +619,12 @@ pub fn agents(project: &str, rows: &[Row]) -> Agents {
     shown.extend(tasks);
     // Each workflow under the agent that runs it, or under the nearest
     // one listed on its line of makers; else at the end.
-    let by_bot: HashMap<&str, &Row> = rows.iter().map(|r| (r.bot.as_str(), r)).collect();
     let mut runs: Vec<(usize, Listed)> = Vec::new();
+    // Each row by its bot, made only once a workflow runs.
+    let mut by_bot: Option<HashMap<&str, &Row>> = None;
     for row in rows.iter().filter(|row| row.run.is_some()) {
+        let by_bot =
+            by_bot.get_or_insert_with(|| rows.iter().map(|r| (r.bot.as_str(), r)).collect());
         let mut at = row.maker.as_str();
         let mut under = None;
         for _ in 0..=rows.len() {
