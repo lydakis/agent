@@ -565,12 +565,13 @@ fn reply_whole(app: &App, lines: &[String]) {
 }
 
 /// How many times the window connected again, following its agent anew
-/// each time (the test's own connection is followed from the start).
+/// each time (the test's own connection is followed from the start). The
+/// follow of every other project is on a connection of its own.
 fn reconnects(asked: &Mutex<Vec<(Instant, Value)>>) -> usize {
     let asked = asked.lock().unwrap();
     asked
         .iter()
-        .filter(|(_, asked)| asked["op"] == "follow")
+        .filter(|(_, asked)| asked["op"] == "follow" && asked["bot"] != "*.*")
         .count()
 }
 

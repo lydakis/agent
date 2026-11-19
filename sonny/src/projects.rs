@@ -117,6 +117,23 @@ pub struct View {
     drawn: Vec<Option<usize>>,
 }
 
+/// The leads of `projects` in the order the page lists them, the idle
+/// ones' fold open: where `alt+n` goes once this project has no one.
+pub fn order(projects: Vec<Project>, now: u64) -> Vec<String> {
+    let view = View {
+        projects,
+        fold_open: true,
+        read: true,
+        ..Default::default()
+    };
+    (view.shown(now).into_iter())
+        .filter_map(|row| match row {
+            Shown::Project(at, _) => Some(view.projects[at].lead.clone()),
+            Shown::Fold(..) => None,
+        })
+        .collect()
+}
+
 impl View {
     /// The page in a window whose project's lead is `here`: the pick
     /// starts on it.

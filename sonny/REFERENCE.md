@@ -133,6 +133,16 @@ its ends, as a multiplexer's previous and next tab: the window becomes that
 agent's, and from one the list does not show they go to the lead. With
 words typed, all of them move the cursor.
 
+The footer says `? N elsewhere` for the agents that need you in every other
+project: a call held for your approval, or a question still open. It is
+not there at none, and a click on it opens **Projects**. `alt+n`, typed or
+not, goes to the next agent that needs you: this project's first, in the
+pane's order, then the other projects' in the order **Projects** lists
+them, around the end; at none it says `no one needs you`. The footer
+learns from the daemon's events as they come, on a connection of its own,
+so an approval held in another project shows as soon as `/status` would
+show it, with nothing read on a timer.
+
 ![Projects at 150, 120, 60 and 44 columns: a superlead with two projects under it, a third outside it, four idle projects folded; the pane shows the picked project's agents where there is room](../docs/sonny/projects-projects.png)
 
 ### Creating an agent
