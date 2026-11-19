@@ -12490,10 +12490,23 @@ match the jemalloc-daemon row (key p99 1.7 to 2.3 s).
   1 to 2 MiB per process, and every alternative is slower, heavier or
   both.
 
-Others that ship static musl or fleet-scale Rust binaries chose the
-same: ripgrep links jemalloc only into its musl builds because musl's
-allocator "appears to slow down ripgrep quite a bit"; uv and ruff use
-jemalloc on Linux and macOS and mimalloc on Windows; Codex links jemalloc
-into its musl builds and later set `narenas_ratio:0.25` "to reduce idle
-RSS after conversations unload". Deno keeps the system allocator; Zed
-offers mimalloc as an optional feature.
+Other Rust projects, read 2026-11-19 at the revisions below:
+
+- **ripgrep** links jemalloc only into its musl builds, because musl's
+  allocator "appears to slow down ripgrep quite a bit"
+  (BurntSushi/ripgrep `fdf7d95`, `crates/core/main.rs`).
+- **uv** uses jemalloc on Linux and macOS and mimalloc on Windows
+  (astral-sh/uv `469fe65`,
+  `crates/uv-performance-memory-allocator/src/lib.rs`).
+- **ruff** does the same (astral-sh/ruff `e69185f`,
+  `crates/ruff/src/main.rs`).
+- **Codex** links jemalloc into its Linux musl builds
+  (openai/codex `b9559ff`, `codex-rs/cli/Cargo.toml`). Its
+  `codex-rs/.cargo/config.toml` gives the reason for its one setting:
+  "Roughly one arena per four CPUs reduces idle RSS after Linux musl
+  conversations unload."
+- **Deno** sets no global allocator (denoland/deno `d8c551b`,
+  `cli/main.rs`).
+- **Zed** uses mimalloc only behind an optional `mimalloc` feature
+  (zed-industries/zed `4e161e7`, `crates/zed/src/main.rs` and
+  `crates/zed/Cargo.toml`).
