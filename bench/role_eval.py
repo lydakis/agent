@@ -370,8 +370,16 @@ QUIET = [
      'plant': 'Z3 nothing failed, and the check comes off'},
 ]
 
+# A choice that is the person's: whether each option the card shows says
+# what they will see or get if they pick it, rather than how it works.
+ASK = [
+    {'say': "Orders only live in sample() right now, and I want them kept between runs. How they're "
+            "stored is my call, so put the choice to me before you build it.",
+     'plant': 'O1 the lead puts the storage choice to the person; each option says what they will see or get'},
+]
+
 DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION, 'live': LIVE,
-        'quiet': QUIET}
+        'quiet': QUIET, 'ask': ASK}
 DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
 # More `[sonny]` settings for a run's config, such as `code_mode`, so two
 # arms of one build can differ in a setting alone.
@@ -999,6 +1007,7 @@ def run(arm, n, bins, model, spec=None):
         (out / 'main.txt').write_text('\n'.join(main) + '\n')
         messages(home, out)
         automation_runs(home, out)
+        asks(home, out)
         if DAY is BURST:
             try:
                 burst_ledger.ledger(out, agent, repo, env, events(), timeline,
@@ -1115,6 +1124,33 @@ def transcript(out):
     automation_notes(parts, out)
 
 
+def asks(home, out):
+    """Every question an agent put to the person with the ask tool, from
+    the run's store, a code-mode step's too: who asked, the question, the
+    why and each option as the card shows it, for O1."""
+    store = home / '.agent/state.sqlite'
+    if not store.exists():
+        return
+    db = sqlite3.connect(f'file:{store}?mode=ro', uri=True)
+    rows = db.execute("SELECT t.bot, CAST(n.item AS TEXT) FROM nodes n JOIN turns t ON t.id = n.turn "
+                      "WHERE json_extract(CAST(n.item AS TEXT), '$.type') = 'function_call' "
+                      "AND json_extract(CAST(n.item AS TEXT), '$.name') = 'ask' ORDER BY n.id").fetchall()
+    db.close()
+    lines = []
+    for bot, item in rows:
+        try:
+            asked = json.loads(json.loads(item).get('arguments') or '{}')
+        except ValueError:
+            continue
+        lines += [f"### {bot}: {asked.get('question', '?')}", '', f"Why: {asked.get('why', '')}", '']
+        for n, option in enumerate(asked.get('options') or [], 1):
+            lines.append(f"{n}. **{option.get('label', '')}**: {option.get('explanation', '')}")
+        if asked.get('command'):
+            lines.append(f"Command: `{asked['command']}`")
+        lines.append('')
+    (out / 'asks.md').write_text('\n'.join(lines) if lines else '(no ask)\n')
+
+
 def automation_notes(parts, out):
     """The notes that woke the lead about a turn an automation started
     (`TASK replied to automation`), after the turns themselves, for Z2."""
@@ -1170,6 +1206,9 @@ def blind():
         # before the paths that name the arm are hidden.
         if DAY is QUIET and (RUNS / run_name / 'automation.md').exists():
             text += '\n\n' + (RUNS / run_name / 'automation.md').read_text()
+        # O1 scores each option as the card showed it.
+        if DAY is ASK and (RUNS / run_name / 'asks.md').exists():
+            text += '\n\n## Asks\n\n' + (RUNS / run_name / 'asks.md').read_text()
         text = re.sub(re.escape(str(ROOT)) + r'/[0-9a-f]{8}-' + re.escape(run_name), str(ROOT / 'RUN'), text)
         if run_name in builds:
             build = builds[run_name]

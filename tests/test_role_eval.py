@@ -136,6 +136,45 @@ class BlindTests(unittest.TestCase):
         for plant in plants:
             self.assertIn(f'| {plant} |', rubric)
 
+    def test_the_ask_day_s_plant_is_scored(self):
+        rubric = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
+        plants = [s['plant'].split()[0] for s in role_eval.ASK if s.get('plant')]
+        self.assertEqual(plants, ['O1'])
+        self.assertIn('| O1 |', rubric)
+
+    def test_each_ask_s_options_are_kept_for_scoring_from_the_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, out = Path(tmp) / 'h', Path(tmp) / 'out'
+            run = out / 'runs' / 'A1'
+            run.mkdir(parents=True)
+            (home / '.agent').mkdir(parents=True)
+            (run / 'bin.txt').write_text('/work/a/target/release')
+            (run / 'transcript.md').write_text('### PERSON\n\nKeep orders\n')
+            (run / 'acp.jsonl').write_text('')
+            db = sqlite3.connect(home / '.agent/state.sqlite')
+            db.executescript(
+                "CREATE TABLE turns(id INTEGER PRIMARY KEY, bot TEXT);"
+                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, turn INTEGER, item BLOB);")
+            asked = {'question': 'Keep orders where?', 'why': 'Decides where orders live.',
+                     'options': [{'label': 'One file', 'explanation': 'Orders are still there after a restart.'},
+                                 {'label': 'A database', 'explanation': 'Uses sqlite3 with an orders table.'}]}
+            db.execute("INSERT INTO turns VALUES (4, 'shop.lead')")
+            db.executemany("INSERT INTO nodes VALUES (?, 4, ?)", [
+                (1, json.dumps({'type': 'function_call', 'name': 'shell', 'arguments': '{"command": "ls"}'})),
+                (2, json.dumps({'type': 'function_call', 'name': 'ask', 'arguments': json.dumps(asked)}))])
+            db.commit()
+            db.close()
+            role_eval.asks(home, run)
+            self.assertEqual((run / 'asks.md').read_text(),
+                             '### shop.lead: Keep orders where?\n\nWhy: Decides where orders live.\n\n'
+                             '1. **One file**: Orders are still there after a restart.\n'
+                             '2. **A database**: Uses sqlite3 with an orders table.\n')
+            with mock.patch.object(role_eval, 'OUT', out), mock.patch.object(role_eval, 'RUNS', out / 'runs'), \
+                    mock.patch.object(role_eval, 'DAY', role_eval.ASK):
+                role_eval.blind()
+            [blind] = list((out / 'blind').iterdir())
+            self.assertIn('## Asks\n\n### shop.lead: Keep orders where?', blind.read_text())
+
     def test_each_automation_run_s_reply_and_the_notes_about_it_are_kept_for_scoring(self):
         with tempfile.TemporaryDirectory() as tmp:
             home, out = Path(tmp) / 'h', Path(tmp) / 'out'

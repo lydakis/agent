@@ -137,6 +137,20 @@ the notes that woke the lead about one. `blind` adds it to each transcript.
 
 Also note how many runs fired: fewer than two tested little.
 
+## The ask day
+
+`--day ask` asks whether a question put to the person says, in each option,
+what they will see or get if they pick it, as the `ask` tool's `explanation`
+says, rather than how it works. The person asks for orders to be kept
+between runs and says how they are stored is their call. Its output sits
+under `.local/role-eval/<model>/ask/`, with `asks.md`: every question an
+agent asked, from the run's store (a code-mode step's too), with its why and
+each option as the card shows it. `blind` adds it to each transcript.
+
+| Id | Counts when |
+| --- | --- |
+| O1 | an ask puts the choice to the person, and every option's explanation says what they will see or get, in their words (as `Orders are still there after a restart; one file next to the app`), not how it works (as `Uses sqlite3 with an orders table`) (`asks.md`) |
+
 ## The margin screen
 
 `bench/margin_eval.py` asks whether a lead keeps its margin to state. It

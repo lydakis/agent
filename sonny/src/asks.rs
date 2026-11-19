@@ -298,7 +298,7 @@ pub fn tool() -> Value {
         "name": TOOL,
         "description": "Put a decision in front of the person: a fork in the road, an architectural \
             choice, or a step that cannot be undone, where their pick changes what you build. Sonny \
-            shows it where you ask it; say what each option does to their goal. Check `sonny ask \
+            shows it where you ask it. Check `sonny ask \
             list` first: an answer there may settle yours. Ask once, one decision per call, and do \
             not repeat it in your reply. When their pick approves an \
             action, say what in covers: their yes covers that action, target and revision alone, so \
@@ -333,7 +333,7 @@ pub fn tool() -> Value {
                         "properties": {
                             "label": {"type": "string", "description": "The option, in a few words."},
                             "explanation": {"type": "string",
-                                "description": "What happens if the person picks it, in one sentence."}
+                                "description": "What the person will see or get if they pick it, in their own words, in one sentence."}
                         },
                         "required": ["label", "explanation"],
                         "additionalProperties": false
@@ -2722,6 +2722,22 @@ mod tests {
             "command": "  npm login --auth-type=web  ",
             "if_unanswered": "go_now",
         })
+    }
+
+    #[test]
+    fn an_option_says_what_the_person_sees_or_gets_once() {
+        // George, 11-19: picks on cards whose options said how a change
+        // works left him asking what it does for him.
+        let tool = tool();
+        let explanation = tool["parameters"]["properties"]["options"]["items"]["properties"]
+            ["explanation"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(explanation.contains("What the person will see or get if they pick it"));
+        assert!(explanation.contains("in their own words"));
+        // Said there alone, not again in the tool's description.
+        let description = tool["description"].as_str().unwrap();
+        assert!(!description.contains("each option"));
     }
 
     #[test]
