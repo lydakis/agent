@@ -518,6 +518,15 @@ pub async fn create(
     if let Some(ttl) = crate::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
+    // The agents it lists and makes are its project's: named as it is up to
+    // the first dot.
+    if let Some((namespace, _)) = coordinator.split_once('.')
+        && !namespace.is_empty()
+    {
+        settings
+            .entry("namespace")
+            .or_insert_with(|| json!(namespace));
+    }
     if !settings.is_empty() {
         params["settings"] = Value::Object(settings);
     }
@@ -840,9 +849,12 @@ mod tests {
         let calls = daemon.calls.lock().unwrap().clone();
         let create = &calls.iter().find(|(op, _)| op == "create").unwrap().1;
         assert_eq!(create["model"], "alpha/role");
-        assert!(
-            create.get("settings").is_none(),
-            "only Claude takes an hour"
+        // Only Claude takes an hour; the lead lists and makes its
+        // project's agents, named as it is up to the first dot.
+        let lead = made["lead"].as_str().unwrap();
+        assert_eq!(
+            create["settings"],
+            json!({"namespace": lead.split_once('.').unwrap().0})
         );
         assert!(
             create.get("effort").is_none(),
@@ -870,7 +882,7 @@ mod tests {
         );
         assert_eq!(
             create["settings"],
-            json!({"sandbox": "workspace-write", "network": true})
+            json!({"sandbox": "workspace-write", "network": true, "namespace": "my-synthetic-repo"})
         );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
         // No gate, as Sonny's `full` row gives, or one left with no tool

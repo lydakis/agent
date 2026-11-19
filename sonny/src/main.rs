@@ -3582,6 +3582,10 @@ pub(crate) fn made(
     if let Some(ms) = config.hold_ms {
         settings.insert("hold_ms".into(), json!(ms));
     }
+    // The agents of its project, which its agent tools list and name.
+    if let Some(namespace) = asked["bot"].as_str().and_then(project::namespace) {
+        settings.insert("namespace".into(), json!(namespace));
+    }
     // The command rules in ~/.agent/rules, which the daemon applies.
     if let Some(rules) = rules::given() {
         settings.insert("rules".into(), json!(rules));
