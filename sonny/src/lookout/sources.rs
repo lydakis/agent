@@ -746,12 +746,13 @@ impl Drop for Runner {
     }
 }
 
-/// The files a source watches, each with when it last changed: an edit
-/// starts it again on them, as a service manager restarts a unit on its
-/// new binary. Only the files its settings list, `~/` read as the home
-/// folder: a cursor the command writes is no reason to start again.
+/// The files a source watches, each with its stamp (device, inode, size
+/// and times, as Git's stat data): an edit starts it again on them, as a
+/// service manager restarts a unit on its new binary. Only the files its
+/// settings list, `~/` read as the home folder: a cursor the command
+/// writes is no reason to start again.
 #[derive(Debug, Default, PartialEq)]
-struct Stamp(Vec<(PathBuf, Option<std::time::SystemTime>)>);
+struct Stamp(Vec<(PathBuf, Option<crate::kept::Stamp>)>);
 
 impl Stamp {
     fn of(watch: &[String]) -> Stamp {
@@ -763,7 +764,7 @@ impl Stamp {
         Stamp(
             (watch.iter().map(path))
                 .map(|path| {
-                    let at = modified(&path);
+                    let at = crate::kept::stamp(&path);
                     (path, at)
                 })
                 .collect(),
@@ -772,12 +773,8 @@ impl Stamp {
 
     /// Whether a file it watches changed, came or went, since.
     fn changed(&self) -> bool {
-        (self.0.iter()).any(|(path, at)| modified(path) != *at)
+        (self.0.iter()).any(|(path, at)| crate::kept::stamp(path) != *at)
     }
-}
-
-fn modified(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// Whether a source works, run by run: after `DOWN_AFTER` failed runs in
@@ -3246,6 +3243,25 @@ mod tests {
         // A listed file that comes is a change, as is one that goes.
         std::fs::write(&later, "").unwrap();
         assert!(stamp.changed());
+        // An editor's save, a new file moved into place, is a change even
+        // at the same length and time, as a 10 ms file clock gives two
+        // saves within one step.
+        let tick = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let saved = |text: &str| {
+            let partial = dir.join("poll.py.partial");
+            std::fs::write(&partial, text).unwrap();
+            (std::fs::File::options().write(true))
+                .open(&partial)
+                .unwrap()
+                .set_modified(tick)
+                .unwrap();
+            std::fs::rename(&partial, &script).unwrap();
+        };
+        saved("print('hi')\n");
+        let stamp = Stamp::of(&[script.display().to_string()]);
+        assert!(!stamp.changed());
+        saved("print('yo')\n");
+        assert!(stamp.changed(), "a save in the same tick is a change");
         let stamp = Stamp::of(&[script.display().to_string()]);
         std::fs::remove_file(&script).unwrap();
         assert!(stamp.changed(), "a file gone is a change");

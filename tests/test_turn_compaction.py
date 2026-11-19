@@ -257,9 +257,10 @@ class TurnCompactionTests(ModelFixture):
         for percent, expected in ((20, True), (0, False)):
             with self.subTest(post_turn_compact_percent=percent):
                 bot = f'Bob{percent}'
-                client = self.client(tools='shell', extra=('--context-window', 'openai/*=40000'),
+                client = self.client(tools='shell',
                                      settings={'compact_tokens': 16384,
-                                               'post_turn_compact_percent': percent})
+                                               'post_turn_compact_percent': percent,
+                                               'context_windows': {'openai/*': 40000}})
                 client.request('provider_models')
                 client.request('create', bot=bot, workspace=str(self.path), tools=['shell'],
                                compaction_instructions='Summarize.')
@@ -302,12 +303,13 @@ class TurnCompactionTests(ModelFixture):
         # purpose: the bot compacts at 7,000 tokens, about 28 KiB at four
         # bytes a token, as with a listed 40,000.
         self.model.bytes_per_token, self.model.context_window = 4, 1_000_000
-        client = self.client(tools='shell', extra=('--context-window', 'openai/*=40000',
-                                                   '--context-window', 'other/*=2000'))
-        self.assertEqual(client.ready['context_windows'], {'openai/*': 40000, 'other/*': 2000})
+        client = self.client(tools='shell')
+        self.assertNotIn('context_windows', client.ready)
         client.request('provider_models')
+        given = {'openai/*': 40000, 'other/*': 2000}
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
-                       compaction_instructions='Summarize.')
+                       compaction_instructions='Summarize.', settings={'context_windows': given})
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['context_windows'], given)
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['message']
         self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
         events = all_events(client, 'Bob')
@@ -316,6 +318,32 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(windows, {40000})
         work = [r for r in drain(self.model) if not is_summary(r)]
         self.assertLess(max(len(json.dumps(r)) for r in work), 7000 * 4 + 24576)
+
+    def test_a_window_changed_since_reaches_the_next_turn_with_no_restart(self):
+        # As a client sends the person's [context_windows] again once they
+        # change: the listing's million tokens, then 40,000, on the same
+        # daemon.
+        self.model.bytes_per_token, self.model.context_window = 4, 1_000_000
+        client = self.client(tools='shell')
+        client.request('provider_models')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        def windows(request_id, prompt):
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt)['result']['message']
+            self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
+            return {e['data'].get('context_window') for e in all_events(client, 'Bob')
+                    if e['event'] == 'usage' and e['turn'] == turn}
+        self.assertEqual(windows('1', 'hello'), {1_000_000})
+        changed = client.request('configure', bot='Bob',
+                                 settings={'context_windows': {'openai/*': 40000}})['result']['changed']
+        self.assertEqual(changed, ['context_windows'])
+        self.assertEqual(windows('2', 'hello'), {40000})
+        client.request('configure', bot='Bob', settings={'context_windows': None})
+        self.assertEqual(windows('3', 'hello'), {1_000_000})
+        for wrong in ({'openai': 40000}, {'openai/*': 1000}):
+            error = client.request('configure', bot='Bob', settings={'context_windows': wrong})['error']
+            self.assertEqual(error, 'invalid_setting', wrong)
+        drain(self.model)
 
     def test_a_compaction_a_client_asks_for_runs_before_the_next_call(self):
         client = self.client(tools='shell')
@@ -542,7 +570,7 @@ class TurnCompactionTests(ModelFixture):
         The compacted events, oldest first."""
         self.model.bytes_per_token = per_token
         self.model.compaction_text = lambda request: 's' * asked_bytes(request)
-        client = self.client(tools='shell', extra=('--context-window', f'openai/*={window}'))
+        client = self.client(tools='shell', settings={'context_windows': {'openai/*': window}})
         client.request('create', bot='Lead', workspace=str(self.path), tools=['shell'],
                        instructions='i' * overhead, compaction_instructions='Summarize.')
         compacted = []
