@@ -6101,7 +6101,7 @@ impl Turn {
                     let folder = (made.get("workspace"))
                         .and_then(Value::as_str)
                         .map_or_else(|| workspace.to_path_buf(), std::path::PathBuf::from);
-                    let mut create = self
+                    let (mut create, looser) = self
                         .spawned(
                             &me,
                             &folder,
@@ -6153,6 +6153,15 @@ impl Turn {
                                     .is_some_and(|field| {
                                         field != "workspace" && !asked.iter().any(|a| a == field)
                                     }) => {}
+                        // Refused for the profile's sandbox, in its words.
+                        Err(error)
+                            if error.code == "invalid_setting"
+                                && (error.detail.as_deref())
+                                    .is_some_and(|why| why.starts_with("sandbox:"))
+                                && let Some(why) = looser =>
+                        {
+                            return Err(Error::with("invalid_setting", why));
+                        }
                         made => {
                             made?;
                         }
@@ -6244,7 +6253,8 @@ impl Turn {
     /// the preamble, or with `agents` or a profile, those a client composes
     /// for the folder, in the profile's role); the role's tools or its own,
     /// search kept to a model that has it; its settings, in the role's
-    /// sandbox unless the call names one (`sandbox_asked`).
+    /// sandbox unless the call names one (`sandbox_asked`), with why the
+    /// daemon will refuse a new agent in it when it is looser.
     #[allow(clippy::too_many_arguments)]
     async fn spawned(
         &self,
@@ -6255,7 +6265,7 @@ impl Turn {
         model: Option<String>,
         effort: Option<String>,
         sandbox_asked: bool,
-    ) -> Result<Value> {
+    ) -> Result<(Value, Option<String>)> {
         // The folder this turn works in, which may be its own for the turn.
         let Some(workspace) = workspace.to_str().map(str::to_owned) else {
             return Err(Error::with(
@@ -6344,19 +6354,31 @@ impl Turn {
             .map(serde_json::to_value)
             .transpose()?
             .unwrap_or_else(|| json!({}));
-        // The profile's sandbox over this agent's, never looser.
+        // The profile's sandbox over this agent's, never looser. One looser
+        // is asked for as it is, so the daemon refuses a new agent and a
+        // resend still finds the one it made; why is said in the profile's
+        // words.
+        let mut looser = None;
         if let (Some((role, sandbox)), false, Some(own)) =
             (sandbox, sandbox_asked, settings.as_object_mut())
+            && let Err(why) = agent_client::policy::with_sandbox(own, &sandbox)
         {
-            agent_client::policy::with_sandbox(own, &sandbox)
-                .map_err(|why| Error::with("invalid_setting", format!("profile {role}: {why}")))?;
+            own.insert("sandbox".into(), json!(sandbox));
+            // Folders and network go with workspace-write alone.
+            if sandbox != "workspace-write" {
+                for key in ["writable", "network", "unix_sockets"] {
+                    own.remove(key);
+                }
+            }
+            looser = Some(format!("profile {role}: {why}"));
         }
-        Ok(
+        Ok((
             json!({"bot":name,"workspace":workspace,"model":model,"effort":effort,
             "instructions":instructions,"tools":tools,"settings":settings,
             "compaction_instructions":me["compaction_instructions"],
             "compaction_model":compaction_model}),
-        )
+            looser,
+        ))
     }
 
     /// This bot's project's agents, as a name pattern: those named as it

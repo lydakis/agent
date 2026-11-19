@@ -268,6 +268,18 @@ class AgentToolsTests(ModelFixture):
         # The call's own sandbox stands over the profile's.
         asked = client.request('inspect', bot='shop.asked')['result']['settings']
         self.assertEqual(asked['sandbox'], 'workspace-write', asked)
+        # Sent again after its profile went looser: the agent it made stands,
+        # as when its folder's files change; only the message, from another
+        # turn, is another request.
+        spawn = ('spawn_agent', {'name': 'once', 'message': 'q', 'profile': 'reviewer', 'request_id': 'once'})
+        self.run_calls(client, 'shop.lead', 'first', spawn)
+        (agents / 'reviewer.md').write_text('---\nsandbox: danger-full-access\n---\nReview it.\n')
+        self.run_calls(client, 'shop.lead', 'again', spawn)
+        events = client.request('events', bot='shop.lead', after=0, limit=256)['result']['events']
+        node = [e for e in events if e['event'] == 'tool_completed'][-1]['data']['node']
+        again = node_item(client, 'shop.lead', node)['result']['output']
+        self.assertIn('from differs from the request that sent message', again)
+        self.assertEqual(client.request('inspect', bot='shop.once')['result']['settings']['sandbox'], 'read-only')
 
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
