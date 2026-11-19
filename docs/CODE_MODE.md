@@ -155,7 +155,7 @@ it has are the mechanisms a client builds one from
   once; `step_result` records how it ended. Either way it reaches the
   audit trail. A step waiting on a gate adds one entry to the daemon's
   map of waiting steps (src/server/mod.rs:1212).
-- **Yielding (protocol 85; declared `yields` since 91).** A tool's client may hand a call back with
+- **Yielding (protocol 85; declared `yields` since 92).** A tool's client may hand a call back with
   what it wrote so far (`yield_call`), as Codex's `exec` yields at
   `yield_time_ms`. The yield is a lift: the call becomes `proc:N`, waits on
   its answer with no deadline, and `wait` collects it or, with `terminate`,
@@ -781,7 +781,7 @@ client when it lands:
 6. **Replay's daemon part:** a step's started and ended marks, a result
    kept until a host takes it, and a call handed to a new owner once.
 7. **The yield (slice Y), built in protocol 85.** `yield_call` lifts a
-   waiting call of a `yields` tool (`lift` until protocol 91) with its output so far, which the model
+   waiting call of a `yields` tool (`lift` until protocol 92) with its output so far, which the model
    reads beside `"yielded":true`; a yielded call has no deadline (schema
    106); `wait` takes `terminate`. Tested with a plain socket client
    (tests/test_yield.py): the handle and the output so far, live or parked,

@@ -3660,7 +3660,7 @@ schedule, so a waiting call costs a row and no timer. A later call's gate that
 lapses first ends the wait as `tool_unserved` and the turn as it ends one
 waiting on a verdict. A message that joins the turn lifts the wait as it
 lifts a verdict's (see [tool approval](#tool-approval)) only while a step
-of the call waits on a gate (protocol 91, below): the call becomes a
+of the call waits on a gate (protocol 92, below): the call becomes a
 `proc:` handle answered `"waits_for":"answer"`, its client still lists,
 takes and answers it, and the answer ends the command, told as
 `{"answer": TEXT}`. Any other call keeps the message for its answer. An interrupt ends the call as cancelled, like any
@@ -3683,7 +3683,7 @@ step of the call waits on a gate, since that is a wait for a verdict,
 which a steer always lifts. Any other call is answered first and the
 steer joins the turn at the next boundary.
 
-Protocol version 91 drops `lift`: a steer never moves a running call,
+Protocol version 92 drops `lift`: a steer never moves a running call,
 as Codex never does. A busy lead fed a note every few seconds had a
 quick `exec` (a message sent, a task started) come back as
 `{"background":true,"steered":true}` dozens of times a day, each costing
@@ -3716,7 +3716,7 @@ ends it and is told and collected as a lifted call's, pictures included;
 `lifted_ended` with `outcome: "stopped"` tells its client to stop the
 work. Its daemon steps run on, and what they kept stays readable until the
 call ends; a lifted call's steps keep theirs the same way. Only a waiting
-call of a tool declared `yields` (protocol 91; `lift` before) yields: any
+call of a tool declared `yields` (protocol 92; `lift` before) yields: any
 other tool's is `call_not_yieldable`, and one answered, lifted or out of time already is
 `no_pending_call`.
 
