@@ -491,9 +491,9 @@ pub fn plain(dir: &Path) -> Result<String, String> {
 }
 
 /// The folder's instructions for a lead, when they are not the ones it
-/// `held` last: a lead takes its folder's as its window opens and at each
-/// idle point after. With what was left out of them, which the lead goes
-/// without either way.
+/// `held` last: a lead takes its folder's as its window opens, and only
+/// then, as Codex reads its instructions once as a session starts. With
+/// what was left out of them, which the lead goes without either way.
 pub fn review(
     dir: &Path,
     held: &str,

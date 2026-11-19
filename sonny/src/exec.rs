@@ -221,9 +221,9 @@ pub fn tool(escalates: bool) -> Option<Value> {
         "expire_ms": TIMEOUT.as_millis() as u64,
         // The agent's gate judges the script's calls, not the script.
         "steps": true,
-        // A script may run for minutes, so a message for the agent lifts
-        // a call still running past the grace, as it lifts a command.
-        "lift": true,
+        // A script may run for minutes: it hands its call back at its
+        // yield_time_ms or yield_control(), as Codex's exec yields.
+        "yields": true,
     }))
 }
 

@@ -4154,7 +4154,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
             grammar: None,
             steps: false,
             gate_daemon_steps: false,
-            lift: false,
+            yields: false,
             inherit: Inherit::All,
             kind: None,
         };
@@ -5831,7 +5831,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     // The lead's own tool, which a bot it creates does not take.
@@ -5846,7 +5846,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     let declared = [react.clone()];
@@ -5956,7 +5956,7 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     let (lead, _) = db
@@ -6023,7 +6023,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6120,7 +6120,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6198,7 +6198,7 @@ fn a_reader_lists_waiting_calls_past_the_answers_the_writer_held_at_its_last_com
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6287,7 +6287,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -18963,7 +18963,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -20528,7 +20528,7 @@ fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: Some("mcp".into()),
     };
@@ -20747,7 +20747,7 @@ fn a_daemon_step_cut_short_still_names_the_files_it_changes() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: Some("mcp".into()),
     };
@@ -22114,7 +22114,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -22154,9 +22154,19 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             db.tool_start(turn, call, false, false).unwrap();
         }
         let now = epoch_now();
-        let (p1, _) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
-        let (p2, _) = db.lift(turn, "c2", None, None, &[], now).unwrap().unwrap();
-        let (p3, _) = db.lift(turn, "c3", None, None, &[], now).unwrap().unwrap();
+        // Each yielded by its client: no step of them waits on a gate, so
+        // a message would leave them running.
+        assert!(db.lift(turn, "c1", None, None, &[], now).unwrap().is_none());
+        let so_far = result("starting");
+        let (p1, _) = (db.lift(turn, "c1", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
+        let (p2, _) = (db.lift(turn, "c2", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
+        let (p3, _) = (db.lift(turn, "c3", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         (turn, p1, p2, p3)
@@ -22208,8 +22218,9 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
     let _ = std::fs::remove_file(&path);
 }
 
-/// A lifted answered call stays its client's past its turn: its time goes
-/// on the schedule when it lifts, a step its client asks for is listed for
+/// A lifted answered call stays its client's past its turn: a message lifts
+/// it only while a step of it waits on a gate, its time goes on the
+/// schedule once that step is decided, a step its client asks for is listed for
 /// its bot, a prune of its turn leaves it listed and answerable, and its
 /// answer ends its row in the audit trail.
 #[test]
@@ -22225,7 +22236,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -22266,13 +22277,10 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .unwrap();
     db.tool_start(turn, &call, false, false).unwrap();
     let now = epoch_now();
-    let (process, lapse) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
-    let Some(lapse) = lapse else {
-        panic!("a lifted call with a time of its own was not scheduled");
-    };
-    assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
-    // A step asked for while its turn still runs is listed under its
-    // call's handle too.
+    // Running, no step of it at a gate: a message leaves it alone.
+    assert!(db.lift(turn, "c1", None, None, &[], now).unwrap().is_none());
+    // A step asked for while its turn still runs waits on its gate, which
+    // a message lifts the call for, and is listed under its call's handle.
     use agent_runtime::store::Step;
     let Step::Pending { .. } = db
         .step_announce(
@@ -22291,6 +22299,9 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
     else {
         panic!("a gated step was decided at once");
     };
+    let (process, lapse) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
+    // No time while its step waits on the gate.
+    assert_eq!(lapse, None);
     let running = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
     assert_eq!(running["approvals"][0]["call_id"], "c1/0", "{running}");
     assert_eq!(
@@ -22317,6 +22328,13 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         leased: false,
     })
     .unwrap();
+    // Let through, the step leaves the gate: the call's time runs again,
+    // on the schedule.
+    db.step_check("Lead", turn, "c1/0", now, false).unwrap();
+    let Lifted::Waiting(Some(lapse)) = db.lifted_check(process, now, false).unwrap() else {
+        panic!("a lifted call with a time of its own was not scheduled");
+    };
+    assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // A step its client asks for past the turn waits for the bot's gate,
@@ -22696,7 +22714,7 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -23058,7 +23076,7 @@ fn schema_105_bots_that_message_with_tools_make_and_close_agents_too() {
 /// A call its client yields is lifted with its output so far, and waits on
 /// its answer with no deadline: past its tool's own time it still waits,
 /// its answer is taken, and it ends answered, the turn still reading the
-/// yield after its answer is collected. A tool not declared `lift` does not
+/// yield after its answer is collected. A tool not declared `yields` does not
 /// yield.
 #[test]
 fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
@@ -23073,13 +23091,13 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: true,
+        yields: true,
         inherit: Inherit::All,
         kind: None,
     };
     let quick = Declared {
         name: "note".into(),
-        lift: false,
+        yields: false,
         steps: false,
         ..exec.clone()
     };
@@ -23119,9 +23137,9 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
     }
     let now = epoch_now();
     let Err(refused) = db.yield_call("Lead", turn, "note-1", &result("so far"), now) else {
-        panic!("a call of a tool that does not lift yielded");
+        panic!("a call of a tool that does not yield yielded");
     };
-    assert_eq!(refused.code, "call_not_liftable");
+    assert_eq!(refused.code, "call_not_yieldable");
     let yielded = db
         .yield_call("Lead", turn, "exec-1", &result("built 3 of 9"), now)
         .unwrap();

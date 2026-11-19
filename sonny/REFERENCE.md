@@ -350,8 +350,11 @@ The project's wins, then the config's, then `lead` and `task`. A name that
 is not a profile in the folder's or the person's `.agents/agents` (nor one
 Sonny ships) stops the lead or task from being made, with
 `profile_not_found`. The profile is read when the lead's instructions are
-composed, so a change takes at the lead's next idle point. `extends` and `skills` work
-in any profile ([CLIENT.md](../docs/CLIENT.md)); a profile that extends
+composed, so a change takes when a window next opens on the lead. `extends`, `skills` and
+`sandbox` work in any profile ([CLIENT.md](../docs/CLIENT.md)): a task or
+workflow worker started in a profile with a `sandbox` runs in it, never
+looser than its permissions row would give it, and a lead runs in its
+row's; a profile that extends
 `lead` or `task` is not offered to agents as a role to start a peer in.
 
 ### Effort for leads and tasks
