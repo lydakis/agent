@@ -11628,6 +11628,7 @@ impl App {
         self.counted_at = Some(Instant::now());
         let (client, woken) = (self.client.clone(), self.woken.clone());
         let (store, bot) = (self.options.store.clone(), self.bot.clone());
+        let lone = self.project.is_none();
         // What was read of each agent's history and question goes with the
         // count, which gives it back however it ends.
         let (mut latest, mut seen) = (
@@ -11670,13 +11671,23 @@ impl App {
                 }
             }
             let rows = kept_mark.unwrap_or_else(|| rows_mark(&listed));
+            // A task's window counts its lead's agents, the lead found in
+            // the listing it counts, the first snapshot too.
+            let scope = match lone {
+                true => background::Scope {
+                    lead: task_lead(&bot, Some(&listed)),
+                    ..scope
+                },
+                false => scope,
+            };
             // The listing is current from here: a read that fails keeps it
             // and counts again.
             let unread = |listed, reads| Counted {
                 listed: Some((listed, rows)),
                 ..failed(reads)
             };
-            let Some(mark) = standing(&client, rows, local).await else {
+            // Counted again once the lead it lists for changes.
+            let Some(mark) = standing(&client, rows ^ name_key(&scope.lead), local).await else {
                 return Some(unread(listed, (latest, seen)));
             };
             if was == Some(mark) {
@@ -25041,6 +25052,57 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(app.counts, Some(counts));
+    }
+
+    #[tokio::test]
+    async fn a_task_of_another_lead_counts_that_leads_agents_from_the_first_snapshot() {
+        // Idle, so no history is read: the count is the listing alone.
+        let bot = |name: &str, id: i64, maker: Option<&str>| {
+            json!({"name": name, "bot_id": id, "last": {"turn": 1, "status": "completed"},
+                "created_by": maker})
+        };
+        let snapshot = json!([
+            bot("calc.lead", 1, None),
+            bot("calc.lead.docs", 2, None),
+            bot("calc.halves", 3, Some("calc.lead")),
+            bot("calc.notes", 4, Some("calc.lead.docs")),
+        ]);
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" if ask["names"].is_null() && ask["active"].is_null() => {
+                json!({"bots": snapshot, "cursor": 7, "next_after": null})
+            }
+            "follow" => json!({"following": ask["bot"]}),
+            "bots" => json!({"bots": [], "next_after": null}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc.notes".into();
+        let dir = std::env::temp_dir().join(unique("sonny-task-lead-count"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.options.store = dir.join("state.sqlite");
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        app.counted_at = None;
+        app.count_agents().await;
+        while !app.counting.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        app.counted_at = Some(Instant::now());
+        app.count_agents().await;
+        // Its own lead's agents, on the first count, and the folder's other
+        // lead as a row of its own: not the first lead's task.
+        let counted: std::collections::BTreeSet<&str> =
+            app.status_bots.iter().map(String::as_str).collect();
+        assert_eq!(
+            counted,
+            ["calc.lead", "calc.lead.docs", "calc.notes"].into()
+        );
+        assert_eq!(app.scope().lead, "calc.lead.docs");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
