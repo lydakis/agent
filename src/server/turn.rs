@@ -6053,8 +6053,14 @@ impl Turn {
                         if start.len() < arguments.len() {
                             start.push('…');
                         }
-                        json!({"bot":call["bot"],"turn":call["turn"],"tool":call["name"],
-                            "arguments":start,"waiting_on":call["gates"]})
+                        let mut row = json!({"bot":call["bot"],"turn":call["turn"],
+                            "tool":call["name"],"arguments":start,"waiting_on":call["gates"]});
+                        // One a message lifted, or its client yielded, waits
+                        // on past its turn, under the handle it answers.
+                        if call["handle"].is_string() {
+                            row["handle"] = call["handle"].clone();
+                        }
+                        row
                     })
                     .collect();
                 json!({"approvals":calls,"next_after":page["next_after"]})
