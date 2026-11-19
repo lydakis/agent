@@ -18228,6 +18228,184 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
 }
 
 #[test]
+fn made_says_of_each_bot_another_made_how_often_the_person_stepped_in() {
+    let path = std::env::temp_dir().join(format!("agent-made-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let hour = 3_600_000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let since = now - 3 * hour;
+    for bot in [
+        "p.lead", "p.alone", "p.wrote", "p.quoted", "p.called", "p.old", "q.task",
+    ] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+    }
+    // Each turn, the request that started it, and how long after `since`
+    // it started; every bot's first is the work its maker gave it.
+    let turns = [
+        ("p.lead", "1", 10),
+        ("p.alone", "1", 10),
+        ("p.alone", "2", 20),
+        ("p.wrote", "1", 10),
+        ("p.wrote", "2", hour),
+        ("p.quoted", "1", 10),
+        ("p.quoted", "2", 20),
+        ("p.quoted", "3", 30),
+        ("p.called", "1", 10),
+        ("p.old", "1", -2 * hour),
+        ("p.old", "2", -hour),
+        ("q.task", "1", 10),
+    ];
+    let mut started = Vec::new();
+    for (bot, request, at) in &turns {
+        let turn = db
+            .begin(
+                bot,
+                request,
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(turn, vec![assistant("done")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+        started.push((*bot, *request, turn, since + at));
+    }
+    let raw = Connection::open(&path).unwrap();
+    for (_, _, turn, at) in &started {
+        raw.execute(
+            "UPDATE turns SET started_ms=?,finished_ms=?+60000 WHERE id=?",
+            rusqlite::params![at, at, turn],
+        )
+        .unwrap();
+    }
+    raw.execute(
+        "UPDATE bots SET created_by='p.lead' WHERE name NOT IN ('p.lead')",
+        [],
+    )
+    .unwrap();
+    let turn = |bot: &str, request: &str| {
+        started
+            .iter()
+            .find(|(b, r, ..)| *b == bot && *r == request)
+            .unwrap()
+            .2
+    };
+    // The task alone took in only what its lead sent: once its own words,
+    // once a reply it was quoted. The quoted task's lead passed on the
+    // person's own words once.
+    let lead_sent = "UPDATE messages SET from_bot='p.lead',quotes=? WHERE id=?";
+    raw.execute(
+        lead_sent,
+        rusqlite::params![
+            r#"[{"text":"a reply","from":{"bot":"p.alone","turn":1},"reply":true}]"#,
+            turn("p.alone", "2")
+        ],
+    )
+    .unwrap();
+    raw.execute(
+        lead_sent,
+        rusqlite::params![
+            r#"[{"text":"what the person said"}]"#,
+            turn("p.quoted", "2")
+        ],
+    )
+    .unwrap();
+    raw.execute(
+        lead_sent,
+        rusqlite::params![
+            r#"[{"text":"a bot's words","from":{"bot":"p.alone","turn":1}}]"#,
+            turn("p.quoted", "3")
+        ],
+    )
+    .unwrap();
+    // The person decided one call of the called task, a rule another.
+    let bot_id = |bot: &str| -> i64 {
+        raw.query_row("SELECT id FROM bots WHERE name=?", [bot], |r| r.get(0))
+            .unwrap()
+    };
+    for approved in ["person", "rule"] {
+        raw.execute(
+            "INSERT INTO audit(at_ms,bot_id,bot,turn,call_id,tool,approved,access,outcome,preview)
+             VALUES(?,?,'p.called',?,'c','shell',?,'write','ok','')",
+            rusqlite::params![
+                since + 20,
+                bot_id("p.called"),
+                turn("p.called", "1"),
+                approved
+            ],
+        )
+        .unwrap();
+    }
+
+    let made = db.made(Some("p.*"), since, None, None).unwrap();
+    let rows: Vec<_> = made["made"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["bot"].as_str().unwrap(),
+                row["turns"].as_i64().unwrap(),
+                row["work_ms"].as_i64().unwrap(),
+                row["person_messages"].as_i64().unwrap(),
+                row["person_quotes"].as_i64().unwrap(),
+                row["person_calls"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("p.alone", 2, 120_000, 0, 0, 0),
+            ("p.called", 1, 60_000, 0, 0, 1),
+            ("p.quoted", 3, 180_000, 0, 1, 0),
+            ("p.wrote", 2, 120_000, 1, 0, 0),
+        ],
+        "by name; the lead no one made, the turns before the window and the other project's are out"
+    );
+    assert_eq!(made["made"][0]["running"], false);
+    assert_eq!(made["next_after"], Value::Null);
+
+    // The window before: the old task's second turn, whose message the
+    // person wrote.
+    let before = db
+        .made(Some("p.*"), since - 2 * hour, Some(since), None)
+        .unwrap();
+    assert_eq!(before["made"].as_array().unwrap().len(), 1);
+    assert_eq!(before["made"][0]["bot"], "p.old");
+    assert_eq!(before["made"][0]["turns"], 2);
+    assert_eq!(before["made"][0]["person_messages"], 1);
+
+    // Pages go on after the name given.
+    let page = db.made(None, since, None, Some("p.called")).unwrap();
+    let bots: Vec<_> = page["made"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["bot"].as_str().unwrap())
+        .collect();
+    assert_eq!(bots, ["p.quoted", "p.wrote", "q.task"]);
+    assert_eq!(page["made"][1]["person_messages"], 1);
+
+    assert_eq!(
+        db.made(None, since, Some(since), None).unwrap_err().code,
+        "invalid_made_window"
+    );
+    assert_eq!(
+        db.made(Some(""), 0, None, None).unwrap_err().code,
+        "invalid_bot_filter"
+    );
+    drop(raw);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn usage_files_each_call_under_the_model_that_spent_it_with_its_cache_writes() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();

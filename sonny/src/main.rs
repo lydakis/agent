@@ -14447,14 +14447,14 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        let (query, window) = view.query(now);
-        let read = self.client.request("usage", query).await;
+        let (ask, window) = view.ask(now);
+        let read = usage::read(&self.client, ask, self.store()).await;
         // The price sheet as its file says now, so an edit shows at the
         // next read; a sheet that does not parse prices nothing.
         let prices = agent_client::config::load()
             .and_then(|config| agent_client::config::prices(&config))
             .unwrap_or_default();
-        view.loaded(window, read.map_err(|error| error.to_string()), prices);
+        view.loaded(window, read, prices);
     }
 
     /// Whether the scheduler runs, read beside the window while
@@ -14540,18 +14540,23 @@ impl App {
             watch.read = Instant::now();
             return;
         }
+        // Where the tasks' done marks and roles are, only for a read due.
+        let store = (self.watch.as_ref())
+            .and_then(|watch| watch.usage.as_ref())
+            .is_some_and(usage::View::due)
+            .then(|| self.store());
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.usage
         {
-            if view.due() {
+            if let Some(store) = store {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64;
-                let (query, window) = view.query(now);
+                let (ask, window) = view.ask(now);
                 let selection = view.selection();
                 self.card_read = Some(tokio::spawn(async move {
-                    let read = client.request("usage", query).await;
+                    let read = usage::read(&client, ask, store).await;
                     // The price sheet as its file says now, so an edit shows
                     // at the next read; a sheet that does not parse prices
                     // nothing.
@@ -14559,7 +14564,6 @@ impl App {
                         .and_then(|config| agent_client::config::prices(&config))
                         .unwrap_or_default();
                     woken.notify_one();
-                    let read = read.map_err(|error| error.to_string());
                     CardRead::Usage(selection, window, read, prices)
                 }));
             }

@@ -1,9 +1,13 @@
 //! `/usage`: the tokens the project's agents spent, or every agent's, in
-//! the last day, week or month: in all, over time as stacked bars, by
+//! the last day, week or month: in all, over time as stacked bars, how
+//! the tasks went (how many finished without the person, how often they
+//! stepped in and how, how many were marked done, without them by how long
+//! a task worked and by its role, and that share the period before), by
 //! agent (or project), by model, and by what started the turns: the
-//! commons, a trigger, the margin, or a prompt. One daemon read, `usage`, each time
-//! the view changes and every minute while it is open: it reads every
-//! matching turn, so it is not asked for often. With the person's price
+//! commons, a trigger, the margin, or a prompt. Two daemon reads, `usage`
+//! and `made` (this period's and the one before), each time the view
+//! changes and every minute while it is open: they read every matching
+//! turn, so they are not asked for often. With the person's price
 //! sheet (`~/.agent/prices.toml`, or the file config's `prices` names),
 //! each model's cost and their sum, priced here from the sheet as it
 //! stands at each read; the daemon counts tokens only.
@@ -48,6 +52,15 @@ impl Period {
             Period::Day => "last 24 hours",
             Period::Week => "last 7 days",
             Period::Month => "last 30 days",
+        }
+    }
+
+    /// The period before it, as a share of it is compared with.
+    fn before(self) -> &'static str {
+        match self {
+            Period::Day => "the day before",
+            Period::Week => "the week before",
+            Period::Month => "the month before",
         }
     }
 
@@ -217,6 +230,19 @@ impl View {
             query["name"] = json!(self.scope.glob);
         }
         (query, (since, bucket, buckets))
+    }
+
+    /// What [`read`] asks the daemon for what it shows, at `now`, and the
+    /// window it asks for.
+    pub fn ask(&self, now: i64) -> (Ask, (i64, i64, usize)) {
+        let (usage, window) = self.query(now);
+        let ask = Ask {
+            usage,
+            name: (!self.all).then(|| self.scope.glob.clone()),
+            since: window.0,
+            now,
+        };
+        (ask, window)
     }
 
     /// What it shows: every project's or this one's, and over which
@@ -439,6 +465,9 @@ impl View {
         out.extend(self.chart(read, width));
         out.push(legend(&total, self.cached));
         out.push(Line::default());
+        if let Some(tasks) = Tasks::of(&usage["tasks"]) {
+            out.extend(tasks.lines(read.period, width));
+        }
         // The project's agents by name; every agent's by project, as a
         // fleet's names start with theirs.
         let mut rows: Vec<Row> = Vec::new();
@@ -487,7 +516,6 @@ impl View {
         out.push(Line::default());
         out.extend(self.bars("By model", &models, &total, width, costs));
         out.extend(speed);
-        out.extend(self.time(usage, width));
         // What Sonny's own features started, by the origin it gave their
         // turns; one with none was a prompt, a person's or an agent's.
         // An automation's turns from before 0.8.0 say `trigger`: one row.
@@ -675,100 +703,6 @@ impl View {
         out
     }
 
-    /// Where the finished turns' time went, by agent (or project): each
-    /// one's bar as long as its average turn, in the model's calls, its
-    /// tools and the rest, with its rounds and tool calls a turn and its
-    /// model's output a second. Nothing when no finished turn was timed.
-    fn time(&self, usage: &Value, width: usize) -> Vec<Line<'static>> {
-        let total = Took::of(&usage["time"]);
-        if total.turns == 0 {
-            return Vec::new();
-        }
-        let mut rows: Vec<(String, Took)> = Vec::new();
-        for bot in usage["bots"].as_array().into_iter().flatten() {
-            let name = bot["bot"].as_str().unwrap_or("?");
-            let name = match self.all {
-                true => name.split('.').next().unwrap_or(name).to_owned(),
-                false => self.scope.short(name),
-            };
-            let took = Took::of(&bot["time"]);
-            if took.turns == 0 {
-                continue;
-            }
-            match rows.iter_mut().find(|(n, _)| *n == name) {
-                Some((_, sum)) => sum.add(took),
-                None => rows.push((name, took)),
-            }
-        }
-        rows.sort_by(|a, b| b.1.turn_ms.cmp(&a.1.turn_ms).then_with(|| a.0.cmp(&b.0)));
-        let hidden = rows.len().saturating_sub(LISTED);
-        let mut rest = Took::of(&usage["other_bots"]["time"]);
-        for (_, took) in rows.drain(rows.len() - hidden..) {
-            rest.add(took);
-        }
-        if rest.turns > 0 {
-            rows.push(("the rest".to_owned(), rest));
-        }
-        // A pane too narrow for every figure keeps only the turn's length.
-        let full = width >= 4 + 2 + 4 + TIME_FIGURES.len();
-        let shown = match full {
-            true => TIME_FIGURES,
-            false => &TIME_FIGURES[..8],
-        };
-        let figures = shown.len();
-        let name_width = (rows.iter().map(|(name, _)| name.width()))
-            .max()
-            .unwrap_or(0)
-            .clamp(4, 28)
-            .min(width.saturating_sub(figures + 6).max(4));
-        let room = width.saturating_sub(name_width + 2 + figures).clamp(4, 40);
-        let most = (rows.iter().map(|(_, took)| took.each()))
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let mut out = vec![
-            Line::default(),
-            Line::from(vec![
-                Span::raw(format!("{:<w$}", "Time", w = name_width + 2 + room)).bold(),
-                Span::raw(shown).dim(),
-            ]),
-        ];
-        for (name, took) in &rows {
-            let turns = took.turns.max(1) as f64;
-            let mut spans = vec![Span::raw(format!(
-                "{:<name_width$}  ",
-                crate::transcript::cut(name, name_width)
-            ))];
-            // Each part of its average turn: the parts summed over its
-            // turns, scaled as the turn is to the longest.
-            let parts = took
-                .parts()
-                .map(|(n, color)| (n / took.turns.max(1), color));
-            spans.extend(hbar(&parts, most, room));
-            spans.push(Span::raw(format!(" {:>7}", span(took.each()))));
-            if full {
-                spans.push(Span::raw(format!(" {:>6.1}", took.rounds as f64 / turns)));
-                spans.push(Span::raw(format!(" {:>6.1}", took.calls as f64 / turns)));
-                spans.push(match took.per_second() {
-                    Some(rate) => Span::raw(format!(" {rate:>6}")),
-                    None => Span::raw(format!(" {:>6}", "-")).dim(),
-                });
-            }
-            out.push(Line::from(spans));
-        }
-        let [(model, _), (tools, _), (rest, _)] = total.parts();
-        let all = total.turn_ms.max(1);
-        out.push(Line::from(vec![
-            Span::raw("█").fg(MODEL_TIME),
-            Span::raw(format!(" model {}%   ", model * 100 / all)),
-            Span::raw("█").fg(TOOL_TIME),
-            Span::raw(format!(" tools {}%   ", tools * 100 / all)),
-            Span::raw("█").fg(REST_TIME),
-            Span::raw(format!(" waiting and the rest {}%", rest * 100 / all)),
-        ]));
-        out
-    }
-
     /// The line under the card: the keys it takes.
     pub fn keys(&self) -> String {
         let scope = match self.all {
@@ -786,84 +720,6 @@ impl View {
             .key(cached.0, cached.1)
             .esc(crate::hint::Esc::Close)
             .text()
-    }
-}
-
-/// The colors of a turn's time: its model's calls, its tools, and the
-/// rest.
-const MODEL_TIME: Color = Color::Green;
-const TOOL_TIME: Color = Color::Yellow;
-const REST_TIME: Color = Color::DarkGray;
-/// The time section's columns after the bars.
-const TIME_FIGURES: &str = "  a turn rounds  calls  tok/s";
-
-/// What some finished turns with timed calls took, from a `usage` row's
-/// `time`: their time from start to end, the tool calls that ran to their
-/// end and those calls' time, and their own timed model calls: how many,
-/// their output and their time.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Took {
-    pub turns: u64,
-    pub turn_ms: u64,
-    pub rounds: u64,
-    pub calls: u64,
-    pub tool_ms: u64,
-    pub model_ms: u64,
-    pub output: u64,
-}
-
-impl Took {
-    fn of(row: &Value) -> Self {
-        let count = |key: &str| row[key].as_u64().unwrap_or(0);
-        Self {
-            turns: count("turns"),
-            turn_ms: count("turn_ms"),
-            rounds: count("timed_rounds"),
-            calls: count("tool_calls"),
-            tool_ms: count("tool_ms"),
-            model_ms: count("model_ms"),
-            output: count("timed_output_tokens"),
-        }
-    }
-    fn add(&mut self, other: Took) {
-        self.turns += other.turns;
-        self.turn_ms += other.turn_ms;
-        self.rounds += other.rounds;
-        self.calls += other.calls;
-        self.tool_ms += other.tool_ms;
-        self.model_ms += other.model_ms;
-        self.output += other.output;
-    }
-    /// Its average turn's time.
-    fn each(&self) -> u64 {
-        self.turn_ms / self.turns.max(1)
-    }
-    /// Its model's output tokens a second, from send to answer, as the
-    /// speed section counts them.
-    fn per_second(&self) -> Option<u64> {
-        (self.output * 1000).checked_div(self.model_ms)
-    }
-    /// Its time in the model's calls, in tools, and the rest: pacing,
-    /// summaries, the daemon's own time, gates waited on and failed
-    /// attempts. Each within what is left of the turns' time.
-    fn parts(&self) -> [(u64, Color); 3] {
-        let model = self.model_ms.min(self.turn_ms);
-        let tools = self.tool_ms.min(self.turn_ms - model);
-        [
-            (model, MODEL_TIME),
-            (tools, TOOL_TIME),
-            (self.turn_ms - model - tools, REST_TIME),
-        ]
-    }
-}
-
-/// A longer time in a few characters: as `took` under a minute, then
-/// minutes and seconds, then hours and minutes.
-fn span(ms: u64) -> String {
-    match ms / 1000 {
-        s if s < 60 => took(ms),
-        s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
-        s => format!("{}h {:02}m", s / 3600, s / 60 % 60),
     }
 }
 
@@ -1103,6 +959,316 @@ fn midnight(now: i64) -> i64 {
     epoch as i64 * 1000
 }
 
+/// The longest a task worked, in milliseconds, for each length it is
+/// counted under: under half an hour, half an hour to two hours, longer.
+const LENGTHS: [(u64, &str); 3] = [
+    (30 * 60_000, "under 30 min"),
+    (2 * 3_600_000, "30 min to 2 h"),
+    (u64::MAX, "over 2 h"),
+];
+
+/// How the tasks of a period went, as the Tasks section draws it: of the
+/// agents other agents made that worked in the period (a workflow's
+/// workers, leads and Sonny's own left out), how many still work, and of
+/// those that ended, how many finished with nobody stepping in (no word
+/// of the person's taken in, none passed on by an agent quoting them, no
+/// call they decided), how the person stepped into the rest, how many are
+/// marked done, and the share without them by how long a task worked, by
+/// its role, and in the period before.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Tasks {
+    pub worked: u64,
+    pub working: u64,
+    pub ended: u64,
+    pub alone: u64,
+    /// Over the ended tasks: the person's messages they took in, agents'
+    /// messages quoting the person, and calls the person decided.
+    pub messages: u64,
+    pub quotes: u64,
+    pub calls: u64,
+    pub done: u64,
+    /// Without the person and ended, for each of [`LENGTHS`].
+    pub lengths: [(u64, u64); 3],
+    /// Each role's name, without the person and ended, most ended first.
+    pub roles: Vec<(String, u64, u64)>,
+    /// Without the person and ended, the period before.
+    pub before: Option<(u64, u64)>,
+}
+
+/// One agent another made, as `made` lists it.
+struct Made<'a> {
+    bot: &'a str,
+    work_ms: u64,
+    running: bool,
+    last_turn: Option<i64>,
+    messages: u64,
+    quotes: u64,
+    calls: u64,
+}
+
+impl<'a> Made<'a> {
+    fn of(row: &'a Value) -> Option<Self> {
+        let bot = row["bot"].as_str()?;
+        let count = |key: &str| row[key].as_u64().unwrap_or(0);
+        Some(Self {
+            bot,
+            work_ms: count("work_ms"),
+            running: row["running"] == true,
+            last_turn: row["last_turn"].as_i64(),
+            messages: count("person_messages"),
+            quotes: count("person_quotes"),
+            calls: count("person_calls"),
+        })
+    }
+    /// Whether it is a task: not a workflow's worker, a lead, or one of
+    /// Sonny's own.
+    fn task(&self) -> bool {
+        !crate::project::is_internal(self.bot)
+            && !crate::project::is_lead(self.bot)
+            && !crate::workflow::is_worker(self.bot)
+    }
+    /// Whether the person stepped in.
+    fn stepped(&self) -> bool {
+        self.messages + self.quotes + self.calls > 0
+    }
+}
+
+impl Tasks {
+    /// The tasks among `made`, each one's done mark and role read by
+    /// `done` (with its last turn and whether one runs) and `role`.
+    pub fn tally(
+        made: &[Value],
+        done: impl Fn(&str, Option<i64>, bool) -> bool,
+        role: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let mut tasks = Self::default();
+        for made in made.iter().filter_map(Made::of).filter(Made::task) {
+            tasks.worked += 1;
+            if made.running {
+                tasks.working += 1;
+                continue;
+            }
+            tasks.ended += 1;
+            let alone = !made.stepped() as u64;
+            tasks.alone += alone;
+            tasks.messages += made.messages;
+            tasks.quotes += made.quotes;
+            tasks.calls += made.calls;
+            tasks.done += done(made.bot, made.last_turn, made.running) as u64;
+            let length = (LENGTHS.iter())
+                .position(|(most, _)| made.work_ms < *most)
+                .unwrap_or(LENGTHS.len() - 1);
+            tasks.lengths[length].0 += alone;
+            tasks.lengths[length].1 += 1;
+            let role = role(made.bot).unwrap_or_else(|| "no role".to_owned());
+            match tasks.roles.iter_mut().find(|(name, ..)| *name == role) {
+                Some((_, without, of)) => {
+                    *without += alone;
+                    *of += 1;
+                }
+                None => tasks.roles.push((role, alone, 1)),
+            }
+        }
+        tasks
+            .roles
+            .sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        tasks
+    }
+
+    /// Of the tasks among `made` of the period before, those that ended
+    /// without the person, and those that ended.
+    pub fn before(made: &[Value]) -> (u64, u64) {
+        let ended: Vec<Made> = (made.iter().filter_map(Made::of))
+            .filter(|made| made.task() && !made.running)
+            .collect();
+        let alone = ended.iter().filter(|made| !made.stepped()).count();
+        (alone as u64, ended.len() as u64)
+    }
+
+    /// As kept in the usage read; none when no task worked.
+    fn of(kept: &Value) -> Option<Self> {
+        serde_json::from_value::<Self>(kept.clone())
+            .ok()
+            .filter(|tasks| tasks.worked > 0)
+    }
+
+    /// The section at `width`, for `period`: its head, then, once a task
+    /// ended, each share as a bar.
+    fn lines(&self, period: Period, width: usize) -> Vec<Line<'static>> {
+        let mut head = format!("  {} worked in the {}", self.worked, period.label());
+        if self.working > 0 {
+            head.push_str(&format!(" · {} still working", self.working));
+        }
+        let mut out = vec![Line::from(vec![
+            Span::raw("Tasks").bold(),
+            Span::raw(crate::transcript::cut(&head, width.saturating_sub(5))).dim(),
+        ])];
+        if self.ended == 0 {
+            out.push(Line::default());
+            return out;
+        }
+        // The name gives way first, down to its least, then the bar.
+        let name_width = 21.min(width.saturating_sub(SHARE + 2 + 4)).max(8);
+        let room = width.saturating_sub(name_width + 2 + SHARE).min(30);
+        let share = |name: &str, part: u64, of: u64, indent: usize| {
+            let name = format!("{}{name}", " ".repeat(indent));
+            let mut spans = vec![Span::raw(format!(
+                "{:<name_width$}  ",
+                crate::transcript::cut(&name, name_width)
+            ))];
+            spans.extend(meter(part, of, room));
+            spans.push(Span::raw(format!(" {part:>4} of {of:<4}")));
+            spans.push(Span::raw(format!(" {:>4}", percent(part, of))).dim());
+            spans
+        };
+        let mut alone = share("Finished without you", self.alone, self.ended, 0);
+        if let Some((part, of)) = self.before.filter(|(_, of)| *of > 0) {
+            let was = format!("  was {} {}", percent(part, of), period.before());
+            let used: usize = alone.iter().map(|span| span.content.width()).sum();
+            if used + was.width() <= width {
+                alone.push(Span::raw(was).dim());
+            }
+        }
+        out.push(Line::from(alone));
+        let stepped = self.ended - self.alone;
+        out.push(Line::from(share("You stepped in", stepped, self.ended, 0)));
+        if stepped > 0 {
+            let mut how = Vec::new();
+            if self.messages > 0 {
+                how.push(format!("you wrote {}", self.messages));
+            }
+            if self.quotes > 0 {
+                how.push(format!("your words passed on {}", self.quotes));
+            }
+            if self.calls > 0 {
+                how.push(format!("calls you decided {}", self.calls));
+            }
+            let how = format!("  {}", how.join(" · "));
+            out.push(Line::from(crate::transcript::cut(&how, width)).dim());
+        }
+        out.push(Line::from(share("Marked done", self.done, self.ended, 0)));
+        out.push(Line::default());
+        out.push(
+            Line::from(crate::transcript::cut(
+                "Without you, by how long they worked",
+                width,
+            ))
+            .bold(),
+        );
+        for ((alone, of), (_, name)) in self.lengths.iter().zip(LENGTHS) {
+            if *of > 0 {
+                out.push(Line::from(share(name, *alone, *of, 2)));
+            }
+        }
+        // Roles only once there are two to tell apart.
+        if self.roles.len() > 1 {
+            out.push(Line::default());
+            out.push(Line::from(crate::transcript::cut("Without you, by role", width)).bold());
+            for (role, alone, of) in self.roles.iter().take(LISTED) {
+                out.push(Line::from(share(role, *alone, *of, 2)));
+            }
+        }
+        out.push(Line::default());
+        out
+    }
+}
+
+/// The columns a share takes after its bar: ` 15 of 21    71%`.
+const SHARE: usize = 1 + 4 + 4 + 4 + 1 + 4;
+
+/// `part` of `of` as a whole percent, rounded.
+fn percent(part: u64, of: u64) -> String {
+    format!("{}%", (part * 200 + of).checked_div(of * 2).unwrap_or(0))
+}
+
+/// `part` of `of` as a bar `room` columns long: filled, then the rest
+/// faint.
+fn meter(part: u64, of: u64, room: usize) -> Vec<Span<'static>> {
+    let filled = ((part as usize * room * 2 + of as usize) / (of as usize * 2).max(1)).min(room);
+    vec![
+        Span::raw("█".repeat(filled)).fg(Color::Blue),
+        Span::raw("░".repeat(room - filled)).fg(Color::DarkGray),
+    ]
+}
+
+/// What `/usage` reads for a selection: its `usage` request, and the
+/// tasks it covers, `made` from `since` to `now` and the period before.
+pub struct Ask {
+    pub usage: Value,
+    name: Option<String>,
+    since: i64,
+    now: i64,
+}
+
+/// The usage `ask` names, read with `client`, with what its tasks did kept
+/// under `tasks`, their done marks and roles read beside `store`.
+pub async fn read(
+    client: &agent_client::Client,
+    ask: Ask,
+    store: std::path::PathBuf,
+) -> Result<Value, String> {
+    let mut usage =
+        (client.request("usage", ask.usage.clone()).await).map_err(|error| error.to_string())?;
+    let name = ask.name.as_deref();
+    let made = made(client, name, ask.since, ask.now).await?;
+    let span = (ask.now - ask.since).max(1);
+    let before = made_before(client, name, ask.since - span, ask.since).await;
+    let tasks = tokio::task::spawn_blocking(move || {
+        let mut tasks = Tasks::tally(
+            &made,
+            |bot, last, running| {
+                crate::resolved::holds(crate::resolved::read(&store, bot), last, running)
+            },
+            |bot| crate::task::noted_profile(&store, bot),
+        );
+        tasks.before = before.map(|made| Tasks::before(&made));
+        tasks
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    usage["tasks"] = serde_json::to_value(tasks).unwrap_or_default();
+    Ok(usage)
+}
+
+/// The period before's, or none when it could not be read: the share is
+/// then shown alone.
+async fn made_before(
+    client: &agent_client::Client,
+    name: Option<&str>,
+    since: i64,
+    until: i64,
+) -> Option<Vec<Value>> {
+    made(client, name, since.max(0), until).await.ok()
+}
+
+/// Every page of `made` from `since` to `until`.
+async fn made(
+    client: &agent_client::Client,
+    name: Option<&str>,
+    since: i64,
+    until: i64,
+) -> Result<Vec<Value>, String> {
+    let mut all = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut query = json!({"since_ms": since, "until_ms": until.max(since + 1)});
+        if let Some(name) = name {
+            query["name"] = json!(name);
+        }
+        if let Some(after) = &after {
+            query["after"] = json!(after);
+        }
+        let mut page = (client.request("made", query).await).map_err(|error| error.to_string())?;
+        if let Some(rows) = page["made"].as_array_mut() {
+            all.append(rows);
+        }
+        match page["next_after"].as_str() {
+            Some(next) if Some(next) != after.as_deref() => after = Some(next.to_owned()),
+            _ => return Ok(all),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,6 +1292,107 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn made(bot: &str, work_min: u64, running: bool, wrote: u64, quoted: u64, calls: u64) -> Value {
+        json!({
+            "bot": bot, "turns": 2, "work_ms": work_min * 60_000, "running": running,
+            "last_turn": 9, "person_messages": wrote, "person_quotes": quoted, "person_calls": calls,
+        })
+    }
+
+    #[test]
+    fn tasks_count_those_that_ended_without_the_person() {
+        let made = [
+            made("p.fix-login", 20, false, 0, 0, 0),
+            made("p.add-export", 50, false, 1, 0, 0),
+            made("p.rename", 10, false, 0, 1, 0),
+            made("p.migrate", 200, false, 0, 0, 2),
+            made("p.tidy", 40, false, 0, 0, 0),
+            made("p.still", 5, true, 3, 0, 0),
+            // Leads, workflow workers and Sonny's own are no tasks.
+            made("p.web.lead", 5, false, 0, 0, 0),
+            made("p.wf-1.wf-step", 5, false, 0, 0, 0),
+            made(".sonny-namer", 5, false, 0, 0, 0),
+        ];
+        let tasks = Tasks::tally(
+            &made,
+            |bot, _, _| bot == "p.fix-login" || bot == "p.migrate",
+            |bot| (bot == "p.migrate" || bot == "p.tidy").then(|| "backend".to_owned()),
+        );
+        assert_eq!((tasks.worked, tasks.working, tasks.ended), (6, 1, 5));
+        assert_eq!(tasks.alone, 2);
+        // The running task's message is not counted until it ends.
+        assert_eq!((tasks.messages, tasks.quotes, tasks.calls), (1, 1, 2));
+        assert_eq!(tasks.done, 2);
+        assert_eq!(tasks.lengths, [(1, 2), (1, 2), (0, 1)]);
+        assert_eq!(
+            tasks.roles,
+            [("no role".to_owned(), 1, 3), ("backend".to_owned(), 1, 2)]
+        );
+        assert_eq!(Tasks::before(&made), (2, 5));
+    }
+
+    #[test]
+    fn tasks_show_once_one_worked() {
+        assert_eq!(Tasks::of(&Value::Null), None);
+        assert_eq!(Tasks::of(&json!(Tasks::default())), None);
+        let tasks = Tasks {
+            worked: 2,
+            working: 2,
+            ..Tasks::default()
+        };
+        let lines = Tasks::of(&json!(tasks)).unwrap().lines(Period::Week, 80);
+        // Nothing ended yet: the head alone.
+        assert_eq!(
+            text(&lines),
+            "Tasks  2 worked in the last 7 days · 2 still working\n"
+        );
+    }
+
+    #[test]
+    fn no_task_row_is_wider_than_the_card() {
+        let tasks = Tasks {
+            worked: 1234,
+            working: 34,
+            ended: 1200,
+            alone: 845,
+            messages: 912,
+            quotes: 133,
+            calls: 4021,
+            done: 1001,
+            lengths: [(500, 600), (300, 450), (45, 150)],
+            roles: vec![
+                (
+                    "a-role-with-a-name-longer-than-the-column".to_owned(),
+                    600,
+                    800,
+                ),
+                ("frontend".to_owned(), 245, 400),
+            ],
+            before: Some((400, 1000)),
+        };
+        for width in 30..=120 {
+            for line in tasks.lines(Period::Month, width) {
+                assert!(
+                    line.width() <= width,
+                    "{} columns in {width}: {:?}",
+                    line.width(),
+                    text(&[line])
+                );
+            }
+        }
+        let wide = text(&tasks.lines(Period::Day, 100));
+        assert!(wide.contains("Finished without you"), "{wide}");
+        assert!(
+            wide.contains(" 845 of 1200  70%  was 40% the day before"),
+            "{wide}"
+        );
+        assert!(
+            wide.contains("you wrote 912 · your words passed on 133 · calls you decided 4021"),
+            "{wide}"
+        );
+        assert!(wide.contains("Without you, by role"), "{wide}");
     }
 
     #[test]
@@ -1271,77 +1538,6 @@ mod tests {
             ]
         );
         assert!(speeds(&rows[2..], &total, 80).is_empty());
-    }
-
-    #[test]
-    fn each_agent_says_where_its_turns_went() {
-        // Two agents' finished turns: one waits on its model, the other on
-        // its tools; the longer turn's bar is the longest.
-        let mut view = View::new(scope());
-        let (_, window) = view.query(1_800_000_000_000);
-        let time = |turns, turn_ms, rounds, calls, tool_ms, model_ms, output| {
-            json!({"turns": turns, "turn_ms": turn_ms, "model_rounds": rounds,
-                "tool_calls": calls, "tool_ms": tool_ms, "paced_ms": 0, "summary_ms": 0,
-                "daemon_ms": 0, "timed_rounds": rounds, "timed_output_tokens": output,
-                "model_ms": model_ms, "first_token_ms": 0})
-        };
-        view.loaded(
-            window,
-            Ok(json!({
-                "turns": 4, "input_tokens": 2000, "cached_input_tokens": 0, "output_tokens": 200,
-                "time": time(4, 100_000, 20, 16, 30_000, 62_000, 3_100),
-                "bots": [
-                    {"bot": "p.docs", "turns": 2, "input_tokens": 1000, "cached_input_tokens": 0,
-                     "output_tokens": 100, "time": time(2, 80_000, 18, 16, 30_000, 46_000, 1_400)},
-                    {"bot": "p.lead", "turns": 2, "input_tokens": 1000, "cached_input_tokens": 0,
-                     "output_tokens": 100, "time": time(2, 20_000, 2, 0, 0, 16_000, 1_700)},
-                ],
-                "other_bots": null, "models": [], "origins": [], "series": [],
-            })),
-            Vec::new(),
-        );
-        let lines = view.card(70);
-        let card = text(&lines);
-        let time: Vec<&str> = card
-            .lines()
-            .skip_while(|l| !l.starts_with("Time"))
-            .collect();
-        assert_eq!(time.len(), 4, "{card}");
-        assert!(time[0].ends_with("a turn rounds  calls  tok/s"), "{card}");
-        assert!(time[1].starts_with("docs"), "{card}");
-        assert!(time[1].ends_with(" 40 s    9.0    8.0     30"), "{card}");
-        assert!(time[2].ends_with(" 10 s    1.0    0.0    106"), "{card}");
-        assert_eq!(
-            time[3],
-            "█ model 62%   █ tools 30%   █ waiting and the rest 8%"
-        );
-        // The longer turn's bar is longer, and no row is wider than the card.
-        let filled = |row: &str| row.chars().filter(|c| "█▏▎▍▌▋▊▉".contains(*c)).count();
-        assert!(filled(time[1]) > 3 * filled(time[2]), "{card}");
-        for line in lines
-            .iter()
-            .filter(|l| text(std::slice::from_ref(l)).contains(" s "))
-        {
-            assert!(line.width() <= 70, "{card}");
-        }
-        // A narrow pane keeps each row on one line, with its turn's length.
-        for width in 30..=70 {
-            let narrow = view.card(width);
-            let card = text(&narrow);
-            let at = (narrow.iter())
-                .position(|l| text(std::slice::from_ref(l)).starts_with("Time"))
-                .unwrap();
-            let rows: Vec<&Line> = narrow[at..at + 3].iter().collect();
-            assert_eq!(rows.len(), 3, "{width}: {card}");
-            for line in rows {
-                let t = text(std::slice::from_ref(line));
-                assert!(line.width() <= width, "{width}: {card}");
-                assert!(t.starts_with("Time") || t.contains(" s"), "{width}: {card}");
-            }
-        }
-        assert_eq!(span(42_000), "42 s");
-        assert_eq!(span(72_000), "1m 12s");
-        assert_eq!(span(3_720_000), "1h 02m");
     }
 
     #[test]

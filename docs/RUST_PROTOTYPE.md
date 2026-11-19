@@ -1294,7 +1294,7 @@ operations.
 
 Reads that decide nothing run beside the service loop, not in it:
 `history_nodes`, `history_items`, `history_search`, `turns`, `bots`,
-`events`, `usage`, `prompts` and `audit`. Each runs on one of the store's reader
+`events`, `usage`, `made`, `prompts` and `audit`. Each runs on one of the store's reader
 connections (at most `--max-readers`, one per logical CPU by default; WAL
 readers do not block each other or the writer). One reader opens with the
 store; another opens when a read is queued with no reader free to take
@@ -1492,6 +1492,7 @@ own path from the turn. Example requests:
 {"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
 {"id":23,"op":"turns","bot":"Bob","newest":true,"limit":3}
 {"id":30,"op":"usage","name":"project.*","since_ms":1793000000000,"bucket_ms":21600000,"limit":64}
+{"id":33,"op":"made","name":"project.*","since_ms":1793000000000,"until_ms":1793600000000,"after":null}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
 {"id":29,"op":"compact","bot":"Bob","bot_id":1}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
@@ -1833,6 +1834,27 @@ requests go on while it reads. As an observation, not
 a screen: the same statement in Python's SQLite over a synthetic store of 164k
 turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
 Sonny's `/usage` draws it, reading again once a minute while it is open.
+
+Protocol 95 adds `made`, also an observation read: the bots another bot made
+(those with a `created_by`) that started a turn in a window, and how often a
+person stepped into those turns. `name` is a `bots` GLOB, `since_ms` (0 or
+more) and `until_ms` (absent is now) bound when the turns started
+(`invalid_made_window` otherwise). Each row, in name order, has the bot's
+`turns`, `work_ms` (each turn's start to its end, or to now while it runs),
+whether one is `running`, its `last_turn`, and three counts over the window's
+turns: `person_messages`, messages a person wrote (no `from_bot`, no
+`origin`) that its turns took in; `person_quotes`, messages another bot sent it
+that quote a person's own words (a quote with no `from`, no `origin`, not a
+`reply`); and `person_calls`, its calls the audit trail says a person decided.
+A bot's first message is the work its maker gave it, so it is never counted.
+A page stays within half an event as sent, as a `bots` page does; with more,
+`next_after` names its last bot, to pass as `after` (`null` on the last page).
+Sonny's `/usage` reads it for the period it shows and the one before, to say
+how many tasks finished with nobody stepping in. As an observation, not a
+screen: the same statements in Python's SQLite over a synthetic store of 10,000
+bots, 200,000 turns and a million audit rows took about 0.9 s for every bot's
+month and the month before (4 pages), 0.09 s for every bot's day, and 0.02 s for
+one project's month; over 300 bots, 0.01 s for every bot's month.
 
 Protocol 24 lets a bot declare up to 32 tools, from 16, under the same 64 KiB
 of declarations: a Sonny lead with MCP servers already declared 15 of Sonny's
