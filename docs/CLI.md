@@ -580,6 +580,11 @@ turn with a level sees it in its shell as `AGENT_EFFORT`, and a new bot that tak
 from `AGENT_MODEL` takes its level from `AGENT_EFFORT`, so a peer started
 on its creator's model thinks as hard as its creator; a bot given
 `--model` or a profile's model gets only its own `--effort`.
+`run --replaces BOT/N` names a message this same sender sent to `--bot`
+that this prompt replaces: still in line, it is withdrawn and this prompt
+sent in its place in one step; taken in already, it stays and this prompt
+goes after it. The reply's `replaced` says which (`withdrawn` or `taken`,
+with the turn that took it in), and `--pretty` adds it to the first line.
 `run --quote BOT/N` copies that one message's words after this prompt,
 with a line saying who wrote it, even when other messages were steered or
 attached beside it; `BOT/N:reply` copies the reply the finished turn it

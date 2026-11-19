@@ -422,6 +422,19 @@ class SocketAndCliTests(ModelFixture):
                          (queued['handle'], 'withdrawn', True))
         still = json.loads(self.agent('wait', '--store', str(self.store), '--timeout=0', slow, check=False).stdout)
         self.assertEqual(still['pending'], [slow])
+        # --replaces takes back a message still in line and sends another in
+        # its place, in one step; only one sent to the same bot.
+        queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Slow', '--detach',
+                                       '--delivery', 'queue', 'upload as picked').stdout)
+        replaced = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Slow', '--detach',
+                                         '--delivery', 'queue', '--replaces', queued['handle'],
+                                         'reversed order').stdout)
+        self.assertEqual((replaced['replaced']['handle'], replaced['replaced']['status']),
+                         (queued['handle'], 'withdrawn'))
+        elsewhere = self.agent('run', '--store', str(self.store), '--bot', 'Quick', '--detach',
+                               '--replaces', replaced['handle'], 'mine', check=False)
+        self.assertEqual(elsewhere.returncode, 2, elsewhere.stderr)
+        self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--turn', str(replaced['message']))
         # interrupt prints the turn view, as it stood when asked.
         printed = self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--pretty').stdout
         self.assertIn('\n  "handle"', printed)
