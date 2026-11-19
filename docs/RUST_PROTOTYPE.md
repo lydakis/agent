@@ -1853,6 +1853,16 @@ a screen: the same statement in Python's SQLite over a synthetic store of 164k
 turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
 Sonny's `/usage` draws it, reading again once a minute while it is open.
 
+Protocol 94 lets `usage` take `until_ms`, only the turns started before it
+(the answer echoes it, `null` when absent; earlier than `since_ms` is
+`invalid_usage_window`), and `names`, 1 to 256 names of up to 128 bytes as
+`bots` takes them, only those bots' turns, found by each name's own turns
+rather than every turn in the window; with `name` too, both narrow. A client
+reads a window that has ended, or many bots' own rows past the `limit` of
+one read, a page of names at a time. Sonny's `/usage` reads its tasks so,
+this period and the one before: over a synthetic store of 10,000 tasks and
+200,000 turns, 80 reads of 256 names took about 0.4 s in all.
+
 Protocol 24 lets a bot declare up to 32 tools, from 16, under the same 64 KiB
 of declarations: a Sonny lead with MCP servers already declared 15 of Sonny's
 and `exec`, so one more of Sonny's, the commons, or one of a client's own,

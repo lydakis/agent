@@ -2705,6 +2705,18 @@ pub struct Messages<'a> {
     /// Each one's words whole, as `text`, beside the preview.
     pub words: bool,
 }
+/// What `usage` sums: the turns started from `since_ms` to `until_ms`
+/// (now when absent) of the bots `name`, a GLOB pattern, and `names` pick
+/// (every bot when both are absent), in buckets `bucket_ms` wide, with the
+/// `limit` that spent most listed by name.
+pub struct UsageQuery<'a> {
+    pub name: Option<&'a str>,
+    pub names: Option<&'a [String]>,
+    pub since_ms: i64,
+    pub until_ms: Option<i64>,
+    pub bucket_ms: Option<i64>,
+    pub limit: usize,
+}
 /// The kinds of sender a message has, by what it records: another bot's
 /// turn (`from_bot`), a client's name (`origin`), or neither, a person.
 #[derive(Clone, Copy, PartialEq)]
@@ -16850,34 +16862,45 @@ impl Database {
         Ok(low)
     }
 
-    /// What the turns of the bots whose names match `name` (every bot
-    /// when absent) spent, from those started at `since_ms` or later: in
-    /// all, by bot (the `limit` that spent most, the rest summed as one),
-    /// by the model that spent it, with its cache writes, by the origin its
-    /// client gave the turn, and, with `bucket_ms`, in buckets of that
-    /// width from `since_ms`. A turn counts wholly where it started. One
-    /// snapshot.
-    pub fn usage(
-        &self,
-        name: Option<&str>,
-        since_ms: i64,
-        bucket_ms: Option<i64>,
-        limit: usize,
-    ) -> Result<Value> {
+    /// What the turns `selector` picks spent: in all, by bot (the `limit`
+    /// that spent most, the rest summed as one), by the model that spent
+    /// it, with its cache writes, by the origin its client gave the turn,
+    /// and, with `bucket_ms`, in buckets of that width from `since_ms`. A
+    /// turn counts wholly where it started. One snapshot.
+    pub fn usage(&self, selector: &UsageQuery) -> Result<Value> {
+        let UsageQuery {
+            name,
+            names,
+            since_ms,
+            until_ms,
+            bucket_ms,
+            limit,
+        } = *selector;
         if name.is_some_and(|pattern| pattern.is_empty() || pattern.len() > 256) {
             return fail_with(
                 "invalid_bot_filter",
                 "name is a GLOB pattern of 1 to 256 bytes",
             );
         }
+        if names.is_some_and(|names| {
+            !(1..=256).contains(&names.len()) || names.iter().any(|n| n.is_empty() || n.len() > 128)
+        }) {
+            return fail_with(
+                "invalid_bot_filter",
+                "names lists 1 to 256 names of up to 128 bytes",
+            );
+        }
         if !(1..=256).contains(&limit) {
             return fail_with("invalid_usage_page", "limit must be 1 to 256");
         }
-        if since_ms < 0 {
-            return fail_with("invalid_usage_window", "since_ms must be 0 or more");
+        if since_ms < 0 || until_ms.is_some_and(|until| until < since_ms) {
+            return fail_with(
+                "invalid_usage_window",
+                "since_ms must be 0 or more, and until_ms no earlier",
+            );
         }
         if let Some(bucket) = bucket_ms {
-            let buckets = (epoch_ms() - since_ms).max(0) / bucket.max(1);
+            let buckets = (until_ms.unwrap_or_else(epoch_ms) - since_ms).max(0) / bucket.max(1);
             if bucket < 1 || since_ms == 0 || buckets >= MAX_USAGE_BUCKETS {
                 return fail_with(
                     "invalid_usage_window",
@@ -16887,26 +16910,44 @@ impl Database {
                 );
             }
         }
-        let glob = match name {
-            Some(_) => " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)",
-            None => "",
-        };
+        // Each statement takes the window and the bots by the same names.
+        let mut glob = String::new();
+        let mut picks: Vec<(&str, Box<dyn rusqlite::ToSql>)> = vec![(":since", Box::new(since_ms))];
+        if let Some(pattern) = name {
+            glob.push_str(
+                " AND t.bot GLOB :pattern AND t.bot >= :prefix AND t.bot < :prefix || CAST(x'ff' AS TEXT)",
+            );
+            picks.push((":pattern", Box::new(pattern.to_owned())));
+            picks.push((":prefix", Box::new(glob_prefix(pattern))));
+        }
+        if let Some(names) = names {
+            glob.push_str(" AND t.bot IN (SELECT value FROM json_each(:names))");
+            picks.push((":names", Box::new(serde_json::to_string(names)?)));
+        }
+        if let Some(until) = until_ms {
+            // With names, each bot's own turns are found by name and the
+            // end only filters them: as a second bound it would win the
+            // plan and walk every bot's turns in the window.
+            glob.push_str(match names {
+                Some(_) => " AND +t.started_ms < :until",
+                None => " AND t.started_ms < :until",
+            });
+            picks.push((":until", Box::new(until)));
+        }
+        let picked: Vec<(&str, &dyn rusqlite::ToSql)> = (picks.iter())
+            .map(|(key, value)| (*key, value.as_ref()))
+            .collect();
         // A turn counts once in each grouping but by model, where it
         // counts under every model that spent in it.
         let snapshot = self.conn.unchecked_transaction()?;
         let mut statement = snapshot.prepare_cached(&format!(
-            "SELECT t.bot,b.id,(t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
+            "SELECT t.bot,b.id,(t.started_ms-:since)/:width,COUNT(*),SUM(t.input_tokens),
                     SUM(t.cached_input_tokens),SUM(t.output_tokens),m.origin,SUM(t.daemon_ms)
              FROM turns t JOIN bots b ON b.name=t.bot JOIN messages m ON m.id=t.id
-             WHERE t.started_ms>=?1{glob} GROUP BY 1,3,8"
+             WHERE t.started_ms>=:since{glob} GROUP BY 1,3,8"
         ))?;
         let width = bucket_ms.unwrap_or(i64::MAX);
-        let mut rows = match name {
-            Some(pattern) => {
-                statement.query(params![since_ms, width, pattern, glob_prefix(pattern)])?
-            }
-            None => statement.query(params![since_ms, width])?,
-        };
+        let mut rows = statement.query(&*[&picked[..], &[(":width", &width as _)]].concat())?;
         let mut total = Spent::default();
         let mut bots: HashMap<String, (i64, Spent)> = HashMap::new();
         let mut origins: HashMap<Option<String>, Spent> = HashMap::new();
@@ -16935,17 +16976,9 @@ impl Database {
                     m.speed,SUM(m.timed_rounds),SUM(m.timed_output_tokens),SUM(m.model_ms),
                     SUM(m.first_token_ms)
              FROM turns t CROSS JOIN turn_models m ON m.turn=t.id
-             WHERE t.started_ms>=?1{glob} GROUP BY 1,8"
+             WHERE t.started_ms>=:since{glob} GROUP BY 1,8"
         ))?;
-        let mut rows = match name {
-            Some(pattern) => statement.query(params![
-                since_ms,
-                None::<i64>,
-                pattern,
-                glob_prefix(pattern)
-            ])?,
-            None => statement.query(params![since_ms])?,
-        };
+        let mut rows = statement.query(&*picked)?;
         // Each model's spend at each speed, and its cache writes: 5-minute
         // and hour. The window's turns lead, each one's rows found by its
         // key.
@@ -16974,18 +17007,10 @@ impl Database {
                     SUM(t.timed_rounds),SUM(t.timed_output_tokens),SUM(t.model_ms),
                     SUM(t.first_token_ms)
              FROM turns t
-             WHERE t.started_ms>=?1 AND t.finished_ms IS NOT NULL AND t.timed_rounds>0{glob}
+             WHERE t.started_ms>=:since AND t.finished_ms IS NOT NULL AND t.timed_rounds>0{glob}
              GROUP BY t.bot"
         ))?;
-        let mut rows = match name {
-            Some(pattern) => statement.query(params![
-                since_ms,
-                None::<i64>,
-                pattern,
-                glob_prefix(pattern)
-            ])?,
-            None => statement.query(params![since_ms])?,
-        };
+        let mut rows = statement.query(&*picked)?;
         let mut clocks: HashMap<String, Clock> = HashMap::new();
         let mut clocked = Clock::default();
         while let Some(r) = rows.next()? {
@@ -17023,6 +17048,7 @@ impl Database {
         timing(&mut out, timed);
         out["time"] = clocked.json();
         out["since_ms"] = json!(since_ms);
+        out["until_ms"] = json!(until_ms);
         out["bucket_ms"] = json!(bucket_ms);
         out["bots"] = bots
             .iter()
