@@ -112,6 +112,9 @@ pub struct View {
     pub read: bool,
     /// The first row in view, kept so the pick stays in view.
     top: usize,
+    /// Whether the wheel moved the rows since the pick last moved: the
+    /// pick is then let out of view until a key moves it.
+    scrolled: bool,
     /// The rows in view, as last drawn, for the mouse: each line with the
     /// row it draws.
     drawn: Vec<Option<usize>>,
@@ -308,6 +311,7 @@ impl View {
 
     /// A key, the page having the keys.
     pub fn key(&mut self, key: &KeyEvent, now: u64) -> Act {
+        self.scrolled = false;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Finding: what is typed narrows the rows; the arrows still pick.
         if let Some(query) = &mut self.finding {
@@ -399,6 +403,16 @@ impl View {
         }
     }
 
+    /// Words pasted while finding, as if typed.
+    pub fn paste(&mut self, text: &str, now: u64) {
+        let Some(query) = &mut self.finding else {
+            return;
+        };
+        query.extend(text.chars().filter(|c| !c.is_control()));
+        self.scrolled = false;
+        self.found(now);
+    }
+
     /// The pick after what is found changed: it stays on a project that
     /// matches, else goes to the first that does, not to one kept only
     /// because it holds a match.
@@ -435,6 +449,7 @@ impl View {
 
     /// The wheel: the rows in view move, the pick stays.
     pub fn scroll(&mut self, down: bool) {
+        self.scrolled = true;
         self.top = match down {
             true => self.top + 3,
             false => self.top.saturating_sub(3),
@@ -484,8 +499,8 @@ impl View {
         }
         let rows = height.saturating_sub(out.len()).max(1);
         let picked = self.picked_row(&shown);
-        // The pick stays in view, two rows from either end where it can.
-        if let Some(at) = picked {
+        // The pick stays in view, unless the wheel moved the rows since.
+        if let Some(at) = picked.filter(|_| !self.scrolled) {
             if at < self.top {
                 self.top = at;
             } else if at >= self.top + rows {
@@ -786,6 +801,40 @@ mod tests {
         assert_eq!(text(&mut view, 70).len(), 8);
         assert_eq!(view.key(&key(KeyCode::Tab), NOW), Act::Stay);
         assert_eq!(view.key(&key(KeyCode::Esc), NOW), Act::Close);
+    }
+
+    #[test]
+    fn a_pasted_find_picks_the_first_match_and_the_wheel_lets_the_pick_out_of_view() {
+        let mut view = rulebook();
+        view.key(
+            &KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            NOW,
+        );
+        view.paste("Site", NOW);
+        assert_eq!(view.picked().unwrap().lead, "site.lead");
+        assert_eq!(
+            view.key(&KeyEvent::from(KeyCode::Enter), NOW),
+            Act::Go("site.lead".into())
+        );
+        // Four rows in view, the pick on the first: the wheel moves the
+        // rows past it, and a key brings it back into view.
+        let mut view = rulebook();
+        view.key(&KeyEvent::from(KeyCode::Right), NOW);
+        for _ in 0..3 {
+            view.key(&KeyEvent::from(KeyCode::Up), NOW);
+        }
+        view.fold_open = true;
+        assert_eq!(view.picked().unwrap().lead, "books.lead");
+        let rows = |view: &mut View| -> Vec<String> {
+            (view.lines(70, 7, NOW).iter())
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect()
+        };
+        assert_eq!(rows(&mut view)[3], " ○ Bookkeeping  superlead");
+        view.scroll(true);
+        assert_eq!(rows(&mut view)[3], " ? Site redesign           ? 1");
+        view.key(&KeyEvent::from(KeyCode::Down), NOW);
+        assert_eq!(rows(&mut view)[3], "   ● Ledger import         ● 1");
     }
 
     #[test]
