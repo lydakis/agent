@@ -138,7 +138,9 @@ project: a call held for your approval, or a question still open. It is
 not there at none, and a click on it opens **Projects**. `alt+n`, typed or
 not, goes to the next agent that needs you: this project's first, in the
 pane's order, then the other projects' in the order **Projects** lists
-them, around the end; at none it says `no one needs you`. The footer
+them, from the one after this project's around to the one before it, so
+from any project it reaches every one; at none it says `no one needs you`.
+Side chats are left out, as `/status` leaves them. The footer
 learns from the daemon's events as they come, on a connection of its own,
 so an approval held in another project shows as soon as `/status` would
 show it, with nothing read on a timer.

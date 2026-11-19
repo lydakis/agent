@@ -573,6 +573,12 @@ impl Needs {
         self.unsure.contains(bot)
     }
 
+    /// `bot`'s turn runs, its start unseen: its history, read once the
+    /// turn ends, says what is open.
+    pub fn read_at_end(&mut self, bot: &str) {
+        self.unsure.insert(bot.to_owned());
+    }
+
     /// `bot`'s turn is over, its end unseen: its history, read next, says
     /// what is open.
     pub fn sure(&mut self, bot: &str) {

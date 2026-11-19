@@ -51,9 +51,19 @@ pub const NARROW: [&str; 1] = ["tool_completed"];
 
 /// Every project but the window's, followed while the window is open.
 pub struct Elsewhere {
-    /// The agents of other projects that need the person, by name.
-    pub waiting: watch::Receiver<Vec<String>>,
+    /// The agents of other projects that need the person.
+    pub waiting: watch::Receiver<Waiting>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// The agents of other projects that need the person, in the order
+/// **Projects** lists their projects.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Waiting {
+    /// The place of the window's project in that order.
+    pub here: usize,
+    /// Each agent, with its project's place.
+    pub agents: Vec<(usize, String)>,
 }
 
 impl Drop for Elsewhere {
@@ -66,7 +76,7 @@ impl Elsewhere {
     /// Follows what needs the person outside `project`, waking the window
     /// (`woken`) when it changes.
     pub fn start(socket: PathBuf, store: PathBuf, project: String, woken: Arc<Notify>) -> Self {
-        let (tell, waiting) = watch::channel(Vec::new());
+        let (tell, waiting) = watch::channel(Waiting::default());
         let task = tokio::spawn(async move {
             follow(socket, store, project, tell, woken).await;
         });
@@ -79,17 +89,30 @@ impl Elsewhere {
     }
 }
 
-/// Whether `bot` is an agent of a project other than `project`: not one of
-/// Sonny's own (a leading dot).
-pub fn other(bot: &str, project: &str) -> bool {
-    !bot.starts_with('.') && bot.split_once('.').is_some_and(|(of, _)| of != project)
+/// Whether `bot` is an agent of a project other than `project`, of those
+/// in `projects` (each by name): not one of Sonny's own (a leading dot),
+/// nor a side chat, which `/status` leaves out too.
+pub fn other(bot: &str, project: &str, projects: &HashMap<String, usize>) -> bool {
+    !bot.starts_with('.')
+        && bot.contains('.')
+        && crate::side_source(bot).is_none()
+        && project_in(bot, projects) != project
+}
+
+/// The project `bot` is an agent of: the longest start of its name that
+/// names one of `projects`, as a window finds its own, so `shop.web.page`
+/// is `shop.web`'s where both projects are; else up to its first dot.
+pub fn project_in<'a>(bot: &'a str, projects: &HashMap<String, usize>) -> &'a str {
+    (bot.match_indices('.').map(|(at, _)| &bot[..at]).rev())
+        .find(|start| projects.contains_key(*start))
+        .unwrap_or_else(|| bot.split_once('.').map_or(bot, |(of, _)| of))
 }
 
 async fn follow(
     socket: PathBuf,
     store: PathBuf,
     project: String,
-    tell: watch::Sender<Vec<String>>,
+    tell: watch::Sender<Waiting>,
     woken: Arc<Notify>,
 ) {
     // Made again each time none of the agents followed narrowly waits.
@@ -102,7 +125,7 @@ async fn follow_once(
     socket: &std::path::Path,
     store: &std::path::Path,
     project: &str,
-    tell: &watch::Sender<Vec<String>>,
+    tell: &watch::Sender<Waiting>,
     woken: &Notify,
 ) -> bool {
     let Ok((client, mut events)) = Client::connect(socket).await else {
@@ -121,18 +144,27 @@ async fn follow_once(
     let Ok(held) = needs::listing(&client, None).await else {
         return false;
     };
-    needs.held(held, |bot| other(bot, project));
     let Ok((listed, _)) = standing::list(&client, "*.*").await else {
         return false;
     };
     let order = in_order(store, &listed);
+    let theirs = |bot: &str| other(bot, project, &order);
+    needs.held(held, theirs);
+    // What the history of each agent with a question open said, kept to
+    // read again when a lead marks it done.
+    let mut seen_of: HashMap<String, Seen> = HashMap::new();
     let identity = client.identity().map(str::to_owned);
     let kept = crate::kept_seen(store, identity.as_deref());
     let mut read: HashMap<String, (i64, Seen)> = HashMap::new();
     // Each idle agent's question as of its last turn, as `/status` reads
     // it: what a window kept, else read now.
     for bot in &listed {
-        if !other(&bot.name, project) || bot.head.is_none() || bot.running_turn.is_some() {
+        if !theirs(&bot.name) || bot.head.is_none() {
+            continue;
+        }
+        // Its turn runs: what it asked, read once the turn ends.
+        if bot.running_turn.is_some() {
+            needs.read_at_end(&bot.name);
             continue;
         }
         let Some(turn) = bot.last.as_ref().map(|last| last.turn) else {
@@ -153,7 +185,11 @@ async fn follow_once(
                 seen
             }
         };
-        needs.asked(&bot.name, seen.open(store, &bot.name, false));
+        let open = seen.clone().open(store, &bot.name, false);
+        if open.is_some() {
+            seen_of.insert(bot.name.clone(), seen);
+        }
+        needs.asked(&bot.name, open);
     }
     if !read.is_empty() {
         crate::keep_seen(store, ".elsewhere", identity.as_deref(), &read);
@@ -168,12 +204,18 @@ async fn follow_once(
         }
         narrow.insert(bot, true);
     }
+    // The agents a lead's turn marked done, by the lead: read again once
+    // the turn ends, when the mark is beside the store.
+    let mut marked: HashMap<String, Vec<String>> = HashMap::new();
     tell_waiting(&needs, project, &order, tell, woken);
     while let Some(event) = events.recv().await {
-        let Some(bot) = event["bot"].as_str().filter(|bot| other(bot, project)) else {
+        let Some(bot) = event["bot"].as_str().filter(|bot| theirs(bot)) else {
             continue;
         };
         let bot = bot.to_owned();
+        if let Some(done) = marks(&event, &bot, &order) {
+            marked.entry(bot.clone()).or_default().push(done);
+        }
         // A call held for the person, or a question asked: its calls from
         // here on, to see it let go or answered.
         if !narrow.contains_key(&bot) && waits_from(&event) {
@@ -191,8 +233,26 @@ async fn follow_once(
             if let Some(seen) = needs::scan(&client, &due, turn).await
                 && needs.stirred(&due) == stirred
             {
-                needs.asked(&due, seen.open(store, &due, false));
+                let open = seen.clone().open(store, &due, false);
+                match open.is_some() {
+                    true => seen_of.insert(due.clone(), seen),
+                    false => seen_of.remove(&due),
+                };
+                needs.asked(&due, open);
                 read = true;
+            }
+        }
+        // A lead's turn that marked agents done: their questions close.
+        if event["event"] == "turn_finished" {
+            for done in marked.remove(&bot).unwrap_or_default() {
+                if let Some(seen) = seen_of.get(&done) {
+                    let open = seen.clone().open(store, &done, false);
+                    if open.is_none() {
+                        seen_of.remove(&done);
+                    }
+                    needs.asked(&done, open);
+                    read = true;
+                }
             }
         }
         if changed || read {
@@ -214,14 +274,31 @@ async fn follow_once(
     false
 }
 
+/// The agent a `mark_done` call starting in `event`, by `bot`, marks done:
+/// `bot` itself, or a task of its project by name.
+fn marks(event: &Value, bot: &str, projects: &HashMap<String, usize>) -> Option<String> {
+    let data = &event["data"];
+    if event["event"] != "tool_started" || data["name"] != crate::resolved::TOOL {
+        return None;
+    }
+    let arguments: Value = (data["arguments"].as_str())
+        .and_then(|arguments| serde_json::from_str(arguments).ok())
+        .unwrap_or(Value::Null);
+    match crate::resolved::itself(&arguments, bot) {
+        true => Some(bot.to_owned()),
+        false => crate::resolved::call(&arguments, project_in(bot, projects)),
+    }
+}
+
 /// Whether `event` holds a call for the person, or asks a question (the
 /// ask tool's call starting): after it, the agent's calls ending say when
 /// it no longer waits.
 fn waits_from(event: &Value) -> bool {
     match event["event"].as_str() {
         Some("approval_asked") => true,
-        Some("approval_requested") => (event["data"]["calls"].as_array().into_iter().flatten())
-            .any(needs::person_call),
+        Some("approval_requested") => {
+            (event["data"]["calls"].as_array().into_iter().flatten()).any(needs::person_call)
+        }
         Some("tool_started") => event["data"]["name"] == crate::asks::TOOL,
         _ => false,
     }
@@ -266,18 +343,19 @@ fn tell_waiting(
     needs: &needs::Needs,
     project: &str,
     order: &HashMap<String, usize>,
-    tell: &watch::Sender<Vec<String>>,
+    tell: &watch::Sender<Waiting>,
     woken: &Notify,
 ) {
-    let mut waiting: Vec<String> = (needs.waiting())
-        .filter(|bot| other(bot, project))
-        .map(str::to_owned)
+    let place = |bot: &str| (order.get(project_in(bot, order)).copied()).unwrap_or(usize::MAX);
+    let mut agents: Vec<(usize, String)> = (needs.waiting())
+        .filter(|bot| other(bot, project, order))
+        .map(|bot| (place(bot), bot.to_owned()))
         .collect();
-    let place = |bot: &str| {
-        let of = bot.split_once('.').map_or(bot, |(of, _)| of);
-        (order.get(of).copied().unwrap_or(usize::MAX), bot.to_owned())
+    agents.sort();
+    let mut waiting = Waiting {
+        here: order.get(project).copied().unwrap_or(0),
+        agents,
     };
-    waiting.sort_by_key(|bot| place(bot));
     if tell.send_if_modified(|was| {
         let moved = *was != waiting;
         *was = std::mem::take(&mut waiting);
@@ -287,9 +365,22 @@ fn tell_waiting(
     }
 }
 
-/// Where `alt+n` goes from `here`: the next of `waiting`, this project's
-/// first as the pane lists them, then the other projects' in the order
-/// **Projects** has; around the end, and the first from one not in it.
+/// Every agent that needs the person, in the order `alt+n` goes round
+/// them from the window's project: `local`, its own as the pane lists
+/// them, then `elsewhere`'s by their projects' places in **Projects**,
+/// from the one after the window's around to the one before it. The same
+/// round from every project, so `alt+n` reaches each.
+pub fn round<'a>(local: &'a [String], elsewhere: &'a Waiting) -> Vec<&'a str> {
+    let (after, before): (Vec<_>, Vec<_>) =
+        (elsewhere.agents.iter()).partition(|(place, _)| *place > elsewhere.here);
+    (local.iter().map(String::as_str))
+        .chain(after.into_iter().map(|(_, bot)| bot.as_str()))
+        .chain(before.into_iter().map(|(_, bot)| bot.as_str()))
+        .collect()
+}
+
+/// Where `alt+n` goes from `here`: the next of `waiting` ([`round`]),
+/// around the end, and the first from one not in it.
 pub fn next<'a>(waiting: &[&'a str], here: &str) -> Option<&'a str> {
     let first = waiting.first()?;
     Some(match waiting.iter().position(|bot| *bot == here) {
@@ -304,10 +395,42 @@ mod tests {
 
     #[test]
     fn other_projects_are_every_project_but_this_one_and_not_sonnys_own() {
+        let projects: HashMap<String, usize> =
+            [("tally", 0), ("site", 1), ("shop", 2), ("shop.web", 3)]
+                .map(|(name, at)| (name.to_owned(), at))
+                .into();
+        let other = |bot, project| other(bot, project, &projects);
         assert!(other("site.lead", "tally"));
         assert!(other("books.fix", "tally"));
         assert!(!other("tally.readme", "tally"));
         assert!(!other(".sky.lead", "tally"));
+        // A side chat is left out, as `/status` leaves it.
+        assert!(!other("site.lead.side-1a2b", "tally"));
+        // A project named with a dot is its own, not the one it starts with.
+        assert!(other("shop.web.lead", "shop"));
+        assert!(other("shop.web.page", "shop"));
+        assert!(!other("shop.webby", "shop"));
+        assert!(other("shop.fix", "shop.web"));
+        assert_eq!(project_in("shop.web.page", &projects), "shop.web");
+        assert_eq!(project_in("new.lead", &projects), "new");
+    }
+
+    #[test]
+    fn a_lead_marking_a_task_done_names_it_in_full() {
+        let projects: HashMap<String, usize> = [("shop".to_owned(), 0)].into();
+        let started = |arguments: &str| json!({"event": "tool_started", "data": {"name": "mark_done", "arguments": arguments}});
+        let task = started(r#"{"task":"fix"}"#);
+        assert_eq!(
+            marks(&task, "shop.lead", &projects).as_deref(),
+            Some("shop.fix")
+        );
+        let own = started("{}");
+        assert_eq!(
+            marks(&own, "shop.fix", &projects).as_deref(),
+            Some("shop.fix")
+        );
+        let other = json!({"event": "tool_started", "data": {"name": "shell"}});
+        assert_eq!(marks(&other, "shop.lead", &projects), None);
     }
 
     /// An approval held in another project is told the window as the
@@ -336,7 +459,10 @@ mod tests {
                 tokio::spawn(async move {
                     let (read, mut write) = stream.into_split();
                     let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
-                    write.write_all(format!("{ready}\n").as_bytes()).await.unwrap();
+                    write
+                        .write_all(format!("{ready}\n").as_bytes())
+                        .await
+                        .unwrap();
                     let mut lines = BufReader::new(read).lines();
                     let mut gone = gone.lock().await;
                     loop {
@@ -375,31 +501,48 @@ mod tests {
         // Every agent, for the few events of a turn; the held calls and
         // the agents read once.
         let (_, first) = requests.recv().await.unwrap();
-        assert_eq!((op(&first), first["bot"].clone()), ("follow".into(), json!("*.*")));
+        assert_eq!(
+            (op(&first), first["bot"].clone()),
+            ("follow".into(), json!("*.*"))
+        );
         assert_eq!(first["kinds"], json!(WIDE));
         while op(&requests.recv().await.unwrap().1) != "bots" {}
         // Its own project's approval, then another's.
         go.send(held("tally.readme", "c1", 7)).unwrap();
         go.send(held("site.fix", "c2", 8)).unwrap();
-        tokio::time::timeout(wait, waiting.wait_for(|bots| !bots.is_empty()))
+        tokio::time::timeout(wait, waiting.wait_for(|bots| !bots.agents.is_empty()))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(*waiting.borrow(), ["site.fix"]);
+        let names = |waiting: &Waiting| -> Vec<String> {
+            waiting.agents.iter().map(|(_, bot)| bot.clone()).collect()
+        };
+        assert_eq!(names(&waiting.borrow()), ["site.fix"]);
         // The held agent's calls, from its approval on; not the other's.
         let (_, narrow) = requests.recv().await.unwrap();
-        assert_eq!(narrow, json!({"id": narrow["id"], "op": "follow", "bot": "site.fix",
-            "after": 8, "kinds": NARROW}));
+        assert_eq!(
+            narrow,
+            json!({"id": narrow["id"], "op": "follow", "bot": "site.fix",
+            "after": 8, "kinds": NARROW})
+        );
         // Allowed, it starts: no one elsewhere, and a new connection.
-        go.send(json!({"cursor": 9, "bot": "site.fix", "turn": 1, "event": "tool_started",
-            "data": {"call_id": "c2", "name": "shell"}}))
-            .unwrap();
-        tokio::time::timeout(wait, waiting.wait_for(|bots| bots.is_empty()))
+        go.send(
+            json!({"cursor": 9, "bot": "site.fix", "turn": 1, "event": "tool_started",
+            "data": {"call_id": "c2", "name": "shell"}}),
+        )
+        .unwrap();
+        tokio::time::timeout(wait, waiting.wait_for(|bots| bots.agents.is_empty()))
             .await
             .unwrap()
             .unwrap();
-        let (again, follow) = tokio::time::timeout(wait, requests.recv()).await.unwrap().unwrap();
-        assert_eq!((again, op(&follow), follow["bot"].clone()), (2, "follow".into(), json!("*.*")));
+        let (again, follow) = tokio::time::timeout(wait, requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (again, op(&follow), follow["bot"].clone()),
+            (2, "follow".into(), json!("*.*"))
+        );
         drop(open);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -411,5 +554,31 @@ mod tests {
         assert_eq!(next(&waiting, "tally.readme"), Some("site.lead"));
         assert_eq!(next(&waiting, "books.fix"), Some("tally.readme"));
         assert_eq!(next(&[], "tally.lead"), None);
+    }
+
+    /// One waiting in each of three projects, A, B and C as **Projects**
+    /// lists them: from each, `alt+n` goes to the next, and so to all.
+    #[test]
+    fn alt_n_reaches_every_project_from_any() {
+        let places = [("a.fix", 0), ("b.fix", 1), ("c.fix", 2)];
+        let from = |here: usize| {
+            let elsewhere = Waiting {
+                here,
+                agents: (places.iter())
+                    .filter(|(_, at)| *at != here)
+                    .map(|(bot, at)| (*at, (*bot).to_owned()))
+                    .collect(),
+            };
+            let local = vec![places[here].0.to_owned()];
+            let round: Vec<String> = round(&local, &elsewhere)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let round: Vec<&str> = round.iter().map(String::as_str).collect();
+            next(&round, places[here].0).map(str::to_owned)
+        };
+        assert_eq!(from(0).as_deref(), Some("b.fix"));
+        assert_eq!(from(1).as_deref(), Some("c.fix"));
+        assert_eq!(from(2).as_deref(), Some("a.fix"));
     }
 }

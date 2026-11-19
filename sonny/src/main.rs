@@ -764,31 +764,34 @@ impl App {
     /// The agents of other projects that need the person and that the
     /// footer's `?` does not count already (a superlead's `/status` lists
     /// the projects it holds), in the order **Projects** lists them.
-    fn elsewhere_waiting(&self) -> Vec<String> {
+    fn elsewhere_waiting(&self) -> elsewhere::Waiting {
         let Some((open, _, _)) = &self.other_projects else {
-            return Vec::new();
+            return elsewhere::Waiting::default();
         };
-        let counted = |bot: &str| {
-            self.status_bots.contains(bot)
-                || (self.fleet.as_ref())
+        let mut waiting = open.waiting.borrow().clone();
+        waiting.agents.retain(|(_, bot)| {
+            !self.status_bots.contains(bot)
+                && !(self.fleet.as_ref())
                     .is_some_and(|fleet| fleet.past_status(bot, &self.status_bots))
-        };
-        (open.waiting.borrow().iter())
-            .filter(|bot| !counted(bot))
-            .cloned()
-            .collect()
+        });
+        waiting
     }
 
     /// `alt+n`: the next agent that needs the person, this project's first
-    /// as the pane lists them, then the other projects' as **Projects**
-    /// does, around the end.
+    /// as the pane lists them and those the footer counts beside them
+    /// (questions forwarded from leads it follows), then the other
+    /// projects' as **Projects** lists them, from the one after this
+    /// project's around ([`elsewhere::round`]).
     fn next_needing(&mut self) {
-        let here: Vec<String> = (self.margin.agents().listed.iter())
+        let mut local: Vec<String> = (self.margin.agents().listed.iter())
             .filter(|agent| agent.run.is_none() && agent.group == status::Group::NeedsYou)
             .map(|agent| agent.bot.clone())
             .collect();
-        let waiting: Vec<String> = here.into_iter().chain(self.elsewhere_waiting()).collect();
-        let waiting: Vec<&str> = waiting.iter().map(String::as_str).collect();
+        if let Some(fleet) = &self.fleet {
+            local.extend(fleet.waiting_past_status_of(&self.status_bots));
+        }
+        let elsewhere = self.elsewhere_waiting();
+        let waiting = elsewhere::round(&local, &elsewhere);
         match elsewhere::next(&waiting, &self.bot) {
             None => self.notice = Some("no one needs you".into()),
             Some(to) if to == self.bot => {}
@@ -7463,6 +7466,16 @@ impl Fleet {
         (self.needs.waiting())
             .filter(|bot| self.past_status(bot, listed))
             .count()
+    }
+
+    /// Those [`Fleet::waiting_past_status`] counts, by name, in order.
+    fn waiting_past_status_of(&self, listed: &std::collections::HashSet<String>) -> Vec<String> {
+        let mut waiting: Vec<String> = (self.needs.waiting())
+            .filter(|bot| self.past_status(bot, listed))
+            .map(str::to_owned)
+            .collect();
+        waiting.sort();
+        waiting
     }
 
     /// Whether `bot` is one [`Fleet::waiting_past_status`] counts, were it
@@ -22921,7 +22934,7 @@ impl App {
         }
         // What needs the person in the other projects: its `?` beats as
         // this project's does, and it gives way whole, its word with it.
-        let elsewhere = self.elsewhere_waiting().len();
+        let elsewhere = self.elsewhere_waiting().agents.len();
         let mut pulse = self.elsewhere_pulse.get();
         pulse.see(elsewhere, Instant::now());
         self.elsewhere_pulse.set(pulse);
