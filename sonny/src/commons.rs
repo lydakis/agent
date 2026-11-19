@@ -1058,7 +1058,7 @@ fn count_reads(dir: &Path, names: &[&str]) {
 
 /// Each thread's summary as last read, by name, with the file's size and
 /// time it was read at: a listing reads again only a thread that changed.
-type Summaries = HashMap<String, (u64, std::time::SystemTime, Value)>;
+type Summaries = HashMap<String, (crate::kept::Stamp, Value)>;
 
 /// Where a summary keeps its first post's fields, for a filter.
 const OPENING: &str = "opening";
@@ -1127,14 +1127,16 @@ fn list(
         else {
             continue;
         };
-        let Ok(meta) = entry.metadata() else { continue };
-        let stamp = (meta.len(), meta.modified().unwrap_or(std::time::UNIX_EPOCH));
+        let Some(stamp) = (entry.metadata().ok()).and_then(|meta| crate::kept::Stamp::of(&meta))
+        else {
+            continue;
+        };
         let mut thread = match known.get(name) {
-            Some((len, at, thread)) if (*len, *at) == stamp => thread.clone(),
+            Some((at, thread)) if *at == stamp => thread.clone(),
             // A thread that will not read is left for read to name.
             _ => match summary(name, &path) {
                 Some(thread) => {
-                    known.insert(name.to_owned(), (stamp.0, stamp.1, thread.clone()));
+                    known.insert(name.to_owned(), (stamp, thread.clone()));
                     thread
                 }
                 None => continue,
@@ -1898,7 +1900,7 @@ pub struct View {
     /// The thread opened, by name, and its posts as last read.
     open: Option<(String, Value)>,
     /// The opened thread's file size and time when its posts were read.
-    open_stamp: Option<(u64, std::time::SystemTime)>,
+    open_stamp: Option<crate::kept::Stamp>,
     /// What the listing last read of each thread.
     known: Summaries,
     /// The golden tickets the week's invites held, each one agent's.
@@ -1962,9 +1964,7 @@ impl View {
             .min(self.threads.len().saturating_sub(1));
         if let Some((name, _)) = &self.open {
             // Read again only once it changed.
-            let stamp = std::fs::metadata(self.dir.join(format!("{name}.jsonl")))
-                .ok()
-                .map(|meta| (meta.len(), meta.modified().unwrap_or(std::time::UNIX_EPOCH)));
+            let stamp = crate::kept::stamp(&self.dir.join(format!("{name}.jsonl")));
             if stamp.is_some() && stamp == self.open_stamp {
                 return;
             }
@@ -3509,7 +3509,7 @@ mod tests {
         let mut view = View::open(home, "a".into());
         assert_eq!(view.threads[0]["posts"], 1);
         // A summary kept for a file as it was is used again.
-        view.known.get_mut("t").unwrap().2["title"] = json!("kept");
+        view.known.get_mut("t").unwrap().1["title"] = json!("kept");
         view.reload();
         assert_eq!(view.threads[0]["title"], "kept");
         let reply = json!({"reply": {"thread": "t", "text": "two"}});

@@ -23,12 +23,12 @@
 //! [fallbacks]                   # the model a declined request goes to, for every agent that names none; restart the daemon to apply
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"  # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
 //!
-//! [context_windows]             # tokens a model's context holds, over its provider's listing; restart the daemon to apply
+//! [context_windows]             # tokens a model's context holds, over its provider's listing; each agent's next turn takes a change
 //! "bedrock/*" = 400000          # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
 //! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
 //! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
 //!
-//! [speeds]                      # the tiers past standard a model serves, over the daemon's own list; restart the daemon to apply
+//! [speeds]                      # the tiers past standard a model serves, over the daemon's own list; each agent's next turn takes a change
 //! "openrouter/openai/gpt-6.1-sol" = ["fast"]  # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
 //! "anthropic/claude-opus-5" = []  # standard only: a bot's fast runs this model at standard
 //!
@@ -172,14 +172,14 @@ pub struct Config {
     /// `[context_windows]`: the context window, in tokens, of each model
     /// whose `PROVIDER/MODEL` path a pattern matches, `*` and `?` wildcards,
     /// the most specific pattern winning, over what its provider lists.
-    /// Unset, the provider's listing, else the daemon's own default. The
-    /// agent CLI starts the daemon with them.
+    /// Unset, the provider's listing, else the daemon's own default. Sent
+    /// with each agent as its `context_windows` setting ([`model_tables`]).
     pub context_windows: BTreeMap<String, u64>,
     /// `[speeds]`: the tiers past standard (`fast`, `ultrafast`) each model
     /// whose `PROVIDER/MODEL` path a pattern matches serves, `*` and `?`
     /// wildcards, the most specific pattern winning, over the daemon's own
-    /// list; an empty list says standard only. The agent CLI starts the
-    /// daemon with them.
+    /// list; an empty list says standard only. Sent with each agent as
+    /// its `speeds` setting ([`model_tables`]).
     pub speeds: BTreeMap<String, Vec<String>>,
     /// `prices`: the price sheet's file, from `/` or `~/`; unset,
     /// `~/.agent/prices.toml`. See `prices`.
@@ -453,6 +453,64 @@ pub fn formula(key: &str, text: &str, cpus: f64, memory: f64) -> Result<f64, Str
 
 /// Each `[daemon]` limit as the `agent serve` flag and value it starts a
 /// daemon with, worked out for this machine, the defaults included.
+/// `[speeds]` and `[context_windows]` as the bot settings that carry
+/// them, `speeds` and `context_windows`, each `null` when the file sets
+/// none: a client gives them to each agent it makes and sends them again
+/// as they change, and each turn reads them as it starts, so an edit needs
+/// no daemon restart.
+pub fn model_tables(config: &Config) -> [(&'static str, serde_json::Value); 2] {
+    let table = |set: serde_json::Value, empty: bool| match empty {
+        true => serde_json::Value::Null,
+        false => set,
+    };
+    [
+        (
+            "speeds",
+            table(
+                // Each list as the daemon keeps it, fastest last.
+                (config.speeds.iter())
+                    .map(|(pattern, tiers)| {
+                        let tiers = ["fast", "ultrafast"]
+                            .into_iter()
+                            .filter(|tier| tiers.iter().any(|given| given == tier));
+                        (
+                            pattern.clone(),
+                            serde_json::json!(tiers.collect::<Vec<_>>()),
+                        )
+                    })
+                    .collect(),
+                config.speeds.is_empty(),
+            ),
+        ),
+        (
+            "context_windows",
+            table(
+                serde_json::json!(config.context_windows),
+                config.context_windows.is_empty(),
+            ),
+        ),
+    ]
+}
+
+/// The `configure` settings that bring a bot whose settings are `had`, as
+/// `inspect` gives them, to `config`'s [`model_tables`]; empty when it has
+/// them.
+pub fn model_tables_changed(
+    config: &Config,
+    had: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    // `inspect` gives an unset table as `{}`.
+    let had = |key: &str| match had.get(key) {
+        Some(serde_json::Value::Object(set)) if set.is_empty() => &serde_json::Value::Null,
+        Some(table) => table,
+        None => &serde_json::Value::Null,
+    };
+    (model_tables(config).into_iter())
+        .filter(|(key, value)| had(key) != value)
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect()
+}
+
 pub fn daemon_flags(daemon: &BTreeMap<String, String>) -> Result<Vec<(String, String)>, String> {
     let (cpus, memory) = machine();
     let mut flags = Vec::new();
