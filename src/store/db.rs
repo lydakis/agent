@@ -781,15 +781,16 @@ impl Settings {
                 return refuse("rules take at most 256 KiB as JSON");
             }
         }
-        // A name a pattern can follow with `.*`: no pattern characters.
+        // The start of a bot's name, which a pattern follows with `.*`:
+        // a bot name's characters.
         if self.namespace.as_ref().is_some_and(|namespace| {
             namespace.is_empty()
                 || namespace.len() > NAMESPACE_BYTES
-                || namespace
-                    .chars()
-                    .any(|c| matches!(c, '*' | '?' | '[' | ']') || c.is_control())
+                || !namespace
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         }) {
-            return refuse("namespace is 1 to 128 bytes, with no *, ?, [ or ]");
+            return refuse("namespace is 1 to 128 of A-Z a-z 0-9 . _ -");
         }
         if crate::output::encoded_len(&self.env).unwrap_or(usize::MAX) > ENV_JSON {
             return refuse("env takes at most 16 KiB as JSON");
@@ -20510,8 +20511,7 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         conn.execute(
             "UPDATE bots SET settings=json_set(COALESCE(settings,'{}'),'$.namespace',
                      substr(name,1,instr(name,'.')-1))
-             WHERE instr(name,'.')>1 AND substr(name,1,instr(name,'.')-1) NOT GLOB '*[][*?]*'
-                 AND json_type(settings,'$.namespace') IS NULL",
+             WHERE instr(name,'.')>1 AND json_type(settings,'$.namespace') IS NULL",
             [],
         )?;
     }

@@ -23263,6 +23263,42 @@ fn schema_107_moves_instructions_out_of_the_row() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// A namespace starts the names of the bots its tools make, so it takes a
+/// bot name's characters.
+#[test]
+fn a_namespace_takes_a_bot_names_characters() {
+    let mut db = db();
+    for namespace in ["my team", "a/b", "é", "shop.*", ""] {
+        let made = db.create(
+            "Bob",
+            Some("/synthetic"),
+            Binding {
+                settings: Settings {
+                    namespace: Some(namespace.to_owned()),
+                    ..Settings::default()
+                },
+                ..binding()
+            },
+        );
+        assert_eq!(made.unwrap_err().code, "invalid_setting", "{namespace:?}");
+    }
+    let made = db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            settings: Settings {
+                namespace: Some("my-repo_2.web".to_owned()),
+                ..Settings::default()
+            },
+            ..binding()
+        },
+    );
+    assert_eq!(
+        made.unwrap().0.settings.namespace.as_deref(),
+        Some("my-repo_2.web")
+    );
+}
+
 /// Schema 108: the group a bot's agent tools list and name bots in is its
 /// `namespace` setting. A bot made before keeps the group its name gave
 /// it, the name up to its first dot; a bot with none, or with a setting
