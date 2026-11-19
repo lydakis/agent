@@ -330,7 +330,7 @@ The project's wins, then the config's, then `lead` and `task`. A name that
 is not a profile in the folder's or the person's `.agents/agents` (nor one
 Sonny ships) stops the lead or task from being made, with
 `profile_not_found`. The profile is read when the lead's instructions are
-composed, so a change takes at the lead's next idle point. `extends` and `skills` work
+composed, so a change takes when a window next opens on the lead. `extends` and `skills` work
 in any profile ([CLIENT.md](../docs/CLIENT.md)); a profile that extends
 `lead` or `task` is not offered to agents as a role to start a peer in.
 

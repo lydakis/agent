@@ -2871,15 +2871,18 @@ async fn run() -> Result<(), String> {
     }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), whatever set its instructions before; a file of
-    // the folder's it cannot use is left out, and said.
+    // the folder's it cannot use is left out, and said. Only here, as the
+    // window opens, as Codex reads its instructions once as a session
+    // starts: they lead every request, so a change while the lead works
+    // would cost its next call the whole prompt cache.
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
             .or(bot["workspace"].as_str().map(std::path::Path::new))
     {
         let chosen = project::chosen(&app.options.store, &name);
-        app.holds = bot["instructions"].as_str().unwrap_or_default().to_owned();
-        match project::review(dir, &app.holds, chosen.as_deref()) {
+        let holds = bot["instructions"].as_str().unwrap_or_default();
+        match project::review(dir, holds, chosen.as_deref()) {
             Ok((taken, left_out)) => {
                 app.warnings.extend(left_out);
                 app.instruct = taken;
@@ -5475,10 +5478,6 @@ struct App {
     restored: Option<trigger::Restored>,
     /// The folder the next message moves the bot to: its lead moved away.
     move_to: Option<String>,
-    /// The instructions the lead holds, as this window last saw or sent
-    /// them: at each idle point its folder's are composed again and sent
-    /// when they differ.
-    holds: String,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
     /// Connecting again beside the loop, and reading what happened while
@@ -7433,7 +7432,6 @@ impl App {
             upgrades: None,
             restored: None,
             move_to: None,
-            holds: String::new(),
             retry: None,
             reattaching: None,
             upgraded: false,
@@ -8115,34 +8113,6 @@ impl App {
         self.words_only = view == View::Words;
     }
 
-    /// A lead takes its folder's instructions at each idle point: composed
-    /// again as a turn ends, and sent by the [`App::configure`] that
-    /// follows when they changed. A file of the folder's it cannot use is
-    /// left out, and said, and the lead told.
-    fn folder_instructions(&mut self) {
-        if self.project.is_none() || self.options.side.is_some() {
-            return;
-        }
-        let chosen = project::chosen(&self.options.store, &self.bot);
-        let dir = std::path::Path::new(&self.workspace);
-        match project::review(dir, &self.holds, chosen.as_deref()) {
-            Ok((None, _)) => {}
-            Ok((Some(text), left_out)) => {
-                self.instruct = Some(text);
-                self.notice = project::warnings_notice(&left_out, true);
-                let (client, bot) = (self.client.clone(), self.bot.clone());
-                self.write(async move {
-                    let told = project::tell_warnings(&client, &bot, &left_out).await;
-                    let said = told
-                        .err()
-                        .map(|error| format!("the lead's instructions: {error}"));
-                    Wrote::Said(said)
-                });
-            }
-            Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
-        }
-    }
-
     /// `write` sent to the daemon beside the loop, once the writes made
     /// before it are done, as Codex sends its ops one after another: the
     /// window goes on meanwhile, and what came of each is applied in the
@@ -8424,9 +8394,6 @@ impl App {
             Ok(_) => {
                 if let Some(declare) = &declare {
                     self.declared = declare.clone();
-                }
-                if let Some(text) = text {
-                    self.holds = text;
                 }
                 if let Some((model, effort)) = switch {
                     // A lead's project file says what it runs, for the next
@@ -13643,7 +13610,6 @@ impl App {
                     "interrupted" => "idle",
                     _ => "error",
                 });
-                self.folder_instructions();
                 self.configure();
                 // Only this view knows whether the turn said anything, so it
                 // rings for the end of every turn of its own; the project's
@@ -25622,6 +25588,52 @@ mod tests {
                 .await;
             assert!(app.suggesting.is_none(), "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_lead_keeps_its_instructions_through_its_turns_so_its_next_call_reads_the_cache() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({})
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-lead-holds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "Run the tests.\n").unwrap();
+        let mut app = app(client);
+        app.project = Some("shop".into());
+        app.workspace = dir.display().to_string();
+        // What its folder tells it changes while it works, as a rule
+        // edited or a fact saved to its memory does.
+        std::fs::write(dir.join("AGENTS.md"), "Run the tests twice.\n").unwrap();
+        for turn in 1..=3 {
+            app.daemon(turn_event("accepted", turn, json!({}))).await;
+            app.daemon(turn_event(
+                "turn_finished",
+                turn,
+                json!({"status": "completed"}),
+            ))
+            .await;
+            app.beside_done().await;
+        }
+        // Its instructions lead every request: sent again between two
+        // calls, they would cost the next one the whole prompt cache.
+        // They are taken as a window opens, as Codex reads its own once.
+        assert!(app.instruct.is_none());
+        let configured: Vec<Value> = (asked.lock().unwrap().iter())
+            .filter(|request| request["op"] == "configure")
+            .cloned()
+            .collect();
+        assert!(
+            configured
+                .iter()
+                .all(|request| request.get("instructions").is_none()),
+            "{configured:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
