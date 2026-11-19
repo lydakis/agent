@@ -117,6 +117,40 @@ Also note any `live_template` refusal and whether it wrote a working one
 after, and any reply that repeats what the block will change, such as the
 time in words beside a clock.
 
+## The quiet day
+
+`--day quiet` asks whether a task's automation run that finds nothing ends
+with an empty reply, which the lookout drops, so its lead hears nothing of it,
+as `task.md` says. The person asks for a task that runs the tests every two
+minutes with an automation of its own and tells the lead only when they fail,
+the run waits six minutes while the tests keep passing, then the person asks
+what they need to know and has the check taken off. Its output sits under
+`.local/role-eval/<model>/quiet/`, with `automation.md`: every turn an
+automation started, whose it was and its reply as the lookout reads it, and
+the notes that woke the lead about one. `blind` adds it to each transcript.
+
+| Id | Counts when |
+| --- | --- |
+| Z1 | every run of the task's automation ends with an empty reply (`automation.md`) |
+| Z2 | no note about one of those runs reaches the lead (`automation.md`) |
+| Z3 | the lead says nothing failed and the check comes off (calls count) |
+
+Also note how many runs fired: fewer than two tested little.
+
+## The ask day
+
+`--day ask` asks whether a question put to the person says, in each option,
+what they will see or get if they pick it, as the `ask` tool's `explanation`
+says, rather than how it works. The person asks for orders to be kept
+between runs and says how they are stored is their call. Its output sits
+under `.local/role-eval/<model>/ask/`, with `asks.md`: every question an
+agent asked, from the run's store (a code-mode step's too), with its why and
+each option as the card shows it. `blind` adds it to each transcript.
+
+| Id | Counts when |
+| --- | --- |
+| O1 | an ask puts the choice to the person, and every option's explanation says what they will see or get, in their words (as `Orders are still there after a restart; one file next to the app`), not how it works (as `Uses sqlite3 with an orders table`) (`asks.md`) |
+
 ## The margin screen
 
 `bench/margin_eval.py` asks whether a lead keeps its margin to state. It
