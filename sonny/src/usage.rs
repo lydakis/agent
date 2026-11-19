@@ -422,6 +422,12 @@ impl View {
                 Line::from("Each turn an agent takes counts here, in the project it started in.")
                     .dim(),
             );
+            // A task can still work, or have ended, on a turn started
+            // before the period.
+            if let Some(tasks) = Tasks::of(&usage["tasks"]) {
+                out.push(Line::default());
+                out.extend(tasks.lines(read.period, width));
+            }
             return out;
         }
         let input = total.fresh + total.cached;
@@ -1811,6 +1817,21 @@ mod tests {
         assert_eq!(shown, [("p.old", false), ("p.long", true)]);
         assert_eq!(before[0]["person_messages"], 1);
         assert_eq!(Tasks::before(&before), (0, 1));
+    }
+
+    #[test]
+    fn tasks_show_with_no_turn_started_in_the_period() {
+        let mut view = View::new(scope());
+        let (_, window) = view.query(1_800_000_000_000);
+        let tasks = Tasks {
+            worked: 1,
+            working: 1,
+            ..Tasks::default()
+        };
+        view.loaded(window, Ok(json!({"turns": 0, "tasks": tasks})), Vec::new());
+        let card = text(&view.card(80));
+        assert!(card.contains("No turns in the "), "{card}");
+        assert!(card.contains("Tasks  1 worked in the "), "{card}");
     }
 
     #[test]
