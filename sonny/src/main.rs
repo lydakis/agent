@@ -645,6 +645,8 @@ struct StatusRead {
     /// The agents whose history moved since it was read, in the listing's
     /// order, left to read beside the card ([`StatusView::fill`]).
     unread: Vec<String>,
+    /// Of those, the ones with no title, whose first line is read too.
+    untitled: std::collections::HashSet<String>,
 }
 
 /// The agents of `scope` as `/status` shows them, and footers and leads
@@ -789,6 +791,7 @@ async fn read_status_of(
     let mut listed_here: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let (mut fresh, mut whole) = (false, true);
     let mut unread_here = Vec::new();
+    let mut untitled_here = std::collections::HashSet::new();
     // Side chats are not the project's agents.
     for bot in listed {
         let name = bot.name.as_str();
@@ -844,7 +847,12 @@ async fn read_status_of(
         let stale = !is_read(bot, &head, status_read, asks_seen);
         if stale || untitled {
             match view.fill {
-                true => unread_here.push(name.to_owned()),
+                true => {
+                    unread_here.push(name.to_owned());
+                    if untitled {
+                        untitled_here.insert(name.to_owned());
+                    }
+                }
                 false => {
                     if stale {
                         fresh = true;
@@ -1093,6 +1101,7 @@ async fn read_status_of(
         fresh,
         whole,
         unread: unread_here,
+        untitled: untitled_here,
     })
 }
 
@@ -1169,6 +1178,7 @@ async fn fill_status(
             return (alerts, None);
         };
         let mut unread = std::mem::take(&mut read.unread);
+        let untitled = std::mem::take(&mut read.untitled);
         unread.retain(|name| !failed.contains(name));
         let owed = owed.get_or_insert_with(|| unread.iter().cloned().collect());
         let still: std::collections::HashSet<&str> = unread.iter().map(String::as_str).collect();
@@ -1226,7 +1236,9 @@ async fn fill_status(
             };
             fresh = true;
             let read = read_agent(client, bot, status_read, asks_seen, view.readers).await;
-            if !(read & read_title(client, options_store, bot).await) {
+            // Only one with no title, so a lead keeps its project's.
+            let titled = !untitled.contains(name) || read_title(client, options_store, bot).await;
+            if !(read & titled) {
                 failed.insert(name.clone());
             }
         }
@@ -1594,9 +1606,11 @@ async fn read_title(client: &Client, store: &std::path::Path, bot: &standing::Ag
     let first = async {
         let asked = json!({"bot": name, "limit": 4, "oldest_first": true});
         let page = client.request("history_nodes", asked).await.ok()?;
-        let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+        let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
             .filter_map(|node| node["node"].as_i64())
             .collect();
+        // The oldest page comes newest first, as every page does.
+        nodes.sort_unstable();
         let read = client
             .request("history_items", json!({"bot": name, "nodes": nodes}))
             .await
@@ -25649,10 +25663,26 @@ mod tests {
                 "created_by": "titled.lead"},
             {"name": "titled.kept", "bot_id": 3, "head": 4, "last": {"turn": 1, "status": "completed"},
                 "created_by": "titled.lead"},
-            {"name": "titled.lead", "bot_id": 1, "head": null},
+            {"name": "titled.lead", "bot_id": 1, "head": 2, "workspace": "WORKSPACE",
+                "last": {"turn": 1, "status": "completed"}},
         ]);
         let reads = Arc::new(AtomicUsize::new(0));
         let counted_reads = reads.clone();
+        let dir = std::env::temp_dir().join(unique("sonny-first-line"));
+        // The lead's project has a title of its own.
+        let folder = dir.join("titled");
+        std::fs::create_dir_all(folder.join(".agents")).unwrap();
+        std::fs::write(
+            folder.join(agent_client::project::FILE),
+            "name = \"titled\"\ntitle = \"Tally the logins\"\n",
+        )
+        .unwrap();
+        let snapshot: Value = serde_json::from_str(
+            &snapshot
+                .to_string()
+                .replace("WORKSPACE", folder.to_str().unwrap()),
+        )
+        .unwrap();
         let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
             "bots" => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
             "follow" => json!({"following": ask["bot"]}),
@@ -25661,22 +25691,23 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(ask["bot"].as_str().unwrap().to_owned());
-                json!({"nodes": [{"node": 1, "turn": 1}], "next_from": null})
+                // The oldest page, newest first as every page comes.
+                json!({"nodes": [{"node": 3, "turn": 2}, {"node": 1, "turn": 1}], "next_from": null})
             }
             "history_nodes" => {
                 counted_reads.fetch_add(1, Ordering::SeqCst);
                 json!({"nodes": [], "next_from": null})
             }
-            "history_items" if ask["nodes"] == json!([1]) => json!({"items": [{"node": 1,
-                "item": {"role": "user", "content": [{"type": "input_text",
-                    "text": "\nFix the flaky login test\nIt fails one run in ten."}]}}]}),
+            "history_items" if ask["nodes"] == json!([1, 3]) => json!({"items": [
+                {"node": 1, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "\nFix the flaky login test\nIt fails one run in ten."}]}},
+                {"node": 3, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Also check the logout"}]}}]}),
             "history_items" => json!({"items": []}),
             "approvals" => json!({"approvals": []}),
             _ => json!({}),
         })
         .await;
-        let dir = std::env::temp_dir().join(unique("sonny-first-line"));
-        std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
         crate::title::note(&store, "titled.kept", 3, "Keep the cache warm").unwrap();
         let mut app = app(client);
@@ -25720,6 +25751,20 @@ mod tests {
             Some("Fix the flaky login test")
         );
         assert!(reads.load(Ordering::SeqCst) > 0);
+        // `/status` filling in reads none either, and the lead keeps its
+        // project's title.
+        app.status_read.clear();
+        app.asks_seen.clear();
+        app.status().await;
+        app.status_whole().await;
+        assert_eq!(*firsts.lock().unwrap(), ["titled.helper"]);
+        assert_eq!(crate::title::noted(&store, "titled.lead", 1), None);
+        assert_eq!(
+            titles
+                .named("titled.lead", Some(1), folder.to_str())
+                .as_deref(),
+            Some("Tally the logins")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
