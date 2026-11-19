@@ -1466,6 +1466,9 @@ class SocketAndCliTests(ModelFixture):
                          [('Bob', 'shell', 'shell', 'nobody', 'unknown', 'completed')])
         self.assertEqual(audit('--kind', 'web'), [])
         self.assertEqual(audit('--bot', 'B*', '--since', '1h'), rows)
+        # Who approved is a word of its own, read as written, by its index for the person's.
+        self.assertEqual(audit('--approved', 'nobody'), rows)
+        self.assertEqual(audit('--approved', 'person'), [])
         self.assertIn(' Bob ', self.agent('audit', *store, '--pretty').stdout)
         bad = self.agent('audit', *store, '--kind', 'disk', check=False)
         self.assertEqual(json.loads(bad.stderr)['error'], 'invalid_audit')

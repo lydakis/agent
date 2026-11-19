@@ -1856,15 +1856,16 @@ a screen: the same statement in Python's SQLite over a synthetic store of 164k
 turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
 Sonny's `/usage` draws it, reading again once a minute while it is open.
 
-Protocol 94 lets `usage` take `until_ms`, only the turns started before it
+Protocol 97 lets `usage` take `until_ms`, only the turns started before it
 (the answer echoes it, `null` when absent; earlier than `since_ms` is
 `invalid_usage_window`), and `names`, 1 to 256 names of up to 128 bytes as
 `bots` takes them, only those bots' turns, found by each name's own turns
 rather than every turn in the window; with `name` too, both narrow. A client
 reads a window that has ended, or many bots' own rows past the `limit` of
 one read, a page of names at a time. Sonny's `/usage` reads its tasks so,
-this period and the one before: over a synthetic store of 10,000 tasks and
-200,000 turns, 80 reads of 256 names took about 0.4 s in all.
+this period and the one before, beside the person's `messages` and `audit`:
+over a synthetic store of 10,000 tasks and 200,000 turns, a month's Tasks
+read in about 1.5 s on four CPUs, one project's in about 66 ms.
 
 Protocol 24 lets a bot declare up to 32 tools, from 16, under the same 64 KiB
 of declarations: a Sonny lead with MCP servers already declared 15 of Sonny's
@@ -4255,7 +4256,12 @@ one, and the rest equal to a row's. `limit` is 1 to 500 (100 by default).
 The reply is `{rows, next_before}`; pass `next_before` as `before` for the
 next older page, `null` when there is none. A word outside a field's
 vocabulary is `invalid_audit`, never an empty page. It reads on a reader
-connection, so it waits for no turn.
+connection, so it waits for no turn. The calls a person decided have an
+index of their own, `audit_person` on `(id, bot)` for `approved` `person`
+(protocol 97): they are few beside the rest, so a read of them, every
+agent's or a pattern's, walks only theirs (a project's month over a
+synthetic trail of 1M rows: 9 ms, from 71 ms), and a call nobody or a rule
+approved writes nothing more.
 
 `{"op":"audit_trim","before"}` or `{"op":"audit_trim","before_ms"}`
 deletes every row older than that id or time, in pieces of 10,000 on the

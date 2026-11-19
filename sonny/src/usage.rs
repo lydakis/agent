@@ -1000,7 +1000,8 @@ pub struct Tasks {
 /// One agent another made, as [`read`] lists it.
 struct Made<'a> {
     bot: &'a str,
-    work_ms: u64,
+    /// None when a turn went untimed.
+    work_ms: Option<u64>,
     running: bool,
     last_turn: Option<i64>,
     messages: u64,
@@ -1014,7 +1015,7 @@ impl<'a> Made<'a> {
         let count = |key: &str| row[key].as_u64().unwrap_or(0);
         Some(Self {
             bot,
-            work_ms: count("work_ms"),
+            work_ms: row["work_ms"].as_u64(),
             running: row["running"] == true,
             last_turn: row["last_turn"].as_i64(),
             messages: count("person_messages"),
@@ -1060,11 +1061,14 @@ impl Tasks {
             tasks.messages += made.messages;
             tasks.calls += made.calls;
             tasks.done += done(made.bot, made.last_turn, made.running) as u64;
-            let length = (LENGTHS.iter())
-                .position(|(most, _)| made.work_ms < *most)
-                .unwrap_or(LENGTHS.len() - 1);
-            tasks.lengths[length].0 += alone;
-            tasks.lengths[length].1 += 1;
+            // A task with an untimed turn has no length to count it by.
+            if let Some(work_ms) = made.work_ms {
+                let length = (LENGTHS.iter())
+                    .position(|(most, _)| work_ms < *most)
+                    .unwrap_or(LENGTHS.len() - 1);
+                tasks.lengths[length].0 += alone;
+                tasks.lengths[length].1 += 1;
+            }
             let role = role(made.bot).unwrap_or_else(|| "no role".to_owned());
             match tasks.roles.iter_mut().find(|(name, ..)| *name == role) {
                 Some((_, without, of)) => {
@@ -1210,10 +1214,14 @@ pub async fn read(
     ask: Ask,
     store: PathBuf,
 ) -> Result<Value, String> {
-    let (usage, tasks) = tokio::join!(
-        window.request("usage", ask.usage.clone()),
-        tasks(&socket, &ask, store),
-    );
+    // The period's own usage is this period's for the tasks too.
+    let (read, this) = tokio::sync::oneshot::channel();
+    let usage = async {
+        let usage = window.request("usage", ask.usage.clone()).await;
+        let _ = read.send(usage.as_ref().ok().cloned());
+        usage
+    };
+    let (usage, tasks) = tokio::join!(usage, tasks(&socket, &ask, store, this));
     let mut usage = usage.map_err(|error| error.to_string())?;
     if let Some(tasks) = tasks {
         usage["tasks"] = serde_json::to_value(tasks).unwrap_or_default();
@@ -1221,20 +1229,26 @@ pub async fn read(
     Ok(usage)
 }
 
-/// How the tasks `ask` covers went, read on [`AT_ONCE`] connections of
-/// their own to `socket`, so their replies never crowd the window's and
-/// the daemon answers them side by side (it answers one connection's in
-/// turn): the tasks from `bots`, their turns and time from `usage` by
-/// their names, the person's messages from `messages` and the calls they
-/// decided from `audit`, for each period, all asked at once; their done
+/// How the tasks `ask` covers went, read on connections of their own to
+/// `socket`, so their replies never crowd the window's, and several, as the
+/// daemon answers one connection's reads in turn: the tasks from `bots`,
+/// their turns and time from the period's own `usage` (sent on by the
+/// window as `usage`) and the period before's, or by their names when more
+/// worked than one read lists, the person's messages from `messages` and
+/// the calls they decided from `audit`, all asked at once; their done
 /// marks and roles beside `store`. None when any of it could not be read:
 /// without every message and call, a task the person stepped into would
 /// read as one that finished without them.
-async fn tasks(socket: &std::path::Path, ask: &Ask, store: PathBuf) -> Option<Tasks> {
+async fn tasks(
+    socket: &std::path::Path,
+    ask: &Ask,
+    store: PathBuf,
+    usage: tokio::sync::oneshot::Receiver<Option<Value>>,
+) -> Option<Tasks> {
     let (since, now) = (ask.since, ask.now);
     let before = (since - (now - since).max(1)).max(0);
     let mut connects = tokio::task::JoinSet::new();
-    for _ in 0..AT_ONCE {
+    for _ in 0..=AT_ONCE {
         let socket = socket.to_owned();
         connects.spawn(async move { agent_client::Client::connect(&socket).await });
     }
@@ -1246,23 +1260,45 @@ async fn tasks(socket: &std::path::Path, ask: &Ask, store: PathBuf) -> Option<Ta
     }
     let scope = ask.name.clone().unwrap_or_else(|| "*".to_owned());
     let spent = async {
-        let tasks = listed(&clients[0], ask.name.as_deref(), before).await?;
+        // Each period's usage in one read when its bots fit one; else by
+        // the tasks' names, once they are listed.
+        let name = ask.name.as_deref();
+        let (tasks, this, last) = tokio::join!(
+            listed(&clients[0], name, before),
+            async { Some(complete(&usage.await.ok()??)) },
+            async { Some(complete(&spent_in(&clients[2], name, before, since).await?)) },
+        );
+        let tasks = tasks?;
         let names: Vec<&str> = tasks.iter().map(|task| task.bot.as_str()).collect();
         let (this, last) = tokio::join!(
-            spent(&clients, &names, since, now),
-            spent(&clients[AT_ONCE / 2..], &names, before, since),
+            async {
+                match this {
+                    Some(Some(this)) => Some(this),
+                    _ => spent(&clients, &names, since, now).await,
+                }
+            },
+            async {
+                match last {
+                    Some(Some(last)) => Some(last),
+                    _ => spent(&clients[AT_ONCE / 2..], &names, before, since).await,
+                }
+            },
         );
         Some((tasks, this?, last))
     };
     let (spent, wrote, decided) = tokio::join!(
         spent,
-        person(&clients, Person::Messages, &scope, (before, since, now)),
-        person(&clients, Person::Calls, &scope, (before, since, now)),
+        async {
+            let wrote = person(&clients, 1, Person::Messages, &scope, (before, now)).await?;
+            without_briefs(&clients, wrote).await
+        },
+        person(&clients, 3, Person::Calls, &scope, (before, now)),
     );
     let ((tasks, this, last), wrote, decided) = (spent?, wrote?, decided?);
+    let (wrote, decided) = (split(&wrote, since), split(&decided, since));
     let tally = move || {
-        let this = rows(&tasks, &this, &wrote.0, &decided.0, Some(now));
-        let last = last.map(|last| rows(&tasks, &last, &wrote.1, &decided.1, None));
+        let this = rows(&tasks, &this, &wrote.0, &decided.0, (since, now));
+        let last = last.map(|last| rows(&tasks, &last, &wrote.1, &decided.1, (before, since)));
         let mut tasks = Tasks::tally(
             &this,
             |bot, last, running| {
@@ -1279,6 +1315,7 @@ async fn tasks(socket: &std::path::Path, ask: &Ask, store: PathBuf) -> Option<Ta
 /// A task as `bots` lists it.
 struct Listed {
     bot: String,
+    bot_id: i64,
     /// When the turn it runs started; none when it runs none.
     running: Option<i64>,
     last: Option<i64>,
@@ -1310,7 +1347,8 @@ async fn listed(
             }
             tasks.push(Listed {
                 bot: bot["name"].as_str().unwrap_or_default().to_owned(),
-                running: running.then(|| bot["started_ms"].as_i64().unwrap_or(i64::MAX)),
+                bot_id: bot["bot_id"].as_i64().unwrap_or_default(),
+                running: running.then(|| bot["started_ms"].as_i64().unwrap_or(since)),
                 last: bot["running_turn"]
                     .as_i64()
                     .or(bot["last"]["turn"].as_i64()),
@@ -1325,6 +1363,54 @@ async fn listed(
     }
 }
 
+/// The usage of each agent in scope `name` (every agent with none) from
+/// `since` to `until`, in one read of as many as it lists; none when it
+/// could not be read.
+async fn spent_in(
+    client: &agent_client::Client,
+    name: Option<&str>,
+    since: i64,
+    until: i64,
+) -> Option<Value> {
+    let mut query = json!({"since_ms": since, "until_ms": until, "limit": 256});
+    if let Some(name) = name {
+        query["name"] = json!(name);
+    }
+    client.request("usage", query).await.ok()
+}
+
+/// What [`by_bot`] reads from a `usage` read, when it lists every agent
+/// that worked.
+fn complete(read: &Value) -> Option<HashMap<String, Worked>> {
+    read["other_bots"].is_null().then(|| by_bot(read))
+}
+
+/// What an agent's turns in a period spent, as `usage` reads it.
+#[derive(Clone, Copy, Default)]
+struct Worked {
+    /// The turns it started.
+    turns: u64,
+    /// Those that finished with timed calls, the only ones `usage` times.
+    timed: u64,
+    /// Their time from start to end.
+    turn_ms: u64,
+}
+
+/// What each bot's turns spent, from a `usage` read.
+fn by_bot(read: &Value) -> HashMap<String, Worked> {
+    let count = |value: &Value| value.as_u64().unwrap_or(0);
+    (read["bots"].as_array().into_iter().flatten())
+        .filter_map(|bot| {
+            let spent = Worked {
+                turns: count(&bot["turns"]),
+                timed: count(&bot["time"]["turns"]),
+                turn_ms: count(&bot["time"]["turn_ms"]),
+            };
+            Some((bot["bot"].as_str()?.to_owned(), spent))
+        })
+        .collect()
+}
+
 /// The turns each of `names` started from `since` to `until`, and the time
 /// its finished ones took, from `usage` asked for as many names at a time
 /// as it takes, a few reads at once; none when a read failed.
@@ -1333,7 +1419,7 @@ async fn spent(
     names: &[&str],
     since: i64,
     until: i64,
-) -> Option<HashMap<String, (u64, u64)>> {
+) -> Option<HashMap<String, Worked>> {
     let mut chunks = names.chunks(256).enumerate();
     let mut reads = tokio::task::JoinSet::new();
     let mut spent = HashMap::new();
@@ -1350,13 +1436,7 @@ async fn spent(
         let Some(read) = reads.join_next().await else {
             return Some(spent);
         };
-        for bot in read.ok()??["bots"].as_array().into_iter().flatten() {
-            let count = |value: &Value| value.as_u64().unwrap_or(0);
-            if let Some(name) = bot["bot"].as_str() {
-                let time = (count(&bot["turns"]), count(&bot["time"]["turn_ms"]));
-                spent.insert(name.to_owned(), time);
-            }
-        }
+        spent.extend(by_bot(&read.ok()??));
     }
 }
 
@@ -1365,9 +1445,74 @@ async fn spent(
 /// reads side by side.
 const AT_ONCE: usize = 4;
 
-/// By agent, how many of something the person did from `since` to `now`,
-/// and in the period before.
-type Split = (HashMap<String, u64>, HashMap<String, u64>);
+/// One thing the person did for an agent: its name and number, the
+/// message's number (none for a call), and when.
+struct Did {
+    bot: String,
+    bot_id: i64,
+    message: Option<i64>,
+    at: i64,
+}
+
+/// By agent number, how many of something the person did from `since` to
+/// `now`, and in the period before.
+type Split = (HashMap<i64, u64>, HashMap<i64, u64>);
+
+/// How many of `done` fell to each agent, split at `since`.
+fn split(done: &[Did], since: i64) -> Split {
+    let mut split = Split::default();
+    for did in done {
+        let side = if did.at < since {
+            &mut split.1
+        } else {
+            &mut split.0
+        };
+        *side.entry(did.bot_id).or_default() += 1;
+    }
+    split
+}
+
+/// The person's messages in `wrote` but each task's first: Sonny starts a
+/// task with the person's words as its brief, which is no stepping in. A
+/// task's first message here is its first of all when it has none before
+/// it, which one read a task asks, all of them side by side.
+async fn without_briefs(
+    clients: &[Arc<agent_client::Client>],
+    wrote: Vec<Did>,
+) -> Option<Vec<Did>> {
+    let mut first: HashMap<i64, (&str, i64)> = HashMap::new();
+    // Leads, workflow workers and Sonny's own are no tasks.
+    let task = |bot: &str| {
+        !crate::project::is_lead(bot)
+            && !crate::project::is_internal(bot)
+            && !crate::workflow::is_worker(bot)
+    };
+    for did in wrote.iter().filter(|did| task(&did.bot)) {
+        let Some(message) = did.message else { continue };
+        let earliest = first.entry(did.bot_id).or_insert((&did.bot, message));
+        earliest.1 = earliest.1.min(message);
+    }
+    let mut reads = tokio::task::JoinSet::new();
+    for (at, (bot, message)) in first.into_values().enumerate() {
+        let client = clients[at % clients.len()].clone();
+        let query = json!({"bot": bot, "before": message, "limit": 1});
+        reads.spawn(async move {
+            // A task gone since is no brief to leave out.
+            let page = client.request("messages", query).await.ok();
+            let first = page.is_some_and(|page| page["messages"] == json!([]));
+            first.then_some(message)
+        });
+    }
+    let mut briefs = std::collections::HashSet::new();
+    while let Some(read) = reads.join_next().await {
+        briefs.extend(read.ok()?);
+    }
+    Some(
+        (wrote.into_iter())
+            .filter(|did| !did.message.is_some_and(|message| briefs.contains(&message)))
+            .collect(),
+    )
+}
 
 /// What the person did that [`person`] counts.
 #[derive(Clone, Copy)]
@@ -1378,49 +1523,43 @@ enum Person {
     Calls,
 }
 
-/// How many `what` the person did for each agent in `scope` over
-/// `(before, since, now)`, split at `since`: the span read in [`AT_ONCE`]
-/// slices side by side, each paged to its end. None when any page could
-/// not be read.
+/// Each `what` the person did for an agent in `scope` from `before` to
+/// `now`, read in [`AT_ONCE`] slices of the span side by side, from
+/// connection `first` on, each paged to its end: the daemon answers one
+/// connection's reads in turn, and a page's cost is its rows. None when any
+/// page could not be read.
 async fn person(
     clients: &[Arc<agent_client::Client>],
+    first: usize,
     what: Person,
     scope: &str,
-    (before, since, now): (i64, i64, i64),
-) -> Option<Split> {
+    (before, now): (i64, i64),
+) -> Option<Vec<Did>> {
     let step = ((now - before) / AT_ONCE as i64).max(1);
     let mut reads = tokio::task::JoinSet::new();
-    let mut from = before;
-    while from < now {
-        let until = (from + step).min(now);
-        let client = clients[reads.len() % clients.len()].clone();
+    let mut at = before;
+    while at < now {
+        let until = (at + step).min(now);
+        let client = clients[(first + reads.len()) % clients.len()].clone();
         let scope = scope.to_owned();
-        reads.spawn(async move { person_slice(&client, what, &scope, from, until).await });
-        from = until;
+        reads.spawn(async move { person_pages(&client, what, &scope, (at, until)).await });
+        at = until;
     }
-    let mut split = Split::default();
+    let mut done = Vec::new();
     while let Some(read) = reads.join_next().await {
-        for (bot, at) in read.ok()?? {
-            let side = if at < since {
-                &mut split.1
-            } else {
-                &mut split.0
-            };
-            *side.entry(bot).or_default() += 1;
-        }
+        done.extend(read.ok()??);
     }
-    Some(split)
+    Some(done)
 }
 
 /// Each of `what` the person did for an agent in `scope` from `since` to
-/// `until`: the agent and when.
-async fn person_slice(
+/// `until`, every page of it: the agent, its number, the message's and when.
+async fn person_pages(
     client: &agent_client::Client,
     what: Person,
     scope: &str,
-    since: i64,
-    until: i64,
-) -> Option<Vec<(String, i64)>> {
+    (since, until): (i64, i64),
+) -> Option<Vec<Did>> {
     let (op, list, time, next, mut query) = match what {
         Person::Messages => (
             "messages",
@@ -1442,8 +1581,18 @@ async fn person_slice(
     loop {
         let page = client.request(op, query.clone()).await.ok()?;
         for row in page[list].as_array().into_iter().flatten() {
-            if let (Some(bot), Some(at)) = (row["bot"].as_str(), row[time].as_i64()) {
-                done.push((bot.to_owned(), at));
+            if let (Some(bot), Some(bot_id), Some(at)) = (
+                row["bot"].as_str(),
+                row["bot_id"].as_i64(),
+                row[time].as_i64(),
+            ) {
+                let message = row["message"].as_i64();
+                done.push(Did {
+                    bot: bot.to_owned(),
+                    bot_id,
+                    message,
+                    at,
+                });
             }
         }
         match &page[next.0] {
@@ -1453,30 +1602,37 @@ async fn person_slice(
     }
 }
 
-/// Each of `tasks` that started a turn in a period, as [`Tasks::tally`]
-/// takes it: its turns and their time from `spent`, the person's messages
-/// in `wrote` and calls in `decided`. With `now`, the period runs to now:
-/// a task running counts as running, its turn's time so far with the rest.
+/// Each of `tasks` that worked in the period from `start` to `end`, as
+/// [`Tasks::tally`] takes it: its turns and their time from `spent`, the
+/// person's messages in `wrote` and calls in `decided`. A task whose turn
+/// started before `end` and still runs counts as running, its turn's time
+/// so far with the rest, so one still at work when an earlier period ended
+/// is not counted as ended there. Its time is none when a turn it finished
+/// went untimed, which `usage` leaves out of `turn_ms`.
 fn rows(
     tasks: &[Listed],
-    spent: &HashMap<String, (u64, u64)>,
-    wrote: &HashMap<String, u64>,
-    decided: &HashMap<String, u64>,
-    now: Option<i64>,
+    spent: &HashMap<String, Worked>,
+    wrote: &HashMap<i64, u64>,
+    decided: &HashMap<i64, u64>,
+    (start, end): (i64, i64),
 ) -> Vec<Value> {
     let mut rows = Vec::new();
     for task in tasks {
-        let Some(&(turns, mut work_ms)) = spent.get(&task.bot).filter(|(turns, _)| *turns > 0)
-        else {
+        let spent = spent.get(&task.bot).copied().unwrap_or_default();
+        let running = task.running.filter(|started| *started < end);
+        if spent.turns == 0 && running.is_none() {
             continue;
-        };
-        let running = now.zip(task.running);
-        if let Some((now, started)) = running {
-            work_ms += (now - started).max(0) as u64;
         }
-        let count = |of: &HashMap<String, u64>| of.get(&task.bot).copied().unwrap_or(0);
+        // Its running turn, when it started in the period, is among its
+        // turns but not yet timed.
+        let open = running.is_some_and(|started| started >= start) as u64;
+        let work_ms = (spent.turns == spent.timed + open).then(|| {
+            let so_far = running.map_or(0, |started| (end - started).max(0) as u64);
+            spent.turn_ms + so_far
+        });
+        let count = |of: &HashMap<i64, u64>| of.get(&task.bot_id).copied().unwrap_or(0);
         rows.push(json!({
-            "bot": task.bot, "turns": turns, "work_ms": work_ms,
+            "bot": task.bot, "turns": spent.turns, "work_ms": work_ms,
             "running": running.is_some(), "last_turn": task.last,
             "person_messages": count(wrote), "person_calls": count(decided),
             "created_by": task.created_by, "expire_ms": task.expire_ms,
@@ -1535,63 +1691,78 @@ mod tests {
         // A side chat of a task: made by it, expiring.
         let mut side = made("p.tidy.side-a1", 5, false, 1, 0);
         (side["created_by"], side["expire_ms"]) = (json!("p.tidy"), json!(3_600_000));
-        let rows = [&made_rows[..], &[side]].concat();
+        // A task with an untimed turn: counted, but by no length.
+        let mut untimed = made("p.quick", 0, false, 0, 0);
+        untimed["work_ms"] = Value::Null;
+        let rows = [&made_rows[..], &[side, untimed]].concat();
         let tasks = Tasks::tally(
             &rows,
             |bot, _, _| bot == "p.fix-login" || bot == "p.migrate",
             |bot| (bot == "p.migrate" || bot == "p.tidy").then(|| "backend".to_owned()),
         );
-        assert_eq!((tasks.worked, tasks.working, tasks.ended), (6, 1, 5));
-        assert_eq!(tasks.alone, 2);
+        assert_eq!((tasks.worked, tasks.working, tasks.ended), (7, 1, 6));
+        assert_eq!(tasks.alone, 3);
         // The running task's message is not counted until it ends.
         assert_eq!((tasks.messages, tasks.calls), (1, 3));
         assert_eq!(tasks.done, 2);
         assert_eq!(tasks.lengths, [(1, 2), (1, 2), (0, 1)]);
         assert_eq!(
             tasks.roles,
-            [("no role".to_owned(), 1, 3), ("backend".to_owned(), 1, 2)]
+            [("no role".to_owned(), 2, 4), ("backend".to_owned(), 1, 2)]
         );
-        assert_eq!(Tasks::before(&rows), (2, 5));
+        assert_eq!(Tasks::before(&rows), (3, 6));
     }
 
     #[test]
     fn each_period_counts_its_turns_and_what_the_person_did_in_them() {
-        let listed = |bot: &str, running: Option<i64>| Listed {
+        let listed = |bot: &str, bot_id: i64, running: Option<i64>| Listed {
             bot: bot.to_owned(),
+            bot_id,
             running,
             last: Some(9),
             created_by: json!("p.lead"),
             expire_ms: Value::Null,
         };
         let tasks = [
-            listed("p.a", None),
-            listed("p.b", Some(180)),
-            listed("p.old", None),
+            listed("p.a", 1, None),
+            listed("p.b", 2, Some(180)),
+            listed("p.old", 3, None),
+            listed("p.long", 4, Some(50)),
+            listed("p.untimed", 5, None),
         ];
-        let map = |pairs: &[(&str, u64)]| -> HashMap<String, u64> {
-            pairs.iter().map(|(bot, n)| (bot.to_string(), *n)).collect()
+        let spent = |turns, timed, turn_ms| Worked {
+            turns,
+            timed,
+            turn_ms,
         };
-        // Turns and their finished time: p.old worked only the period
-        // before; p.b runs one turn, started at 180.
+        // The person's, by agent number: p.a's own number 1, and 7, an
+        // agent of the same name before it, gone since, which is not p.a.
+        let by_id = |pairs: &[(i64, u64)]| -> HashMap<i64, u64> { pairs.iter().copied().collect() };
+        // p.old worked only the period before; p.b runs one turn, started
+        // at 180; p.long's turn started at 50, before this period, and
+        // runs still; one of p.untimed's two finished turns went untimed.
         let this = HashMap::from([
-            ("p.a".to_owned(), (2, 30)),
-            ("p.b".to_owned(), (1, 0)),
-            ("p.old".to_owned(), (0, 0)),
+            ("p.a".to_owned(), spent(2, 2, 30)),
+            ("p.b".to_owned(), spent(1, 0, 0)),
+            ("p.untimed".to_owned(), spent(2, 1, 40)),
         ]);
-        let last = HashMap::from([("p.old".to_owned(), (1, 10))]);
+        let last = HashMap::from([
+            ("p.old".to_owned(), spent(1, 1, 10)),
+            ("p.long".to_owned(), spent(1, 0, 0)),
+        ]);
         let rows_now = rows(
             &tasks,
             &this,
-            &map(&[("p.a", 1)]),
-            &map(&[("p.b", 2)]),
-            Some(200),
+            &by_id(&[(1, 1), (7, 4)]),
+            &by_id(&[(2, 2)]),
+            (100, 200),
         );
         let shown: Vec<_> = (rows_now.iter())
             .map(|row| {
                 (
                     row["bot"].as_str().unwrap(),
                     row["turns"].as_u64().unwrap(),
-                    row["work_ms"].as_u64().unwrap(),
+                    row["work_ms"].as_u64(),
                     row["running"] == true,
                     row["person_messages"].as_u64().unwrap(),
                     row["person_calls"].as_u64().unwrap(),
@@ -1601,16 +1772,24 @@ mod tests {
         assert_eq!(
             shown,
             [
-                ("p.a", 2, 30, false, 1, 0),
+                ("p.a", 2, Some(30), false, 1, 0),
                 // Running: its turn counts to now.
-                ("p.b", 1, 20, true, 0, 2),
+                ("p.b", 1, Some(20), true, 0, 2),
+                // Running since before the period: still at work in it.
+                ("p.long", 0, Some(150), true, 0, 0),
+                // An untimed turn: no time to count it by.
+                ("p.untimed", 2, None, false, 0, 0),
             ]
         );
-        let before = rows(&tasks, &last, &map(&[("p.old", 1)]), &HashMap::new(), None);
-        assert_eq!(before.len(), 1);
-        assert_eq!(before[0]["bot"], "p.old");
+        let before = rows(&tasks, &last, &by_id(&[(3, 1)]), &HashMap::new(), (0, 100));
+        let shown: Vec<_> = (before.iter())
+            .map(|row| (row["bot"].as_str().unwrap(), row["running"] == true))
+            .collect();
+        // p.long had not ended when that period did; p.b's turn started
+        // after it.
+        assert_eq!(shown, [("p.old", false), ("p.long", true)]);
         assert_eq!(before[0]["person_messages"], 1);
-        assert_eq!(before[0]["running"], false);
+        assert_eq!(Tasks::before(&before), (0, 1));
     }
 
     #[test]
