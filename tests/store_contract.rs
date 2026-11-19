@@ -22154,9 +22154,19 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             db.tool_start(turn, call, false, false).unwrap();
         }
         let now = epoch_now();
-        let (p1, _) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
-        let (p2, _) = db.lift(turn, "c2", None, None, &[], now).unwrap().unwrap();
-        let (p3, _) = db.lift(turn, "c3", None, None, &[], now).unwrap().unwrap();
+        // Each yielded by its client: no step of them waits on a gate, so
+        // a message would leave them running.
+        assert!(db.lift(turn, "c1", None, None, &[], now).unwrap().is_none());
+        let so_far = result("starting");
+        let (p1, _) = (db.lift(turn, "c1", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
+        let (p2, _) = (db.lift(turn, "c2", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
+        let (p3, _) = (db.lift(turn, "c3", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         (turn, p1, p2, p3)
@@ -22208,8 +22218,9 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
     let _ = std::fs::remove_file(&path);
 }
 
-/// A lifted answered call stays its client's past its turn: its time goes
-/// on the schedule when it lifts, a step its client asks for is listed for
+/// A lifted answered call stays its client's past its turn: a message lifts
+/// it only while a step of it waits on a gate, its time goes on the
+/// schedule once that step is decided, a step its client asks for is listed for
 /// its bot, a prune of its turn leaves it listed and answerable, and its
 /// answer ends its row in the audit trail.
 #[test]
@@ -22266,13 +22277,10 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .unwrap();
     db.tool_start(turn, &call, false, false).unwrap();
     let now = epoch_now();
-    let (process, lapse) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
-    let Some(lapse) = lapse else {
-        panic!("a lifted call with a time of its own was not scheduled");
-    };
-    assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
-    // A step asked for while its turn still runs is listed under its
-    // call's handle too.
+    // Running, no step of it at a gate: a message leaves it alone.
+    assert!(db.lift(turn, "c1", None, None, &[], now).unwrap().is_none());
+    // A step asked for while its turn still runs waits on its gate, which
+    // a message lifts the call for, and is listed under its call's handle.
     use agent_runtime::store::Step;
     let Step::Pending { .. } = db
         .step_announce(
@@ -22291,6 +22299,9 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
     else {
         panic!("a gated step was decided at once");
     };
+    let (process, lapse) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
+    // No time while its step waits on the gate.
+    assert_eq!(lapse, None);
     let running = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
     assert_eq!(running["approvals"][0]["call_id"], "c1/0", "{running}");
     assert_eq!(
@@ -22317,6 +22328,13 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         leased: false,
     })
     .unwrap();
+    // Let through, the step leaves the gate: the call's time runs again,
+    // on the schedule.
+    db.step_check("Lead", turn, "c1/0", now, false).unwrap();
+    let Lifted::Waiting(Some(lapse)) = db.lifted_check(process, now, false).unwrap() else {
+        panic!("a lifted call with a time of its own was not scheduled");
+    };
+    assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // A step its client asks for past the turn waits for the bot's gate,

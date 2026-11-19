@@ -14380,8 +14380,9 @@ impl Database {
     /// background command `proc:N`, which waits on past the turn, and its
     /// call is answered with that handle, in one commit. Verdicts the worker
     /// holds for it are written with it. `None` when it is decided or
-    /// answered already, lifted already, or its time ran out: the turn takes
-    /// it as it is. With `yielded`, its client's output so far, the client
+    /// answered already, lifted already, or its time ran out, or, for a
+    /// message's lift of a client's call, no step of it waits on a gate any
+    /// more: the turn takes it as it is. With `yielded`, its client's output so far, the client
     /// yields an answered call the same way ([`Database::yield_call`]): the
     /// handle says so and carries that output, and the call waits on its
     /// answer with no deadline.
@@ -14419,10 +14420,18 @@ impl Database {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                     })
                     .optional()?;
+                // A message lifts a client's call only while a step of it
+                // waits on a gate, checked here in the lift's own commit:
+                // one whose step was let through since runs, never moved.
+                // Its client's yield lifts it whatever its steps do.
+                let liftable = |paused: bool, expires_ms: i64| -> Result<bool> {
+                    Ok(match yielded {
+                        Some(_) => paused || now_ms < expires_ms.max(0) as u64,
+                        None => paused && self.step_gated(turn, call_id)?,
+                    })
+                };
                 match answer {
-                    Some((true, expires_ms, paused))
-                        if paused || now_ms < expires_ms.max(0) as u64 =>
-                    {
+                    Some((true, expires_ms, paused)) if liftable(paused, expires_ms)? => {
                         let lapse =
                             (!paused && yielded.is_none()).then_some(expires_ms.max(0) as u64);
                         ("answer", lapse)
