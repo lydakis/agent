@@ -4127,6 +4127,14 @@ mod tests {
         );
         // A short one shows whole.
         assert_eq!(prompt("- a\n- b", 80, None).1, Folds::default());
+        // A table drawn from all its lines at once folds whole where it ends.
+        let table: String = "| a | b |\n|---|---|\n".to_owned()
+            + &(1..=12)
+                .map(|n| format!("| {n} | x |\n"))
+                .collect::<String>();
+        let (rows, fold) = prompt(&table, 80, None);
+        assert!(fold.more.is_some(), "{:?}", text(&rows));
+        assert!(!text(&rows).iter().any(|row| row.contains('│')));
     }
 
     #[test]

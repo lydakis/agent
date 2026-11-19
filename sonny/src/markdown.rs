@@ -19,6 +19,7 @@ use ratatui::{
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
+use crate::table::Cells;
 use crate::transcript::{
     Picture, bars, fence_picture, html_tag, html_words, picture_file, picture_words, pictures,
     relead, width_hint, wrap, wrap_lines,
@@ -73,8 +74,9 @@ struct Block {
     gap: bool,
     rows: Vec<Line<'static>>,
     /// A table, whose columns a later row can widen: none of its rows is
-    /// handed out until it ends.
+    /// handed out until it ends. And where its last table ends.
     holds: bool,
+    tables: usize,
     /// A footnote's definition, which text after it can point at.
     note: bool,
     /// A list's items after its first, where each can be read on from.
@@ -83,11 +85,33 @@ struct Block {
     /// read on from no line inside one.
     paragraph: bool,
     across: Vec<Range<usize>>,
+    /// A paragraph in a container, its last words: the marks its rows
+    /// after its first start with, and its words' style. A line going on
+    /// with it is drawn under them.
+    lead: Option<Lead>,
     /// It points at a link or footnote not defined yet.
     broken: bool,
     /// A fence at the top level, open where the text ends: its marks and
     /// language.
     fence: Option<Fence>,
+}
+
+/// What a paragraph's rows after its first go under, and its words' style.
+#[derive(Clone)]
+struct Lead {
+    rest: Vec<Span<'static>>,
+    base: Style,
+}
+
+impl Lead {
+    /// A line going on with the paragraph, as its rows.
+    fn rows(&self, line: &str, width: usize) -> Vec<Line<'static>> {
+        let mut words = self.rest.clone();
+        words.extend(inline(line.trim_start(), self.base));
+        let mut hang = vec![Span::raw("  ")];
+        hang.extend(self.rest.iter().cloned());
+        wrap_lines(Line::from(words), width, Line::from("  "), Line::from(hang))
+    }
 }
 
 /// An item of a list at the top level, after its first: the items before
@@ -188,7 +212,8 @@ enum Leaf {
 /// row starting with the two columns a reply's lead takes. `end` says the
 /// text is all there is: a fence it leaves open shows as code.
 fn draw(source: &str, width: usize, at: &Where, notes: &mut Notes, end: bool) -> Vec<Block> {
-    draw_after(source, 0, width, at, notes, end).0
+    let mut cells = Cells::default();
+    draw_after(source, 0, width, at, notes, &mut cells, end).0
 }
 
 /// `source` drawn from `skip` on, what is before it read only for its
@@ -199,9 +224,11 @@ fn draw_after(
     width: usize,
     at: &Where,
     notes: &mut Notes,
+    cells: &mut Cells,
     end: bool,
 ) -> (Vec<Block>, Vec<Range<usize>>) {
     let mut draw = Draw {
+        cells,
         source,
         width,
         at,
@@ -225,9 +252,12 @@ fn draw_after(
         blocks: Vec::new(),
         top: None,
         top_holds: false,
+        top_tables: 0,
         top_note: false,
         top_paragraph: false,
         across: Vec::new(),
+        lead: None,
+        rest: Vec::new(),
         top_notes: 0,
         skip,
         loose: None,
@@ -294,6 +324,8 @@ struct Draw<'a> {
     width: usize,
     at: &'a Where,
     notes: &'a mut Notes,
+    /// The cells of tables read so far.
+    cells: &'a mut Cells,
     end: bool,
     /// Rows of the top-level block being drawn, and where in the text
     /// each one's line starts.
@@ -326,14 +358,20 @@ struct Draw<'a> {
     /// The top-level block open: where it starts, whether a blank line
     /// is before it, and its fence.
     top: Option<(usize, bool, Option<Fence>)>,
-    /// The top-level block holds a table.
+    /// The top-level block holds a table, and where its last table ends.
     top_holds: bool,
+    top_tables: usize,
     /// The top-level block is a footnote's definition.
     top_note: bool,
     /// The top-level block is a paragraph.
     top_paragraph: bool,
     /// Its marks that run across lines.
     across: Vec<Range<usize>>,
+    /// The last paragraph's lead, the rows drawn when it ended and where
+    /// it ended; the marks the last words drawn went under after their
+    /// first row.
+    lead: Option<(usize, usize, Lead)>,
+    rest: Vec<Span<'static>>,
     /// The footnotes it points at that are defined.
     top_notes: usize,
     /// Where the text drawn starts: before it, definitions read earlier,
@@ -375,7 +413,12 @@ impl Draw<'_> {
             self.styles.clear();
             self.links.clear();
             self.html.clear();
+            let base = self.base();
             self.words(lines);
+            if !self.holders.is_empty() {
+                let rest = std::mem::take(&mut self.rest);
+                self.lead = Some((self.rows.len(), range.end, Lead { rest, base }));
+            }
             self.ended(range, true);
         }
     }
@@ -505,6 +548,8 @@ impl Draw<'_> {
             let across = std::mem::take(&mut self.across);
             let notes = std::mem::take(&mut self.top_notes);
             let holds = std::mem::take(&mut self.top_holds);
+            let tables = std::mem::take(&mut self.top_tables);
+            let lead = self.lead.take();
             if start < self.skip {
                 self.rows.clear();
                 self.offsets.clear();
@@ -520,6 +565,11 @@ impl Draw<'_> {
                 },
             );
             let broken = footnote_marks(&self.source[start..end]) > notes;
+            let lead = lead
+                .filter(|(rows, ended, _)| {
+                    *rows == self.rows.len() && line_end(self.source, *ended) == end
+                })
+                .map(|(_, _, lead)| lead);
             self.blocks.push(Block {
                 start,
                 end,
@@ -527,10 +577,12 @@ impl Draw<'_> {
                 rows: std::mem::take(&mut self.rows),
                 offsets: std::mem::take(&mut self.offsets),
                 holds,
+                tables,
                 note,
                 items,
                 paragraph,
                 across,
+                lead,
                 broken,
                 fence,
             });
@@ -644,6 +696,7 @@ impl Draw<'_> {
             Tag::Table(_) => {
                 self.begin(range.start);
                 self.top_holds = true;
+                self.top_tables = self.top_tables.max(range.end);
                 self.leaf = Some(Leaf::Table(range));
             }
             Tag::Emphasis => self.styles.push(self.style().italic()),
@@ -689,7 +742,12 @@ impl Draw<'_> {
                     let rows = self.pictures(&found);
                     self.framed(rows);
                 } else {
+                    let base = self.base();
                     self.words(lines);
+                    if matches!(tag, TagEnd::Paragraph) && !self.holders.is_empty() {
+                        let rest = std::mem::take(&mut self.rest);
+                        self.lead = Some((self.rows.len(), range.end, Lead { rest, base }));
+                    }
                 }
                 self.ended(range, true);
             }
@@ -820,6 +878,7 @@ impl Draw<'_> {
             self.rows.extend(rows);
             self.mark();
         }
+        self.rest = rest;
     }
 
     /// Rows drawn on their own (a table, a picture), each starting with a
@@ -858,7 +917,12 @@ impl Draw<'_> {
     }
 
     fn table(&mut self, range: Range<usize>) {
-        let rows: Vec<String> = (self.source[range].lines())
+        // A table still coming is drawn when it ends, as a later row may
+        // widen its columns: until then it is only read, as Codex holds one.
+        if !self.end && line_end(self.source, range.end) >= self.source.len() {
+            return;
+        }
+        let rows: Vec<String> = (self.source[range.clone()].lines())
             .map(|line| {
                 let mut line = line.trim();
                 for _ in 0..self.quotes {
@@ -868,7 +932,11 @@ impl Draw<'_> {
             })
             .filter(|line| !line.is_empty())
             .collect();
-        let drawn = crate::table::draw(&rows, self.inner());
+        let drawn = crate::table::draw(&rows, self.inner(), self.cells);
+        // Its rows are drawn from all its lines at once: they stand at the
+        // last, so a fold leaves the table whole on the side it ends.
+        let last = self.source[..range.end].trim_end();
+        self.here = last.rfind('\n').map_or(0, |at| at + 1).max(range.start);
         self.framed(drawn);
     }
 
@@ -1348,10 +1416,29 @@ pub struct Markdown {
     /// The open block holds its rows until it ends, as a table does, and
     /// whether a blank row goes before them.
     held: Option<bool>,
+    waiting: bool,
+    /// The open block is a reply's paragraph, its marks all closed, and
+    /// whether a blank row goes before it: a line going on with it is drawn
+    /// on its own, a row of its own.
+    prose: Option<bool>,
+    /// The open block's last words are a paragraph in a container, its
+    /// marks all closed, and whether a blank row goes before the block: a
+    /// line going on with it is drawn on its own, under its lead.
+    nest: Option<(bool, Lead)>,
+    /// The open block is a tight list at the top level, read on from its
+    /// last item, done but for what comes: whether a blank row goes before
+    /// it, and its item's indent, mark and number. A new item after it is
+    /// read alone, the items before it done.
+    list: Option<(bool, usize, u8, Option<u64>)>,
+    /// The open block is a table at the top level: a line that goes on
+    /// with it, a row starting with `|`, is only kept until it ends.
+    table: bool,
     /// The last preview: the line it showed, at what width, whether first,
     /// how many rows at most, and its rows. A frame drawn with no new words
     /// draws none again.
     shown: std::cell::RefCell<Option<Shown>>,
+    /// The open table's cells, read once as it is drawn again.
+    cells: std::cell::RefCell<Cells>,
     /// A fence at the top level open: read a line at a time, its code
     /// colored as it comes, or a picture's source gathered until it closes.
     fence: Option<Open>,
@@ -1359,6 +1446,9 @@ pub struct Markdown {
 
 #[derive(Clone)]
 struct Shown {
+    /// Pictures drawn beside the loop by then: one landing since may
+    /// fill a row that stood for it.
+    landed: u64,
     partial: String,
     width: usize,
     first: bool,
@@ -1435,13 +1525,26 @@ impl Markdown {
             }
             return;
         }
-        push_line(&mut self.source, line);
+        if self.prose_read(line, width, out) || self.nest_read(line, width, out) {
+            return;
+        }
+        if self.table && table_row(line) {
+            push_line(&mut self.source, line);
+            return;
+        }
+        // A blank line ends a table: it is drawn once, and goes out.
+        let table_ends = self.table && line.trim().is_empty();
+        if !self.item_read(line, out) {
+            push_line(&mut self.source, line);
+        }
+        (self.prose, self.nest, self.table, self.list) = (None, None, false, None);
         let (mut blocks, links) = draw_defined(
             &self.defs,
             &self.source,
             width,
             &self.at,
             &mut self.notes,
+            self.cells.get_mut(),
             false,
         );
         let Some(open) = blocks.pop() else {
@@ -1477,9 +1580,21 @@ impl Markdown {
             self.source.drain(..ended);
             (self.given, self.gapped) = (0, false);
             self.last.clear();
+            self.cells.get_mut().clear();
         }
+        self.waiting = waiting;
         if waiting {
             self.last.clear();
+            self.held = None;
+            return;
+        }
+        if table_ends && let Some(end) = open.end.checked_sub(drained) {
+            let gap = open.gap && !self.gapped;
+            self.give(&open.rows[self.given.min(open.rows.len())..], gap, out);
+            self.source.drain(..end.min(self.source.len()));
+            (self.given, self.gapped) = (0, false);
+            self.last.clear();
+            self.cells.get_mut().clear();
             self.held = None;
             return;
         }
@@ -1513,10 +1628,28 @@ impl Markdown {
             self.held = None;
             return;
         }
+        // Rows from the line where a mark still open starts may change when
+        // it closes: they wait for it.
+        let from = (open.items.last())
+            .filter(|item| !open.holds || open.tables <= item.cut)
+            .map_or(open.start, |item| item.cut);
+        let mut sure = match first_open(&self.source[from - drained..]) {
+            None => usize::MAX,
+            Some(at) => {
+                let text = &self.source[from - drained..];
+                let line = from + text[..at].rfind('\n').map_or(0, |at| at + 1);
+                (open.offsets.iter())
+                    .take_while(|offset| **offset < line)
+                    .count()
+            }
+        };
         let (mut rows, mut gap) = (open.rows, open.gap);
         // A list at the top level reads on from its last item, as the list
         // that item starts: the items before it are done.
-        if let Some(item) = open.items.last().filter(|_| !open.holds) {
+        // A table in an item before it is done with it.
+        if let Some(item) =
+            (open.items.last()).filter(|item| !open.holds || open.tables <= item.cut)
+        {
             let cut = item.cut - drained;
             if item.rows > self.given {
                 let gap = gap && !self.gapped;
@@ -1528,6 +1661,7 @@ impl Markdown {
                 self.defs.push_str("\n\n");
             }
             self.source.drain(..cut);
+            self.cells.get_mut().clear();
             if let Some(number) = item.number {
                 renumber(&mut self.source, number);
             }
@@ -1537,6 +1671,7 @@ impl Markdown {
             self.last = self.last.split_off(done.min(self.last.len()));
             rows = rows.split_off(done);
             gap = item.gap_rows > 0;
+            sure = sure.saturating_sub(done);
         }
         // The open block's rows a new line left as they were will not
         // change: they go out.
@@ -1544,7 +1679,8 @@ impl Markdown {
             true => 0,
             false => (self.last.iter().zip(&rows))
                 .take_while(|(was, is)| was == is)
-                .count(),
+                .count()
+                .min(sure),
         };
         if settled > self.given {
             let gap = gap && !self.gapped;
@@ -1554,6 +1690,18 @@ impl Markdown {
         }
         self.last = rows;
         self.held = open.holds.then_some(gap);
+        self.table = open.holds && open.items.is_empty() && {
+            let text = (open.start.checked_sub(drained)).and_then(|at| self.source.get(at..));
+            text.is_some_and(|text| table_row(text) && text.lines().nth(1).is_some_and(table_row))
+        };
+        self.prose = (open.paragraph && !self.at.document && sure == usize::MAX).then_some(gap);
+        self.nest = (open.lead)
+            .filter(|_| !self.at.document && !open.holds && sure == usize::MAX)
+            .map(|lead| (gap, lead));
+        self.list = (!open.holds && sure == usize::MAX)
+            .then(|| tight_item(&self.source))
+            .flatten()
+            .map(|(indent, mark, number)| (gap, indent, mark, number));
         // A reply's paragraph, whose every line is a row of its own, reads
         // on from its first line not out, when that line starts with a word
         // and so goes on as the words it is: the lines out are done.
@@ -1570,6 +1718,216 @@ impl Markdown {
             self.last.drain(..self.given);
             self.given = 0;
         }
+    }
+
+    /// A line that goes on with a reply's paragraph as words, or starts
+    /// one, read on its own: the rows before it are done, as no mark is
+    /// open across it, and it is drawn as the whole would draw it. Whether
+    /// it was.
+    fn prose_read(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) -> bool {
+        if !self.words_alone(line) || first_open(line).is_some() {
+            return false;
+        }
+        let blank = self.source.trim_start_matches(['\n', ' ']).is_empty();
+        match self.prose {
+            Some(gap) => {
+                let rows = self.last.split_off(self.given.min(self.last.len()));
+                if !rows.is_empty() {
+                    self.give(&rows, gap && !self.gapped, out);
+                    self.gapped = true;
+                }
+                // A blank line before it ends the paragraph: it starts one.
+                let words = self.source.trim_end_matches(['\n', ' ', '\t']).len();
+                let starts = self.source[words..].matches('\n').count() > 1;
+                self.source.clear();
+                if starts {
+                    self.source.push('\n');
+                }
+                self.prose = Some(starts);
+                self.gapped &= !starts;
+            }
+            None if blank => {
+                self.prose = Some(blank_between(&self.source, 0, self.source.len()));
+                self.gapped = false;
+            }
+            None => return false,
+        }
+        push_line(&mut self.source, line);
+        self.given = 0;
+        self.last = prose_rows(line, width);
+        true
+    }
+
+    /// A new item of the open list, tight at the top level: the item before
+    /// it is done and goes out, and the item is read on its own, numbered
+    /// on from it. Whether it was.
+    fn item_read(&mut self, line: &str, out: &mut Vec<Line<'static>>) -> bool {
+        let Some(gap) = self.next_item(line).map(|(gap, _)| gap) else {
+            return false;
+        };
+        let number = self.list.and_then(|(.., number)| number);
+        let rows = self.last.split_off(self.given.min(self.last.len()));
+        self.give(&rows, gap && !self.gapped, out);
+        self.source.clear();
+        (self.given, self.gapped) = (0, false);
+        self.last.clear();
+        self.cells.get_mut().clear();
+        push_line(&mut self.source, line);
+        if let Some(number) = number {
+            renumber(&mut self.source, number + 1);
+        }
+        true
+    }
+
+    /// When `line` is a new item of the open list: whether a blank row goes
+    /// before the list, and the rows of the item before it not out yet.
+    fn next_item(&self, line: &str) -> Option<(bool, &[Line<'static>])> {
+        let (gap, indent, mark, _) = self.list?;
+        let (at, is, _) = item_mark(line)?;
+        (at == indent && is == mark && !self.waiting)
+            .then(|| (gap, &self.last[self.given.min(self.last.len())..]))
+    }
+
+    /// A line going on with a paragraph in a container, read on its own:
+    /// the rows before it are done, as no mark is open across it, and it
+    /// is drawn under the paragraph's lead. Whether it was.
+    fn nest_read(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) -> bool {
+        let Some((gap, lead)) = self.nest.take() else {
+            return false;
+        };
+        if !self.nested_words(line) || first_open(line).is_some() {
+            return false;
+        }
+        let rows = self.last.split_off(self.given.min(self.last.len()));
+        if !rows.is_empty() {
+            self.give(&rows, gap && !self.gapped, out);
+            self.gapped = true;
+        }
+        self.last.extend(rows);
+        self.given = self.last.len();
+        push_line(&mut self.source, line);
+        self.last.extend(lead.rows(line, width));
+        self.nest = Some((gap, lead));
+        true
+    }
+
+    /// Whether `line` goes on with the open block's paragraph in a
+    /// container, as words alone.
+    fn nested_words(&self, line: &str) -> bool {
+        let text = self.source.strip_suffix('\n').unwrap_or(&self.source);
+        let last = &text[text.rfind('\n').map_or(0, |at| at + 1)..];
+        !last.trim().is_empty()
+            && line
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(char::is_alphabetic)
+            && self.alone(line)
+    }
+
+    /// Whether `line` can be read on its own as words going on with a
+    /// reply's paragraph: no block of its own, no footnote, no link to a
+    /// label that may be defined elsewhere, and nothing before it drawn
+    /// otherwise until words join it: a picture alone, a line's last `\`.
+    fn words_alone(&self, line: &str) -> bool {
+        starts_with_word(line) && self.alone(line)
+    }
+
+    /// What every line read on its own needs: nothing before it drawn
+    /// otherwise until words join it, no footnote, no link to a label that
+    /// may be defined elsewhere.
+    fn alone(&self, line: &str) -> bool {
+        !self.at.document
+            && !self.waiting
+            && !self.source.contains("![")
+            && !self.source.trim_end_matches('\n').ends_with('\\')
+            && !line.contains("[^")
+            && !line.contains("][")
+            && !(line.contains('[') && !self.defs.is_empty())
+    }
+
+    /// The line still coming drawn on its own, after the open block's rows
+    /// as the last line left them, when it can only go on as words: a reply's
+    /// paragraph with no mark open, or none, and a line that starts with a
+    /// word. None when it must be read with the rest.
+    fn prose_line(
+        &self,
+        partial: &str,
+        width: usize,
+        first: bool,
+        most: usize,
+    ) -> Option<Vec<Line<'static>>> {
+        // A list starting under a reply's paragraph ends it: the list is
+        // drawn on its own after it.
+        let list = (self.prose)
+            .filter(|_| starts_list(partial) && self.alone(partial))
+            .map(|gap| (gap, &self.last[self.given.min(self.last.len())..]));
+        if let Some((gap, rows)) = self.next_item(partial).or(list) {
+            let mut source = String::new();
+            self.rewrite.clone().line(&closed(partial), &mut source);
+            if let Some((.., Some(number))) = self.list {
+                renumber(&mut source, number + 1);
+            }
+            let (blocks, _) = draw_defined(
+                &self.defs,
+                &source,
+                width,
+                &self.at,
+                &mut self.notes.clone(),
+                &mut Cells::default(),
+                false,
+            );
+            let mut out = Vec::with_capacity(rows.len() + 2);
+            if gap && self.any && !self.gapped && !rows.is_empty() {
+                out.push(Line::from("  "));
+            }
+            out.extend(rows.iter().cloned());
+            for block in blocks {
+                out.extend(block.rows);
+            }
+            bullet(&mut out, first && !self.any);
+            out.drain(..out.len().saturating_sub(most));
+            return Some(out);
+        }
+        if let Some((gap, lead)) = &self.nest {
+            if !self.nested_words(partial) {
+                return None;
+            }
+            let rows = &self.last[self.given.min(self.last.len())..];
+            let shown = lead.rows(&closed(partial), width);
+            let mut out = Vec::with_capacity(rows.len() + shown.len() + 1);
+            if *gap && self.any && !self.gapped {
+                out.push(Line::from("  "));
+            }
+            out.extend(rows.iter().cloned());
+            out.extend(shown);
+            bullet(&mut out, first && !self.any);
+            out.drain(..out.len().saturating_sub(most));
+            return Some(out);
+        }
+        if !self.words_alone(partial) {
+            return None;
+        }
+        let blank = self.source.trim_start_matches(['\n', ' ']).is_empty();
+        let gap = match self.prose {
+            Some(gap) => gap,
+            None if blank => blank_between(&self.source, 0, self.source.len()),
+            None => return None,
+        };
+        let rows = match self.prose {
+            Some(_) => &self.last[self.given.min(self.last.len())..],
+            None => &[],
+        };
+        let shown = prose_rows(&closed(partial), width);
+        let mut out = Vec::with_capacity(rows.len() + shown.len() + 1);
+        if gap && self.any && !(self.prose.is_some() && self.gapped) {
+            out.push(Line::from("  "));
+        }
+        out.extend(rows.iter().cloned());
+        out.extend(shown);
+        bullet(&mut out, first && !self.any);
+        out.drain(..out.len().saturating_sub(most));
+        Some(out)
     }
 
     /// Rows going out, after a blank row when one was written before them.
@@ -1603,7 +1961,9 @@ impl Markdown {
         // A table's rows wait for its lines to end: the line still coming
         // changes nothing.
         let partial = if self.held.is_some() { "" } else { partial };
+        let landed = crate::drawing::landed();
         if let Some(shown) = &*self.shown.borrow()
+            && shown.landed == landed
             && shown.partial == partial
             && (shown.width, shown.first, shown.most) == (width, first, most)
         {
@@ -1611,6 +1971,7 @@ impl Markdown {
         }
         let rows = self.preview(partial, width, first, most);
         *self.shown.borrow_mut() = Some(Shown {
+            landed,
             partial: partial.to_owned(),
             width,
             first,
@@ -1651,6 +2012,15 @@ impl Markdown {
             bullet(&mut out, from == 0 && first && !self.any);
             return out;
         }
+        if let Some(rows) = self.prose_line(partial, width, first, most) {
+            return rows;
+        }
+        self.redrawn(partial, width, first, most)
+    }
+
+    /// The open blocks drawn again from their text, with `partial`.
+    fn redrawn(&self, partial: &str, width: usize, first: bool, most: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
         let mut source = self.source.clone();
         if !partial.is_empty() {
             let shown = match Fence::opened_by(partial) {
@@ -1660,7 +2030,15 @@ impl Markdown {
             self.rewrite.clone().line(&shown, &mut source);
         }
         let mut notes = self.notes.clone();
-        let (blocks, _) = draw_defined(&self.defs, &source, width, &self.at, &mut notes, false);
+        let (blocks, _) = draw_defined(
+            &self.defs,
+            &source,
+            width,
+            &self.at,
+            &mut notes,
+            &mut self.cells.borrow_mut(),
+            false,
+        );
         let mut any = self.any;
         for (at, block) in blocks.iter().enumerate() {
             let from = if at == 0 { self.given } else { 0 };
@@ -1705,6 +2083,7 @@ impl Markdown {
             width,
             &self.at,
             &mut self.notes,
+            self.cells.get_mut(),
             true,
         );
         for (at, block) in blocks.iter().enumerate() {
@@ -1729,20 +2108,22 @@ fn draw_defined(
     width: usize,
     at: &Where,
     notes: &mut Notes,
+    cells: &mut Cells,
     end: bool,
 ) -> (Vec<Block>, Vec<Range<usize>>) {
     if defs.is_empty() {
-        return draw_after(source, 0, width, at, notes, end);
+        return draw_after(source, 0, width, at, notes, cells, end);
     }
     let skip = defs.len();
     let text = format!("{defs}{source}");
-    let (mut blocks, links) = draw_after(&text, skip, width, at, notes, end);
+    let (mut blocks, links) = draw_after(&text, skip, width, at, notes, cells, end);
     for block in &mut blocks {
         block.start -= skip;
         block.end -= skip;
         for item in &mut block.items {
             item.cut -= skip;
         }
+        block.tables = block.tables.saturating_sub(skip);
         for marks in &mut block.across {
             *marks = marks.start - skip..marks.end - skip;
         }
@@ -1769,6 +2150,132 @@ fn footnote_marks(text: &str) -> usize {
             })
         })
         .count()
+}
+
+/// Where the first mark in `text` that nothing closes yet starts: a code
+/// span's backticks, emphasis or strikethrough, read as [`closed`] reads
+/// them, or a link's bracket.
+fn first_open(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut open: Vec<(&str, usize)> = Vec::new();
+    let mut brackets: Vec<usize> = Vec::new();
+    let mut code: Option<(usize, usize)> = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        let c = bytes[at];
+        if c == b'\\' {
+            at += 2;
+            continue;
+        }
+        if c == b'`' {
+            let run = bytes[at..].iter().take_while(|b| **b == b'`').count();
+            match code {
+                Some((open, _)) if open == run => code = None,
+                None => code = Some((run, at)),
+                _ => {}
+            }
+            at += run;
+            continue;
+        }
+        if code.is_some() {
+            at += 1;
+            continue;
+        }
+        if matches!(c, b'*' | b'_' | b'~') {
+            let run = bytes[at..].iter().take_while(|b| **b == c).count();
+            let before = at.checked_sub(1).map(|b| bytes[b]);
+            let after = bytes.get(at + run).copied();
+            let mark = &text[at..at + run.min(if c == b'~' { 2 } else { 3 })];
+            let closes = open.last().is_some_and(|(last, _)| *last == mark)
+                && before.is_some_and(|b| !b.is_ascii_whitespace());
+            let word_before = before.is_some_and(|b| b.is_ascii_alphanumeric());
+            if closes {
+                open.pop();
+            } else if after.is_some_and(|b| !b.is_ascii_whitespace())
+                && !(c == b'_' && word_before)
+                && (c != b'~' || run == 2)
+            {
+                open.push((mark, at));
+            }
+            at += run;
+            continue;
+        }
+        match c {
+            b'[' => brackets.push(at),
+            b']' => _ = brackets.pop(),
+            _ => {}
+        }
+        at += 1;
+    }
+    let marks = [open.first().map(|(_, at)| *at), brackets.first().copied()]
+        .into_iter()
+        .flatten()
+        .min();
+    match code {
+        Some((_, at)) => Some(marks.map_or(at, |marks| marks.min(at))),
+        None => marks,
+    }
+}
+
+/// Whether a line is a table's row at the top level, as a table still
+/// open reads one.
+fn table_row(line: &str) -> bool {
+    let row = line.trim_start_matches(' ');
+    line.len() - row.len() <= 3 && row.starts_with('|')
+}
+
+/// A list item's mark starting `line` at the top level: its indent, its
+/// bullet or the mark after its number, and the number.
+fn item_mark(line: &str) -> Option<(usize, u8, Option<u64>)> {
+    let rest = line.trim_start_matches(' ');
+    let indent = line.len() - rest.len();
+    let bytes = rest.as_bytes();
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    let (mark, number, after) = match *bytes.first()? {
+        b'-' | b'*' | b'+' => (bytes[0], None, 1),
+        b'0'..=b'9' if digits <= 9 => {
+            (*bytes.get(digits)?, rest[..digits].parse().ok(), digits + 1)
+        }
+        _ => return None,
+    };
+    let rule = number.is_none()
+        && rest.bytes().all(|b| b == mark || b == b' ')
+        && rest.bytes().filter(|b| *b == mark).count() >= 3;
+    (indent <= 3
+        && matches!(mark, b'-' | b'*' | b'+' | b'.' | b')')
+        && matches!(bytes.get(after), None | Some(b' '))
+        && !rule)
+        .then_some((indent, mark, number))
+}
+
+/// Whether `line` starts a list that can end a paragraph: an item with
+/// words, numbered from 1 if numbered.
+fn starts_list(line: &str) -> bool {
+    item_mark(line).is_some_and(|(indent, mark, number)| {
+        let words = line[indent..].trim_start_matches(|c: char| c.is_ascii_digit());
+        number.is_none_or(|number| number == 1)
+            && !words[1..].trim().is_empty()
+            && (mark != b'*' || !words[1..].trim_start().starts_with('*'))
+    })
+}
+
+/// A list at the top level that `source` is, one item with no blank line
+/// in it or after it, nor anything a later line could still change: its
+/// item's indent, mark and number.
+fn tight_item(source: &str) -> Option<(usize, u8, Option<u64>)> {
+    let text = source.trim_start_matches('\n');
+    let found = item_mark(text.lines().next()?)?;
+    let plain = text.lines().all(|line| !line.trim().is_empty())
+        && !["]:", "```", "~~~", "<", "\\\n"]
+            .iter()
+            .any(|mark| text.contains(mark));
+    plain.then_some(found)
+}
+
+/// A line of a reply's paragraph at the top level, as its own rows.
+fn prose_rows(line: &str, width: usize) -> Vec<Line<'static>> {
+    let words = inline(line, Style::new());
+    wrap_lines(Line::from(words), width, Line::from("  "), Line::from("  "))
 }
 
 /// Whether a line starts with a letter, at most three spaces in: words
@@ -1879,7 +2386,9 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
     };
     let at = Where::default();
     let mut notes = Notes::default();
+    let mut cells = Cells::default();
     let mut draw = Draw {
+        cells: &mut cells,
         source: &source,
         width: usize::MAX,
         at: &at,
@@ -1903,9 +2412,12 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         blocks: Vec::new(),
         top: None,
         top_holds: false,
+        top_tables: 0,
         top_note: false,
         top_paragraph: false,
         across: Vec::new(),
+        lead: None,
+        rest: Vec::new(),
         top_notes: 0,
         skip: 0,
         loose: None,
@@ -2108,6 +2620,10 @@ mod tests {
             "Words\n2. not a list\n    not code\nword *em\nphasis* and `co\nde` end\nmore words\nlast",
             "- a\n\n- b [x][x]\n- c\n\n```\ncode\n```\n\n[x]: /x\n\nEnd.",
             "A note.[^n] And `[^code]`.\n\nB\n\n[^n]: The note.\n\nC [^gone]",
+            "prefix `code\nmore\nend` suffix\nthen *a\nb\nc* d\nlast line",
+            "- one\n\n  | a | b |\n  |---|---|\n  | 1 | 2 |\n  | 333 | 4 |\n- two\n- three **x**\n\nAfter.",
+            "- an item that wraps\n  onto a line\n  and `one` more\nlazy words\n- next\n\n  its second\n  paragraph\n\n> quoted\n> on\nlazy\n\nafter",
+            "3. **Bold** item\n   with words\n   - nested `x`\n     going on\n\n   back in three\n   and on\n4. four\n   ![a](p.png)\n   words\n   end\\\n   break",
         ];
         for reply in replies {
             for markdown in [
@@ -2145,15 +2661,122 @@ mod tests {
         // A list's items go out once the next one comes.
         assert!(markdown.feed("- one", 40, false).is_empty());
         assert_eq!(text(&markdown.feed("- two", 40, false)), ["  - one"]);
-        // A table is held until it ends: a later row can widen its columns.
+        // A table is held until it ends, as Codex holds one: a later row
+        // can widen its columns.
         markdown.feed("", 40, false);
         assert!(markdown.feed("| a | b |", 40, false).is_empty());
         assert!(markdown.feed("|---|---|", 40, false).is_empty());
         assert!(markdown.feed("| 1 | 2 |", 40, false).is_empty());
-        let open = text(&markdown.open("", 40, false));
-        assert!(open.iter().any(|row| row.contains("│ 1")), "{open:?}");
+        let open = text(&markdown.open("| 3", 40, false));
+        assert!(!open.iter().any(|row| row.contains('│')), "{open:?}");
         let rest = text(&markdown.end(40, false));
         assert!(rest.iter().any(|row| row.contains("│ 1")), "{rest:?}");
+    }
+
+    #[test]
+    fn a_line_going_on_as_words_is_drawn_as_the_whole_would_draw_it() {
+        let replies: [&[&str]; 10] = [
+            &[],
+            &["A first line of a paragraph,"],
+            &["Para one.", "", "Para two starts", "and goes on"],
+            &["# Head", ""],
+            &["Some `code` and **bold** words", "then more of them"],
+            &["- an item that wraps", "  onto a second line"],
+            &["> a quoted line"],
+            &["1. **First** item", "   - a nested item with `code`"],
+            &["- item", "", "  its second paragraph"],
+            &["> a quote", ""],
+        ];
+        let partials = [
+            "words still coming",
+            "with **bold that has not clo",
+            "a [link](https://exa",
+            "and `cod",
+            "math \\(x^2\\) here",
+            "with <kbd>K</kbd> keys",
+            "a long line that will wrap past the width of the pane at forty columns or so",
+        ];
+        let mut drawn = 0;
+        for lines in replies {
+            for partial in partials {
+                for first in [true, false] {
+                    let mut markdown = Markdown::default();
+                    for line in lines {
+                        markdown.feed(line, 40, first);
+                    }
+                    if let Some(rows) = markdown.prose_line(partial, 40, first, usize::MAX) {
+                        drawn += 1;
+                        assert_eq!(
+                            rows,
+                            markdown.redrawn(partial, 40, first, usize::MAX),
+                            "{lines:?} {partial:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Each reply but those ending in a heading or a blank line after
+        // a quote draws its words so.
+        assert_eq!(drawn, 8 * partials.len() * 2);
+    }
+
+    #[test]
+    fn a_new_item_is_drawn_as_the_whole_list_would_draw_it() {
+        let replies: [&[&str]; 7] = [
+            &["A paragraph", "goes on"],
+            &["- one"],
+            &["1. one", "1. two **x**"],
+            &["- a", "  - nested", "    going on"],
+            &["7) seven", "   words"],
+            &["Intro", "", "* star"],
+            &["- loose", "", "- list"],
+        ];
+        let partials = [
+            "- new **bo",
+            "2. num",
+            "- ",
+            "-",
+            "* other",
+            "- - -",
+            "8) n `c",
+            "  - in",
+            "1. first",
+        ];
+        let mut drawn = 0;
+        for lines in replies {
+            for partial in partials {
+                for first in [true, false] {
+                    let mut markdown = Markdown::default();
+                    let mut rows = Vec::new();
+                    for line in lines {
+                        rows.extend(markdown.feed(line, 40, first));
+                    }
+                    if let Some(shown) = markdown.prose_line(partial, 40, first, usize::MAX) {
+                        drawn += 1;
+                        assert_eq!(
+                            shown,
+                            markdown.redrawn(partial, 40, first, usize::MAX),
+                            "{lines:?} {partial:?}"
+                        );
+                    }
+                    // A `-` under a paragraph of many lines makes them all a
+                    // heading, which streaming leaves as the lines out read,
+                    // as Codex does.
+                    let setext = lines.len() > 1 && partial.trim() == "-";
+                    if !first && !setext {
+                        let mut all = lines.to_vec();
+                        all.push(partial);
+                        rows.extend(markdown.feed(partial, 40, false));
+                        rows.extend(markdown.end(40, false));
+                        let all = all.join("\n");
+                        assert_eq!(text(&rows), whole(&markdown, &all, 40), "{all:?}");
+                    }
+                }
+            }
+        }
+        // Lists that can end the paragraph, and items with the open item's
+        // mark and indent in each tight list.
+        assert_eq!(drawn, (4 + 3 + 2 + 3 + 1 + 1) * 2);
     }
 
     #[test]
