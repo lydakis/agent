@@ -1004,28 +1004,36 @@ struct Made<'a> {
     messages: u64,
     quotes: u64,
     calls: u64,
+    side: bool,
 }
 
 impl<'a> Made<'a> {
     fn of(row: &'a Value) -> Option<Self> {
         let bot = row["bot"].as_str()?;
         let count = |key: &str| row[key].as_u64().unwrap_or(0);
+        // Its first message is the work its maker gave it, never a step in.
+        let first = &row["first_message"];
         Some(Self {
             bot,
             work_ms: count("work_ms"),
             running: row["running"] == true,
             last_turn: row["last_turn"].as_i64(),
-            messages: count("person_messages"),
-            quotes: count("person_quotes"),
+            messages: count("person_messages").saturating_sub((first["person"] == true) as u64),
+            quotes: count("person_quotes").saturating_sub((first["quotes_person"] == true) as u64),
             calls: count("person_calls"),
+            side: crate::side_copy(&json!({
+                "name": bot, "created_by": row["created_by"], "expire_ms": row["expire_ms"],
+            }))
+            .is_some(),
         })
     }
-    /// Whether it is a task: not a workflow's worker, a lead, or one of
-    /// Sonny's own.
+    /// Whether it is a task: not a workflow's worker, a lead, a side chat,
+    /// or one of Sonny's own.
     fn task(&self) -> bool {
         !crate::project::is_internal(self.bot)
             && !crate::project::is_lead(self.bot)
             && !crate::workflow::is_worker(self.bot)
+            && !self.side
     }
     /// Whether the person stepped in.
     fn stepped(&self) -> bool {
@@ -1298,12 +1306,13 @@ mod tests {
         json!({
             "bot": bot, "turns": 2, "work_ms": work_min * 60_000, "running": running,
             "last_turn": 9, "person_messages": wrote, "person_quotes": quoted, "person_calls": calls,
+            "created_by": "p.lead", "expire_ms": null, "first_message": null,
         })
     }
 
     #[test]
     fn tasks_count_those_that_ended_without_the_person() {
-        let made = [
+        let made_rows = [
             made("p.fix-login", 20, false, 0, 0, 0),
             made("p.add-export", 50, false, 1, 0, 0),
             made("p.rename", 10, false, 0, 1, 0),
@@ -1315,22 +1324,30 @@ mod tests {
             made("p.wf-1.wf-step", 5, false, 0, 0, 0),
             made(".sonny-namer", 5, false, 0, 0, 0),
         ];
+        // A side chat of a task: made by it, expiring.
+        let mut side = made("p.tidy.side-a1", 5, false, 1, 0, 0);
+        (side["created_by"], side["expire_ms"]) = (json!("p.tidy"), json!(3_600_000));
+        // A task whose brief its maker wrote as the person: not a step in.
+        let mut briefed = made("p.briefed", 5, false, 1, 1, 0);
+        briefed["first_message"] = json!({"person": true, "quotes_person": false});
+        let rows = [&made_rows[..], &[side, briefed]].concat();
         let tasks = Tasks::tally(
-            &made,
+            &rows,
             |bot, _, _| bot == "p.fix-login" || bot == "p.migrate",
             |bot| (bot == "p.migrate" || bot == "p.tidy").then(|| "backend".to_owned()),
         );
-        assert_eq!((tasks.worked, tasks.working, tasks.ended), (6, 1, 5));
+        assert_eq!((tasks.worked, tasks.working, tasks.ended), (7, 1, 6));
         assert_eq!(tasks.alone, 2);
-        // The running task's message is not counted until it ends.
-        assert_eq!((tasks.messages, tasks.quotes, tasks.calls), (1, 1, 2));
+        // The running task's message is not counted until it ends; the
+        // briefed task's quote of the person, after its brief, is.
+        assert_eq!((tasks.messages, tasks.quotes, tasks.calls), (1, 2, 2));
         assert_eq!(tasks.done, 2);
-        assert_eq!(tasks.lengths, [(1, 2), (1, 2), (0, 1)]);
+        assert_eq!(tasks.lengths, [(1, 3), (1, 2), (0, 1)]);
         assert_eq!(
             tasks.roles,
-            [("no role".to_owned(), 1, 3), ("backend".to_owned(), 1, 2)]
+            [("no role".to_owned(), 1, 4), ("backend".to_owned(), 1, 2)]
         );
-        assert_eq!(Tasks::before(&made), (2, 5));
+        assert_eq!(Tasks::before(&rows), (2, 6));
     }
 
     #[test]

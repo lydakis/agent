@@ -18362,25 +18362,39 @@ fn made_says_of_each_bot_another_made_how_often_the_person_stepped_in() {
     assert_eq!(
         rows,
         [
-            ("p.alone", 2, 120_000, 0, 0, 0),
-            ("p.called", 1, 60_000, 0, 0, 1),
-            ("p.quoted", 3, 180_000, 0, 1, 0),
-            ("p.wrote", 2, 120_000, 1, 0, 0),
+            ("p.alone", 2, 120_000, 1, 0, 0),
+            ("p.called", 1, 60_000, 1, 0, 1),
+            ("p.quoted", 3, 180_000, 1, 1, 0),
+            ("p.wrote", 2, 120_000, 2, 0, 0),
         ],
         "by name; the lead no one made, the turns before the window and the other project's are out"
     );
+    // Each counts its first message too, and says what it was, so a client
+    // can tell the work a bot was given from what came after.
     assert_eq!(made["made"][0]["running"], false);
+    assert_eq!(made["made"][0]["created_by"], "p.lead");
+    assert_eq!(made["made"][0]["expire_ms"], Value::Null);
+    assert_eq!(
+        made["made"][0]["first_message"],
+        json!({"person": true, "quotes_person": false})
+    );
     assert_eq!(made["next_after"], Value::Null);
 
-    // The window before: the old task's second turn, whose message the
-    // person wrote.
+    // The window before: the old task's two turns, both of whose messages
+    // the person wrote.
     let before = db
         .made(Some("p.*"), since - 2 * hour, Some(since), None)
         .unwrap();
     assert_eq!(before["made"].as_array().unwrap().len(), 1);
     assert_eq!(before["made"][0]["bot"], "p.old");
     assert_eq!(before["made"][0]["turns"], 2);
-    assert_eq!(before["made"][0]["person_messages"], 1);
+    assert_eq!(before["made"][0]["person_messages"], 2);
+    // A window without a bot's first message says nothing of it.
+    let later = db
+        .made(Some("p.old"), since - hour, Some(since), None)
+        .unwrap();
+    assert_eq!(later["made"][0]["person_messages"], 1);
+    assert_eq!(later["made"][0]["first_message"], Value::Null);
 
     // Pages go on after the name given.
     let page = db.made(None, since, None, Some("p.called")).unwrap();
@@ -18391,7 +18405,7 @@ fn made_says_of_each_bot_another_made_how_often_the_person_stepped_in() {
         .map(|row| row["bot"].as_str().unwrap())
         .collect();
     assert_eq!(bots, ["p.quoted", "p.wrote", "q.task"]);
-    assert_eq!(page["made"][1]["person_messages"], 1);
+    assert_eq!(page["made"][1]["person_messages"], 2);
 
     assert_eq!(
         db.made(None, since, Some(since), None).unwrap_err().code,

@@ -1840,12 +1840,15 @@ person stepped into those turns. `name` is a `bots` GLOB, `since_ms` (0 or
 more) and `until_ms` (absent is now) bound when the turns started
 (`invalid_made_window` otherwise). Each row, in name order, has the bot's
 `turns`, `work_ms` (each turn's start to its end, or to now while it runs),
-whether one is `running`, its `last_turn`, and three counts over the window's
-turns: `person_messages`, messages a person wrote (no `from_bot`, no
+whether one is `running`, its `last_turn`, `created_by`, `expire_ms`, and
+three counts over the window's turns: `person_messages`, messages a person wrote (no `from_bot`, no
 `origin`) that its turns took in; `person_quotes`, messages another bot sent it
 that quote a person's own words (a quote with no `from`, no `origin`, not a
 `reply`); and `person_calls`, its calls the audit trail says a person decided.
-A bot's first message is the work its maker gave it, so it is never counted.
+The counts take in the bot's first message too; when the window's turns
+took it in, `first_message` says whether a person wrote it (`person`) and
+whether it quotes one (`quotes_person`), else it is `null`, so a client can
+tell the work a bot was given from what came after.
 A page stays within half an event as sent, as a `bots` page does; with more,
 `next_after` names its last bot, to pass as `after` (`null` on the last page).
 Sonny's `/usage` reads it for the period it shows and the one before, to say

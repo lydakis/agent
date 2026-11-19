@@ -16949,7 +16949,7 @@ impl Database {
         };
         let mut statement = snapshot.prepare_cached(&format!(
             "SELECT t.bot,COUNT(*),SUM(COALESCE(t.finished_ms,?3)-t.started_ms),
-                    b.running_turn IS NOT NULL,b.last_turn
+                    b.running_turn IS NOT NULL,b.last_turn,b.created_by,b.expire_ms
              FROM turns t JOIN bots b ON b.name=t.bot
              WHERE t.started_ms>=?1 AND t.started_ms<?2 AND b.created_by IS NOT NULL
                  AND t.bot>?4 AND (?5 IS NULL OR t.bot<=?5){}
@@ -16970,7 +16970,9 @@ impl Database {
             let row = json!({"bot": bot, "turns": r.get::<_, i64>(1)?,
                 "work_ms": r.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0),
                 "running": r.get::<_, bool>(3)?, "last_turn": r.get::<_, Option<i64>>(4)?,
-                "person_messages": i64::MAX, "person_quotes": i64::MAX, "person_calls": i64::MAX});
+                "created_by": r.get::<_, String>(5)?, "expire_ms": r.get::<_, Option<i64>>(6)?,
+                "person_messages": i64::MAX, "person_quotes": i64::MAX, "person_calls": i64::MAX,
+                "first_message": {"person": false, "quotes_person": false}});
             let size = crate::output::encoded_len(&row)? + 1;
             if bytes + size > crate::output::MAX_EVENT / 2 {
                 next = made.last().map(|(bot, _): &(String, Value)| bot.clone());
@@ -16984,6 +16986,7 @@ impl Database {
             for key in ["person_messages", "person_quotes", "person_calls"] {
                 row[key] = json!(0);
             }
+            row["first_message"] = Value::Null;
         }
         if let (Some((first, _)), Some((last, _))) = (made.first(), made.last()) {
             // The page's bots, from just before the first to the last.
@@ -16994,22 +16997,25 @@ impl Database {
                 at.insert(bot.clone(), index);
             }
             // Who wrote what the window's turns took in: a person, or a
-            // bot quoting a person's own words (not a reply it quotes). The
-            // bot's first message, which its maker sent to start it, is the
-            // work it was given, not a step in.
+            // bot quoting a person's own words (not a reply it quotes); and
+            // the same of the bot's first message, when the window took it
+            // in, so a client can tell the work it was given from what came
+            // after.
             let mut statement = snapshot.prepare_cached(&format!(
-                "SELECT t.bot,
-                        SUM(m.from_bot IS NULL AND m.origin IS NULL),
-                        SUM(m.from_bot IS NOT NULL AND m.quotes IS NOT NULL AND EXISTS(
+                "SELECT bot,SUM(person),SUM(quoted),
+                        MAX(CASE WHEN first THEN person END),MAX(CASE WHEN first THEN quoted END)
+                 FROM (SELECT t.bot,
+                        m.id=(SELECT MIN(f.id) FROM messages f WHERE f.bot=t.bot) AS first,
+                        m.from_bot IS NULL AND m.origin IS NULL AS person,
+                        m.from_bot IS NOT NULL AND m.quotes IS NOT NULL AND EXISTS(
                             SELECT 1 FROM json_each(m.quotes) q
                             WHERE json_extract(q.value,'$.from') IS NULL
                                 AND json_extract(q.value,'$.origin') IS NULL
-                                AND json_extract(q.value,'$.reply') IS NULL))
-                 FROM turns t JOIN bots b ON b.name=t.bot CROSS JOIN messages m ON m.turn=t.id
-                 WHERE t.started_ms>=?1 AND t.started_ms<?2 AND b.created_by IS NOT NULL
-                     AND t.bot>?4 AND t.bot<=?5{}
-                     AND m.id>(SELECT MIN(f.id) FROM messages f WHERE f.bot=t.bot)
-                 GROUP BY t.bot",
+                                AND json_extract(q.value,'$.reply') IS NULL) AS quoted
+                     FROM turns t JOIN bots b ON b.name=t.bot CROSS JOIN messages m ON m.turn=t.id
+                     WHERE t.started_ms>=?1 AND t.started_ms<?2 AND b.created_by IS NOT NULL
+                         AND t.bot>?4 AND t.bot<=?5{})
+                 GROUP BY bot",
                 glob("t.bot")
             ))?;
             let mut rows =
@@ -17020,6 +17026,11 @@ impl Database {
                     let row = &mut made[index].1;
                     row["person_messages"] = json!(r.get::<_, Option<i64>>(1)?.unwrap_or(0));
                     row["person_quotes"] = json!(r.get::<_, Option<i64>>(2)?.unwrap_or(0));
+                    if let (Some(person), Some(quotes)) =
+                        (r.get::<_, Option<bool>>(3)?, r.get::<_, Option<bool>>(4)?)
+                    {
+                        row["first_message"] = json!({"person": person, "quotes_person": quotes});
+                    }
                 }
             }
             drop(rows);
