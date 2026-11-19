@@ -82,11 +82,14 @@ pub fn note_later(store: &Path, bot: &str, id: i64, title: &str) {
                     unsafe {
                         libc::setpriority(libc::PRIO_PROCESS, 0, 10);
                     }
-                    // What came meanwhile written together: the folder
-                    // made and its time read once for all of them.
+                    // Written once the notes stop coming for a moment, all
+                    // together: while /status fills, the disk is left to the
+                    // daemon, and the folder is made and its time read once.
                     while let Ok(job) = take.recv() {
                         let mut jobs = vec![job];
-                        jobs.extend(take.try_iter());
+                        while let Ok(job) = take.recv_timeout(std::time::Duration::from_secs(1)) {
+                            jobs.push(job);
+                        }
                         let _ = write_all(&jobs);
                     }
                 });
