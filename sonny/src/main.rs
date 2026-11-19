@@ -549,6 +549,7 @@ async fn with_error(client: &Client, mut turn: Value) -> Value {
 /// What a window adds to what `/status` reads: its own agent's questions
 /// and calls, as it holds them, its model, and where its project's windows
 /// sit. `sonny status` reads with none.
+#[derive(Clone)]
 struct StatusView<'a> {
     bot: &'a str,
     asks: &'a [asks::Ask],
@@ -559,6 +560,69 @@ struct StatusView<'a> {
     /// Each row's details, its profile and what follows it; with none
     /// only where each agent stands is read, as the footer counts it.
     details: bool,
+    /// Whether the histories not read yet are left to read beside the
+    /// card, which draws its rows first ([`StatusRead::unread`]).
+    fill: bool,
+    /// What the window's other reads of histories read, or read now.
+    readers: Option<&'a Readers>,
+}
+
+/// What a window's reads of its agents' histories (its count, its card,
+/// a lead's first pass) hold between them, so none reads a history another
+/// read or reads now: each agent's latest items by its head and its
+/// question by the turn it ended, as read last, and the agents being read.
+#[derive(Default)]
+struct Readers {
+    reads: std::sync::Mutex<Shared>,
+    /// Told each time a read lands, to whoever waits on it.
+    landed: tokio::sync::Notify,
+}
+
+/// What the reads under way read, held while any runs: each hands what
+/// it read back to the window once it ends.
+#[derive(Default)]
+struct Shared {
+    latest: HashMap<String, (Value, Latest)>,
+    seen: HashMap<String, (i64, Seen)>,
+    reading: std::collections::HashSet<String>,
+    running: usize,
+}
+
+impl Readers {
+    /// One read of histories under way, until it ends.
+    fn underway(&self) -> Underway<'_> {
+        if let Ok(mut shared) = self.reads.lock() {
+            shared.running += 1;
+        }
+        Underway(self)
+    }
+}
+
+/// A read of histories under way: once none is, what they read is let go.
+struct Underway<'a>(&'a Readers);
+
+impl Drop for Underway<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut shared) = self.0.reads.lock() {
+            shared.running -= 1;
+            if shared.running == 0 {
+                shared.latest = HashMap::new();
+                shared.seen = HashMap::new();
+            }
+        }
+    }
+}
+
+/// An agent being read, let go however its read ends.
+struct Reading<'a>(&'a Readers, &'a str);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut shared) = self.0.reads.lock() {
+            shared.reading.remove(self.1);
+        }
+        self.0.landed.notify_waiters();
+    }
 }
 
 /// What `/status` read: its rows, what waits on the person, and which
@@ -578,6 +642,9 @@ struct StatusRead {
     /// Whether every history it read was read: one that failed counts as
     /// nothing until a later read.
     whole: bool,
+    /// The agents whose history moved since it was read, in the listing's
+    /// order, left to read beside the card ([`StatusView::fill`]).
+    unread: Vec<String>,
 }
 
 /// The agents of `scope` as `/status` shows them, and footers and leads
@@ -648,6 +715,7 @@ async fn read_status_of(
     view: StatusView<'_>,
     kept_rows: Option<(&mut Built, &std::collections::BTreeSet<String>)>,
 ) -> Result<StatusRead, String> {
+    let _underway = view.readers.map(Readers::underway);
     let background::Scope {
         project,
         lead,
@@ -720,6 +788,7 @@ async fn read_status_of(
     // kept for the next read.
     let mut listed_here: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let (mut fresh, mut whole) = (false, true);
+    let mut unread_here = Vec::new();
     // Side chats are not the project's agents.
     for bot in listed {
         let name = bot.name.as_str();
@@ -762,26 +831,24 @@ async fn read_status_of(
             rows.push(row);
             continue;
         }
-        // Its latest items are read again only once its history moved:
-        // the same head is the same history. A failed read is kept
-        // for none, so the next refresh tries again.
+        // Its history is read again only once it moved, here or, while
+        // the card fills, beside it: a row not read yet says what the
+        // listing does.
         let head = json!([bot.bot_id, bot.head]);
-        let latest = match status_read.remove(name) {
-            // No history yet: nothing to read, and nothing asked of the
-            // daemon for it, however many such agents a project holds.
-            _ if bot.head.is_none() => Some(Latest::default()),
-            Some((seen, latest)) if seen == head => Some(latest),
-            _ => {
-                fresh = true;
-                let latest = read_latest(client, name).await;
-                whole &= latest.is_some();
-                latest
+        let unread = !is_read(bot, &head, status_read, asks_seen);
+        if unread {
+            match view.fill {
+                true => unread_here.push(name.to_owned()),
+                false => {
+                    fresh = true;
+                    whole &= read_agent(client, bot, status_read, asks_seen, view.readers).await;
+                }
             }
-        };
-        if let Some(latest) = &latest {
-            status_read.insert(name.to_owned(), (head, latest.clone()));
         }
-        let latest = latest.unwrap_or_default();
+        let latest = (status_read.get(name))
+            .filter(|(seen, _)| *seen == head)
+            .map(|(_, latest)| latest.clone())
+            .unwrap_or_default();
         // Its turn, as the listing says: the one the daemon runs, however
         // many messages were steered into it or queued after it since, or
         // how its newest that ran (or failed in line) ended.
@@ -868,26 +935,7 @@ async fn read_status_of(
         let seen = match turn {
             Some(last) if !running => match asks_seen.get(name) {
                 Some((at, seen)) if *at == last => seen.clone(),
-                was => {
-                    fresh = true;
-                    // Read on from where the last read ended, as the sky
-                    // does. A read that failed is kept for none: the next
-                    // refresh, or window, reads it again.
-                    let read = match was.map(|(_, was)| was.clone()) {
-                        Some(was) => needs::scan_since(client, name, turn, &was).await,
-                        None => needs::scan(client, name, turn).await,
-                    };
-                    match read {
-                        Some(seen) => {
-                            asks_seen.insert(name.to_owned(), (last, seen.clone()));
-                            seen
-                        }
-                        None => {
-                            whole = false;
-                            Seen::default()
-                        }
-                    }
-                }
+                _ => Seen::default(),
             },
             _ => Seen {
                 ask,
@@ -913,7 +961,8 @@ async fn read_status_of(
         }
         needs.asked(name, ask.clone().filter(|_| !resolved));
         read.push(name.to_owned());
-        if !running {
+        // One not read yet says nothing of its question.
+        if !running && !(unread && view.fill) {
             idle.push(name.to_owned());
         }
         if let Some(ask) = &ask {
@@ -1032,7 +1081,300 @@ async fn read_status_of(
         idle,
         fresh,
         whole,
+        unread: unread_here,
     })
+}
+
+/// `/status` as it opens ([`Fill`]): every row drawn from the listing at
+/// once, with what was read of each agent before, then each history that
+/// moved since read beside the loop, the rows on screen first, and the rows
+/// drawn again once those are read and then as often as the card reads
+/// them again, on the listing as read again. What it read is kept for the
+/// next window; the rows whole, once every one is read.
+#[allow(clippy::too_many_arguments)]
+async fn fill_status(
+    client: &Client,
+    options_store: &std::path::Path,
+    scope: background::Scope,
+    turns: &HashMap<String, Value>,
+    status_read: &mut HashMap<String, (Value, Latest)>,
+    asks_seen: &mut HashMap<String, (i64, Seen)>,
+    view: StatusView<'_>,
+    fill: Fill,
+    woken: &tokio::sync::Notify,
+    logs: &str,
+    temp_due: bool,
+) -> (Alerts, Option<Box<StatusRead>>) {
+    let _underway = view.readers.map(Readers::underway);
+    let Fill {
+        came,
+        listed,
+        shown,
+        take,
+        keep,
+    } = fill;
+    let kept = agent_client::socket::canonical_store(options_store)
+        .unwrap_or_else(|_| options_store.to_path_buf());
+    let listing = async {
+        match listed {
+            Some(listed) => Some(listed),
+            None => (standing::list(client, &scope.glob).await.ok()).map(|listed| listed.0),
+        }
+    };
+    let (alerts, listed) = tokio::join!(read_alerts(client, logs, temp_due), listing);
+    let Some(mut listed) = listed else {
+        return (alerts, None);
+    };
+    let lead = kept_by(&listed, view.bot, &scope.project);
+    if take {
+        take_reads(&kept, &lead, client.identity(), status_read, asks_seen);
+    }
+    // Those whose read failed wait for the next refresh, as a read
+    // that fails does.
+    let mut failed = std::collections::HashSet::new();
+    // The agents unread as the card opened: once each is read, the rest is
+    // read as a refresh reads it, whole.
+    let mut owed: Option<std::collections::HashSet<String>> = None;
+    let (mut fresh, mut first) = (false, true);
+    loop {
+        let whole = owed.as_ref().is_some_and(|owed| owed.is_empty());
+        let this = StatusView {
+            fill: !whole,
+            ..view.clone()
+        };
+        let Ok(mut read) = read_status_of(
+            client,
+            options_store,
+            scope.clone(),
+            &listed,
+            turns,
+            status_read,
+            asks_seen,
+            this,
+            None,
+        )
+        .await
+        else {
+            return (alerts, None);
+        };
+        let mut unread = std::mem::take(&mut read.unread);
+        unread.retain(|name| !failed.contains(name));
+        let owed = owed.get_or_insert_with(|| unread.iter().cloned().collect());
+        let still: std::collections::HashSet<&str> = unread.iter().map(String::as_str).collect();
+        owed.retain(|name| still.contains(name.as_str()));
+        drop(still);
+        if !whole && owed.is_empty() && !unread.is_empty() {
+            continue;
+        }
+        if whole || unread.is_empty() {
+            if keep || fresh || read.fresh {
+                keep_for(
+                    &kept,
+                    &lead,
+                    &scope.lead,
+                    client.identity(),
+                    status_read,
+                    asks_seen,
+                );
+            }
+            read.fresh = false;
+            read.whole &= failed.is_empty();
+            return (alerts, Some(Box::new(read)));
+        }
+        // The rows on screen first, then the rest as the card lists them.
+        let at: HashMap<&str, usize> = (read.rows.iter().enumerate())
+            .map(|(at, row)| (row.bot.as_str(), at))
+            .collect();
+        let place = |name: &String| at.get(name.as_str()).copied().unwrap_or(usize::MAX);
+        unread.sort_by_cached_key(place);
+        let on_screen = unread.iter().take_while(|name| place(name) < shown).count();
+        drop(at);
+        if let Ok(mut came) = came.lock() {
+            *came = Some((alerts.clone(), Box::new(read)));
+        }
+        woken.notify_one();
+        let agents: HashMap<&str, &standing::Agent> = (listed.iter())
+            .map(|bot| (bot.name.as_str(), bot))
+            .collect();
+        // The rows on screen drawn as soon as they are read; the rest on
+        // the listing as the card reads it again.
+        let screen = (std::mem::replace(&mut first, false))
+            .then_some(on_screen)
+            .filter(|on_screen| *on_screen > 0);
+        let began = Instant::now();
+        for (n, name) in unread.iter().enumerate() {
+            let done = match screen {
+                Some(on_screen) => n == on_screen,
+                None => began.elapsed() >= STATUS_AGAIN,
+            };
+            if done {
+                break;
+            }
+            let Some(bot) = agents.get(name.as_str()) else {
+                continue;
+            };
+            fresh = true;
+            if !read_agent(client, bot, status_read, asks_seen, view.readers).await {
+                failed.insert(name.clone());
+            }
+        }
+        drop(agents);
+        if screen.is_none() {
+            let Ok((again, _)) = standing::list(client, &scope.glob).await else {
+                return (alerts, None);
+            };
+            listed = again;
+        }
+    }
+}
+
+/// The lead whose windows keep what `/status` reads for `bot`'s window
+/// ([`take_reads`]): itself when it is one, else the first lead up its
+/// line of makers as `listed` gives them, else its project's first lead.
+fn kept_by(listed: &[standing::Agent], bot: &str, project: &str) -> String {
+    let made: HashMap<&str, &str> = (listed.iter())
+        .map(|bot| (bot.name.as_str(), bot.maker()))
+        .collect();
+    let mut at = bot;
+    // A ring of makers leads to no lead.
+    for _ in 0..=made.len() {
+        if project::is_lead(at) {
+            return at.to_owned();
+        }
+        match made.get(at) {
+            Some(by) if !by.is_empty() => at = by,
+            _ => break,
+        }
+    }
+    format!("{project}.lead")
+}
+
+/// Keep what a window read for the next one, in `lead`'s file: in place
+/// of what it held when the window is the lead's own (`own`), else added
+/// to it, as the lead's window reads more agents than a task's does.
+fn keep_for(
+    store: &std::path::Path,
+    lead: &str,
+    own: &str,
+    identity: Option<&str>,
+    status_read: &HashMap<String, (Value, Latest)>,
+    asks_seen: &HashMap<String, (i64, Seen)>,
+) {
+    if lead == own {
+        return keep_reads(store, lead, identity, status_read, asks_seen);
+    }
+    let (mut latest, mut seen) = (status_read.clone(), asks_seen.clone());
+    take_reads(store, lead, identity, &mut latest, &mut seen);
+    keep_reads(store, lead, identity, &latest, &seen);
+}
+
+/// Whether what `/status` read of `bot` holds as the listing has it now:
+/// its latest items as of its history's `head`, none to read while it has
+/// no history, and its question as of the turn that ended last.
+fn is_read(
+    bot: &standing::Agent,
+    head: &Value,
+    status_read: &HashMap<String, (Value, Latest)>,
+    asks_seen: &HashMap<String, (i64, Seen)>,
+) -> bool {
+    let latest =
+        bot.head.is_none() || (status_read.get(&bot.name)).is_some_and(|(seen, _)| seen == head);
+    let ended = (bot.last.as_ref()).filter(|_| bot.running_turn.is_none());
+    let asked = ended
+        .is_none_or(|last| (asks_seen.get(&bot.name)).is_some_and(|(turn, _)| *turn == last.turn));
+    latest && asked
+}
+
+/// Read what `/status` holds of `bot` that moved since: its latest items
+/// once its history moved, the same head being the same history, and an
+/// idle agent's question once per turn it ended, read on from where the
+/// last read ended, as the sky does. A read that failed is kept for none,
+/// so the next refresh, or window, reads it again; whether all were read.
+/// What the window's other `readers` read is taken, and one they read now
+/// is waited for, not read again.
+async fn read_agent(
+    client: &Client,
+    bot: &standing::Agent,
+    status_read: &mut HashMap<String, (Value, Latest)>,
+    asks_seen: &mut HashMap<String, (i64, Seen)>,
+    readers: Option<&Readers>,
+) -> bool {
+    let name = bot.name.as_str();
+    let mut whole = true;
+    let head = json!([bot.bot_id, bot.head]);
+    let ended = (bot.last.as_ref()).filter(|_| bot.running_turn.is_none());
+    let _reading = match readers {
+        Some(readers) => loop {
+            let landed = readers.landed.notified();
+            tokio::pin!(landed);
+            landed.as_mut().enable();
+            {
+                let Ok(mut shared) = readers.reads.lock() else {
+                    break None;
+                };
+                if let Some(read) = (shared.latest.get(name)).filter(|(seen, _)| *seen == head) {
+                    status_read.insert(name.to_owned(), read.clone());
+                }
+                if let Some(last) = ended
+                    && let Some(seen) =
+                        (shared.seen.get(name)).filter(|(turn, _)| *turn == last.turn)
+                {
+                    asks_seen.insert(name.to_owned(), seen.clone());
+                }
+                if is_read(bot, &head, status_read, asks_seen) {
+                    return true;
+                }
+                if shared.reading.insert(name.to_owned()) {
+                    break Some(Reading(readers, name));
+                }
+            }
+            landed.await;
+        },
+        None => None,
+    };
+    // No history yet: nothing asked of the daemon for it, however many
+    // such agents a project holds.
+    match status_read.get(name) {
+        _ if bot.head.is_none() => {
+            status_read.insert(name.to_owned(), (head, Latest::default()));
+        }
+        Some((seen, _)) if *seen == head => {}
+        _ => match read_latest(client, name).await {
+            Some(latest) => {
+                status_read.insert(name.to_owned(), (head, latest));
+            }
+            None => {
+                status_read.remove(name);
+                whole = false;
+            }
+        },
+    }
+    if let Some(last) = ended.map(|last| last.turn)
+        && (asks_seen.get(name)).is_none_or(|(turn, _)| *turn != last)
+    {
+        let read = match asks_seen.get(name).map(|(_, was)| was.clone()) {
+            Some(was) => needs::scan_since(client, name, Some(last), &was).await,
+            None => needs::scan(client, name, Some(last)).await,
+        };
+        match read {
+            Some(seen) => {
+                asks_seen.insert(name.to_owned(), (last, seen));
+            }
+            None => whole = false,
+        }
+    }
+    // What it read, for the others to take.
+    if let Some(readers) = readers
+        && let Ok(mut shared) = readers.reads.lock()
+    {
+        if let Some(read) = status_read.get(name) {
+            shared.latest.insert(name.to_owned(), read.clone());
+        }
+        if let Some(seen) = asks_seen.get(name) {
+            shared.seen.insert(name.to_owned(), seen.clone());
+        }
+    }
+    whole
 }
 
 /// Where `/status` keeps what it read of each agent's history for the next
@@ -2594,6 +2936,8 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             places: Default::default(),
             aside: &|_| false,
             details: true,
+            fill: false,
+            readers: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
@@ -3169,8 +3513,10 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         None => std::env::current_dir().map_err(|e| e.to_string())?,
     };
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
-    let composed =
-        agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
+    let composed = agent_client::policy::hiding(&agent_client::hidden::known(), || {
+        agent_client::policy::instructions(&workspace, None, &memory)
+    })
+    .map_err(|e| e.to_string())?;
     let info = crate::project::read(&workspace)?;
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
@@ -4591,6 +4937,33 @@ type StatusCame = (
     HashMap<String, (i64, Seen)>,
 );
 
+/// What `/status` says is broken around the agents, with the temporary
+/// folders' when read ([`read_alerts`]).
+type Alerts = (Vec<status::Alert>, Option<Vec<status::Alert>>);
+
+/// The rows `/status` drew as it opened, and each time it read more of
+/// them, for the window to take as they land ([`App::status_filled`]).
+type Filling = Arc<std::sync::Mutex<Option<(Alerts, Box<StatusRead>)>>>;
+
+/// How `/status` opens: every row drawn from the listing at once, then
+/// filled in as each history is read, beside the loop.
+struct Fill {
+    came: Filling,
+    /// The project's agents as the window keeps them listed, when it has
+    /// them: the rows draw without asking for them again.
+    listed: Option<Vec<standing::Agent>>,
+    /// How many rows the card shows at once: theirs are read first.
+    shown: usize,
+    /// Whether to start from what an earlier window kept, as this one
+    /// holds no read yet.
+    take: bool,
+    /// Whether what this window read is kept for the next, once read.
+    keep: bool,
+}
+
+/// How often `/status` reads its rows again while open.
+const STATUS_AGAIN: Duration = Duration::from_secs(2);
+
 /// The margin's references read beside the loop, by bot and note.
 type References = Vec<((String, String), margin::Reference)>;
 
@@ -4870,6 +5243,8 @@ struct Watch {
     /// The workflow run a stop was asked for, by its id, until the confirm
     /// is answered: only `enter` stops it.
     stop: Option<String>,
+    /// Whether `/status`'s rows have landed since it opened.
+    listed: bool,
 }
 
 impl Watch {
@@ -5142,6 +5517,11 @@ struct App {
     status_read: HashMap<String, (Value, Latest)>,
     /// Whether `/status` read a history since it last kept its reads.
     reads_unkept: bool,
+    /// What the window's reads of histories hold between them.
+    readers: Arc<Readers>,
+    /// Whether the window started from what its project's lead's windows
+    /// kept of each history: its first count takes it.
+    reads_taken: bool,
     /// A lead's window reads, once it has drawn, the histories that moved
     /// since a window last kept its reads, off the loop: `/status` then
     /// opens on them. None before it starts; done once it has.
@@ -5617,6 +5997,10 @@ struct App {
     tasking: Option<tokio::task::JoinHandle<TasksRead>>,
     /// A read for the open card, under way beside the loop.
     card_read: Option<tokio::task::JoinHandle<CardRead>>,
+    /// `/status` filling in as it opens, beside the loop: where its rows
+    /// land as they are read, and the read, which ends whole. Other cards
+    /// read meanwhile; the card's own refreshes wait for it.
+    filling: Option<(Filling, tokio::task::JoinHandle<CardRead>)>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
     /// The words view's hints on the turn being drawn.
@@ -7306,6 +7690,8 @@ impl App {
             running_heads: HashMap::new(),
             status_read: HashMap::new(),
             reads_unkept: false,
+            readers: Arc::default(),
+            reads_taken: false,
             warming: None,
             sounds: sound::Sounds::new(false),
             needs_pulse: std::cell::Cell::default(),
@@ -7495,6 +7881,7 @@ impl App {
             tasks_all_read: None,
             tasking: None,
             card_read: None,
+            filling: None,
             tasks_width: 0,
             turn_hints: TurnHints::default(),
             top_turn: None,
@@ -7832,9 +8219,10 @@ impl App {
                     self.place_picked(node);
                 }
             }
+            keyed |= self.status_filled().await;
             if self.pane.as_ref().is_some_and(pane::Pane::is_card)
                 && self.watch.as_ref().is_some_and(|w| {
-                    w.read.elapsed() > Duration::from_secs(2)
+                    w.read.elapsed() > STATUS_AGAIN
                         || w.usage.as_ref().is_some_and(usage::View::due)
                         || w.audit.as_ref().is_some_and(audit::View::due)
                         || w.background
@@ -10021,7 +10409,8 @@ impl App {
         }
         self.keep_asked();
         match &mut self.watch {
-            Some(watch) if listed(watch) => {
+            // Its page opens as the card's rows land, when they list it.
+            Some(watch) if listed(watch) || !watch.listed => {
                 watch.run = Some(run.to_owned());
                 watch.picked = None;
             }
@@ -11562,8 +11951,7 @@ impl App {
             }
             self.kept_rows = counted.kept.unwrap_or_default();
             if let Some((latest, seen)) = counted.reads {
-                self.status_read = latest;
-                self.asks_seen = seen;
+                self.reads_came(latest, seen);
             }
             if let Some((counts, bots)) = counted.read {
                 self.counts = Some(counts);
@@ -11634,10 +12022,14 @@ impl App {
             std::mem::take(&mut self.asks_seen),
         );
         let (was, turns) = (self.counted_mark, self.turns.clone());
+        // Every window starts from what its lead's windows kept, read
+        // beside the loop with the first count.
+        let take = !std::mem::replace(&mut self.reads_taken, true);
         let told = self.blanks.tasks.clone();
         // The rows' mark is kept up to date as rows change, and taken again
         // whole only from a new snapshot.
         let kept_mark = self.rows_mark.filter(|_| !whole);
+        let readers = self.readers.clone();
         self.counting = Some(tokio::spawn(async move {
             let failed = |reads| Counted {
                 mark: None,
@@ -11648,6 +12040,12 @@ impl App {
                 own: None,
                 kept: None,
             };
+            if take {
+                let kept =
+                    agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
+                let lead = kept_by(&listed, &bot, &scope.project);
+                take_reads(&kept, &lead, client.identity(), &mut latest, &mut seen);
+            }
             let (mut listed, mut kept_mark) = (listed, kept_mark);
             if !moved.is_empty() {
                 let names: Vec<String> = moved.iter().cloned().collect();
@@ -11697,6 +12095,8 @@ impl App {
                 places: Default::default(),
                 aside: &|_| false,
                 details: false,
+                fill: false,
+                readers: Some(&readers),
             };
             let Ok(read) = read_status_of(
                 &client,
@@ -13719,41 +14119,32 @@ impl App {
         if let Some(fleet) = &self.fleet {
             fleet.layout.places_now(PLACES_NOW).await;
         }
-        // What an earlier window read, on the first open here; what this
-        // one read since, kept once each open, not at every refresh.
-        let store = agent_client::socket::canonical_store(&self.options.store)
-            .unwrap_or_else(|_| self.options.store.clone());
-        // What the background pass read, waited for if it still runs, so
-        // no history is read twice.
-        self.warmed().await;
-        let lead = self.scope().lead;
-        if self.status_read.is_empty() {
-            let identity = self.client.identity();
-            take_reads(
-                &store,
-                &lead,
-                identity,
-                &mut self.status_read,
-                &mut self.asks_seen,
-            );
+        // The card draws at once, and its rows as soon as they are listed:
+        // each history read beside the loop fills in its row. What an
+        // earlier window read is taken on the first open here; what this
+        // one read since is kept once each open, not at every refresh. A
+        // read under way for the card shown before is let go.
+        if let Some(job) = self.card_read.take() {
+            job.abort();
         }
-        let (project, rows) = match self.status_rows().await {
-            Ok(read) => read,
-            Err(error) => {
-                self.notice = Some(error);
-                return;
-            }
+        if let Some((_, job)) = self.filling.take() {
+            job.abort();
+        }
+        let filling = Filling::default();
+        let fill = Fill {
+            came: filling.clone(),
+            listed: self.listed.clone(),
+            shown: self.height,
+            take: self.status_read.is_empty(),
+            keep: std::mem::take(&mut self.reads_unkept),
         };
-        if std::mem::take(&mut self.reads_unkept) {
-            let identity = self.client.identity();
-            keep_reads(&store, &lead, identity, &self.status_read, &self.asks_seen);
-        }
-        let alerts = self.status_alerts().await;
+        let job = self.read_status_beside(Some(fill));
+        self.filling = Some((filling, job));
         self.watch = Some(Watch {
-            project,
-            rows,
+            project: self.scope().project,
+            rows: Vec::new(),
             read: Instant::now(),
-            alerts,
+            alerts: Vec::new(),
             open: Vec::new(),
             background: None,
             usage: None,
@@ -13767,17 +14158,8 @@ impl App {
             more: false,
             run: None,
             stop: None,
+            listed: false,
         });
-        // The first row picked, or the agent named last in what shows:
-        // Enter opens the one the conversation just pointed to.
-        let named = self.screen.last_agent();
-        if let Some(watch) = &mut self.watch {
-            let picks = card_picks(watch, self.width.max(40));
-            watch.pick = (named.and_then(|named| {
-                (picks.iter()).position(|picked| *picked == Picked::Agent(named.clone()))
-            }))
-            .or((!picks.is_empty()).then_some(0));
-        }
         self.open_pane(pane::Pane::card("status", PICK_KEYS));
     }
 
@@ -13816,6 +14198,7 @@ impl App {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
     }
@@ -13890,6 +14273,7 @@ impl App {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
     }
@@ -13919,6 +14303,7 @@ impl App {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         self.open_pane(pane::Pane::card("audit", STATUS_KEYS));
     }
@@ -13994,6 +14379,7 @@ impl App {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         self.open_pane(pane::Pane::card("memory", STATUS_KEYS));
     }
@@ -14024,6 +14410,7 @@ impl App {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
     }
@@ -14049,6 +14436,7 @@ impl App {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
     }
@@ -14178,12 +14566,16 @@ impl App {
             watch.read = Instant::now();
             return;
         }
-        self.card_read = Some(self.read_status_beside());
+        // The card's rows read again once it has filled in.
+        if self.filling.is_none() {
+            self.card_read = Some(self.read_status_beside(None));
+        }
     }
 
     /// `/status` read again beside the loop: its alerts, then its rows.
-    fn read_status_beside(&mut self) -> tokio::task::JoinHandle<CardRead> {
+    fn read_status_beside(&mut self, fill: Option<Fill>) -> tokio::task::JoinHandle<CardRead> {
         let (client, woken) = (self.client.clone(), self.woken.clone());
+        let readers = self.readers.clone();
         let (store, scope, turns) = (self.options.store.clone(), self.scope(), self.turns.clone());
         let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
         let (bot, asks, approvals) = (self.bot.clone(), self.asks.clone(), self.approvals.clone());
@@ -14197,7 +14589,6 @@ impl App {
         let logs = tilde(&format!("{}.companions", self.store().display()));
         let temp_due = (self.temp_read.as_ref()).is_none_or(|(at, _)| at.elapsed() >= TEMP_READ);
         tokio::spawn(async move {
-            let alerts = read_alerts(&client, &logs, temp_due).await;
             let view = StatusView {
                 bot: &bot,
                 asks: &asks,
@@ -14206,18 +14597,58 @@ impl App {
                 places,
                 aside: &*aside,
                 details: true,
+                fill: fill.is_some(),
+                readers: Some(&readers),
             };
-            let read = read_status(&client, &store, scope, &turns, &mut latest, &mut seen, view)
-                .await
-                .ok()
-                .map(|read| (Box::new(read), latest, seen));
+            let Some(fill) = fill else {
+                let alerts = read_alerts(&client, &logs, temp_due).await;
+                let read =
+                    read_status(&client, &store, scope, &turns, &mut latest, &mut seen, view)
+                        .await
+                        .ok()
+                        .map(|read| (Box::new(read), latest, seen));
+                woken.notify_one();
+                return CardRead::Status(alerts, read);
+            };
+            let read = fill_status(
+                &client,
+                &store,
+                scope,
+                &turns,
+                &mut latest,
+                &mut seen,
+                view,
+                fill,
+                &woken,
+                &logs,
+                temp_due,
+            )
+            .await;
             woken.notify_one();
-            CardRead::Status(alerts, read)
+            let (alerts, read) = read;
+            CardRead::Status(alerts, read.map(|read| (read, latest, seen)))
         })
     }
 
     /// What a read for the open card found, shown in it while it is open.
+    /// What `/status` read is kept, the card open or not.
     fn card_came(&mut self, read: CardRead) {
+        if let CardRead::Status(alerts, read) = read {
+            match read {
+                Some((read, latest, seen)) => {
+                    self.reads_came(latest, seen);
+                    self.status_landed(alerts, *read);
+                }
+                // A card whose agents could not be listed closes, saying so.
+                None if self.watch.as_ref().is_some_and(|watch| !watch.listed) => {
+                    self.close_pane(false);
+                    self.closed = None;
+                    self.notice = Some("could not list the agents".into());
+                }
+                None => {}
+            }
+            return;
+        }
         let Some(watch) = &mut self.watch else {
             return;
         };
@@ -14241,47 +14672,99 @@ impl App {
                     view.loaded(window, read, prices);
                 }
             }
-            CardRead::Status((alerts, temp), read) => {
-                if let Some(temp) = temp {
-                    self.temp_read = Some((Instant::now(), temp));
-                }
-                let mut alerts = alerts;
-                if let Some((_, temp)) = &self.temp_read {
-                    alerts.extend(temp.iter().cloned());
-                }
-                alerts.extend(status::background_alert(self.failed));
-                let Some((read, latest, seen)) = read else {
-                    return;
-                };
-                self.status_read = latest;
-                self.asks_seen = seen;
-                let (_, rows) = self.status_kept(*read);
-                if let Some(watch) = &mut self.watch {
-                    watch.rows = rows;
-                    watch.read = Instant::now();
-                    watch.alerts = alerts;
-                }
-            }
+            CardRead::Status(..) => {}
         }
     }
 
-    /// What `/status` says is broken around the agents: the daemon's
-    /// companions that are down or keep restarting, turns held on a cause
-    /// the person can fix, a temporary folder every agent shares low on
-    /// space or inodes, and failures `/background` lists that the person
-    /// has not seen there. Nothing when all is well.
-    async fn status_alerts(&mut self) -> Vec<status::Alert> {
-        let logs = tilde(&format!("{}.companions", self.store().display()));
-        let temp_due = (self.temp_read.as_ref()).is_none_or(|(at, _)| at.elapsed() >= TEMP_READ);
-        let (mut alerts, temp) = read_alerts(&self.client, &logs, temp_due).await;
+    /// The rows `/status` read so far as it opened, as they land, and its
+    /// read once whole.
+    /// Whether the card's first rows came: they answer the person's
+    /// `/status`, so they draw at once, as a key does.
+    async fn status_filled(&mut self) -> bool {
+        let Some((filling, job)) = &self.filling else {
+            return false;
+        };
+        let unlisted = |app: &Self| app.watch.as_ref().is_some_and(|watch| !watch.listed);
+        let was = unlisted(self);
+        let came = filling.lock().ok().and_then(|mut came| came.take());
+        let ended = job.is_finished();
+        if let Some((alerts, read)) = came {
+            self.status_landed(alerts, *read);
+        }
+        if ended
+            && let Some((_, job)) = self.filling.take()
+            && let Ok(read) = job.await
+        {
+            self.card_came(read);
+        }
+        was && !unlisted(self)
+    }
+
+    /// What `/status` read, in its card: its rows, with their times
+    /// counting on from now, and what is broken around them. Its first
+    /// rows pick the agent named last in what shows, else the first, and
+    /// open the run asked for, or say it ended.
+    fn status_landed(&mut self, (alerts, temp): Alerts, read: StatusRead) {
         if let Some(temp) = temp {
             self.temp_read = Some((Instant::now(), temp));
         }
+        let mut alerts = alerts;
         if let Some((_, temp)) = &self.temp_read {
             alerts.extend(temp.iter().cloned());
         }
         alerts.extend(status::background_alert(self.failed));
-        alerts
+        let (project, rows) = self.status_kept(read);
+        let named = self.screen.last_agent();
+        let width = self.width.max(40);
+        // Into `/status`'s card, not another that took its place.
+        let Some(watch) = self.watch.as_mut().filter(|watch| {
+            watch.background.is_none()
+                && watch.usage.is_none()
+                && watch.audit.is_none()
+                && watch.commons.is_none()
+                && watch.memory.is_none()
+                && watch.sky.is_none()
+        }) else {
+            return;
+        };
+        watch.rows = rows;
+        watch.read = Instant::now();
+        watch.alerts = alerts;
+        if std::mem::replace(&mut watch.listed, true) {
+            return;
+        }
+        // The head names the project by its title, else its name.
+        watch.project = project;
+        let picks = card_picks(watch, width);
+        watch.pick = (named.and_then(|named| {
+            (picks.iter()).position(|picked| *picked == Picked::Agent(named.clone()))
+        }))
+        .or((!picks.is_empty()).then_some(0));
+        if let Some(run) = watch.run.clone()
+            && run_of(watch, &run).is_none()
+        {
+            watch.run = None;
+            self.notice = Some("that workflow has ended".into());
+        }
+    }
+
+    /// What a read beside the loop read of each agent's history and
+    /// question, kept with what the window holds: the newer question
+    /// where both read one.
+    fn reads_came(
+        &mut self,
+        latest: HashMap<String, (Value, Latest)>,
+        seen: HashMap<String, (i64, Seen)>,
+    ) {
+        self.status_read.extend(latest);
+        for (name, (turn, read)) in seen {
+            match self.asks_seen.get(&name) {
+                Some((had, _)) if *had > turn => {}
+                _ => {
+                    self.asks_seen.insert(name, (turn, read));
+                }
+            }
+        }
     }
 
     /// Count what runs for this agent in the background again, every ten
@@ -14386,7 +14869,19 @@ impl App {
         }
     }
 
-    /// The project's agents, as `/status` shows them.
+    /// `/status` as it lands once every row is read.
+    #[cfg(test)]
+    async fn status_whole(&mut self) {
+        if let Some((_, job)) = self.filling.take()
+            && let Ok(read) = job.await
+        {
+            self.card_came(read);
+        }
+    }
+
+    /// The project's agents, as `/status` shows them, each history read
+    /// before they show.
+    #[cfg(test)]
     async fn status_rows(&mut self) -> Result<(String, Vec<status::Row>), String> {
         let scope = self.scope();
         let fleet = self.fleet.as_ref();
@@ -14398,6 +14893,8 @@ impl App {
             places: fleet.map(|fleet| fleet.layout.places()).unwrap_or_default(),
             aside: &|name| fleet.is_some_and(|fleet| fleet.layout.aside(name)),
             details: true,
+            fill: false,
+            readers: Some(&self.readers),
         };
         let read = read_status(
             &self.client,
@@ -14444,6 +14941,7 @@ impl App {
                 let (client, woken) = (self.client.clone(), self.woken.clone());
                 let (store, scope) = (self.options.store.clone(), self.scope());
                 let lead = scope.lead.clone();
+                let readers = self.readers.clone();
                 self.warming = Some(Warming::Running(tokio::spawn(async move {
                     let kept = agent_client::socket::canonical_store(&store)
                         .unwrap_or_else(|_| store.clone());
@@ -14457,6 +14955,8 @@ impl App {
                         places: Default::default(),
                         aside: &|_| false,
                         details: true,
+                        fill: false,
+                        readers: Some(&readers),
                     };
                     let turns = HashMap::new();
                     let read =
@@ -20361,7 +20861,9 @@ impl App {
                 }
             } else {
                 // A run's page closes once the run ends.
-                watch.run = None;
+                if watch.listed {
+                    watch.run = None;
+                }
                 pane.page = false;
                 let (mut lines, folding, marks) = watch_card(watch, width);
                 let mut picked = None;
@@ -24398,6 +24900,8 @@ mod tests {
             places: Default::default(),
             aside: &|_| false,
             details: true,
+            fill: false,
+            readers: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let read = read_status(
@@ -24710,6 +25214,7 @@ mod tests {
             app.bot = "shop.lead".into();
             app.options.store = store.clone();
             app.status().await;
+            app.status_whole().await;
             assert_eq!(app.watch.as_ref().unwrap().rows.len(), 2);
             app
         };
@@ -24844,6 +25349,85 @@ mod tests {
         assert!(app.asks_seen.contains_key("shop.t1"));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_draws_every_row_at_once_and_fills_them_in_the_rows_on_screen_first() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let histories = asked.clone();
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let open = gate.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => {
+                        let bot = |n: i64| {
+                            json!({"name": format!("shop.t{n}"), "bot_id": n, "head": n,
+                        "status": "completed", "running_turn": null,
+                        "last": {"turn": n, "status": "completed",
+                            "started_ms": 1_000 * n, "finished_ms": 2_000 * n}})
+                        };
+                        json!({"bots": [bot(1), bot(2), bot(3)], "next_after": null})
+                    }
+                    "history_nodes" => {
+                        // A store that reads no history until the card has drawn.
+                        tokio::task::block_in_place(|| {
+                            while !open.load(std::sync::atomic::Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        });
+                        let bot = asked["bot"].as_str().unwrap_or_default().to_owned();
+                        let mut asked = histories.lock().unwrap();
+                        if asked.last() != Some(&bot) {
+                            asked.push(bot);
+                        }
+                        json!({"nodes": [{"node": 1, "turn": 1}], "next_from": null})
+                    }
+                    "history_items" => json!({"items": [
+                {"node": 1, "item": {"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]}}]}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let dir = std::env::temp_dir().join(unique("sonny-status-fills"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.options.store = dir.join("state.sqlite");
+        // One row on screen: the latest to finish, listed last.
+        app.height = 1;
+        app.status().await;
+        assert!(
+            app.watch
+                .as_ref()
+                .is_some_and(|watch| watch.rows.is_empty())
+        );
+        let drawn = async {
+            while !app.watch.as_ref().is_some_and(|watch| watch.listed) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                app.status_filled().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), drawn)
+            .await
+            .unwrap();
+        // Every row at once, each saying only what the listing does.
+        let rows = &app.watch.as_ref().unwrap().rows;
+        let names: Vec<&str> = rows.iter().map(|row| row.bot.as_str()).collect();
+        assert_eq!(names, ["shop.t3", "shop.t2", "shop.t1"]);
+        assert!(rows.iter().all(|row| row.latest.is_empty()));
+        assert!(asked.lock().unwrap().is_empty());
+        // Then filled in, the row on screen read first.
+        gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.status_whole().await;
+        let rows = &app.watch.as_ref().unwrap().rows;
+        assert!(rows.iter().all(|row| !row.latest.is_empty()));
+        assert_eq!(*asked.lock().unwrap(), ["shop.t3", "shop.t2", "shop.t1"]);
+        assert!(app.filling.is_none());
+        // And kept for the next window.
+        assert!(reads_file(&app.options.store, "shop.lead").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_lead_window_reads_its_agents_histories_before_status_opens() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24875,6 +25459,7 @@ mod tests {
         assert_eq!(histories.load(Ordering::SeqCst), 2);
         // `/status` opens on what it read.
         app.status().await;
+        app.status_whole().await;
         assert_eq!(app.watch.as_ref().unwrap().rows.len(), 1);
         assert_eq!(histories.load(Ordering::SeqCst), 2);
         // A task's window leaves it to its lead's.
@@ -24977,6 +25562,61 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(app.counts, Some(counts));
+    }
+
+    #[tokio::test]
+    async fn every_window_starts_from_what_its_leads_windows_kept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let histories = Arc::new(AtomicUsize::new(0));
+        let read = histories.clone();
+        let snapshot = json!([
+            {"name": "shop.lead", "bot_id": 1, "head": 3, "last": {"turn": 3, "status": "completed"}},
+            {"name": "shop.fix", "bot_id": 2, "head": 5, "last": {"turn": 5, "status": "completed"},
+                "created_by": "shop.lead"},
+        ]);
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
+            "follow" => json!({"following": ask["bot"]}),
+            "history_nodes" => {
+                read.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [], "next_from": null})
+            }
+            "history_items" => json!({"items": []}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let dir = std::env::temp_dir().join(unique("sonny-kept-reads"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        // The lead's window kept what it read of both.
+        let latest = HashMap::from([
+            ("shop.lead".to_owned(), (json!([1, 3]), Latest::default())),
+            ("shop.fix".to_owned(), (json!([2, 5]), Latest::default())),
+        ]);
+        let seen = HashMap::from([
+            ("shop.lead".to_owned(), (3, Seen::default())),
+            ("shop.fix".to_owned(), (5, Seen::default())),
+        ]);
+        keep_reads(&store, "shop.lead", None, &latest, &seen);
+        // A task's window counts from it, reading no history.
+        let mut app = app(client);
+        app.bot = "shop.fix".into();
+        app.options.store = store;
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        app.count_agents().await;
+        while !app.counting.as_ref().unwrap().is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        app.counted_at = None;
+        app.count_agents().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 0);
+        assert_eq!(app.status_read.len(), 2);
+        assert!(app.reads_taken);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -25108,6 +25748,83 @@ mod tests {
         app.follower.as_ref().unwrap().moved("shop.fix");
         counted(&mut app).await;
         assert!(app.counted_mark.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_closed_agent_leaves_the_counts_on_its_close_and_comes_back_with_a_message() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lead = json!({"name": "shop.lead", "bot_id": 1, "head": 1});
+        let fix = |closed: bool| {
+            let mut row = json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                "last": {"turn": 4, "status": "completed"}, "created_by": "shop.lead"});
+            if closed {
+                row["closed_ms"] = json!(1_700_000_000_000_i64);
+            }
+            row
+        };
+        let closed = Arc::new(AtomicBool::new(false));
+        let shut = closed.clone();
+        let snapshot = json!([fix(false), lead]);
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" if ask["names"].is_null() && ask["active"].is_null() => {
+                assert_eq!(ask["open"], true, "{ask}");
+                json!({"bots": snapshot, "cursor": 7, "next_after": null})
+            }
+            "follow" => json!({"following": ask["bot"]}),
+            // Read by name, a closed agent's row says when it closed.
+            "bots" if ask["names"].is_array() => {
+                json!({"bots": [fix(shut.load(Ordering::SeqCst))], "next_after": null})
+            }
+            "bots" => json!({"bots": [], "next_after": null}),
+            "history_nodes" => json!({"nodes": [], "next_from": null}),
+            "history_items" => json!({"items": []}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let dir = std::env::temp_dir().join(unique("sonny-closed-counts"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.options.store = dir.join("state.sqlite");
+        let counted = async |app: &mut App| {
+            app.counted_at = None;
+            app.count_agents().await;
+            if let Some(job) = &app.counting {
+                while !job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            app.counted_at = Some(Instant::now());
+            app.count_agents().await;
+        };
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        counted(&mut app).await;
+        let names = |app: &App| -> Vec<String> {
+            (app.listed.iter().flatten())
+                .map(|bot| bot.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&app), ["shop.fix", "shop.lead"]);
+        assert_eq!(app.counts.as_ref().unwrap().idle, 2);
+        // Closed: the follow's one `closed` event takes it off.
+        closed.store(true, Ordering::SeqCst);
+        let event = json!({"event": "closed", "bot": "shop.fix", "following": "shop.*"});
+        assert!(app.follower.as_mut().unwrap().heard(&event));
+        counted(&mut app).await;
+        assert_eq!(names(&app), ["shop.lead"]);
+        assert_eq!(app.counts.as_ref().unwrap().idle, 1);
+        // A message opens it again, and it is back.
+        closed.store(false, Ordering::SeqCst);
+        let event = json!({"event": "queued", "bot": "shop.fix", "following": "shop.*"});
+        assert!(app.follower.as_mut().unwrap().heard(&event));
+        counted(&mut app).await;
+        assert_eq!(names(&app), ["shop.fix", "shop.lead"]);
+        assert_eq!(app.counts.as_ref().unwrap().idle, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28547,6 +29264,7 @@ mod tests {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         app.press("run/run1").await;
         assert_eq!(app.watch.as_ref().unwrap().run.as_deref(), Some("run1"));
@@ -34296,6 +35014,7 @@ mod tests {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         };
         // The folder's other lead opens by its own name, not its label.
         let (lines, _, marks) = watch_card(&watch, 80);
@@ -34794,6 +35513,7 @@ mod tests {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let pick = |app: &App| app.watch.as_ref().unwrap().pick;
@@ -34865,6 +35585,7 @@ mod tests {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let watch = |app: &App| {
@@ -34981,6 +35702,7 @@ mod tests {
             more: false,
             run: None,
             stop: None,
+            listed: true,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);

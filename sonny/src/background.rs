@@ -728,6 +728,7 @@ pub fn icons(items: &[Item], bot: &str, icons: &HashMap<String, String>) -> Stri
 
 /// The agents a window's `/background` covers: the project's, as
 /// `/status` lists them, by a glob.
+#[derive(Clone)]
 pub struct Scope {
     pub project: String,
     pub lead: String,

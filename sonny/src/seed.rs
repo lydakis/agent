@@ -24,10 +24,18 @@ fn seed_with(
     let mut seeded = Vec::new();
     for folder in folders(top) {
         let to = copy.join(&folder);
+        // The folders above it made, or found, as folders: a link the
+        // checkout holds in their place, committed or not, would take the
+        // clone wherever it points.
+        let above: Vec<&std::ffi::OsStr> = (folder.parent().into_iter())
+            .flat_map(Path::components)
+            .map(|part| part.as_os_str())
+            .collect();
         if to.symlink_metadata().is_ok()
-            || to
-                .parent()
-                .is_some_and(|up| std::fs::create_dir_all(up).is_err())
+            || folder
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            || crate::git::folders(copy, &above, true).is_err()
         {
             continue;
         }

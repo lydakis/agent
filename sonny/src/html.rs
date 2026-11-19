@@ -11,6 +11,30 @@ use std::{
 /// How tall a page is laid out, in CSS pixels, before its blank end is cut.
 const WINDOW_HEIGHT: u32 = 1600;
 
+/// The folder drawn pages, their pictures and the browser's screenshots
+/// are kept in: Sonny's own, under `~/.agent`, which no sandboxed command
+/// writes, never the shared temporary folder, where an agent could put a
+/// link in a file's place for the browser or Sonny to follow, or a file of
+/// its own where Sonny looks for one it kept.
+pub fn pages() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".agent/sonny/pages"),
+        None => std::env::temp_dir().join("sonny-pages"),
+    }
+}
+
+/// [`pages`], made if need be, for the person alone.
+pub fn pages_made() -> Result<PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = pages();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
 /// The page at `path` as a PNG, `css_width` CSS pixels wide at twice
 /// that in device pixels; or why not.
 pub fn render(path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
@@ -19,7 +43,7 @@ pub fn render(path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
 
 /// [`render`] with this browser, or Quick Look without one.
 fn render_with(chrome: Option<PathBuf>, path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
-    let out = std::env::temp_dir().join(format!("sonny-shot-{}", std::process::id()));
+    let out = pages_made()?.join(format!("shot-{}", std::process::id()));
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let shot = match chrome {
         Some(chrome) => {
