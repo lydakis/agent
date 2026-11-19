@@ -148,8 +148,9 @@ pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
 /// each its name, agent, state, group (`needs_you`, `working`, `idle`,
 /// `done`), whether a turn runs, its pull request and latest step, and
 /// the agent that made it.
-pub fn tasks(rows: &mut [Row]) -> Vec<Task> {
+pub fn tasks<R: std::borrow::BorrowMut<Row>>(rows: &mut [R]) -> Vec<Task> {
     (rows.iter_mut())
+        .map(|row| row.borrow_mut())
         .filter(|row| row.name != "lead")
         .map(|row| {
             (row.line.get_or_insert_with(|| {
@@ -338,8 +339,9 @@ struct Listing<'a> {
     helping: std::collections::HashSet<&'a str>,
 }
 
-fn listing(rows: &[Row]) -> Listing<'_> {
-    let tasks: Vec<&Row> = rows.iter().filter(|r| r.name != "lead").collect();
+fn listing<R: std::borrow::Borrow<Row>>(rows: &[R]) -> Listing<'_> {
+    let rows = || rows.iter().map(|row| row.borrow());
+    let tasks: Vec<&Row> = rows().filter(|r| r.name != "lead").collect();
     // A task's own helpers fold under the task the lead's line started:
     // each row by the top of its line of makers among the tasks.
     let by_bot: HashMap<&str, &Row> = tasks.iter().map(|r| (r.bot.as_str(), *r)).collect();
@@ -359,7 +361,7 @@ fn listing(rows: &[Row]) -> Listing<'_> {
     let mut under: HashMap<String, Vec<&Row>> = HashMap::new();
     let mut helping = std::collections::HashSet::new();
     // The lead is listed first in its group, as one of the agents.
-    let mut listed: Vec<&Row> = rows.iter().filter(|r| r.name == "lead").collect();
+    let mut listed: Vec<&Row> = rows().filter(|r| r.name == "lead").collect();
     for row in &tasks {
         match top(row) {
             // One that needs the person or failed is listed there too.
@@ -429,8 +431,8 @@ fn tally(listed: &[&Row]) -> Counts {
 }
 
 /// The agents `rows` lists, by their own names.
-pub fn bots(rows: &[Row]) -> std::collections::HashSet<String> {
-    rows.iter().map(|row| row.bot.clone()).collect()
+pub fn bots<R: std::borrow::Borrow<Row>>(rows: &[R]) -> std::collections::HashSet<String> {
+    rows.iter().map(|row| row.borrow().bot.clone()).collect()
 }
 
 /// See [`Card`].
@@ -610,8 +612,9 @@ impl Agents {
 
 /// See [`Agents`]: `rows` as `/status` read them for `project`, by its
 /// title or else its name. The same in every window of the project.
-pub fn agents(project: &str, rows: &[Row]) -> Agents {
+pub fn agents<R: std::borrow::Borrow<Row>>(project: &str, rows: &[R]) -> Agents {
     let Listing { listed, under, .. } = listing(rows);
+    let rows: Vec<&Row> = rows.iter().map(|row| row.borrow()).collect();
     let entry = |row: &Row, helpers: Vec<Group>| Listed {
         bot: row.bot.clone(),
         name: row.name.clone(),
@@ -642,9 +645,12 @@ pub fn agents(project: &str, rows: &[Row]) -> Agents {
     shown.extend(tasks);
     // Each workflow under the agent that runs it, or under the nearest
     // one listed on its line of makers; else at the end.
-    let by_bot: HashMap<&str, &Row> = rows.iter().map(|r| (r.bot.as_str(), r)).collect();
     let mut runs: Vec<(usize, Listed)> = Vec::new();
+    // Each row by its bot, made only once a workflow runs.
+    let mut by_bot: Option<HashMap<&str, &Row>> = None;
     for row in rows.iter().filter(|row| row.run.is_some()) {
+        let by_bot =
+            by_bot.get_or_insert_with(|| rows.iter().map(|r| (r.bot.as_str(), *r)).collect());
         let mut at = row.maker.as_str();
         let mut under = None;
         for _ in 0..=rows.len() {
