@@ -10384,7 +10384,8 @@ mod tests {
         assert_eq!(settings.writable, [kept.to_str().unwrap()]);
         // Resolved again, it would be where the link points.
         confine(&mut again, true).unwrap();
-        assert_eq!(again.writable, ["/etc"]);
+        let etc = std::fs::canonicalize("/etc").unwrap();
+        assert_eq!(again.writable, [etc.to_str().unwrap()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
     fn scratch(name: &str) -> std::path::PathBuf {
