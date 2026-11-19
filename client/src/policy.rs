@@ -1020,7 +1020,9 @@ pub const SANDBOXES: [&str; 3] = ["read-only", "workspace-write", "danger-full-a
 /// as strict, else the profile's, which in `read-only` writes no folder
 /// and reaches no network or socket. One looser than theirs is refused,
 /// saying both, as the daemon refuses a bot looser than its maker; no
-/// sandbox in them is the loosest.
+/// sandbox in them is the loosest, and takes the profile's whatever it is,
+/// so a maker's own sandbox, which the daemon applies after, refuses one
+/// looser than that instead of holding the bot to it unasked.
 pub fn with_sandbox(
     settings: &mut serde_json::Map<String, serde_json::Value>,
     sandbox: &str,
@@ -1038,7 +1040,7 @@ pub fn with_sandbox(
             theirs.unwrap_or("none")
         ));
     }
-    if mine < held {
+    if mine < held || theirs.is_none() {
         settings.insert("sandbox".into(), sandbox.into());
         if sandbox != "workspace-write" {
             for key in ["writable", "network", "unix_sockets"] {
@@ -1686,9 +1688,14 @@ mod tests {
         with_sandbox(&mut free, "workspace-write").unwrap();
         assert_eq!(free["sandbox"], "workspace-write");
         assert_eq!(free["network"], true);
+        // Named even when unconfined, so the daemon refuses it under a
+        // confined maker rather than giving it the maker's sandbox.
         let mut free = settings(serde_json::json!({}));
         with_sandbox(&mut free, "danger-full-access").unwrap();
-        assert_eq!(free, settings(serde_json::json!({})));
+        assert_eq!(
+            free,
+            settings(serde_json::json!({"sandbox": "danger-full-access"}))
+        );
         // Looser is refused, never tightened in silence.
         let mut reading = settings(serde_json::json!({"sandbox": "read-only"}));
         let why = with_sandbox(&mut reading, "workspace-write").unwrap_err();
