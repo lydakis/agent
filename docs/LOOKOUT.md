@@ -49,7 +49,9 @@ it as it stops. Its own lines go to `STORE.companions/sonny-lookout.log`,
 and each follower it watches (`seated`), each follower whose file it
 read again after a change (`reloaded`) and each note it sends (`woke`) to
 `STORE.lookout.jsonl`. Which revision of each follower's file it took
-(the file's modification time, or none for a file it saw go) and when is
+(the file's device, inode, size and times, as Git's stat data, so two
+writes within one tick of the file clock are two; or none for a file it
+saw go) and when is
 kept in `STORE.lookout.taken.json`, written only as one changes, and the
 `follows` tool lists it as `lookout`: whether a lookout runs, when it
 took the file (`took_ms`), whether what it took is the file as it is now
@@ -262,7 +264,8 @@ log, `STORE.companions/sonny-lookout.log`.
 The lookout reads the settings again every 15 seconds: a source added or
 changed starts, one removed stops, and a lookout that stops stops its
 sources' commands. So does a source when a file its `watch` list names
-changed, came or went since it started, as a service manager restarts a
+changed (its device, inode, size or times, as Git's stat data), came or
+went since it started, as a service manager restarts a
 unit on its new binary: `watch = ["~/bin/slack-poll"]`, each file from `/`
 or `~/`. An edited script then runs on its new code within 15 seconds, a
 stream that never exits included; the log says `source_stopped` with why.
