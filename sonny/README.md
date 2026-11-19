@@ -116,6 +116,7 @@ Closing its window leaves the daemon and running turns alive.
 | Interrupt the turn | Esc |
 | List agents and open their conversations | `/status` |
 | Go to another project's lead | `/projects`, or ← with nothing typed |
+| Go to the project's agent above or below | Alt-← or Alt-→ with nothing typed |
 | Switch this window to another agent | `/switch` |
 | Create an agent with a profile and workspace | `/new [NAME]` |
 | Ask a copy of this agent a separate question | `/side [QUESTION]` |

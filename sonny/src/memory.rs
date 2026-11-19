@@ -529,6 +529,25 @@ impl View {
     }
 
     /// `←` on the pick: its section folds, the pick on its heading.
+    /// Whether `←` has nothing here to close: no page open, and no
+    /// heading open above the pick to fold.
+    pub fn left_ends(&self) -> bool {
+        if !self.pages.is_empty() {
+            return false;
+        }
+        let items = self.items();
+        let Some(heading) = (items.get(..=self.selected.min(items.len().saturating_sub(1))))
+            .and_then(|above| {
+                above
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Heading(_)))
+            })
+        else {
+            return true;
+        };
+        !matches!(&items[heading], Item::Heading(key) if self.is_open(key))
+    }
+
     fn go_out(&mut self) {
         let items = self.items();
         // Nothing listed yet, or nothing left: nothing to fold.

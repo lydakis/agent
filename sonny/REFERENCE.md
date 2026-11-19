@@ -125,6 +125,14 @@ conversation and what the pane showed. The empty composer says
 `← projects`. Zen, a side chat and an agent shown beside keep you where you
 are: `←` there does nothing.
 
+Inside a project, with nothing typed, `→` gives the keys to the pane as
+`tab` does, and `←` at the pane's first page, with nothing left to close,
+gives them back. `alt+←` and `alt+→` (or `ctrl+←` and `ctrl+→`) go to the
+agent above or below in the pane's list of the project's agents, around
+its ends, as a multiplexer's previous and next tab: the window becomes that
+agent's, and from one the list does not show they go to the lead. With
+words typed, all of them move the cursor.
+
 ![Projects at 150, 120, 60 and 44 columns: a superlead with two projects under it, a third outside it, four idle projects folded; the pane shows the picked project's agents where there is room](../docs/sonny/projects-projects.png)
 
 ### Creating an agent
