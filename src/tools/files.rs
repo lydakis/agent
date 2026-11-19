@@ -138,10 +138,13 @@ async fn confined(
 /// inside the sandbox, so none follows a link swapped in after the check.
 pub(super) async fn patch(
     policy: &Policy,
-    changes: &[crate::sandbox::Change],
+    changes: Vec<crate::sandbox::Change>,
     held: Option<&mut crate::sandbox::Hold>,
 ) -> Result<()> {
-    let given = serde_json::to_vec(changes)?;
+    // As large as the files it writes: serialized off the runtime thread.
+    let given = tokio::task::spawn_blocking(move || serde_json::to_vec(&changes))
+        .await
+        .map_err(|_| Error::new("io_error"))??;
     helper(policy, &[PATCH], &given, held).await
 }
 

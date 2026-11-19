@@ -394,7 +394,7 @@ impl Staged {
                 })
                 .collect();
             if !changes.is_empty() {
-                files::patch(&policy, &changes, held).await?;
+                files::patch(&policy, changes, held).await?;
             }
             return Ok(self.summary);
         }
