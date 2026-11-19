@@ -1017,9 +1017,10 @@ pub const SANDBOXES: [&str; 3] = ["read-only", "workspace-write", "danger-full-a
 
 /// `settings`, a new bot's as `create` takes them, in the sandbox
 /// `sandbox` a profile names, one of [`SANDBOXES`]: theirs where it is
-/// as strict, else the profile's, which in `read-only` writes no folder
-/// and reaches no network or socket. One looser than theirs is refused,
-/// saying both, as the daemon refuses a bot looser than its maker; no
+/// as strict, else the profile's; a `read-only` profile's writes no
+/// folder and reaches no network or socket, though theirs did. One looser
+/// than theirs is refused, saying both, as the daemon refuses a bot
+/// looser than its maker; no
 /// sandbox in them is the loosest, and takes the profile's whatever it is,
 /// so a maker's own sandbox, which the daemon applies after, refuses one
 /// looser than that instead of holding the bot to it unasked.
@@ -1042,10 +1043,11 @@ pub fn with_sandbox(
     }
     if mine < held || theirs.is_none() {
         settings.insert("sandbox".into(), sandbox.into());
-        if sandbox != "workspace-write" {
-            for key in ["writable", "network", "unix_sockets"] {
-                settings.remove(key);
-            }
+    }
+    // Read-only reaches no socket its maker's settings named either.
+    if sandbox == "read-only" {
+        for key in ["writable", "network", "unix_sockets"] {
+            settings.remove(key);
         }
     }
     Ok(())
@@ -1676,6 +1678,14 @@ mod tests {
         assert_eq!(
             serde_json::Value::Object(held),
             serde_json::json!({"sandbox": "read-only", "speed": "fast"})
+        );
+        // Read-only as theirs is: still no socket theirs reached.
+        let mut reading =
+            settings(serde_json::json!({"sandbox": "read-only", "unix_sockets": ["/d.sock"]}));
+        with_sandbox(&mut reading, "read-only").unwrap();
+        assert_eq!(
+            reading,
+            settings(serde_json::json!({"sandbox": "read-only"}))
         );
         // As strict: theirs stands, folders and all.
         let working =
