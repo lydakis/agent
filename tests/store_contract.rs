@@ -22889,6 +22889,31 @@ fn close_all_closes_names_or_a_patterns_quiet_bots_the_asker_made() {
         answer["refused"],
         json!([{"bot": "shop.gone", "error": "bot_not_found"}])
     );
+    // Each bot it closed has one `closed` event, with its time; closing
+    // one again tells nothing.
+    let mut told: Vec<(String, i64)> = db.events_of_kinds(&["closed"], 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| {
+            (
+                event["bot"].as_str().unwrap().to_owned(),
+                event["data"]["closed_ms"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    told.sort();
+    assert_eq!(
+        told,
+        [
+            ("shop.busy", 3_000),
+            ("shop.fix", 1_000),
+            ("shop.lead", 2_000),
+            ("shop.look", 2_000),
+            ("shop.other", 2_000),
+        ]
+        .map(|(bot, at)| (bot.to_owned(), at))
+    );
     // A bot closes itself only by its name alone.
     let me = ["shop.lead".to_owned()];
     assert_eq!(
@@ -22927,6 +22952,13 @@ fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
     assert_eq!(db.close("shop.fix", 2_000).unwrap(), (Some(1_000), None));
     assert_eq!(db.inspect("shop.fix").unwrap().closed_ms, Some(1_000));
     assert_eq!(db.inspect("shop.look").unwrap().closed_ms, None);
+    // Followers are told once, when it closes: closing it again tells
+    // nothing.
+    let closed = db.events_of_kinds(&["closed"], 0, 256).unwrap();
+    let closed = closed["events"].as_array().unwrap();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["bot"], "shop.fix");
+    assert_eq!(closed[0]["data"]["closed_ms"], 1_000);
     assert_eq!(
         names(
             db.list(None, 64, Some("shop.*"), false, None, true, None)

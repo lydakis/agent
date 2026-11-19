@@ -2993,6 +2993,7 @@ mod tests {
             until: None,
             runs: None,
             made: None,
+            outlives_close: false,
         };
         let subscribers = HashMap::from([(
             "shop.lead".to_owned(),
@@ -3054,6 +3055,7 @@ mod tests {
             until: None,
             runs: None,
             made: None,
+            outlives_close: false,
         };
         let wanted = |subs: &[super::super::subs::Sub], field: &str| {
             super::super::subs::wanted(subs, "cr", field)
