@@ -773,6 +773,19 @@ impl Needs {
     }
 
     /// The calls of `bot`'s `turn` that wait on the person.
+    /// Whether `bot`'s turn `turn` ending lets go a step held for the
+    /// person whose call no event said was lifted: one lifted before these
+    /// events were followed waits on past the turn, as the daemon says.
+    pub fn ends_steps_of_unseen(&self, bot: &str, turn: i64) -> bool {
+        let Some(steps) = self.steps.get(bot) else {
+            return false;
+        };
+        (self.turn_calls(bot, turn)).any(|call| {
+            steps.contains_key(&(turn, call.to_owned()))
+                && !lifted(&self.lifted, &self.steps, bot, turn, call)
+        })
+    }
+
     fn turn_calls(&self, bot: &str, turn: i64) -> impl Iterator<Item = &str> {
         (self.calls.get(bot).into_iter())
             .flat_map(move |calls| calls.range((turn, String::new())..))
@@ -962,6 +975,32 @@ mod tests {
         ));
         assert!(!needs.waits("p.fix"));
         assert!(needs.lifted.is_empty());
+    }
+
+    #[test]
+    fn a_step_of_a_call_lifted_unseen_is_read_again_at_its_turns_end() {
+        let mut needs = Needs::default();
+        let step = json!({"calls": [{"call_id": "c1/1", "step_of": "c1", "gates": ["manual"]}]});
+        needs.event(&event("p.fix", 3, "approval_requested", step));
+        // The lift came before these events: its turn's end would let the
+        // step go, so what the daemon holds is read again.
+        assert!(needs.ends_steps_of_unseen("p.fix", 3));
+        assert!(!needs.ends_steps_of_unseen("p.fix", 4));
+        needs.event(&event("p.fix", 3, "call_lifted", json!({"call_id": "c1"})));
+        assert!(!needs.ends_steps_of_unseen("p.fix", 3));
+        // A call of its own, not a step, ends with its turn.
+        let manual = json!({"calls": [{"call_id": "c2", "gates": ["manual"]}]});
+        needs.event(&event("p.ask", 5, "approval_requested", manual));
+        assert!(!needs.ends_steps_of_unseen("p.ask", 5));
+        // Listed lifted, the step waits on past the turn.
+        let mut lifted = Held::new("p.new", 6, "c3/1");
+        (lifted.step_of, lifted.lifted) = (Some("c3".into()), true);
+        let step = json!({"calls": [{"call_id": "c3/1", "step_of": "c3", "gates": ["manual"]}]});
+        needs.event(&event("p.new", 6, "approval_requested", step));
+        needs.held(vec![lifted], |bot| bot == "p.new");
+        let end = event("p.new", 6, "turn_finished", json!({"status": "completed"}));
+        needs.event(&end);
+        assert!(needs.waits("p.new"));
     }
 
     #[test]

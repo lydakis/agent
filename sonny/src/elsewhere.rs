@@ -412,7 +412,17 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         if let Some(done) = done {
             marked.entry(bot.clone()).or_default().push(done);
         }
+        // A turn ending that would let go a step of a call lifted before
+        // the follow started: what the daemon holds of it, read again.
+        let again = ours
+            && event["event"] == "turn_finished"
+            && (event["turn"].as_i64()).is_some_and(|turn| needs.ends_steps_of_unseen(&bot, turn));
         let mut changed = ours && needs.event(&event);
+        if again && let Ok(held) = needs::listing(&client, Some(&bot)).await {
+            let was = needs.waits(&bot);
+            needs.held(held, |of| of == bot);
+            changed |= was != needs.waits(&bot);
+        }
         // Closed, it needs no one, as `/status` lists it no more.
         if ours && event["event"] == "closed" {
             changed |= needs.waits(&bot);
