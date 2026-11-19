@@ -575,8 +575,7 @@ fn a_task_outside_git_is_removed() {
     let lab = Lab::new("rm-outside");
     let workspace = lab.scratch.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let start =
-        serde_json::json!({"name": "demo.fix", "brief": "fix it"});
+    let start = serde_json::json!({"name": "demo.fix", "brief": "fix it"});
     let (ok, said) = lab.tool(&workspace, "start_task", start, false);
     assert!(ok, "{said}");
     let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5, "workspace": workspace}]);
@@ -603,8 +602,7 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
     std::fs::write(ws.join("AGENTS.md"), "Build with the workspace tool.\n").unwrap();
     std::fs::rename(&lab.repo, ws.join("src/api")).unwrap();
     // By default, a task shares the folder, and is told so.
-    let shared =
-        serde_json::json!({"name": "edit", "brief": "edit the deck"});
+    let shared = serde_json::json!({"name": "edit", "brief": "edit the deck"});
     let (ok, said) = lab.tool(&ws, "start_task", shared, false);
     assert!(ok, "{said}");
     assert!(
@@ -1063,8 +1061,7 @@ fn a_helper_of_a_task_in_a_repository_inside_the_lead_s_folder_starts_on_its_bra
     // Named no folder, the helper works in the task's repository, from
     // its branch.
     *lab.bot.borrow_mut() = "demo.fix".into();
-    let call =
-        serde_json::json!({"name": "review", "brief": "review it"});
+    let call = serde_json::json!({"name": "review", "brief": "review it"});
     let (ok, said) = lab.tool(&fix, "start_task", call, false);
     assert!(ok, "{said}");
     let review = lab.home.join(".agent/worktrees/demo.review");
