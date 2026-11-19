@@ -25,17 +25,19 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 /// The events that move where an agent stands, as a `bots` row says it:
-/// a turn taken up or ended, a message queued or held, an approval held
-/// for the person or a step of a lifted call decided, an agent made,
-/// closed or gone. What moves a running turn along (its messages, steers,
-/// waits and pacing) is not followed: a count reads the running agents'
-/// rows again each time.
-pub const KINDS: [&str; 13] = [
+/// its status, running turn, what it waits on and how its last turn
+/// ended; an approval held for the person; an agent made, closed or gone.
+pub const KINDS: [&str; 18] = [
     "created",
     "forked",
     "queued",
     "accepted",
+    "steered",
     "held",
+    "message_ended",
+    "turn_waiting",
+    "turn_resumed",
+    "turn_paced",
     "turn_finished",
     "approval_requested",
     "approval_asked",
