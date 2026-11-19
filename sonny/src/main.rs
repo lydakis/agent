@@ -748,7 +748,8 @@ impl App {
             self.other_projects = None;
             return;
         }
-        if self.counts.is_none() {
+        // Not before the window's own counts, nor with no store to share.
+        if self.counts.is_none() || self.options.store.as_os_str().is_empty() {
             return;
         }
         let project = &self.scope().project;
