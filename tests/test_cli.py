@@ -1152,6 +1152,30 @@ class SocketAndCliTests(ModelFixture):
         again = self.agent('run', *self.again, '--profile', 'reviewer', '--bot', 'Rev', 'hello', check=False)
         self.assertEqual(again.returncode, 2)
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_profile_starts_its_bot_in_its_sandbox_and_never_looser_than_its_maker(self):
+        roles = self.path / '.agents' / 'agents'
+        roles.mkdir(parents=True)
+        (roles / 'reviewer.md').write_text('---\nsandbox: read-only\n---\nReview it.\n')
+        (roles / 'loose.md').write_text('---\nsandbox: danger-full-access\n---\nDo anything.\n')
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', '--sandbox', 'workspace-write', 'hello')
+        self.agent('run', *self.common, '--profile', 'reviewer', '--new', '--created-by', 'p.lead',
+                   '--bot', 'p.rev', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        self.assertEqual(control.request('inspect', bot='p.rev')['result']['settings']['sandbox'], 'read-only')
+        # Looser than its maker: refused, never given the maker's instead.
+        loose = self.agent('run', *self.common, '--profile', 'loose', '--new', '--created-by', 'p.lead',
+                           '--bot', 'p.loose', 'hello', check=False)
+        self.assertNotEqual(loose.returncode, 0)
+        self.assertIn('invalid_setting', loose.stderr)
+        self.assertEqual(control.request('inspect', bot='p.loose')['error'], 'bot_not_found')
+        # --sandbox stands over the profile's.
+        self.agent('run', *self.common, '--profile', 'loose', '--sandbox', 'workspace-write', '--new',
+                   '--created-by', 'p.lead', '--bot', 'p.asked', 'hello')
+        self.assertEqual(control.request('inspect', bot='p.asked')['result']['settings']['sandbox'],
+                         'workspace-write')
+
     def test_a_client_makes_a_bot_for_another_while_the_prompt_stays_its_own(self):
         # As Sonny's /new starts a task for the lead in its window: the task
         # is the lead's, by its id, and what it was told has no bot author.

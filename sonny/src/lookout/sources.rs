@@ -218,6 +218,8 @@ pub struct Event {
 
 impl Event {
     /// A line a source printed: a JSON object with `text`, or plain text.
+    /// An object without `text` is said whole, as plain text is; one whose
+    /// `text` is blank is no event but a clear.
     pub fn parse(source: &str, line: &str, at_ms: u128) -> Option<Event> {
         let line = line.trim();
         if line.is_empty() {
@@ -227,7 +229,7 @@ impl Event {
                      id,
                      topic: Option<String>,
                      from: Option<String>,
-                     url: Option<String>,
+                     details,
                      steer,
                      fields| Event {
             source: source.to_owned(),
@@ -235,7 +237,7 @@ impl Event {
             topic: topic.map(|topic: String| cut(&topic, FIELD_CHARS)),
             text: text_cut(text),
             from: from.map(|from| cut(&from, FIELD_CHARS)),
-            details: details(url.map(|url| cut(&url, FIELD_CHARS)), &fields),
+            details,
             quote: None,
             steer,
             steer_by: None,
@@ -265,14 +267,27 @@ impl Event {
             Value::Number(n) => Some(n.to_string()),
             _ => None,
         };
-        let text = said("text")?;
+        let text = said("text");
+        // A blank `text` clears what the source last said of its topic.
+        if text.is_none() && object["text"].is_string() {
+            return None;
+        }
         let steer = object["steer"] == true;
         // A topic is what a subscription names after the colon, and goes in
         // the note unquoted, so it holds no colon and no line break.
         let topic = said("topic")
             .filter(|topic| !topic.contains(':') && !topic.chars().any(char::is_control));
-        let (id, from, url) = (said("id"), said("from"), said("url"));
-        Some(event(&text, id, topic, from, url, steer, object))
+        let (id, from) = (said("id"), said("from"));
+        Some(match text {
+            Some(text) => {
+                let url = said("url").map(|url| cut(&url, FIELD_CHARS));
+                let details = details(url, &object);
+                event(&text, id, topic, from, details, steer, object)
+            }
+            // No text: the whole line is what subscribers read, as a plain
+            // line is, and nothing after it says its fields again.
+            None => event(line, id, topic, from, None, steer, object),
+        })
     }
 
     /// The lookout's word about `source`: `kind` (`down` or `back`),
@@ -2197,7 +2212,8 @@ mod tests {
         assert_eq!(object.from.as_deref(), Some("ana"));
         assert_eq!(object.details.as_deref(), Some("https://x.test/41"));
         assert_eq!(Event::parse("slack", "   ", 0), None);
-        assert_eq!(Event::parse("slack", r#"{"id": 1}"#, 0), None);
+        // A blank text clears; it is no event.
+        assert_eq!(Event::parse("slack", r#"{"id": 1, "text": " "}"#, 0), None);
         let topical = Event::parse("slack", r#"{"text": "x", "topic": "deploys"}"#, 0).unwrap();
         assert_eq!(topical.topic.as_deref(), Some("deploys"));
         // A topic with a colon could not be named by a subscription.
@@ -2227,6 +2243,66 @@ mod tests {
             Event::parse("s", "a", 0).unwrap().seq,
             Event::parse("s", "a", 0).unwrap().seq
         );
+    }
+
+    #[test]
+    fn a_json_line_without_text_is_said_whole() {
+        let printed = r#"{"event": "merged", "pr": 42}"#;
+        let event = Event::parse("ci", &format!("  {printed} \n"), 0).unwrap();
+        assert_eq!(event.text, printed);
+        assert_eq!(*event.fields, json!({"event": "merged", "pr": 42}));
+        // The line is its text, so nothing after it says its fields again.
+        assert_eq!(event.details, None);
+        let sub = |filter: Option<Value>| super::super::subs::Sub {
+            name: "merges".into(),
+            tasks_of: Vec::new(),
+            agents: Vec::new(),
+            sources: vec!["ci".into()],
+            filter,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+            outlives_close: false,
+        };
+        assert!(sub(None).hears(&event));
+        assert!(sub(Some(json!({"event": ["merged"]}))).hears(&event));
+        assert!(!sub(Some(json!({"event": ["closed"]}))).hears(&event));
+        let heard = Heard {
+            event,
+            subs: vec!["merges".into()],
+            order: 0,
+            due: false,
+        };
+        assert_eq!(untimed(&line(&heard)), format!("[ci]\n{printed}"));
+        // Its own fields are read as they are beside a text.
+        let named = r#"{"topic": "12", "id": "m-12", "from": "ci", "steer": true, "text": null}"#;
+        let named = Event::parse("ci", named, 0).unwrap();
+        assert_eq!(
+            (
+                named.text.as_str(),
+                named.topic.as_deref(),
+                named.id.as_deref()
+            ),
+            (
+                r#"{"topic": "12", "id": "m-12", "from": "ci", "steer": true, "text": null}"#,
+                Some("12"),
+                Some("m-12")
+            )
+        );
+        assert_eq!(named.from.as_deref(), Some("ci"));
+        assert!(named.steer);
+        // A long one is cut as any text is.
+        let long = json!({"log": "a".repeat(TEXT_CHARS)}).to_string();
+        let long = Event::parse("ci", &long, 0).unwrap();
+        assert!(long.text.starts_with(r#"{"log":"a"#) && long.text.ends_with(r#"a"}"#));
+        assert!(long.text.chars().count() < TEXT_CHARS + 100);
+        // With a text, the text is what it says, as before.
+        let texted = Event::parse("ci", r##"{"text": "#42 merged", "pr": 42}"##, 0).unwrap();
+        assert_eq!(texted.text, "#42 merged");
+        assert_eq!(texted.details.as_deref(), Some(r#"{"pr":42}"#));
     }
 
     #[test]
@@ -2717,6 +2793,31 @@ mod tests {
         assert_eq!(texts, ["run 1 of count", "same", "run 2 of count"]);
         runner.set(Vec::new());
         assert!(runner.running.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_source_s_json_line_without_text_reaches_its_subscribers_whole() {
+        let dir = std::env::temp_dir().join(format!("lookout-no-text-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.clone(), sent);
+        runner.set(vec![Source {
+            name: "ci".into(),
+            command: r#"echo '{"event": "merged", "pr": 42}'; echo '{"text": "ship it"}'"#.into(),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+            watch: Vec::new(),
+            icon: None,
+            wants: None,
+        }]);
+        let texts = [
+            next_event(&mut got).await.text,
+            next_event(&mut got).await.text,
+        ];
+        assert_eq!(texts, [r#"{"event": "merged", "pr": 42}"#, "ship it"]);
+        runner.set(Vec::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -749,10 +749,10 @@ enum Command {
         error: Option<ToolError>,
     },
     /// Hand a declared call this client answers, of a tool declared
-    /// `lift`, back to the model while the client still runs it, with
+    /// `yields`, back to the model while the client still runs it, with
     /// `output` so far, bounded as an answer is: the call moves to the
-    /// background as a message moves it, and its answer, given later with
-    /// `tool_result`, is its command's.
+    /// background, and its answer, given later with `tool_result`, is its
+    /// command's.
     YieldCall {
         bot: String,
         turn: i64,
@@ -4239,8 +4239,9 @@ impl Service {
             self.spawn(bot.clone(), started.turn, None, steered, false);
         }
         // The running turn may have started after the steer was queued, from
-        // an admission answered in between. A command it is running moves
-        // to the background so the steer reaches it now.
+        // an admission answered in between. A `wait` it is in ends, and a
+        // call waiting on its verdict moves to the background, so the steer
+        // reaches it now; a running call ends or yields first.
         if started.fresh
             && matches!(started.status, "queued" | "attached")
             && matches!(delivery, Delivery::Steer | Delivery::Attach)

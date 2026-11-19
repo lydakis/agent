@@ -36,9 +36,17 @@ Implemented 2026-09-19.
 4. **Profiles.** Files `<role>.md` in `<workspace>/.agents/agents` and
    `~/.agents/agents` become a second index of the roles a new agent can be
    started in (Sonny's `start_task` takes one by name). A profile is markdown with optional YAML front matter:
-   `description`, `model`, and `tools` (a list of this runtime's tool
-   names) are read, any other key is ignored, so an agent file written for
-   another harness loads as it is. The body is the role. Sonny's own
+   `description`, `model`, `tools` (a list of this runtime's tool
+   names) and `sandbox` are read, any other key is ignored, so an agent file written for
+   another harness loads as it is. The body is the role. `sandbox` is
+   `read-only`, `workspace-write` or `danger-full-access`, as a Codex
+   role's `config_file` sets `sandbox_mode`: an agent started in the
+   profile (`--profile`, `spawn_agent`'s `profile`, Sonny's `start_task`
+   and workflow workers) starts in it unless the call names its own
+   sandbox. It never loosens what the agent would get from its maker: a
+   stricter one replaces that (`read-only` with no writable folders,
+   network or sockets), and a looser one is refused as `invalid_setting`
+   rather than tightened. Any other value is `profile_invalid`. Sonny's own
    roles (`lead` and `task`, the client roles in `policy.rs`) are left
    out of the index: a file of either name replaces Sonny's text for it,
    not a role to start a peer in, so no agent is offered a nested lead.
@@ -47,7 +55,7 @@ Implemented 2026-09-19.
 
    Two more keys compose a profile from others. `extends: NAME` builds on
    another profile: its body comes first, then this one's, and its
-   `model` and `tools` stand where this one names none; chains are
+   `model`, `tools` and `sandbox` stand where this one names none; chains are
    followed up to 8 deep, and a circle is `profile_invalid`. Extending
    its own name builds on the file of that name it shadows, so a folder's
    `lead.md` with `extends: lead` adds to the person's, and the person's
