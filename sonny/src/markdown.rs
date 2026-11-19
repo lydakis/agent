@@ -1673,6 +1673,7 @@ impl Markdown {
         // A blank line ends a table: it is drawn once, and goes out.
         let table_ends = self.table && line.trim().is_empty();
         if table_ends
+            && (self.source.lines()).all(|line| line.trim().is_empty() || table_row(line))
             && !self.source.contains("[^")
             && (self.defs.is_empty() || links_inline(&self.source))
             && let Some(gap) = self.held
@@ -2408,12 +2409,12 @@ fn draw_defined(
 fn footnote_marks(text: &str) -> usize {
     (text.match_indices("[^"))
         .filter(|(at, _)| {
+            // A name holds no space or bracket, so the search stops at the
+            // next marker: the text is read about once.
             let rest = &text[at + 2..];
-            let name = rest.find(']').map(|end| &rest[..end]);
-            name.is_some_and(|name| {
-                !name.is_empty()
-                    && !name.contains(char::is_whitespace)
-                    && !rest[name.len() + 1..].starts_with(':')
+            let end = rest.find(|c: char| c == ']' || c == '[' || c.is_whitespace());
+            end.is_some_and(|end| {
+                end > 0 && rest[end..].starts_with(']') && !rest[end + 1..].starts_with(':')
             })
         })
         .count()
@@ -2814,6 +2815,15 @@ mod tests {
                 whole(&Markdown::default(), reply, 40)
             );
         }
+        // A definition before a table is no row of it, and stays known.
+        let table = "[d]: /target\n\n| A | B |\n|---|---|\n| x | y |\n\nSee [label][d].";
+        assert_eq!(
+            streamed(Markdown::default(), table, 40),
+            whole(&Markdown::default(), table, 40)
+        );
+        // Footnote marks no bracket closes are read once each.
+        assert_eq!(footnote_marks(&"[^a".repeat(50_000)), 0);
+        assert_eq!(footnote_marks("See [^1] and [^a b] and [^n]: x"), 1);
         // Quote marks deep on one line are read once each.
         let deep = format!("{} x", ">".repeat(20_000));
         assert!(!whole(&reply, &deep, 40).is_empty());
