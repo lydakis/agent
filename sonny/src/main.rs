@@ -859,7 +859,7 @@ async fn read_status_of(
                         whole &=
                             read_agent(client, bot, status_read, asks_seen, view.readers).await;
                     }
-                    if untitled && read_title(client, &store, bot).await {
+                    if untitled && read_title(client, &store, bot, status_read).await {
                         title = (bot.bot_id).and_then(|id| crate::title::noted(&store, name, id));
                     }
                 }
@@ -945,7 +945,9 @@ async fn read_status_of(
                     .map(|(began, ended)| ended.saturating_sub(began) / 1000),
             ),
         };
-        let Latest { mut step, pr, ask } = latest;
+        let Latest {
+            mut step, pr, ask, ..
+        } = latest;
         // A question stays open until its answer lands, past work that
         // does not wait on it and messages that answer something else:
         // an idle agent's recent history is read once per turn it
@@ -1202,21 +1204,30 @@ async fn fill_status(
             read.whole &= failed.is_empty();
             return (alerts, Some(Box::new(read)));
         }
-        // The rows on screen first, then the rest as the card lists them.
+        let agents: HashMap<&str, &standing::Agent> = (listed.iter())
+            .map(|bot| (bot.name.as_str(), bot))
+            .collect();
+        let stale = |name: &str| {
+            (agents.get(name)).is_some_and(|bot| {
+                !is_read(bot, &json!([bot.bot_id, bot.head]), status_read, asks_seen)
+            })
+        };
+        // The rows on screen first, then the rest as the card lists them:
+        // what each is doing before the first lines of those with no title.
         let at: HashMap<&str, usize> = (read.rows.iter().enumerate())
             .map(|(at, row)| (row.bot.as_str(), at))
             .collect();
         let place = |name: &String| at.get(name.as_str()).copied().unwrap_or(usize::MAX);
-        unread.sort_by_cached_key(place);
+        unread.sort_by_cached_key(|name| {
+            let at = place(name);
+            (at >= shown, at >= shown && !stale(name), at)
+        });
         let on_screen = unread.iter().take_while(|name| place(name) < shown).count();
         drop(at);
         if let Ok(mut came) = came.lock() {
             *came = Some((alerts.clone(), Box::new(read)));
         }
         woken.notify_one();
-        let agents: HashMap<&str, &standing::Agent> = (listed.iter())
-            .map(|bot| (bot.name.as_str(), bot))
-            .collect();
         // The rows on screen drawn as soon as they are read; the rest on
         // the listing as the card reads it again.
         let screen = (std::mem::replace(&mut first, false))
@@ -1235,9 +1246,17 @@ async fn fill_status(
                 continue;
             };
             fresh = true;
+            let moved = !is_read(bot, &json!([bot.bot_id, bot.head]), status_read, asks_seen);
             let read = read_agent(client, bot, status_read, asks_seen, view.readers).await;
-            // Only one with no title, so a lead keeps its project's.
-            let titled = !untitled.contains(name) || read_title(client, options_store, bot).await;
+            // Only one with no title, so a lead keeps its project's. Off
+            // screen, a first line its history read did not hold waits
+            // until every row's history is read.
+            let later = screen.is_none()
+                && moved
+                && (status_read.get(name)).is_none_or(|(_, latest)| latest.first.is_none());
+            let titled = !untitled.contains(name)
+                || later
+                || read_title(client, options_store, bot, status_read).await;
             if !(read & titled) {
                 failed.insert(name.clone());
             }
@@ -1583,7 +1602,12 @@ pub(crate) fn keep_beside(file: &std::path::Path, bytes: &[u8]) {
 /// from its history: an agent none was noted for as it started, as a
 /// helper is, or a task started before tasks had titles. False where the
 /// read failed, which the next read tries again.
-async fn read_title(client: &Client, store: &std::path::Path, bot: &standing::Agent) -> bool {
+async fn read_title(
+    client: &Client,
+    store: &std::path::Path,
+    bot: &standing::Agent,
+    status_read: &HashMap<String, (Value, Latest)>,
+) -> bool {
     let name = bot.name.as_str();
     let Some(id) = bot.bot_id.filter(|_| bot.head.is_some()) else {
         return true;
@@ -1603,7 +1627,15 @@ async fn read_title(client: &Client, store: &std::path::Path, bot: &standing::Ag
         reading.2 = true;
         return true;
     }
+    // Its whole history read for `/status` already holds it.
+    let head = json!([bot.bot_id, bot.head]);
+    let known = (status_read.get(name))
+        .filter(|(seen, _)| *seen == head)
+        .and_then(|(_, latest)| latest.first.clone());
     let first = async {
+        if known.is_some() {
+            return known;
+        }
         let asked = json!({"bot": name, "limit": 4, "oldest_first": true});
         let page = client.request("history_nodes", asked).await.ok()?;
         let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
@@ -1684,10 +1716,18 @@ async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
                 })
         })
         .collect();
+    // A page with none older holds the first message.
+    let first = (page["next_from"].is_null() && !nodes.is_empty()).then(|| {
+        (flat.iter().rev())
+            .find(|item| item["role"] == "user")
+            .map(text)
+            .unwrap_or_default()
+    });
     Some(Latest {
         ask: asks::open(&flat),
         pr,
         step: App::step(&entries),
+        first,
     })
 }
 
@@ -5276,6 +5316,10 @@ struct Latest {
     pr: Option<String>,
     /// The question it asked the person and has no answer to yet.
     ask: Option<asks::Ask>,
+    /// Its first message's first line, when the page read holds its
+    /// whole history: a title found with no read of its own.
+    #[serde(skip)]
+    first: Option<String>,
 }
 
 /// `/status` in the pane, its timers ticking and its rows read again
@@ -25663,6 +25707,8 @@ mod tests {
                 "created_by": "titled.lead"},
             {"name": "titled.kept", "bot_id": 3, "head": 4, "last": {"turn": 1, "status": "completed"},
                 "created_by": "titled.lead"},
+            {"name": "titled.short", "bot_id": 4, "head": 8, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
             {"name": "titled.lead", "bot_id": 1, "head": 2, "workspace": "WORKSPACE",
                 "last": {"turn": 1, "status": "completed"}},
         ]);
@@ -25694,10 +25740,20 @@ mod tests {
                 // The oldest page, newest first as every page comes.
                 json!({"nodes": [{"node": 3, "turn": 2}, {"node": 1, "turn": 1}], "next_from": null})
             }
+            // Its whole history on its newest page, with none older.
+            "history_nodes" if ask["bot"] == "titled.short" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [{"node": 8, "turn": 1}, {"node": 7, "turn": 1}], "next_from": null})
+            }
             "history_nodes" => {
                 counted_reads.fetch_add(1, Ordering::SeqCst);
                 json!({"nodes": [], "next_from": null})
             }
+            "history_items" if ask["nodes"] == json!([8, 7]) => json!({"items": [
+                {"node": 8, "item": {"role": "assistant", "content": [{"type": "output_text",
+                    "text": "Counted."}]}},
+                {"node": 7, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Count the coins\nBoth jars."}]}}]}),
             "history_items" if ask["nodes"] == json!([1, 3]) => json!({"items": [
                 {"node": 1, "item": {"role": "user", "content": [{"type": "input_text",
                     "text": "\nFix the flaky login test\nIt fails one run in ten."}]}},
@@ -25735,6 +25791,12 @@ mod tests {
             Some("Fix the flaky login test")
         );
         assert_eq!(*firsts.lock().unwrap(), ["titled.helper"]);
+        // One whose newest page holds its whole history takes its first
+        // line from that page, with no read of its own.
+        assert_eq!(
+            crate::title::noted(&store, "titled.short", 4).as_deref(),
+            Some("Count the coins")
+        );
         // Read again after it moved: its title is not.
         app.follower.as_ref().unwrap().moved("titled.helper");
         counted(&mut app).await;
