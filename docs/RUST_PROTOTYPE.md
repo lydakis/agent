@@ -4004,8 +4004,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   decided; a verdict for a call after a `wait` waits in the store.
 - **A message lifts the wait** (protocol 64, schema 91). A steer that
   joins the turn while a call waits for its verdict, held live or parked,
-  wakes the turn and lifts the call (a call its client answers only as
-  protocol 70 says, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
+  wakes the turn and lifts the call (a call its client answers only while
+  a step of it waits on a gate, protocol 92, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
   its request `process` (an indexed column), and answers the call with
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`
