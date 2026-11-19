@@ -31,6 +31,7 @@ mod declared;
 mod desktop;
 mod diff;
 mod drawing;
+mod elsewhere;
 mod embed;
 mod exec;
 mod footer;
@@ -709,7 +710,7 @@ impl App {
 
     /// **Projects** in the conversation's place, the pick on the project
     /// the window is in: `←` with nothing typed, `/projects`, or a click
-    /// on the footer's `elsewhere`. Its follow of every project starts on
+    /// on the footer's `← ? N`. Its follow of every project starts on
     /// a connection of its own and ends with the page.
     async fn open_projects(&mut self) {
         let Some((client, follower, drain)) =
@@ -736,6 +737,103 @@ impl App {
             side: Rect::default(),
             connected_at: Instant::now(),
         }));
+    }
+
+    /// What needs the person in every project, followed for as long as
+    /// the window is open where **Projects** shows, by one window of the
+    /// store for all ([`elsewhere`]): started once the window's own footer
+    /// is counted, so the window's start comes first, and again a few
+    /// seconds after it stopped, as when the daemon went.
+    fn elsewhere_tick(&mut self) {
+        if !self.projects_here() {
+            self.other_projects = None;
+            return;
+        }
+        // Not before the window's own counts, nor with no store to share.
+        if self.counts.is_none() || self.options.store.as_os_str().is_empty() {
+            return;
+        }
+        let project = &self.scope().project;
+        let again = match &self.other_projects {
+            None => true,
+            Some((open, _)) if open.project != *project => true,
+            Some((open, at)) => open.ended() && at.elapsed() >= ELSEWHERE_AGAIN,
+        };
+        if again {
+            let open = elsewhere::Elsewhere::start(
+                self.options.socket.clone(),
+                self.store(),
+                project.clone(),
+                self.woken.clone(),
+            );
+            self.other_projects = Some((open, Instant::now()));
+        }
+    }
+
+    /// The agents of other projects that need the person and that the
+    /// footer's `?` does not count already (a superlead's `/status` lists
+    /// the projects it holds), in the order **Projects** lists them.
+    fn elsewhere_waiting(&self) -> elsewhere::Waiting {
+        let Some((open, _)) = &self.other_projects else {
+            return elsewhere::Waiting::default();
+        };
+        let mut waiting = open.waiting.borrow().outside(&self.scope().project);
+        waiting.agents.retain(|(_, bot)| {
+            !self.status_bots.contains(bot)
+                && !(self.fleet.as_ref())
+                    .is_some_and(|fleet| fleet.past_status(bot, &self.status_bots))
+        });
+        waiting
+    }
+
+    /// `alt+n`: the next agent that needs the person, this project's first
+    /// (as the pane lists them, the questions the footer counts beside
+    /// them, and any other the shared follow knows), then the other
+    /// projects' as **Projects** lists them, from the one after this
+    /// project's around ([`elsewhere::round`]).
+    fn next_needing(&mut self) {
+        let mut local: Vec<String> = (self.margin.agents().listed.iter())
+            .filter(|agent| agent.run.is_none() && agent.group == status::Group::NeedsYou)
+            .map(|agent| agent.bot.clone())
+            .collect();
+        if let Some(fleet) = &self.fleet {
+            local.extend(fleet.waiting_past_status_of(&self.status_bots));
+        }
+        // Each in its own project's place, as a superlead's list or a
+        // followed lead's question may be another project's; and every
+        // agent the shared follow knows waits, this project's too (a
+        // sibling lead's task is in no list of this window's), each once.
+        let (local, elsewhere) = match &self.other_projects {
+            Some((open, _)) => {
+                let shared = open.waiting.borrow();
+                let here = shared
+                    .order
+                    .get(&self.scope().project)
+                    .copied()
+                    .unwrap_or(0);
+                let local = (local.into_iter())
+                    .map(|bot| (shared.place(&bot).unwrap_or(here), bot))
+                    .collect();
+                let agents = (shared.agents.iter())
+                    .map(|(place, _, bot)| (*place, bot.clone()))
+                    .collect();
+                (local, elsewhere::Waiting { here, agents })
+            }
+            None => (
+                (local.into_iter()).map(|bot| (0, bot)).collect::<Vec<_>>(),
+                elsewhere::Waiting::default(),
+            ),
+        };
+        let waiting = elsewhere::round(&local, &elsewhere);
+        match elsewhere::next(&waiting, &self.bot) {
+            None => self.notice = Some("no one needs you".into()),
+            Some(to) if to == self.bot => {}
+            Some(to) => {
+                let to = to.to_owned();
+                self.carry_draft = true;
+                self.switch_window(to);
+            }
+        }
     }
 
     /// While **Projects** is open, every project read again once its
@@ -3976,9 +4074,15 @@ async fn run() -> Result<(), String> {
         if let Some(first) = &first {
             args.extend(["--send-file".into(), first.display().to_string()]);
         }
+        let draft = (app.carry_draft && !app.input.trim().is_empty())
+            .then(|| attach::draft(&app.input, &app.pictures))
+            .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
+        if let Some(draft) = &draft {
+            args.extend(["--draft-file".into(), draft.display().to_string()]);
+        }
         let error = std::process::Command::new(me).args(&args).exec();
-        if let Some(first) = &first {
-            let _ = std::fs::remove_file(first);
+        for kept in [&first, &draft].into_iter().flatten() {
+            let _ = std::fs::remove_file(kept);
         }
         return Err(format!("could not open {other}: {error}"));
     }
@@ -5139,7 +5243,7 @@ const ZEN_ENDS: &str = "End zen and hear what was kept";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
-const SHORTCUTS: [(&str, &str); 24] = [
+const SHORTCUTS: [(&str, &str); 25] = [
     ("enter", "send, or steer the running turn"),
     ("tab", "queue for after the running turn"),
     ("↑↓", "earlier prompts, past the first or last row"),
@@ -5159,6 +5263,7 @@ const SHORTCUTS: [(&str, &str); 24] = [
         "alt+← alt+→",
         "with nothing typed, the agent above or below",
     ),
+    ("alt+n", "the next agent that needs you"),
     ("ctrl+\\", "keys to the pane and back"),
     ("ctrl+[ ctrl+]", "hide the pane, show it again"),
     ("ctrl+g", "open the pane's agent in the main view"),
@@ -5634,6 +5739,10 @@ struct Fill {
 
 /// How often `/status` reads its rows again while open.
 const STATUS_AGAIN: Duration = Duration::from_secs(2);
+
+/// How soon the follow of the other projects starts again once it
+/// stopped, as when the daemon went and came back.
+const ELSEWHERE_AGAIN: Duration = Duration::from_secs(5);
 
 /// The margin's references read beside the loop, by bot and note.
 type References = Vec<((String, String), margin::Reference)>;
@@ -6190,6 +6299,9 @@ struct App {
     /// Another agent, which this window opens on instead once it quits:
     /// `/switch NAME`, or one `/new` made.
     switch_to: Option<String>,
+    /// What is typed goes with the window to the agent it switches to:
+    /// `alt+n` works with words typed, which it never drops.
+    carry_draft: bool,
     /// The Sonny installed while this window was open, which it reopens on
     /// once it quits ([`update::installed_since`]).
     reopen_on: Option<PathBuf>,
@@ -6232,6 +6344,12 @@ struct App {
     /// The footer's needs-you count, which beats a few times when it
     /// rises; kept as the footer is drawn, from what it counts.
     needs_pulse: std::cell::Cell<look::Pulse>,
+    /// What needs the person in every project, followed by one window of
+    /// the store for all, and when it started.
+    other_projects: Option<(elsewhere::Elsewhere, Instant)>,
+    /// The `?` of the footer's `← ? N`, which beats as the needs-you count
+    /// does.
+    elsewhere_pulse: std::cell::Cell<look::Pulse>,
     /// The reply text the current model call has streamed.
     said: String,
     /// Words streamed that show nothing yet, held until visible words
@@ -7591,12 +7709,26 @@ impl Fleet {
     /// lead followed in the same folder has its own row, counted there.
     fn waiting_past_status(&self, listed: &std::collections::HashSet<String>) -> usize {
         (self.needs.waiting())
-            .filter(|bot| !listed.contains(*bot))
-            .filter(|bot| {
-                self.raised.contains(*bot)
-                    || (workflow::worker_project(bot).is_some() && self.below(bot))
-            })
+            .filter(|bot| self.past_status(bot, listed))
             .count()
+    }
+
+    /// Those [`Fleet::waiting_past_status`] counts, by name, in order.
+    fn waiting_past_status_of(&self, listed: &std::collections::HashSet<String>) -> Vec<String> {
+        let mut waiting: Vec<String> = (self.needs.waiting())
+            .filter(|bot| self.past_status(bot, listed))
+            .map(str::to_owned)
+            .collect();
+        waiting.sort();
+        waiting
+    }
+
+    /// Whether `bot` is one [`Fleet::waiting_past_status`] counts, were it
+    /// waiting.
+    fn past_status(&self, bot: &str, listed: &std::collections::HashSet<String>) -> bool {
+        !listed.contains(bot)
+            && (self.raised.contains(bot)
+                || (workflow::worker_project(bot).is_some() && self.below(bot)))
     }
 
     /// `bot` as this window names it: a task by its short name, another
@@ -8373,6 +8505,7 @@ impl App {
             paused,
             quit: false,
             switch_to: None,
+            carry_draft: false,
             reopen_on: None,
             started: Instant::now(),
             fleet: None,
@@ -8401,6 +8534,8 @@ impl App {
             warming: None,
             sounds: sound::Sounds::new(false),
             needs_pulse: std::cell::Cell::default(),
+            other_projects: None,
+            elsewhere_pulse: std::cell::Cell::default(),
             said: String::new(),
             unseen: String::new(),
             staged: Vec::new(),
@@ -8986,6 +9121,7 @@ impl App {
             self.settle_task_asks().await;
             self.count_agents().await;
             self.projects_tick().await;
+            self.elsewhere_tick();
             self.read_references().await;
             self.read_names().await;
             self.warm_reads().await;
@@ -17431,6 +17567,8 @@ impl App {
                 });
             }
             "status" if self.options.side.is_none() => self.status().await,
+            "projects" if self.projects_here() => self.open_projects().await,
+            "projects" => {}
             // An agent's title button: this window becomes its Sonny.
             "main" => self.switch_command(id).await,
             // Its name: its own tab, where the lead's tasks are laid out.
@@ -18268,6 +18406,8 @@ impl App {
                     {
                         self.step_agent(matches!(key.code, KeyCode::Right | KeyCode::Char('f')))
                     }
+                    // The next agent that needs the person, typed or not.
+                    KeyCode::Char('n') if alt && self.projects_here() => self.next_needing(),
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
@@ -20074,6 +20214,7 @@ impl App {
             || self.shell.is_some()
             || (self.pane.as_ref()).is_some_and(|pane| pane.is_card() || pane.program.is_some())
             || self.needs_pulse.get().moving(Instant::now())
+            || self.elsewhere_pulse.get().moving(Instant::now())
     }
 
     /// Whether only words are drawn: the person's, the agent's, its
@@ -23046,6 +23187,22 @@ impl App {
         if counts.idle > 0 {
             let forms = footer::count(status::sign(started::IDLE), counts.idle, true);
             items.push(Item::new(Slot::Idle, forms).opens("status"));
+        }
+        // What needs the person in the other projects, as `← ? N`: the
+        // muted arrow, then the count drawn as this project's. It is one
+        // item, drawn whatever is typed; only its `?` beats, and it gives
+        // way whole.
+        let elsewhere = self.elsewhere_waiting().agents.len();
+        let mut pulse = self.elsewhere_pulse.get();
+        pulse.see(elsewhere, Instant::now());
+        self.elsewhere_pulse.set(pulse);
+        if elsewhere > 0 {
+            let mut forms = footer::count(status::sign("needs you"), elsewhere, true);
+            if pulse.on(Instant::now()) {
+                footer::beat(&mut forms[0][0]);
+            }
+            forms[0].insert(0, Span::raw("← ").dim());
+            items.push(Item::new(Slot::Elsewhere, forms).opens("projects"));
         }
         // How full the next round is, as what is left of its window: no
         // hue while there is room, then yellow, then red, and it never
@@ -28267,6 +28424,22 @@ mod tests {
         assert_eq!(stepped(&listed, "calc.divide", true), Some("calc.lead"));
         assert_eq!(stepped(&listed, "calc.divide", false), Some("calc.lead"));
         assert_eq!(stepped(&[], "calc.lead", true), None);
+    }
+
+    #[tokio::test]
+    async fn alt_n_says_no_one_needs_you_at_none_and_keeps_what_is_typed() {
+        let mut app = app(zen_daemon().await);
+        let alt_n = Event::Key(event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT));
+        app.input.set("fix it");
+        app.key(alt_n.clone()).await;
+        assert_eq!(app.notice.as_deref(), Some("no one needs you"));
+        assert_eq!(&*app.input, "fix it");
+        assert_eq!(app.bot, "b");
+        // In zen it does nothing.
+        app.notice = None;
+        app.zen = Some("the rounding".into());
+        app.key(alt_n).await;
+        assert_eq!(app.notice, None);
     }
 
     #[tokio::test]

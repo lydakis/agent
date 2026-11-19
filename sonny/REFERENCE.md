@@ -133,6 +133,22 @@ its ends, as a multiplexer's previous and next tab: the window becomes that
 agent's, and from one the list does not show they go to the lead. With
 words typed, all of them move the cursor.
 
+The footer says `← ? N` for the agents that need you in every other
+project: a call held for your approval, or a question still open. The
+muted `←` is the key that shows them, and tells this `?` from the
+project's own; it is drawn whatever is typed. It is not there at none, it
+gives way whole, and a click on it opens **Projects**. `alt+n`, typed or
+not, goes to the next agent that needs you: this project's first, then
+the other projects' in the order **Projects** lists them, from the one
+after this project's around to the one before it, in each its lead first
+and then by name, so from any agent it reaches every one; at none it says
+`no one needs you`.
+Side chats are left out, as `/status` leaves them. The footer
+learns from the daemon's events as they come, so an approval held in
+another project shows as soon as `/status` would show it, with nothing read
+on a timer. One window of the store follows for all of them, and the others
+hear it on a socket beside the store; when it closes, another follows on.
+
 ![Projects at 150, 120, 60 and 44 columns: a superlead with two projects under it, a third outside it, four idle projects folded; the pane shows the picked project's agents where there is room](../docs/sonny/projects-projects.png)
 
 ### Creating an agent

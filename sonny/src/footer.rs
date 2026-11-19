@@ -32,6 +32,9 @@ pub enum Slot {
     Working,
     /// The agents at rest: the first to go.
     Idle,
+    /// What needs the person in the other projects, drawn `← ? N`: the
+    /// arrow to **Projects** and the count, one item.
+    Elsewhere,
     /// The context while under half of it is used: good to know.
     RoomyContext,
     /// The context once half of it is used: it never goes.
@@ -46,7 +49,7 @@ impl Slot {
 
 /// The order things give way: each step takes that item to its next
 /// form, and a step for an item absent or at its last form is passed.
-const LADDER: [Slot; 12] = [
+const LADDER: [Slot; 13] = [
     Slot::Idle,
     Slot::Folded,
     Slot::Access,
@@ -58,6 +61,7 @@ const LADDER: [Slot; 12] = [
     Slot::Profile,
     Slot::Model,
     Slot::Working,
+    Slot::Elsewhere,
     Slot::Pending,
 ];
 
@@ -306,6 +310,36 @@ mod tests {
             assert_eq!(row.width(), w, "{row}");
             assert!(row.starts_with("  ⏵⏵") && row.ends_with("  "), "{row}");
         }
+    }
+
+    #[test]
+    fn elsewhere_gives_way_whole_after_idle_and_working_and_opens_projects() {
+        let with_elsewhere = || {
+            let mut items = busy();
+            let mut forms = count(crate::status::sign("needs you"), 3, true);
+            forms[0].insert(0, Span::raw("← ").dim());
+            items.push(Item::new(Slot::Elsewhere, forms).opens("projects"));
+            items
+        };
+        let rows: Vec<String> = [120, 100, 44, 38].map(|w| row(with_elsewhere(), w)).into();
+        assert!(
+            rows[0].ends_with("? 1  ✗ 1  ● 2  ○ 4  ← ? 3  37% left  "),
+            "{}",
+            rows[0]
+        );
+        // The idle count goes first, then the working one, then it, whole.
+        assert!(
+            rows[1].ends_with("? 1  ✗ 1  ● 2  ← ? 3  37% left  "),
+            "{}",
+            rows[1]
+        );
+        assert!(rows[2].ends_with("? 1  ✗ 1  ← ? 3  37%  "), "{}", rows[2]);
+        assert!(rows[3].ends_with("? 1  ✗ 1  37%  "), "{}", rows[3]);
+        for (row, w) in rows.iter().zip([120, 100, 44, 38]) {
+            assert_eq!(row.width(), w, "{row}");
+        }
+        let (_, opens) = lay(with_elsewhere(), 120);
+        assert_eq!(opens.last().map(|(_, link)| *link), Some("projects"));
     }
 
     #[test]

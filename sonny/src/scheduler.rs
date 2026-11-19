@@ -1323,7 +1323,7 @@ fn run_own(me: &Path, args: &[&str]) -> Option<libc::pid_t> {
 
 /// A lock on `path`, a plain file made when it is not there: None while
 /// another process holds it.
-fn locked(path: &Path) -> Result<Option<std::fs::File>, String> {
+pub(crate) fn locked(path: &Path) -> Result<Option<std::fs::File>, String> {
     use std::os::fd::AsRawFd;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
