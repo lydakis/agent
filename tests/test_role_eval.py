@@ -154,14 +154,16 @@ class BlindTests(unittest.TestCase):
             db = sqlite3.connect(home / '.agent/state.sqlite')
             db.executescript(
                 "CREATE TABLE turns(id INTEGER PRIMARY KEY, bot TEXT);"
-                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, turn INTEGER, item BLOB);")
+                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, parent INTEGER, turn INTEGER, item BLOB);")
             asked = {'question': 'Keep orders where?', 'why': 'Decides where orders live.',
                      'options': [{'label': 'One file', 'explanation': 'Orders are still there after a restart.'},
                                  {'label': 'A database', 'explanation': 'Uses sqlite3 with an orders table.'}]}
             db.execute("INSERT INTO turns VALUES (4, 'shop.lead')")
-            db.executemany("INSERT INTO nodes VALUES (?, 4, ?)", [
-                (1, json.dumps({'type': 'function_call', 'name': 'shell', 'arguments': '{"command": "ls"}'})),
-                (2, json.dumps({'type': 'function_call', 'name': 'ask', 'arguments': json.dumps(asked)}))])
+            # As the store keeps a turn: only its first node names it.
+            db.executemany("INSERT INTO nodes VALUES (?, ?, ?, ?)", [
+                (1, None, 4, json.dumps({'type': 'message', 'role': 'user', 'content': []})),
+                (2, 1, None, json.dumps({'type': 'function_call', 'name': 'shell', 'arguments': '{"command": "ls"}'})),
+                (3, 2, None, json.dumps({'type': 'function_call', 'name': 'ask', 'arguments': json.dumps(asked)}))])
             db.commit()
             db.close()
             role_eval.asks(home, run)

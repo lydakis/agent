@@ -1132,9 +1132,17 @@ def asks(home, out):
     if not store.exists():
         return
     db = sqlite3.connect(f'file:{store}?mode=ro', uri=True)
-    rows = db.execute("SELECT t.bot, CAST(n.item AS TEXT) FROM nodes n JOIN turns t ON t.id = n.turn "
-                      "WHERE json_extract(CAST(n.item AS TEXT), '$.type') = 'function_call' "
-                      "AND json_extract(CAST(n.item AS TEXT), '$.name') = 'ask' ORDER BY n.id").fetchall()
+    # Only a turn's first node names the turn: walk each ask's lineage up
+    # to it for the agent that asked.
+    rows = db.execute(
+        "WITH RECURSIVE up(start, parent, turn) AS ("
+        " SELECT id, parent, turn FROM nodes"
+        " WHERE json_extract(CAST(item AS TEXT), '$.type') = 'function_call'"
+        " AND json_extract(CAST(item AS TEXT), '$.name') = 'ask'"
+        " UNION ALL SELECT up.start, n.parent, n.turn FROM nodes n JOIN up ON n.id = up.parent"
+        " WHERE up.turn IS NULL) "
+        "SELECT t.bot, CAST(n.item AS TEXT) FROM up JOIN turns t ON t.id = up.turn "
+        "JOIN nodes n ON n.id = up.start ORDER BY up.start").fetchall()
     db.close()
     lines = []
     for bot, item in rows:
