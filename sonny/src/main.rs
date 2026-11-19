@@ -563,6 +563,66 @@ struct StatusView<'a> {
     /// Whether the histories not read yet are left to read beside the
     /// card, which draws its rows first ([`StatusRead::unread`]).
     fill: bool,
+    /// What the window's other reads of histories read, or read now.
+    readers: Option<&'a Readers>,
+}
+
+/// What a window's reads of its agents' histories (its count, its card,
+/// a lead's first pass) hold between them, so none reads a history another
+/// read or reads now: each agent's latest items by its head and its
+/// question by the turn it ended, as read last, and the agents being read.
+#[derive(Default)]
+struct Readers {
+    reads: std::sync::Mutex<Shared>,
+    /// Told each time a read lands, to whoever waits on it.
+    landed: tokio::sync::Notify,
+}
+
+/// What the reads under way read, held while any runs: each hands what
+/// it read back to the window once it ends.
+#[derive(Default)]
+struct Shared {
+    latest: HashMap<String, (Value, Latest)>,
+    seen: HashMap<String, (i64, Seen)>,
+    reading: std::collections::HashSet<String>,
+    running: usize,
+}
+
+impl Readers {
+    /// One read of histories under way, until it ends.
+    fn underway(&self) -> Underway<'_> {
+        if let Ok(mut shared) = self.reads.lock() {
+            shared.running += 1;
+        }
+        Underway(self)
+    }
+}
+
+/// A read of histories under way: once none is, what they read is let go.
+struct Underway<'a>(&'a Readers);
+
+impl Drop for Underway<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut shared) = self.0.reads.lock() {
+            shared.running -= 1;
+            if shared.running == 0 {
+                shared.latest = HashMap::new();
+                shared.seen = HashMap::new();
+            }
+        }
+    }
+}
+
+/// An agent being read, let go however its read ends.
+struct Reading<'a>(&'a Readers, &'a str);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut shared) = self.0.reads.lock() {
+            shared.reading.remove(self.1);
+        }
+        self.0.landed.notify_waiters();
+    }
 }
 
 /// What `/status` read: its rows, what waits on the person, and which
@@ -655,6 +715,7 @@ async fn read_status_of(
     view: StatusView<'_>,
     kept_rows: Option<(&mut Built, &std::collections::BTreeSet<String>)>,
 ) -> Result<StatusRead, String> {
+    let _underway = view.readers.map(Readers::underway);
     let background::Scope {
         project,
         lead,
@@ -780,7 +841,7 @@ async fn read_status_of(
                 true => unread_here.push(name.to_owned()),
                 false => {
                     fresh = true;
-                    whole &= read_agent(client, bot, status_read, asks_seen).await;
+                    whole &= read_agent(client, bot, status_read, asks_seen, view.readers).await;
                 }
             }
         }
@@ -1044,6 +1105,7 @@ async fn fill_status(
     logs: &str,
     temp_due: bool,
 ) -> (Alerts, Option<Box<StatusRead>>) {
+    let _underway = view.readers.map(Readers::underway);
     let Fill {
         came,
         listed,
@@ -1076,7 +1138,7 @@ async fn fill_status(
     let (mut fresh, mut first) = (false, true);
     loop {
         let whole = owed.as_ref().is_some_and(|owed| owed.is_empty());
-        let view = StatusView {
+        let this = StatusView {
             fill: !whole,
             ..view.clone()
         };
@@ -1088,7 +1150,7 @@ async fn fill_status(
             turns,
             status_read,
             asks_seen,
-            view,
+            this,
             None,
         )
         .await
@@ -1152,7 +1214,7 @@ async fn fill_status(
                 continue;
             };
             fresh = true;
-            if !read_agent(client, bot, status_read, asks_seen).await {
+            if !read_agent(client, bot, status_read, asks_seen, view.readers).await {
                 failed.insert(name.clone());
             }
         }
@@ -1228,15 +1290,48 @@ fn is_read(
 /// idle agent's question once per turn it ended, read on from where the
 /// last read ended, as the sky does. A read that failed is kept for none,
 /// so the next refresh, or window, reads it again; whether all were read.
+/// What the window's other `readers` read is taken, and one they read now
+/// is waited for, not read again.
 async fn read_agent(
     client: &Client,
     bot: &standing::Agent,
     status_read: &mut HashMap<String, (Value, Latest)>,
     asks_seen: &mut HashMap<String, (i64, Seen)>,
+    readers: Option<&Readers>,
 ) -> bool {
     let name = bot.name.as_str();
     let mut whole = true;
     let head = json!([bot.bot_id, bot.head]);
+    let ended = (bot.last.as_ref()).filter(|_| bot.running_turn.is_none());
+    let _reading = match readers {
+        Some(readers) => loop {
+            let landed = readers.landed.notified();
+            tokio::pin!(landed);
+            landed.as_mut().enable();
+            {
+                let Ok(mut shared) = readers.reads.lock() else {
+                    break None;
+                };
+                if let Some(read) = (shared.latest.get(name)).filter(|(seen, _)| *seen == head) {
+                    status_read.insert(name.to_owned(), read.clone());
+                }
+                if let Some(last) = ended
+                    && let Some(seen) =
+                        (shared.seen.get(name)).filter(|(turn, _)| *turn == last.turn)
+                {
+                    asks_seen.insert(name.to_owned(), seen.clone());
+                }
+                if is_read(bot, &head, status_read, asks_seen) {
+                    return true;
+                }
+                if shared.reading.insert(name.to_owned()) {
+                    break Some(Reading(readers, name));
+                }
+            }
+            landed.await;
+        },
+        None => None,
+    };
     // No history yet: nothing asked of the daemon for it, however many
     // such agents a project holds.
     match status_read.get(name) {
@@ -1254,7 +1349,6 @@ async fn read_agent(
             }
         },
     }
-    let ended = (bot.last.as_ref()).filter(|_| bot.running_turn.is_none());
     if let Some(last) = ended.map(|last| last.turn)
         && (asks_seen.get(name)).is_none_or(|(turn, _)| *turn != last)
     {
@@ -1267,6 +1361,17 @@ async fn read_agent(
                 asks_seen.insert(name.to_owned(), (last, seen));
             }
             None => whole = false,
+        }
+    }
+    // What it read, for the others to take.
+    if let Some(readers) = readers
+        && let Ok(mut shared) = readers.reads.lock()
+    {
+        if let Some(read) = status_read.get(name) {
+            shared.latest.insert(name.to_owned(), read.clone());
+        }
+        if let Some(seen) = asks_seen.get(name) {
+            shared.seen.insert(name.to_owned(), seen.clone());
         }
     }
     whole
@@ -2832,6 +2937,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             aside: &|_| false,
             details: true,
             fill: false,
+            readers: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
@@ -5409,6 +5515,8 @@ struct App {
     status_read: HashMap<String, (Value, Latest)>,
     /// Whether `/status` read a history since it last kept its reads.
     reads_unkept: bool,
+    /// What the window's reads of histories hold between them.
+    readers: Arc<Readers>,
     /// Whether the window started from what its project's lead's windows
     /// kept of each history: its first count takes it.
     reads_taken: bool,
@@ -7580,6 +7688,7 @@ impl App {
             running_heads: HashMap::new(),
             status_read: HashMap::new(),
             reads_unkept: false,
+            readers: Arc::default(),
             reads_taken: false,
             warming: None,
             sounds: sound::Sounds::new(false),
@@ -11918,6 +12027,7 @@ impl App {
         // The rows' mark is kept up to date as rows change, and taken again
         // whole only from a new snapshot.
         let kept_mark = self.rows_mark.filter(|_| !whole);
+        let readers = self.readers.clone();
         self.counting = Some(tokio::spawn(async move {
             let failed = |reads| Counted {
                 mark: None,
@@ -11984,6 +12094,7 @@ impl App {
                 aside: &|_| false,
                 details: false,
                 fill: false,
+                readers: Some(&readers),
             };
             let Ok(read) = read_status_of(
                 &client,
@@ -14462,6 +14573,7 @@ impl App {
     /// `/status` read again beside the loop: its alerts, then its rows.
     fn read_status_beside(&mut self, fill: Option<Fill>) -> tokio::task::JoinHandle<CardRead> {
         let (client, woken) = (self.client.clone(), self.woken.clone());
+        let readers = self.readers.clone();
         let (store, scope, turns) = (self.options.store.clone(), self.scope(), self.turns.clone());
         let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
         let (bot, asks, approvals) = (self.bot.clone(), self.asks.clone(), self.approvals.clone());
@@ -14484,6 +14596,7 @@ impl App {
                 aside: &*aside,
                 details: true,
                 fill: fill.is_some(),
+                readers: Some(&readers),
             };
             let Some(fill) = fill else {
                 let alerts = read_alerts(&client, &logs, temp_due).await;
@@ -14774,6 +14887,7 @@ impl App {
             aside: &|name| fleet.is_some_and(|fleet| fleet.layout.aside(name)),
             details: true,
             fill: false,
+            readers: Some(&self.readers),
         };
         let read = read_status(
             &self.client,
@@ -14820,6 +14934,7 @@ impl App {
                 let (client, woken) = (self.client.clone(), self.woken.clone());
                 let (store, scope) = (self.options.store.clone(), self.scope());
                 let lead = scope.lead.clone();
+                let readers = self.readers.clone();
                 self.warming = Some(Warming::Running(tokio::spawn(async move {
                     let kept = agent_client::socket::canonical_store(&store)
                         .unwrap_or_else(|_| store.clone());
@@ -14834,6 +14949,7 @@ impl App {
                         aside: &|_| false,
                         details: true,
                         fill: false,
+                        readers: Some(&readers),
                     };
                     let turns = HashMap::new();
                     let read =
@@ -24778,6 +24894,7 @@ mod tests {
             aside: &|_| false,
             details: true,
             fill: false,
+            readers: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let read = read_status(
