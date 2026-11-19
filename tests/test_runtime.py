@@ -1077,10 +1077,14 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_a_bots_speed_reaches_only_the_models_that_serve_it(self):
-        # The built-in list names exact Claude models; the person adds one.
-        client, model, path = self.start(extra=('--speeds', 'anthropic/synthetic-claude=fast'))
-        client.request('create', bot='Bob', workspace=str(path), effort='low')
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['speed'], 'standard')
+        # The built-in list names exact Claude models; the bot's speeds,
+        # the person's [speeds], add one.
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low',
+                       settings={'speeds': {'anthropic/synthetic-claude': ['fast']}})
+        record = client.request('inspect', bot='Bob')['result']
+        self.assertEqual(record['settings']['speed'], 'standard')
+        self.assertEqual(record['settings']['speeds'], {'anthropic/synthetic-claude': ['fast']})
         def served(request_id):
             turn = client.request('submit', bot='Bob', request_id=request_id, prompt='hello')['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -1097,11 +1101,41 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(client.request('configure', bot='Bob', settings={'speed': 'standard'})['result']['changed'], ['speed'])
         self.assertEqual(served('f2'), (None, 'standard'))
         self.assertEqual(client.ready['providers']['anthropic']['speeds']['claude-opus-5-5'], ['fast'])
-        self.assertEqual(client.ready['speeds'], {'anthropic/synthetic-claude': ['fast']})
+        self.assertNotIn('speeds', client.ready)
         # Usage keeps each speed's spend apart.
         spent = client.request('usage', since_ms=0)['result']['models']
         self.assertEqual(sorted((m['model'], m['speed'], m['turns']) for m in spent),
                          [('anthropic/synthetic-claude', 'fast', 1), ('anthropic/synthetic-claude', 'standard', 2)])
+
+    def test_a_bots_speeds_change_at_its_next_turn_with_no_restart(self):
+        # As a client sends the person's [speeds] again once they change:
+        # the same daemon, the bot's next turn.
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low', settings={'speed': 'fast'})
+        def served(request_id):
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt='hello')['result']['message']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return model.requests.get(timeout=5).get('speed')
+        # Not in the daemon's list: standard.
+        self.assertIsNone(served('s1'))
+        given = {'anthropic/synthetic-*': ['fast'], 'anthropic/synthetic-claude': []}
+        changed = client.request('configure', bot='Bob', settings={'speeds': given})['result']['changed']
+        self.assertEqual(changed, ['speeds'])
+        # The most specific pattern wins: standard only.
+        self.assertIsNone(served('s2'))
+        given = {'anthropic/synthetic-*': ['fast']}
+        client.request('configure', bot='Bob', settings={'speeds': given})
+        self.assertEqual(served('s3'), 'fast')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['speeds'], given)
+        # Taken away, the daemon's list again.
+        client.request('configure', bot='Bob', settings={'speeds': None})
+        self.assertIsNone(served('s4'))
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['speeds'], {})
+        # A wrong table is refused, the bot's kept.
+        for wrong in ({'synthetic-claude': ['fast']}, {'anthropic/x': ['standard']}, {'anthropic/x': 'fast'}):
+            error = client.request('configure', bot='Bob', settings={'speeds': wrong})['error']
+            self.assertEqual(error, 'invalid_setting', wrong)
+        self.assertEqual(served('s5'), None)
 
     def test_a_short_tool_call_sends_no_refresh(self):
         client, model, path = self.start()

@@ -848,10 +848,10 @@ has something on it, or is off the screen, no time shows.
   `sonny-config` skill. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
-  agent when it is made, `trailer` and `hold`, every agent Sonny made
-  takes within seconds of the file changing, or, at work, once its turn
-  ends. `[fallbacks]`, like `[speeds]` and `[context_windows]`, is the
-  daemon's: every agent takes it once the daemon starts again.
+  agent when it is made, `trailer`, `hold`, `[speeds]` and
+  `[context_windows]`, every agent Sonny made takes within seconds of the
+  file changing, or, at work, once its turn ends: no restart. `[fallbacks]`
+  is the daemon's: every agent takes it once the daemon starts again.
 
   ![/config: the Models group under its bold name, a model set in ink and the defaults muted](../docs/sonny/config-groups.png)
 

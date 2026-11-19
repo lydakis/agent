@@ -1355,6 +1355,11 @@ impl Attempt {
             if let Some(ms) = config.hold_ms {
                 settings.insert("hold_ms".into(), json!(ms));
             }
+            for (key, table) in agent_client::config::model_tables(&config) {
+                if !table.is_null() {
+                    settings.insert(key.into(), table);
+                }
+            }
             let create = json!({"bot": worker, "workspace": dir, "model": model,
                 "instructions": told.instructions, "effort": effort, "tools": tools,
                 "declare": crate::declared::tools(crate::served::Role::WORKER.within(&json!(settings))),

@@ -1473,11 +1473,6 @@ pub struct Configuration {
     /// Files every Linux sandbox shows from the person's copy, with text
     /// before each.
     pub own_copy_files: Vec<(PathBuf, String)>,
-    /// The context windows the person set, by model path.
-    pub context_windows: Arc<agent_runtime::provider::Windows>,
-    /// The tiers faster than standard the person says models serve, by
-    /// model path, over the built-in catalog.
-    pub speeds: Arc<agent_runtime::provider::Speeds>,
     /// The model a declined request goes to, by the declined model's path,
     /// for a bot that names none of its own.
     pub fallbacks: Arc<agent_runtime::provider::Fallbacks>,
@@ -2289,8 +2284,6 @@ struct Binder {
     transport: Arc<Transport>,
     credentials: agent_runtime::tools::Credentials,
     stall_timeout: Duration,
-    windows: Arc<agent_runtime::provider::Windows>,
-    speeds: Arc<agent_runtime::provider::Speeds>,
 }
 
 impl Binder {
@@ -2376,7 +2369,7 @@ impl Binder {
         }
         let provider = provider
             .with_stall_timeout(self.stall_timeout)?
-            .with_models(&spec.name, self.windows.clone(), self.speeds.clone());
+            .with_name(&spec.name);
         let (searches, speeds) = (provider.searches(), provider.speeds());
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
             "transport":spec.transport(),"efforts":spec.family.efforts(),
@@ -2465,8 +2458,6 @@ pub async fn run(config: Configuration) -> Result<()> {
         transport: transport.clone(),
         credentials: credentials.clone(),
         stall_timeout,
-        windows: config.context_windows.clone(),
-        speeds: config.speeds.clone(),
     };
     let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
@@ -2683,8 +2674,6 @@ pub async fn run(config: Configuration) -> Result<()> {
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
-        "context_windows":config.context_windows.json(),
-        "speeds":config.speeds.json(),
         "fallbacks":config.fallbacks.json(),
         "durability":"sqlite_full","partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
