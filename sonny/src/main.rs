@@ -792,6 +792,7 @@ async fn read_status_of(
     let (mut fresh, mut whole) = (false, true);
     let mut unread_here = Vec::new();
     let mut untitled_here = std::collections::HashSet::new();
+    let mut later = Vec::new();
     // Side chats are not the project's agents.
     for bot in listed {
         let name = bot.name.as_str();
@@ -859,7 +860,13 @@ async fn read_status_of(
                         whole &=
                             read_agent(client, bot, status_read, asks_seen, view.readers).await;
                     }
-                    if untitled && read_title(client, &store, bot, status_read).await {
+                    // A first line its history read did not hold waits
+                    // until every row's history is read.
+                    let known = (status_read.get(name))
+                        .is_some_and(|(seen, latest)| *seen == head && latest.first.is_some());
+                    if untitled && !known {
+                        later.push(bot);
+                    } else if untitled && read_title(client, &store, bot, status_read).await {
                         title = (bot.bot_id).and_then(|id| crate::title::noted(&store, name, id));
                     }
                 }
@@ -1077,6 +1084,24 @@ async fn read_status_of(
     }
     // Agents gone from the listing are forgotten with it.
     status_read.retain(|name, _| listed_here.contains(name.as_str()));
+    if !later.is_empty() {
+        let at: HashMap<&str, usize> = (rows.iter().enumerate())
+            .map(|(at, row)| (row.bot.as_str(), at))
+            .collect();
+        let mut noted = Vec::new();
+        for bot in later {
+            if read_title(client, &store, bot, status_read).await
+                && let Some(title) =
+                    (bot.bot_id).and_then(|id| crate::title::noted(&store, &bot.name, id))
+                && let Some(&at) = at.get(bot.name.as_str())
+            {
+                noted.push((at, title));
+            }
+        }
+        for (at, title) in noted {
+            rows[at].title = title;
+        }
+    }
     // The project's title, from its lead's folder's file.
     let lead_folder = (listed.iter())
         .find(|bot| bot.name == lead)
@@ -1716,8 +1741,11 @@ async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
                 })
         })
         .collect();
-    // A page with none older holds the first message.
-    let first = (page["next_from"].is_null() && !nodes.is_empty()).then(|| {
+    // A page with none older holds the first message, when every item on
+    // it came back whole.
+    let whole =
+        entries.len() == nodes.len() && entries.iter().all(|entry| entry["error"].is_null());
+    let first = (page["next_from"].is_null() && !nodes.is_empty() && whole).then(|| {
         (flat.iter().rev())
             .find(|item| item["role"] == "user")
             .map(text)
@@ -25789,12 +25817,19 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let firsts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let asked = firsts.clone();
+        let read_first = |firsts: &std::sync::Mutex<Vec<String>>| {
+            let mut read = firsts.lock().unwrap().clone();
+            read.sort();
+            read
+        };
         let snapshot = json!([
             {"name": "titled.helper", "bot_id": 2, "head": 5, "last": {"turn": 1, "status": "completed"},
                 "created_by": "titled.lead"},
             {"name": "titled.kept", "bot_id": 3, "head": 4, "last": {"turn": 1, "status": "completed"},
                 "created_by": "titled.lead"},
             {"name": "titled.short", "bot_id": 4, "head": 8, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.big", "bot_id": 5, "head": 10, "last": {"turn": 1, "status": "completed"},
                 "created_by": "titled.lead"},
             {"name": "titled.lead", "bot_id": 1, "head": 2, "workspace": "WORKSPACE",
                 "last": {"turn": 1, "status": "completed"}},
@@ -25832,10 +25867,18 @@ mod tests {
                 counted_reads.fetch_add(1, Ordering::SeqCst);
                 json!({"nodes": [{"node": 8, "turn": 1}, {"node": 7, "turn": 1}], "next_from": null})
             }
+            "history_nodes" if ask["bot"] == "titled.big" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [{"node": 10, "turn": 1}, {"node": 9, "turn": 1}], "next_from": null})
+            }
             "history_nodes" => {
                 counted_reads.fetch_add(1, Ordering::SeqCst);
                 json!({"nodes": [], "next_from": null})
             }
+            // Its items too large for one answer: only the newest came.
+            "history_items" if ask["nodes"] == json!([10, 9]) => json!({"items": [
+                {"node": 10, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Not the first"}]}}]}),
             "history_items" if ask["nodes"] == json!([8, 7]) => json!({"items": [
                 {"node": 8, "item": {"role": "assistant", "content": [{"type": "output_text",
                     "text": "Counted."}]}},
@@ -25877,7 +25920,12 @@ mod tests {
             crate::title::noted(&store, "titled.helper", 2).as_deref(),
             Some("Fix the flaky login test")
         );
-        assert_eq!(*firsts.lock().unwrap(), ["titled.helper"]);
+        assert_eq!(read_first(&firsts), ["titled.big", "titled.helper"]);
+        // One whose newest page did not all come reads its first line.
+        assert_eq!(
+            crate::title::noted(&store, "titled.big", 5).as_deref(),
+            Some("Fix the flaky login test")
+        );
         // One whose newest page holds its whole history takes its first
         // line from that page, with no read of its own.
         assert_eq!(
@@ -25887,7 +25935,7 @@ mod tests {
         // Read again after it moved: its title is not.
         app.follower.as_ref().unwrap().moved("titled.helper");
         counted(&mut app).await;
-        assert_eq!(*firsts.lock().unwrap(), ["titled.helper"]);
+        assert_eq!(read_first(&firsts), ["titled.big", "titled.helper"]);
         // A title noted as it started is never read, nor replaced.
         assert_eq!(
             crate::title::noted(&store, "titled.kept", 3).as_deref(),
@@ -25906,7 +25954,7 @@ mod tests {
         app.asks_seen.clear();
         app.status().await;
         app.status_whole().await;
-        assert_eq!(*firsts.lock().unwrap(), ["titled.helper"]);
+        assert_eq!(read_first(&firsts), ["titled.big", "titled.helper"]);
         assert_eq!(crate::title::noted(&store, "titled.lead", 1), None);
         assert_eq!(
             titles
