@@ -924,7 +924,7 @@ pub struct Blanks {
     /// The sources the person set up, by name.
     pub sources: Arc<Vec<String>>,
     /// The agents as `/status` last read them, as `tasks()` gives them.
-    pub tasks: Arc<Vec<Value>>,
+    pub tasks: Arc<Vec<crate::status::Task>>,
     /// Counts each change to `tasks`.
     pub tasks_read: u64,
     /// The person's own notes, `[sonny.notes.NAME]`, shown over the
@@ -957,9 +957,10 @@ pub struct Margin {
     /// What template notes are filled from, as the window sets it before
     /// each draw ([`Margin::set_blanks`]).
     blanks: Blanks,
-    /// The bot's own tasks that need the person, failed or work, as
-    /// `/status` last read them, shown under the plan.
-    tasks: Vec<crate::status::Own>,
+    /// The project's agents as `/status` last read them, shown above
+    /// the plan and notes under a muted rule, and the agent of this
+    /// window, bold among them.
+    agents: (crate::status::Agents, String),
     /// Template notes as last filled, by note id; the person's own by
     /// `~NAME`.
     watch: crate::live::Watch,
@@ -1063,19 +1064,21 @@ impl Margin {
         )
     }
 
-    /// Whether it holds no note, no plan and no task.
+    /// Whether it holds no note, no plan, and lists no task.
     pub fn is_empty(&self) -> bool {
-        self.kept.notes.is_empty()
-            && self.plan.is_empty()
-            && self.tasks.is_empty()
-            && self.blanks.notes.is_empty()
+        self.notes_empty() && self.agents.0.is_empty()
     }
 
-    /// The bot's own tasks that need the person, failed or work, as
-    /// `/status` read them now ([`crate::status::own`]).
-    pub fn set_tasks(&mut self, tasks: Vec<crate::status::Own>) {
-        if self.tasks != tasks {
-            self.tasks = tasks;
+    /// Whether the agent keeps nothing here: no note and no plan.
+    fn notes_empty(&self) -> bool {
+        self.kept.notes.is_empty() && self.plan.is_empty() && self.blanks.notes.is_empty()
+    }
+
+    /// The project's agents as `/status` read them now
+    /// ([`crate::status::agents`]), in the window of `here`.
+    pub fn set_agents(&mut self, agents: crate::status::Agents, here: &str) {
+        if self.agents.0 != agents || self.agents.1 != here {
+            self.agents = (agents, here.to_owned());
             self.changes += 1;
         }
     }
@@ -1540,7 +1543,40 @@ impl Margin {
         Some(whole)
     }
 
+    /// The pane at rest: on top, Sonny's, the project's agents; under a
+    /// muted rule, the agent's, its plan and notes. With no task listed,
+    /// the plan and notes alone; with nothing kept, the agents alone.
     fn draw(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
+        let (agents, here) = &self.agents;
+        let listed = crate::status::agents_lines(agents, here, width);
+        if listed.is_empty() {
+            return self.draw_notes(width, workspace, live);
+        }
+        let mut lines = vec![Line::default()];
+        let mut marks = Vec::new();
+        // A click on a row goes to its agent.
+        for (line, bot) in listed {
+            if let Some(bot) = bot {
+                marks.push((lines.len(), Mark::Link(format!("{BUTTON}task/{bot}"))));
+            }
+            lines.push(line);
+        }
+        if self.notes_empty() {
+            return (lines, marks);
+        }
+        lines.push(Line::from(format!(" {}", "─".repeat(width.saturating_sub(1)))).dim());
+        let (notes, noted) = self.draw_notes(width, workspace, live);
+        // The plan or first note right under the rule.
+        let skip = usize::from(notes.first().is_some_and(|line| line.width() == 0));
+        let at = lines.len();
+        marks.extend((noted.into_iter()).map(|(row, mark)| (at + row - skip, mark)));
+        lines.extend(notes.into_iter().skip(skip));
+        (lines, marks)
+    }
+
+    /// The agent's plan and notes, as [`Margin::draw`] draws them under
+    /// the agents.
+    fn draw_notes(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
         let mut lines = Vec::new();
         let mut marks = Vec::new();
         if !self.plan.is_empty() {
@@ -1563,21 +1599,9 @@ impl Margin {
                 lines.extend(crate::transcript::wrap(step, width, lead(), lead()));
             }
         }
-        // What the bot has going, under the plan and above the notes: a
-        // click on a task goes to it.
-        let tasks = crate::status::own_lines(&self.tasks, width);
-        if !tasks.is_empty() {
-            lines.push(Line::default());
-        }
-        for (line, bot) in tasks {
-            if let Some(bot) = bot {
-                marks.push((lines.len(), Mark::Link(format!("{BUTTON}task/{bot}"))));
-            }
-            lines.push(line);
-        }
         let person = self.blanks.notes.clone();
         if self.kept.notes.is_empty() && person.is_empty() {
-            if self.plan.is_empty() && self.tasks.is_empty() {
+            if self.plan.is_empty() {
                 lines.push(Line::default());
                 lines.push(
                     Line::from(" Notes the agent keeps beside the conversation show here.").dim(),
@@ -1946,7 +1970,9 @@ mod tests {
     #[test]
     fn a_template_note_fills_and_fills_again_only_once_what_it_read_changes() {
         let mut margin = margin();
-        margin.blanks.tasks = Arc::new(vec![json!({"name": "calc.add", "state": "working"})]);
+        margin.blanks.tasks = Arc::new(vec![Arc::new(
+            json!({"name": "calc.add", "state": "working"}),
+        )]);
         let post = json!({"kind": "pinned", "id": "tasks", "title": "Tasks",
             "live": true, "markdown": "{% for t in tasks() %}- {{ t.name }}: {{ t.state }}\n{% endfor %}"});
         assert_eq!(
@@ -1968,7 +1994,9 @@ mod tests {
         later(&mut margin);
         drawn(&mut margin, folder);
         assert_eq!(margin.changes(), changes, "nothing it read changed");
-        margin.blanks.tasks = Arc::new(vec![json!({"name": "calc.add", "state": "failed"})]);
+        margin.blanks.tasks = Arc::new(vec![Arc::new(
+            json!({"name": "calc.add", "state": "failed"}),
+        )]);
         margin.blanks.tasks_read += 1;
         later(&mut margin);
         assert!(drawn(&mut margin, folder).contains("calc.add: failed"));
@@ -2179,26 +2207,48 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_s_tasks_show_under_the_plan_and_above_the_notes() {
-        use crate::status::{Group, Own};
+    fn the_projects_agents_show_above_a_rule_over_the_plan_and_notes() {
+        use crate::status::{Agents, Counts, Group, Listed};
         let mut margin = margin();
-        let task = |name: &str, title: &str, state: &str, group| Own {
+        let agent = |name: &str, title: &str, state: &str, group| Listed {
             bot: format!("calc.{name}"),
             name: name.into(),
             title: title.into(),
             state: state.into(),
             group,
+            lead: name == "lead",
             helpers: Vec::new(),
             run: None,
         };
-        // Its tasks alone open it, as a plan does.
-        margin.set_tasks(vec![task(
-            "halves",
-            "Round half cents to even",
-            "working",
-            Group::Working,
-        )]);
+        let agents = |listed: Vec<Listed>| Agents {
+            project: "Tally invoices".into(),
+            counts: Counts {
+                working: listed.len(),
+                ..Counts::default()
+            },
+            listed,
+        };
+        let lead = || agent("lead", "", "waiting on halves", Group::Working);
+        // The lead alone is no list, and opens nothing.
+        margin.set_agents(agents(vec![lead()]), "calc.lead");
+        assert!(margin.is_empty());
+        // A task in it opens it, as a plan does.
+        let halves = || {
+            agent(
+                "halves",
+                "Round half cents to even",
+                "working",
+                Group::Working,
+            )
+        };
+        margin.set_agents(agents(vec![lead(), halves()]), "calc.lead");
         assert!(!margin.is_empty());
+        let text = drawn(&mut margin, Path::new("/"));
+        // Nothing kept: the agents alone, no rule.
+        assert!(
+            !text.contains('─') && !text.contains("Notes the agent"),
+            "{text}"
+        );
         margin.set_plan(&["[ ] Ship".to_owned()]);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "1 of 5"});
         margin.apply("c1", &post, Some(7), Some(3), None);
@@ -2207,20 +2257,48 @@ mod tests {
             text.find(what)
                 .unwrap_or_else(|| panic!("{what} in {text}"))
         };
-        assert!(at("Plan") < at(" Tasks · 1") && at(" Tasks · 1") < at("Repro"));
+        assert!(at("Tally invoices · 2 working") < at("lead · waiting on halves"));
+        assert!(at(" ● Round half cents to even  halves") < at(" ───"));
+        assert!(at(" ───") < at("Plan") && at("Plan") < at("Repro"));
+        // The plan right under the rule.
+        let rows: Vec<&str> = text.lines().collect();
+        let rule = rows.iter().position(|row| row.starts_with(" ───")).unwrap();
+        assert!(rows[rule + 1].contains("Plan"), "{text}");
+        // A click on an agent goes to it; the window's own goes nowhere.
+        let (lines, marks) = margin.lines(60, Path::new("/"), None);
+        let row = |name: &str| {
+            (lines.iter())
+                .position(|line| line.spans.iter().any(|s| s.content == name))
+                .unwrap()
+        };
+        assert!(marks.contains(&(
+            row("halves"),
+            Mark::Link(format!("{BUTTON}task/calc.halves"))
+        )));
+        assert!(!marks.iter().any(|(at, _)| *at == row("lead")));
+        // The note's pin and buttons still on its own row.
+        let repro = (lines.iter())
+            .position(|line| line.spans.iter().any(|s| s.content.contains("Repro")))
+            .unwrap();
         assert!(
-            text.contains(" ● Round half cents to even  halves"),
+            marks
+                .iter()
+                .any(|(at, mark)| *at == repro && matches!(mark, Mark::Tag(_)))
+        );
+        // In the task's window the lead is the link.
+        margin.set_agents(agents(vec![lead(), halves()]), "calc.halves");
+        let (lines, marks) = margin.lines(60, Path::new("/"), None);
+        let lead_row = (lines.iter())
+            .position(|line| line.spans.iter().any(|s| s.content == "lead"))
+            .unwrap();
+        assert!(marks.contains(&(lead_row, Mark::Link(format!("{BUTTON}task/calc.lead")))));
+        // No task going: the plan and notes alone, drawn again.
+        margin.set_agents(agents(vec![lead()]), "calc.lead");
+        let text = drawn(&mut margin, Path::new("/"));
+        assert!(
+            !text.contains("Tally invoices") && !text.contains('─'),
             "{text}"
         );
-        // A click on the task goes to it.
-        let (lines, marks) = margin.lines(60, Path::new("/"), None);
-        let row = (lines.iter())
-            .position(|line| line.spans.iter().any(|s| s.content == "halves"))
-            .unwrap();
-        assert!(marks.contains(&(row, Mark::Link(format!("{BUTTON}task/calc.halves")))));
-        // None going: no block, drawn again once that changes.
-        margin.set_tasks(Vec::new());
-        assert!(!drawn(&mut margin, Path::new("/")).contains("Tasks"));
     }
 
     #[test]
@@ -3294,7 +3372,7 @@ mod tests {
         let tasks = |n: usize| {
             Arc::new(
                 (0..n)
-                    .map(|i| json!({"name": format!("t{i}"), "state": "working"}))
+                    .map(|i| Arc::new(json!({"name": format!("t{i}"), "state": "working"})))
                     .collect(),
             )
         };

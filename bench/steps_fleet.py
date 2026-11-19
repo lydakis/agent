@@ -38,7 +38,7 @@ YIELD = os.environ.get('YIELD') == '1'
 EXEC = {'name': 'exec', 'description': 'Run a script.',
         'parameters': {'type': 'object', 'properties': {'code': {'type': 'string'}},
                        'required': ['code'], 'additionalProperties': False},
-        'answered_by': 'bench', 'steps': True, **({'lift': True} if YIELD else {})}
+        'answered_by': 'bench', 'steps': True, **({'yields': True} if YIELD else {})}
 
 
 class Pipe:

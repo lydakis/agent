@@ -26,8 +26,8 @@ use tokio::sync::Notify;
 
 /// The events that move where an agent stands, as a `bots` row says it:
 /// its status, running turn, what it waits on and how its last turn
-/// ended; an approval held for the person; an agent made or gone.
-pub const KINDS: [&str; 17] = [
+/// ended; an approval held for the person; an agent made, closed or gone.
+pub const KINDS: [&str; 18] = [
     "created",
     "forked",
     "queued",
@@ -44,51 +44,83 @@ pub const KINDS: [&str; 17] = [
     "call_lifted",
     "lifted_ended",
     "step_decided",
+    "closed",
     "deleted",
 ];
 
-/// The fields of a `bots` row a window reads to count its agents;
-/// a kept listing holds only these, so a window that keeps every agent of
-/// a large fleet keeps a little of each.
-pub const KEPT: [&str; 14] = [
-    "name",
-    "bot_id",
-    "head",
-    "running_turn",
-    "status",
-    "waiting_on",
-    "last",
-    "started_ms",
-    "expire_ms",
-    "created_by",
-    "created_by_id",
-    "model",
-    "provider",
-    "workspace",
-];
-
-/// `row` with only the [`KEPT`] fields.
-pub fn kept(mut row: Value) -> Value {
-    if let Some(fields) = row.as_object_mut() {
-        fields.retain(|field, _| KEPT.contains(&field.as_str()));
-    }
-    row
+/// An agent as a window keeps it: the fields of a `bots` row a count
+/// reads, typed, so a window that keeps every agent of a large fleet keeps
+/// a little of each.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct Agent {
+    pub name: String,
+    pub bot_id: Option<i64>,
+    pub head: Option<i64>,
+    pub running_turn: Option<i64>,
+    pub status: Option<String>,
+    pub waiting_on: Value,
+    /// How its newest turn that ran ended.
+    pub last: Option<Ended>,
+    pub started_ms: Option<u64>,
+    /// When a side chat ends: a side chat is not a project's agent.
+    pub expire_ms: Option<i64>,
+    pub created_by: Option<String>,
+    pub created_by_id: Option<i64>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub workspace: Option<String>,
 }
 
-/// Every agent `pattern` names, every page, with the events' cursor read
-/// before the first page: following from it misses no change.
-pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<Value>, i64)> {
+/// How a turn ended, as a `bots` row's `last` says it.
+#[derive(Clone, Debug, Default, PartialEq, Hash, serde::Deserialize)]
+#[serde(default)]
+pub struct Ended {
+    pub turn: i64,
+    pub status: String,
+    pub started_ms: Option<u64>,
+    pub finished_ms: Option<u64>,
+    /// The code it failed or was interrupted with.
+    pub error: Option<String>,
+}
+
+impl Agent {
+    /// The agent that made it, or empty.
+    pub fn maker(&self) -> &str {
+        self.created_by.as_deref().unwrap_or("")
+    }
+}
+
+/// `row`, a `bots` row, as a window keeps it; none for a row that is not
+/// one, or for an agent closed, which a window's project leaves out as
+/// Codex's thread list leaves archived threads out, until a message
+/// opens it again.
+pub fn kept(row: Value) -> Option<Agent> {
+    if !row["closed_ms"].is_null() {
+        return None;
+    }
+    serde_json::from_value(row).ok()
+}
+
+/// Every agent `pattern` names but those closed, every page, with the
+/// events' cursor read before the first page: following from it misses no
+/// change.
+pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<Agent>, i64)> {
     let mut listed = Vec::new();
     let mut after: Option<String> = None;
     let mut cursor = None;
     loop {
-        let mut ask = json!({"name": pattern, "limit": 256});
+        let mut ask = json!({"name": pattern, "limit": 256, "open": true});
         if let Some(after) = &after {
             ask["after"] = json!(after);
         }
         let page = client.request("bots", ask).await?;
         cursor = cursor.or(page["cursor"].as_i64());
-        listed.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        listed.extend(
+            (page["bots"].as_array().into_iter().flatten())
+                .cloned()
+                .filter_map(kept),
+        );
         match page["next_after"].as_str() {
             Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
             _ => break,
@@ -98,8 +130,8 @@ pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<V
 }
 
 /// The rows of `names`, read by name, 256 a request: the agents that
-/// moved. One that is gone is not among them.
-pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec<Value>> {
+/// moved. One that is gone, or closed, is not among them.
+pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec<Agent>> {
     let mut rows = Vec::new();
     for chunk in names.chunks(256) {
         rows.extend(every(client, json!({"names": chunk, "limit": 256})).await?);
@@ -109,7 +141,7 @@ pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec
 
 /// Every page of the `bots` listing `ask` names, each row [`kept`]: a page
 /// ends at its row count or its size, whichever comes first.
-pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Value>> {
+pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Agent>> {
     let mut rows = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -121,7 +153,7 @@ pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Valu
         rows.extend(
             (page["bots"].as_array().into_iter().flatten())
                 .cloned()
-                .map(kept),
+                .filter_map(kept),
         );
         match page["next_after"].as_str() {
             Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
@@ -135,7 +167,7 @@ pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Valu
 pub struct Changes {
     /// A fresh snapshot, every agent the pattern names: taken at the start
     /// and after the follow said `pruned`.
-    pub snapshot: Option<Vec<Value>>,
+    pub snapshot: Option<Vec<Agent>>,
     /// The agents an event moved since.
     pub moved: BTreeSet<String>,
 }
@@ -260,7 +292,7 @@ async fn snapshot(
     let mut pause = Duration::from_millis(250);
     loop {
         if let Ok((listed, cursor)) = list(&client, &pattern).await {
-            changes.lock().unwrap().snapshot = Some(listed.into_iter().map(kept).collect());
+            changes.lock().unwrap().snapshot = Some(listed);
             woken.notify_one();
             if !is_glob(&pattern) {
                 return;
@@ -283,7 +315,9 @@ mod tests {
     /// A daemon that lists any pattern's one agent, named for how many
     /// times it was listed, with the cursor it was listed at, and keeps
     /// every follow asked of it.
-    async fn listing_daemon() -> (Arc<Client>, Arc<Mutex<Vec<Value>>>) {
+    /// A daemon that lists one agent a snapshot under the pattern's
+    /// prefix, and keeps the `follow` asks and the `bots` asks it was sent.
+    async fn listing_daemon() -> (Arc<Client>, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<Value>>>) {
         let dir = std::env::temp_dir().join(format!(
             "sonny-standing-{}-{}",
             std::process::id(),
@@ -297,6 +331,8 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let follows = Arc::new(Mutex::new(Vec::new()));
         let asked_follows = follows.clone();
+        let listings = Arc::new(Mutex::new(Vec::new()));
+        let asked_listings = listings.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -313,6 +349,7 @@ mod tests {
                 let id = asked["id"].clone();
                 let said = match asked["op"].as_str() {
                     Some("bots") => {
+                        asked_listings.lock().unwrap().push(asked.clone());
                         let prefix = asked["name"].as_str().unwrap().trim_end_matches('*');
                         let row = json!({"name": format!("{prefix}{listed}"), "head": 1});
                         listed += 1;
@@ -332,11 +369,20 @@ mod tests {
             }
         });
         let (client, _events) = Client::connect(&socket).await.unwrap();
-        (client, follows)
+        (client, follows, listings)
+    }
+
+    /// An agent `name` at history `head`, as a window keeps it.
+    fn agent(name: &str, head: i64) -> Agent {
+        Agent {
+            name: name.into(),
+            head: Some(head),
+            ..Default::default()
+        }
     }
 
     /// The next snapshot `follower` takes in.
-    async fn next_snapshot(follower: &Follower, woken: &Notify) -> Vec<Value> {
+    async fn next_snapshot(follower: &Follower, woken: &Notify) -> Vec<Agent> {
         loop {
             if let Some(snapshot) = follower.take().snapshot {
                 return snapshot;
@@ -348,12 +394,13 @@ mod tests {
     #[tokio::test]
     async fn a_follow_on_the_windows_connection_names_what_it_moved_and_snapshots_again_after_a_gap()
      {
-        let (client, follows) = listing_daemon().await;
+        let (client, follows, listings) = listing_daemon().await;
         let woken = Arc::new(Notify::new());
         let mut follower = Follower::start(client, "shop.*".into(), woken.clone());
         // The snapshot, then the follow from the cursor it was listed at.
         let first = next_snapshot(&follower, &woken).await;
-        assert_eq!(first, vec![json!({"name": "shop.0", "head": 1})]);
+        assert_eq!(first, vec![agent("shop.0", 1)]);
+        let snapshot = listings.lock().unwrap()[0].clone();
         while follows.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
         }
@@ -362,6 +409,13 @@ mod tests {
             asked,
             json!({"id": asked["id"], "op": "follow", "bot": "shop.*", "after": 40, "kinds": KINDS})
         );
+        // The snapshot leaves closed agents out, as the follow hears them
+        // close.
+        assert_eq!(
+            snapshot,
+            json!({"id": snapshot["id"], "op": "bots", "name": "shop.*", "limit": 256, "open": true})
+        );
+        assert!(KINDS.contains(&"closed"));
         // What the follow brought is its own; the window's agent's events
         // are the window's, even of a kind the follow takes.
         let brought = json!({"event": "turn_finished", "bot": "shop.fix", "following": "shop.*"});
@@ -379,7 +433,7 @@ mod tests {
         // follow again from its cursor.
         assert!(follower.heard(&json!({"event": "pruned", "bot": "shop.*", "before": 9})));
         let again = next_snapshot(&follower, &woken).await;
-        assert_eq!(again, vec![json!({"name": "shop.1", "head": 1})]);
+        assert_eq!(again, vec![agent("shop.1", 1)]);
         while follows.lock().unwrap().len() < 2 {
             tokio::task::yield_now().await;
         }
@@ -388,12 +442,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_project_of_the_windows_agent_alone_is_heard_through_its_own_follow() {
-        let (client, follows) = listing_daemon().await;
+        let (client, follows, _) = listing_daemon().await;
         let woken = Arc::new(Notify::new());
         let mut follower = Follower::start(client, "solo".into(), woken.clone());
         assert_eq!(
             next_snapshot(&follower, &woken).await,
-            vec![json!({"name": "solo0", "head": 1})]
+            vec![agent("solo0", 1)]
         );
         // Its events are the window's to show, and move it here too.
         assert!(!follower.heard(&json!({"event": "turn_finished", "bot": "solo"})));
@@ -401,5 +455,13 @@ mod tests {
         // No second follow of its name, which would take the window's place.
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(follows.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_closed_agent_is_left_out_and_shows_again_once_open() {
+        let closed = json!({"name": "shop.fix", "head": 3, "closed_ms": 1700000000000_i64});
+        assert_eq!(kept(closed), None);
+        let open = json!({"name": "shop.fix", "head": 4});
+        assert_eq!(kept(open), Some(agent("shop.fix", 4)));
     }
 }

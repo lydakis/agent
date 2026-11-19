@@ -399,6 +399,20 @@ pub struct Settings {
     /// Calls on another model, a summarizer or a fallback, go at standard.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<crate::provider::Speed>,
+    /// The tiers faster than standard each model serves, by `PROVIDER/MODEL`
+    /// pattern (`*` and `?` wildcards, the most specific winning), over the
+    /// daemon's catalog: its speed reaches only a model that serves it.
+    /// Its client sends the person's `[speeds]`, and sends them again as
+    /// they change; each turn reads them as it starts. A bot made by
+    /// another takes its creator's unless its client gives its own.
+    #[serde(default, skip_serializing_if = "crate::provider::Speeds::is_empty")]
+    pub speeds: crate::provider::Speeds,
+    /// The context window in tokens of each model, by `PROVIDER/MODEL`
+    /// pattern as `speeds` takes them, over its provider's listing: the
+    /// window its compaction thresholds are counted from. Its client sends
+    /// the person's `[context_windows]`, as `speeds`.
+    #[serde(default, skip_serializing_if = "crate::provider::Windows::is_empty")]
+    pub context_windows: crate::provider::Windows,
     /// How its shell, write and edit calls are confined, by Codex's
     /// sandbox modes; none runs them unconfined.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -590,6 +604,18 @@ impl Settings {
         use crate::sandbox::Mode;
         self.rules = creator.rules.clone();
         self.env = creator.env.clone();
+        // Where its cut outputs go is where its creator's do: the daemon
+        // makes that folder and writes it outside any sandbox, so no bot
+        // names one for the bots it makes.
+        self.outputs = creator.outputs.clone();
+        // What its creator's models serve and hold, unless its client
+        // said.
+        if self.speeds.is_empty() {
+            self.speeds = creator.speeds.clone();
+        }
+        if self.context_windows.is_empty() {
+            self.context_windows = creator.context_windows.clone();
+        }
         if creator.never_asks() {
             self.approval_policy = creator.approval_policy;
         }
@@ -621,8 +647,9 @@ impl Settings {
     /// `creator`'s settings makes, [`Settings::under`] would not keep as
     /// asked: a sandbox looser than its creator's, said, so the bot is
     /// refused rather than made otherwise than asked. Those left unasked
-    /// take its creator's, and its `rules` and `env` are its creator's
-    /// whatever it asks, as no client picks them for a bot another makes.
+    /// take its creator's, and its `rules`, `env` and `outputs` are its
+    /// creator's whatever it asks, as no client picks them for a bot
+    /// another makes.
     pub fn beyond(&self, creator: &Settings) -> Option<String> {
         let held = self.clone().under(creator);
         let creator_sandbox = || {
@@ -748,6 +775,11 @@ impl Settings {
         if crate::output::encoded_len(&self.env).unwrap_or(usize::MAX) > ENV_JSON {
             return refuse("env takes at most 16 KiB as JSON");
         }
+        if crate::output::encoded_len(&self.speeds).unwrap_or(usize::MAX) > ENV_JSON
+            || crate::output::encoded_len(&self.context_windows).unwrap_or(usize::MAX) > ENV_JSON
+        {
+            return refuse("speeds and context_windows each take at most 16 KiB as JSON");
+        }
         for (name, value) in &self.env {
             // A name a shell can set: a letter or `_`, then letters,
             // digits and `_`, and none of the daemon's own.
@@ -806,7 +838,8 @@ impl Settings {
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
             "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy,
-            "steps_only":self.steps_only})
+            "steps_only":self.steps_only,"speeds":self.speeds,
+            "context_windows":self.context_windows})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -827,7 +860,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 26] = [
+pub const SETTINGS: [&str; 28] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -854,6 +887,8 @@ pub const SETTINGS: [&str; 26] = [
     "env",
     "approval_policy",
     "steps_only",
+    "speeds",
+    "context_windows",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -1436,6 +1471,16 @@ pub struct Binding<'a> {
     pub request_id: Option<&'a str>,
     /// The bot starts a line of its own, at depth 0, though it has a creator.
     pub starts_line: bool,
+}
+/// What became of the message a submission replaces: withdrawn by it
+/// while still in line, or how it had ended already.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replaced {
+    pub message: i64,
+    /// `withdrawn`, `failed` (it never reached the bot), or `taken`.
+    pub status: String,
+    /// The turn that took it in, when one did.
+    pub turn: Option<i64>,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -2238,11 +2283,14 @@ pub enum CallAnswer {
     /// Its client's answer, or `tool_unserved` once its time ran out.
     Given(Outcome),
     /// Still waiting until `expires_ms`, or with no deadline while a step
-    /// of it waits on a gate; `notify` fires when an answer is held for the
-    /// turn, or the call's time runs again.
+    /// of it waits on a gate or runs; `notify` fires when an answer is held
+    /// for the turn, or the call's time runs again. `gated` while a step of
+    /// it waits on a gate: it then waits on someone, not on work, so a
+    /// message for the turn lifts it.
     Pending {
         notify: Arc<Notify>,
         expires_ms: Option<u64>,
+        gated: bool,
     },
     /// Its client yielded it: its handle answers it, recorded by the
     /// yield, and the call waits on as that command.
@@ -4112,6 +4160,7 @@ impl Database {
             self.files_gone.len(),
             self.calls_ended.len(),
         );
+        let announced = self.outcomes.len();
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -4123,6 +4172,7 @@ impl Database {
             self.stepped.truncate(stepped);
             self.files_gone.truncate(files);
             self.calls_ended.truncate(ended);
+            self.outcomes.truncate(announced);
             self.restore_steps(gone);
             self.recount_pending()?;
         }
@@ -4347,8 +4397,8 @@ impl Database {
     /// The bot's turn parked on a wait of its own while a steer waits for
     /// it, with the newest queued steer: the steer wakes it. A `wait`'s
     /// handles are reported pending; a call waiting on its verdict, or on
-    /// its client's answer when that lifts (see `wake`), is lifted to the
-    /// background. The daemon's load gate
+    /// its client's answer while a step of it waits on a gate (see
+    /// `wake`), is lifted to the background. The daemon's load gate
     /// or a closed pool is not the bot's own wait, so neither is woken.
     pub fn steered_park(&self, name: &str) -> Result<Option<(i64, i64)>> {
         let parked: Option<i64> = self
@@ -8856,6 +8906,80 @@ impl Database {
             outcome,
         ))
     }
+    /// Withdraw message `message` of bot `name` for the submission
+    /// `request_id` that replaces it, if it is still in line; a message
+    /// already taken in, or ended, stays as it is and says how. Only its
+    /// own sender may replace it: the same bot, or client, and person.
+    /// A retry of the submission withdraws nothing.
+    pub fn replace(
+        &mut self,
+        name: &str,
+        message: i64,
+        request_id: &str,
+        options: &TurnOptions,
+    ) -> Result<Replaced> {
+        type Row = (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            bool,
+        );
+        let sender = options.from.as_ref().map(|(bot, _)| bot);
+        // The sending bot by identity too: one deleted and made again under
+        // its name is another sender. A client's or person's has none.
+        let row: Option<Row> = self
+            .conn
+            .prepare_cached(
+                "SELECT status,turn,from_bot,origin,person,
+                    EXISTS(SELECT 1 FROM messages WHERE bot=?2 AND request_id=?3),
+                    from_id IS (SELECT id FROM bots WHERE name=?4)
+                 FROM messages WHERE id=?1 AND bot=?2",
+            )?
+            .query_row(params![message, name, request_id, sender], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .optional()?;
+        let Some((status, turn, from_bot, origin, person, resent, same_bot)) = row else {
+            return Err(
+                Error::with("turn_not_found", format!("{name} has no message {message}"))
+                    .facts(json!({"bot":name,"message":message})),
+            );
+        };
+        if from_bot.as_ref().or(origin.as_ref()) != sender.or(options.origin.as_ref())
+            || person != options.person
+            || !same_bot
+        {
+            return Err(Error::with(
+                "not_permitted",
+                format!("{name}/{message} has another sender; only its sender may replace it"),
+            )
+            .facts(json!({"bot":name,"message":message})));
+        }
+        if !resent && matches!(status.as_str(), "queued" | "ready" | "attached") {
+            self.end_queued(message, &Error::new("cancelled"))?;
+            return Ok(Replaced {
+                message,
+                status: "withdrawn".to_owned(),
+                turn: None,
+            });
+        }
+        Ok(Replaced {
+            message,
+            status,
+            turn,
+        })
+    }
     /// Deliver a bounded prefix of queued steers into the running turn,
     /// and attached messages with them unless `attached` is false (a reply
     /// that ended the turn's calls, which an attached message never
@@ -10225,10 +10349,22 @@ impl Database {
                 unserved("a later call's gate lapsed before the answer".into()),
             ),
             None => CallAnswer::Pending {
+                gated: paused && self.step_gated(turn, call_id)?,
                 notify: self.live.entry(turn).or_default().notify.clone(),
                 expires_ms,
             },
         })
+    }
+    /// Whether a step of call `call_id` waits on a gate, which stops the
+    /// call's time as a step that runs does.
+    fn step_gated(&self, turn: i64, call_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM approvals INDEXED BY approvals_steps
+                 WHERE turn=? AND step_of=?)",
+            )?
+            .query_row(params![turn, call_id], |r| r.get(0))?)
     }
     /// Whether a call of the turn was moved to the background: its
     /// process row stays while the turn's rows are kept, after its answers
@@ -10359,7 +10495,7 @@ impl Database {
     /// as a message lifts it ([`Database::lift`]), so the model reads its
     /// handle, `yielded`, and `so_far`, and the call waits on its answer,
     /// with no deadline, as that command. Only a call of a tool declared
-    /// `lift`. The handle answers the call with the yield: the reply names
+    /// `yields`. The handle answers the call with the yield: the reply names
     /// it, and the turn waiting on the call is woken by `notify` while it
     /// runs and by `resume` while it is parked.
     pub fn yield_call(
@@ -10393,14 +10529,14 @@ impl Database {
         let Some(name) = name else {
             return fail("no_pending_call");
         };
-        let lifts = self
+        let yields = self
             .inspect(bot)?
             .declared(&name)
-            .is_some_and(|tool| tool.lift);
-        if !lifts {
+            .is_some_and(|tool| tool.yields);
+        if !yields {
             return fail_with(
-                "call_not_liftable",
-                format!("{name} is not declared lift: only its answer ends the call"),
+                "call_not_yieldable",
+                format!("{name} is not declared yields: only its answer ends the call"),
             );
         }
         let Some((process, _)) = self.lift(turn, call_id, None, Some(so_far), &[], now_ms)? else {
@@ -10558,6 +10694,12 @@ impl Database {
     /// gives: at once when it is allowed at once, under no gate or when
     /// its client only `record`s it (a step it would not put to a gate),
     /// and once decided otherwise.
+    ///
+    /// A step its client asks about that names one of the bot's own tools,
+    /// other than its call's, is decided instead as that call from the
+    /// model would be ([`Database::step_planned`]), with the daemon's own
+    /// facts: the same command in a script or in an automation's check is
+    /// judged alike.
     #[allow(clippy::too_many_arguments)]
     pub fn step_announce(
         &mut self,
@@ -10618,6 +10760,14 @@ impl Database {
         let id = format!("{call_id}/{step}");
         if self.request(turn, &id)?.is_some() {
             return fail_with("step_waiting", format!("step {step} is waiting already"));
+        }
+        // A step that names one of the bot's own tools, other than its
+        // call's, is decided as that call from the model would be, by the
+        // plan every caller shares; its client does what it allows.
+        if !record && tool != parent && own_step(&bot, tool) {
+            return self.step_planned(
+                bot, turn, call_id, step, &id, tool, arguments, &parent, lifted, now_ms,
+            );
         }
         let gates: Vec<CallGate> = bot
             .gates
@@ -10691,6 +10841,141 @@ impl Database {
             &bot, turn, call_id, &id, tool, arguments, gates, lifted, now_ms,
         )
     }
+    /// Decide step `id` of call `call_id`, which names the bot's own tool
+    /// `tool`, as the same call from the model would be ([`Bot::plan`]),
+    /// in the turn's folder under the bot's rules, as a daemon step of the
+    /// call is decided, and without running it: refused by the rules, the
+    /// sandbox or a bot that never asks; put to the gates that name `tool`
+    /// (and its call's, when that tool says they judge its daemon steps)
+    /// when the plan gates it; otherwise allowed and recorded, its row in
+    /// the audit trail finished when its client says how it ended.
+    #[allow(clippy::too_many_arguments)]
+    fn step_planned(
+        &mut self,
+        bot: Bot,
+        turn: i64,
+        call_id: &str,
+        step: &str,
+        id: &str,
+        tool: &str,
+        arguments: Value,
+        parent: &str,
+        lifted: bool,
+        now_ms: u64,
+    ) -> Result<Stepped> {
+        if !bot.may_call(tool) {
+            return Err(Error::with("tool_not_available", tool));
+        }
+        let capture = self.capture(turn, call_id)?;
+        let Some(workspace) = capture.workspace.as_deref() else {
+            return fail("workspace_required");
+        };
+        let text = arguments.to_string();
+        let call = ToolCall {
+            name: tool.to_owned(),
+            call_id: id.to_owned(),
+            arguments: text.clone(),
+            custom: false,
+            links: Default::default(),
+        };
+        let plan = bot.plan(&call, std::path::Path::new(workspace), &capture.rules);
+        let refusal = if plan.refused_unasked() {
+            Some((Error::with("approval_refused", NEVER_ASKS), true))
+        } else if let Some(error) = plan.ruled_out() {
+            Some((error, false))
+        } else if plan.escapes() && tool == "shell" {
+            Some((crate::tools::escalation_refused(), false))
+        } else {
+            None
+        };
+        let gates_parent = bot
+            .declared(parent)
+            .is_some_and(|declared| declared.gate_daemon_steps);
+        let mut gates: Vec<CallGate> = Vec::new();
+        for g in bot.gates.iter().filter(|g| {
+            g.tools
+                .iter()
+                .any(|t| (plan.gated && t == tool) || (gates_parent && t == parent))
+        }) {
+            if !gates.iter().any(|kept| kept.tag == g.tag) {
+                gates.push(CallGate {
+                    tag: g.tag.clone(),
+                    expire_ms: g.expire_ms,
+                });
+            }
+        }
+        let refusal = refusal.or_else(|| {
+            (!gates.is_empty() && bot.settings.never_asks())
+                .then(|| (Error::with("approval_refused", NEVER_ASKS), true))
+        });
+        let kind = bot
+            .declared(tool)
+            .and_then(|declared| declared.kind.as_deref());
+        let facts = audit::of_call(tool, kind, plan.in_sandbox());
+        if let Some((error, denied)) = refusal {
+            let tx = self.conn.savepoint()?;
+            audit::insert(
+                &tx,
+                now_ms as i64,
+                bot.bot_id,
+                &bot.name,
+                turn,
+                call_id,
+                Some(step),
+                tool,
+                audit::Facts {
+                    place: None,
+                    ..facts
+                },
+                "nobody",
+                "denied",
+                &text,
+            )?;
+            let mut decided = json!({"call_id":id,"step_of":call_id,"name":tool,
+                "decision":"deny","approvals":[],"error":error.code,"reason":error.detail});
+            previewed(&mut decided, tool, &text);
+            if denied {
+                decided["denied"] = json!(true);
+            }
+            event(&tx, &bot.name, Some(turn), "step_decided", decided)?;
+            tx.commit()?;
+            return Ok(Stepped {
+                step: Step::Decided(json!({"call_id":id,"decision":"deny",
+                    "reason":error.detail,"error":error.code,"approvals":[]})),
+                notify: None,
+                wake: false,
+                lifted: None,
+            });
+        }
+        if !gates.is_empty() {
+            let arguments = json!({"arguments":arguments,"audit":facts.to_json()});
+            return self.gate_step(
+                &bot, turn, call_id, id, tool, arguments, gates, lifted, now_ms,
+            );
+        }
+        let tx = self.conn.savepoint()?;
+        audit::insert(
+            &tx,
+            now_ms as i64,
+            bot.bot_id,
+            &bot.name,
+            turn,
+            call_id,
+            Some(step),
+            tool,
+            facts,
+            if plan.ruled() { "rule" } else { "nobody" },
+            "unknown",
+            &text,
+        )?;
+        tx.commit()?;
+        Ok(Stepped {
+            step: Step::Decided(json!({"call_id":id,"decision":"allow","approvals":[]})),
+            notify: None,
+            wake: false,
+            lifted: None,
+        })
+    }
     /// Put a step to `gates`: its approval row, announced and listed as a
     /// gated call is, its call's time stopped while it waits. `arguments`
     /// holds the step's arguments and its facts for the audit trail, and
@@ -10724,13 +11009,11 @@ impl Database {
         ])?;
         let approval = tx.last_insert_rowid();
         tag_approval(&tx, approval, turn, &gates)?;
-        let paused = tx
-            .prepare_cached(
-                "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
-                 WHERE turn=? AND call_id=? AND paused_ms IS NULL",
-            )?
-            .execute(params![now_ms as i64, turn, call_id])?
-            == 1;
+        tx.prepare_cached(
+            "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
+             WHERE turn=? AND call_id=? AND paused_ms IS NULL",
+        )?
+        .execute(params![now_ms as i64, turn, call_id])?;
         let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
         let data = json!({"calls":[{"call_id":id,"step_of":call_id,"request":1,
             "announced_ms":now_ms,"gates":tags,"name":tool,"node":0}]});
@@ -10762,9 +11045,9 @@ impl Database {
         self.approvals += 1;
         self.steps.insert(approval, turn);
         // The call now waits on a verdict, which a message for its turn
-        // lifts: the turn hears so, live or parked, if one waits.
-        let steered =
-            paused && !lifted && bot.running_turn == Some(turn) && self.joining_steer(&bot.name)?;
+        // lifts: the turn hears so, live or parked, if one waits, its time
+        // stopped by this step or already by one that runs.
+        let steered = !lifted && bot.running_turn == Some(turn) && self.joining_steer(&bot.name)?;
         Ok(Stepped {
             step: Step::Pending {
                 approval,
@@ -12892,28 +13175,76 @@ impl Database {
             )?;
         }
         // A call a message lifted waits on past its turn, as its background
-        // command, with the steps its client asks about.
-        let lifted: Vec<i64> = tx
-            .prepare_cached(
-                "SELECT a.id FROM approvals a WHERE a.turn=?1 AND a.step_of IN
-                 (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL)",
-            )?
-            .query_map([turn], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        let unstarted = match bot.gates.is_empty() {
-            true => 0,
-            false => tx.execute(
-                "DELETE FROM approvals WHERE turn=?1 AND process IS NULL AND (step_of IS NULL
-                 OR step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL))",
-                [turn],
-            )? as i64,
+        // command, but a step of it that waited on a verdict when the message
+        // lifted it waits no longer than its turn: each is denied, as an
+        // answered call's are, and the call's time runs again, so nothing
+        // the turn asked about is decided once it is over. A call its
+        // client yielded is background work, whose steps wait on.
+        // Only a turn with a step waiting has one to end or keep: every
+        // step's approval is in `steps` while it waits.
+        let stepping = self.steps.values().any(|of| *of == turn);
+        type Lifted = (String, String, String, String, Option<String>);
+        let lifted: Vec<Lifted> = match stepping {
+            false => Vec::new(),
+            true => tx
+                .prepare_cached(
+                    "DELETE FROM approvals WHERE turn=?1 AND step_of IN
+                 (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL AND NOT yielded)
+                 RETURNING call_id,step_of,name,json_extract(arguments,'$.arguments'),
+                    json_extract(arguments,'$.audit')",
+                )?
+                .query_map([turn], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?,
         };
-        // Each step still waiting is gone with its turn: its `approve_step`
-        // is told to find so.
+        let now_ms = epoch_ms().max(0) as u64;
+        for (id, parent, name, arguments, facts) in &lifted {
+            audit_step(
+                &tx,
+                &bot,
+                turn,
+                parent,
+                id,
+                name,
+                facts.as_deref(),
+                "nobody",
+                "denied",
+                arguments,
+                now_ms,
+            )?;
+            let data = json!({"call_id":id,"step_of":parent,"name":name,"decision":"deny",
+                "reason":"its turn ended","approvals":[]});
+            event(&tx, &bot.name, Some(turn), "step_decided", data)?;
+        }
+        for parent in lifted.iter().map(|(_, parent, ..)| parent) {
+            resume_call(&tx, turn, parent, now_ms)?;
+        }
+        let background: Vec<i64> = match stepping {
+            false => Vec::new(),
+            true => tx
+                .prepare_cached(
+                    "SELECT a.id FROM approvals a WHERE a.turn=?1 AND a.step_of IN
+                     (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL)",
+                )?
+                .query_map([turn], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?,
+        };
+        let unstarted = lifted.len() as i64
+            + match bot.gates.is_empty() {
+                true => 0,
+                false => tx.execute(
+                    "DELETE FROM approvals WHERE turn=?1 AND process IS NULL AND (step_of IS NULL
+                     OR step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL))",
+                    [turn],
+                )? as i64,
+            };
+        // Each step still waiting is gone with its turn, but a yielded
+        // call's: its `approve_step` is told to find so.
         let ended: Vec<i64> = self
             .steps
             .iter()
-            .filter(|(id, of)| **of == turn && !lifted.contains(id))
+            .filter(|(id, of)| **of == turn && !background.contains(id))
             .map(|(id, _)| *id)
             .collect();
         // As `unstep` does, with the turn's savepoint open.
@@ -13661,30 +13992,28 @@ impl Database {
         // Parked on an answer: the answer, its client's yield, its
         // deadline, or a later gated call's lapse resumes it.
         if let Some((_, status, Some(call_id))) = parked {
-            let answer: Option<(String, bool, i64, bool)> = self
+            let answer: Option<(bool, i64, bool)> = self
                 .conn
                 .prepare_cached(
-                    "SELECT name,output IS NOT NULL OR yielded,expires_ms,paused_ms IS NOT NULL
+                    "SELECT output IS NOT NULL OR yielded,expires_ms,paused_ms IS NOT NULL
                      FROM answers WHERE turn=? AND call_id=?",
                 )?
                 .query_row(params![turn, call_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })
                 .optional()?;
-            let Some((tool, answered, expires_ms, paused)) = answer else {
+            let Some((answered, expires_ms, paused)) = answer else {
                 return Ok(Wake::Resume);
             };
             // A message that joins the turn lifts the call it waits on, as
-            // it lifts a `wait`, when a step of the call waits on a gate or
-            // its tool lifts: the turn resumes to take it. Any other call
-            // is answered first.
+            // it ends a `wait`, while a step of the call waits on a gate:
+            // the turn resumes to take it. A running call is answered or
+            // yielded first, never moved.
             if status == "waiting"
                 && !answered
+                && paused
+                && self.step_gated(turn, &call_id)?
                 && self.joining_steer(name)?
-                && (paused
-                    || (self.inspect(name)?)
-                        .declared(&tool)
-                        .is_some_and(|tool| tool.lift))
             {
                 return Ok(Wake::Resume);
             }
@@ -14369,8 +14698,9 @@ impl Database {
     /// background command `proc:N`, which waits on past the turn, and its
     /// call is answered with that handle, in one commit. Verdicts the worker
     /// holds for it are written with it. `None` when it is decided or
-    /// answered already, lifted already, or its time ran out: the turn takes
-    /// it as it is. With `yielded`, its client's output so far, the client
+    /// answered already, lifted already, or its time ran out, or, for a
+    /// message's lift of a client's call, no step of it waits on a gate any
+    /// more: the turn takes it as it is. With `yielded`, its client's output so far, the client
     /// yields an answered call the same way ([`Database::yield_call`]): the
     /// handle says so and carries that output, and the call waits on its
     /// answer with no deadline.
@@ -14408,10 +14738,18 @@ impl Database {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                     })
                     .optional()?;
+                // A message lifts a client's call only while a step of it
+                // waits on a gate, checked here in the lift's own commit:
+                // one whose step was let through since runs, never moved.
+                // Its client's yield lifts it whatever its steps do.
+                let liftable = |paused: bool, expires_ms: i64| -> Result<bool> {
+                    Ok(match yielded {
+                        Some(_) => paused || now_ms < expires_ms.max(0) as u64,
+                        None => paused && self.step_gated(turn, call_id)?,
+                    })
+                };
                 match answer {
-                    Some((true, expires_ms, paused))
-                        if paused || now_ms < expires_ms.max(0) as u64 =>
-                    {
+                    Some((true, expires_ms, paused)) if liftable(paused, expires_ms)? => {
                         let lapse =
                             (!paused && yielded.is_none()).then_some(expires_ms.max(0) as u64);
                         ("answer", lapse)
@@ -17508,6 +17846,14 @@ fn step_started(
     Ok(())
 }
 /// Mark a daemon step refused: ended as it was decided, its name spent.
+/// Whether a client's step naming `tool` is decided by the bot's plan for
+/// that tool ([`Database::step_planned`]): one of the daemon's tools, or
+/// one its client declared that is judged whole, not by its steps,
+/// whether or not the bot may call it now.
+fn own_step(bot: &Bot, tool: &str) -> bool {
+    crate::tools::is_daemon_tool(tool)
+        || (bot.declared.iter()).any(|declared| declared.name == tool && !declared.steps)
+}
 fn step_refused(
     tx: &Connection,
     bot: &str,
@@ -21229,6 +21575,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_made_bot_s_outputs_are_its_creator_s_whatever_it_asks() {
+        let creator = Settings {
+            outputs: Some("/home/p/cut".into()),
+            ..Settings::default()
+        };
+        for asked in [None, Some("/home/p/.agent/keys".to_owned())] {
+            let made = Settings {
+                outputs: asked,
+                ..Settings::default()
+            };
+            assert_eq!(made.under(&creator).outputs, creator.outputs);
+        }
+        let sandboxed = Settings {
+            sandbox: Some(crate::sandbox::Mode::WorkspaceWrite),
+            ..creator.clone()
+        };
+        let made = Settings {
+            outputs: Some("/etc".into()),
+            ..Settings::default()
+        };
+        assert_eq!(made.under(&sandboxed).outputs, creator.outputs);
+    }
+
+    #[test]
     fn one_bots_approvals_read_only_its_own_running_commands() {
         let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
         let plan: Vec<String> = (db
@@ -21421,6 +21791,39 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_another_makes_takes_its_creator_s_speeds_and_windows_unless_given() {
+        let table = |set: Value| serde_json::from_value::<Settings>(set).unwrap();
+        let creator = table(json!({"speeds": {"a/*": ["fast"]}, "context_windows": {"a/b": 4096}}));
+        let child = Settings::default().under(&creator);
+        assert_eq!(
+            (child.speeds, child.context_windows),
+            (creator.speeds.clone(), creator.context_windows.clone())
+        );
+        let own = table(json!({"speeds": {"a/c": []}}));
+        let child = own.clone().under(&creator);
+        assert_eq!(child.speeds, own.speeds);
+        assert_eq!(child.context_windows, creator.context_windows);
+        assert!(own.beyond(&creator).is_none());
+        // A wrong table is refused as it is read, a large one by its size.
+        for wrong in [
+            json!({"speeds": {"ab": ["fast"]}}),
+            json!({"speeds": {"a/b": ["standard"]}}),
+            json!({"context_windows": {"a/b": 1023}}),
+            json!({"context_windows": {"a b/c": 4096}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Settings>(wrong.clone()).is_err(),
+                "{wrong}"
+            );
+        }
+        let many: serde_json::Map<String, Value> = (0..1000)
+            .map(|n| (format!("provider/model-{n}"), json!(4096)))
+            .collect();
+        let large = table(json!({"context_windows": many}));
+        assert_eq!(large.validate().unwrap_err().code, "invalid_setting");
+    }
+
+    #[test]
     fn every_setting_is_named() {
         // Every field, so a new one doesn't compile until it is listed.
         let all = Settings {
@@ -21453,6 +21856,8 @@ mod tests {
             env: [("A".to_owned(), "1".to_owned())].into(),
             approval_policy: Some(ApprovalPolicy::Never),
             steps_only: Some(vec!["*".into()]),
+            speeds: serde_json::from_value(json!({"a/b": ["fast"]})).unwrap(),
+            context_windows: serde_json::from_value(json!({"a/b": 2000})).unwrap(),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()

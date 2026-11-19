@@ -1093,35 +1093,17 @@ fn watchable(path: &Path) -> Result<(), &'static str> {
     }
 }
 
-/// git about `repo` alone: a hook's `GIT_DIR` and the like would name
-/// another repository than the one launchd's fire, which has none, reads.
+/// git about `repo` alone, which an agent may have written: in a
+/// read-only sandbox with the network off, as every listing of a checkout
+/// Sonny makes (#597), so nothing its config names (an fsmonitor, a
+/// signature program, the transport a partial clone fetches a missing
+/// object with) runs as the person, at the add or at any fire.
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let mut command = std::process::Command::new("git");
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-    ] {
-        command.env_remove(key);
-    }
-    let out = command
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let out = crate::task::confined_bytes(repo, args, &[]).ok()?;
     // Only the newline git ends its answer with goes: a path may end in
     // spaces.
-    out.status.success().then(|| {
-        let text = String::from_utf8_lossy(&out.stdout);
-        text.strip_suffix('\n').unwrap_or(&text).to_owned()
-    })
+    let text = String::from_utf8_lossy(&out);
+    Some(text.strip_suffix('\n').unwrap_or(&text).to_owned())
 }
 
 /// Where a repository's HEAD was when the trigger last looked, and when.
@@ -1979,7 +1961,8 @@ fn valid_name(name: &str) -> Result<(), String> {
 /// Write the trigger's definition and ring the scheduler. A trigger of that
 /// name already there is left as it is: the same one is returned, to say
 /// so, and another is `automation_exists`, naming the first field that differs.
-pub fn install(
+#[cfg(test)]
+fn install(
     places: &Places,
     app: &Path,
     trigger: &Trigger,
@@ -1988,8 +1971,24 @@ pub fn install(
     replace: bool,
     ring: Ring,
 ) -> Result<Option<Trigger>, String> {
+    install_as(places, app, trigger, when, environment, replace, ring, None)
+}
+
+/// [`install`], replacing only the definition `reviewed` is of.
+#[allow(clippy::too_many_arguments)]
+fn install_as(
+    places: &Places,
+    app: &Path,
+    trigger: &Trigger,
+    when: &When,
+    environment: &[(&str, String)],
+    replace: bool,
+    ring: Ring,
+    reviewed: Option<&Reviewed>,
+) -> Result<Option<Trigger>, String> {
     valid_name(&trigger.name)?;
     let _lock = Lock::take(places)?;
+    as_reviewed(places, &trigger.name, reviewed)?;
     // macOS folders ignore case: `Build` would overwrite `build`'s files,
     // its definition or an ended one's last result.
     let taken = |dir: &Path, file: &str| {
@@ -2176,8 +2175,14 @@ fn forget(path: &Path) -> Result<(), String> {
 /// Remove a trigger, whatever is left of it: its definition, its last
 /// result and its queue.
 pub fn remove(places: &Places, name: &str) -> Result<(), String> {
+    remove_as(places, name, None)
+}
+
+/// [`remove`], of the definition `reviewed` is of.
+fn remove_as(places: &Places, name: &str, reviewed: Option<&Reviewed>) -> Result<(), String> {
     valid_name(name)?;
     let _lock = Lock::take(places)?;
+    as_reviewed(places, name, reviewed)?;
     match retire(places, name, false)? {
         true => Ok(()),
         false => Err(format!("automation_not_found: {name}")),
@@ -2189,9 +2194,20 @@ pub fn remove(places: &Places, name: &str) -> Result<(), String> {
 /// one is done, for the ask it left. The ask's name, which what comes of
 /// it carries.
 pub fn fire_now(places: &Places, name: &str, ring: Ring) -> Result<String, String> {
+    fire_as(places, name, ring, None)
+}
+
+/// [`fire_now`], of the definition `reviewed` is of.
+fn fire_as(
+    places: &Places,
+    name: &str,
+    ring: Ring,
+    reviewed: Option<&Reviewed>,
+) -> Result<String, String> {
     valid_name(name)?;
     let file = {
         let _lock = Lock::take(places)?;
+        as_reviewed(places, name, reviewed)?;
         if !stored(&places.job(name)) {
             return Err(format!("automation_not_found: {name}"));
         }
@@ -3338,14 +3354,17 @@ pub fn cli(args: &[String]) -> i32 {
 pub fn tool(arguments: &Value, caller: &Caller) -> Result<Value, String> {
     let places = Places::home()?;
     let named = |key: &str| arguments[key].as_str().filter(|name| !name.is_empty());
+    let reviewed = Reviewed::of(arguments);
+    let reviewed = reviewed.as_ref();
     if let Some(asked) = arguments.get("add") {
-        return add(&places, &add_args(asked));
+        return add_as(&places, &add_args(asked), true, reviewed);
     }
     if let Some(name) = named("remove") {
-        return remove(&places, name).map(|()| json!({"removed": name}));
+        return remove_as(&places, name, reviewed).map(|()| json!({"removed": name}));
     }
     if let Some(name) = named("run") {
-        return fire_now(&places, name, &ring).map(|file| fired(&places, name, &file, FIRE_WAIT));
+        return fire_as(&places, name, &ring, reviewed)
+            .map(|file| fired(&places, name, &file, FIRE_WAIT));
     }
     if let Some(name) = named("show") {
         return own(&places, name, caller).ok_or_else(|| format!("automation_not_found: {name}"));
@@ -3413,6 +3432,56 @@ fn own(places: &Places, name: &str, caller: &Caller) -> Option<Value> {
             .iter()
             .any(|key| row[key].as_i64() == Some(id));
     theirs.then_some(row)
+}
+
+/// The key of an agent's `automations` call that names the definition
+/// its parts were asked about ([`Reviewed`]); Sonny sets it, not the agent.
+pub const REVIEWED: &str = "reviewed";
+
+/// The definition of the automation `name` an agent's removal, run or
+/// replacement of it had its parts asked about: its generation, or none
+/// for one with no definition then.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Reviewed {
+    pub name: String,
+    pub generation: Option<String>,
+}
+
+impl Reviewed {
+    /// As an `automations` call's arguments carry it, or none.
+    fn of(arguments: &Value) -> Option<Reviewed> {
+        serde_json::from_value(arguments.get(REVIEWED)?.clone()).ok()
+    }
+}
+
+/// Refuse to act on the automation `name` when it is not the definition
+/// `reviewed` is of: one replaced, or added, since its parts were asked
+/// about, whose own were not. Called with the lock held, so none changes
+/// between this and the act.
+fn as_reviewed(places: &Places, name: &str, reviewed: Option<&Reviewed>) -> Result<(), String> {
+    let Some(reviewed) = reviewed.filter(|reviewed| reviewed.name == name) else {
+        return Ok(());
+    };
+    let now = read_trigger(&places.job(name))
+        .ok()
+        .map(|(t, _)| t.generation);
+    match now.is_some() && now != reviewed.generation {
+        true => Err(format!(
+            "automation_changed: {name} changed while what it does was asked about; ask again"
+        )),
+        false => Ok(()),
+    }
+}
+
+/// The automation `name` as its definition stands, and whether `caller`
+/// has a part in it ([`own`]): what an agent's removal or run of it acts
+/// on. None for one with no definition, or whose definition cannot be
+/// read.
+pub fn standing(places: &Places, name: &str, caller: &Caller) -> Option<(Trigger, bool)> {
+    valid_name(name).ok()?;
+    let (trigger, _) = read_trigger(&places.job(name)).ok()?;
+    let mine = own(places, name, caller).is_some();
+    Some((trigger, mine))
 }
 
 /// The first page, in name order, of the automations `caller` has a part
@@ -3587,6 +3656,7 @@ pub fn add_sonnys(name: &str, at: &str, gate: &str, message: &str) -> Result<Val
         &Places::home()?,
         &sonnys_args(name, at, gate, message),
         false,
+        None,
     )
 }
 
@@ -3598,12 +3668,18 @@ fn sonnys_args(name: &str, at: &str, gate: &str, message: &str) -> Vec<String> {
 }
 
 fn add(places: &Places, args: &[String]) -> Result<Value, String> {
-    add_as(places, args, true)
+    add_as(places, args, true, None)
 }
 
 /// [`add`]; `agents_gate` says whether a gate the shell's agent gives is
-/// that agent's, to run in its sandbox.
-fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, String> {
+/// that agent's, to run in its sandbox, and one it replaces is the
+/// definition `reviewed` is of.
+fn add_as(
+    places: &Places,
+    args: &[String],
+    agents_gate: bool,
+    reviewed: Option<&Reviewed>,
+) -> Result<Value, String> {
     let asked = parse_add(args, now())?;
     let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     // The shell's own agent, when it is an agent's shell.
@@ -3792,7 +3868,7 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
             .map(|(_, agent)| (AGENT_BIN, agent.clone()));
         environment.extend(kept);
     }
-    match install(
+    match install_as(
         places,
         &app,
         &trigger,
@@ -3800,6 +3876,7 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         &environment,
         asked.replace,
         &ring,
+        reviewed,
     )? {
         Some(there) => {
             // The same repository made again has another git folder, and
@@ -7459,6 +7536,46 @@ pub(crate) mod tests {
             "{cannot}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_agent_acts_only_on_the_definition_its_parts_were_asked_about() {
+        let w = World::new("reviewed");
+        let s = trigger();
+        let of = |generation: Option<&str>| Reviewed {
+            name: s.name.clone(),
+            generation: generation.map(str::to_owned),
+        };
+        let changed =
+            |refused: String| assert!(refused.starts_with("automation_changed"), "{refused}");
+        let ring = || w.fake.ring();
+        // None there when it was asked about: one added since is not it.
+        w.install(&s).unwrap();
+        changed(fire_as(&w.places, &s.name, &ring, Some(&of(None))).unwrap_err());
+        // Replaced since: neither run nor removed, nor replaced again.
+        let replacement = Trigger {
+            generation: "test-2".into(),
+            message: "Something else.".into(),
+            ..s.clone()
+        };
+        w.replace(&replacement);
+        let asked = of(Some(&s.generation));
+        changed(fire_as(&w.places, &s.name, &ring, Some(&asked)).unwrap_err());
+        changed(remove_as(&w.places, &s.name, Some(&asked)).unwrap_err());
+        let when = every("1d", clock(2026, 9, 28, 9, 7)).unwrap();
+        let app = Path::new("/A/agent-app");
+        let again = install_as(&w.places, app, &s, &when, &[], true, &ring, Some(&asked));
+        changed(again.unwrap_err());
+        assert_eq!(w.rows()[0]["message"], "Something else.");
+        // Another name's review says nothing of this one; its own does.
+        let other = Reviewed {
+            name: "other".into(),
+            generation: None,
+        };
+        fire_as(&w.places, &s.name, &ring, Some(&other)).unwrap();
+        remove_as(&w.places, &s.name, Some(&of(Some("test-2")))).unwrap();
+        assert!(!w.state(&s.name).0);
+        std::fs::remove_dir_all(&w.root).ok();
     }
 
     #[test]

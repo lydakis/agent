@@ -50,6 +50,8 @@ pub use terminal::POLL_YIELD_MS;
 const AUDIT_ROWS: usize = 50;
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
+/// The most a history tool page holds; it shrinks to fit context.
+pub const HISTORY_PAGE_BYTES: usize = 64 * 1024;
 /// Retained output per stream. Past this a stream keeps its first and last
 /// `KEPT_END` bytes and the command runs on.
 pub const ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -95,6 +97,11 @@ const INPUT_BYTES: usize = 16 * 1024;
 /// never as a step of a script; `None` for a step or a name that is none.
 pub fn direct_only(name: &str) -> Option<&'static str> {
     Tool::parse(name).and_then(Tool::direct_only)
+}
+
+/// Whether `name` is one of the daemon's own tools.
+pub fn is_daemon_tool(name: &str) -> bool {
+    Tool::parse(name).is_some()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -191,7 +198,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Past timeout_ms (default 120 s, up to a day) a command moves to the background and keeps running: the result is its proc handle, yielded=true and its last lines. With background=true only timeout_ms ends it, killed with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; once the daemon's background commands fill its process bound, starting one more kills a command of the agent holding the most: the one it started or waited on least recently, never one of its 8 most recent (a smaller bound's number). With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Past timeout_ms (default 120 s, up to a day) a command moves to the background and keeps running: the result is its proc handle, yielded=true and its last lines. With background=true only timeout_ms ends it, killed with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A message that arrives while a command runs is taken once it ends or yields. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; once the daemon's background commands fill its process bound, starting one more kills a command of the agent holding the most: the one it started or waited on least recently, never one of its 8 most recent (a smaller bound's number). With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
@@ -222,9 +229,9 @@ impl Tool {
                 "required":["input"],"additionalProperties":false}),
             ),
             Tool::History => (
-                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Or give handle alone, a message's number as run, wait and the listing give it (BOT/N), to read the turn that took that message in. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns. With query, bot may also be a pattern of * ? and [...], case-sensitive, such as * for every agent or proj.* for some: it searches every agent it matches at once, newest first; each match then names its bot and its handle. With audit instead, reads the audit trail: every agent's tool calls and their steps, or with bot one agent's, newest first, each with its time, turn, call, tool, kind, place, who approved it, access, outcome and the start of its arguments; audit's fields filter it, and next_before passed as before pages older rows.",
+                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Or give handle alone, a message's number as run, wait and the listing give it (BOT/N), to read the turn that took that message in. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns. With query, bot may also be a pattern of * ? and [...], case-sensitive, such as * for every agent or proj.* for some: it searches every agent it matches at once, newest first; each match then names its bot and its handle. With audit instead, reads the audit trail: every agent's tool calls and their steps, or with bot one agent's, newest first, each with its time, turn, call, tool, kind, place, who approved it, access, outcome and the start of its arguments; audit's fields filter it, and next_before passed as before pages older rows.",
                 json!({"type":"object","properties":{"bot":{"type":"string","minLength":1,"maxLength":128},
-                "turn":{"type":"integer","minimum":1},"handle":{"type":"string","minLength":1,"maxLength":256},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536},
+                "turn":{"type":"integer","minimum":1},"handle":{"type":"string","minLength":1,"maxLength":256},"offset":{"type":"integer","minimum":0},
                 "query":{"type":"string","minLength":1,"maxLength":256},"before":{"type":"integer","minimum":1},
                 "audit":{"type":"object","properties":{"kind":{"enum":crate::store::audit::KINDS},
                 "place":{"enum":crate::store::audit::PLACES},"approved":{"enum":crate::store::audit::APPROVERS},
@@ -255,18 +262,19 @@ impl Tool {
             // ([`Agents`]): what its shell's `agent` would send, held to
             // what the bot's own socket allows.
             Tool::SendMessage => (
-                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. delivery steer (the default) joins the bot's running turn at its next step, or starts a turn when none runs; queue waits for a turn of its own after what it has in line. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote lists the messages, one or several, whose words the daemon copies after the message in that order, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with, such as [\"shop.lead/12\",\"shop.lead/15\"]. A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
+                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. delivery steer (the default) joins the bot's running turn at its next step, or starts a turn when none runs; queue waits for a turn of its own after what it has in line. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote lists the messages, one or several, whose words the daemon copies after the message in that order, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with, such as [\"shop.lead/12\",\"shop.lead/15\"]. replaces, the handle BOT/N of a message this bot sent to the same bot, withdraws that message if it still waits in line and sends this one in its place (the result says replaced: BOT/N), or, once that message was taken in, sends this one after it (the result says taken: BOT/N, with taken_turn, the turn that took it in). A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
                 json!({"type":"object","properties":{
                 "to":{"type":"string","minLength":1,"maxLength":128},
                 "message":{"type":"string","minLength":1},
                 "delivery":{"enum":["steer","queue"]},
                 "interrupt":{"type":"boolean"},
                 "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16},
+                "replaces":{"type":"string","minLength":3,"maxLength":256},
                 "request_id":{"type":"string","minLength":1,"maxLength":128}},
                 "required":["to","message"],"additionalProperties":false}),
             ),
             Tool::ListAgents => (
-                "List bots by name: each one's status, running turn, what it waits on, workspace, model, the bot that made it (created_by), and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, the bots named as this one is up to its first dot. running=true lists only those with a turn running. approvals=true lists instead the calls of those bots waiting on a gate, each with its bot, turn, tool, the start of its arguments, and the tags it waits on. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next. Agents closed with close_agent are left out unless closed=true, which lists them too, each with closed_ms.",
+                "List bots by name: each one's status, running turn, what it waits on, workspace, model, the bot that made it (created_by), and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, the bots named as this one is up to its first dot. running=true lists only those with a turn running. approvals=true lists instead the calls of those bots waiting on a gate, each with its bot, turn, tool, the start of its arguments, the tags it waits on, and the handle of one that waits on in the background. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next. Agents closed with close_agent are left out unless closed=true, which lists them too, each with closed_ms.",
                 json!({"type":"object","properties":{
                 "name":{"type":"string","minLength":1,"maxLength":256},
                 "running":{"type":"boolean"},
@@ -283,7 +291,7 @@ impl Tool {
                 "required":["reason"],"additionalProperties":false}),
             ),
             Tool::SpawnAgent => (
-                "Start a new agent, made by this one, on work of its own: it works in this agent's folder, in its sandbox and under its approval gates, never more loosely, with this agent's tools, and the message is its first. name is the new agent's whole name, or, with no dot, a name in this agent's project, the part of this agent's name before its first dot: review from shop.lead names shop.review. It starts fresh, told the preamble every new agent is told; with agents=true, also the folder's AGENTS.md files, skills and memory; with profile, those in the role its file .agents/agents/PROFILE.md describes, in the folder or the home folder, with the role's model and tools; or with instructions, exactly that text instead, which takes neither agents nor profile. model (PROVIDER/MODEL) and effort default to this agent's, or to the profile's model. With fork=true it starts instead from a copy of this agent's conversation so far, with its instructions, tools and model, and takes no instructions, agents, profile, model or effort. A request_id sent again starts nothing new; without one, the call's own is used. Returns the new agent's name and the handle of its first message, BOT/N, which wait and history take; close it with close_agent once its work is done.",
+                "Start a new agent, made by this one, on work of its own: it works in this agent's folder, in its sandbox and under its approval gates, never more loosely, with this agent's tools, and the message is its first. name is the new agent's whole name, or, with no dot, a name in this agent's project, the part of this agent's name before its first dot: review from shop.lead names shop.review. It starts fresh, told the preamble every new agent is told; with agents=true, also the folder's AGENTS.md files, skills and memory; with profile, those in the role its file .agents/agents/PROFILE.md describes, in the folder or the home folder, with the role's model, tools and sandbox; or with instructions, exactly that text instead, which takes neither agents nor profile. model (PROVIDER/MODEL) and effort default to this agent's, or to the profile's model. With fork=true it starts instead from a copy of this agent's conversation so far, with its instructions, tools and model, and takes no instructions, agents, profile, model or effort. A request_id sent again starts nothing new; without one, the call's own is used. Returns the new agent's name and the handle of its first message, BOT/N, which wait and history take; close it with close_agent once its work is done.",
                 json!({"type":"object","properties":{
                 "name":{"type":"string","minLength":1,"maxLength":128},
                 "message":{"type":"string","minLength":1},
@@ -323,7 +331,7 @@ impl Tool {
                 "additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, a command or call that yielded, or a call a message moved to the background while it waited on its approval). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
  With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. With terminate: true, every handle, each a proc:N, is stopped first, as write_stdin with kill=true stops it, and the wait returns how each ended. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"},"terminate":{"type":"boolean"}},
@@ -386,17 +394,14 @@ pub struct Declared {
     /// wants.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gate_daemon_steps: bool,
-    /// Whether a steer lifts a call still waiting for its answer to the
-    /// background once it has waited the grace a foreground command gets,
-    /// as it lifts that command: for a tool whose calls may run long, a
-    /// script say, or wait on a person. Left out, the call is answered
-    /// first and the steer is taken at the next boundary, as Codex takes a
-    /// message once the running tool returns. A call one of whose steps
-    /// waits on a gate is lifted either way, as a gated call is. Its
-    /// client may also hand such a call back itself, with its output so
-    /// far (`yield_call`), as Codex's exec yields.
+    /// Whether its client may hand a call still waiting for its answer
+    /// back to the model, with its output so far (`yield_call`), as
+    /// Codex's exec yields: for a tool whose calls may run long, a script
+    /// say. A steer never moves a running call; it is taken once the call
+    /// is answered or yielded, as Codex takes a message once the running
+    /// tool returns.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub lift: bool,
+    pub yields: bool,
     /// What kind of tool it is, one of the audit trail's kinds, which its
     /// calls' rows there name; none when its client says nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -747,10 +752,10 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                     );
                 }
             }
-            None if tool.expire_ms.is_some() || tool.steps || tool.lift => {
+            None if tool.expire_ms.is_some() || tool.steps || tool.yields => {
                 return fail_with(
                     "invalid_declare",
-                    format!("{name}: expire_ms, steps and lift go with answered_by"),
+                    format!("{name}: expire_ms, steps and yields go with answered_by"),
                 );
             }
             None => {}
@@ -931,8 +936,8 @@ pub struct Place {
     /// `WAITING`, then `COUNTED` while it holds its place, then `LEFT`.
     state: Arc<std::sync::atomic::AtomicU8>,
     count: Arc<std::sync::atomic::AtomicUsize>,
-    /// The command's newest output, which a client may look at once a
-    /// steer moves it to the background.
+    /// The command's newest output, which a client may look at once it
+    /// yields to the background.
     peek: Peek,
 }
 const WAITING: u8 = 0;
@@ -1244,6 +1249,9 @@ pub enum Agents {
         interrupt: bool,
         /// `{"bot","message","reply"?}`, as `submit` takes them.
         quotes: Vec<serde_json::Value>,
+        /// The number of a message this bot sent `to` that this one
+        /// replaces.
+        replaces: Option<i64>,
         request_id: Option<String>,
     },
     /// Agents by name, or the calls waiting on an approval.
@@ -1361,7 +1369,6 @@ pub enum Prepared {
         /// turn that took that message in.
         handle: Option<String>,
         offset: u64,
-        limit: usize,
     },
     /// The audit trail, every agent's or `query.bot`'s. Resolved by the
     /// runtime, never by the registry.
@@ -2089,7 +2096,6 @@ impl Registry {
             handle: Option<String>,
             #[serde(default)]
             offset: u64,
-            limit: Option<usize>,
             query: Option<String>,
             before: Option<i64>,
             audit: Option<AuditArgs>,
@@ -2102,7 +2108,6 @@ impl Registry {
                     ("turn", self.turn.is_some()),
                     ("handle", self.handle.is_some()),
                     ("offset", self.offset != 0),
-                    ("limit", self.limit.is_some()),
                 ]
                 .into_iter()
                 .filter_map(|(name, given)| given.then_some(name))
@@ -2338,7 +2343,6 @@ impl Registry {
                         before: args.before,
                     });
                 }
-                let limit = args.limit.unwrap_or(64 * 1024);
                 // Only another agent's turns are listed: a bot's own are in
                 // its context, and the context note numbers those left out.
                 if args.turn.is_some_and(|turn| turn < 1)
@@ -2349,7 +2353,6 @@ impl Registry {
                         .as_ref()
                         .is_some_and(|handle| handle.len() > 256)
                     || args.before.is_some()
-                    || !(4..=64 * 1024).contains(&limit)
                 {
                     return fail("invalid_tool_arguments");
                 }
@@ -2358,7 +2361,6 @@ impl Registry {
                     turn: args.turn,
                     handle: args.handle,
                     offset: args.offset,
-                    limit,
                 }
             }
             Tool::WebSearch => {
@@ -2430,6 +2432,7 @@ impl Registry {
                     interrupt: bool,
                     #[serde(default)]
                     quote: Vec<String>,
+                    replaces: Option<String>,
                     request_id: Option<String>,
                 }
                 let args: Send = serde_json::from_str(args).map_err(invalid)?;
@@ -2449,12 +2452,40 @@ impl Registry {
                 if args.quote.len() > 16 {
                     return fail_with("invalid_tool_arguments", "at most 16 quotes");
                 }
+                // Only a message sent to the same bot; the daemon checks
+                // this bot sent it.
+                let replaces = match args.replaces.as_deref() {
+                    None => None,
+                    Some(handle) => match handle.rsplit_once('/') {
+                        Some((bot, message)) if bot == args.to => {
+                            match message.parse::<i64>().ok().filter(|m| *m > 0) {
+                                Some(message) => Some(message),
+                                None => {
+                                    return fail_with(
+                                        "invalid_tool_arguments",
+                                        format!("replaces {handle:?} is no BOT/N"),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            return fail_with(
+                                "invalid_tool_arguments",
+                                format!(
+                                    "replaces names a message sent to {}, as {}/N, not {handle:?}",
+                                    args.to, args.to
+                                ),
+                            );
+                        }
+                    },
+                };
                 Prepared::Agents(Agents::Send {
                     to: args.to,
                     message: args.message,
                     delivery,
                     interrupt: args.interrupt,
                     quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
+                    replaces,
                     request_id: args.request_id,
                 })
             }
@@ -2861,8 +2892,9 @@ impl Registry {
                 for path in patch.paths() {
                     writable(sandbox.clone(), &resolve(workspace, path), path).await?;
                 }
-                // A removal happens here, outside the sandbox: the name
-                // removed, a link too, must be one the bot may write.
+                // The name removed, a link too, must be one the bot may
+                // write: said before anything runs, as the sandbox would
+                // refuse it there.
                 for path in patch.removed() {
                     removable(sandbox.clone(), &resolve(workspace, path), path).await?;
                 }
@@ -2870,7 +2902,7 @@ impl Registry {
                     .as_ref()
                     .map_or(&[][..], |policy| &policy.unreadable);
                 let staged = patch.stage(workspace, hidden).await?;
-                // A process slot only while the sandbox's helper writes.
+                // A process slot only while the sandbox's helper runs.
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = match staged.writes() {
                     true => self.helper_slot(&sandbox, &mut slot).await?,
@@ -3253,7 +3285,7 @@ impl Registry {
         Stopper { stop, listed }
     }
 
-    /// `run`, a command a steer moved to the background, ended when its
+    /// `run`, a command that yielded to the background, ended when its
     /// agent kills it by `stopper`'s handle, as one started there is.
     pub fn until_stopped<F>(
         &self,
@@ -3448,7 +3480,7 @@ impl Registry {
         false
     }
 
-    /// `run`, a command a steer moved to the background, ended as the pull
+    /// `run`, a command that yielded to the background, ended as the pull
     /// cord is pulled, as one started there is.
     pub fn until_pulled<F>(&self, run: F) -> impl Future<Output = Result<Outcome>> + use<F>
     where
@@ -5897,12 +5929,8 @@ mod tests {
             _ => panic!("{args} was accepted"),
         };
         assert_eq!(
-            detail(r#"{"query":"x","limit":10}"#),
-            "query takes no limit"
-        );
-        assert_eq!(
-            detail(r#"{"query":"x","turn":2,"offset":5,"limit":10}"#),
-            "query takes no turn, offset or limit"
+            detail(r#"{"query":"x","turn":2,"offset":5}"#),
+            "query takes no turn or offset"
         );
         assert_eq!(detail(r#"{"query":"x","before":0}"#), "before is 1 or more");
         assert_eq!(
@@ -5914,6 +5942,45 @@ mod tests {
                 .prepare("history", r#"{"query":"x","before":3}"#)
                 .is_ok()
         );
+    }
+    #[test]
+    fn history_takes_no_limit_in_any_mode() {
+        let history = Registry::new("history").unwrap();
+        let schema = Tool::History.schema();
+        assert!(
+            schema.parameters["properties"].get("limit").is_none(),
+            "{}",
+            schema.parameters
+        );
+        assert!(
+            !schema.description.contains("limit"),
+            "{}",
+            schema.description
+        );
+        for args in [
+            r#"{"turn":1,"limit":10}"#,
+            r#"{"bot":"Bob","turn":1,"offset":4,"limit":65536}"#,
+            r#"{"handle":"Bob/3","limit":10}"#,
+            r#"{"bot":"Bob","limit":10}"#,
+            r#"{"query":"x","limit":10}"#,
+            r#"{"audit":{},"limit":10}"#,
+        ] {
+            assert!(
+                matches!(
+                    history.prepare("history", args),
+                    Err(error) if error.code == "invalid_tool_arguments"
+                ),
+                "{args} was accepted"
+            );
+        }
+        assert!(matches!(
+            history.prepare("history", r#"{"turn":1,"offset":4}"#),
+            Ok(Prepared::History {
+                turn: Some(1),
+                offset: 4,
+                ..
+            })
+        ));
     }
     #[cfg(unix)]
     #[test]

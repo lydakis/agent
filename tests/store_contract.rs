@@ -4154,7 +4154,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
             grammar: None,
             steps: false,
             gate_daemon_steps: false,
-            lift: false,
+            yields: false,
             inherit: Inherit::All,
             kind: None,
         };
@@ -5714,7 +5714,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
             "compact_keep":25,"compact_tokens":null,"post_turn_compact_percent":70,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
-            "approval_policy":null,"steps_only":null})
+            "approval_policy":null,"steps_only":null,"speeds":{},"context_windows":{}})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -5831,7 +5831,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     // The lead's own tool, which a bot it creates does not take.
@@ -5846,7 +5846,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     let declared = [react.clone()];
@@ -5956,7 +5956,7 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         kind: None,
     };
     let (lead, _) = db
@@ -6023,7 +6023,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6120,7 +6120,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6198,7 +6198,7 @@ fn a_reader_lists_waiting_calls_past_the_answers_the_writer_held_at_its_last_com
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -6287,7 +6287,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -18963,7 +18963,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -20528,7 +20528,7 @@ fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: Some("mcp".into()),
     };
@@ -20747,7 +20747,7 @@ fn a_daemon_step_cut_short_still_names_the_files_it_changes() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: Some("mcp".into()),
     };
@@ -22114,7 +22114,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         grammar: None,
         steps: false,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -22154,9 +22154,19 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             db.tool_start(turn, call, false, false).unwrap();
         }
         let now = epoch_now();
-        let (p1, _) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
-        let (p2, _) = db.lift(turn, "c2", None, None, &[], now).unwrap().unwrap();
-        let (p3, _) = db.lift(turn, "c3", None, None, &[], now).unwrap().unwrap();
+        // Each yielded by its client: no step of them waits on a gate, so
+        // a message would leave them running.
+        assert!(db.lift(turn, "c1", None, None, &[], now).unwrap().is_none());
+        let so_far = result("starting");
+        let (p1, _) = (db.lift(turn, "c1", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
+        let (p2, _) = (db.lift(turn, "c2", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
+        let (p3, _) = (db.lift(turn, "c3", None, Some(&so_far), &[], now))
+            .unwrap()
+            .unwrap();
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         (turn, p1, p2, p3)
@@ -22208,8 +22218,9 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
     let _ = std::fs::remove_file(&path);
 }
 
-/// A lifted answered call stays its client's past its turn: its time goes
-/// on the schedule when it lifts, a step its client asks for is listed for
+/// A lifted answered call stays its client's past its turn: a message lifts
+/// it only while a step of it waits on a gate, its time goes on the
+/// schedule once that step is decided, a step its client asks for is listed for
 /// its bot, a prune of its turn leaves it listed and answerable, and its
 /// answer ends its row in the audit trail.
 #[test]
@@ -22225,7 +22236,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -22266,13 +22277,10 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .unwrap();
     db.tool_start(turn, &call, false, false).unwrap();
     let now = epoch_now();
-    let (process, lapse) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
-    let Some(lapse) = lapse else {
-        panic!("a lifted call with a time of its own was not scheduled");
-    };
-    assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
-    // A step asked for while its turn still runs is listed under its
-    // call's handle too.
+    // Running, no step of it at a gate: a message leaves it alone.
+    assert!(db.lift(turn, "c1", None, None, &[], now).unwrap().is_none());
+    // A step asked for while its turn still runs waits on its gate, which
+    // a message lifts the call for, and is listed under its call's handle.
     use agent_runtime::store::Step;
     let Step::Pending { .. } = db
         .step_announce(
@@ -22291,6 +22299,9 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
     else {
         panic!("a gated step was decided at once");
     };
+    let (process, lapse) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
+    // No time while its step waits on the gate.
+    assert_eq!(lapse, None);
     let running = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
     assert_eq!(running["approvals"][0]["call_id"], "c1/0", "{running}");
     assert_eq!(
@@ -22317,6 +22328,13 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         leased: false,
     })
     .unwrap();
+    // Let through, the step leaves the gate: the call's time runs again,
+    // on the schedule.
+    db.step_check("Lead", turn, "c1/0", now, false).unwrap();
+    let Lifted::Waiting(Some(lapse)) = db.lifted_check(process, now, false).unwrap() else {
+        panic!("a lifted call with a time of its own was not scheduled");
+    };
+    assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // A step its client asks for past the turn waits for the bot's gate,
@@ -22696,7 +22714,7 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: false,
+        yields: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -23058,7 +23076,7 @@ fn schema_105_bots_that_message_with_tools_make_and_close_agents_too() {
 /// A call its client yields is lifted with its output so far, and waits on
 /// its answer with no deadline: past its tool's own time it still waits,
 /// its answer is taken, and it ends answered, the turn still reading the
-/// yield after its answer is collected. A tool not declared `lift` does not
+/// yield after its answer is collected. A tool not declared `yields` does not
 /// yield.
 #[test]
 fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
@@ -23073,13 +23091,13 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
         grammar: None,
         steps: true,
         gate_daemon_steps: false,
-        lift: true,
+        yields: true,
         inherit: Inherit::All,
         kind: None,
     };
     let quick = Declared {
         name: "note".into(),
-        lift: false,
+        yields: false,
         steps: false,
         ..exec.clone()
     };
@@ -23119,9 +23137,9 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
     }
     let now = epoch_now();
     let Err(refused) = db.yield_call("Lead", turn, "note-1", &result("so far"), now) else {
-        panic!("a call of a tool that does not lift yielded");
+        panic!("a call of a tool that does not yield yielded");
     };
-    assert_eq!(refused.code, "call_not_liftable");
+    assert_eq!(refused.code, "call_not_yieldable");
     let yielded = db
         .yield_call("Lead", turn, "exec-1", &result("built 3 of 9"), now)
         .unwrap();
@@ -23514,5 +23532,400 @@ fn glob_matches_as_the_store_does() {
             .query_row("SELECT ?2 GLOB ?1", [pattern, name], |r| r.get(0))
             .unwrap();
         assert_eq!(glob(pattern, name), stored, "{pattern} on {name}");
+    }
+}
+
+#[test]
+fn a_message_in_line_is_replaced_by_its_sender_alone_and_one_taken_in_stays() {
+    let mut db = db();
+    for bot in ["Bob", "Carol", "Dan"] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+    }
+    let sent = |db: &mut Database, bot: &str, request: &str| {
+        db.begin(
+            bot,
+            request,
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    let (bob, dan) = (sent(&mut db, "Bob", "b"), sent(&mut db, "Dan", "d"));
+    let from = |sender: &str, turn: i64, delivery| TurnOptions {
+        delivery,
+        from: Some((sender.into(), turn)),
+        ..TurnOptions::default()
+    };
+    let running = sent(&mut db, "Carol", "c");
+    let first = db
+        .begin(
+            "Carol",
+            "b1",
+            "upload as picked",
+            true,
+            &from("Bob", bob, Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // Another sender, another bot's message, and a person may not.
+    for (bot, options) in [
+        ("Carol", from("Dan", dan, Delivery::Queue)),
+        ("Carol", TurnOptions::default()),
+        ("Dan", from("Bob", bob, Delivery::Queue)),
+    ] {
+        let refused = db.replace(bot, first, "x", &options).unwrap_err();
+        assert!(
+            matches!(refused.code.as_str(), "not_permitted" | "turn_not_found"),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(db.turn_status("Carol", first).unwrap(), "queued");
+    // A send refused after the withdraw leaves the message in line.
+    let refused = db.atomic(|db| {
+        db.replace("Carol", first, "b2", &from("Bob", bob, Delivery::Queue))?;
+        db.begin(
+            "Carol",
+            "b2",
+            "reversed order",
+            true,
+            &from("Bob", bob, Delivery::Queue),
+            |_, _| agent_runtime::fail("provider_not_found"),
+        )
+    });
+    assert_eq!(refused.unwrap_err().code, "provider_not_found");
+    assert_eq!(db.turn_status("Carol", first).unwrap(), "queued");
+    // Its sender replaces it: withdrawn, kept in history, and the new one
+    // waits in its place.
+    let replaced = db
+        .replace("Carol", first, "b2", &from("Bob", bob, Delivery::Queue))
+        .unwrap();
+    assert_eq!(
+        (replaced.status.as_str(), replaced.turn),
+        ("withdrawn", None)
+    );
+    let second = db
+        .begin(
+            "Carol",
+            "b2",
+            "reversed order",
+            true,
+            &from("Bob", bob, Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(second.status, "queued");
+    assert_eq!(db.turn_status("Carol", first).unwrap(), "withdrawn");
+    // A retry of the same send withdraws nothing and answers the same.
+    let again = db
+        .replace("Carol", first, "b2", &from("Bob", bob, Delivery::Queue))
+        .unwrap();
+    assert_eq!(again.status, "withdrawn");
+    // A steer the running turn took in stays: the new one follows it.
+    let steer = db
+        .begin(
+            "Carol",
+            "b3",
+            "and the tests",
+            true,
+            &from("Bob", bob, Delivery::Steer),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.absorb(
+        running,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let taken = db
+        .replace("Carol", steer, "b4", &from("Bob", bob, Delivery::Steer))
+        .unwrap();
+    assert_eq!(
+        (taken.status.as_str(), taken.turn),
+        ("taken", Some(running))
+    );
+    assert_eq!(db.turn_status("Carol", steer).unwrap(), "taken");
+    // A bot deleted and made again under its name is another sender.
+    db.create("Eve", Some("/synthetic"), binding()).unwrap();
+    let eve = sent(&mut db, "Eve", "e");
+    let note = db
+        .begin(
+            "Carol",
+            "e1",
+            "a note",
+            true,
+            &from("Eve", eve, Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(eve, vec![assistant("done")], &[], None).unwrap();
+    db.finish(eve, None).unwrap();
+    db.delete_bot("Eve").unwrap();
+    db.create("Eve", Some("/synthetic"), binding()).unwrap();
+    let again = sent(&mut db, "Eve", "e2");
+    let refused = db
+        .replace("Carol", note, "e3", &from("Eve", again, Delivery::Queue))
+        .unwrap_err();
+    assert_eq!(refused.code, "not_permitted");
+    assert_eq!(db.turn_status("Carol", note).unwrap(), "queued");
+}
+
+static STEPPING: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| vec!["shell".into(), "send_message".into()]);
+
+/// A bot whose declared `run` takes steps, judged by an `auto` gate on
+/// `run`, `shell` and its declared `start_task`, under a workspace sandbox
+/// when `sandboxed`, with `rules`.
+fn stepping_bot(db: &mut Database, sandboxed: bool, rules: Option<agent_runtime::rules::Policy>) {
+    let run = Declared {
+        name: "run".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: Some(600_000),
+        grammar: None,
+        steps: true,
+        gate_daemon_steps: false,
+        yields: false,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    let start = Declared {
+        name: "start_task".into(),
+        steps: false,
+        ..run.clone()
+    };
+    let gate = Gate {
+        tag: "auto".into(),
+        tools: vec!["run".into(), "shell".into(), "start_task".into()],
+        expire_ms: None,
+    };
+    let mut settings = Settings {
+        rules,
+        ..Default::default()
+    };
+    if sandboxed {
+        settings.sandbox = Some(agent_runtime::sandbox::Mode::WorkspaceWrite);
+    }
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            tools: &STEPPING,
+            declared: Some(&ToolList::new(vec![run, start]).unwrap()),
+            gate: Some(&gate),
+            settings,
+            ..binding()
+        },
+    )
+    .unwrap();
+}
+
+/// A turn of `Lead` with its `run` call `c1` waiting for its answer.
+fn running_call(db: &mut Database) -> i64 {
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "run".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+        links: Default::default(),
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
+    turn
+}
+
+#[test]
+fn a_step_naming_the_bots_own_tool_is_decided_by_its_plan() {
+    use agent_runtime::store::Step;
+    let mut db = db();
+    stepping_bot(&mut db, true, None);
+    let turn = running_call(&mut db);
+    let now = epoch_now();
+    let ask = |db: &mut Database, step: &str, tool: &str, arguments: Value| {
+        db.step_announce(
+            "Lead",
+            turn,
+            "c1",
+            step,
+            tool,
+            arguments,
+            false,
+            Default::default(),
+            now,
+        )
+        .unwrap()
+        .step
+    };
+    // A command its sandbox holds runs unjudged, as the same call from the
+    // model would, though the gate names the call's own tool.
+    let Step::Decided(inside) = ask(&mut db, "1", "shell", json!({"command": "test -f done"}))
+    else {
+        panic!("a confined command waited");
+    };
+    assert_eq!(inside["decision"], "allow", "{inside}");
+    // One that leaves the sandbox waits for the gate that names shell.
+    let Step::Pending { .. } = ask(
+        &mut db,
+        "2",
+        "shell",
+        json!({"command": "make", "sandbox_permissions": "require_escalated"}),
+    ) else {
+        panic!("an escalated command was not put to its gate");
+    };
+    // A declared tool judged whole waits as its call from the model does.
+    let Step::Pending { .. } = ask(&mut db, "3", "start_task", json!({"name": "watch"})) else {
+        panic!("a start was not put to its gate");
+    };
+    // An agent tool the gate does not name runs unjudged.
+    let Step::Decided(sent) = ask(
+        &mut db,
+        "4",
+        "send_message",
+        json!({"to": "Other", "message": "hi"}),
+    ) else {
+        panic!("a message waited");
+    };
+    assert_eq!(sent["decision"], "allow", "{sent}");
+    // A tool the bot may not call is refused.
+    let refused = db.step_announce(
+        "Lead",
+        turn,
+        "c1",
+        "5",
+        "spawn_agent",
+        json!({}),
+        false,
+        Default::default(),
+        now,
+    );
+    assert_eq!(
+        refused.err().map(|e| e.code),
+        Some("tool_not_available".to_owned())
+    );
+    // The waiting ones are listed under the tool each amounts to.
+    let listed = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
+    let names: Vec<&str> = (listed["approvals"].as_array().unwrap().iter())
+        .filter_map(|call| call["name"].as_str())
+        .collect();
+    assert_eq!(names, ["shell", "start_task"], "{listed}");
+    // A name not the bot's own is judged by its call's gates, as before.
+    let Step::Pending { .. } = ask(&mut db, "6", "mcp__s__t", json!({})) else {
+        panic!("a client's own step was not put to its call's gate");
+    };
+}
+
+#[test]
+fn a_rule_refuses_a_step_naming_shell_as_it_refuses_the_command() {
+    use agent_runtime::store::Step;
+    let mut db = db();
+    let forbidden = json!({"prefix_rules": [{"pattern": ["rm"], "decision": "forbidden"}]});
+    stepping_bot(
+        &mut db,
+        true,
+        Some(serde_json::from_value(forbidden).unwrap()),
+    );
+    let turn = running_call(&mut db);
+    let Step::Decided(denied) = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "shell",
+            json!({"command": "rm -rf x"}),
+            false,
+            Default::default(),
+            epoch_now(),
+        )
+        .unwrap()
+        .step
+    else {
+        panic!("a forbidden command waited");
+    };
+    assert_eq!(denied["decision"], "deny", "{denied}");
+    assert_eq!(denied["error"], "command_forbidden", "{denied}");
+    // Its row in the audit trail says so, under shell.
+    let trail = db.audit(&Default::default()).unwrap();
+    assert_eq!(trail["rows"][0]["tool"], "shell", "{trail}");
+    assert_eq!(trail["rows"][0]["outcome"], "denied", "{trail}");
+}
+
+#[test]
+fn a_held_step_of_a_lifted_call_ends_with_its_turn() {
+    use agent_runtime::store::Step;
+    // Lifted by a message, ended by the turn or by its interruption, or
+    // yielded by its client, whose steps wait on.
+    for (yielded, error) in [(false, None), (false, Some("cancelled")), (true, None)] {
+        let mut db = db();
+        stepping_bot(&mut db, false, None);
+        let turn = running_call(&mut db);
+        let now = epoch_now();
+        let Step::Pending { .. } = db
+            .step_announce(
+                "Lead",
+                turn,
+                "c1",
+                "0",
+                "send",
+                json!({}),
+                false,
+                Default::default(),
+                now,
+            )
+            .unwrap()
+            .step
+        else {
+            panic!("a gated step was decided at once");
+        };
+        let so_far = result("so far");
+        let (process, _) = db
+            .lift(turn, "c1", None, yielded.then_some(&so_far), &[], now)
+            .unwrap()
+            .unwrap();
+        let error = error.map(agent_runtime::Error::new);
+        db.finish(turn, error.as_ref()).unwrap();
+        let listed = db.approvals(None, None, 0, None, 64).unwrap();
+        if yielded {
+            assert_eq!(
+                listed["approvals"][0]["handle"],
+                format!("proc:{process}").as_str(),
+                "{listed}"
+            );
+            continue;
+        }
+        assert_eq!(listed["approvals"], json!([]), "{listed}");
+        let events = db.events("Lead", 0, 256).unwrap();
+        let decided = (events["events"].as_array().unwrap().iter())
+            .find(|e| e["event"] == "step_decided")
+            .unwrap_or_else(|| panic!("no step_decided: {events}"));
+        assert_eq!(decided["data"]["decision"], "deny", "{decided}");
+        assert_eq!(decided["data"]["reason"], "its turn ended", "{decided}");
+        // The call waits on for its client's answer, its time running.
+        let calls = db.tool_calls("sonny", 0, 10).unwrap();
+        assert_eq!(calls["calls"][0]["call_id"], "c1", "{calls}");
     }
 }

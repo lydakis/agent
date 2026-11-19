@@ -77,7 +77,7 @@ pub struct Data {
     /// The folder a file blank's path is read from.
     pub folder: PathBuf,
     /// What `tasks()` gives: the agents as `/status` last read them.
-    pub tasks: Arc<Vec<Json>>,
+    pub tasks: Arc<Vec<Arc<Json>>>,
     /// Seconds since the epoch.
     pub now: i64,
 }
@@ -512,14 +512,14 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
     let (r, d) = (reads.clone(), data.clone());
     env.add_function("tasks", move || {
         read(&r, &|reads| reads.tasks = true);
-        d.tasks.iter().map(value).collect::<Value>()
+        d.tasks.iter().map(|task| value(task)).collect::<Value>()
     });
     let (r, d) = (reads.clone(), data.clone());
     env.add_function("task", move |name: String| -> Result<Value, Error> {
         read(&r, &|reads| reads.tasks = true);
         (d.tasks.iter())
             .find(|task| task["name"] == name.as_str())
-            .map(value)
+            .map(|task| value(task))
             .ok_or_else(|| failed(format!("no task named {name}")))
     });
     let (r, now) = (reads.clone(), data.now);
@@ -754,8 +754,8 @@ mod tests {
             sources: Arc::new(vec![]),
             folder: folder.to_owned(),
             tasks: Arc::new(vec![
-                json!({"name": "calc.add", "state": "working", "group": "working"}),
-                json!({"name": "calc.sub", "state": "failed", "group": "needs_you"}),
+                Arc::new(json!({"name": "calc.add", "state": "working", "group": "working"})),
+                Arc::new(json!({"name": "calc.sub", "state": "failed", "group": "needs_you"})),
             ]),
             now: 1_000_000,
         }

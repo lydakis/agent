@@ -330,8 +330,11 @@ The project's wins, then the config's, then `lead` and `task`. A name that
 is not a profile in the folder's or the person's `.agents/agents` (nor one
 Sonny ships) stops the lead or task from being made, with
 `profile_not_found`. The profile is read when the lead's instructions are
-composed, so a change takes at the lead's next idle point. `extends` and `skills` work
-in any profile ([CLIENT.md](../docs/CLIENT.md)); a profile that extends
+composed, so a change takes when a window next opens on the lead. `extends`, `skills` and
+`sandbox` work in any profile ([CLIENT.md](../docs/CLIENT.md)): a task or
+workflow worker started in a profile with a `sandbox` runs in it, never
+looser than its permissions row would give it, and a lead runs in its
+row's; a profile that extends
 `lead` or `task` is not offered to agents as a role to start a peer in.
 
 ### Effort for leads and tasks
@@ -848,10 +851,10 @@ has something on it, or is off the screen, no time shows.
   `sonny-config` skill. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
-  agent when it is made, `trailer` and `hold`, every agent Sonny made
-  takes within seconds of the file changing, or, at work, once its turn
-  ends. `[fallbacks]`, like `[speeds]` and `[context_windows]`, is the
-  daemon's: every agent takes it once the daemon starts again.
+  agent when it is made, `trailer`, `hold`, `[speeds]` and
+  `[context_windows]`, every agent Sonny made takes within seconds of the
+  file changing, or, at work, once its turn ends: no restart. `[fallbacks]`
+  is the daemon's: every agent takes it once the daemon starts again.
 
   ![/config: the Models group under its bold name, a model set in ink and the defaults muted](../docs/sonny/config-groups.png)
 
@@ -2325,18 +2328,27 @@ many rows as the margin draws it in, and it goes back beside the
 conversation once there is room again. The agent's plan sits over the
 notes, one plan however often it changes; each `plan` call in the
 conversation is a row of how far it had got, and where the margin cannot
-show, the newest is the whole checklist. Under the plan and above the
-notes, `Tasks · 2` lists what the agent has going: its own tasks that
-need you, failed or work, in that order, each its mark, its title and its
-name, a task's helpers counted under it (`└ 2 helpers, 1 working`), and a
-workflow it runs as a row with its strip. Idle and done ones are not
-there: `/status` has them. Sonny draws it from what `/status` reads, as it
-draws the footer's counts; it is no tool call and no note, so no agent
-writes it and nothing folds it away. With none, it is not drawn; the
-margin opens for it as it does for a plan. A click on a task, or `enter`
-with it picked, goes to it.
+show, the newest is the whole checklist.
 
-![The margin's tasks at 150, 60 and 44 columns: under the plan, above the notes, one that needs you first, a task's helpers counted under it](../docs/sonny/margin-tasks.png)
+At rest the pane has two parts. On top, Sonny's: the project's agents,
+under the head `/status` has (the project's title and a count for each
+group with any). The lead is the first row whatever its state, its name
+and state word alone; then every task that needs you, failed or works, in
+that order, each its mark, its title and its name, a task's helpers
+counted under it (`└ 2 helpers, 1 working`), and a workflow as a row with
+its strip under the agent that runs it. The list is the project's, so it
+is the same in the lead's window and in each task's: from a task, the lead
+and the other tasks are one click away. The agent the window is on is in
+bold and plain, not blue. Idle and done tasks are not there: `/status`
+has them, and opens the whole list in the same place. Under a muted rule,
+the agent's: the margin, its plan and notes. Sonny draws the list from
+what `/status` reads, as it draws the footer's counts; it is no tool call
+and no note, so no agent writes it. With no task in the list it is not
+drawn, and the pane is the margin alone; the pane opens for it as it does
+for a plan. A click on a row, or `enter` with it picked, goes to its
+agent.
+
+![The project's agents above the margin at 150, 120, 60 and 44 columns, from the lead's window and from a task's](../docs/sonny/margin-agents.png)
 
 The notes are kept by agent in
 `~/.agent/sonny/margin/`, with the newest node of the agent's history they

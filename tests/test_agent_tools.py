@@ -3,6 +3,8 @@ pause_agents, spawn_agent and close_agent, made as the calling bot."""
 import hashlib
 import json
 import os
+import shutil
+import sys
 import time
 import unittest
 
@@ -78,6 +80,50 @@ class AgentToolsTests(ModelFixture):
         self.assertEqual(client.finished(message)['data']['status'], 'completed')
         listed = {m['message']: m for m in client.request('messages', bot='shop.fix', after=0)['result']['messages']}
         self.assertEqual(listed[message]['delivery'], 'queue')
+
+    def test_a_message_still_in_line_is_replaced_and_one_taken_in_is_followed(self):
+        import threading
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = threading.Event()
+        self.model.all_streaming.set()
+        self.addCleanup(self.model.release_headers.set)
+        client = self.client(TOOLS)
+        for bot in ('shop.lead', 'web.lead', 'shop.fix'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        busy = client.request('submit', bot='shop.fix', request_id='busy', prompt='gate')['result']['message']
+        self.model.requests.get(timeout=3)
+        self.run_calls(client, 'shop.lead', 'first',
+                       ('send_message', {'to': 'shop.fix', 'message': 'upload as picked', 'delivery': 'queue'}))
+        first = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
+        self.assertEqual(first['status'], 'queued', first)
+        self.run_calls(client, 'shop.lead', 'second',
+                       ('send_message', {'to': 'shop.fix', 'message': 'reversed order',
+                                         'delivery': 'queue', 'replaces': first['handle']}))
+        second = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
+        self.assertEqual(second['replaced'], first['handle'], second)
+        old, new = (int(sent['handle'].rsplit('/', 1)[1]) for sent in (first, second))
+        self.assertEqual(client.finished(old)['data']['status'], 'withdrawn')
+        # Another agent may not replace it, nor may it name another bot's.
+        self.run_calls(client, 'web.lead', 'theirs',
+                       ('send_message', {'to': 'shop.fix', 'message': 'mine instead',
+                                         'replaces': second['handle']}),
+                       ('send_message', {'to': 'web.lead', 'message': 'elsewhere',
+                                         'replaces': second['handle']}))
+        self.assertIn('not_permitted', self.output(client, 'web.lead', 'send_message-1'))
+        self.assertIn('invalid_tool_arguments', self.output(client, 'web.lead', 'send_message-2'))
+        listed = {m['message']: m for m in client.request('messages', bot='shop.fix', after=0)['result']['messages']}
+        self.assertEqual(listed[old]['status'], 'withdrawn')
+        self.assertEqual(len(listed), 3, listed)
+        # Once taken in, it stays, and the new one follows it.
+        self.model.release_headers.set()
+        client.finished(busy)
+        self.assertEqual(client.finished(new)['data']['status'], 'completed')
+        self.run_calls(client, 'shop.lead', 'third',
+                       ('send_message', {'to': 'shop.fix', 'message': 'one more thing',
+                                         'replaces': second['handle']}))
+        third = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
+        self.assertEqual((third['taken'], third['taken_turn']), (second['handle'], new), third)
+        client.finished(int(third['handle'].rsplit('/', 1)[1]))
 
     def test_agents_are_listed_by_project_and_the_calls_waiting_on_approval(self):
         client = self.client(TOOLS)
@@ -234,6 +280,50 @@ class AgentToolsTests(ModelFixture):
         helper = client.request('inspect', bot='shop.helper')['result']
         asked = client.request('inspect', bot='shop.asked')['result']
         self.assertEqual((helper['tools'], asked['tools']), (['echo', 'spawn_agent'], ['echo']))
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_profile_starts_its_agent_in_its_sandbox_and_never_looser(self):
+        agents = self.path / '.agents' / 'agents'
+        agents.mkdir(parents=True)
+        (agents / 'reviewer.md').write_text('---\nsandbox: read-only\n---\nReview it.\n')
+        (agents / 'careful.md').write_text('---\nextends: reviewer\n---\nBe careful.\n')
+        (agents / 'loose.md').write_text('---\nsandbox: danger-full-access\n---\nDo anything.\n')
+        client = self.client(TOOLS)
+        made = client.request('create', bot='shop.lead', workspace=str(self.path),
+                              settings={'sandbox': 'workspace-write', 'network': True,
+                                        'writable': [str(self.path)]})
+        self.assertIn('result', made, made)
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'review', 'message': 'q', 'profile': 'reviewer'}),
+                       ('spawn_agent', {'name': 'careful', 'message': 'q', 'profile': 'careful'}),
+                       ('spawn_agent', {'name': 'loose', 'message': 'q', 'profile': 'loose'}),
+                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'profile': 'loose',
+                                        'settings': {'sandbox': 'workspace-write'}}))
+        # Read-only: nothing written, no network, its maker's folders gone.
+        for name in ('shop.review', 'shop.careful'):
+            settings = client.request('inspect', bot=name)['result']['settings']
+            self.assertEqual((settings['sandbox'], settings.get('network', False), settings.get('writable') or []),
+                             ('read-only', False, []), settings)
+        # Looser than its maker is refused, saying so; nothing is made.
+        refused = self.output(client, 'shop.lead', 'spawn_agent-3')
+        self.assertIn('invalid_setting', refused)
+        self.assertIn("profile loose: sandbox: the profile's danger-full-access is looser than workspace-write", refused)
+        self.assertEqual(client.request('inspect', bot='shop.loose')['error'], 'bot_not_found')
+        # The call's own sandbox stands over the profile's.
+        asked = client.request('inspect', bot='shop.asked')['result']['settings']
+        self.assertEqual(asked['sandbox'], 'workspace-write', asked)
+        # Sent again after its profile went looser: the agent it made stands,
+        # as when its folder's files change; only the message, from another
+        # turn, is another request.
+        spawn = ('spawn_agent', {'name': 'once', 'message': 'q', 'profile': 'reviewer', 'request_id': 'once'})
+        self.run_calls(client, 'shop.lead', 'first', spawn)
+        (agents / 'reviewer.md').write_text('---\nsandbox: danger-full-access\n---\nReview it.\n')
+        self.run_calls(client, 'shop.lead', 'again', spawn)
+        events = client.request('events', bot='shop.lead', after=0, limit=256)['result']['events']
+        node = [e for e in events if e['event'] == 'tool_completed'][-1]['data']['node']
+        again = node_item(client, 'shop.lead', node)['result']['output']
+        self.assertIn('from differs from the request that sent message', again)
+        self.assertEqual(client.request('inspect', bot='shop.once')['result']['settings']['sandbox'], 'read-only')
 
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)

@@ -422,6 +422,19 @@ class SocketAndCliTests(ModelFixture):
                          (queued['handle'], 'withdrawn', True))
         still = json.loads(self.agent('wait', '--store', str(self.store), '--timeout=0', slow, check=False).stdout)
         self.assertEqual(still['pending'], [slow])
+        # --replaces takes back a message still in line and sends another in
+        # its place, in one step; only one sent to the same bot.
+        queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Slow', '--detach',
+                                       '--delivery', 'queue', 'upload as picked').stdout)
+        replaced = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Slow', '--detach',
+                                         '--delivery', 'queue', '--replaces', queued['handle'],
+                                         'reversed order').stdout)
+        self.assertEqual((replaced['replaced']['handle'], replaced['replaced']['status']),
+                         (queued['handle'], 'withdrawn'))
+        elsewhere = self.agent('run', '--store', str(self.store), '--bot', 'Quick', '--detach',
+                               '--replaces', replaced['handle'], 'mine', check=False)
+        self.assertEqual(elsewhere.returncode, 2, elsewhere.stderr)
+        self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--turn', str(replaced['message']))
         # interrupt prints the turn view, as it stood when asked.
         printed = self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--pretty').stdout
         self.assertIn('\n  "handle"', printed)
@@ -1138,6 +1151,30 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(both.returncode, 2)
         again = self.agent('run', *self.again, '--profile', 'reviewer', '--bot', 'Rev', 'hello', check=False)
         self.assertEqual(again.returncode, 2)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_profile_starts_its_bot_in_its_sandbox_and_never_looser_than_its_maker(self):
+        roles = self.path / '.agents' / 'agents'
+        roles.mkdir(parents=True)
+        (roles / 'reviewer.md').write_text('---\nsandbox: read-only\n---\nReview it.\n')
+        (roles / 'loose.md').write_text('---\nsandbox: danger-full-access\n---\nDo anything.\n')
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', '--sandbox', 'workspace-write', 'hello')
+        self.agent('run', *self.common, '--profile', 'reviewer', '--new', '--created-by', 'p.lead',
+                   '--bot', 'p.rev', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        self.assertEqual(control.request('inspect', bot='p.rev')['result']['settings']['sandbox'], 'read-only')
+        # Looser than its maker: refused, never given the maker's instead.
+        loose = self.agent('run', *self.common, '--profile', 'loose', '--new', '--created-by', 'p.lead',
+                           '--bot', 'p.loose', 'hello', check=False)
+        self.assertNotEqual(loose.returncode, 0)
+        self.assertIn('invalid_setting', loose.stderr)
+        self.assertEqual(control.request('inspect', bot='p.loose')['error'], 'bot_not_found')
+        # --sandbox stands over the profile's.
+        self.agent('run', *self.common, '--profile', 'loose', '--sandbox', 'workspace-write', '--new',
+                   '--created-by', 'p.lead', '--bot', 'p.asked', 'hello')
+        self.assertEqual(control.request('inspect', bot='p.asked')['result']['settings']['sandbox'],
+                         'workspace-write')
 
     def test_a_client_makes_a_bot_for_another_while_the_prompt_stays_its_own(self):
         # As Sonny's /new starts a task for the lead in its window: the task
@@ -2348,6 +2385,30 @@ class ModelListTests(ModelFixture):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn('another one', refused.stderr)
         self.assertFalse(self.catalog.exists())
+
+    def test_the_config_s_speeds_and_windows_reach_a_bot_at_each_run(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        provider = f'provider = "fixture=responses,{self.url}"\n'
+        config.write_text(provider + '[speeds]\n"fixture/*" = ["ultrafast", "fast"]\n')
+
+        def settings():
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(self.state) + '.sock')
+                lines = s.makefile('rw')
+                lines.readline()
+                lines.write(json.dumps({'id': 1, 'op': 'inspect', 'bot': 'Bob'}) + '\n')
+                lines.flush()
+                record = next(m for m in map(json.loads, lines) if m.get('id') == 1)['result']
+                return record['settings']['speeds'], record['settings']['context_windows']
+
+        self.agent('run', *self.store, '--model', 'fixture/synthetic-model', '--new', '--bot', 'Bob', 'hello')
+        self.assertEqual(settings(), ({'fixture/*': ['fast', 'ultrafast']}, {}))
+        # Edited with the daemon up: the next run sends the file as it is
+        # now, for that turn, with no restart.
+        config.write_text(provider + '[context_windows]\n"fixture/*" = 40000\n')
+        self.agent('run', *self.store, '--bot', 'Bob', 'again')
+        self.assertEqual(settings(), ({}, {'fixture/*': 40000}))
 
     def test_a_provider_whose_key_is_not_set_does_not_stop_the_daemon(self):
         config = self.home / '.agent' / 'config.toml'

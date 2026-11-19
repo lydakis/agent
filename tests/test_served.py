@@ -494,17 +494,21 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(status, 'completed')
         self.assertIn('ran', results[-1][1])
 
-    def test_a_lifted_script_goes_on_to_its_next_steps(self):
+    def test_a_message_never_moves_a_running_script(self):
+        # As Codex takes a message once the running tool returns: the
+        # script's own result, every step of it run, then the message.
         code = ('for (let n = 0; n < 5; n++) {\n'
                 '  const r = await tools.shell({command: `sleep 0.5; echo ${n} >> steps`});\n'
                 '  if (r.isError) { text(r.content[0].text); break; }\n'
                 '}\ntext("all");')
         results, status = self.steered_script('', code=code, waits=False)
-        handle = json.loads(results[0][1])['handle']
-        later = self.daemon.request('submit', bot='calc.lead', request_id='c', prompt='collect:' + handle)['result']['message']
-        self.assertEqual(self.daemon.finished(later, 30)['data']['status'], 'completed')
-        self.assertIn('all', self.output('calc.lead', later))
+        self.assertEqual(status, 'completed')
+        [(_, said)] = results
+        self.assertNotIn('"handle"', said)
+        self.assertTrue(said.endswith('all'), said)
         self.assertEqual((self.path / 'steps').read_text(), '0\n1\n2\n3\n4\n')
+        events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
+        self.assertEqual([e for e in events if e['event'] == 'call_lifted'], [])
 
     def test_a_message_during_two_scripts_of_one_round_leaves_both_running(self):
         code = ('const r = await tools.shell({command: "sleep 2; echo CALL >> made; echo ran CALL"});\n'
@@ -532,16 +536,6 @@ class ServedToolTests(ModelFixture):
                                               after=lambda turn: self.gate(turn))
         self.assertEqual(status, 'completed')
         self.assertIn('ran', results[-1][1])
-
-    def test_a_script_a_message_lifted_outlives_its_turn(self):
-        results, status = self.steered_script('sleep 3; echo done > made; echo ran', waits=False)
-        self.assertEqual(status, 'completed')
-        handle = json.loads(results[0][1])['handle']
-        later = self.daemon.request('submit', bot='calc.lead', request_id='c', prompt='collect:' + handle)['result']['message']
-        self.assertEqual(self.daemon.finished(later, 30)['data']['status'], 'completed')
-        got = self.output('calc.lead', later)
-        self.assertIn('ran', got)
-        self.assertEqual((self.path / 'made').read_text(), 'done\n')
 
     def yielding_script(self, code):
         """A code-mode lead runs `code`, then waits on the handle its call
@@ -1114,40 +1108,57 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
                          {'automations': [], 'next_after': None})
         missing = json.loads(self.call('calc.lead', 'automations', {'show': 'watch'}))
         self.assertIn('automation_not_found', missing['detail'])
-        # Adding one acts outside its sandbox, and no one reviews it.
-        refused = json.loads(self.call('calc.lead', 'automations', {'add': {'every': '30m', 'message': 'Check.'}}))
+        # One that starts an agent is a start, which leaves its sandbox, and
+        # no one reviews it.
+        starts = {'add': {'in': '5m', 'start': {'name': 'watch', 'model': 'openai/synthetic-model'},
+                          'message': 'Check.'}}
+        refused = json.loads(self.call('calc.lead', 'automations', starts))
         self.assertEqual(refused['error'], 'escalation_refused')
         self.assertFalse((self.path / '.agent/automations/jobs').exists())
-
-    def test_an_agent_s_automation_waits_for_its_gate(self):
-        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', approve=['automations'], approver='manual',
-                            declare=[{**declared('automations'), 'steps': True}])
-        self.host()
-        # A look goes by without the gate.
-        self.assertEqual(json.loads(self.call('calc.lead', 'automations', {}))['automations'], [])
+        # One that only wakes the agent is its own state: nothing to review.
+        wakes = self.call('calc.lead', 'automations', {'add': {'every': '30m', 'message': 'Check.'}})
+        self.assertNotIn('escalation_refused', wakes)
         self.assertEqual(self.daemon.request('approvals', bot='calc.lead')['result']['approvals'], [])
-        # A run is put to it first, and refused there.
-        self.script.append(('automations', {'run': 'watch'}))
+
+    def test_an_agent_s_automation_is_judged_by_its_parts(self):
+        start = {**declared('start_task'), 'expire_ms': 2000}
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', approve=['start_task'], approver='manual',
+                            declare=[{**declared('automations'), 'steps': True}, start])
+        self.host()
+        # A look goes by without the gate, and so does a run of one that is
+        # not there, which has no parts.
+        self.assertEqual(json.loads(self.call('calc.lead', 'automations', {}))['automations'], [])
+        self.assertIn('automation_not_found', self.call('calc.lead', 'automations', {'run': 'watch'}))
+        self.assertEqual(self.daemon.request('approvals', bot='calc.lead')['result']['approvals'], [])
+        # An agent it starts is put to the gate as the start it is, and
+        # refused there.
+        starts = {'add': {'in': '5m', 'start': {'name': 'watch', 'model': 'openai/synthetic-model'},
+                          'message': 'Check.'}}
+        self.script.append(('automations', starts))
         self.model.call_script = self.script
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='run', prompt='script')['result']['message']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='start', prompt='script')['result']['message']
         deadline = time.monotonic() + 30
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')
             time.sleep(.05)
-        self.assertEqual((asked[0]['name'], asked[0]['arguments']), ('automations', {'run': 'watch'}))
+        self.assertEqual((asked[0]['name'], asked[0]['arguments']),
+                         ('start_task', {'name': 'watch', 'brief': 'Check.', 'model': 'openai/synthetic-model'}))
         self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
                             request=asked[0]['request'], decision='deny', by='test')
         self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
-        self.assertIn('automations was not approved', self.output('calc.lead', turn))
+        self.assertIn('the agent it starts (start_task) was not approved', self.output('calc.lead', turn))
+        self.assertFalse((self.path / '.agent/automations/jobs').exists())
 
     def test_an_automation_s_time_stands_still_while_its_gate_weighs_it(self):
         # Its answer is due two seconds after the call; the gate takes longer.
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', approve=['automations'], approver='manual',
-                            declare=[{**declared('automations'), 'steps': True, 'expire_ms': 2000}])
+                            instructions='Lead.', approve=['start_task'], approver='manual',
+                            declare=[{**declared('automations'), 'steps': True, 'expire_ms': 2000},
+                                     declared('start_task')])
         self.host()
-        self.script.append(('automations', {'remove': 'watch'}))
+        self.script.append(('automations', {'add': {'in': '5m', 'message': 'Check.', 'start': {
+            'name': 'watch', 'model': 'openai/synthetic-model'}}}))
         self.model.call_script = self.script
         turn = self.daemon.request('submit', bot='calc.lead', request_id='remove', prompt='script')['result']['message']
         deadline = time.monotonic() + 30
@@ -1160,7 +1171,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
         output = self.output('calc.lead', turn)
         self.assertNotIn('ran out of time', output)
-        self.assertIn('watch', output)
+        self.assertNotIn('not approved', output)
 
     @unittest.skipIf(sys.platform == 'darwin', "launchd runs Sonny's scheduler on a Mac")
     def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):

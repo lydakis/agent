@@ -25,7 +25,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
     not(feature = "heap-profile"),
     target_os = "linux",
     target_env = "musl",
-    target_arch = "x86_64"
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -118,6 +118,11 @@ fn run() -> Result<i32> {
         // A sandboxed bot's write, which the daemon runs in the sandbox.
         Some(agent_runtime::sandbox::WRITE) if args.len() == 2 => {
             agent_runtime::sandbox::write(std::path::Path::new(&args[1]))?;
+            return Ok(0);
+        }
+        // A sandboxed bot's patch, which the daemon runs in the sandbox.
+        Some(agent_runtime::sandbox::PATCH) if args.len() == 1 => {
+            agent_runtime::sandbox::patch()?;
             return Ok(0);
         }
         None => return fail_with("usage", "a command is required; use agent --help"),
@@ -405,8 +410,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut unreadable = Vec::new();
     let mut own_copies = Vec::new();
     let mut own_copy_files = Vec::new();
-    let mut windows = Vec::new();
-    let mut speeds = Vec::new();
     let mut fallbacks = Vec::new();
     let mut models = None;
     let mut provider_config = None;
@@ -442,8 +445,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 }
                 _ => return fail_with("usage", "--own-copy-file needs FILE=FIRST, FILE absolute"),
             },
-            "--context-window" => windows.push(value.as_str()),
-            "--speeds" => speeds.push(value.as_str()),
             "--fallbacks" => fallbacks.push(value.as_str()),
             "--models" => models = Some(value.into()),
             // Made whole here, so the file watched and reread on each edit is
@@ -524,8 +525,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         unreadable,
         own_copies,
         own_copy_files,
-        context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
-        speeds: std::sync::Arc::new(agent_runtime::provider::Speeds::parse(speeds)?),
         fallbacks: std::sync::Arc::new(agent_runtime::provider::Fallbacks::parse(fallbacks)?),
         models,
         provider_config,

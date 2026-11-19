@@ -11991,3 +11991,394 @@ both sides in every footprint run, and the gate passed.
 
 This change does not touch Sonny. Of the same job's Sonny rows, only the
 quiet window's CPU moved more than 15% (0.77 to 0.96 ms a second).
+
+## jemalloc in the aarch64 Linux build, compiled as Codex's
+
+The static Linux builds compile their C dependencies with Zig 0.14.0's
+clang (`zig cc -target <arch>-linux-musl`), as Codex's musl releases do,
+instead of Ubuntu's `musl-gcc`. With `musl-gcc` on the arm runner,
+jemalloc's configure found no usable atomics and v0.10.2's aarch64 build
+failed (#1192), so #1193 had kept musl's allocator there. With Zig's clang
+jemalloc builds, and aarch64 allocates with it again, with Codex's
+`narenas_ratio:0.25`.
+
+Screened as the Perf job screens (`bench/perf_gate.py`, two alternating
+rounds) but on the static musl builds, each on its own GitHub runner: main
+(d3f8309) built as its release does with `musl-gcc`, against 7e67cb3
+built with Zig. The gate passed on both: store work per turn
+did not rise.
+
+### aarch64 (ubuntu-24.04-arm): musl's allocator against jemalloc
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 47.145 | 44.753 | -5.1% |
+| admission | burst submit p99, ms | 7.246 | 7.833 | +8.1% |
+| completion | release to terminal p99, ms | 14.134 | 13.954 | -1.3% |
+| footprint | idle RSS, MiB | 11.576 | 12.883 | +11.3% |
+| footprint | per idle bot, KiB | 1.772 | 2.982 | +68.3% |
+| footprint | RSS after a turn each, MiB | 20.076 | 30.385 | +51.3% |
+| footprint | CPU per turn, ms | 1.062 | 0.939 | -11.6% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 43.75 | 37.5 | -14.3% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 10.0 | 7.5 | -25.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 6.685 | 3.75 | -43.9% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 10.44 | 7.06 | -32.4% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2212.0 | 2163.5 | -2.2% |
+| sonny | lookout note p95 at 100x10, ms | 2400.5 | 2328.0 | -3.0% |
+| sonny | quiet window CPU, ms/s | 0.575 | 0.78 | +35.7% |
+| sonny | quiet window reads, KiB/s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window RSS, MiB | 17.7 | 24.4 | +37.9% |
+| sonny | sky replay CPU per 1k lines, ms | 13.61 | 6.805 | -50.0% |
+| sonny | sky replay RSS, MiB | 51.55 | 62.85 | +21.9% |
+| lifecycle | CPU, s | 0.695 | 0.6 | -13.7% |
+| lifecycle | p95 turn, ms | 586.583 | 589.822 | +0.6% |
+| lifecycle | peak RSS, MiB | 20.406 | 24.193 | +18.6% |
+
+As on x86_64 (#1158), jemalloc spends less CPU and holds more memory:
+
+- **Faster:** CPU per turn −12%, lifecycle CPU −14%, lookout CPU −14% to
+  −44%, sky replay CPU −50%. Latency moves within the runner's noise
+  (burst submit p99 +8%, completion p99 −1%).
+- **More memory:** memory after a turn each is 20.1 → 30.4 MiB (+51%), a
+  quiet window 17.7 → 24.4 MiB (+38%), lifecycle peak +19%, idle +11%.
+  jemalloc keeps freed pages for 10 s, as #1158 measured, and George kept
+  Codex's settings knowing this (11-18).
+- **Quiet window CPU** is 0.58 → 0.78 ms a second.
+
+### x86_64 (ubuntu-24.04): the compiler alone
+
+Both sides already allocate with jemalloc here, so this row isolates the
+switch from `musl-gcc` to Zig's clang for SQLite, jemalloc, aws-lc and
+ring.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.32 | 35.171 | +2.5% |
+| admission | burst submit p99, ms | 6.329 | 6.413 | +1.3% |
+| completion | release to terminal p99, ms | 11.767 | 12.411 | +5.5% |
+| footprint | idle RSS, MiB | 14.398 | 13.895 | -3.5% |
+| footprint | per idle bot, KiB | 2.448 | 2.846 | +16.3% |
+| footprint | RSS after a turn each, MiB | 31.744 | 31.863 | +0.4% |
+| footprint | CPU per turn, ms | 0.839 | 0.849 | +1.2% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 25.0 | 25.0 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 5.625 | 5.625 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.125 | 4.065 | -1.5% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 5.75 | 5.88 | +2.3% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2090.5 | 2140.0 | +2.4% |
+| sonny | lookout note p95 at 100x10, ms | 2255.0 | 2207.0 | -2.1% |
+| sonny | quiet window CPU, ms/s | 0.585 | 0.385 | -34.2% |
+| sonny | quiet window reads, KiB/s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window RSS, MiB | 27.05 | 26.9 | -0.6% |
+| sonny | sky replay CPU per 1k lines, ms | 10.94 | 11.02 | +0.7% |
+| sonny | sky replay RSS, MiB | 61.7 | 63.95 | +3.6% |
+| lifecycle | CPU, s | 0.465 | 0.465 | +0.0% |
+| lifecycle | p95 turn, ms | 591.682 | 578.401 | -2.2% |
+| lifecycle | peak RSS, MiB | 25.432 | 25.078 | -1.4% |
+
+Every row moves within the runner's run-to-run noise. The largest, the
+quiet window's CPU, is lower (0.59 → 0.39 ms a second).
+
+## A window lists its project once and follows it (#1180)
+
+A window lists its project once, follows the project's pattern from the
+listing's cursor, and reads again by name only the agents an event moved,
+plus the running ones. Main is 6e5392f (#1161), and the change is the same
+base with #1180 on it, both built with `--workspace --bins` on the 4-CPU
+Linux container. `bench/ends.py`, with agents in projects; the high end is
+10,000 agents, 30 busy, 8 scripts, a 0.5 s pace, and N windows, then 20 s
+after the turns stop.
+
+### Low end
+
+One window, 10 agents:
+
+| Side | Window start, s | Key p50 / p99, ms | Turn p50 / p99, ms | Idle CPU, window | `bots` requests |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| main | 0.120 | 0.92 / 3.45 | 51.9 / 200.2 | 0.2% | 15 |
+| change | 0.129 | 1.15 / 2.99 | 52.0 / 63.3 | 0.2% | 6 |
+
+### High end, every window in its own project (`spread`)
+
+| Windows | Side | Key p50 / p99, ms | Daemon CPU busy / after, % | Windows CPU busy / after, % | `bots` requests |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100 | main | 1.94 / 29.3 | 57.7 / 14.8 | 36.9 / 20.0 | 3,440 |
+| 100 | change | 2.17 / 11.6 | 43.5 / 1.3 | 31.5 / 16.2 | 374 |
+| 200 | main | 2.30 / 13.2 | 76.1 / 19.4 | 60.6 / 39.6 | 6,721 |
+| 200 | change | 3.04 / 16.7 | 58.4 / 1.4 | 55.9 / 32.7 | 584 |
+
+### High end, every window in one 10,000-agent project (`one`)
+
+| Windows | Side | Key p50 / p99, ms | Daemon CPU busy / after, % | Windows CPU busy / after, % | Windows anon, GiB | `bots` requests |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 32 | main | 2.02 / 11.0 | 155.6 / 151.6 | 98.7 / 106.9 | 3.29 | 10,279 |
+| 32 | change | 3.08 / 136.9 | 88.1 / 49.2 | 225.0 / 86.9 | 3.18 | 2,113 |
+| 100 | main | 3.35 / 10.3 | 164.7 / 152.7 | 109.6 / 123.9 | 4.98 | 12,474 |
+| 100 | change | 4.36 / 76.7 | 104.1 / 111.8 | 217.2 / 236.6 | 8.19 | 4,828 |
+| 200 | main | 4.95 / 16.7 | 150.9 / 154.9 | 96.1 / 117.6 | 2.52 | 14,082 |
+| 200 | change | 5.31 / 50.6 | 119.1 / 93.6 | 139.0 / 267.2 | 8.59 | 7,718 |
+
+The daemon's share moved into the windows. With one project shared by
+every window, each count still builds every one of the 10,000 rows' status
+and the tasks listing again every 3 s, in each window. A `perf
+--call-graph dwarf` profile of one of the 32 puts 60% of its CPU in the
+count: `read_status_of` 35%, `status::tasks` 9%, dropping the old tasks
+on the window's thread 7%, `needs::scan` 6%, `resolved::read` 4%, and
+`moved_rows` 3.5%. George shipped it in 0.10.2 with this cost; a count
+that builds again only the rows that moved follows it.
+
+### Daemon screens
+
+The Perf workflow's matched screens on 5ddd887 against main (91805174):
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.340 | 0.315 | -7.4 |
+| lifecycle | p95 turn, ms | 581.3 | 590.3 | +1.6 |
+| lifecycle | peak RSS, MiB | 26.5 | 27.1 | +2.1 |
+| completion | release to terminal p99, ms | 6.33 | 6.23 | -1.6 |
+| admission | lone submit CPU, ms | 24.24 | 23.51 | -3.0 |
+| admission | burst submit p99, ms | 2.365 | 2.372 | +0.3 |
+| footprint | idle RSS, MiB | 17.5 | 17.7 | +1.0 |
+| footprint | per idle bot, KiB | 1.87 | 1.74 | -6.6 |
+| footprint | RSS after a turn each, MiB | 46.8 | 55.1 | +17.7 |
+| footprint | CPU per turn, ms | 0.592 | 0.627 | +5.9 |
+| sonny | quiet window CPU, ms/s | 0.39 | 0.195 | -50.0 |
+| sonny | quiet window requests, /s | 0.695 | 0.0 | -100.0 |
+
+None of these screens follows a pattern, so the fan-out's clone and
+encode for a pattern's live events never run in them; the gate passed.
+
+## Release 0.10.2 against 0.10.1
+
+This measures every change since 0.10.1 together: v0.10.1 (c9902ec) against
+the release tree before #1179 and #1180 (main at 882b285; #1187 and #1188
+after it change only a test and the version). Each side runs its own daemon
+with its own Sonny, since the protocol moved from 85.
+
+The benchmark is `bench/ends.py` (#1163) at the low end (10 agents, one
+window) and the high end (10,000 stored agents, 30 busy, 8 scripts, 20 s). It
+ran locally on Linux 6.18 with 4 cores, glibc release builds, so jemalloc
+(#1158, musl builds only) is not in these numbers. Base and head alternated,
+two rounds each, except the 100-window high end, which ran once.
+
+### Low end
+
+| Measure | 0.10.1 | 0.10.2 |
+| --- | ---: | ---: |
+| key p99, ms | 2.38 / 1.20 | 1.12 / 1.26 |
+| turn p50, ms | 48.1 / 48.0 | 47.9 / 48.1 |
+| turn p99, ms | 53.3 / 50.5 | 51.4 / 52.4 |
+| idle daemon RSS, MiB | 18.5 / 19.5 | 22.6 / 21.2 |
+| idle window RSS, MiB | 21.3 / 22.1 | 26.2 / 26.3 |
+| idle window CPU, % | 0.20 / 0.15 | 0.10 / 0.10 |
+| idle window wakeups, /s | 25.9 / 26.5 | 6.5 / 6.7 |
+
+- **Keys and turns hold.** Every latency row overlaps.
+- **A quiet window wakes four times less.** #1176 reads keys from an event
+  stream instead of polling.
+- **Idle memory is higher.** The window is 4 to 5 MiB higher, which #1166
+  measured as clean shared code pages. The daemon is 2 to 3 MiB higher.
+
+### High end
+
+The store's one-time migration of nested repositories
+(`approvals::nested_gone`, run from a window's start until `<store>.migrated`
+records it) is marked done before the windows open, as it is on any store a
+window has opened once. Without the mark, every window of the run inspects all
+10,000 agents one by one at once, and that dominates the run: 32 windows sent
+about 100,000 inspects in 20 s on 0.10.2 against 26,000 on 0.10.1, because
+#1163 freed the loop that had throttled them. Both versions run the same
+migration.
+
+| Measure | 0.10.1 | 0.10.2 |
+| --- | ---: | ---: |
+| 32 windows, one project: windows CPU, % | 6.49 / 6.54 | 5.00 / 5.04 |
+| windows wakeups, /s | 1,712 / 1,717 | 1,230 / 1,218 |
+| daemon CPU, % | 123.8 / 124.3 | 134.0 / 133.1 |
+| key p99, ms | 9.8 / 10.3 | 13.3 / 10.8 |
+| worst key, ms | 58.0 / 16.5 | 14.2 / 12.3 |
+| turns finished | 8,018 / 8,127 | 8,198 / 8,220 |
+| scripts finished | 705 / 740 | 985 / 1,007 |
+| 100 windows, spread: windows CPU, % | 15.8 | 12.3 |
+| daemon CPU, % | 124.6 | 132.2 |
+| key p99, ms | 9.8 | 18.5 |
+| worst key, ms | 22.8 | 26.6 |
+| turns finished | 8,129 | 8,470 |
+| scripts finished | 743 | 1,028 |
+
+- **The daemon does more in the same time.** Scripts finished rise 38 to 40%
+  and turns 1 to 4%, as step writes no longer hold the loop (#1163) and a
+  parked turn's claim no longer does either (#1177). The daemon's 8 to 10
+  more CPU points go to that extra work.
+- **Windows cost less.** Windows CPU falls 23% at 32 windows and 22% at 100.
+- **Keys.** The worst key at 32 windows is 12 to
+  14 ms against 16 to 58 ms. Key p99 at 100 windows is 18.5 ms against 9.8 ms
+  in a single round.
+
+## A steer never cuts a running call (#1203)
+
+A note for a busy lead lifted the call it was running after 250 ms, so a
+call that ended a second later came back as a `steered` handle the model
+had to `wait` on. Now the note waits for the call to end or yield on its
+own time, as Codex's does.
+
+### A busy lead fed a note every 2 s
+
+One lead runs `sleep 1` commands back to back for 60 s, as a quick exec
+sends a message or starts a task, while a note is steered into it every
+2 s; the synthetic model waits on any handle it is given. Main (4cfd195)
+against this change, release builds, one 4-CPU Linux container:
+
+| Measure | Main | Change |
+| --- | ---: | ---: |
+| notes sent / taken | 30 / 30 | 30 / 30 |
+| commands run | 60 | 60 |
+| commands cut into a `steered` handle | 13 | 0 |
+| `wait` calls | 13 | 0 |
+| model rounds | 74 | 61 |
+| note to its delivery p50, ms | 222 | 221 |
+| note to its delivery max, ms | 262 | 420 |
+
+- **13 of 30 notes cut a command,** each costing a `wait` call and a model
+  round: 21% more rounds for the same work. On a lead with a 500k-token
+  conversation each of those rounds is a full read of it.
+- **A note still arrives promptly.** The median is unchanged; the worst
+  case is now the rest of the running call, bounded by its own yield
+  (a shell command's `timeout_ms`, an exec script's 30 s `yield_time_ms`).
+
+### Daemon screens
+
+The Perf workflow's daemon screens on this change against main (4cfd195),
+two alternating rounds, same container. Store work per turn is the same on
+both (the gate counts it); nothing passes the 15% warning line:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 32.03 | 35.16 | +9.7 |
+| admission | burst submit p99, ms | 4.31 | 4.36 | +1.2 |
+| completion | release to terminal p99, ms | 10.23 | 11.13 | +8.8 |
+| footprint | idle RSS, MiB | 16.6 | 17.5 | +5.8 |
+| footprint | per idle bot, KiB | 1.91 | 1.72 | -10.2 |
+| footprint | RSS after a turn each, MiB | 33.4 | 34.6 | +3.7 |
+| footprint | CPU per turn, ms | 0.804 | 0.823 | +2.4 |
+| lifecycle | CPU, s | 0.55 | 0.55 | +0.0 |
+| lifecycle | p95 turn, ms | 606.4 | 580.8 | -4.2 |
+| lifecycle | peak RSS, MiB | 26.5 | 26.2 | -1.2 |
+
+None of these screens runs a call its client answers or a steer, so the
+paths this changes never run in them; the moves are this container's
+spread. The change only removes work on a turn's path: no lift future
+racing each foreground command, no grace timer per steer. What it adds is
+an indexed read of `approvals(turn, step_of)` when an answered call's
+clock is stopped, and one `next_lapse` read when a turn parked on an
+answer resumes for a steer.
+
+## A message replaced in line (#1200)
+
+`submit` with `replaces` withdraws a message still in line and sends the
+new one in one store step. A submit without it does no new store work: the
+same job, with one bool more.
+
+### Hot-path screens
+
+The CI Perf job (`bench/perf_gate.py`, Ubuntu 24.04 runner, 2026-11-19)
+on b3e3122 against 4cfd195, screened alternately. No bench sends
+`replaces`, so these screen the plain path; the gate's store-work count
+passed.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.575 | 0.56 | -2.6% |
+| lifecycle | p95 turn, ms | 578.238 | 577.35 | -0.2% |
+| lifecycle | peak RSS, MiB | 25.973 | 26.535 | +2.2% |
+| completion | release to terminal p99, ms | 11.664 | 11.917 | +2.2% |
+| admission | lone submit CPU, ms | 35.024 | 35.696 | +1.9% |
+| admission | burst submit p99, ms | 4.405 | 4.386 | -0.4% |
+| footprint | idle RSS, MiB | 17.428 | 17.623 | +1.1% |
+| footprint | per idle bot, KiB | 1.856 | 1.874 | +1.0% |
+| footprint | RSS after a turn each, MiB | 41.908 | 40.494 | -3.4% |
+| footprint | CPU per turn, ms | 1.032 | 1.024 | -0.8% |
+
+Every change is under the gate's 15% line.
+
+### The replacing submit
+
+A one-off store screen (release build, a file store, one group commit of
+2,000 each, three rounds, 2026-11-19): a plain queued submit took 26 to
+33 µs; a replacing one, 74 to 93 µs; a withdraw (`end_queued`, as
+`interrupt` does) then a plain submit, 74 to 81 µs. Replacing costs what
+withdrawing and sending already cost, plus one indexed read of the
+replaced message and a savepoint, within the rounds' spread.
+
+## Automations judged by their parts (#1207)
+
+A turn's end (`finish`) now denies a held step of a call a message lifted,
+which outlived its turn before. It looks for such steps, and for the steps of
+a yielded call that wait on, only when one of the turn's steps waits: every
+waiting step is in the store's in-memory list, so a turn with none (nearly
+every turn) runs neither query, where main ran the second one at every turn
+end. A client's `approve_step` naming one of the bot's own tools runs the
+same plan `run_step` does and writes one audit row; no screen sends one.
+
+The Perf workflow's matched screens on 75140fc against main (e83c185), two
+alternating rounds on one runner; the gate passed, store work per turn
+unchanged:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.330 | 0.335 | +1.5 |
+| lifecycle | p95 turn, ms | 573.7 | 574.0 | +0.1 |
+| lifecycle | peak RSS, MiB | 26.6 | 26.1 | -1.7 |
+| completion | release to terminal p99, ms | 6.49 | 6.59 | +1.5 |
+| admission | lone submit CPU, ms | 24.06 | 23.94 | -0.5 |
+| admission | burst submit p99, ms | 2.726 | 2.740 | +0.5 |
+| footprint | idle RSS, MiB | 17.5 | 17.4 | -0.5 |
+| footprint | per idle bot, KiB | 1.81 | 1.91 | +5.4 |
+| footprint | RSS after a turn each, MiB | 52.1 | 51.9 | -0.4 |
+| footprint | CPU per turn, ms | 0.679 | 0.661 | -2.5 |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 18.75 | +50.0 |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 4.37 | 4.32 | -1.3 |
+| sonny | quiet window CPU, ms/s | 0.38 | 0.57 | +50.0 |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | 0.0 |
+| sonny | sky replay CPU per 1k lines, ms | 7.75 | 7.65 | -1.4 |
+
+The two Sonny rows at +50% are one or two CPU ticks over a few seconds
+(10x1 sends 4,000 deltas to one lead, the quiet window draws nothing), in
+code this change does not touch (the lookout and the window); the gate
+warns only when the head's best run is worse than the base's worst, and it
+did not.
+
+## Speeds and context windows as bot settings (#1208)
+
+`[speeds]` and `[context_windows]` became bot settings that each turn
+reads, in place of the daemon's `--speeds` and `--context-window` flags.
+The tables are shared, not copied: a pattern table is one reference-counted
+slice, so a turn that shapes its provider for a faster speed takes the
+bot's `speeds` with a count bump, as main took the flag's table, and a
+turn at standard speed does not touch it. The window is looked up once a
+turn, as before.
+
+Main is f06b14a, and the change is the pull request's head on it, both
+release builds on the 4-CPU Linux container. The Perf workflow's four
+daemon screens ran alternately, base then head, two rounds, and
+`bench.perf_gate` compared the medians:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.40 | 43.53 | +0.3 |
+| admission | burst submit p99, ms | 5.56 | 5.24 | -5.8 |
+| completion | release to terminal p99, ms | 13.06 | 12.55 | -3.9 |
+| footprint | idle RSS, MiB | 17.64 | 17.33 | -1.7 |
+| footprint | per idle bot, KiB | 1.70 | 1.72 | +0.9 |
+| footprint | RSS after a turn each, MiB | 35.86 | 34.07 | -5.0 |
+| footprint | CPU per turn, ms | 0.97 | 0.93 | -4.1 |
+| lifecycle | CPU, s | 0.70 | 0.68 | -3.6 |
+| lifecycle | p95 turn, ms | 590.9 | 588.0 | -0.5 |
+| lifecycle | peak RSS, MiB | 27.01 | 26.72 | -1.1 |
+
+Store work per turn counted the same on both sides. Every move is inside
+the spread main shows against itself in the sections above.

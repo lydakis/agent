@@ -39,20 +39,13 @@ pub const WORKFLOW: &str = crate::workflow::NAME;
 /// calls do: a start runs the folder's setup script and a new project its
 /// lead, outside the agent's sandbox, a removal can
 /// drop work, a follow sends other bots' words to the follower's
-/// reviewer, an automation is a job that runs as the person, its `if`
-/// command outside any sandbox, a script calls MCP servers, which run
+/// reviewer, a script calls MCP servers, which run
 /// as the person too, and so do the browser and the desktop. A workflow
-/// starts agents, as a start does.
-pub const GATED: [&str; 9] = [
-    START,
-    REMOVE,
-    PROJECT,
-    FOLLOWS,
-    AUTOMATIONS,
-    EXEC,
-    BROWSER,
-    DESKTOP,
-    WORKFLOW,
+/// starts agents, as a start does. An automation is judged by its parts,
+/// each as the tool it amounts to ([`automation_parts`]), as a script's
+/// calls are, never as a whole.
+pub const GATED: [&str; 8] = [
+    START, REMOVE, PROJECT, FOLLOWS, EXEC, BROWSER, DESKTOP, WORKFLOW,
 ];
 
 /// The most of what a call printed that its result holds, under the
@@ -364,8 +357,9 @@ fn follows() -> Value {
 fn automations() -> Value {
     json!({
         "name": AUTOMATIONS,
-        // Its gate judges what `automate` puts to it: an add, a removal
-        // or a run, not a look.
+        // Its calls are judged by the steps `automate` asks for: one per
+        // part of an add, a removal or a run, under the tool it amounts
+        // to, and none for a look.
         "steps": true,
         "description": "Your automations, which wake an agent later, repeatedly, or when something \
             happens, even with Sonny closed. Each run gives the agent the message in its own conversation, \
@@ -1072,23 +1066,32 @@ struct Line {
 
 impl Line {
     /// `caller`'s, whose own folder is `here`: a lead's folder is its own,
-    /// and so is that of an agent no lead heads the line of. Read with the
-    /// daemon's CLI, as the start itself is made.
+    /// that of every agent in its line is the lead's, and an agent no lead
+    /// heads the line of has its own. Read with the daemon's CLI, as the
+    /// start itself is made: who leads goes by who made each agent, never
+    /// by its name or the folder its turn is in, so no agent passes for a
+    /// lead, whose folder's setup runs as the person.
     fn of(caller: &str, here: &Path) -> Line {
-        let mut side_of = None;
-        let (below, depth, lead) = match crate::project::is_lead(caller) {
-            true => (false, 0, None),
-            false => {
-                let record =
-                    crate::task::record_of_bot(caller).unwrap_or_else(|| json!({"name": caller}));
-                side_of = crate::side_copy(&record).map(str::to_owned);
-                let lead = crate::declared::lead_by(&record, |at| {
-                    crate::task::record_of_bot(at["created_by"].as_str()?)
-                });
-                // A lead's side chat starts its tasks as the lead does.
-                let below = !side_of.as_deref().is_some_and(crate::project::is_lead);
-                (below, record["depth"].as_u64().unwrap_or(0), lead)
-            }
+        let record = crate::task::record_of_bot(caller);
+        let lead = record.as_ref().and_then(|record| {
+            crate::declared::lead_by(record, |at| {
+                crate::task::record_of_bot(at["created_by"].as_str()?)
+            })
+        });
+        let lead_name = lead.as_ref().and_then(|lead| lead["name"].as_str());
+        let side_of = (record.as_ref())
+            .and_then(crate::side_copy)
+            .map(str::to_owned);
+        // The lead itself, or a side chat of it, which starts its tasks
+        // as the lead does.
+        let leads = lead_name.is_some()
+            && (record.as_ref().and_then(|r| r["name"].as_str()) == lead_name
+                || side_of.as_deref() == lead_name);
+        let depth = match leads {
+            true => 0,
+            false => (record.as_ref())
+                .and_then(|record| record["depth"].as_u64())
+                .unwrap_or(0),
         };
         let lead = lead.as_ref().and_then(|lead| {
             let name = lead["name"].as_str()?;
@@ -1097,15 +1100,15 @@ impl Line {
         });
         let project = project_of(lead.as_ref().map_or(caller, |(lead, _)| lead));
         let folder = match lead {
-            Some((_, folder)) if below => folder,
+            Some((_, folder)) if !leads => folder,
             _ => here.to_owned(),
         };
         Line {
-            lead: !below,
+            lead: leads,
             depth,
             folder,
             project,
-            side_of: side_of.filter(|_| below),
+            side_of: side_of.filter(|_| !leads),
         }
     }
 
@@ -1129,7 +1132,8 @@ impl Line {
             if by_id == me {
                 return true;
             }
-            if crate::project::is_lead(by) {
+            if crate::task::record_of_bot(by).is_some_and(|by| crate::project::is_lead_record(&by))
+            {
                 return false;
             }
             match crate::task::record_of_bot(by) {
@@ -1918,8 +1922,11 @@ fn looks(arguments: &Value) -> bool {
         .all(|key| arguments.get(key).is_none_or(Value::is_null))
 }
 
-/// Answer an `automations` call: one that adds, removes or runs one is a
-/// step the agent's gate judges first, as a script's calls are; a look
+/// Answer an `automations` call. An add, a removal or a run is judged by
+/// its parts, each a step of the call under the tool it amounts to,
+/// decided by the agent's daemon as that tool's call from the model would
+/// be: any step refused refuses the call, with nothing added. A part that
+/// touches only the agent itself, as waking it, is no step, and a look
 /// runs unjudged, as reads do.
 async fn automate(
     client: &Arc<Client>,
@@ -1929,11 +1936,31 @@ async fn automate(
     socket: &Path,
     place: Place,
 ) -> Answer {
-    if looks(&call["arguments"]) {
+    let bot = str_of(&call["bot"]);
+    let (parts, reviewed) = match looks(&call["arguments"]) {
+        true => (Vec::new(), None),
+        false => automation_parts(client, &bot, &call["arguments"]).await?,
+    };
+    // What it removes, runs or replaces is the definition its parts were
+    // read from, or nothing: the tool refuses one that changed since.
+    let mut call = call.clone();
+    match reviewed {
+        Some(reviewed) => call["arguments"][crate::trigger::REVIEWED] = json!(reviewed),
+        None => {
+            if let Some(arguments) = call["arguments"].as_object_mut() {
+                arguments.remove(crate::trigger::REVIEWED);
+            }
+        }
+    }
+    let call = &call;
+    if parts.is_empty() {
         return answer(client, call, me, store, socket, place).await;
     }
-    let bot = str_of(&call["bot"]);
-    unreviewed(client, &bot, &Value::Null, AUTOMATIONS).await?;
+    // An agent it starts is started as start_task starts one: refused to
+    // a confined agent no one reviews.
+    if parts.iter().any(|part| part.tool == START) {
+        unreviewed(client, &bot, &Value::Null, START).await?;
+    }
     let steps = crate::exec::Steps::new(
         client.clone(),
         bot,
@@ -1941,27 +1968,250 @@ async fn automate(
         str_of(&call["call_id"]),
     );
     let asked = std::time::Instant::now();
-    let facts = crate::exec::Facts {
-        kind: "agents",
-        place: None,
-        access: Some("write"),
-    };
-    let step = (steps
-        .ask(
-            AUTOMATIONS,
-            AUTOMATIONS,
-            call["arguments"].clone(),
-            facts,
-            true,
-        )
-        .await)
-        .map_err(|e| ("automation_refused", e))?;
-    // The daemon's clock for the call stood still while the gate weighed
+    let mut allowed = Vec::with_capacity(parts.len());
+    for part in parts {
+        let called = format!("{} ({})", part.what, part.tool);
+        let facts = crate::exec::Facts {
+            kind: part.kind,
+            place: None,
+            access: None,
+        };
+        match (steps.ask(part.tool, &called, part.arguments, facts, true)).await {
+            Ok(step) => allowed.push(step),
+            Err(refused) => {
+                // Nothing of it was added, so the parts allowed before
+                // never happened.
+                for step in allowed {
+                    steps.ran(step, true).await;
+                }
+                return Err(("automation_refused", refused));
+            }
+        }
+    }
+    // The daemon's clock for the call stood still while the gates weighed
     // it, so this one does too.
     let call = later(call, asked.elapsed());
     let answered = answer(client, &call, me, store, socket, place).await;
-    steps.ran(step, answered.is_err()).await;
+    for step in allowed {
+        steps.ran(step, answered.is_err()).await;
+    }
     answered
+}
+
+/// One part of an automation that reaches past the agent asking: the step
+/// it amounts to, under that tool's name and arguments.
+#[derive(Debug, PartialEq)]
+struct Part {
+    tool: &'static str,
+    /// What the part is, for a refusal to name.
+    what: &'static str,
+    /// Its kind in the audit trail.
+    kind: &'static str,
+    arguments: Value,
+}
+
+impl Part {
+    /// Its `if` command, run where the automation runs it: in the agent's
+    /// sandbox, or outside any for one the agent did not write.
+    fn check(command: &str, folder: Option<&Path>, outside: bool) -> Part {
+        let mut arguments = json!({"command": command});
+        if let Some(folder) = folder {
+            arguments["workdir"] = json!(folder);
+        }
+        if outside {
+            arguments["sandbox_permissions"] = json!("require_escalated");
+        }
+        Part {
+            tool: "shell",
+            what: "its if command",
+            kind: "shell",
+            arguments,
+        }
+    }
+
+    /// A message to another agent: each run's to the agent it wakes, or
+    /// each run's answer to the agent it answers.
+    fn message(to: &str, what: &'static str, message: &str) -> Part {
+        Part {
+            tool: "send_message",
+            what,
+            kind: "agents",
+            arguments: json!({"to": to, "message": message}),
+        }
+    }
+
+    /// The agent its first run starts.
+    fn start(name: &str, model: &str, effort: Option<&str>, brief: &str) -> Part {
+        let mut arguments = json!({"name": name, "brief": brief, "model": model});
+        if let Some(effort) = effort {
+            arguments["effort"] = json!(effort);
+        }
+        Part {
+            tool: START,
+            what: "the agent it starts",
+            kind: "agents",
+            arguments,
+        }
+    }
+}
+
+/// What a run's answer is said to be, to the agent it goes to.
+const ANSWERS: &str = "each run's answer";
+
+/// The parts of an `add` by the agent `me`: none for one that only wakes
+/// it, else its `if` command as a `shell` call in its own sandbox, where it
+/// runs at each fire, a message to another agent as `send_message`, and an
+/// agent it starts as `start_task`.
+fn added_parts(me: &str, add: &Value) -> Vec<Part> {
+    let text = |key: &str| add[key].as_str().filter(|value| !value.is_empty());
+    let message = text("message").unwrap_or_default();
+    let mut parts = Vec::new();
+    if let Some(command) = text("if") {
+        parts.push(Part::check(command, None, false));
+    }
+    if let Some(name) = add["start"]["name"].as_str() {
+        let model = add["start"]["model"].as_str().unwrap_or_default();
+        parts.push(Part::start(
+            name,
+            model,
+            add["start"]["effort"].as_str(),
+            message,
+        ));
+    }
+    if let Some(to) = text("agent").filter(|to| *to != me) {
+        parts.push(Part::message(to, "the agent it wakes", message));
+    }
+    if let Some(to) = text("reply_to").filter(|to| *to != me) {
+        parts.push(Part::message(to, "the agent it answers", ANSWERS));
+    }
+    parts
+}
+
+/// The parts of the automation `trigger` stands as, for a removal or run
+/// of it by `caller`, as its add would have asked them: an `if` command
+/// the caller did not write runs where its writer's do, outside the
+/// caller's sandbox. The caller is who the automation pins, by id in its
+/// store, not by name: another store sharing this HOME can have an agent
+/// of the same name.
+fn standing_parts(caller: &crate::trigger::Caller, trigger: &crate::trigger::Trigger) -> Vec<Part> {
+    use crate::trigger::{Target, Writer};
+    let ours = caller.store.as_deref() == Some(trigger.store_id.as_str());
+    let mine = |id: i64| ours && caller.id == Some(id);
+    let mut parts = Vec::new();
+    if let Some(command) = &trigger.gate {
+        let written = matches!(&trigger.gate_by, Some(Writer::Agent(_, by)) if mine(*by));
+        parts.push(Part::check(command, trigger.dir.as_deref(), !written));
+    }
+    match &trigger.target {
+        Target::Start {
+            name,
+            model,
+            effort,
+            ..
+        } => parts.push(Part::start(
+            name,
+            model,
+            effort.as_deref(),
+            &trigger.message,
+        )),
+        Target::Bot { name, id } if !mine(*id) => {
+            parts.push(Part::message(name, "the agent it wakes", &trigger.message))
+        }
+        Target::Bot { .. } => {}
+    }
+    if let Some((to, _)) = trigger.reply_to.as_ref().filter(|(_, id)| !mine(*id)) {
+        parts.push(Part::message(to, "the agent it answers", ANSWERS));
+    }
+    parts
+}
+
+/// The parts of an `automations` call by the agent `bot` that adds,
+/// removes or runs one, each once: an add's own, and when it replaces one
+/// that is not the agent's, that one's too; a removal of one that is not
+/// the agent's, its parts; a run, the parts of the one it runs. Only a
+/// removal, a run or a replacement reads the daemon, for who the agent is,
+/// and with the parts comes the definition they were read from
+/// ([`crate::trigger::Reviewed`]), which the call then acts on only as it
+/// stands: one replaced, or added, while its parts were asked about is
+/// not what was asked about.
+async fn automation_parts(
+    client: &Client,
+    bot: &str,
+    arguments: &Value,
+) -> Result<(Vec<Part>, Option<crate::trigger::Reviewed>), (&'static str, String)> {
+    let named = |key: &str| arguments[key].as_str().filter(|name| !name.is_empty());
+    let add = &arguments["add"];
+    // The name an add replaces: its own, its agent's, or, run from the
+    // agent's shell, the agent's that shell runs as.
+    let replaced = |me: &[String]| {
+        (add["name"].as_str())
+            .or(add["start"]["name"].as_str())
+            .or(add["agent"].as_str())
+            .or(me.last().map(String::as_str))
+            .unwrap_or(bot)
+            .to_owned()
+    };
+    let (mut parts, acted, run) = match (add.is_object(), named("remove"), named("run")) {
+        (true, ..) => (
+            added_parts(bot, add),
+            (add["replace"] == true).then_some(None),
+            false,
+        ),
+        (false, Some(name), _) => (Vec::new(), Some(Some(name.to_owned())), false),
+        (false, None, Some(name)) => (Vec::new(), Some(Some(name.to_owned())), true),
+        _ => (Vec::new(), None, false),
+    };
+    let mut reviewed = None;
+    if let Some(name) = acted {
+        let (me, id) = automation_caller(client, bot).await?;
+        let name = name.unwrap_or_else(|| replaced(&me));
+        let caller = crate::trigger::Caller {
+            id,
+            store: client.store().map(str::to_owned),
+        };
+        let places = crate::trigger::Places::home().map_err(|e| ("automation_refused", e))?;
+        let standing = crate::trigger::standing(&places, &name, &caller);
+        if let Some((trigger, mine)) = &standing
+            && (run || !mine)
+        {
+            parts.extend(standing_parts(&caller, trigger));
+        }
+        reviewed = Some(crate::trigger::Reviewed {
+            generation: standing.map(|(trigger, _)| trigger.generation),
+            name,
+        });
+    }
+    let mut once: Vec<Part> = Vec::with_capacity(parts.len());
+    for part in parts {
+        if !once.contains(&part) {
+            once.push(part);
+        }
+    }
+    Ok((once, reviewed))
+}
+
+/// The names the agent `bot` acts as, its own and that of the agent a side
+/// chat copies, and the id its automations know it by, as the tool's
+/// answer reads them.
+async fn automation_caller(
+    client: &Client,
+    bot: &str,
+) -> Result<(Vec<String>, Option<i64>), (&'static str, String)> {
+    let page = client
+        .request("bots", json!({"name": bot, "limit": 1}))
+        .await
+        .map_err(|e| ("caller_unknown", e.to_string()))?;
+    let record = page["bots"]
+        .get(0)
+        .filter(|record| record["name"] == bot)
+        .ok_or(("caller_unknown", format!("{bot} is gone")))?;
+    Ok(match crate::side_copy(record) {
+        Some(source) => (
+            vec![bot.to_owned(), source.to_owned()],
+            record["created_by_id"].as_i64(),
+        ),
+        None => (vec![bot.to_owned()], record["bot_id"].as_i64()),
+    })
 }
 
 /// Answer a `desktop` call in the host, with the agent's gate judging what
@@ -3336,6 +3586,225 @@ mod tests {
         for code in ["io", "storage", "store_busy", "overloaded"] {
             assert!(!wants_none(code), "{code}");
         }
+    }
+
+    /// A stand-in daemon that allows every step but those whose tool is in
+    /// `refused`, and the requests it was sent, in order.
+    async fn steps_daemon(
+        refused: &'static [&'static str],
+    ) -> (Arc<Client>, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            kept.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("approve_step") if refused.contains(&request["name"].as_str().unwrap()) => {
+                    json!({"decision": "deny", "reason": "no"})
+                }
+                Some("approve_step") => json!({"decision": "allow"}),
+                Some("bots") => json!({"bots": [{"name": "watch", "bot_id": 7}]}),
+                Some("inspect") => json!({"name": "watch", "bot_id": 7, "settings": {},
+                    "gates": [{"tag": "auto", "tools": ["start_task"]}]}),
+                Some("step_result") => json!({}),
+                _ => json!({"error": {"code": "unexpected"}}),
+            }
+        })
+        .await;
+        (client, asked)
+    }
+
+    /// The steps `asked` holds, as (tool, arguments).
+    fn steps_of(asked: &[Value]) -> Vec<(String, Value)> {
+        (asked.iter())
+            .filter(|request| request["op"] == "approve_step")
+            .map(|request| {
+                let tool = request["name"].as_str().unwrap_or_default().to_owned();
+                (tool, request["arguments"].clone())
+            })
+            .collect()
+    }
+
+    async fn add(client: &Arc<Client>, add: Value) -> Answer {
+        let call = json!({"bot": "watch", "turn": 1, "call_id": "c1", "name": AUTOMATIONS,
+            "arguments": {"add": add}});
+        let none = Path::new("/nowhere");
+        automate(client, &call, none, none, none, Place::Free).await
+    }
+
+    #[tokio::test]
+    async fn an_automation_that_only_wakes_its_agent_asks_nothing() {
+        let (client, asked) = steps_daemon(&[]).await;
+        for wakes in [
+            json!({"every": "30m", "message": "Check the build."}),
+            json!({"every": "30m", "agent": "watch", "reply_to": "watch", "message": "Check."}),
+        ] {
+            let _ = add(&client, wakes).await;
+        }
+        let asked = asked.lock().unwrap();
+        assert_eq!(steps_of(&asked), [], "{asked:?}");
+        assert!(
+            !asked.iter().any(|request| request["op"] == "inspect"),
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_part_of_an_automation_is_asked_as_the_tool_it_amounts_to() {
+        let (client, asked) = steps_daemon(&[]).await;
+        let _ = add(
+            &client,
+            json!({"every": "1h", "if": "test -f done", "agent": "shop.lead",
+                "reply_to": "shop.lead", "message": "The build is done."}),
+        )
+        .await;
+        let _ = add(
+            &client,
+            json!({"in": "5m", "start": {"name": "check", "model": "openai/gpt"},
+                "message": "Check it."}),
+        )
+        .await;
+        let asked = asked.lock().unwrap();
+        assert_eq!(
+            steps_of(&asked),
+            [
+                ("shell".to_owned(), json!({"command": "test -f done"})),
+                (
+                    "send_message".to_owned(),
+                    json!({"to": "shop.lead", "message": "The build is done."})
+                ),
+                (
+                    "send_message".to_owned(),
+                    json!({"to": "shop.lead", "message": ANSWERS})
+                ),
+                (
+                    START.to_owned(),
+                    json!({"name": "check", "brief": "Check it.", "model": "openai/gpt"})
+                ),
+            ],
+            "{asked:?}"
+        );
+        // A start is judged as start_task is: its agent's sandbox read first.
+        assert!(
+            asked.iter().any(|request| request["op"] == "inspect"),
+            "{asked:?}"
+        );
+        // Each allowed step is told how the call ended.
+        assert_eq!(
+            (asked
+                .iter()
+                .filter(|request| request["op"] == "step_result"))
+            .count(),
+            4,
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_part_refuses_the_automation() {
+        let (client, asked) = steps_daemon(&["send_message"]).await;
+        let refused = add(
+            &client,
+            json!({"every": "1h", "if": "true", "agent": "shop.lead", "message": "Go."}),
+        )
+        .await;
+        let (code, why) = refused.unwrap_err();
+        assert_eq!(code, "automation_refused");
+        assert!(
+            why.contains("the agent it wakes (send_message) was not approved: no"),
+            "{why}"
+        );
+        let asked = asked.lock().unwrap();
+        // Nothing was added: the tool never ran, and the part allowed
+        // before is told it failed.
+        assert!(
+            !asked.iter().any(|request| request["op"] == "bots"),
+            "{asked:?}"
+        );
+        let told: Vec<&Value> = (asked.iter())
+            .filter(|request| request["op"] == "step_result")
+            .collect();
+        assert_eq!(told.len(), 1, "{asked:?}");
+        assert_eq!(told[0]["failed"], true, "{told:?}");
+    }
+
+    #[test]
+    fn a_standing_automation_s_parts_are_its_add_s() {
+        use crate::trigger::{Target, Writer};
+        let mut trigger = crate::trigger::Trigger {
+            generation: "test-1".into(),
+            not_before: None,
+            name: "watch".into(),
+            target: Target::Bot {
+                name: "watch".into(),
+                id: 7,
+            },
+            when: "every 30m".into(),
+            at: None,
+            commit: None,
+            dir: None,
+            reply_to: None,
+            gate: None,
+            gate_by: None,
+            runs: None,
+            until: None,
+            turn_budget_tokens: None,
+            budget_counts: None,
+            file: None,
+            daemon: crate::trigger::Daemon {
+                store: None,
+                socket: None,
+            },
+            store_id: "00ab".into(),
+            message: "Check.".into(),
+            shadow: false,
+            live: false,
+        };
+        let caller = |store: &str, id: i64| crate::trigger::Caller {
+            id: Some(id),
+            store: Some(store.into()),
+        };
+        let watch = caller("00ab", 7);
+        assert_eq!(standing_parts(&watch, &trigger), []);
+        // Another agent's: the message to it.
+        assert_eq!(
+            standing_parts(&caller("00ab", 8), &trigger),
+            [Part::message("watch", "the agent it wakes", "Check.")]
+        );
+        // So is an agent of the same id in another store sharing this HOME.
+        assert_eq!(
+            standing_parts(&caller("00cd", 7), &trigger),
+            [Part::message("watch", "the agent it wakes", "Check.")]
+        );
+        // An if the agent wrote runs in its sandbox; anyone else's outside,
+        // the same name's in another store too.
+        trigger.gate = Some("make check".into());
+        trigger.dir = Some(PathBuf::from("/work"));
+        trigger.gate_by = Some(Writer::Agent("watch".into(), 7));
+        assert_eq!(
+            standing_parts(&watch, &trigger),
+            [Part::check("make check", Some(Path::new("/work")), false)]
+        );
+        assert_eq!(
+            standing_parts(&caller("00cd", 7), &trigger)[0].arguments["sandbox_permissions"],
+            "require_escalated"
+        );
+        trigger.gate_by = Some(Writer::Person);
+        assert_eq!(
+            standing_parts(&watch, &trigger)[0].arguments["sandbox_permissions"],
+            "require_escalated"
+        );
+        trigger.gate = None;
+        trigger.target = Target::Start {
+            name: "check".into(),
+            model: "openai/gpt".into(),
+            effort: None,
+            by: Some(("watch".into(), 7)),
+            fresh: false,
+        };
+        assert_eq!(
+            standing_parts(&watch, &trigger),
+            [Part::start("check", "openai/gpt", None, "Check.")]
+        );
     }
 
     #[tokio::test]

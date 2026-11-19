@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --replaces --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
@@ -269,7 +269,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --protect --protect-existing --protect-path --wall --unreadable --own-copy --own-copy-file --context-window --speeds --fallbacks --models --provider-config --await-owner",
+        flags: "--shell-exclude --protect --protect-existing --protect-path --wall --unreadable --own-copy --own-copy-file --fallbacks --models --provider-config --await-owner",
         settings: "",
         startup: true,
     },
@@ -399,6 +399,10 @@ fn print_flags(flags: &str) {
                 "BOT/N",
                 "Copy exactly message N, as its number shows it, after this prompt, with who wrote it; BOT/N:reply copies the reply of the turn that took it in; repeat for more",
             ),
+            "--replaces" => (
+                "BOT/N",
+                "Withdraw message N, one this sender sent to --bot, if it still waits in line, and send this prompt in its place; once it was taken in, this prompt goes after it",
+            ),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),
             "--keep-turns" => (
@@ -475,14 +479,6 @@ fn print_flags(flags: &str) {
             "--protect-path" => (
                 "PATH",
                 "Keep PATH, by its absolute path, read-only in every sandbox, and from being made when missing; repeatable",
-            ),
-            "--context-window" => (
-                "PATTERN=TOKENS",
-                "The context window of each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards), over its provider's listing; the most specific pattern wins; repeatable; clients pass [context_windows] from ~/.agent/config.toml",
-            ),
-            "--speeds" => (
-                "PATTERN=TIERS",
-                "The tiers faster than standard (fast, ultrafast, comma-separated, or none) each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards) serves, over the built-in list; a bot's speed reaches only models that serve it, others run at standard; the most specific pattern wins; repeatable; clients pass [speeds] from ~/.agent/config.toml",
             ),
             "--fallbacks" => (
                 "PATTERN=PROVIDER/MODEL",
@@ -823,8 +819,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--unreadable"
                     | "--own-copy"
                     | "--own-copy-file"
-                    | "--context-window"
-                    | "--speeds"
                     | "--fallbacks"
             )
         {

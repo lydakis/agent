@@ -409,26 +409,29 @@ class WaitTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'wait-3')['results'][handle]['stdout'], 'done')
 
-    def test_a_steer_moves_a_running_command_to_the_background(self):
+    def test_a_steer_never_moves_a_running_command(self):
+        """As Codex takes a message once the running tool returns: the
+        command's own result, then the steer, at the next model request."""
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 3; printf done')['result']['message']
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 1.5; printf done')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        sent = time.monotonic()
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
         done = client.finished(steer['message'])['data']
         self.assertEqual((done['status'], done['turn']), ('taken', turn))
-        # Moved to the background before it ended, not waited out.
-        lifted = self.tool_output(client, 'Bob', 'lift-1')
-        self.assertEqual((lifted['background'], lifted['steered']), (True, True))
-        # Running still, and counted once: as the process it is now.
-        handle = lifted['handle']
-        self.assertEqual(client.request('wait', handles=[handle], timeout_ms=0)['result']['pending'], [handle])
-        self.assertEqual(client.request('stats')['result']['running_processes'], 1)
-        # Nothing was killed: the command finished and its output arrived
-        # on the handle.
+        # Waited out, not moved to the background.
+        self.assertGreater(time.monotonic() - sent, 1.0)
+        ran = self.tool_output(client, 'Bob', 'lift-1')
+        self.assertEqual((ran['stdout'], ran['exit_code']), ('done', 0))
+        self.assertNotIn('steered', ran)
+        self.assertNotIn('background', ran)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        result = self.tool_output(client, 'Bob', 'wait-2')['results'][lifted['handle']]
-        self.assertEqual((result['stdout'], result['exit_code']), ('done', 0))
+        took = [r for r in self.model_inputs() if any(i.get('role') == 'user' and i['content'][0]['text'] == 'steer:look'
+                                                       for i in r['input'])][0]
+        tail = [i for i in took['input'] if i.get('call_id') == 'lift-1' or i.get('role') == 'user'][-2:]
+        self.assertEqual(tail[0]['type'], 'function_call_output')
+        self.assertEqual(tail[1]['content'][0]['text'], 'steer:look')
 
     def test_commands_in_one_response_run_together_and_record_in_order(self):
         client = self.client('echo,shell,wait')
@@ -452,7 +455,20 @@ class WaitTests(ModelFixture):
         for n, call in enumerate(ids, 1):
             self.assertEqual(self.tool_output(client, 'Bob', call)['stdout'], str(n))
 
-    def test_a_steer_moves_every_running_command_to_the_background(self):
+    def test_a_steered_command_still_yields_on_its_own_time(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftyield:sleep 2; printf done')['result']['message']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        yielded = self.tool_output(client, 'Bob', 'lift-1')
+        self.assertEqual((yielded['background'], yielded['yielded']), (True, True))
+        self.assertNotIn('steered', yielded)
+        result = self.tool_output(client, 'Bob', 'wait-2')['results'][yielded['handle']]
+        self.assertEqual((result['stdout'], result['exit_code']), ('done', 0))
+
+    def test_a_steer_never_moves_commands_running_together(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='p',
@@ -460,15 +476,13 @@ class WaitTests(ModelFixture):
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
                        and m['data']['call_id'] == 'para-3')
         time.sleep(.2)
-        sent = time.monotonic()
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
         done = client.finished(steer['message'])['data']
         self.assertEqual((done['status'], done['turn']), ('taken', turn))
-        self.assertLess(time.monotonic() - sent, 1.0)
-        for call in ('para-1', 'para-2'):
-            lifted = self.tool_output(client, 'Bob', call)
-            self.assertEqual((lifted['background'], lifted['steered']), (True, True))
-        self.assertEqual(self.tool_output(client, 'Bob', 'para-3')['stdout'], 'c')
+        for call, said in (('para-1', 'a'), ('para-2', 'b'), ('para-3', 'c')):
+            ran = self.tool_output(client, 'Bob', call)
+            self.assertEqual(ran['stdout'], said)
+            self.assertNotIn('steered', ran)
 
     def test_a_command_that_ends_soon_after_a_steer_returns_as_usual(self):
         client = self.client('echo,shell,wait')
@@ -480,21 +494,21 @@ class WaitTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'quick')
 
-    def test_a_steer_for_another_folder_moves_the_command_to_the_background_too(self):
+    def test_a_steer_for_another_folder_waits_for_the_command_too(self):
         other = self.path / 'other'
         other.mkdir()
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 3; printf done')['result']['message']
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 1; printf done')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look',
                                workspace=str(other), delivery='steer')['result']['message']
-        # It joins the turn as any steer does, so the command goes on in
-        # the background rather than being waited out.
+        # It joins the turn as any steer does, once the command ends.
         done = client.finished(steer)['data']
         self.assertEqual((done['status'], done['turn']), ('taken', turn))
-        lifted = self.tool_output(client, 'Bob', 'lift-1')
-        self.assertEqual((lifted['background'], lifted['steered']), (True, True))
+        ran = self.tool_output(client, 'Bob', 'lift-1')
+        self.assertEqual(ran['stdout'], 'done')
+        self.assertNotIn('steered', ran)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_a_steer_leaves_a_command_waiting_for_a_slot_in_line(self):

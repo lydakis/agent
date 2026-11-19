@@ -17,6 +17,16 @@ pub fn folders(config: &crate::config::Config) -> Vec<PathBuf> {
         .collect()
 }
 
+/// [`folders`] for the person's config as it reads now, each by its real
+/// path, as the daemon knows them; with a config that doesn't read, the
+/// ones always kept.
+pub fn known() -> Vec<PathBuf> {
+    let config = crate::config::load().unwrap_or_default();
+    (folders(&config).into_iter())
+        .map(|folder| std::fs::canonicalize(&folder).unwrap_or(folder))
+        .collect()
+}
+
 /// Whether the file open as `file` is, or is in, one of `hidden`, known by
 /// their real paths. The file opened is judged, not the path it was opened
 /// by, so no link, swapped or not, reaches one; a file whose place the

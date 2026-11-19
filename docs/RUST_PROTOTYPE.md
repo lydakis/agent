@@ -239,8 +239,7 @@ every command that ended before schema 77). A bot that takes no work when
 its commands end (being deleted, out of budget, past the pending bounds) is
 told at its next turn's end. Commands lost to a restart are told the same way
 once the daemon is back, and so are those the pull cord ended, after the pause
-lifts. Unlike a client's message, the steer moves no running command to the
-background and wakes no parked wait: a running turn hears at its end, and a
+lifts. Unlike a client's message, the steer wakes no parked wait: a running turn hears at its end, and a
 wait takes its result earlier. A bot whose client collects results itself sets
 `quiet_background` and is never told. A note waiting to run keeps the commands
 it tells of from retention until it has run, and is not held to the bounds on
@@ -529,6 +528,20 @@ line records `message_ended` (`status` `withdrawn` or `failed`, with the
 error), and one taken into a running turn the `steered` event on that
 turn; `queued`, `attached` and `held` name the message (`turn` null).
 
+Protocol 91 lets `submit` take `replaces`, the number of a message of the
+same bot from the same sender (the same `from` bot or `origin`, and
+`person`; anyone else's is `not_permitted`, a number the bot has not
+`turn_not_found`). Still in line (`queued`, `ready` or `attached`), it is
+withdrawn, as `interrupt` withdraws it and kept in history so, in the same
+store step that sends the new message: no turn takes it in between, and a
+send refused there leaves it in line. Taken in or ended already, it stays
+as it is and the new message goes as any other. The answer adds
+`replaced: {message, handle, status, turn}`, `status` being `withdrawn`,
+`taken` with the `turn` that took it in, or `failed`; a retry withdraws
+nothing and answers what became of it. An agent's `send_message` takes it
+as `replaces: BOT/N` and answers `replaced: BOT/N`, or `taken: BOT/N` with
+`taken_turn`; the CLI's `run --replaces BOT/N` sends it.
+
 Protocol 87 gives `messages` and `follow` one selector, the shape `bots`
 and `audit` already take, as Kubernetes lists and watches by one selector
 and Gmail lists one query across every thread. `bot` is a name, or a GLOB
@@ -690,7 +703,9 @@ when it sets either.
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock holds input plus this bound against quota from a call's start, on both endpoints (the model's maximum when it is unset), so a bound near real output buys throughput there. | none |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
-| `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), or the person's `serve --speeds`, announced in `ready` (see [providers](#providers-and-models)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). Each list claims only what its endpoint, region and sign-in are documented to serve. OpenAI's API on a key serves `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; the ChatGPT sign-in serves what Codex's bundled catalog lists for it, `fast` on those models and no `ultrafast`. Bedrock serves those two `ultrafast` alone, through their `us.` and `global.` profiles in any region, and under their bare `openai.` ids on Mantle in us-east-1 only (Codex's Bedrock catalogs, and Bedrock's model cards). Each call's `usage` event says the tier that served it. A call the provider refuses for its tier (a 400 that names the field or the value sent) fails as `provider_speed_refused`, its detail and facts naming the provider, model, region (Bedrock's, else null) and speed; it is never retried at standard nor run there in its place. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
+| `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), announced in `ready`, or the bot's `speeds` (see [providers](#providers-and-models)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). Each list claims only what its endpoint, region and sign-in are documented to serve. OpenAI's API on a key serves `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; the ChatGPT sign-in serves what Codex's bundled catalog lists for it, `fast` on those models and no `ultrafast`. Bedrock serves those two `ultrafast` alone, through their `us.` and `global.` profiles in any region, and under their bare `openai.` ids on Mantle in us-east-1 only (Codex's Bedrock catalogs, and Bedrock's model cards). Each call's `usage` event says the tier that served it. A call the provider refuses for its tier (a 400 that names the field or the value sent) fails as `provider_speed_refused`, its detail and facts naming the provider, model, region (Bedrock's, else null) and speed; it is never retried at standard nor run there in its place. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
+| `speeds` | The tiers faster than standard each model serves, `{"PROVIDER/MODEL": ["fast", "ultrafast"]}` with `*` and `?` wildcards in the pattern, `[]` for standard only, over the daemon's list: for a model the list does not name, or to take a tier from one it does. The most specific pattern wins (an exact path over any wildcard, then the most characters that are not wildcards, then the first by name). Clients send the person's `[speeds]` from `~/.agent/config.toml` with each bot and again as they change; each turn reads them as it starts, so a change needs no restart. A bot made by another takes its creator's unless its client sends its own. At most 16 KiB as JSON. | none |
+| `context_windows` | The context window in tokens of each model, `{"PROVIDER/MODEL": TOKENS}` patterned and ranked as `speeds`, at least 1024, over its provider's listing, so one can be set lower on purpose: the window its compaction thresholds count from. Clients send the person's `[context_windows]` as `speeds`; each turn reads them as it starts. At most 16 KiB as JSON. | none |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. Off, or in `read-only`, the bot is neither offered nor runs `web_fetch` or `web_search` (see [sandbox](#sandbox)). | off |
@@ -1031,7 +1046,7 @@ is a bot's choice because a fallback answers with a model the caller did not
 pick and bills at that model's rate. A bot that names none takes the
 daemon's: `serve --fallbacks PATTERN=PROVIDER/MODEL`, repeatable, by the
 turn's `PROVIDER/MODEL` path with `*` and `?` wildcards, the most specific
-pattern winning, as `--speeds` reads them, announced in `ready` as
+pattern winning, as a bot's `speeds` reads them, announced in `ready` as
 `fallbacks`. Clients pass the person's `[fallbacks]` from
 `~/.agent/config.toml`, so an entry reaches every bot, also one made before
 it, once the daemon starts again; neither the CLI nor Sonny copies one into a
@@ -1689,6 +1704,26 @@ brought each event, as an Ethereum subscription's notifications name their
 subscription. A window whose project is its agent alone hears its own
 follow. A window that loses the daemon, or whose follow says `pruned`,
 lists again.
+Protocol 93 decides an `approve_step` step that names one of the bot's own
+tools, other than its call's (one of the daemon's, or one its client declared
+that is judged whole rather than by steps), as the same call from the model
+would be, by the planner `run_step` shares: the bot's rules
+(`command_forbidden`, `command_needs_approval`), `approval_policy`, its
+sandbox and the way out of it (`escalation_refused`), and the gates that name
+that tool, not the gates of the call's tool (unless that tool sets
+`gate_daemon_steps`). A tool the bot may not call is `tool_not_available`.
+Nothing runs: the daemon records the step in the audit trail with its own
+facts, and its client does what was allowed, telling how it ended with
+`step_result`. A name that is not the bot's own, such as a script's MCP tool,
+is judged as before. A client judges a call whose parts amount to other tools
+this way, each part as its tool: Sonny's `automations` asks for an `if` as
+`shell` in the agent's sandbox, another agent as `send_message`, and an agent
+it starts as `start_task`. A step that waits on a verdict for a call a message
+lifted no longer outlives its turn: when the turn ends, interrupted or not, the
+step is denied (`step_decided`, `its turn ended`), its call's time runs again,
+and its client's `approve_step` is told; a call its client yielded is background
+work, whose steps wait on, listed under its handle. `list_agents` with
+`approvals` names that handle.
 Protocol version 14 adds `configure`, which changes what a bot's client
 chose for it when it was made: its `instructions` (up to 64 KiB, as on
 `create`), and its `model` with an optional `effort` (absent is the model's
@@ -2599,8 +2634,8 @@ both streams as they came, escape sequences and control characters left
 out, a line a carriage return rewrote as it ended, redacted as its result
 is. A line cut where older output was let go is left out. Nothing is taken
 from what its agent reads. The daemon keeps that 16 KiB beside what the
-command's result keeps, for each such command while it runs, a command a
-steer moved to the background included. A detached command's output goes
+command's result keeps, for each such command while it runs, a command
+that yielded to the background included. A detached command's output goes
 nowhere, so it answers its folder with `lines: null`. A call, a handle that
 has ended, or a detached command an earlier daemon started answers
 `process_not_running`. `agent ps [--bot NAME]`
@@ -2714,8 +2749,7 @@ one person's agents. The reading
 view removes insignificant JSON whitespace from multiline provider items so
 each occupies one JSONL record. Single-line items need no whitespace rewrite;
 whitespace inside text strings remains intact. Pages
-contain at most 64 KiB of text. Optional `limit` (4–65,536 bytes) requests a
-smaller page.
+contain at most 64 KiB of text; the tool takes no size argument.
 The runtime also limits the encoded tool result, including escaping and page
 metadata, to half the input-byte allowance remaining after the current turn
 and its mandatory prefix (summary and bare omission notice).
@@ -3017,13 +3051,14 @@ holds its turn, counted from when it starts running, not from any time
 spent in line for a process slot. No clock kills a foreground command: past
 its `timeout_ms` it moves to the background and keeps running, as Codex's
 unified exec yields a command, and the call's result is its `proc:N` handle
-with `yielded: true` and its last 20 lines of output so far, as a steer
-moves one (`steered: true`). A background command holds no turn while it
+with `yielded: true` and its last 20 lines of output so far. A message
+for the turn never moves a running command: it is taken once the command
+ends or yields, as Codex takes it. A background command holds no turn while it
 runs, so it has no timeout unless its call names one, of up to a day: as
 Codex's unified exec runs a command, it runs until it exits, `write_stdin`
 with `kill: true` on its handle stops it, or the daemon stops, and only a
-`timeout_ms` it was given ends it with `timed_out`. A command a steer or
-its timeout moves to the background has no timeout from then on. A
+`timeout_ms` it was given ends it with `timed_out`. A command its timeout
+moves to the background has no timeout from then on. A
 command a script runs as a daemon step (`run_step`) has no timeout unless
 its arguments name one, which then ends it with `timed_out`, since a step
 cannot be handed back as a handle; its call's time stops while it runs, as
@@ -3032,7 +3067,7 @@ starts a background command as a turn's call does, under `CALL:STEP`: it is
 the bot's, not the call's, so the step answers at once with its `proc:N`
 handle, which outlives the call for the model to `wait` on, and its end is
 told as any background command's. No bot has a share of its own: once the daemon's background
-commands, steered ones included, are past `--max-processes` (64 a CPU by
+commands, yielded ones included, are past `--max-processes` (64 a CPU by
 default), starting one more kills a command of the bot holding the most,
 the one it started or waited on least recently, never one of its 8 most
 recent (under a bound of 8, the bound's number, so one bot past a small
@@ -3659,9 +3694,8 @@ model can act on it; the service wakes a parked one then from its own
 schedule, so a waiting call costs a row and no timer. A later call's gate that
 lapses first ends the wait as `tool_unserved` and the turn as it ends one
 waiting on a verdict. A message that joins the turn lifts the wait as it
-lifts a verdict's (see [tool approval](#tool-approval)) when the tool is
-declared with `lift` (protocol 70, below) or a step of the call waits on a
-gate: the call becomes a
+lifts a verdict's (see [tool approval](#tool-approval)) only while a step
+of the call waits on a gate (protocol 92, below): the call becomes a
 `proc:` handle answered `"waits_for":"answer"`, its client still lists,
 takes and answers it, and the answer ends the command, told as
 `{"answer": TEXT}`. Any other call keeps the message for its answer. An interrupt ends the call as cancelled, like any
@@ -3678,17 +3712,28 @@ on. Codex never moves a running tool aside for a new message: the message
 waits for the call to return, and a long command yields on its own. Now a
 steer lifts a call its client answers only when the tool is declared with
 `"lift": true`, a tool whose calls may run for minutes or wait on a person
-(Sonny marks `exec`, `browser` and `desktop`), and only once the call has
-waited the 250 ms grace a foreground `shell` command gets; or, at once,
-when a step of the call waits on a gate, since that is a wait for a
-verdict, which a steer always lifts. Any other call is answered first and
-the steer joins the turn at the next boundary. A call of a tool that
-lifts holds live for the whole grace, whatever the bot's
-`approval_hold_ms`, so it never parks inside it and is lifted live rather
-than parked and woken again; parked, a steer resumes the turn only when the call
-lifts, and a step that starts waiting on a gate while a steer waits wakes
-it (or the live turn) then. Calls waiting for their approval, and `shell`
-commands, are lifted as before.
+(Sonny marked `exec`, `browser` and `desktop`), once the call had waited
+the 250 ms grace a foreground `shell` command got; or, at once, when a
+step of the call waits on a gate, since that is a wait for a verdict,
+which a steer always lifts. Any other call is answered first and the
+steer joins the turn at the next boundary.
+
+Protocol version 92 drops `lift`: a steer never moves a running call,
+as Codex never does. A busy lead fed a note every few seconds had a
+quick `exec` (a message sent, a task started) come back as
+`{"background":true,"steered":true}` dozens of times a day, each costing
+a `wait` call and a model round on a long conversation. A call runs until
+it ends or yields on its own time: a `shell` command at its `timeout_ms`,
+a client's call when its client yields it (`yield_call`, below; Sonny's
+`exec` at its 30 s `yield_time_ms`), a `write_stdin` at its
+`yield_time_ms`. The steer is taken at the next model request. What waits
+on someone rather than on work still ends on a steer at once: a `wait`
+(`steered: true`, its handles pending), a call waiting for its approval,
+and a client's call one of whose steps waits on a gate, each lifted to
+the background as before; parked, a steer resumes the turn only for
+those, and a step that starts waiting on a gate while a steer waits wakes
+it (or the live turn) then. What a client may yield is declared
+`"yields": true` in place of `lift`.
 
 Protocol version 85 lets the client hand such a call back itself, as
 Codex's `exec` yields a script still running at its `yield_time_ms`:
@@ -3706,8 +3751,8 @@ ends it and is told and collected as a lifted call's, pictures included;
 `lifted_ended` with `outcome: "stopped"` tells its client to stop the
 work. Its daemon steps run on, and what they kept stays readable until the
 call ends; a lifted call's steps keep theirs the same way. Only a waiting
-call of a tool declared `lift` yields: any other tool's is
-`call_not_liftable`, and one answered, lifted or out of time already is
+call of a tool declared `yields` (protocol 92; `lift` before) yields: any
+other tool's is `call_not_yieldable`, and one answered, lifted or out of time already is
 `no_pending_call`.
 
 Protocol version 85 also gives `wait` `terminate: true`: each handle,
@@ -3994,8 +4039,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   decided; a verdict for a call after a `wait` waits in the store.
 - **A message lifts the wait** (protocol 64, schema 91). A steer that
   joins the turn while a call waits for its verdict, held live or parked,
-  wakes the turn and lifts the call (a call its client answers only as
-  protocol 70 says, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
+  wakes the turn and lifts the call (a call its client answers only while
+  a step of it waits on a gate, protocol 92, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
   its request `process` (an indexed column), and answers the call with
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`

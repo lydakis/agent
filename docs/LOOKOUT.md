@@ -49,7 +49,9 @@ it as it stops. Its own lines go to `STORE.companions/sonny-lookout.log`,
 and each follower it watches (`seated`), each follower whose file it
 read again after a change (`reloaded`) and each note it sends (`woke`) to
 `STORE.lookout.jsonl`. Which revision of each follower's file it took
-(the file's modification time, or none for a file it saw go) and when is
+(the file's device, inode, size and times, as Git's stat data, so two
+writes within one tick of the file clock are two; or none for a file it
+saw go) and when is
 kept in `STORE.lookout.taken.json`, written only as one changes, and the
 `follows` tool lists it as `lookout`: whether a lookout runs, when it
 took the file (`took_ms`), whether what it took is the file as it is now
@@ -243,7 +245,9 @@ every = "1m"   # how long after it exits it runs again: 30s, 5m, 1h; a minute un
 
 Every line the command prints is one event: plain text, or a JSON object
 with `text` and, if it has them, `id`, `topic` (what it is about: a
-channel, a thread), `from` (who wrote it there), `url` and `steer`. An
+channel, a thread), `from` (who wrote it there), `url` and `steer`.
+`text` is what subscribers read: an object without it is delivered whole,
+the line as its text, as plain text is. An
 object whose `text` is empty, as `{"topic": "12", "text": ""}`, is no
 event: it clears what the source last said of that topic, or of the
 source itself with no topic, as an MQTT message with an empty payload
@@ -260,7 +264,8 @@ log, `STORE.companions/sonny-lookout.log`.
 The lookout reads the settings again every 15 seconds: a source added or
 changed starts, one removed stops, and a lookout that stops stops its
 sources' commands. So does a source when a file its `watch` list names
-changed, came or went since it started, as a service manager restarts a
+changed (its device, inode, size or times, as Git's stat data), came or
+went since it started, as a service manager restarts a
 unit on its new binary: `watch = ["~/bin/slack-poll"]`, each file from `/`
 or `~/`. An edited script then runs on its new code within 15 seconds, a
 stream that never exits included; the log says `source_stopped` with why.
@@ -435,7 +440,8 @@ value, a list of them, or one of the string matchers), `{"numeric": [">",
 holds, as sequence IDs and nanosecond times run) or `{"exists": true}` /
 `{"exists": false}`. `"$or": [P1,
 P2]` beside the fields takes either pattern. A plain-text line is the
-event `{"text": LINE}`. A filter is at most 4 KiB, 256 values and 6 levels
+event `{"text": LINE}`; an object without `text` is matched by the fields
+it printed. A filter is at most 4 KiB, 256 values and 6 levels
 deep; nothing in it runs, and it only ever narrows what is heard.
 
 The lookout checks a filter as each event comes, before the event waits

@@ -1,6 +1,6 @@
-"""A call a message lifts, and a call its client yields (`yield_call`): both
-become `proc:N`, which wait collects, a steer ends a wait on at once, and
-wait with terminate or write_stdin with kill stops."""
+"""A call its client yields (`yield_call`) becomes `proc:N`, which wait
+collects, a steer ends a wait on at once, and wait with terminate or
+write_stdin with kill stops. A steer never moves a running call itself."""
 import json
 import os
 import time
@@ -10,12 +10,12 @@ from tests.test_images import image
 from tests.test_runtime import ModelFixture
 from tests.test_steps import EXEC
 
-LIFTING = {'name': 'start_task', 'description': 'Start a task.',
+START_TASK = {'name': 'start_task', 'description': 'Start a task.',
            'parameters': {'type': 'object', 'properties': {'name': {'type': 'string'}},
                           'required': ['name'], 'additionalProperties': False},
-           'answered_by': 'sonny', 'lift': True}
+           'answered_by': 'sonny', 'yields': True}
 # A script tool whose client yields a script still running.
-YIELDING = dict(EXEC, lift=True)
+YIELDING = dict(EXEC, yields=True)
 TOOLS = ['echo', 'shell', 'read', 'wait', 'write_stdin']
 
 
@@ -42,17 +42,23 @@ class Calls(ModelFixture):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class LiftedCalls(Calls):
-    """What a call a message lifts does, which a yielded call does too."""
-    def lifted(self):
-        """A lead whose answered call a steer lifted: the client, and its handle."""
+    """What a call its client yielded does on past its turn."""
+    def parked(self):
+        """A lead whose answered call waits on its client, parked."""
         client = self.client('echo,wait,write_stdin', settings={'approval_hold_ms': 0})
         self.addCleanup(lambda: client.close(kill=True))
-        client.request('create', bot='Lead', workspace=str(self.path), declare=[LIFTING],
+        client.request('create', bot='Lead', workspace=str(self.path), declare=[START_TASK],
                        tools=['echo', 'wait', 'write_stdin'])
         self.model.call_script = [('start_task', {'name': 'fix'})]
         turn = client.request('submit', bot='Lead', request_id='t', prompt='script')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
-        client.request('submit', bot='Lead', request_id='s', prompt='steer:look', delivery='steer')
+        return client, turn
+
+    def lifted(self):
+        """A lead whose answered call its client yielded: the client, and its handle."""
+        client, turn = self.parked()
+        reply = client.request('yield_call', bot='Lead', turn=turn, call_id='script-0', output='starting')
+        self.assertIn('result', reply, reply)
         lifted = client.receive(lambda m: m.get('event') == 'call_lifted' and m.get('turn') == turn)['data']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         return client, turn, lifted['handle']
@@ -234,10 +240,10 @@ class YieldedCalls(Calls):
         self.assertEqual(client.finished(waited['message'])['data']['status'], 'completed')
         self.assertEqual(json.loads(self.output_of('wait-1'))['error'], 'invalid_handle')
 
-    def test_only_a_waiting_call_of_a_lift_tool_yields(self):
+    def test_only_a_waiting_call_of_a_yields_tool_yields(self):
         client, turn = self.script(tool=EXEC)
         refused = client.request('yield_call', bot='Lead', turn=turn, call_id='script-0', output='x')
-        self.assertEqual(refused['error'], 'call_not_liftable', refused)
+        self.assertEqual(refused['error'], 'call_not_yieldable', refused)
 
     def test_a_call_yields_once_and_only_its_answer_s_worth_of_output(self):
         client, turn = self.script()

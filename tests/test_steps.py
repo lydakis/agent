@@ -808,12 +808,12 @@ class DaemonStepTests(ModelFixture):
         gone = client.request('artifact', bot='Lead', turn=turn, call_id='script-0/1', stream='stdout')
         self.assertIn('error', gone)
 
-    def test_a_lifted_call_keeps_its_step_past_its_turn(self):
-        client, turn = self.script(tool=dict(EXEC, lift=True), settings={'approval_hold_ms': 0})
+    def test_a_yielded_call_keeps_its_step_past_its_turn(self):
+        client, turn = self.script(tool=dict(EXEC, yields=True), settings={'approval_hold_ms': 0})
         request = self.ask(client, turn, arguments={'command': 'sleep 1; echo lifted'})
         self.running(client)
-        steered = client.request('submit', bot='Lead', request_id='s', prompt='go on', delivery='steer')
-        self.assertIn('result', steered)
+        yielded = client.request('yield_call', bot='Lead', turn=turn, call_id='script-0', output='so far')
+        self.assertIn('result', yielded)
         ran = self.reply(client, request, timeout=15)['result']
         self.assertEqual(json.loads(ran['output'])['stdout'], 'lifted\n')
 

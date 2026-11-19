@@ -171,6 +171,15 @@ pub fn is_lead(bot: &str) -> bool {
     lead_project(bot).is_some()
 }
 
+/// Whether `record`, a bot as the daemon lists it, is a project's lead:
+/// named as one ([`is_lead`]) and made by no agent, as Sonny makes leads
+/// for the person. An agent may name one it makes as a lead, but that
+/// doesn't make it one: what a lead may do, such as run its folder's
+/// setup as the person, goes by who made it, not by its name.
+pub fn is_lead_record(record: &serde_json::Value) -> bool {
+    is_lead(record["name"].as_str().unwrap_or_default()) && !record["created_by"].is_string()
+}
+
 /// Whether `name` can name another lead of a folder, as in
 /// `shop.lead.NAME`: lowercase letters, digits and hyphens, at most 32,
 /// and never a side chat's.
@@ -437,8 +446,10 @@ fn compose(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
 /// opening.
 fn folder(dir: &Path, role: &agent_client::policy::Profile) -> Result<Composed, String> {
     let memory = memory(dir)?;
-    let composed = agent_client::policy::instructions_leaving_out(dir, Some(role), &memory)
-        .map_err(|e| e.to_string())?;
+    let composed = agent_client::policy::hiding(&agent_client::hidden::known(), || {
+        agent_client::policy::instructions_leaving_out(dir, Some(role), &memory)
+    })
+    .map_err(|e| e.to_string())?;
     // Paths under the home folder as `~`, so a narrow window shows what
     // is missing; the lead's shell reads them the same.
     let home = std::env::var("HOME").unwrap_or_default();
@@ -472,15 +483,17 @@ fn memory(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// skills and memory, in no role, then what every task is told.
 pub fn plain(dir: &Path) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
-    let composed = agent_client::policy::instructions(dir, None, &memory)
-        .map_err(|e| format!("{}: {e}", e.code()))?;
+    let composed = agent_client::policy::hiding(&agent_client::hidden::known(), || {
+        agent_client::policy::instructions(dir, None, &memory)
+    })
+    .map_err(|e| format!("{}: {e}", e.code()))?;
     as_task(dir, &read(dir)?, &composed.text)
 }
 
 /// The folder's instructions for a lead, when they are not the ones it
-/// `held` last: a lead takes its folder's as its window opens and at each
-/// idle point after. With what was left out of them, which the lead goes
-/// without either way.
+/// `held` last: a lead takes its folder's as its window opens, and only
+/// then, as Codex reads its instructions once as a session starts. With
+/// what was left out of them, which the lead goes without either way.
 pub fn review(
     dir: &Path,
     held: &str,
@@ -1159,12 +1172,37 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
             dir.display()
         ));
     }
+    // Never Agent's own folder or one in it: its store, keys, rules and
+    // settings, which every sandbox keeps read-only, would be the new
+    // lead's folder to write.
+    let own = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".agent"))
+        .and_then(|own| own.canonicalize().ok());
+    if let Some(own) = own.filter(|own| dir.starts_with(own)) {
+        return Err(format!(
+            "project_invalid: {} is in {}, Agent's own folder",
+            dir.display(),
+            own.display()
+        ));
+    }
     Ok((dir, picks))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_is_one_no_agent_made_whatever_its_name() {
+        assert!(is_lead_record(&serde_json::json!({"name": "shop.lead"})));
+        assert!(is_lead_record(
+            &serde_json::json!({"name": "shop.lead.ui", "created_by": null})
+        ));
+        assert!(!is_lead_record(
+            &serde_json::json!({"name": "shop.lead", "created_by": "shop.fix"})
+        ));
+        assert!(!is_lead_record(&serde_json::json!({"name": "shop.fix"})));
+    }
 
     #[test]
     fn sonny_s_own_bots_share_no_name_with_a_folder_s() {

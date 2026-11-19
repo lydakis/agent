@@ -728,6 +728,7 @@ pub fn icons(items: &[Item], bot: &str, icons: &HashMap<String, String>) -> Stri
 
 /// The agents a window's `/background` covers: the project's, as
 /// `/status` lists them, by a glob.
+#[derive(Clone)]
 pub struct Scope {
     pub project: String,
     pub lead: String,
@@ -778,7 +779,7 @@ pub struct View {
     page: Option<Page>,
     /// The tasks as `/status` last read them, whose agents a follow's
     /// page lists.
-    tasks: Arc<Vec<Value>>,
+    tasks: Arc<Vec<crate::status::Task>>,
     /// What the open follow's page says beyond its settings.
     follow: Follow,
     /// When the open automation's page says it runs next, in seconds.
@@ -1385,7 +1386,7 @@ impl View {
     }
 
     /// The tasks as `/status` read them now.
-    pub fn set_tasks(&mut self, tasks: &Arc<Vec<Value>>) {
+    pub fn set_tasks(&mut self, tasks: &Arc<Vec<crate::status::Task>>) {
         self.tasks = tasks.clone();
     }
 
@@ -2655,6 +2656,7 @@ impl View {
         // Nor the one it is for, nor a workflow's workers or its row, as
         // the lookout.
         let (done, live): (Vec<&Value>, Vec<&Value>) = (self.tasks.iter())
+            .map(|task| &**task)
             .filter(|task| {
                 let name = agent(task);
                 !name.is_empty()
@@ -3770,8 +3772,10 @@ mod tests {
             outlives_close: false,
         };
         let task = |name: &str, maker: &str, state: &str, group: &str| {
-            json!({"name": name, "agent": format!("calc.{name}"), "state": state,
-                "group": group, "maker": maker})
+            Arc::new(
+                json!({"name": name, "agent": format!("calc.{name}"), "state": state,
+                "group": group, "maker": maker}),
+            )
         };
         let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, true)]);
         view.set_tasks(&Arc::new(vec![
@@ -3783,8 +3787,8 @@ mod tests {
             task("readme", "calc.lead", "idle", "done"),
             task("docs", "calc.lead", "idle", "done"),
             // A workflow's own row is no agent.
-            json!({"name": "lead#wf-1a2b", "agent": "calc.lead#wf-1a2b", "state": "working",
-                "group": "working", "maker": "calc.lead"}),
+            Arc::new(json!({"name": "lead#wf-1a2b", "agent": "calc.lead#wf-1a2b",
+                "state": "working", "group": "working", "maker": "calc.lead"})),
         ]));
         view.key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -4097,8 +4101,10 @@ mod tests {
             outlives_close: false,
         };
         let task = |name: &str, maker: &str| {
-            json!({"name": name, "agent": format!("calc.{name}"), "state": "working",
-                "group": "working", "maker": maker})
+            Arc::new(
+                json!({"name": name, "agent": format!("calc.{name}"), "state": "working",
+                "group": "working", "maker": maker}),
+            )
         };
         let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, false)]);
         view.set_tasks(&Arc::new(vec![

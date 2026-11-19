@@ -50,8 +50,15 @@ pub struct Row {
     pub group: Group,
     /// The workflow run this row is, whose strip stands where an
     /// agent's state does.
-    pub run: Option<crate::workflow::view::Live>,
+    pub run: Option<Box<crate::workflow::view::Live>>,
+    /// Its line in [`tasks`], once made: a row kept from one count to the
+    /// next keeps it.
+    pub line: Option<Task>,
 }
+
+/// A task as a template note's `tasks()` gives it, shared by every listing
+/// of the tasks that holds it.
+pub type Task = std::sync::Arc<serde_json::Value>;
 
 /// Where a task stands, as `/status` groups the tasks, in its order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -141,19 +148,30 @@ pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
 /// each its name, agent, state, group (`needs_you`, `working`, `idle`,
 /// `done`), whether a turn runs, its pull request and latest step, and
 /// the agent that made it.
-pub fn tasks(rows: &[Row]) -> Vec<serde_json::Value> {
-    (rows.iter())
+pub fn tasks(rows: &mut [Row]) -> Vec<Task> {
+    (rows.iter_mut())
         .filter(|row| row.name != "lead")
         .map(|row| {
-            // Times that hold still while nothing changes: when its turn
-            // started, or ended, in seconds, which `| ago` keeps current;
-            // and how long its last turn took, once it is over.
-            serde_json::json!({"name": row.name, "agent": row.bot, "state": row.state,
-                "group": row.group.key(), "running": row.running, "pr": row.pr,
-                "latest": row.latest, "at": row.at.map(|ms| ms / 1000),
-                "seconds": row.seconds.filter(|_| !row.running), "maker": row.maker})
+            (row.line.get_or_insert_with(|| {
+                // Times that hold still while nothing changes: when its turn
+                // started, or ended, in seconds, which `| ago` keeps current;
+                // and how long its last turn took, once it is over.
+                std::sync::Arc::new(serde_json::json!({"name": row.name, "agent": row.bot,
+                    "state": row.state, "group": row.group.key(), "running": row.running,
+                    "pr": row.pr, "latest": row.latest, "at": row.at.map(|ms| ms / 1000),
+                    "seconds": row.seconds.filter(|_| !row.running), "maker": row.maker}))
+            }))
+            .clone()
         })
         .collect()
+}
+
+/// Whether two listings of the tasks say the same: a task either holds is
+/// compared only where the two do not share it.
+pub fn same_tasks(one: &[Task], other: &[Task]) -> bool {
+    one.len() == other.len()
+        && (one.iter().zip(other))
+            .all(|(one, other)| std::sync::Arc::ptr_eq(one, other) || one == other)
 }
 
 /// The pull request `text` links last, as `owner/repo#N`: a GitHub pull
@@ -532,112 +550,215 @@ pub fn card(
     }
 }
 
-/// One of an agent's own tasks as the margin lists it: one that needs
-/// the person, failed or works, or a workflow it runs.
+/// One of the project's agents as the pane lists it above the margin: the
+/// lead, a task that needs the person, failed or works, or a workflow
+/// that runs.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Own {
+pub struct Listed {
     pub bot: String,
     pub name: String,
     pub title: String,
     pub state: String,
     pub group: Group,
+    /// Whether it is the lead, whose row is its name and state word.
+    pub lead: bool,
     /// Its helpers' groups: each agent whose line of makers leads to it.
     pub helpers: Vec<Group>,
-    pub run: Option<crate::workflow::view::Live>,
+    pub run: Option<Box<crate::workflow::view::Live>>,
 }
 
-/// The tasks among `rows` that `bot` made and that need the person,
-/// failed or work, workflows it runs among them, in the order of the
-/// groups; each with its helpers counted.
-pub fn own(rows: &[Row], bot: &str) -> Vec<Own> {
-    let by_bot: HashMap<&str, &Row> = rows.iter().map(|r| (r.bot.as_str(), r)).collect();
-    // The task of `bot`'s own that `row`'s line of makers leads to.
-    fn under<'a>(
-        row: &'a Row,
-        bot: &str,
-        by_bot: &HashMap<&str, &'a Row>,
-        most: usize,
-    ) -> Option<&'a str> {
-        let mut at = row;
-        for _ in 0..=most {
-            if at.maker == bot {
-                return Some(at.bot.as_str());
-            }
-            at = by_bot.get(at.maker.as_str())?;
-        }
-        None
+/// The project's agents as the pane shows them at rest, above the
+/// margin: `/status`'s head, the project's title and its counts, then the
+/// lead and every task that needs the person, failed or works, in the
+/// order of the groups, each workflow under the agent that runs it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Agents {
+    pub project: String,
+    pub counts: Counts,
+    pub listed: Vec<Listed>,
+}
+
+impl Agents {
+    /// Whether it lists no task and no workflow: then it is not drawn.
+    pub fn is_empty(&self) -> bool {
+        self.listed.iter().all(|agent| agent.lead)
     }
-    let mut helpers: HashMap<&str, Vec<Group>> = HashMap::new();
-    for row in rows.iter().filter(|r| r.maker != bot && r.run.is_none()) {
-        if let Some(task) = under(row, bot, &by_bot, rows.len()) {
-            helpers.entry(task).or_default().push(row.group);
-        }
-    }
-    let mut own: Vec<Own> = (rows.iter())
-        .filter(|r| r.maker == bot && r.bot != bot)
-        .filter(|r| matches!(r.group, Group::NeedsYou | Group::Failed | Group::Working))
-        .map(|r| Own {
-            bot: r.bot.clone(),
-            name: r.name.clone(),
-            title: r.title.clone(),
-            state: r.state.clone(),
-            group: r.group,
-            helpers: helpers.remove(r.bot.as_str()).unwrap_or_default(),
-            run: r.run.clone(),
+}
+
+/// See [`Agents`]: `rows` as `/status` read them for `project`, by its
+/// title or else its name. The same in every window of the project.
+pub fn agents(project: &str, rows: &[Row]) -> Agents {
+    let Listing { listed, under, .. } = listing(rows);
+    let entry = |row: &Row, helpers: Vec<Group>| Listed {
+        bot: row.bot.clone(),
+        name: row.name.clone(),
+        title: row.title.clone(),
+        state: row.state.clone(),
+        group: row.group,
+        lead: row.name == "lead",
+        helpers,
+        run: None,
+    };
+    // The lead first, whatever its state, then the tasks by group.
+    let mut shown: Vec<Listed> = (listed.iter())
+        .filter(|row| row.name == "lead")
+        .map(|row| entry(row, Vec::new()))
+        .collect();
+    let mut tasks: Vec<Listed> = (listed.iter())
+        .filter(|row| row.name != "lead" && row.run.is_none())
+        .filter(|row| matches!(row.group, Group::NeedsYou | Group::Failed | Group::Working))
+        .map(|row| {
+            let helpers = (under.get(&row.bot).into_iter().flatten())
+                .filter(|helper| helper.run.is_none())
+                .map(|helper| helper.group)
+                .collect();
+            entry(row, helpers)
         })
         .collect();
-    own.sort_by_key(|task| task.group);
-    own
+    tasks.sort_by_key(|task| task.group);
+    shown.extend(tasks);
+    // Each workflow under the agent that runs it, or under the nearest
+    // one listed on its line of makers; else at the end.
+    let by_bot: HashMap<&str, &Row> = rows.iter().map(|r| (r.bot.as_str(), r)).collect();
+    let mut runs: Vec<(usize, Listed)> = Vec::new();
+    for row in rows.iter().filter(|row| row.run.is_some()) {
+        let mut at = row.maker.as_str();
+        let mut under = None;
+        for _ in 0..=rows.len() {
+            if let Some(i) = shown.iter().position(|agent| agent.bot == at) {
+                under = Some(i);
+                break;
+            }
+            match by_bot.get(at) {
+                Some(maker) if maker.maker != at => at = maker.maker.as_str(),
+                _ => break,
+            }
+        }
+        let run = Listed {
+            run: row.run.clone(),
+            ..entry(row, Vec::new())
+        };
+        runs.push((under.unwrap_or(usize::MAX), run));
+    }
+    let mut out = Vec::with_capacity(shown.len() + runs.len());
+    for (i, agent) in shown.into_iter().enumerate() {
+        out.push(agent);
+        out.extend(
+            (runs.iter())
+                .filter(|(at, _)| *at == i)
+                .map(|(_, run)| run.clone()),
+        );
+    }
+    out.extend(
+        (runs.into_iter())
+            .filter(|(at, _)| *at == usize::MAX)
+            .map(|(_, run)| run),
+    );
+    Agents {
+        project: project.to_owned(),
+        counts: tally(&listed),
+        listed: out,
+    }
 }
 
-/// The margin's tasks, `width` wide: `Tasks · 2`, then a row for each,
-/// its mark, its title in a column and its name, its helpers counted
-/// under it, a workflow with its strip; each row with the agent a click
-/// on it goes to. None, nothing.
-pub fn own_lines(own: &[Own], width: usize) -> Vec<(Line<'static>, Option<String>)> {
-    if own.is_empty() {
+/// The project's agents, `width` wide, in a window of `here`: the head,
+/// then a row for each, its mark, its title in a column and its name, a
+/// link; the lead's its name and state word; this window's own agent bold
+/// and plain; helpers counted under their task, a workflow with its
+/// strip. Each row with the agent a click on it goes to. With no task in
+/// it, nothing.
+pub fn agents_lines(
+    agents: &Agents,
+    here: &str,
+    width: usize,
+) -> Vec<(Line<'static>, Option<String>)> {
+    if agents.is_empty() {
         return Vec::new();
     }
-    let mut out = vec![(
-        Line::from(vec![
-            Span::raw(" Tasks").bold(),
-            Span::raw(format!(" · {}", own.len())).dim(),
-        ]),
-        None,
-    )];
-    let agents = || own.iter().filter(|task| task.run.is_none());
-    let names = agents().map(|task| task.name.width()).max().unwrap_or(0);
-    let titles = (agents().map(|task| task.title.width()).max().unwrap_or(0))
+    // `/status`'s head. Too long for its row, done and then idle give
+    // way, as in the footer, then the title is cut at a word.
+    let mut counted: Vec<(Group, String)> = (GROUPS.into_iter())
+        .filter(|group| agents.counts.of(*group) > 0)
+        .map(|group| {
+            let n = agents.counts.of(group);
+            (group, format!(" · {n} {}", group.counted(n)))
+        })
+        .collect();
+    let after = |counted: &[(Group, String)]| -> usize {
+        counted.iter().map(|(_, said)| said.width()).sum()
+    };
+    while 1 + agents.project.width() + after(&counted) > width
+        && (counted.last()).is_some_and(|(group, _)| FOLDS.contains(group))
+    {
+        counted.pop();
+    }
+    let project = crate::title::cut(
+        &agents.project,
+        width.saturating_sub(1 + after(&counted)).max(8),
+    );
+    let mut head = vec![Span::raw(" "), Span::raw(project).bold()];
+    for (_, said) in counted {
+        let (dot, count) = said.split_at(" · ".len());
+        head.push(Span::raw(dot.to_owned()).dim());
+        head.push(Span::raw(count.to_owned()));
+    }
+    let mut out = vec![(Line::from(head), None)];
+    // An agent's name: this window's own bold and plain, any other in the
+    // agents' color, and a click goes to it.
+    let named = |agent: &Listed| -> (Span<'static>, Option<String>) {
+        match agent.bot == here {
+            true => (Span::raw(agent.name.clone()).bold(), None),
+            false => (
+                Span::raw(agent.name.clone()).bold().fg(Color::Blue),
+                Some(agent.bot.clone()),
+            ),
+        }
+    };
+    let tasks = || (agents.listed.iter()).filter(|agent| !agent.lead && agent.run.is_none());
+    let names = tasks().map(|task| task.name.width()).max().unwrap_or(0);
+    let titles = (tasks().map(|task| task.title.width()).max().unwrap_or(0))
         .min(width.saturating_sub(5 + names));
-    for task in own {
-        let mut spans = vec![Span::raw(" "), mark(&task.state)];
-        if let Some(run) = &task.run {
+    for agent in &agents.listed {
+        let mut spans = vec![Span::raw(" "), mark(&agent.state)];
+        if let Some(run) = &agent.run {
             // Its name and its strip, as the Pane draws it: a workflow
             // that has not ended works.
             let run = crate::workflow::view::Live {
                 phase: String::new(),
-                ..run.clone()
+                ..(**run).clone()
             };
             spans = vec![Span::raw(" "), mark("working")];
             spans.extend(run_spans(&run, width, &spans.clone(), None));
             out.push((Line::from(spans), None));
             continue;
         }
-        let room = width.saturating_sub(5 + task.name.width());
+        if agent.lead {
+            // Its name and state word alone: the head carries its title.
+            let (name, goes) = named(agent);
+            let room = width.saturating_sub(5 + agent.name.width());
+            let state = crate::title::cut(&agent.state, room);
+            spans.push(name);
+            if !state.is_empty() {
+                spans.push(Span::raw(format!(" · {state}")).dim());
+            }
+            out.push((Line::from(spans), goes));
+            continue;
+        }
+        let room = width.saturating_sub(5 + agent.name.width());
         let column = titles.min(room);
-        if !task.title.is_empty() && column > 1 {
-            let title = crate::title::cut(&task.title, column);
+        if !agent.title.is_empty() && column > 1 {
+            let title = crate::title::cut(&agent.title, column);
             let pad = column.saturating_sub(title.width());
             spans.push(Span::raw(format!("{title}{}  ", " ".repeat(pad))));
         }
-        // In the agents' color: a click goes to it.
-        spans.push(Span::raw(task.name.clone()).bold().fg(Color::Blue));
-        out.push((Line::from(spans), Some(task.bot.clone())));
-        if !task.helpers.is_empty() {
-            let n = task.helpers.len();
+        let (name, goes) = named(agent);
+        spans.push(name);
+        out.push((Line::from(spans), goes));
+        if !agent.helpers.is_empty() {
+            let n = agent.helpers.len();
             let mut said = format!("└ {n} helper{}", if n == 1 { "" } else { "s" });
             for state in [Group::NeedsYou, Group::Failed, Group::Working] {
-                let k = task.helpers.iter().filter(|h| **h == state).count();
+                let k = agent.helpers.iter().filter(|h| **h == state).count();
                 if k > 0 {
                     said.push_str(&format!(", {k} {}", state.counted(k)));
                 }
@@ -1091,7 +1212,7 @@ mod tests {
             running: true,
             seconds: Some(19),
             group: Group::Working,
-            run: Some(Live {
+            run: Some(Box::new(Live {
                 name: "blind-role-eval-score".into(),
                 phase: "Score".into(),
                 phases: vec![
@@ -1112,7 +1233,7 @@ mod tests {
                     ),
                 ],
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert_eq!(
@@ -1451,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn the_margin_lists_this_agent_s_own_tasks_that_need_you_failed_or_work() {
+    fn the_pane_lists_the_projects_agents_the_lead_first_then_by_group() {
         use crate::workflow::view::{Counts, Live};
         let titled = |title: &str, row: Row| Row {
             title: title.into(),
@@ -1486,7 +1607,7 @@ mod tests {
                 state: "Score · 2 working, 3 finished".into(),
                 maker: "calc.lead".into(),
                 group: Group::Working,
-                run: Some(Live {
+                run: Some(Box::new(Live {
                     name: "blind-role-eval-score".into(),
                     phase: "Score".into(),
                     phases: vec![
@@ -1506,22 +1627,34 @@ mod tests {
                         ),
                     ],
                     ..Default::default()
-                }),
+                })),
                 ..Row::default()
             },
         ];
-        let own = own(&rows, "calc.lead");
-        let names: Vec<&str> = own.iter().map(|task| task.name.as_str()).collect();
+        let agents = agents("Tally invoices", &rows);
+        let names: Vec<&str> = (agents.listed.iter())
+            .map(|agent| agent.name.as_str())
+            .collect();
+        // The lead first, then by group; another agent's task is the
+        // project's too, and a helper that needs the person shows alone.
         assert_eq!(
             names,
-            ["readme", "halves", "workflow blind-role-eval-score"]
+            [
+                "lead",
+                "workflow blind-role-eval-score",
+                "halves-c",
+                "readme",
+                "halves",
+                "other"
+            ]
         );
+        let halves = &agents.listed[4];
         assert_eq!(
-            own[1].helpers,
+            halves.helpers,
             [Group::Working, Group::Idle, Group::NeedsYou]
         );
-        let text = |width| -> Vec<String> {
-            (own_lines(&own, width).into_iter())
+        let text = |here: &str, width| -> Vec<String> {
+            (agents_lines(&agents, here, width).into_iter())
                 .map(|(line, _)| line.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect::<Vec<String>>()
                 .into_iter()
@@ -1529,35 +1662,69 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            text(48),
+            text("calc.lead", 52),
             [
-                " Tasks · 3",
+                " Tally invoices · 2 need you · 4 working · 1 idle",
+                " ● lead · working",
+                " ● blind-role-eval-score ✓✓✓ ●●",
+                " ? halves-c",
                 " ? Check the README against the code  readme",
                 " ● Round half cents to even           halves",
                 "   └ 3 helpers, 1 needs you, 1 working",
-                " ● blind-role-eval-score ✓✓✓ ●●",
+                " ● other",
             ]
         );
-        // Narrow, the title is cut at a word; the name stays.
-        assert_eq!(text(30)[1], " ? Check the README…    readme");
-        // A click on a task goes to it; the heading, its helpers and a
-        // workflow go nowhere.
-        let goes: Vec<Option<String>> = own_lines(&own, 48)
-            .into_iter()
-            .map(|(_, bot)| bot)
-            .collect();
+        // Narrow, the title is cut at a word; the name stays. The head
+        // drops done and idle, then cuts the project's title.
+        assert_eq!(text("calc.lead", 30)[4], " ? Check the README…  readme");
         assert_eq!(
-            goes,
+            text("calc.lead", 60)[0],
+            " Tally invoices · 2 need you · 4 working · 1 idle · 1 done"
+        );
+        assert_eq!(
+            text("calc.lead", 40)[0],
+            " Tally invoices · 2 need you · 4 working"
+        );
+        assert_eq!(text("calc.lead", 36)[0], " Tally… · 2 need you · 4 working");
+        // A click on an agent goes to it, but on this window's own, which
+        // is bold and plain; the head, helpers and a workflow go nowhere.
+        let goes = |here: &str| -> Vec<Option<String>> {
+            (agents_lines(&agents, here, 52).into_iter())
+                .map(|(_, bot)| bot)
+                .collect()
+        };
+        let link = |bot: &str| Some(format!("calc.{bot}"));
+        assert_eq!(
+            goes("calc.lead"),
             [
                 None,
-                Some("calc.readme".into()),
-                Some("calc.halves".into()),
                 None,
-                None
+                None,
+                link("halves-c"),
+                link("readme"),
+                link("halves"),
+                None,
+                link("other")
             ]
         );
-        // None of its own going: no block.
-        assert!(own_lines(&super::own(&rows, "calc.halves-c"), 48).is_empty());
+        // The same list in a task's window, the lead a link there and the
+        // task plain.
+        assert_eq!(text("calc.halves", 52), text("calc.lead", 52));
+        let from_task = goes("calc.halves");
+        assert_eq!((&from_task[1], &from_task[5]), (&link("lead"), &None));
+        let lines = agents_lines(&agents, "calc.halves", 52);
+        let name = |row: usize, name: &str| {
+            let span = (lines[row].0.spans.iter())
+                .find(|s| s.content == name)
+                .unwrap();
+            (span.style.fg, span.style.add_modifier)
+        };
+        use ratatui::style::Modifier;
+        assert_eq!(name(5, "halves"), (None, Modifier::BOLD));
+        assert_eq!(name(1, "lead"), (Some(Color::Blue), Modifier::BOLD));
+        // Only the lead, idle or not: not drawn.
+        let alone = super::agents("Tally invoices", &rows[..1]);
+        assert!(alone.is_empty() && agents_lines(&alone, "calc.lead", 52).is_empty());
     }
 
     #[test]
@@ -1571,7 +1738,7 @@ mod tests {
             ..row("sub", "done", Group::Done)
         };
         let lead = row("lead", "working", Group::Working);
-        let tasks = tasks(&[lead, working, done]);
+        let tasks = tasks(&mut [lead, working, done]);
         assert_eq!(tasks.len(), 2, "the lead is not a task");
         assert_eq!(
             (tasks[0]["at"].as_u64(), tasks[0]["seconds"].as_u64()),
