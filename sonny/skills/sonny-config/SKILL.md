@@ -90,10 +90,11 @@ each setting is; what to set is the person's call.
   (`allow` runs outside the sandbox without asking, `prompt` always asks,
   `forbidden` never runs, with a `justification`); `timeout`, `nice`,
   `nohup` and `time` before a command are seen through, and `env` or
-  `NAME=value` only to ask or refuse. Agents can read but not
-  write that folder from a sandbox, so suggest a rule to the person;
-  "always allow" on an approval prompt adds one, and
-  `sonny rules check -- COMMAND` shows what the rules decide. The files
+  `NAME=value` only to ask or refuse. The rules files are the person's,
+  written by their "always allow": to get a command allowed for good, run
+  that command escalated with `prefix_rule` naming its prefix (such as
+  `["mcpx"]`), and the person's "always allow" on that call writes the
+  rule. `sonny rules check -- COMMAND` shows what the rules decide. The files
   are Starlark, as in Codex (`host_executable` works; `network_rule`
   is refused).
 
