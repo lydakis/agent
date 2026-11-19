@@ -3,6 +3,8 @@ pause_agents, spawn_agent and close_agent, made as the calling bot."""
 import hashlib
 import json
 import os
+import shutil
+import sys
 import time
 import unittest
 
@@ -235,6 +237,7 @@ class AgentToolsTests(ModelFixture):
         asked = client.request('inspect', bot='shop.asked')['result']
         self.assertEqual((helper['tools'], asked['tools']), (['echo', 'spawn_agent'], ['echo']))
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_profile_starts_its_agent_in_its_sandbox_and_never_looser(self):
         agents = self.path / '.agents' / 'agents'
         agents.mkdir(parents=True)
@@ -242,15 +245,16 @@ class AgentToolsTests(ModelFixture):
         (agents / 'careful.md').write_text('---\nextends: reviewer\n---\nBe careful.\n')
         (agents / 'loose.md').write_text('---\nsandbox: danger-full-access\n---\nDo anything.\n')
         client = self.client(TOOLS)
-        client.request('create', bot='shop.lead', workspace=str(self.path),
-                       settings={'sandbox': 'workspace-write', 'network': True,
-                                 'writable': [str(self.path)]})
+        made = client.request('create', bot='shop.lead', workspace=str(self.path),
+                              settings={'sandbox': 'workspace-write', 'network': True,
+                                        'writable': [str(self.path)]})
+        self.assertIn('result', made, made)
         self.run_calls(client, 'shop.lead', 'go',
                        ('spawn_agent', {'name': 'review', 'message': 'q', 'profile': 'reviewer'}),
                        ('spawn_agent', {'name': 'careful', 'message': 'q', 'profile': 'careful'}),
                        ('spawn_agent', {'name': 'loose', 'message': 'q', 'profile': 'loose'}),
                        ('spawn_agent', {'name': 'asked', 'message': 'q', 'profile': 'loose',
-                                        'settings': {'sandbox': 'read-only'}}))
+                                        'settings': {'sandbox': 'workspace-write'}}))
         # Read-only: nothing written, no network, its maker's folders gone.
         for name in ('shop.review', 'shop.careful'):
             settings = client.request('inspect', bot=name)['result']['settings']
@@ -263,7 +267,7 @@ class AgentToolsTests(ModelFixture):
         self.assertEqual(client.request('inspect', bot='shop.loose')['error'], 'bot_not_found')
         # The call's own sandbox stands over the profile's.
         asked = client.request('inspect', bot='shop.asked')['result']['settings']
-        self.assertEqual(asked['sandbox'], 'read-only', asked)
+        self.assertEqual(asked['sandbox'], 'workspace-write', asked)
 
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
