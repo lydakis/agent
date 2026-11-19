@@ -331,11 +331,20 @@ impl Titles {
     }
 }
 
+/// The columns `title` takes: a byte each when every byte is a printable
+/// ASCII character, as nearly every title is, without decoding it.
+pub fn width(title: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    match title.bytes().all(|byte| (0x20..0x7f).contains(&byte)) {
+        true => title.len(),
+        false => title.width(),
+    }
+}
+
 /// `title` cut to `room` columns at a word, with `…`; where no word fits,
 /// cut where the room ends; with room for no more than the `…`, none.
 pub fn cut(title: &str, room: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    if title.width() <= room {
+    if width(title) <= room {
         return title.to_owned();
     }
     if room < 2 {
@@ -347,7 +356,7 @@ pub fn cut(title: &str, room: usize) -> String {
             true => word.to_owned(),
             false => format!("{kept} {word}"),
         };
-        if next.width() + 1 > room {
+        if width(&next) + 1 > room {
             break;
         }
         kept = next;
@@ -398,6 +407,16 @@ mod tests {
             Some("Sum the column")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_title_s_width_is_its_columns() {
+        assert_eq!(width("Sum the column"), 14);
+        // Wide characters take two columns, and anything else what
+        // unicode-width counts.
+        assert_eq!(width("Sum 合計"), 8);
+        let tab = "Sum\tit";
+        assert_eq!(width(tab), unicode_width::UnicodeWidthStr::width(tab));
     }
 
     #[test]

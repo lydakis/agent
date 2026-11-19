@@ -491,7 +491,7 @@ pub fn card_after(
         .collect();
     let names = (titled.iter()).map(|(row, _)| row.name.width()).max();
     let titles = (titled.iter())
-        .map(|(row, indent)| indent + row.title.width())
+        .map(|(row, indent)| indent + crate::title::width(&row.title))
         .max()
         .unwrap_or(0)
         .min(width.saturating_sub(5 + names.unwrap_or(0)));
@@ -1146,7 +1146,7 @@ fn row_lines(
                     time = None;
                 }
                 let title = crate::title::cut(&row.title, column);
-                let pad = column.saturating_sub(title.width());
+                let pad = column.saturating_sub(crate::title::width(&title));
                 spans.push(Span::raw(format!("{title}{}  ", " ".repeat(pad))));
             }
             // In the agents' color: a click opens it.
