@@ -12219,6 +12219,64 @@ migration.
   14 ms against 16 to 58 ms. Key p99 at 100 windows is 18.5 ms against 9.8 ms
   in a single round.
 
+## A steer never cuts a running call (#1203)
+
+A note for a busy lead lifted the call it was running after 250 ms, so a
+call that ended a second later came back as a `steered` handle the model
+had to `wait` on. Now the note waits for the call to end or yield on its
+own time, as Codex's does.
+
+### A busy lead fed a note every 2 s
+
+One lead runs `sleep 1` commands back to back for 60 s, as a quick exec
+sends a message or starts a task, while a note is steered into it every
+2 s; the synthetic model waits on any handle it is given. Main (4cfd195)
+against this change, release builds, one 4-CPU Linux container:
+
+| Measure | Main | Change |
+| --- | ---: | ---: |
+| notes sent / taken | 30 / 30 | 30 / 30 |
+| commands run | 60 | 60 |
+| commands cut into a `steered` handle | 13 | 0 |
+| `wait` calls | 13 | 0 |
+| model rounds | 74 | 61 |
+| note to its delivery p50, ms | 222 | 221 |
+| note to its delivery max, ms | 262 | 420 |
+
+- **13 of 30 notes cut a command,** each costing a `wait` call and a model
+  round: 21% more rounds for the same work. On a lead with a 500k-token
+  conversation each of those rounds is a full read of it.
+- **A note still arrives promptly.** The median is unchanged; the worst
+  case is now the rest of the running call, bounded by its own yield
+  (a shell command's `timeout_ms`, an exec script's 30 s `yield_time_ms`).
+
+### Daemon screens
+
+The Perf workflow's daemon screens on this change against main (4cfd195),
+two alternating rounds, same container. Store work per turn is the same on
+both (the gate counts it); nothing passes the 15% warning line:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 32.03 | 35.16 | +9.7 |
+| admission | burst submit p99, ms | 4.31 | 4.36 | +1.2 |
+| completion | release to terminal p99, ms | 10.23 | 11.13 | +8.8 |
+| footprint | idle RSS, MiB | 16.6 | 17.5 | +5.8 |
+| footprint | per idle bot, KiB | 1.91 | 1.72 | -10.2 |
+| footprint | RSS after a turn each, MiB | 33.4 | 34.6 | +3.7 |
+| footprint | CPU per turn, ms | 0.804 | 0.823 | +2.4 |
+| lifecycle | CPU, s | 0.55 | 0.55 | +0.0 |
+| lifecycle | p95 turn, ms | 606.4 | 580.8 | -4.2 |
+| lifecycle | peak RSS, MiB | 26.5 | 26.2 | -1.2 |
+
+None of these screens runs a call its client answers or a steer, so the
+paths this changes never run in them; the moves are this container's
+spread. The change only removes work on a turn's path: no lift future
+racing each foreground command, no grace timer per steer. What it adds is
+an indexed read of `approvals(turn, step_of)` when an answered call's
+clock is stopped, and one `next_lapse` read when a turn parked on an
+answer resumes for a steer.
+
 ## A message replaced in line (#1200)
 
 `submit` with `replaces` withdraws a message still in line and sends the
