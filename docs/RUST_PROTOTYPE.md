@@ -239,8 +239,7 @@ every command that ended before schema 77). A bot that takes no work when
 its commands end (being deleted, out of budget, past the pending bounds) is
 told at its next turn's end. Commands lost to a restart are told the same way
 once the daemon is back, and so are those the pull cord ended, after the pause
-lifts. Unlike a client's message, the steer moves no running command to the
-background and wakes no parked wait: a running turn hears at its end, and a
+lifts. Unlike a client's message, the steer wakes no parked wait: a running turn hears at its end, and a
 wait takes its result earlier. A bot whose client collects results itself sets
 `quiet_background` and is never told. A note waiting to run keeps the commands
 it tells of from retention until it has run, and is not held to the bounds on
@@ -2613,8 +2612,8 @@ both streams as they came, escape sequences and control characters left
 out, a line a carriage return rewrote as it ended, redacted as its result
 is. A line cut where older output was let go is left out. Nothing is taken
 from what its agent reads. The daemon keeps that 16 KiB beside what the
-command's result keeps, for each such command while it runs, a command a
-steer moved to the background included. A detached command's output goes
+command's result keeps, for each such command while it runs, a command
+that yielded to the background included. A detached command's output goes
 nowhere, so it answers its folder with `lines: null`. A call, a handle that
 has ended, or a detached command an earlier daemon started answers
 `process_not_running`. `agent ps [--bot NAME]`
@@ -3030,13 +3029,14 @@ holds its turn, counted from when it starts running, not from any time
 spent in line for a process slot. No clock kills a foreground command: past
 its `timeout_ms` it moves to the background and keeps running, as Codex's
 unified exec yields a command, and the call's result is its `proc:N` handle
-with `yielded: true` and its last 20 lines of output so far, as a steer
-moves one (`steered: true`). A background command holds no turn while it
+with `yielded: true` and its last 20 lines of output so far. A message
+for the turn never moves a running command: it is taken once the command
+ends or yields, as Codex takes it. A background command holds no turn while it
 runs, so it has no timeout unless its call names one, of up to a day: as
 Codex's unified exec runs a command, it runs until it exits, `write_stdin`
 with `kill: true` on its handle stops it, or the daemon stops, and only a
-`timeout_ms` it was given ends it with `timed_out`. A command a steer or
-its timeout moves to the background has no timeout from then on. A
+`timeout_ms` it was given ends it with `timed_out`. A command its timeout
+moves to the background has no timeout from then on. A
 command a script runs as a daemon step (`run_step`) has no timeout unless
 its arguments name one, which then ends it with `timed_out`, since a step
 cannot be handed back as a handle; its call's time stops while it runs, as
@@ -3045,7 +3045,7 @@ starts a background command as a turn's call does, under `CALL:STEP`: it is
 the bot's, not the call's, so the step answers at once with its `proc:N`
 handle, which outlives the call for the model to `wait` on, and its end is
 told as any background command's. No bot has a share of its own: once the daemon's background
-commands, steered ones included, are past `--max-processes` (64 a CPU by
+commands, yielded ones included, are past `--max-processes` (64 a CPU by
 default), starting one more kills a command of the bot holding the most,
 the one it started or waited on least recently, never one of its 8 most
 recent (under a bound of 8, the bound's number, so one bot past a small
@@ -3672,9 +3672,8 @@ model can act on it; the service wakes a parked one then from its own
 schedule, so a waiting call costs a row and no timer. A later call's gate that
 lapses first ends the wait as `tool_unserved` and the turn as it ends one
 waiting on a verdict. A message that joins the turn lifts the wait as it
-lifts a verdict's (see [tool approval](#tool-approval)) when the tool is
-declared with `lift` (protocol 70, below) or a step of the call waits on a
-gate: the call becomes a
+lifts a verdict's (see [tool approval](#tool-approval)) only while a step
+of the call waits on a gate (protocol 92, below): the call becomes a
 `proc:` handle answered `"waits_for":"answer"`, its client still lists,
 takes and answers it, and the answer ends the command, told as
 `{"answer": TEXT}`. Any other call keeps the message for its answer. An interrupt ends the call as cancelled, like any
@@ -3691,17 +3690,28 @@ on. Codex never moves a running tool aside for a new message: the message
 waits for the call to return, and a long command yields on its own. Now a
 steer lifts a call its client answers only when the tool is declared with
 `"lift": true`, a tool whose calls may run for minutes or wait on a person
-(Sonny marks `exec`, `browser` and `desktop`), and only once the call has
-waited the 250 ms grace a foreground `shell` command gets; or, at once,
-when a step of the call waits on a gate, since that is a wait for a
-verdict, which a steer always lifts. Any other call is answered first and
-the steer joins the turn at the next boundary. A call of a tool that
-lifts holds live for the whole grace, whatever the bot's
-`approval_hold_ms`, so it never parks inside it and is lifted live rather
-than parked and woken again; parked, a steer resumes the turn only when the call
-lifts, and a step that starts waiting on a gate while a steer waits wakes
-it (or the live turn) then. Calls waiting for their approval, and `shell`
-commands, are lifted as before.
+(Sonny marked `exec`, `browser` and `desktop`), once the call had waited
+the 250 ms grace a foreground `shell` command got; or, at once, when a
+step of the call waits on a gate, since that is a wait for a verdict,
+which a steer always lifts. Any other call is answered first and the
+steer joins the turn at the next boundary.
+
+Protocol version 92 drops `lift`: a steer never moves a running call,
+as Codex never does. A busy lead fed a note every few seconds had a
+quick `exec` (a message sent, a task started) come back as
+`{"background":true,"steered":true}` dozens of times a day, each costing
+a `wait` call and a model round on a long conversation. A call runs until
+it ends or yields on its own time: a `shell` command at its `timeout_ms`,
+a client's call when its client yields it (`yield_call`, below; Sonny's
+`exec` at its 30 s `yield_time_ms`), a `write_stdin` at its
+`yield_time_ms`. The steer is taken at the next model request. What waits
+on someone rather than on work still ends on a steer at once: a `wait`
+(`steered: true`, its handles pending), a call waiting for its approval,
+and a client's call one of whose steps waits on a gate, each lifted to
+the background as before; parked, a steer resumes the turn only for
+those, and a step that starts waiting on a gate while a steer waits wakes
+it (or the live turn) then. What a client may yield is declared
+`"yields": true` in place of `lift`.
 
 Protocol version 85 lets the client hand such a call back itself, as
 Codex's `exec` yields a script still running at its `yield_time_ms`:
@@ -3719,8 +3729,8 @@ ends it and is told and collected as a lifted call's, pictures included;
 `lifted_ended` with `outcome: "stopped"` tells its client to stop the
 work. Its daemon steps run on, and what they kept stays readable until the
 call ends; a lifted call's steps keep theirs the same way. Only a waiting
-call of a tool declared `lift` yields: any other tool's is
-`call_not_liftable`, and one answered, lifted or out of time already is
+call of a tool declared `yields` (protocol 92; `lift` before) yields: any
+other tool's is `call_not_yieldable`, and one answered, lifted or out of time already is
 `no_pending_call`.
 
 Protocol version 85 also gives `wait` `terminate: true`: each handle,
@@ -4007,8 +4017,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   decided; a verdict for a call after a `wait` waits in the store.
 - **A message lifts the wait** (protocol 64, schema 91). A steer that
   joins the turn while a call waits for its verdict, held live or parked,
-  wakes the turn and lifts the call (a call its client answers only as
-  protocol 70 says, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
+  wakes the turn and lifts the call (a call its client answers only while
+  a step of it waits on a gate, protocol 92, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
   its request `process` (an indexed column), and answers the call with
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`

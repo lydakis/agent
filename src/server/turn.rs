@@ -237,8 +237,8 @@ pub struct Turn {
     /// boundary takes it. The bot's record holds the request too, so a
     /// turn that parks or a daemon that restarts still takes it.
     pub compact: Arc<AtomicBool>,
-    /// A `steer` for this turn, which moves a foreground command it is
-    /// running to the background.
+    /// A `steer` for this turn, which ends what waits on someone rather
+    /// than on work: a `wait`, a call waiting on its verdict.
     pub lift: Arc<Lift>,
     pub tokens: Arc<TokenTotals>,
     /// Results this turn's `read` found on the bot's lineage.
@@ -261,10 +261,12 @@ pub struct Turn {
 }
 
 /// A steer waiting for the running turn's next boundary. Armed by `steer`
-/// delivery alone and cleared where the boundary reads steers. A
-/// foreground command running while it is armed moves to the background
-/// and returns its handle, so no command holds a steer back; nothing is
-/// killed, and the bot waits on the handle if it still wants the result.
+/// delivery alone and cleared where the boundary reads steers. It never
+/// moves a running call: a command or a client's call runs until it ends
+/// or yields on its own time, as Codex's do, and the steer joins at the
+/// next model request. What waits on someone rather than on work goes at
+/// once: a `wait` ends with what resolved, and a call waiting on its
+/// verdict, or one whose step does, moves to the background.
 #[derive(Default)]
 pub struct Lift {
     armed: AtomicBool,
@@ -281,9 +283,8 @@ impl Lift {
     fn is_armed(&self) -> bool {
         self.armed.load(Relaxed)
     }
-    /// Once armed, and LIFT_GRACE later: a command that ends that soon
-    /// returns as usual, so a quick one never becomes a handle.
-    async fn lifted(&self) {
+    /// Once armed.
+    async fn armed(&self) {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -293,26 +294,18 @@ impl Lift {
             }
             notified.await;
         }
-        tokio::time::sleep(LIFT_GRACE).await;
     }
 }
 
-/// Why a running foreground command moves to the background: a steer, or,
-/// when its call names a time to yield, that time passing first.
-async fn moved(lift: &Lift, yield_ms: Option<u64>) -> Moved {
-    let yielded = async {
-        match yield_ms {
-            Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        biased;
-        () = lift.lifted() => Moved::Steered,
-        () = yielded => Moved::Yielded,
+/// A running foreground command's time to yield, when its call names one:
+/// it moves to the background then, as Codex's unified exec yields a
+/// command, and is never killed. With none it runs until it ends.
+async fn yields(yield_ms: Option<u64>) {
+    match yield_ms {
+        Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+        None => std::future::pending().await,
     }
 }
-const LIFT_GRACE: Duration = Duration::from_millis(250);
 /// The last lines of output a command that yields reports, as Codex hands
 /// back what a yielded command wrote so far.
 const YIELD_LINES: usize = 20;
@@ -320,20 +313,11 @@ const YIELD_LINES: usize = 20;
 /// waits for the daemon's process budget, so this is a bot's share of it.
 pub(super) const PARALLEL_CALLS: usize = 4;
 
-/// A tool's result, or the command moved to the background, and why.
+/// A tool's result, or the command, which ran past its call's
+/// timeout_ms, moved to the background.
 enum Ran<F, T = Outcome> {
     Done(Result<T>),
-    Lifted(std::pin::Pin<Box<F>>, Moved),
-}
-
-/// Why a running foreground command moved to the background.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Moved {
-    /// A message for the turn came.
-    Steered,
-    /// It ran past its call's timeout_ms, which yields it, as Codex's
-    /// unified exec yields a command, and never kills it.
-    Yielded,
+    Yielded(std::pin::Pin<Box<F>>),
 }
 
 /// Provider-reported tokens across every turn since the daemon started,
@@ -3043,27 +3027,50 @@ impl Turn {
                         CallAnswer::Given(outcome) => Some(outcome),
                         // Woken by its client's yield: the handle answers it.
                         CallAnswer::Yielded => None,
-                        // Woken by a message for the turn: the call is
-                        // lifted to the background, unless its answer came
-                        // or its time ran out meanwhile.
-                        CallAnswer::Pending { .. }
+                        // Woken by a message for the turn while a step of
+                        // the call waits on a gate: the call is lifted to
+                        // the background, unless its answer came or its
+                        // time ran out meanwhile.
+                        CallAnswer::Pending { gated: true, .. }
                             if self.lift.is_armed()
                                 && self.lift_call(&waiting.call_id, None, Vec::new()).await? =>
                         {
                             None
                         }
-                        CallAnswer::Pending { .. } if self.lift.is_armed() => match take().await? {
+                        // A message for the turn with no later gated call
+                        // lapsed: the call runs, its step past its gate by
+                        // now, so the turn waits on for its answer and
+                        // takes the message after, as a running call is
+                        // never moved.
+                        CallAnswer::Pending { .. }
+                            if self.lift.is_armed() && !self.lapsed().await? =>
+                        {
+                            let mut rest = waiting.pending.clone().into_iter();
+                            let (route, retry) =
+                                (accounting.route.get(), accounting.summary_retry());
+                            match self
+                                .await_answer(
+                                    &waiting.call_id,
+                                    &mut rest,
+                                    route.map(String::as_str),
+                                    retry,
+                                )
+                                .await?
+                            {
+                                ControlFlow::Continue(outcome) => outcome,
+                                ControlFlow::Break(stop) => return Ok(stop.round()),
+                            }
+                        }
+                        // Woken by a later gated call's lapse, which ends
+                        // the turn: the call ends unanswered, unless its
+                        // answer came meanwhile.
+                        CallAnswer::Pending { .. } => match take().await? {
                             CallAnswer::Given(outcome) => Some(outcome),
                             CallAnswer::Yielded => None,
-                            CallAnswer::Pending { .. } => {
-                                return fail("invalid_tool_state");
-                            }
+                            CallAnswer::Pending { .. } => Some(unserved(
+                                "a later call's gate lapsed before the answer".into(),
+                            )),
                         },
-                        // Woken by a later gated call's lapse, which ends
-                        // the turn: the call ends unanswered.
-                        CallAnswer::Pending { .. } => Some(unserved(
-                            "a later call's gate lapsed before the answer".into(),
-                        )),
                     };
                     if let Some(outcome) = outcome {
                         let id = waiting.call_id.clone();
@@ -4560,31 +4567,31 @@ impl Turn {
     }
 
     /// Run a prepared tool. The outer error is the runtime's; the inner one
-    /// is the tool's result. With `lift`, a steer, or its time to yield
-    /// passing, moves the run to the background instead, handed back
-    /// unfinished, once the paired signal says it is running: a command
-    /// still waiting for a process slot stays in line in the foreground.
+    /// is the tool's result. With `yielding`, its time to yield passing
+    /// moves the run to the background instead, handed back unfinished,
+    /// once the paired signal says it is running: a command still waiting
+    /// for a process slot stays in line in the foreground.
     async fn run_tool<T, F: Future<Output = Result<T>>>(
         &self,
         run: F,
-        lift: Option<(&Lift, oneshot::Receiver<()>, Option<u64>)>,
+        yielding: Option<(oneshot::Receiver<()>, Option<u64>)>,
     ) -> Result<Ran<F, T>> {
         let mut run = Box::pin(run);
-        let lifted = async {
+        let yielded = async {
             // A run that ends before it starts wins the race below.
-            if let Some((lift, running, yield_ms)) = lift
+            if let Some((running, yield_ms)) = yielding
                 && running.await.is_ok()
             {
-                moved(lift, yield_ms).await
+                yields(yield_ms).await
             } else {
                 std::future::pending().await
             }
         };
-        tokio::pin!(lifted);
+        tokio::pin!(yielded);
         Ok(tokio::select! {
             biased;
             result = &mut run => Ran::Done(result),
-            moved = &mut lifted => Ran::Lifted(run, moved),
+            () = &mut yielded => Ran::Yielded(run),
         })
     }
 
@@ -4754,14 +4761,13 @@ impl Turn {
             };
             let declared = record.declared(&call.name);
             let answered = declared.is_some_and(|tool| tool.answered_by.is_some());
-            let lifts = declared.is_some_and(|tool| tool.lift);
             // A terminal whose end this result shows its bot.
             let mut seen = None;
             let outcome = match prepared {
                 // A declared tool runs nothing: its meaning is its client's,
                 // and so is its answer, when its client gives one.
                 Ok(Prepared::Declared(_)) if answered => match self
-                    .await_answer(&call.call_id, lifts, &mut calls, route, summary_retry_ms)
+                    .await_answer(&call.call_id, &mut calls, route, summary_retry_ms)
                     .await?
                 {
                     ControlFlow::Continue(Some(outcome)) => outcome,
@@ -4785,7 +4791,7 @@ impl Turn {
                             self.kept(outcome, workspace, &call.call_id).await
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(..) => unreachable!("only a command moves to the background"),
+                        Ran::Yielded(..) => unreachable!("only a command moves to the background"),
                     }
                 }
                 Ok(Prepared::Wait {
@@ -4879,7 +4885,7 @@ impl Turn {
                             seen = Some(id);
                             failure(error)
                         }
-                        Ran::Lifted(..) => unreachable!("only a command moves to the background"),
+                        Ran::Yielded(..) => unreachable!("only a command moves to the background"),
                     }
                 }
                 // A poll past the bot's hold parks the turn as `wait` does,
@@ -4926,7 +4932,7 @@ impl Turn {
                             failure(self.no_terminal(handle, error).await?)
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(..) => unreachable!("only a command moves to the background"),
+                        Ran::Yielded(..) => unreachable!("only a command moves to the background"),
                     }
                 }
                 Ok(Prepared::WriteStdin {
@@ -4956,7 +4962,7 @@ impl Turn {
                                 .unwrap_or_else(failure)
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(..) => unreachable!("only a command moves to the background"),
+                        Ran::Yielded(..) => unreachable!("only a command moves to the background"),
                     }
                 }
                 Ok(Prepared::Read {
@@ -5057,10 +5063,7 @@ impl Turn {
                         started,
                         spill,
                     );
-                    match self
-                        .run_tool(run, Some((&self.lift, running, timeout_ms)))
-                        .await?
-                    {
+                    match self.run_tool(run, Some((running, timeout_ms))).await? {
                         Ran::Done(Ok(outcome)) => {
                             self.kept(outcome, workspace, &call.call_id).await
                         }
@@ -5068,19 +5071,11 @@ impl Turn {
                             return Err(error);
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(run, moved) => {
+                        Ran::Yielded(run) => {
                             let outputs = self.outputs(workspace);
                             let owner = record.bot_id;
-                            self.lift_shell(
-                                &call.call_id,
-                                listed,
-                                owner,
-                                run,
-                                &place,
-                                outputs,
-                                moved,
-                            )
-                            .await?
+                            self.yield_shell(&call.call_id, listed, owner, run, &place, outputs)
+                                .await?
                         }
                     }
                 }
@@ -5110,7 +5105,7 @@ impl Turn {
                         return Err(error);
                     }
                     Ran::Done(Err(error)) => failure(error),
-                    Ran::Lifted(..) => unreachable!("only a command moves to the background"),
+                    Ran::Yielded(..) => unreachable!("only a command moves to the background"),
                 },
                 Err(error) => failure(error),
             };
@@ -5169,8 +5164,9 @@ impl Turn {
     /// Run a batch of calls [`Self::parallel`] admits together, up to
     /// [`PARALLEL_CALLS`] at a time and no more than half the process
     /// budget: all started in one commit, each result recorded in call
-    /// order as soon as it and those before it are done. A steer moves every command still running to the
-    /// background, as it does a lone one.
+    /// order as soon as it and those before it are done. Each command
+    /// yields at its own timeout_ms, as a lone one does; a steer moves
+    /// none.
     async fn execute_parallel(
         &self,
         batch: Vec<(ToolCall, Prepared)>,
@@ -5272,7 +5268,7 @@ impl Turn {
         };
         match self.run_tool(record, None).await? {
             Ran::Done(result) => result,
-            Ran::Lifted(..) => unreachable!("a batch is not lifted whole"),
+            Ran::Yielded(..) => unreachable!("a batch does not yield whole"),
         }
     }
 
@@ -5323,34 +5319,26 @@ impl Turn {
                     started,
                     spill,
                 ));
-                let lifted = async {
+                let yielded = async {
                     // A run that ends before it starts wins the race below.
                     match running.await {
-                        Ok(()) => moved(&self.lift, timeout_ms).await,
+                        Ok(()) => yields(timeout_ms).await,
                         Err(_) => std::future::pending().await,
                     }
                 };
                 let finished = tokio::select! {
                     biased;
-                    result = &mut run => Ok(result),
-                    moved = lifted => Err(moved),
+                    result = &mut run => Some(result),
+                    () = yielded => None,
                 };
                 match finished {
-                    Ok(result) => result,
-                    Err(moved) => {
+                    Some(result) => result,
+                    None => {
                         let outputs = self.outputs(workspace);
                         return (
                             call_id.clone(),
-                            self.lift_shell(
-                                &call_id,
-                                listed,
-                                record.bot_id,
-                                run,
-                                &place,
-                                outputs,
-                                moved,
-                            )
-                            .await,
+                            self.yield_shell(&call_id, listed, record.bot_id, run, &place, outputs)
+                                .await,
                         );
                     }
                 }
@@ -5494,8 +5482,9 @@ impl Turn {
                 }
             };
             // A message for the turn lifts the call to the background, as
-            // it lifts a command: the turn takes the message, and the call
-            // waits on for its verdict.
+            // it ends a `wait`: the call waits on someone, not on work, so
+            // the turn takes the message, and the call waits on for its
+            // verdict.
             if self.lift.is_armed() {
                 let served = self.hub.serving(
                     (record.gates.iter())
@@ -5512,7 +5501,7 @@ impl Turn {
                 tokio::select! {
                     () = notify.notified() => continue,
                     () = tokio::time::sleep_until(wake) => {}
-                    () = self.lift.lifted() => continue,
+                    () = self.lift.armed() => continue,
                 }
             }
             // A lapsed gate is judged by the next check.
@@ -5638,6 +5627,16 @@ impl Turn {
         })
     }
 
+    /// Whether one of the turn's undecided gated calls has lapsed, which
+    /// ends the turn.
+    async fn lapsed(&self) -> Result<bool> {
+        let turn = self.turn;
+        let lapse = (self.store)
+            .read("next_lapse", move |db| db.next_lapse(turn))
+            .await?;
+        Ok(lapse.is_some_and(|at| now_ms() >= at))
+    }
+
     /// Lift `call_id`, waiting on its verdict or its client's answer, to
     /// the background for a message that joins the turn. False when it is
     /// decided or answered by now: the next check takes it.
@@ -5665,17 +5664,17 @@ impl Turn {
     }
 
     /// Wait for an answered call's answer: live for the hold, then parked
-    /// like `wait`, holding no task and no slot, until the answer comes or
-    /// the call's time runs out. Answers wake the task through the worker,
-    /// so each check is one job and no commit. A message for the turn
-    /// lifts the call only when its tool `lifts` (once it has waited the
-    /// grace a command gets) or one of its steps waits on a gate (at
-    /// once, as a gated call is lifted); any other call is answered first,
-    /// and the turn takes the message at its next boundary.
+    /// like `wait`, holding no task and no slot, until the answer comes,
+    /// its client yields it, or the call's time runs out. Answers wake the
+    /// task through the worker, so each check is one job and no commit. A
+    /// message for the turn lifts the call only while one of its steps
+    /// waits on a gate (at once, as a gated call is lifted), since it then
+    /// waits on someone, not on work; a running call is answered first,
+    /// and the turn takes the message at its next boundary, as Codex takes
+    /// one once the running tool returns.
     async fn await_answer(
         &self,
         call_id: &str,
-        lifts: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
@@ -5686,10 +5685,9 @@ impl Turn {
         let started = tokio::time::Instant::now();
         let hold =
             started + Duration::from_millis(self.settings().approval_hold_ms().min(ANSWER_HOLD_MS));
-        let graced = started + LIFT_GRACE;
         loop {
             let id = call_id.to_owned();
-            let (notify, expires_ms) = match self
+            let (notify, expires_ms, gated) = match self
                 .store
                 .op("answer_take", move |db| db.answer_take(turn, &id, now_ms()))
                 .await?
@@ -5699,16 +5697,15 @@ impl Turn {
                 CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(Some(outcome))),
                 // Its client yielded it: the handle answers it already.
                 CallAnswer::Yielded => return Ok(ControlFlow::Continue(None)),
-                CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
+                CallAnswer::Pending {
+                    notify,
+                    expires_ms,
+                    gated,
+                } => (notify, expires_ms, gated),
             };
-            // No deadline while a step of the call waits on a gate: it
-            // waits on a verdict, as a gated call does.
-            let gated = expires_ms.is_none();
-            let liftable = gated || lifts;
             // A message for the turn lifts the call to the background: its
             // answer comes later, as the command's result.
-            if liftable && self.lift.is_armed() && (gated || tokio::time::Instant::now() >= graced)
-            {
+            if gated && self.lift.is_armed() {
                 match self.lift_call(call_id, None, Vec::new()).await? {
                     true => return Ok(ControlFlow::Continue(None)),
                     false => continue,
@@ -5717,17 +5714,10 @@ impl Turn {
             let lapse = expires_ms.map(|at| {
                 tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
             });
-            // A call of a tool that lifts waits out its grace live, never
-            // parked inside it: a steer that resumes a parked call lifts it
-            // at once, so parking first would cut the grace short.
-            let held = match lifts {
-                true => hold.max(graced),
-                false => hold,
-            };
-            let wake = lapse.map_or(held, |lapse| lapse.min(held));
+            let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
             let lifted = async {
-                match liftable {
-                    true => self.lift.lifted().await,
+                match gated {
+                    true => self.lift.armed().await,
                     false => std::future::pending().await,
                 }
             };
@@ -5738,10 +5728,10 @@ impl Turn {
                     () = lifted => continue,
                 }
             }
-            // A call out of time is answered by the next check, and one
-            // past its grace is lifted by it.
+            // A call out of time is answered by the next check, and a gated
+            // one a message came for is lifted by it.
             if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse)
-                || (liftable && self.lift.is_armed())
+                || (gated && self.lift.is_armed())
             {
                 continue;
             }
@@ -6744,13 +6734,12 @@ impl Turn {
             .unwrap_or_else(|_| Err(Error::new("turn_task_failed")))
     }
 
-    /// Move a running foreground command to the background: it keeps its
-    /// process slot, and its result arrives on a proc handle as a
-    /// background command's does. One `moved` there by its timeout says
-    /// so, with its last lines so far. A failure to record it drops the
-    /// command, which kills it.
-    #[allow(clippy::too_many_arguments)]
-    async fn lift_shell<F>(
+    /// Move a foreground command that ran past its timeout_ms to the
+    /// background: it keeps its process slot, and its result arrives on a
+    /// proc handle as a background command's does. Its call is answered
+    /// with the handle, yielded=true and its last lines so far. A failure
+    /// to record it drops the command, which kills it.
+    async fn yield_shell<F>(
         &self,
         call_id: &str,
         command: String,
@@ -6758,7 +6747,6 @@ impl Turn {
         run: std::pin::Pin<Box<F>>,
         place: &Place,
         outputs: Option<Outputs>,
-        moved: Moved,
     ) -> Result<Outcome>
     where
         F: Future<Output = Result<Outcome>> + Send + 'static,
@@ -6783,15 +6771,9 @@ impl Turn {
             let _ = sender.send(run.await);
         });
         self.collect(id, call_id, receiver, outputs, None);
-        let mut said = json!({"handle":format!("proc:{id}"),"background":true});
-        match moved {
-            Moved::Steered => said["steered"] = json!(true),
-            Moved::Yielded => {
-                said["yielded"] = json!(true);
-                if let Some((_, Some(lines))) = self.registry.output(id, YIELD_LINES) {
-                    said["tail"] = json!(lines);
-                }
-            }
+        let mut said = json!({"handle":format!("proc:{id}"),"background":true,"yielded":true});
+        if let Some((_, Some(lines))) = self.registry.output(id, YIELD_LINES) {
+            said["tail"] = json!(lines);
         }
         Ok(Outcome::text(said.to_string()))
     }
