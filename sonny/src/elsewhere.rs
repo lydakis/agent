@@ -332,6 +332,9 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
     // The agents a lead's turn marked done, by the lead: read again once
     // the turn ends, when the mark is beside the store.
     let mut marked: HashMap<String, Vec<String>> = HashMap::new();
+    // The agents closed while the follow ran: a turn still running in one
+    // can ask, and needs no one until a message opens it again.
+    let mut closed: HashSet<String> = HashSet::new();
     tell_waiting(&needs, &order, tell);
     loop {
         let Some(event) = events.recv().await else {
@@ -345,7 +348,20 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             continue;
         };
         let bot = bot.to_owned();
-        let ours = theirs(&bot);
+        let mut ours = theirs(&bot);
+        match event["event"].as_str() {
+            Some("closed") => _ = closed.insert(bot.clone()),
+            Some("deleted") => _ = closed.remove(&bot),
+            // A wait from an agent closed: only if a message opened it
+            // again since, as `/status` lists it only then.
+            _ if ours && closed.contains(&bot) && waits_from(&event) => {
+                match standing::rows(&client, std::slice::from_ref(&bot)).await {
+                    Ok(rows) if rows.iter().any(|row| row.name == bot) => _ = closed.remove(&bot),
+                    _ => ours = false,
+                }
+            }
+            _ => {}
+        }
         // A side chat needs no one, but it may mark its source done.
         let side = (!ours).then(|| crate::side_source(&bot)).flatten();
         let done = marks(&event, &bot, &order).map(|done| match side {
@@ -803,7 +819,7 @@ mod tests {
     /// store follows, the others hear it, and one of them follows on once
     /// it closes.
     #[tokio::test]
-    async fn an_approval_in_another_project_is_told_as_its_event_comes() {
+    async fn an_approval_in_another_project_is_told_as_its_event_comes_and_not_once_closed() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = std::env::temp_dir().join(format!("elsewhere-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -940,6 +956,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(names(&heard.borrow().outside("site")), ["tally.readme"]);
+        // Closed while its turn runs, it needs no one, and what that turn
+        // asks after needs no one either, till a message opens it again.
+        let closed = json!({"cursor": 12, "bot": "tally.readme", "event": "closed",
+            "data": {"closed_ms": 1}});
+        go.send(closed).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| shared.agents.is_empty()))
+            .await
+            .unwrap()
+            .unwrap();
+        go.send(held("tally.readme", "c4", 13)).unwrap();
+        go.send(held("site.fix", "c5", 14)).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| !shared.agents.is_empty()))
+            .await
+            .unwrap()
+            .unwrap();
+        let bots: Vec<String> = (heard.borrow().agents.iter())
+            .map(|(_, _, bot)| bot.clone())
+            .collect();
+        assert_eq!(bots, ["site.fix"]);
         drop(second);
         std::fs::remove_dir_all(dir).unwrap();
     }
