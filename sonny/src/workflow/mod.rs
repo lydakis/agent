@@ -945,8 +945,10 @@ fn compose(dir: &Path, roles: &Path, role: Option<&str>) -> Result<Told, String>
     let role = role
         .map(|name| crate::project::profile(roles, name))
         .transpose()?;
-    let composed = agent_client::policy::instructions(dir, role.as_ref(), &memory)
-        .map_err(|e| format!("{}: {e}", e.code()))?;
+    let composed = agent_client::policy::hiding(&agent_client::hidden::known(), || {
+        agent_client::policy::instructions(dir, role.as_ref(), &memory)
+    })
+    .map_err(|e| format!("{}: {e}", e.code()))?;
     Ok(Told {
         instructions: format!("{}\n\n{}", composed.text, told_text()),
         model: role.as_ref().and_then(|role| role.model.clone()),

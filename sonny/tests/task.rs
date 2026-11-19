@@ -36,7 +36,7 @@ impl Lab {
             "#!/bin/sh\ncase \"$1\" in\n\
              run) [ ! -e \"$AGENT_LOG.refuse\" ] || { cat \"$AGENT_LOG.refuse\" >&2; exit 1; }; \
              for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
-             ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
+             ls) if [ \"$3\" = \"$AGENT_BOT\" ] && ! grep -qs \"\\\"name\\\":\\\"$3\\\"\" \"$AGENT_LOG.ls\"; then printf '[{\"name\":\"%s\",\"bot_id\":1}]' \"$3\"; else cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]'; fi;;\n\
              inspect) cat \"$AGENT_LOG.inspect\" 2>/dev/null || exit 1;;\n\
              turns) cat \"$AGENT_LOG.turns\" 2>/dev/null || echo '[]';;\n\
              messages) cat \"$AGENT_LOG.messages\" 2>/dev/null || echo '[]';;\n\

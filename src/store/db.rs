@@ -604,6 +604,10 @@ impl Settings {
         use crate::sandbox::Mode;
         self.rules = creator.rules.clone();
         self.env = creator.env.clone();
+        // Where its cut outputs go is where its creator's do: the daemon
+        // makes that folder and writes it outside any sandbox, so no bot
+        // names one for the bots it makes.
+        self.outputs = creator.outputs.clone();
         // What its creator's models serve and hold, unless its client
         // said.
         if self.speeds.is_empty() {
@@ -643,8 +647,9 @@ impl Settings {
     /// `creator`'s settings makes, [`Settings::under`] would not keep as
     /// asked: a sandbox looser than its creator's, said, so the bot is
     /// refused rather than made otherwise than asked. Those left unasked
-    /// take its creator's, and its `rules` and `env` are its creator's
-    /// whatever it asks, as no client picks them for a bot another makes.
+    /// take its creator's, and its `rules`, `env` and `outputs` are its
+    /// creator's whatever it asks, as no client picks them for a bot
+    /// another makes.
     pub fn beyond(&self, creator: &Settings) -> Option<String> {
         let held = self.clone().under(creator);
         let creator_sandbox = || {
@@ -21257,6 +21262,30 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_made_bot_s_outputs_are_its_creator_s_whatever_it_asks() {
+        let creator = Settings {
+            outputs: Some("/home/p/cut".into()),
+            ..Settings::default()
+        };
+        for asked in [None, Some("/home/p/.agent/keys".to_owned())] {
+            let made = Settings {
+                outputs: asked,
+                ..Settings::default()
+            };
+            assert_eq!(made.under(&creator).outputs, creator.outputs);
+        }
+        let sandboxed = Settings {
+            sandbox: Some(crate::sandbox::Mode::WorkspaceWrite),
+            ..creator.clone()
+        };
+        let made = Settings {
+            outputs: Some("/etc".into()),
+            ..Settings::default()
+        };
+        assert_eq!(made.under(&sandboxed).outputs, creator.outputs);
+    }
 
     #[test]
     fn one_bots_approvals_read_only_its_own_running_commands() {

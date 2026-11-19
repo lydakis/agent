@@ -120,6 +120,11 @@ fn run() -> Result<i32> {
             agent_runtime::sandbox::write(std::path::Path::new(&args[1]))?;
             return Ok(0);
         }
+        // A sandboxed bot's patch, which the daemon runs in the sandbox.
+        Some(agent_runtime::sandbox::PATCH) if args.len() == 1 => {
+            agent_runtime::sandbox::patch()?;
+            return Ok(0);
+        }
         None => return fail_with("usage", "a command is required; use agent --help"),
         _ => {}
     }
