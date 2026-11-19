@@ -1311,12 +1311,11 @@ pub(crate) fn fire(
         ),
         _ if step => format!(
             "{STEP}{question}{STEP_WAITS} so do not go ahead with what needs it. Go on with what \
-             does not depend on it, and say in one line what it holds up, so they see it again. \
-             {tail}"
+             does not depend on it. {tail}"
         ),
         _ => format!(
             "{WAIT}{question}{WAIT_WAITS} person, so do not go ahead with it. Go on with what does \
-             not depend on it, and say in one line what it holds up, so they see it again. {tail}"
+             not depend on it. {tail}"
         ),
     }
 }
@@ -2902,6 +2901,13 @@ mod tests {
         let step = fire("Sign in to npm", Unanswered::Wait, None, "", true);
         assert!(step.contains("your step went: \"Sign in to npm\""));
         assert!(step.contains("do not go ahead with what needs it"));
+        // The card, the composer and the pane already show an open ask
+        // (George, 11-19): a reminder wakes the agent without asking it
+        // for a line about what is held up.
+        for fired in [&wait, &step] {
+            assert!(fired.contains("Go on with what does not depend on it. This is Sonny"));
+            assert!(!fired.contains("one line"));
+        }
     }
 
     #[test]
@@ -2956,6 +2962,13 @@ mod tests {
         .unwrap();
         assert_eq!((step.question.as_str(), step.step), ("npm login", true));
         assert_eq!(said(&step), "Waits for you to run it; a reminder at 01:55.");
+        // A reminder set before its fire dropped the line about what is
+        // held up reads back the same.
+        let old = format!(
+            "{WAIT}{question}{WAIT_WAITS} person, so do not go ahead with it. Go on with what \
+             does not depend on it, and say in one line what it holds up, so they see it again."
+        );
+        assert_eq!(reminder(gate, when, &old), Some(wait.clone()));
         // A name with a quote in it, as the gate writes it.
         let quoted = reminder("'/s' ask open 'it'\\''s' 3 'c'", when, &later).unwrap();
         assert_eq!(quoted.asker, "it's");
