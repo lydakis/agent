@@ -77,6 +77,10 @@ struct Block {
     note: bool,
     /// A list's items after its first, where each can be read on from.
     items: Vec<Item>,
+    /// A paragraph, and the marks in it that run across lines: it is
+    /// read on from no line inside one.
+    paragraph: bool,
+    across: Vec<Range<usize>>,
     /// A fence at the top level, open where the text ends: its marks and
     /// language.
     fence: Option<Fence>,
@@ -218,12 +222,19 @@ fn draw_after(
         top: None,
         top_holds: false,
         top_note: false,
+        top_paragraph: false,
+        across: Vec::new(),
         skip,
         loose: None,
         items: Vec::new(),
     };
     let mut events = Parser::new_ext(source, options()).into_offset_iter();
     for (event, range) in events.by_ref() {
+        // The definitions read before are read again only for what they
+        // define: they are not drawn.
+        if range.end <= skip {
+            continue;
+        }
         draw.event(event, range);
     }
     let links = (events.reference_definitions().iter())
@@ -301,6 +312,10 @@ struct Draw<'a> {
     top_holds: bool,
     /// The top-level block is a footnote's definition.
     top_note: bool,
+    /// The top-level block is a paragraph.
+    top_paragraph: bool,
+    /// Its marks that run across lines.
+    across: Vec<Range<usize>>,
     /// Where the text drawn starts: before it, definitions read earlier,
     /// drawn only for what they define.
     skip: usize,
@@ -346,6 +361,15 @@ impl Draw<'_> {
     }
 
     fn event(&mut self, event: Event<'_>, range: Range<usize>) {
+        if self.top_paragraph
+            && matches!(
+                event,
+                Event::Start(_) | Event::Code(_) | Event::InlineMath(_) | Event::InlineHtml(_)
+            )
+            && self.source[range.clone()].contains('\n')
+        {
+            self.across.push(range.clone());
+        }
         if let Some(Leaf::Table(_)) = &self.leaf {
             if let Event::End(TagEnd::Table) = event {
                 let Some(Leaf::Table(table)) = self.leaf.take() else {
@@ -456,6 +480,8 @@ impl Draw<'_> {
         {
             let note = std::mem::take(&mut self.top_note);
             let items = std::mem::take(&mut self.items);
+            let paragraph = std::mem::take(&mut self.top_paragraph);
+            let across = std::mem::take(&mut self.across);
             let holds = std::mem::take(&mut self.top_holds);
             if start < self.skip {
                 self.rows.clear();
@@ -479,6 +505,8 @@ impl Draw<'_> {
                 holds,
                 note,
                 items,
+                paragraph,
+                across,
                 fence,
             });
         }
@@ -493,6 +521,7 @@ impl Draw<'_> {
         }
         match tag {
             Tag::Paragraph => {
+                self.top_paragraph |= self.holders.is_empty();
                 self.begin(range.start);
                 self.leaf = Some(Leaf::Words);
                 self.styles = vec![self.base()];
@@ -1272,7 +1301,7 @@ fn closed(line: &str) -> String {
 
 /// Markdown read one line at a time, as a reply streams in: each line
 /// [`Markdown::feed`] reads hands out the rows that will not change, the
-/// rows of the block still open shown by [`Markdown::open`] until they
+/// rows of the block still open shown by [`Markdown::open_last`] until they
 /// are, and [`Markdown::end`] the rest.
 #[derive(Default, Clone)]
 pub struct Markdown {
@@ -1294,9 +1323,22 @@ pub struct Markdown {
     /// The open block holds its rows until it ends, as a table does, and
     /// whether a blank row goes before them.
     held: Option<bool>,
+    /// The last preview: the line it showed, at what width, whether first,
+    /// how many rows at most, and its rows. A frame drawn with no new words
+    /// draws none again.
+    shown: std::cell::RefCell<Option<Shown>>,
     /// A fence at the top level open: read a line at a time, its code
     /// colored as it comes, or a picture's source gathered until it closes.
     fence: Option<Open>,
+}
+
+#[derive(Clone)]
+struct Shown {
+    partial: String,
+    width: usize,
+    first: bool,
+    most: usize,
+    rows: Vec<Line<'static>>,
 }
 
 #[derive(Clone)]
@@ -1331,6 +1373,7 @@ impl Markdown {
     /// says nothing of the reply is shown yet, so its first row gets the
     /// bullet.
     pub fn feed(&mut self, text: &str, width: usize, first: bool) -> Vec<Line<'static>> {
+        *self.shown.get_mut() = None;
         let mut lines = String::new();
         self.rewrite.line(text, &mut lines);
         let mut out = Vec::new();
@@ -1390,8 +1433,9 @@ impl Markdown {
             let notes = (blocks.iter())
                 .filter(|block| block.note)
                 .map(|block| block.start..block.end);
-            for span in (links.iter().cloned())
+            for span in (links.iter())
                 .filter(|span| span.end <= ended)
+                .cloned()
                 .chain(notes)
             {
                 self.defs.push_str(&self.source[span]);
@@ -1472,6 +1516,22 @@ impl Markdown {
         }
         self.last = rows;
         self.held = open.holds.then_some(gap);
+        // A reply's paragraph, whose every line is a row of its own, reads
+        // on from its first line not out, when that line starts with a word
+        // and so goes on as the words it is: the lines out are done.
+        if open.paragraph
+            && !self.at.document
+            && self.given > 0
+            && let Some(&cut) = open.offsets.get(self.given)
+            && open.offsets[self.given - 1] < cut
+            && !(open.across.iter()).any(|marks| marks.start < cut && cut < marks.end)
+            && let Some(from) = cut.checked_sub(drained)
+            && starts_with_word(&self.source[from..])
+        {
+            self.source.drain(..from);
+            self.last.drain(..self.given);
+            self.given = 0;
+        }
     }
 
     /// Rows going out, after a blank row when one was written before them.
@@ -1486,9 +1546,43 @@ impl Markdown {
         self.any = true;
     }
 
-    /// The rows not handed out yet, as they read now, with `partial`, the
-    /// line still coming, read as it will once its marks close.
+    /// All the rows not handed out yet.
+    #[cfg(test)]
     pub fn open(&self, partial: &str, width: usize, first: bool) -> Vec<Line<'static>> {
+        self.open_last(partial, width, first, usize::MAX)
+    }
+
+    /// The last `most` of the rows not handed out yet, as they read now,
+    /// with `partial`, the line still coming, read as it will once its marks
+    /// close: as many as a screen shows.
+    pub fn open_last(
+        &self,
+        partial: &str,
+        width: usize,
+        first: bool,
+        most: usize,
+    ) -> Vec<Line<'static>> {
+        // A table's rows wait for its lines to end: the line still coming
+        // changes nothing.
+        let partial = if self.held.is_some() { "" } else { partial };
+        if let Some(shown) = &*self.shown.borrow()
+            && shown.partial == partial
+            && (shown.width, shown.first, shown.most) == (width, first, most)
+        {
+            return shown.rows.clone();
+        }
+        let rows = self.preview(partial, width, first, most);
+        *self.shown.borrow_mut() = Some(Shown {
+            partial: partial.to_owned(),
+            width,
+            first,
+            most,
+            rows: rows.clone(),
+        });
+        rows
+    }
+
+    fn preview(&self, partial: &str, width: usize, first: bool, most: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         if let Some(open) = &self.fence {
             if open.picture.is_none() && !partial.is_empty() {
@@ -1510,11 +1604,13 @@ impl Markdown {
         // A table is drawn as its lines end: the line still coming waits
         // for its own end, so no column widens and narrows as it is typed.
         if let Some(gap) = self.held {
-            out.extend(self.last.iter().cloned());
-            if gap && self.any && !out.is_empty() {
-                out.insert(0, Line::from("  "));
+            let gap = usize::from(gap && self.any && !self.last.is_empty());
+            let from = (self.last.len() + gap).saturating_sub(most);
+            if gap > from {
+                out.push(Line::from("  "));
             }
-            bullet(&mut out, first && !self.any);
+            out.extend(self.last[from.saturating_sub(gap)..].iter().cloned());
+            bullet(&mut out, from == 0 && first && !self.any);
             return out;
         }
         let mut source = self.source.clone();
@@ -1541,6 +1637,7 @@ impl Markdown {
             any = true;
         }
         bullet(&mut out, first && !self.any);
+        out.drain(..out.len().saturating_sub(most));
         out
     }
 
@@ -1608,6 +1705,9 @@ fn draw_defined(
         for item in &mut block.items {
             item.cut -= skip;
         }
+        for marks in &mut block.across {
+            *marks = marks.start - skip..marks.end - skip;
+        }
         for offset in &mut block.offsets {
             *offset -= skip;
         }
@@ -1616,6 +1716,13 @@ fn draw_defined(
         .into_iter()
         .map(|span| span.start - skip..span.end - skip);
     (blocks, links.collect())
+}
+
+/// Whether a line starts with a letter, at most three spaces in: words
+/// that start no block of their own.
+fn starts_with_word(line: &str) -> bool {
+    let words = line.trim_start_matches(' ');
+    line.len() - words.len() <= 3 && words.chars().next().is_some_and(char::is_alphabetic)
 }
 
 /// The list item `source` starts with, after its blank lines, numbered
@@ -1744,6 +1851,8 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         top: None,
         top_holds: false,
         top_note: false,
+        top_paragraph: false,
+        across: Vec::new(),
         skip: 0,
         loose: None,
         items: Vec::new(),
@@ -1942,6 +2051,7 @@ mod tests {
             "1. a\n1. b\n1. c\n\n   more c\n1. d\n\nAfter.",
             "[x]: /x\n- a\n\n- b [x][x]\n- c\n  lazy\n  - nested\n\n    deep\n- [ ] task\n\nEnd.",
             "7) seven\n8) eight\n- other list\n- again\n\n  10. inner\n  11. inner",
+            "Words\n2. not a list\n    not code\nword *em\nphasis* and `co\nde` end\nmore words\nlast",
         ];
         for reply in replies {
             for markdown in [
@@ -2031,6 +2141,29 @@ mod tests {
         for _ in 0..5 {
             once = once.min(time(4_000));
             twice = twice.min(time(8_000));
+            if twice < once * 3 + std::time::Duration::from_millis(50) {
+                return;
+            }
+        }
+        panic!("{once:?} then {twice:?}");
+    }
+
+    #[test]
+    fn a_long_paragraph_streamed_costs_its_length_once() {
+        let time = |lines: usize| {
+            let mut markdown = Markdown::default();
+            let started = std::time::Instant::now();
+            for at in 0..lines {
+                markdown.open(&format!("line {at} of the"), 80, false);
+                markdown.feed(&format!("line {at} of the `long` paragraph"), 80, false);
+            }
+            markdown.end(80, false);
+            started.elapsed()
+        };
+        let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..5 {
+            once = once.min(time(2_000));
+            twice = twice.min(time(4_000));
             if twice < once * 3 + std::time::Duration::from_millis(50) {
                 return;
             }

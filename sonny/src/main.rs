@@ -12272,7 +12272,13 @@ impl App {
 
     /// The bot's words not yet written: the rows held, then the open line,
     /// the part after the last newline, as the rows it will take.
+    #[cfg(test)]
     fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
+        self.open_last_rows(width, usize::MAX)
+    }
+
+    /// The last `most` of [`App::open_rows`]: as many as the screen shows.
+    fn open_last_rows(&self, width: usize, most: usize) -> Vec<Line<'static>> {
         let Some(open) = &self.live else {
             return Vec::new();
         };
@@ -12296,17 +12302,20 @@ impl App {
         // The block still open, its line still coming read as it will once
         // its marks close.
         let prose = self.prose().min(width);
-        rows.extend(open.markdown.open(&open.partial, prose, open.lines == 0));
+        let shown = (open.markdown).open_last(&open.partial, prose, open.lines == 0, most);
+        // Rows cut from the top had words: the bar runs down from them.
+        let cut = shown.len() >= most;
+        rows.extend(shown);
         match &self.bar {
-            Some(bar) => self.bar_open(rows, bar.slot),
+            Some(bar) => self.bar_open(rows, bar.slot, self.barred || cut),
             None => rows,
         }
     }
 
     /// The reply's open rows wearing the bar at `slot` as they will once
     /// written ([`colors::wear`]): from the first row not blank on.
-    fn bar_open(&self, rows: Vec<Line<'static>>, slot: u8) -> Vec<Line<'static>> {
-        let mut barred = self.barred;
+    fn bar_open(&self, rows: Vec<Line<'static>>, slot: u8, barred: bool) -> Vec<Line<'static>> {
+        let mut barred = barred;
         (rows.into_iter())
             .map(|mut row| {
                 barred = row.width() > 0 || barred;
@@ -19933,7 +19942,7 @@ impl App {
         let mut model_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
-        let mut open_rows = self.open_rows(width.min(measure()));
+        let mut open_rows = self.open_last_rows(width.min(measure()), room + 1);
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
         open_rows.extend(self.shell_rows(width));
