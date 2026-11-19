@@ -1613,6 +1613,20 @@ impl Markdown {
         out
     }
 
+    /// The link definitions in the source from `drained` to `upto`, kept
+    /// before that part of the source goes: blocks after it point at them.
+    fn keep_defs(&mut self, links: &[Range<usize>], drained: usize, upto: usize) {
+        for span in links
+            .iter()
+            .filter(|span| span.start >= drained && span.end <= upto)
+        {
+            if let Some(def) = self.source.get(span.start - drained..span.end - drained) {
+                self.defs.push_str(def);
+                self.defs.push_str("\n\n");
+            }
+        }
+    }
+
     fn read(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) {
         self.fed = width;
         if let Some(open) = &mut self.fence {
@@ -1733,6 +1747,7 @@ impl Markdown {
         if table_ends && let Some(end) = open.end.checked_sub(drained) {
             let gap = open.gap && !self.gapped;
             self.give(&open.rows[self.given.min(open.rows.len())..], gap, out);
+            self.keep_defs(&links, drained, open.end);
             self.source.drain(..end.min(self.source.len()));
             (self.given, self.gapped) = (0, false);
             self.last.clear();
@@ -1770,6 +1785,7 @@ impl Markdown {
                 code,
                 picture,
             });
+            self.keep_defs(&links, drained, open.start);
             self.source.clear();
             (self.given, self.gapped) = (0, false);
             self.last.clear();
@@ -1807,11 +1823,7 @@ impl Markdown {
                 let gap = gap && !self.gapped;
                 self.give(&rows[self.given..item.rows], gap, out);
             }
-            for span in links.iter().filter(|span| span.end <= item.cut) {
-                self.defs
-                    .push_str(&self.source[span.start - drained..span.end - drained]);
-                self.defs.push_str("\n\n");
-            }
+            self.keep_defs(&links, drained, item.cut);
             self.source.drain(..cut);
             self.cells.get_mut().clear();
             if let Some(number) = item.number {
@@ -2792,6 +2804,16 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(words, "1. Install");
+        // Definitions before a list's items and before a fence stay known.
+        for reply in [
+            "[a]: /a\n\nSee [x][d].\n\n- one\n- two\n\n[d]: /d",
+            "[d]: /target\n\n```text\nexample\n```\n\nSee [label][d].",
+        ] {
+            assert_eq!(
+                streamed(Markdown::default(), reply, 40),
+                whole(&Markdown::default(), reply, 40)
+            );
+        }
         // Quote marks deep on one line are read once each.
         let deep = format!("{} x", ">".repeat(20_000));
         assert!(!whole(&reply, &deep, 40).is_empty());
