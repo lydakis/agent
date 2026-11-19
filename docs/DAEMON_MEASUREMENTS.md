@@ -12218,3 +12218,34 @@ migration.
 - **Keys.** The worst key at 32 windows is 12 to
   14 ms against 16 to 58 ms. Key p99 at 100 windows is 18.5 ms against 9.8 ms
   in a single round.
+
+## Speeds and context windows as bot settings (#1208)
+
+`[speeds]` and `[context_windows]` became bot settings that each turn
+reads, in place of the daemon's `--speeds` and `--context-window` flags.
+The tables are shared, not copied: a pattern table is one reference-counted
+slice, so a turn that shapes its provider for a faster speed takes the
+bot's `speeds` with a count bump, as main took the flag's table, and a
+turn at standard speed does not touch it. The window is looked up once a
+turn, as before.
+
+Main is f06b14a, and the change is the pull request's head on it, both
+release builds on the 4-CPU Linux container. The Perf workflow's four
+daemon screens ran alternately, base then head, two rounds, and
+`bench.perf_gate` compared the medians:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.40 | 43.53 | +0.3 |
+| admission | burst submit p99, ms | 5.56 | 5.24 | -5.8 |
+| completion | release to terminal p99, ms | 13.06 | 12.55 | -3.9 |
+| footprint | idle RSS, MiB | 17.64 | 17.33 | -1.7 |
+| footprint | per idle bot, KiB | 1.70 | 1.72 | +0.9 |
+| footprint | RSS after a turn each, MiB | 35.86 | 34.07 | -5.0 |
+| footprint | CPU per turn, ms | 0.97 | 0.93 | -4.1 |
+| lifecycle | CPU, s | 0.70 | 0.68 | -3.6 |
+| lifecycle | p95 turn, ms | 590.9 | 588.0 | -0.5 |
+| lifecycle | peak RSS, MiB | 27.01 | 26.72 | -1.1 |
+
+Store work per turn counted the same on both sides. Every move is inside
+the spread main shows against itself in the sections above.

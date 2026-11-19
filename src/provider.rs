@@ -452,7 +452,7 @@ pub struct Provider {
     name: Option<Arc<str>>,
     /// The tiers a bot's `speeds` setting says models serve, over the
     /// catalog's, by model path: a bot's own, as its settings shape it.
-    speeds: Option<Arc<Speeds>>,
+    speeds: Option<Speeds>,
 }
 
 /// Who asks for a call.
@@ -1172,12 +1172,12 @@ impl Provider {
         let speeds = (speed.is_some() && !speeds.is_empty()).then_some(speeds);
         if (max_output_tokens, cache_hour, speed)
             == (self.max_output_tokens, self.cache_hour, self.speed)
-            && speeds == self.speeds.as_deref()
+            && speeds == self.speeds.as_ref()
         {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
         let mut shaped = self.clone().with_cache_hour(cache_hour).with_speed(speed);
-        shaped.speeds = speeds.map(|speeds| Arc::new(speeds.clone()));
+        shaped.speeds = speeds.cloned();
         shaped.max_output_tokens = None;
         if let Some(limit) = max_output_tokens {
             shaped = shaped.with_max_output_tokens(limit)?;
@@ -2151,11 +2151,11 @@ fn claude_model(model: &str) -> &str {
 /// literal characters as `a/b`), then the one with the most characters
 /// that are not wildcards, then the first by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ByModel<T>(Vec<(String, T)>);
+pub struct ByModel<T>(Arc<[(String, T)]>);
 
 impl<T> Default for ByModel<T> {
     fn default() -> Self {
-        Self(Vec::new())
+        Self(Arc::from([]))
     }
 }
 
@@ -2195,7 +2195,7 @@ impl<T> ByModel<T> {
             (pattern.chars().any(wild), std::cmp::Reverse(literal))
         };
         set.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
-        Self(set)
+        Self(set.into())
     }
     /// `PATTERN=VALUE` specs for `flag`, each pattern once, `value`
     /// reading each value; `shape` says what the flag takes.
