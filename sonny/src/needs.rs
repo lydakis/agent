@@ -146,7 +146,7 @@ const fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 /// How many of an agent's newest nodes are read for its open question.
-const SCANNED: usize = 400;
+pub const SCANNED: usize = 400;
 
 /// How many nodes one `history_items` read takes.
 const READ: usize = 100;
@@ -178,25 +178,7 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
     let (mut items, mut turn) = (Vec::new(), Vec::new());
     for chunk in nodes.chunks(READ) {
         let (read, short) = self::items(client, bot, chunk).await;
-        // Newest first, as the nodes were asked for; each node's items
-        // newest first too.
-        let mut read = read.into_iter().peekable();
-        let mut fresh = Vec::new();
-        while let Some((node, item)) = read.next() {
-            let mut kept = vec![item];
-            while let Some((_, item)) = read.next_if(|(next, _)| *next == node) {
-                kept.push(item);
-            }
-            if let Some(&at) = turns.get(&node) {
-                for item in &mut kept {
-                    item["turn"] = json!(at);
-                }
-            }
-            if in_last.contains(&node) {
-                turn.extend(kept.iter().cloned());
-            }
-            fresh.extend(kept.into_iter().rev());
-        }
+        let fresh = arranged(read, &turns, &in_last, &mut turn);
         if short {
             return None;
         }
@@ -220,6 +202,36 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
     })
 }
 
+/// `read`, a read of nodes newest first, as [`scan`] reads it for its
+/// question: each item marked with its node's turn (`turns`), and each
+/// node's items newest first too. Those of the nodes `in_last` go to
+/// `turn` as well.
+fn arranged(
+    read: Vec<(i64, Value)>,
+    turns: &HashMap<i64, i64>,
+    in_last: &HashSet<i64>,
+    turn: &mut Vec<Value>,
+) -> Vec<Value> {
+    let mut read = read.into_iter().peekable();
+    let mut fresh = Vec::new();
+    while let Some((node, item)) = read.next() {
+        let mut kept = vec![item];
+        while let Some((_, item)) = read.next_if(|(next, _)| *next == node) {
+            kept.push(item);
+        }
+        if let Some(&at) = turns.get(&node) {
+            for item in &mut kept {
+                item["turn"] = json!(at);
+            }
+        }
+        if in_last.contains(&node) {
+            turn.extend(kept.iter().cloned());
+        }
+        fresh.extend(kept.into_iter().rev());
+    }
+    fresh
+}
+
 /// [`scan`], going on from what was read before (`was`): only the nodes
 /// written since are read, and while none of them asks, closes or answers
 /// a question, nor is the person's own words, the question is the one
@@ -240,45 +252,104 @@ pub async fn scan_since(client: &Client, bot: &str, last: Option<i64>, was: &See
         return scan(client, bot, last).await;
     }
     let listed = page["nodes"].as_array().cloned().unwrap_or_default();
-    let nodes: Vec<i64> = listed.iter().filter_map(|n| n["node"].as_i64()).collect();
-    let newest = listed.iter().filter_map(|n| n["turn"].as_i64()).max();
-    let last = last.or(newest).or(was.turn);
-    // The turn that says whether it resolved its question: read before, or
-    // whole among the nodes since.
-    let in_last: HashSet<i64> = (listed.iter())
-        .filter(|n| last.is_some() && n["turn"].as_i64() == last)
-        .filter_map(|n| n["node"].as_i64())
-        .collect();
-    if in_last.is_empty() && last != was.turn {
-        return scan(client, bot, last).await;
-    }
-    let (read, short) = items(client, bot, &nodes).await;
+    let since = match Since::of(&listed, last, was, through) {
+        Ok(since) => since,
+        Err(last) => return scan(client, bot, last).await,
+    };
+    let (read, short) = items(client, bot, &since.nodes).await;
     if short {
         return None;
     }
-    let mut turn = Vec::new();
-    // The call that asked what was open, whose output, should it come
-    // late, may say it failed.
-    let open = (was.ask.as_ref()).and_then(|ask| ask.id.rsplit_once('/').map(|(_, call)| call));
-    for (node, item) in read {
-        let of_open = item["type"] == "function_call_output"
-            && open.is_some_and(|call| item["call_id"] == call);
-        if moves_on(&item) || answers(&item) || asks(&item) || of_open {
-            return scan(client, bot, last).await;
-        }
-        if in_last.contains(&node) {
-            turn.push(item);
-        }
+    let last = since.last;
+    match since.seen(bot, was, read) {
+        Some(seen) => Some(seen),
+        None => scan(client, bot, last).await,
     }
-    Some(Seen {
-        ask: was.ask.clone(),
-        itself: match in_last.is_empty() {
+}
+
+/// What [`scan_since`] reads on from a question read before: the nodes
+/// written since, newest first, and the turn that says whether it
+/// resolved its question.
+pub struct Since {
+    pub nodes: Vec<i64>,
+    pub last: Option<i64>,
+    turns: HashMap<i64, i64>,
+    in_last: HashSet<i64>,
+    through: i64,
+}
+
+impl Since {
+    /// The nodes `listed` past `through`, the newest `was` read, for turn
+    /// `last`; the turn to scan whole for when the nodes since cannot say.
+    pub fn of(
+        listed: &[Value],
+        last: Option<i64>,
+        was: &Seen,
+        through: i64,
+    ) -> Result<Self, Option<i64>> {
+        let nodes: Vec<i64> = listed.iter().filter_map(|n| n["node"].as_i64()).collect();
+        let newest = listed.iter().filter_map(|n| n["turn"].as_i64()).max();
+        let last = last.or(newest).or(was.turn);
+        // The turn that says whether it resolved its question: read
+        // before, or whole among the nodes since.
+        let in_last: HashSet<i64> = (listed.iter())
+            .filter(|n| last.is_some() && n["turn"].as_i64() == last)
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        if in_last.is_empty() && last != was.turn {
+            return Err(last);
+        }
+        // Each node's turn, which names an ask with its call.
+        let turns = (listed.iter())
+            .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
+            .collect();
+        Ok(Since {
+            nodes,
+            last,
+            turns,
+            in_last,
+            through,
+        })
+    }
+
+    /// `bot`'s question as `was` read it, gone on through `read`, the items
+    /// at [`Since::nodes`]. Where the person wrote since, every question
+    /// before is set aside, so the nodes since say it whole, as [`scan`]
+    /// would; none when they ask, close or answer one otherwise, and the
+    /// history is to be scanned whole.
+    pub fn seen(self, bot: &str, was: &Seen, read: Vec<(i64, Value)>) -> Option<Seen> {
+        let mut turn = Vec::new();
+        let fresh = arranged(read, &self.turns, &self.in_last, &mut turn);
+        let through = self.nodes.iter().copied().max().or(Some(self.through));
+        let itself = match self.in_last.is_empty() {
             true => was.itself,
             false => resolved_itself(&turn, bot),
-        },
-        turn: last,
-        through: nodes.iter().copied().max().or(Some(through)),
-    })
+        };
+        if fresh.iter().any(moves_on) {
+            return Some(Seen {
+                ask: crate::asks::open(&fresh),
+                itself,
+                turn: self.last,
+                through,
+            });
+        }
+        // The call that asked what was open, whose output, should it come
+        // late, may say it failed.
+        let open = (was.ask.as_ref()).and_then(|ask| ask.id.rsplit_once('/').map(|(_, call)| call));
+        let of_open = |item: &Value| {
+            item["type"] == "function_call_output"
+                && open.is_some_and(|call| item["call_id"] == call)
+        };
+        if (fresh.iter()).any(|item| answers(item) || asks(item) || of_open(item)) {
+            return None;
+        }
+        Some(Seen {
+            ask: was.ask.clone(),
+            itself,
+            turn: self.last,
+            through,
+        })
+    }
 }
 
 /// Whether `item` answers a question: the person's pick.
@@ -303,23 +374,40 @@ fn moves_on(item: &Value) -> bool {
 /// reads them: who sent a prompt marked on it. Whether the read came back
 /// short too, the daemon gone or the nodes pruned.
 pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Value)>, bool) {
-    let mut items = Vec::new();
+    let (entries, short) = entries(client, bot, nodes).await;
+    (of_entries(&entries), short)
+}
+
+/// `bot`'s entries kept at `nodes`, as the daemon reads them, in their
+/// order; whether the read came back short too ([`items`]).
+pub async fn entries(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<Value>, bool) {
+    let mut entries = Vec::new();
     let mut rest = nodes;
     while !rest.is_empty() {
         // The daemon reads at most `HISTORY_NODES` nodes a call.
         let ask = &rest[..rest.len().min(crate::HISTORY_NODES)];
-        let Ok(read) = client
+        let Ok(mut read) = client
             .request("history_items", json!({"bot": bot, "nodes": ask}))
             .await
         else {
-            return (items, true);
+            return (entries, true);
         };
-        let entries = read["items"].as_array().cloned().unwrap_or_default();
-        if entries.is_empty() {
-            return (items, true);
+        let Some(Value::Array(read)) = read.get_mut("items").map(Value::take) else {
+            return (entries, true);
+        };
+        if read.is_empty() {
+            return (entries, true);
         }
-        rest = &rest[entries.len().min(rest.len())..];
-        items.extend(entries.iter().flat_map(|entry| {
+        rest = &rest[read.len().min(rest.len())..];
+        entries.extend(read);
+    }
+    (entries, false)
+}
+
+/// [`entries`] as the transcript reads them ([`items`]).
+pub fn of_entries(entries: &[Value]) -> Vec<(i64, Value)> {
+    (entries.iter())
+        .flat_map(|entry| {
             let node = entry["node"].as_i64().unwrap_or(0);
             // Who sent a prompt, when another bot did, a client from
             // outside (the commons, an automation) or another person.
@@ -367,9 +455,8 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
                     }
                     (node, item)
                 })
-        }));
-    }
-    (items, false)
+        })
+        .collect()
 }
 
 /// How many of an agent's newest nodes are read for whether its newest

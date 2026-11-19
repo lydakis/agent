@@ -925,7 +925,9 @@ async fn read_status_of(
                     .map(|(began, ended)| ended.saturating_sub(began) / 1000),
             ),
         };
-        let Latest { mut step, pr, ask } = latest;
+        let Latest {
+            mut step, pr, ask, ..
+        } = latest;
         // A question stays open until its answer lands, past work that
         // does not wait on it and messages that answer something else:
         // an idle agent's recent history is read once per turn it
@@ -1332,16 +1334,73 @@ async fn read_agent(
         },
         None => None,
     };
+    // A turn ended since its question was read, and its history moved
+    // since its latest was: both read at once where they can be.
+    let both = if let Some(last) = ended
+        && bot.head.is_some()
+        && let Some((seen, latest)) = status_read.get(name)
+        && *seen != head
+        && seen[0] == head[0]
+        && let Some(from) = latest.from
+        && let Some((turn, was)) = asks_seen.get(name)
+        && *turn != last.turn
+    {
+        read_both(client, name, last.turn, from, was).await
+    } else {
+        Both::Apart
+    };
+    match both {
+        Both::Read(latest, seen) => {
+            status_read.insert(name.to_owned(), (head.clone(), latest));
+            match (seen, ended) {
+                (Some(seen), Some(last)) => {
+                    asks_seen.insert(name.to_owned(), (last.turn, seen));
+                }
+                _ => whole = false,
+            }
+        }
+        Both::Failed => {
+            status_read.remove(name);
+            whole = false;
+        }
+        Both::Apart => whole &= read_apart(client, bot, &head, ended, status_read, asks_seen).await,
+    }
+    // What it read, for the others to take.
+    if let Some(readers) = readers
+        && let Ok(mut shared) = readers.reads.lock()
+    {
+        if let Some(read) = status_read.get(name) {
+            shared.latest.insert(name.to_owned(), read.clone());
+        }
+        if let Some(seen) = asks_seen.get(name) {
+            shared.seen.insert(name.to_owned(), seen.clone());
+        }
+    }
+    whole
+}
+
+/// [`read_agent`]'s reads of `bot` taken apart: its latest once its
+/// history moved, and its question once a turn ended since it was read.
+async fn read_apart(
+    client: &Client,
+    bot: &standing::Agent,
+    head: &Value,
+    ended: Option<&standing::Ended>,
+    status_read: &mut HashMap<String, (Value, Latest)>,
+    asks_seen: &mut HashMap<String, (i64, Seen)>,
+) -> bool {
+    let name = bot.name.as_str();
+    let mut whole = true;
     // No history yet: nothing asked of the daemon for it, however many
     // such agents a project holds.
     match status_read.get(name) {
         _ if bot.head.is_none() => {
-            status_read.insert(name.to_owned(), (head, Latest::default()));
+            status_read.insert(name.to_owned(), (head.clone(), Latest::default()));
         }
-        Some((seen, _)) if *seen == head => {}
+        Some((seen, _)) if seen == head => {}
         _ => match read_latest(client, name).await {
             Some(latest) => {
-                status_read.insert(name.to_owned(), (head, latest));
+                status_read.insert(name.to_owned(), (head.clone(), latest));
             }
             None => {
                 status_read.remove(name);
@@ -1361,17 +1420,6 @@ async fn read_agent(
                 asks_seen.insert(name.to_owned(), (last, seen));
             }
             None => whole = false,
-        }
-    }
-    // What it read, for the others to take.
-    if let Some(readers) = readers
-        && let Ok(mut shared) = readers.reads.lock()
-    {
-        if let Some(read) = status_read.get(name) {
-            shared.latest.insert(name.to_owned(), read.clone());
-        }
-        if let Some(seen) = asks_seen.get(name) {
-            shared.seen.insert(name.to_owned(), seen.clone());
         }
     }
     whole
@@ -1553,29 +1601,35 @@ pub(crate) fn keep_beside(file: &std::path::Path, bytes: &[u8]) {
     let _ = agent_client::files::replace_mode(file, bytes, 0o600);
 }
 
+/// How many of an agent's newest nodes `/status` reads for its latest
+/// step, question and pull request.
+const LATEST: usize = 4;
+
 /// `bot`'s latest step, question and pull request; none when a read
 /// failed, which an empty history is not.
 async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
     let page = client
-        .request("history_nodes", json!({"bot": bot, "limit": 4}))
+        .request("history_nodes", json!({"bot": bot, "limit": LATEST}))
         .await
         .ok()?;
-    let nodes: Vec<i64> = page["nodes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|n| n["node"].as_i64())
-        .collect();
-    // Each node's turn, which names an ask with its call.
-    let turns: HashMap<i64, i64> = (page["nodes"].as_array().into_iter().flatten())
-        .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
-        .collect();
+    let listed = page["nodes"].as_array().cloned().unwrap_or_default();
+    let nodes: Vec<i64> = listed.iter().filter_map(|n| n["node"].as_i64()).collect();
     let read = client
         .request("history_items", json!({"bot": bot, "nodes": nodes}))
         .await
         .ok()?;
-    // Newest first, as the nodes were asked for.
     let entries = read["items"].as_array().cloned().unwrap_or_default();
+    Some(latest_of(&listed, &entries))
+}
+
+/// What [`read_latest`] reads from the newest nodes `listed` (as
+/// `history_nodes` lists them, newest first) and their `entries`.
+fn latest_of(listed: &[Value], entries: &[Value]) -> Latest {
+    // Each node's turn, which names an ask with its call.
+    let turns: HashMap<i64, i64> = (listed.iter())
+        .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
+        .collect();
+    // Newest first, as the nodes were asked for.
     let items: Vec<Value> = entries.iter().map(|entry| entry["item"].clone()).collect();
     let pr = items
         .iter()
@@ -1606,11 +1660,74 @@ async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
                 })
         })
         .collect();
-    Some(Latest {
+    Latest {
         ask: asks::open(&flat),
         pr,
-        step: App::step(&entries),
-    })
+        step: App::step(entries),
+        from: listed.iter().filter_map(|n| n["node"].as_i64()).min(),
+    }
+}
+
+/// What [`read_both`] found.
+enum Both {
+    /// `bot`'s latest, and its question gone on from what was read, none
+    /// when a whole scan it took failed.
+    Read(Latest, Option<Seen>),
+    /// Read them apart: the nodes since are too many, or too few to hold
+    /// its newest.
+    Apart,
+    Failed,
+}
+
+/// [`read_latest`] and [`needs::scan_since`] for `bot`, whose turn `last`
+/// ended since `was` was read, in one read where they meet: the nodes
+/// past the newest read before and past `from`, the oldest its latest
+/// was read from, listed at once, then the newest few and those since
+/// read at once. Half the reads a finished turn takes apart.
+async fn read_both(client: &Client, bot: &str, last: i64, from: i64, was: &Seen) -> Both {
+    let Some(through) = was.through else {
+        return Both::Apart;
+    };
+    let ask = json!({"bot": bot, "limit": needs::SCANNED, "min_node": from.min(through + 1)});
+    let Ok(page) = client.request("history_nodes", ask).await else {
+        return Both::Failed;
+    };
+    let listed = page["nodes"].as_array().cloned().unwrap_or_default();
+    // Node ids grow along a history, so with as many past `from` its
+    // newest are among them.
+    if !page["next_from"].is_null() || listed.len() < LATEST {
+        return Both::Apart;
+    }
+    // Newest first: those since `through` lead, as the newest do.
+    let since = (listed.iter())
+        .take_while(|n| n["node"].as_i64().is_some_and(|node| node > through))
+        .count();
+    let Ok(read) = needs::Since::of(&listed[..since], Some(last), was, through) else {
+        return Both::Apart;
+    };
+    let nodes: Vec<i64> = (listed.iter().take(since.max(LATEST)))
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    let (entries, short) = needs::entries(client, bot, &nodes).await;
+    if short {
+        return Both::Failed;
+    }
+    let newest: std::collections::HashSet<i64> = nodes.iter().take(LATEST).copied().collect();
+    let at = |entry: &&Value| entry["node"].as_i64().unwrap_or(0);
+    let latest: Vec<Value> = (entries.iter())
+        .filter(|entry| newest.contains(&at(entry)))
+        .cloned()
+        .collect();
+    let latest = latest_of(&listed[..LATEST], &latest);
+    let after: Vec<Value> = (entries.into_iter())
+        .filter(|entry| entry["node"].as_i64().is_some_and(|node| node > through))
+        .collect();
+    let last = read.last;
+    let seen = match read.seen(bot, was, needs::of_entries(&after)) {
+        Some(seen) => Some(seen),
+        None => needs::scan(client, bot, last).await,
+    };
+    Both::Read(latest, seen)
 }
 
 /// Open `bot`, a lead of `project`, in that project's own home, the
@@ -5209,6 +5326,10 @@ struct Latest {
     pr: Option<String>,
     /// The question it asked the person and has no answer to yet.
     ask: Option<asks::Ask>,
+    /// The oldest of the newest nodes it was read from, from which the
+    /// next read lists on ([`read_both`]).
+    #[serde(default)]
+    from: Option<i64>,
 }
 
 /// `/status` in the pane, its timers ticking and its rows read again
@@ -25156,6 +25277,85 @@ mod tests {
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
         assert_eq!(turn_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_is_read_in_one_listing_and_one_read_as_apart() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        type History = Arc<std::sync::Mutex<Vec<(i64, i64, Value)>>>;
+        let said = |role: &str, text: &str| {
+            let kind = if role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
+            json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]})
+        };
+        // Node, turn, item; two turns ended.
+        let history: History = Arc::new(std::sync::Mutex::new(vec![
+            (10, 1, said("user", "hi")),
+            (11, 1, said("assistant", "first")),
+            (12, 2, said("user", "more")),
+            (13, 2, said("assistant", "second")),
+        ]));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (kept, counted) = (history.clone(), reads.clone());
+        let client = daemon_answering(move |asked| {
+            let history = kept.lock().unwrap();
+            match asked["op"].as_str().unwrap_or_default() {
+                "history_nodes" => {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let floor = asked["min_node"].as_i64().unwrap_or(0);
+                    let limit = asked["limit"].as_u64().unwrap() as usize;
+                    let past: Vec<&(i64, i64, Value)> = history
+                        .iter()
+                        .rev()
+                        .filter(|(n, _, _)| *n >= floor)
+                        .collect();
+                    let nodes: Vec<Value> = (past.iter().take(limit))
+                        .map(|(node, turn, _)| json!({"node": node, "turn": turn}))
+                        .collect();
+                    let next = past.get(limit).map(|(node, _, _)| json!(node));
+                    json!({"nodes": nodes, "next_from": next})
+                }
+                "history_items" => {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let items: Vec<Value> = (asked["nodes"].as_array().unwrap().iter())
+                        .filter_map(|node| history.iter().find(|(n, _, _)| json!(n) == *node))
+                        .map(|(node, _, item)| json!({"node": node, "item": item}))
+                        .collect();
+                    json!({"items": items})
+                }
+                _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+            }
+        })
+        .await;
+        let agent = |head: i64, turn: i64| {
+            standing::kept(json!({"name": "shop.t1", "bot_id": 1, "head": head,
+                "last": {"turn": turn, "status": "completed"}}))
+            .unwrap()
+        };
+        let (mut latest, mut seen) = (HashMap::new(), HashMap::new());
+        assert!(read_agent(&client, &agent(13, 2), &mut latest, &mut seen, None).await);
+        // A third turn ends, its question read on from the second's.
+        history.lock().unwrap().extend([
+            (20, 3, said("user", "go")),
+            (21, 3, said("assistant", "third")),
+        ]);
+        reads.store(0, Ordering::SeqCst);
+        assert!(read_agent(&client, &agent(21, 3), &mut latest, &mut seen, None).await);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        // What reading them apart finds.
+        let apart = read_latest(&client, "shop.t1").await.unwrap();
+        let whole = needs::scan(&client, "shop.t1", Some(3)).await.unwrap();
+        let (head, read) = &latest["shop.t1"];
+        assert_eq!(*head, json!([1, 21]));
+        assert_eq!(
+            (&read.step, &read.pr, &read.ask),
+            (&apart.step, &apart.pr, &apart.ask)
+        );
+        assert_eq!(read.from, Some(12));
+        assert_eq!(seen["shop.t1"], (3, whole));
     }
 
     #[tokio::test]
