@@ -59,6 +59,7 @@ mod lookout;
 #[cfg(target_os = "macos")]
 mod mac;
 mod margin;
+mod markdown;
 mod math;
 mod mcp;
 mod mcp_import;
@@ -13739,7 +13740,13 @@ impl App {
 
     /// The bot's words not yet written: the rows held, then the open line,
     /// the part after the last newline, as the rows it will take.
+    #[cfg(test)]
     fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
+        self.open_last_rows(width, usize::MAX)
+    }
+
+    /// The last `most` of [`App::open_rows`]: as many as the screen shows.
+    fn open_last_rows(&self, width: usize, most: usize) -> Vec<Line<'static>> {
         let Some(open) = &self.live else {
             return Vec::new();
         };
@@ -13760,31 +13767,23 @@ impl App {
                 )),
             }
         }
-        let mut markdown = open.markdown.clone();
-        if !open.partial.is_empty()
-            && let Some(line) = markdown.line(&open.partial)
-        {
-            let lead = match open.lines == 0 && !transcript::heading(&open.partial) {
-                true => "• ",
-                false => "  ",
-            };
-            rows.extend(transcript::wrap_lines(
-                line,
-                width,
-                Line::from(lead),
-                markdown.rest(),
-            ));
-        }
+        // The block still open, its line still coming read as it will once
+        // its marks close.
+        let prose = self.prose().min(width);
+        let shown = (open.markdown).open_last(&open.partial, prose, open.lines == 0, most);
+        // Rows cut from the top had words: the bar runs down from them.
+        let cut = shown.len() >= most;
+        rows.extend(shown);
         match &self.bar {
-            Some(bar) => self.bar_open(rows, bar.slot),
+            Some(bar) => self.bar_open(rows, bar.slot, self.barred || cut),
             None => rows,
         }
     }
 
     /// The reply's open rows wearing the bar at `slot` as they will once
     /// written ([`colors::wear`]): from the first row not blank on.
-    fn bar_open(&self, rows: Vec<Line<'static>>, slot: u8) -> Vec<Line<'static>> {
-        let mut barred = self.barred;
+    fn bar_open(&self, rows: Vec<Line<'static>>, slot: u8, barred: bool) -> Vec<Line<'static>> {
+        let mut barred = barred;
         (rows.into_iter())
             .map(|mut row| {
                 barred = row.width() > 0 || barred;
@@ -21622,7 +21621,7 @@ impl App {
         let mut model_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
-        let mut open_rows = self.open_rows(width.min(measure()));
+        let mut open_rows = self.open_last_rows(width.min(measure()), room + 1);
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
         open_rows.extend(self.shell_rows(width));
@@ -28294,7 +28293,9 @@ mod tests {
             app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 3, "text": text}))
                 .await;
         }
-        let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
+        let open = app.live.as_ref().unwrap();
+        let shown = open.markdown.open(&open.partial, 100, open.lines == 0);
+        let live: Vec<String> = (open.rows.iter().chain(&shown))
             .map(|row| row.to_string())
             .collect();
         let replayed: Vec<String> = transcript::reply("    example()\n", 100, Path::new(""))
@@ -28362,7 +28363,9 @@ mod tests {
         for text in ["    ", "example()\n"] {
             app.daemon(said(text)).await;
         }
-        let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
+        let open = app.live.as_ref().unwrap();
+        let shown = open.markdown.open(&open.partial, 100, open.lines == 0);
+        let live: Vec<String> = (open.rows.iter().chain(&shown))
             .map(|row| row.to_string())
             .collect();
         let replayed: Vec<String> = transcript::reply("    example()\n", 100, Path::new(""))
@@ -31166,7 +31169,7 @@ mod tests {
         app.height = 8;
         app.daemon(turn_event("accepted", 1, json!({"request_id": "r1"})))
             .await;
-        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Here:\n"}))
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Here:\n\n"}))
             .await;
         // A row stands for a picture held back with the words; drawn, it
         // is twelve rows, more than half the screen.

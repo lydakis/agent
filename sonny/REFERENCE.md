@@ -2024,6 +2024,17 @@ heading takes no `•` before it. Your words read as the agent's do: their
 Markdown (bold, code, lists, tables, math, pictures) is drawn the one way
 every surface draws it, in your sent messages, in what waits queued or
 steered, and in a message between agents once opened.
+Markdown is read as CommonMark and GitHub's flavor, with pulldown-cmark
+as Codex reads it: setext headings, `~~~` fences, escapes and entities,
+reference links and footnotes read as GitHub reads them. In a reply,
+each line of a paragraph keeps its own row, as Codex and GitHub comments
+show it; a file in the pane joins them, as GitHub shows a file. A reply
+streams a block at a time, as Codex's does: its rows go out once a new
+line leaves them as they were, the line still coming is shown with its
+marks closed, and a table, or a block pointing at a link or footnote
+defined further on, waits until it can be drawn as it will stay.
+
+![A reply in CommonMark: a setext heading, a ~~~ fence, an entity and escapes, a task list, a table, and a reference link and footnote defined below](../docs/sonny/markdown-commonmark.png)
 
 ![Your message on its band, and the footer, all muted at rest, saying 76% left](../docs/sonny/message-band.png)
 

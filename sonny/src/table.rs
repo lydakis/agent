@@ -9,6 +9,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+/// Cells already read, by their text and whether a header's: a table
+/// still coming is drawn again with each row, and its cells read once.
+pub type Cells = std::collections::HashMap<(String, bool), Line<'static>>;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Align {
     Left,
@@ -69,7 +73,7 @@ const VALUES: usize = 24;
 /// A table at `width`: a grid when its columns fit, a word cut only where
 /// a column has room to spare; else, as Codex draws it, one record per
 /// row, each value beside its column's name.
-pub fn draw(rows: &[String], width: usize) -> Vec<Line<'static>> {
+pub fn draw(rows: &[String], width: usize, read: &mut Cells) -> Vec<Line<'static>> {
     let mut rows: Vec<Vec<String>> = rows.iter().map(|row| cells(row)).collect();
     let (header, aligns) = match rows.get(1).and_then(|row| separator(row)) {
         Some(aligns) => {
@@ -87,12 +91,19 @@ pub fn draw(rows: &[String], width: usize) -> Vec<Line<'static>> {
         .enumerate()
         .map(|(r, mut row)| {
             row.resize(columns, String::new());
-            let base = match header && r == 0 {
+            let head = header && r == 0;
+            let base = match head {
                 true => Style::new().bold(),
                 false => Style::new(),
             };
-            (row.iter())
-                .map(|cell| Line::from(crate::transcript::inline(cell, base)))
+            (row.into_iter())
+                .map(|cell| {
+                    (read.entry((cell, head)))
+                        .or_insert_with_key(|(cell, _)| {
+                            Line::from(crate::transcript::inline(cell, base))
+                        })
+                        .clone()
+                })
                 .collect()
         })
         .collect();
@@ -398,7 +409,7 @@ mod tests {
         ]
         .map(String::from);
         assert_eq!(
-            text(&draw(&rows, 80)),
+            text(&draw(&rows, 80, &mut Cells::default())),
             [
                 "  ┌───────┬───────┐",
                 "  │ Agent │ Turns │",
@@ -418,7 +429,7 @@ mod tests {
             "| lead | coordinates every task in this project and reports back |",
         ]
         .map(String::from);
-        let lines = draw(&rows, 40);
+        let lines = draw(&rows, 40, &mut Cells::default());
         assert!(lines.iter().all(|l| l.width() <= 40), "{:?}", text(&lines));
         let widths: Vec<usize> = lines.iter().map(|l| l.width()).collect();
         assert!(widths.iter().all(|w| *w == widths[0]), "{:?}", text(&lines));
@@ -452,7 +463,7 @@ mod tests {
         ];
         for rows in &tables {
             for width in 12..=120 {
-                let lines = draw(rows, width);
+                let lines = draw(rows, width, &mut Cells::default());
                 assert!(
                     lines.iter().all(|l| l.width() <= width),
                     "width {width}: {:#?}",
@@ -471,7 +482,7 @@ mod tests {
             "| queued | open | worker | claude/queued | failing | codex | never | notice |",
         ]);
         assert_eq!(
-            text(&draw(&rows, 50)),
+            text(&draw(&rows, 50, &mut Cells::default())),
             [
                 "  ────────────────────────────────────────────────",
                 "  Name      scroll",
@@ -495,7 +506,7 @@ mod tests {
             ]
         );
         // At a width it fits, the same table is a grid.
-        assert!(text(&draw(&rows, 120))[0].starts_with("  ┌"));
+        assert!(text(&draw(&rows, 120, &mut Cells::default()))[0].starts_with("  ┌"));
     }
 
     #[test]
@@ -506,7 +517,7 @@ mod tests {
             "| one two three four five six seven | eight |",
         ]);
         assert_eq!(
-            text(&draw(&rows, 24)),
+            text(&draw(&rows, 24, &mut Cells::default())),
             [
                 "  ──────────────────────",
                 "  The first column's",
@@ -528,7 +539,7 @@ mod tests {
             "|---|--:|",
             "| sonny/src/some/deeply/nested/folder/with/a/long/name.rs | 12 |",
         ]);
-        let lines = text(&draw(&rows, 40));
+        let lines = text(&draw(&rows, 40, &mut Cells::default()));
         assert!(lines[0].starts_with("  ┌"), "{lines:#?}");
         assert!(lines.iter().all(|l| l.chars().count() <= 40), "{lines:#?}");
     }

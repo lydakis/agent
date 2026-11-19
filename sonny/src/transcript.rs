@@ -14,355 +14,7 @@ use ratatui::{
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-/// Markdown read one line at a time, as a reply streams in. Only what a
-/// line can say on its own is styled; a fence is remembered between lines.
-#[derive(Default, Clone)]
-pub struct Markdown {
-    fence: bool,
-    /// An SVG or Mermaid fence's language and text, gathered to be drawn
-    /// when it closes.
-    picture: Option<(String, String)>,
-    ready: Option<(String, String)>,
-    /// How far the last line's wrapped rows are indented: under a list
-    /// item's text, so a continuation does not read as a new item.
-    hang: usize,
-    /// How deep in quotes the last line is, so its wrapped rows keep
-    /// its bars.
-    quoted: usize,
-    /// A table's rows, held until it ends, so its columns can be fitted.
-    table: Vec<String>,
-    /// Inside display math, gathered in `picture`: what closes it,
-    /// `$$` or `\]`.
-    math: Option<&'static str>,
-    /// The open fence's code, in its language's colors when known.
-    code: Option<crate::highlight::Code>,
-    /// The folder a picture's relative path is read from: the file's,
-    /// or the agent's workspace; else where Sonny runs.
-    folder: Option<std::path::PathBuf>,
-    /// A file read as a document, not a reply: an ```html or ```svg
-    /// fence in it is code to read, as GitHub shows it, not drawn.
-    document: bool,
-    /// Inside an HTML comment that spans lines.
-    comment: bool,
-}
-
-impl Markdown {
-    /// A reply's Markdown, its pictures' paths read from `folder`.
-    pub fn in_folder(folder: &std::path::Path) -> Self {
-        Self {
-            folder: Some(folder.to_owned()),
-            ..Self::default()
-        }
-    }
-
-    /// A Markdown file in `folder`, read as a document.
-    pub fn document(folder: &std::path::Path) -> Self {
-        Self {
-            document: true,
-            ..Self::in_folder(folder)
-        }
-    }
-
-    /// A streamed line as rows: a table that ended first, then the line,
-    /// then a fence's picture or diff when the line closed one. `first`
-    /// says nothing of the reply is shown yet, so it gets the bullet.
-    pub fn feed(&mut self, text: &str, width: usize, first: bool) -> Vec<Line<'static>> {
-        let mut text = text;
-        if !self.fence && self.math.is_none() {
-            // An HTML comment over lines says nothing; what follows it does.
-            if self.comment {
-                match text.split_once("-->") {
-                    Some((_, after)) => {
-                        self.comment = false;
-                        text = after;
-                        if text.trim().is_empty() {
-                            return Vec::new();
-                        }
-                    }
-                    None => return Vec::new(),
-                }
-            }
-            if let Some(after) = text.trim_start().strip_prefix("<!--")
-                && !after.contains("-->")
-            {
-                self.comment = true;
-                return Vec::new();
-            }
-            if let Some(pictures) = pictures(text) {
-                let mut out = self.finish(width);
-                out.extend(self.pictures(&pictures, width));
-                return out;
-            }
-        }
-        if !self.fence && self.math.is_none() && table_row(text) {
-            self.table.push(text.trim().to_owned());
-            return Vec::new();
-        }
-        let mut out = self.finish(width);
-        if let Some(styled) = self.line(text) {
-            let lead = if first && out.is_empty() && !heading(text) {
-                "• "
-            } else {
-                "  "
-            };
-            out.extend(wrap_lines(styled, width, Line::from(lead), self.rest()));
-        }
-        out.extend(self.picture(width));
-        out
-    }
-
-    /// What is still held when a table ends.
-    pub fn finish(&mut self, width: usize) -> Vec<Line<'static>> {
-        if self.table.is_empty() {
-            return Vec::new();
-        }
-        crate::table::draw(&std::mem::take(&mut self.table), width)
-    }
-
-    /// What is still held when the reply ends: a table, and a fence or
-    /// `$$` block that never closed, shown as the code it is.
-    pub fn end(&mut self, width: usize, first: bool) -> Vec<Line<'static>> {
-        let mut out = self.finish(width);
-        if let Some((_, source)) = self.picture.take() {
-            for text in source.trim_start_matches('\n').lines() {
-                let lead = if first && out.is_empty() {
-                    "• "
-                } else {
-                    "  "
-                };
-                let line = Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(text.to_owned(), Style::new().fg(Color::Cyan)),
-                ]);
-                out.extend(wrap(line, width, Span::raw(lead), Span::raw("    ")));
-            }
-        }
-        *self = Self {
-            folder: self.folder.take(),
-            document: self.document,
-            ..Self::default()
-        };
-        out
-    }
-
-    /// What the last line's wrapped rows start with, inside a reply.
-    pub fn rest(&self) -> Line<'static> {
-        if self.quoted > 0 {
-            let mut spans = vec![Span::raw("  ")];
-            spans.extend(bars(self.quoted));
-            return Line::from(spans);
-        }
-        Line::from(format!("  {}", " ".repeat(self.hang)))
-    }
-
-    /// The picture a fence that just closed drew, as rows of the
-    /// terminal's image cells; or, when it could not be drawn, its source
-    /// and why.
-    pub fn picture(&mut self, width: usize) -> Vec<Line<'static>> {
-        let Some((lang, source)) = self.ready.take() else {
-            return Vec::new();
-        };
-        fence_picture(lang, source, width)
-    }
-
-    /// The styled line, or none for a fence marker, which is not shown.
-    pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
-        let trimmed = text.trim_start();
-        self.hang = 0;
-        self.quoted = 0;
-        // $$ display math $$, on one line or around several, and the
-        // \[ display math \] many models write.
-        let line = trimmed.trim_end();
-        if !self.fence && self.math.is_none() {
-            let open = [("$$", "$$"), ("\\[", "\\]")]
-                .into_iter()
-                .find(|(open, _)| line.starts_with(open));
-            if let Some((open, close)) = open {
-                let inner = &line[open.len()..];
-                if let Some(math) = inner.strip_suffix(close) {
-                    self.ready = Some(("math".into(), math.to_owned()));
-                    return None;
-                }
-                // `\[` opens display math only alone on its line: one that
-                // runs on is an escaped bracket.
-                if open == "$$" || inner.is_empty() {
-                    let held = self.picture.take();
-                    self.picture = held.or(Some(("math".into(), format!("{inner}\n"))));
-                    self.math = Some(close);
-                    return None;
-                }
-            }
-        }
-        if let Some(close) = self.math
-            && line.starts_with(close)
-        {
-            self.math = None;
-            self.ready = self.picture.take();
-            return None;
-        }
-        if self.math.is_some()
-            && let Some((_, math)) = &mut self.picture
-        {
-            math.push_str(text);
-            math.push('\n');
-            return None;
-        }
-        if let Some(lang) = trimmed.strip_prefix("```") {
-            self.fence = !self.fence;
-            let lang = lang.trim();
-            let lang = match lang {
-                "latex" | "tex" | "katex" => "math",
-                lang => lang,
-            };
-            let drawn = match lang {
-                "mermaid" => crate::term::graphics(),
-                "svg" => crate::term::graphics() && !self.document,
-                "html" => !self.document,
-                _ => false,
-            };
-            if self.fence && (drawn || matches!(lang, "diff" | "patch" | "math")) {
-                self.picture = Some((lang.to_owned(), String::new()));
-            } else if self.fence {
-                self.code = crate::highlight::Code::language(lang);
-            } else {
-                self.ready = self.picture.take();
-                self.code = None;
-            }
-            return None;
-        }
-        if let Some((_, picture)) = &mut self.picture {
-            picture.push_str(text);
-            picture.push('\n');
-            return None;
-        }
-        if self.fence {
-            self.hang = 2;
-            let mut spans = vec![Span::raw("  ")];
-            match &mut self.code {
-                Some(code) => spans.extend(code.line(text)),
-                None => spans.push(Span::styled(text.to_owned(), Style::new().fg(Color::Cyan))),
-            }
-            return Some(Line::from(spans));
-        }
-        let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
-        if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
-            // Prose takes no hue: a heading is bold, and its marks stay,
-            // dim, so its level reads.
-            let style = Style::new().add_modifier(Modifier::BOLD);
-            let mut spans = vec![Span::raw(format!("{} ", &trimmed[..hashes])).dim()];
-            spans.extend(inline(trimmed[hashes + 1..].trim(), style));
-            return Some(Line::from(spans));
-        }
-        let indent = &text[..text.len() - trimmed.len()];
-        let bare = trimmed.trim_end();
-        if (bare.len() >= 3
-            && ["-", "*", "_"]
-                .iter()
-                .any(|c| bare.chars().all(|x| x.to_string() == *c || x == ' ')))
-            || matches!(bare, "<hr>" | "<hr/>" | "<hr />")
-        {
-            return Some(Line::from("─".repeat(width_hint())).dim());
-        }
-        for marker in ["- ", "* ", "+ "] {
-            if let Some(rest) = trimmed.strip_prefix(marker) {
-                self.hang = indent.len() + 2;
-                let (mark, rest) = match rest.get(..4) {
-                    Some("[ ] ") => ("☐ ", &rest[4..]),
-                    Some("[x] " | "[X] ") => ("☑ ", &rest[4..]),
-                    _ => ("- ", rest),
-                };
-                let mut spans = vec![Span::raw(format!("{indent}{mark}")).dim()];
-                spans.extend(inline(rest, Style::new()));
-                return Some(Line::from(spans));
-            }
-        }
-        let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-        if (1..=3).contains(&digits)
-            && let Some(rest) = trimmed[digits..].strip_prefix(". ")
-        {
-            self.hang = indent.len() + digits + 2;
-            let mut spans = vec![Span::raw(format!("{indent}{}. ", &trimmed[..digits])).dim()];
-            spans.extend(inline(rest, Style::new()));
-            return Some(Line::from(spans));
-        }
-        if let Some(mut rest) = quote_line(trimmed) {
-            // A quote in a quote, `> >`, draws a bar for each, up to
-            // `QUOTE_DEPTH`: marks past it are kept as written, so a line
-            // of a thousand `>` costs its length, not bars on every row.
-            let mut depth = 1;
-            while depth < QUOTE_DEPTH
-                && let Some(inner) = quote_line(rest.trim_start())
-            {
-                (rest, depth) = (inner, depth + 1);
-            }
-            self.quoted = depth;
-            let mut spans = bars(depth);
-            spans.extend(inline(rest, Style::new().italic()));
-            return Some(Line::from(spans));
-        }
-        let spans = inline(text, Style::new());
-        // A line of HTML that only lays the page out (`<p align=…>`,
-        // `</div>`, `<details>`) leaves no row of its own.
-        if text.contains('<') && spans.iter().all(|span| span.content.trim().is_empty()) {
-            return None;
-        }
-        Some(Line::from(spans))
-    }
-
-    /// Pictures a line holds and nothing else, one under another; those
-    /// that cannot be drawn here (another machine's, or a terminal with no
-    /// pictures) as their words, together on a row.
-    fn pictures(&self, pictures: &[Picture], width: usize) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        let mut words: Vec<Span<'static>> = Vec::new();
-        let flush = |words: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>| {
-            if !words.is_empty() {
-                let line = Line::from(std::mem::take(words));
-                out.extend(wrap(line, width, Span::raw("  "), Span::raw("  ")));
-            }
-        };
-        for picture in pictures {
-            let path = self.path(&picture.src);
-            match (path.as_deref()).and_then(|path| picture_file(path, width, picture)) {
-                Some(rows) => {
-                    flush(&mut words, &mut out);
-                    out.extend(rows);
-                }
-                None => {
-                    if !words.is_empty() {
-                        words.push(Span::raw("  "));
-                    }
-                    words.extend(picture_words(picture, path.is_some()));
-                }
-            }
-        }
-        flush(&mut words, &mut out);
-        out
-    }
-
-    /// The file a picture's address names on this machine, if it does.
-    fn path(&self, src: &str) -> Option<std::path::PathBuf> {
-        let src = src.trim();
-        if let Some(url) = src.strip_prefix("file://") {
-            return crate::pane::file_url(&format!("file://{url}")).map(|(path, _)| path);
-        }
-        if src.contains("://") || src.starts_with("data:") || src.starts_with('#') {
-            return None;
-        }
-        let src = src.split(['?', '#']).next().unwrap_or(src);
-        // `%20` and the like read back, as a browser reads them.
-        let (src, _) = crate::pane::file_url(&format!("file://{src}"))?;
-        let src = src.to_str()?;
-        let path = match src.strip_prefix("~/") {
-            Some(rest) => std::path::Path::new(&std::env::var_os("HOME")?).join(rest),
-            None => match &self.folder {
-                Some(folder) => folder.join(src),
-                None => std::env::current_dir().ok()?.join(src),
-            },
-        };
-        path.is_file().then_some(path)
-    }
-}
+pub use crate::markdown::{Markdown, inline};
 
 /// The picture a fence drew, as rows of the terminal's image cells; or,
 /// when it could not be drawn, its source and why; or a row saying it is
@@ -455,16 +107,16 @@ pub(crate) fn fence_picture(lang: String, source: String, width: usize) -> Vec<L
 
 /// A picture Markdown or HTML names: `![alt](src)` or `<img src alt>`.
 #[derive(Debug, PartialEq)]
-struct Picture {
-    alt: String,
-    src: String,
+pub(crate) struct Picture {
+    pub alt: String,
+    pub src: String,
 }
 
 /// The pictures in a line that holds nothing else: Markdown's `![…](…)`,
 /// those inside a link (`[![…](…)](…)`, as badges are), and HTML's
 /// `<img>`, among the tags that only lay them out (`<p>`, `<a>`,
 /// `<picture>`).
-fn pictures(text: &str) -> Option<Vec<Picture>> {
+pub(crate) fn pictures(text: &str) -> Option<Vec<Picture>> {
     let mut found = Vec::new();
     let mut rest = text.trim();
     while !rest.is_empty() {
@@ -518,7 +170,7 @@ fn markdown_picture(text: &str) -> Option<(usize, Picture)> {
 
 /// A picture file drawn, `path`'s rows of the terminal's cells that a
 /// click opens in the pane; none where it cannot be.
-fn picture_file(
+pub(crate) fn picture_file(
     path: &std::path::Path,
     width: usize,
     picture: &Picture,
@@ -591,7 +243,7 @@ pub(crate) fn picture_again(
 
 /// A picture as words where it is not drawn: a mark, its description
 /// (or its file's name) and, when it is a file here, where it is.
-fn picture_words(picture: &Picture, here: bool) -> Vec<Span<'static>> {
+pub(crate) fn picture_words(picture: &Picture, here: bool) -> Vec<Span<'static>> {
     let name = match picture.alt.trim() {
         "" => picture.src.rsplit('/').next().unwrap_or(&picture.src),
         alt => alt,
@@ -608,15 +260,15 @@ fn picture_words(picture: &Picture, here: bool) -> Vec<Span<'static>> {
 
 /// An HTML tag: its name, lowercased (`!--` for a comment), whether it
 /// closes, and what is written after the name.
-struct Tag {
-    name: String,
-    closing: bool,
+pub(crate) struct Tag {
+    pub name: String,
+    pub closing: bool,
     attributes: String,
 }
 
 impl Tag {
     /// An attribute's value, quoted or not.
-    fn attribute(&self, wanted: &str) -> Option<String> {
+    pub fn attribute(&self, wanted: &str) -> Option<String> {
         let mut rest = self.attributes.as_str();
         loop {
             rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
@@ -721,7 +373,7 @@ const ELEMENTS: &[&str] = &[
 
 /// A tag (or `<!-- comment -->`) of an element in [`ELEMENTS`] at the
 /// start of `text`, and how long it is.
-fn html_tag(text: &str) -> Option<(usize, Tag)> {
+pub(crate) fn html_tag(text: &str) -> Option<(usize, Tag)> {
     if let Some(after) = text.strip_prefix("<!--") {
         let end = after.find("-->")?;
         let tag = Tag {
@@ -793,14 +445,15 @@ impl Next {
 }
 
 /// A rule's width: no wider than a turn's closing rule.
-fn width_hint() -> usize {
+pub(crate) fn width_hint() -> usize {
     40
 }
 
-/// Inline marks inside a line: `code`, **bold**, *italic* or _italic_,
-/// ~~struck~~, [links](url) and $math$ (as Unicode), and the HTML tags
-/// models use (<b>, <i>, <code>, <kbd>, <br>).
-pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
+/// A line of an HTML block, as a README writes one, read for what it
+/// says: `code`, **bold**, *italic* or _italic_, ~~struck~~, [links](url)
+/// and $math$ (as Unicode) among the tags (<b>, <i>, <code>, <kbd>, <br>,
+/// <a>, <img>, <summary>, <h1>), which are read, not shown.
+pub(crate) fn html_words(text: &str, base: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut plain = String::new();
     let mut rest = text;
@@ -873,7 +526,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         if let Some((taken, inner, style, nested)) = found {
             flush(&mut plain, &mut spans);
             if nested {
-                spans.extend(inline(inner, style));
+                spans.extend(html_words(inner, style));
             } else {
                 spans.push(Span::styled(inner.to_owned(), style));
             }
@@ -923,7 +576,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             let mut within = |style: Style, spans: &mut Vec<Span<'static>>| -> bool {
                 match next_lower.find(&lower, &close, from) {
                     Some(end) => {
-                        spans.extend(inline(&text[from..end], style));
+                        spans.extend(html_words(&text[from..end], style));
                         rest = &text[end + close.len()..];
                         true
                     }
@@ -988,7 +641,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 if link.len() < rest.len() {
                     spans.push(Span::styled("▣ ", base.dim()));
                 }
-                spans.extend(inline(label, base.underlined()));
+                spans.extend(html_words(label, base.underlined()));
                 if url != label && !url.starts_with('#') {
                     spans.push(Span::styled(format!(" ({url})"), base.dim()));
                 }
@@ -1141,12 +794,6 @@ fn keep(
     Some(path)
 }
 
-/// `| a | b |`: a table's row, its separator included.
-fn table_row(text: &str) -> bool {
-    let t = text.trim();
-    t.starts_with('|') && t.len() > 1 && t[1..].contains('|')
-}
-
 /// How a row says it goes on with a word cut at the end of the row above,
 /// so an address there can be followed: an explicit left alignment, which
 /// draws as the default does.
@@ -1201,16 +848,36 @@ fn wrap_rows(
             Line::from([vec![goes_on(opens, false)], first.spans].concat())
         }
     };
-    let rest = [vec![goes_on(rest.width(), true)], rest.spans].concat();
     // A band behind the line, as the person's messages have, fills each
     // of its rows.
     let band = match line.style.bg {
         Some(bg) => Style::new().bg(bg),
         None => Style::new(),
     };
+    // A line that fits is its one row.
+    let wide: usize = line.spans.iter().map(|span| span.content.width()).sum();
+    if wide <= room {
+        let cut = line.alignment == Some(CUT);
+        let style = line.style;
+        let mut spans = first.spans;
+        spans.extend(
+            (line.spans.into_iter())
+                .filter(|span| !span.content.is_empty())
+                .map(|span| Span::styled(span.content, style.patch(span.style))),
+        );
+        return vec![Line {
+            alignment: cut.then_some(CUT),
+            style: band,
+            ..Line::from(spans)
+        }];
+    }
+    let rest = [vec![goes_on(rest.width(), true)], rest.spans].concat();
     // Each row, and whether it goes on with a word cut in the row above.
     let mut rows: Vec<(Vec<Span<'static>>, bool)> =
         vec![(first.spans, line.alignment == Some(CUT))];
+    // Words go onto the span they follow when it is a word of the same
+    // style on the same row: a row is a span for each style, not a word.
+    let mut joins = false;
     let mut used = 0;
     for span in line.spans {
         let style = line.style.patch(span.style);
@@ -1222,6 +889,7 @@ fn wrap_rows(
                 rows.push((rest.clone(), false));
                 room = rest_room;
                 used = 0;
+                joins = false;
                 if word.trim().is_empty() {
                     continue;
                 }
@@ -1261,12 +929,19 @@ fn wrap_rows(
                 rows.push((rest.clone(), true));
                 room = rest_room;
                 used = 0;
+                joins = false;
                 word = &word[cut..];
                 wide = wide.saturating_sub(cols);
             }
             used += wide;
-            (rows.last_mut().unwrap().0).push(Span::styled(word.to_owned(), style));
+            let row = &mut rows.last_mut().unwrap().0;
+            match row.last_mut() {
+                Some(last) if joins && last.style == style => last.content.to_mut().push_str(word),
+                _ => row.push(Span::styled(word.to_owned(), style)),
+            }
+            joins = true;
         }
+        joins = false;
     }
     rows.into_iter()
         .map(|(spans, cut)| Line {
@@ -1627,6 +1302,12 @@ fn quote_rows(text: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
         let Some(quoted) = quote_line(line) else {
+            // A blank line before words, or between them and a quote,
+            // stays a blank row.
+            if line.trim().is_empty() {
+                out.push(Line::from("  "));
+                continue;
+            }
             // Its own words, as every surface draws Markdown. A `>` inside
             // a fence is code (a shell's redirect), not a quote: the run
             // goes on to the fence's end, so one reading draws it whole.
@@ -1688,10 +1369,6 @@ pub fn with_quotes(
     prompt.push(end);
     prompt
 }
-
-/// The most bars a quote draws, as deep as it is nested; the rest of
-/// its marks are kept as written, as groups past eight deep are.
-const QUOTE_DEPTH: usize = 8;
 
 /// A quote's bars, `depth` deep, each a tinted blank and a space: drawn
 /// as a bar, copied as blanks ([`crate::look::QUOTE`]).
@@ -2424,21 +2101,14 @@ pub fn markdown_at(
     let width = width.min(crate::measure());
     let wide = first.width().max(rest.width());
     let inner = (width + 2).saturating_sub(wide).max(10);
-    let mut rows = Vec::new();
-    let mut before = None;
-    for (at, line) in text.lines().enumerate() {
-        if at == lines {
-            before = Some(rows.len());
-        }
-        rows.extend(markdown.feed(line, inner, false));
-    }
-    rows.extend(markdown.end(inner, false));
+    let rows = crate::markdown::rows(markdown, text, inner);
+    let before = rows.partition_point(|(line, _)| *line < lines);
     let mut out = Vec::with_capacity(rows.len());
-    for (at, row) in rows.into_iter().enumerate() {
+    for (at, (_, row)) in rows.into_iter().enumerate() {
         let lead = if at == 0 { &first } else { &rest };
         out.push(relead(row, lead));
     }
-    let after = out.split_off(before.unwrap_or(out.len()));
+    let after = out.split_off(before);
     (out, after)
 }
 
@@ -4209,7 +3879,7 @@ mod tests {
     fn a_quote_keeps_its_bar_over_blank_lines_and_without_a_space() {
         // CommonMark: `>` and at most one space; a lone `>` is the quote's
         // blank line, and `> >` a quote inside it.
-        let reply = "> First paragraph.\n>\n>Second, no space.\n> > Nested.\nAfter.";
+        let reply = "> First paragraph.\n>\n>Second, no space.\n> > Nested.\n\nAfter.";
         let lead = || Line::from("  ");
         let rows = markdown(&mut Markdown::default(), reply, 80, (lead(), lead()));
         assert_eq!(
@@ -4219,26 +3889,37 @@ mod tests {
                 "  ▌ ",
                 "  ▌ Second, no space.",
                 "  ▌ ▌ Nested.",
+                "  ",
                 "  After.",
             ]
         );
+        // A line with no `>` goes on with the quote's paragraph, as
+        // CommonMark reads it.
+        let rows = markdown(
+            &mut Markdown::default(),
+            "> A quote that\ncontinues.",
+            80,
+            (lead(), lead()),
+        );
+        assert_eq!(text(&rows), ["  ▌ A quote that", "  ▌ continues."]);
         // A wrapped row keeps every bar its line has.
-        let mut quote = Markdown::default();
-        quote.line("> > a long nested quote");
-        assert_eq!(seen(&quote.rest()), "  ▌ ▌ ");
-        // As deep as it goes, at most eight bars: the rest stays text, so
-        // a run of marks wraps as words do, its rows' leads no longer.
-        let deep = ">".repeat(10_000);
+        let rows = markdown(
+            &mut Markdown::default(),
+            "> > a long nested quote",
+            14,
+            (lead(), lead()),
+        );
+        assert_eq!(seen(&rows[0]), "  ▌ ▌ a long ");
+        assert_eq!(seen(&rows[1]), "  ▌ ▌ nested ");
+        // As deep as it goes, at most eight bars.
+        let deep = format!("{} deep", ">".repeat(10_000));
         let rows = markdown(&mut Markdown::default(), &deep, 80, (lead(), lead()));
         let bars = format!("  {}", "▌ ".repeat(8));
-        assert_eq!(seen(&rows[0]), bars);
-        assert!(seen(&rows[1]).starts_with(&format!("{bars}>")));
+        assert_eq!(seen(&rows[0]), format!("{bars}deep"));
         assert!(rows.iter().all(|row| row.width() <= 80));
         assert_eq!(quote_line(">"), Some(""));
-        quote.line(&deep);
-        assert_eq!(quote.rest().width(), 2 + 2 * 8);
         // Each bar a tinted blank: a copy takes no mark.
-        assert!(!quote.rest().to_string().contains('▌'));
+        assert!(!rows[0].to_string().contains('▌'));
     }
 
     #[test]
@@ -4308,20 +3989,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shot.png"), b"not drawn in tests").unwrap();
         std::fs::write(dir.join("a b.png"), b"not drawn in tests").unwrap();
-        let mut markdown = Markdown::document(&dir);
-        let rows = markdown.feed(
-            "![A shot](shot.png) [![CI](https://x/ci.svg)](https://x)",
-            80,
-            false,
-        );
+        let lead = || Line::from("  ");
+        let shown = |text: &str| {
+            let rows = markdown(&mut Markdown::document(&dir), text, 80, (lead(), lead()));
+            super::tests::text(&rows)
+        };
         // A file here keeps its path, to be clicked; another's only its words.
-        assert_eq!(text(&rows), vec!["  ▣ A shot (shot.png)  ▣ CI"]);
+        assert_eq!(
+            shown("![A shot](shot.png) [![CI](https://x/ci.svg)](https://x)"),
+            vec!["  ▣ A shot (shot.png)  ▣ CI"]
+        );
         // An escaped name reads back as the file's.
-        let rows = markdown.feed("![Spaced](a%20b.png)", 80, false);
-        assert_eq!(text(&rows), vec!["  ▣ Spaced (a%20b.png)"]);
+        assert_eq!(
+            shown("![Spaced](a%20b.png)"),
+            vec!["  ▣ Spaced (a%20b.png)"]
+        );
         // Among words, a picture is a link to it.
-        let rows = markdown.feed("Look: ![plot](out/plot.png).", 80, false);
-        assert_eq!(text(&rows), vec!["  Look: ▣ plot (out/plot.png)."]);
+        assert_eq!(
+            shown("Look: ![plot](out/plot.png)."),
+            vec!["  Look: ▣ plot (out/plot.png)."]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4474,6 +4161,14 @@ mod tests {
         );
         // A short one shows whole.
         assert_eq!(prompt("- a\n- b", 80, None).1, Folds::default());
+        // A table drawn from all its lines at once folds whole where it ends.
+        let table: String = "| a | b |\n|---|---|\n".to_owned()
+            + &(1..=12)
+                .map(|n| format!("| {n} | x |\n"))
+                .collect::<String>();
+        let (rows, fold) = prompt(&table, 80, None);
+        assert!(fold.more.is_some(), "{:?}", text(&rows));
+        assert!(!text(&rows).iter().any(|row| row.contains('│')));
     }
 
     #[test]
@@ -5101,8 +4796,9 @@ mod tests {
             text(&reply("so \\(x^2\\) holds", 40, folder)),
             text(&reply("so $x^2$ holds", 40, folder))
         );
-        // An escaped bracket that runs on is words.
-        assert_eq!(text(&reply("\\[not math", 40, folder)), ["• \\[not math"]);
+        // An escaped bracket that runs on is a bracket, as CommonMark reads
+        // its escape.
+        assert_eq!(text(&reply("\\[not math", 40, folder)), ["• [not math"]);
     }
 
     #[test]
