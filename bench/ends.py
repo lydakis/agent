@@ -335,6 +335,8 @@ def main():
                         help='seconds each busy turn and each script take at least, so both sides do the same work')
     parser.add_argument('--turns', type=int, default=30)
     parser.add_argument('--seed', help='a store of the stored agents to copy, made when missing')
+    parser.add_argument('--dotted', action='store_true',
+                        help="name each agent as its folder's project's, PROJECT.NAME, as Sonny names them")
     args = parser.parse_args()
     agent, sonny = (str(Path(p).resolve()) for p in (args.agent, args.sonny))
     # One fixed place, so a seed's folders are where its agents say.
@@ -375,19 +377,24 @@ def main():
         daemon, control = serve()
         # Stored agents keep their folder: a seed is made for these folders.
         names = []
+        # Each agent as its folder's project's, with --dotted.
+        def of(folder, name):
+            return f'{folder.name}.{name}' if args.dotted else name
+        busy_bot = lambda n: of(folders[0], f'b{n}')
+        script_bot = lambda n: of(folders[0], f's{n}')
         if args.end == 'low':
-            names = [('lead', folders[0], None)] + [(f't{n}', folders[0], None)
-                                                    for n in range(1, args.agents)]
+            names = [(of(folders[0], 'lead'), folders[0], None)] + [(of(folders[0], f't{n}'), folders[0], None)
+                                                                    for n in range(1, args.agents)]
         else:
             for n in range(args.windows):
                 folder = folders[n if args.layout == 'spread' else 0]
-                names.append((f'w{n}', folder, None))
-            names += [(f'b{n}', folders[0], None) for n in range(args.busy)]
-            names += [(f's{n}', folders[0], f'h{n}') for n in range(args.scripts)]
-            names += [(f'x{n}', folders[0], None) for n in range(max(0, args.stored - len(names)))]
+                names.append((of(folder, f'w{n}'), folder, None))
+            names += [(busy_bot(n), folders[0], None) for n in range(args.busy)]
+            names += [(script_bot(n), folders[0], f'h{n}') for n in range(args.scripts)]
+            names += [(of(folders[0], f'x{n}'), folders[0], None) for n in range(max(0, args.stored - len(names)))]
         # The filler first, so a seed holds only it: every run makes its
         # windows', busy and script agents itself.
-        filler = [n for n in names if n[0].startswith('x')]
+        filler = [n for n in names if n[0].rsplit('.', 1)[-1].startswith('x')]
         made = time.monotonic()
         for name, folder, tag in ([] if seeded else filler) + [n for n in names if n not in filler]:
             extra = {'declare': [dict(SCRIPT, answered_by=tag)]} if tag else {}
@@ -408,7 +415,7 @@ def main():
 
         if args.end == 'low':
             # One window, opened on its lead.
-            window('lead', 'lead', folders[0])
+            window('lead', names[0][0], folders[0])
             started = windows.drawn('lead')
             time.sleep(8)  # its first reads done, the lookout started
             groups = {'daemon': lambda: [daemon.pid],
@@ -422,9 +429,9 @@ def main():
             turns = []
             for n in range(args.turns):
                 began = time.monotonic()
-                submitted = need(control.request('submit', bot='t1', request_id=f'turn{n}',
+                submitted = need(control.request('submit', bot=names[1][0], request_id=f'turn{n}',
                                                  prompt='hi'), 'submit')
-                ended(control, f't1/{submitted["message"]}')
+                ended(control, f'{names[1][0]}/{submitted["message"]}')
                 turns.append((time.monotonic() - began) * 1000)
             result['turn_ms'] = spread(turns)
         else:
@@ -449,7 +456,7 @@ def main():
                     stopping.set()
 
             def busy(n):
-                worker(lambda: run_busy(n), f'b{n}')
+                worker(lambda: run_busy(n), busy_bot(n))
 
             def run_busy(n):
                 connection = Connection(sock, retain_durable=False)
@@ -457,21 +464,21 @@ def main():
                 while not stopping.is_set():
                     turn += 1
                     due = time.monotonic() + args.pace
-                    submitted = connection.request('submit', bot=f'b{n}', request_id=f'r{turn}', prompt='delay:50')
+                    submitted = connection.request('submit', bot=busy_bot(n), request_id=f'r{turn}', prompt='delay:50')
                     if busy_still(submitted):
                         time.sleep(.05)
                         continue
-                    ended(connection, f'b{n}/{submitted["result"]["message"]}')
+                    ended(connection, f'{busy_bot(n)}/{submitted["result"]["message"]}')
                     finished[0] += 1
                     stopping.wait(max(0, due - time.monotonic()))
                 connection.close()
 
             def script(n):
-                worker(lambda: run_script(n), f's{n}')
+                worker(lambda: run_script(n), script_bot(n))
 
             def run_script(n):
                 connection = Connection(sock, retain_durable=False)
-                bot, tag, turn = f's{n}', f'h{n}', 0
+                bot, tag, turn = script_bot(n), f'h{n}', 0
                 while not stopping.is_set():
                     turn += 1
                     due = time.monotonic() + args.pace
