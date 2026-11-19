@@ -773,7 +773,8 @@ async fn read_status_of(
         // Its history is read again only once it moved, here or, while
         // the card fills, beside it: a row not read yet says what the
         // listing does.
-        let unread = !is_read(bot, status_read, asks_seen);
+        let head = json!([bot.bot_id, bot.head]);
+        let unread = !is_read(bot, &head, status_read, asks_seen);
         if unread {
             match view.fill {
                 true => unread_here.push(name.to_owned()),
@@ -783,7 +784,6 @@ async fn read_status_of(
                 }
             }
         }
-        let head = json!([bot.bot_id, bot.head]);
         let latest = (status_read.get(name))
             .filter(|(seen, _)| *seen == head)
             .map(|(_, latest)| latest.clone())
@@ -1207,16 +1207,16 @@ fn keep_for(
 }
 
 /// Whether what `/status` read of `bot` holds as the listing has it now:
-/// its latest items as of its history's head, none to read while it has
+/// its latest items as of its history's `head`, none to read while it has
 /// no history, and its question as of the turn that ended last.
 fn is_read(
     bot: &standing::Agent,
+    head: &Value,
     status_read: &HashMap<String, (Value, Latest)>,
     asks_seen: &HashMap<String, (i64, Seen)>,
 ) -> bool {
-    let head = json!([bot.bot_id, bot.head]);
     let latest =
-        bot.head.is_none() || (status_read.get(&bot.name)).is_some_and(|(seen, _)| *seen == head);
+        bot.head.is_none() || (status_read.get(&bot.name)).is_some_and(|(seen, _)| seen == head);
     let ended = (bot.last.as_ref()).filter(|_| bot.running_turn.is_none());
     let asked = ended
         .is_none_or(|last| (asks_seen.get(&bot.name)).is_some_and(|(turn, _)| *turn == last.turn));
