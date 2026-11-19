@@ -120,6 +120,7 @@ fn write_all(jobs: &[(PathBuf, String, i64, String)]) -> std::io::Result<()> {
     let mut done = Ok(());
     for run in jobs.chunk_by(|a, b| a.0 == b.0) {
         let dir = &run[0].0;
+        let made = !dir.is_dir();
         if let Err(error) = std::fs::create_dir_all(dir) {
             done = Err(error);
             continue;
@@ -132,13 +133,13 @@ fn write_all(jobs: &[(PathBuf, String, i64, String)]) -> std::io::Result<()> {
             }
         }
         let after = changed_at(dir);
-        // Its own notes leave the names as read: only another's reads them
-        // again.
+        // Its own notes leave the names as read, in a folder they made
+        // too: only another's reads them again.
         let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(names) = names
-            .get_mut(dir)
-            .filter(|names| names.at.is_some() && names.at == before)
-        {
+        if let Some(names) = names.get_mut(dir).filter(|names| match names.at {
+            Some(_) => names.at == before,
+            None => made,
+        }) {
             names.at = after;
         }
     }
@@ -172,6 +173,13 @@ impl Noted {
     /// was noted for another agent of that name.
     pub fn of(&self, bot: &str, id: Option<i64>) -> Option<String> {
         let id = id?;
+        // One read or noted here, its file written yet or not.
+        let read = READ.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (bot.to_owned(), id);
+        if let Some(title) = read.get(&self.dir).and_then(|read| read.get(&key)) {
+            return Some(title.clone());
+        }
+        drop(read);
         let names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
         if !(names.get(&self.dir))
             .is_some_and(|names| names.names.contains(std::ffi::OsStr::new(bot)))
@@ -375,6 +383,19 @@ mod tests {
         assert_eq!(
             noted(&store, "calc.docs", 3).as_deref(),
             Some("Document the sums")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_line_noted_shows_before_its_file_is_written() {
+        let dir = std::env::temp_dir().join(format!("sonny-later-{}", std::process::id()));
+        let store = dir.join("state.sqlite");
+        note_later(&store, "calc.sum", 4, "Sum the column");
+        // No folder yet: the listing reads none, and shows it all the same.
+        assert_eq!(
+            Noted::read(&store).of("calc.sum", Some(4)).as_deref(),
+            Some("Sum the column")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
