@@ -311,6 +311,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         named_as_sides,
         mut seen_of,
         running,
+        mut closed,
     } = seeded;
     let theirs = |bot: &str| other(bot, &named_as_sides);
     // The agents followed narrowly, and whether each has waited since:
@@ -332,9 +333,9 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
     // The agents a lead's turn marked done, by the lead: read again once
     // the turn ends, when the mark is beside the store.
     let mut marked: HashMap<String, Vec<String>> = HashMap::new();
-    // The agents closed while the follow ran: a turn still running in one
-    // can ask, and needs no one until a message opens it again.
-    let mut closed: HashSet<String> = HashSet::new();
+    // The agents closed (those holding a call when the follow started,
+    // then those it hears close): a turn still running in one can ask,
+    // and needs no one until a message opens it again.
     tell_waiting(&needs, &order, tell);
     loop {
         let Some(event) = events.recv().await else {
@@ -508,6 +509,8 @@ struct Seeded {
     seen_of: HashMap<String, Seen>,
     /// The agents whose turn ran, read once it ends.
     running: Vec<String>,
+    /// The agents closed that hold a call for the person.
+    closed: HashSet<String>,
 }
 
 /// The calls held for the person, and each idle agent's question as of
@@ -526,7 +529,14 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
         .map(|bot| bot.name.clone())
         .collect();
     let theirs = |bot: &str| other(bot, &named_as_sides);
-    needs.held(held, theirs);
+    // A call held by an agent closed needs no one, as `/status` lists it
+    // no more: the listing has only the open, in the order of their names.
+    let open = |bot: &str| (listed.binary_search_by(|row| row.name.as_str().cmp(bot))).is_ok();
+    let closed: HashSet<String> = (held.iter())
+        .filter(|held| theirs(&held.bot) && !open(&held.bot))
+        .map(|held| held.bot.clone())
+        .collect();
+    needs.held(held, |bot| theirs(bot) && !closed.contains(bot));
     let mut seen_of: HashMap<String, Seen> = HashMap::new();
     let mut running = Vec::new();
     let identity = client.identity().map(str::to_owned);
@@ -585,6 +595,7 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
         named_as_sides,
         seen_of,
         running,
+        closed,
     })
 }
 
@@ -852,9 +863,12 @@ mod tests {
                                 let request: Value = serde_json::from_str(&line).unwrap();
                                 let result = match request["op"].as_str() {
                                     Some("bots") => json!({"bots": [
-                                        {"name": "tally.lead", "bot_id": 1},
-                                        {"name": "site.lead", "bot_id": 2}], "cursor": 1}),
-                                    Some("approvals") => json!({"approvals": []}),
+                                        {"name": "site.lead", "bot_id": 2},
+                                        {"name": "tally.lead", "bot_id": 1}], "cursor": 1}),
+                                    // Held by an agent closed: no one's.
+                                    Some("approvals") => json!({"approvals": [
+                                        {"bot": "site.gone", "turn": 1, "call_id": "c0",
+                                            "gates": ["manual"]}]}),
                                     _ => json!({}),
                                 };
                                 let _ = asked.send((at, request.clone()));
@@ -965,6 +979,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // No one waits: a new connection, which the next events go to.
+        loop {
+            let (at, follow) = tokio::time::timeout(wait, requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if at == 4 && op(&follow) == "follow" {
+                break;
+            }
+        }
         go.send(held("tally.readme", "c4", 13)).unwrap();
         go.send(held("site.fix", "c5", 14)).unwrap();
         tokio::time::timeout(wait, heard.wait_for(|shared| !shared.agents.is_empty()))
