@@ -996,15 +996,42 @@ fn without_nested(record: &Value) -> Option<Map<String, Value>> {
 /// named as the daemon knows a git folder, `.git` or `NAME.git`: in one
 /// named otherwise, such as a separate git folder, its hooks and config
 /// would not be kept, so a commit there asks instead.
+///
+/// Only the repository the checkout's own `.git` is: a folder there, never
+/// a link, or a linked worktree's file naming its folder in a repository's
+/// `worktrees` that names this checkout back, as git makes them. A `.git`
+/// file an agent wrote can name any repository's git folder, which would
+/// then be given, writable, to the agents made here.
 pub fn repository(dir: &std::path::Path) -> Option<String> {
-    let found = crate::task::git(
-        dir,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .ok()
-    .filter(|path| !path.is_empty())?;
-    let real = std::fs::canonicalize(found).ok()?;
-    real.to_str()
+    use std::path::Path;
+    let top = crate::task::git(dir, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .filter(|path| !path.is_empty())?;
+    let top = std::fs::canonicalize(top).ok()?;
+    let dot = top.join(".git");
+    let found = std::fs::symlink_metadata(&dot).ok()?;
+    let real = |path: &Path| std::fs::canonicalize(path).ok();
+    let common = if found.is_dir() {
+        dot
+    } else if found.is_file() {
+        let named = std::fs::read_to_string(&dot).ok()?;
+        let admin = real(&top.join(named.trim().strip_prefix("gitdir:")?.trim()))?;
+        let worktrees = admin.parent()?;
+        if worktrees.file_name()? != "worktrees" {
+            return None;
+        }
+        let common = worktrees.parent()?.to_owned();
+        let back = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+        let shared = std::fs::read_to_string(admin.join("commondir")).ok()?;
+        if real(Path::new(back.trim()))? != dot || real(&admin.join(shared.trim()))? != common {
+            return None;
+        }
+        common
+    } else {
+        return None;
+    };
+    common
+        .to_str()
         .filter(|path| path.ends_with(".git"))
         .map(str::to_owned)
 }
@@ -1240,6 +1267,41 @@ pub fn regate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repository_is_one_git_made_never_one_a_file_names() {
+        let dir = std::env::temp_dir().join(format!("sonny-repository-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let repo = dir.join("repo");
+        let git = |at: &std::path::Path, args: &[&str]| {
+            let done = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(at)
+                .env("GIT_CEILING_DIRECTORIES", &dir)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{args:?}");
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&repo, &["worktree", "add", "-q", "../wt"]);
+        let common = Some(repo.join(".git").to_string_lossy().into_owned());
+        assert_eq!(repository(&repo), common);
+        assert_eq!(repository(&dir.join("wt")), common);
+        // A folder whose `.git` file names another checkout's, or another
+        // repository's own folder, is no checkout of it.
+        for named in [repo.join(".git/worktrees/wt"), repo.join(".git")] {
+            let plant = dir.join("plant");
+            let _ = std::fs::remove_dir_all(&plant);
+            std::fs::create_dir(&plant).unwrap();
+            std::fs::write(plant.join(".git"), format!("gitdir: {}\n", named.display())).unwrap();
+            assert_eq!(repository(&plant), None, "{}", named.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_lead_and_its_tasks_write_the_lead_s_state_folder() {

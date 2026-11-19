@@ -28,6 +28,18 @@ fn find_git(path: &std::ffi::OsStr) -> Option<PathBuf> {
         })
 }
 
+/// The variables that name a repository other than the folder git is
+/// run in, as a hook's environment sets them.
+pub(crate) const LOCATING: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new(git_program());
     command.arg("-C").arg(dir);
@@ -48,6 +60,9 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .env("GIT_ALLOW_PROTOCOL", "")
         .stdin(Stdio::null());
     for key in crate::task::kept_keys() {
+        command.env_remove(key);
+    }
+    for key in LOCATING {
         command.env_remove(key);
     }
     let output = command.output().map_err(|e| format!("running git: {e}"))?;

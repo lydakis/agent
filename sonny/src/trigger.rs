@@ -1093,35 +1093,17 @@ fn watchable(path: &Path) -> Result<(), &'static str> {
     }
 }
 
-/// git about `repo` alone: a hook's `GIT_DIR` and the like would name
-/// another repository than the one launchd's fire, which has none, reads.
+/// git about `repo` alone, which an agent may have written: in a
+/// read-only sandbox with the network off, as every listing of a checkout
+/// Sonny makes (#597), so nothing its config names (an fsmonitor, a
+/// signature program, the transport a partial clone fetches a missing
+/// object with) runs as the person, at the add or at any fire.
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let mut command = std::process::Command::new("git");
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-    ] {
-        command.env_remove(key);
-    }
-    let out = command
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let out = crate::task::confined_bytes(repo, args, &[]).ok()?;
     // Only the newline git ends its answer with goes: a path may end in
     // spaces.
-    out.status.success().then(|| {
-        let text = String::from_utf8_lossy(&out.stdout);
-        text.strip_suffix('\n').unwrap_or(&text).to_owned()
-    })
+    let text = String::from_utf8_lossy(&out);
+    Some(text.strip_suffix('\n').unwrap_or(&text).to_owned())
 }
 
 /// Where a repository's HEAD was when the trigger last looked, and when.

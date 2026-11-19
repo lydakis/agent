@@ -2758,7 +2758,7 @@ fn audit(options: &Options) -> Result<i32> {
         left -= rows.len();
         for row in rows {
             if options.pretty {
-                say!("{}", audit_line(row));
+                say!("{}", visible(&audit_line(row)));
             } else {
                 if !first {
                     say_raw!(",");
@@ -2856,14 +2856,15 @@ fn approvals(options: &Options) -> Result<i32> {
         }
         for call in &calls {
             if options.pretty {
-                say!(
+                let line = format!(
                     "{} turn {} {}",
                     call["bot"].as_str().unwrap_or(""),
                     call["turn"],
                     call_line(call)
                 );
+                say!("{}", visible(&line));
                 for line in answer_lines(call, &options.target) {
-                    say!("{line}");
+                    say!("{}", visible(&line));
                 }
             } else {
                 if !first {
@@ -3148,7 +3149,7 @@ fn pages(options: &Options, op: &str, row: impl Fn(&Value) -> String) -> Result<
         left -= turns.len();
         for turn in turns {
             if options.pretty {
-                say!("{}", row(turn));
+                say!("{}", visible(&row(turn)));
             } else {
                 if !first {
                     say_raw!(",");
@@ -3206,7 +3207,7 @@ fn list(options: &Options) -> Result<i32> {
         left -= bots.len();
         for bot in bots {
             if options.pretty {
-                say!(
+                let line = format!(
                     "{:<24} {:<11} {}/{}  {}",
                     bot["name"].as_str().unwrap_or(""),
                     bot["status"].as_str().unwrap_or(""),
@@ -3214,6 +3215,7 @@ fn list(options: &Options) -> Result<i32> {
                     bot["model"].as_str().unwrap_or(""),
                     bot["workspace"].as_str().unwrap_or("")
                 );
+                say!("{}", visible(&line));
             } else {
                 if !first {
                     say_raw!(",");
