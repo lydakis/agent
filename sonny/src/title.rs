@@ -74,8 +74,20 @@ pub fn note_later(store: &Path, bot: &str, id: i64, title: &str) {
             let spawned = std::thread::Builder::new()
                 .name("titles".into())
                 .spawn(move || {
-                    for (dir, bot, id, title) in take {
-                        let _ = write(&dir, &bot, id, &title);
+                    // Behind the daemon and the loop on a busy machine: what
+                    // it writes is known to the window already. On Linux a
+                    // thread has a niceness of its own.
+                    #[cfg(target_os = "linux")]
+                    // SAFETY: setpriority changes only this thread's niceness.
+                    unsafe {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    }
+                    // What came meanwhile written together: the folder
+                    // made and its time read once for all of them.
+                    while let Ok(job) = take.recv() {
+                        let mut jobs = vec![job];
+                        jobs.extend(take.try_iter());
+                        let _ = write_all(&jobs);
                     }
                 });
             std::sync::Mutex::new(spawned.ok().map(|_| send))
@@ -96,20 +108,38 @@ pub fn note_later(store: &Path, bot: &str, id: i64, title: &str) {
 }
 
 fn write(dir: &Path, bot: &str, id: i64, title: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let before = changed_at(dir);
-    std::fs::write(dir.join(bot), format!("{id}\n{}\n", title.trim()))?;
-    let after = changed_at(dir);
-    known(dir, bot, id, title.trim());
-    // Its own note leaves the names as read: only another's reads them again.
-    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(names) = names
-        .get_mut(dir)
-        .filter(|names| names.at.is_some() && names.at == before)
-    {
-        names.at = after;
+    write_all(&[(dir.to_owned(), bot.to_owned(), id, title.to_owned())])
+}
+
+/// Write each title noted, each folder made and its time read once for
+/// the run of notes in it (a window's are all in its store's).
+fn write_all(jobs: &[(PathBuf, String, i64, String)]) -> std::io::Result<()> {
+    let mut done = Ok(());
+    for run in jobs.chunk_by(|a, b| a.0 == b.0) {
+        let dir = &run[0].0;
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            done = Err(error);
+            continue;
+        }
+        let before = changed_at(dir);
+        for (dir, bot, id, title) in run {
+            match std::fs::write(dir.join(bot), format!("{id}\n{}\n", title.trim())) {
+                Ok(()) => known(dir, bot, *id, title.trim()),
+                Err(error) => done = Err(error),
+            }
+        }
+        let after = changed_at(dir);
+        // Its own notes leave the names as read: only another's reads them
+        // again.
+        let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(names) = names
+            .get_mut(dir)
+            .filter(|names| names.at.is_some() && names.at == before)
+        {
+            names.at = after;
+        }
     }
-    Ok(())
+    done
 }
 
 /// The titles noted beside a store, for a listing of many agents: the

@@ -1680,12 +1680,21 @@ async fn read_title(
             .request("history_items", json!({"bot": name, "nodes": nodes}))
             .await
             .ok()?;
-        // Oldest first, as the nodes were asked for.
-        let first = (read["items"].as_array().into_iter().flatten())
-            .flat_map(|entry| responses(&entry["item"]))
-            .find(|item| item["role"] == "user")
-            .map(|item| text(&item));
-        Some(first.unwrap_or_default())
+        // Oldest first, as the nodes were asked for. An item too large to
+        // read before the first message leaves it with no title: read
+        // again, it would be as large.
+        for entry in read["items"].as_array().into_iter().flatten() {
+            if !entry["error"].is_null() {
+                return Some(String::new());
+            }
+            let said = responses(&entry["item"])
+                .into_iter()
+                .find(|item| item["role"] == "user");
+            if let Some(said) = said {
+                return Some(text(&said));
+            }
+        }
+        Some(String::new())
     };
     let first = first.await;
     if let Some(first) = &first {
@@ -25830,6 +25839,8 @@ mod tests {
                 "created_by": "titled.lead"},
             {"name": "titled.big", "bot_id": 5, "head": 10, "last": {"turn": 1, "status": "completed"},
                 "created_by": "titled.lead"},
+            {"name": "titled.odd", "bot_id": 6, "head": 12, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
             {"name": "titled.lead", "bot_id": 1, "head": 2, "workspace": "WORKSPACE",
                 "last": {"turn": 1, "status": "completed"}},
         ]);
@@ -25858,6 +25869,9 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(ask["bot"].as_str().unwrap().to_owned());
+                if ask["bot"] == "titled.odd" {
+                    return json!({"nodes": [{"node": 12, "turn": 1}, {"node": 11, "turn": 1}], "next_from": null});
+                }
                 // The oldest page, newest first as every page comes.
                 json!({"nodes": [{"node": 3, "turn": 2}, {"node": 1, "turn": 1}], "next_from": null})
             }
@@ -25874,6 +25888,11 @@ mod tests {
                 counted_reads.fetch_add(1, Ordering::SeqCst);
                 json!({"nodes": [], "next_from": null})
             }
+            // Its first message too large to read.
+            "history_items" if ask["nodes"] == json!([11, 12]) => json!({"items": [
+                {"node": 11, "error": "item_too_large"},
+                {"node": 12, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Not the first either"}]}}]}),
             // Its items too large for one answer: only the newest came.
             "history_items" if ask["nodes"] == json!([10, 9]) => json!({"items": [
                 {"node": 10, "item": {"role": "user", "content": [{"type": "input_text",
@@ -25919,7 +25938,12 @@ mod tests {
             crate::title::noted(&store, "titled.helper", 2).as_deref(),
             Some("Fix the flaky login test")
         );
-        assert_eq!(read_first(&firsts), ["titled.big", "titled.helper"]);
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
+        // One whose first message is too large to read has no title.
+        assert_eq!(crate::title::noted(&store, "titled.odd", 6), None);
         // One whose newest page did not all come reads its first line.
         assert_eq!(
             crate::title::noted(&store, "titled.big", 5).as_deref(),
@@ -25934,7 +25958,10 @@ mod tests {
         // Read again after it moved: its title is not.
         app.follower.as_ref().unwrap().moved("titled.helper");
         counted(&mut app).await;
-        assert_eq!(read_first(&firsts), ["titled.big", "titled.helper"]);
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
         // A title noted as it started is never read, nor replaced.
         assert_eq!(
             crate::title::noted(&store, "titled.kept", 3).as_deref(),
@@ -25953,7 +25980,10 @@ mod tests {
         app.asks_seen.clear();
         app.status().await;
         app.status_whole().await;
-        assert_eq!(read_first(&firsts), ["titled.big", "titled.helper"]);
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
         assert_eq!(crate::title::noted(&store, "titled.lead", 1), None);
         assert_eq!(
             titles
