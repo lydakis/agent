@@ -542,10 +542,12 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     // A call held by an agent closed needs no one, as `/status` lists it
     // no more: the listing has only the open, in the order of their names.
     let open = |bot: &str| (listed.binary_search_by(|row| row.name.as_str().cmp(bot))).is_ok();
-    let closed: HashSet<String> = (held.iter())
+    let mut closed: HashSet<String> = (held.iter())
         .filter(|held| theirs(&held.bot) && !open(&held.bot))
         .map(|held| held.bot.clone())
         .collect();
+    // Those closed while their turn runs, which can still ask.
+    closed.extend(closed_running(client).await?);
     needs.held(held, |bot| theirs(bot) && !closed.contains(bot));
     let mut seen_of: HashMap<String, Seen> = HashMap::new();
     let mut running = Vec::new();
@@ -607,6 +609,29 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
         running,
         closed,
     })
+}
+
+/// The agents closed whose turn runs: every running agent's row, closed
+/// ones included, as few as the agents at work.
+async fn closed_running(client: &Client) -> Option<Vec<String>> {
+    let mut closed = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut ask = json!({"name": "*.*", "active": true, "limit": 256});
+        if let Some(after) = &after {
+            ask["after"] = json!(after);
+        }
+        let page = client.request("bots", ask).await.ok()?;
+        closed.extend(
+            (page["bots"].as_array().into_iter().flatten())
+                .filter(|row| !row["closed_ms"].is_null())
+                .filter_map(|row| row["name"].as_str().map(str::to_owned)),
+        );
+        match page["next_after"].as_str() {
+            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
+            _ => return Some(closed),
+        }
+    }
 }
 
 /// The agent a `mark_done` call starting in `event`, by `bot`, marks done:
@@ -872,6 +897,10 @@ mod tests {
                                 let Ok(Some(line)) = line else { return };
                                 let request: Value = serde_json::from_str(&line).unwrap();
                                 let result = match request["op"].as_str() {
+                                    // At work, closed: its turn can still ask.
+                                    Some("bots") if request["active"] == true => json!({"bots": [
+                                        {"name": "site.shut", "bot_id": 3, "running_turn": 2,
+                                            "closed_ms": 1}]}),
                                     Some("bots") => json!({"bots": [
                                         {"name": "site.lead", "bot_id": 2},
                                         {"name": "tally.lead", "bot_id": 1}], "cursor": 1}),
@@ -915,7 +944,8 @@ mod tests {
             ("follow".into(), json!("*.*"))
         );
         assert_eq!(first["kinds"], json!(WIDE));
-        while op(&requests.recv().await.unwrap().1) != "bots" {}
+        // Then those at work, closed ones too.
+        while requests.recv().await.unwrap().1["active"] != true {}
         // A second window of the store hears the first: it follows nothing.
         let second = Elsewhere::start(socket, store, "site".into(), woken);
         let mut heard = second.waiting.clone();
@@ -1000,6 +1030,7 @@ mod tests {
             }
         }
         go.send(held("tally.readme", "c4", 13)).unwrap();
+        go.send(held("site.shut", "c6", 13)).unwrap();
         go.send(held("site.fix", "c5", 14)).unwrap();
         tokio::time::timeout(wait, heard.wait_for(|shared| !shared.agents.is_empty()))
             .await
