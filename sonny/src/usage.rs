@@ -1319,6 +1319,8 @@ struct Listed {
     /// When the turn it runs started; none when it runs none.
     running: Option<i64>,
     last: Option<i64>,
+    /// When its last finished turn started and ended.
+    ended: Option<(i64, i64)>,
     created_by: Value,
     expire_ms: Value,
 }
@@ -1348,6 +1350,8 @@ async fn listed(
             tasks.push(Listed {
                 bot: bot["name"].as_str().unwrap_or_default().to_owned(),
                 bot_id: bot["bot_id"].as_i64().unwrap_or_default(),
+                ended: (bot["last"]["started_ms"].as_i64())
+                    .zip(bot["last"]["finished_ms"].as_i64()),
                 running: running.then(|| bot["started_ms"].as_i64().unwrap_or(since)),
                 last: bot["running_turn"]
                     .as_i64()
@@ -1607,8 +1611,10 @@ async fn person_pages(
 /// person's messages in `wrote` and calls in `decided`. A task whose turn
 /// started before `end` and still runs counts as running, its turn's time
 /// so far with the rest, so one still at work when an earlier period ended
-/// is not counted as ended there. Its time is none when a turn it finished
-/// went untimed, which `usage` leaves out of `turn_ms`.
+/// is not counted as ended there, and one whose last turn started before
+/// the period and ended in it counts with that turn's time. Its time is
+/// none when a turn it finished went untimed, which `usage` leaves out of
+/// `turn_ms`.
 fn rows(
     tasks: &[Listed],
     spent: &HashMap<String, Worked>,
@@ -1620,7 +1626,12 @@ fn rows(
     for task in tasks {
         let spent = spent.get(&task.bot).copied().unwrap_or_default();
         let running = task.running.filter(|started| *started < end);
-        if spent.turns == 0 && running.is_none() {
+        // Its last turn, started before the period and ended in it, which
+        // `usage` counts where it started.
+        let crossed = task.ended.filter(|(started, ended)| {
+            *started < start && (start..end).contains(ended) && running.is_none()
+        });
+        if spent.turns == 0 && running.is_none() && crossed.is_none() {
             continue;
         }
         // Its running turn, when it started in the period, is among its
@@ -1628,7 +1639,8 @@ fn rows(
         let open = running.is_some_and(|started| started >= start) as u64;
         let work_ms = (spent.turns == spent.timed + open).then(|| {
             let so_far = running.map_or(0, |started| (end - started).max(0) as u64);
-            spent.turn_ms + so_far
+            let crossed = crossed.map_or(0, |(started, ended)| (ended - started).max(0) as u64);
+            spent.turn_ms + so_far + crossed
         });
         let count = |of: &HashMap<i64, u64>| of.get(&task.bot_id).copied().unwrap_or(0);
         rows.push(json!({
@@ -1720,6 +1732,7 @@ mod tests {
             bot_id,
             running,
             last: Some(9),
+            ended: None,
             created_by: json!("p.lead"),
             expire_ms: Value::Null,
         };
@@ -1729,6 +1742,12 @@ mod tests {
             listed("p.old", 3, None),
             listed("p.long", 4, Some(50)),
             listed("p.untimed", 5, None),
+            // Its one turn started at 50, before this period, and ended in
+            // it at 150.
+            Listed {
+                ended: Some((50, 150)),
+                ..listed("p.crossed", 6, None)
+            },
         ];
         let spent = |turns, timed, turn_ms| Worked {
             turns,
@@ -1779,6 +1798,8 @@ mod tests {
                 ("p.long", 0, Some(150), true, 0, 0),
                 // An untimed turn: no time to count it by.
                 ("p.untimed", 2, None, false, 0, 0),
+                // Ended in this period: counted with its turn's time.
+                ("p.crossed", 0, Some(100), false, 0, 0),
             ]
         );
         let before = rows(&tasks, &last, &by_id(&[(3, 1)]), &HashMap::new(), (0, 100));
