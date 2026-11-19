@@ -682,9 +682,11 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                 ));
             }
             args.extend([flag, value]);
-        } else if flag == "--screenshot-dir" && reach.carry {
+        } else if flag == "--screenshot-dir" && (reach.carry || reach.roots.is_some()) {
+            // A folder the browser writes as the person, which no file of
+            // Sonny's stands in for.
             return Err(format!(
-                "{flag} is not taken over a link: give each screenshot a path"
+                "{flag} is not taken for a confined agent or over a link: give each screenshot a path"
             ));
         } else if ["--screenshot-dir", "-o", "--output"].contains(&flag.as_str()) {
             let file = reach.saved(&value(&mut words)?, &mut carried)?;
@@ -3244,6 +3246,7 @@ mod tests {
         let diff = checked("diff snapshot -o d.txt", &lent).unwrap();
         assert_eq!(diff.carried.len(), 1, "{:?}", diff.carried);
         assert!(checked("screenshot --screenshot-dir shots", &lent).is_err());
+        assert!(checked("screenshot p.png --screenshot-dir shots", &reach(&real)).is_err());
         // A recording's file goes back at its stop, which may be a later
         // call's; a failed command's files go.
         let start = checked("record start r.webm", &lent).unwrap();
