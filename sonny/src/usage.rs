@@ -1631,7 +1631,13 @@ fn rows(
     let mut rows = Vec::new();
     for task in tasks {
         let spent = spent.get(&task.bot).copied().unwrap_or_default();
-        let running = task.running.filter(|started| *started < end);
+        // Running at the period's end: its turn runs now, or its last
+        // turn started before the end and finished after it.
+        let running = (task.running.filter(|started| *started < end)).or_else(|| {
+            (task.ended)
+                .filter(|(started, ended)| *started < end && *ended >= end)
+                .map(|(started, _)| started)
+        });
         // Its last turn, started before the period and ended in it, which
         // `usage` counts where it started.
         let crossed = task.ended.filter(|(started, ended)| {
@@ -1754,6 +1760,12 @@ mod tests {
                 ended: Some((50, 150)),
                 ..listed("p.crossed", 6, None)
             },
+            // Its one turn started at 80, in the period before, and ended
+            // at 150, in this one.
+            Listed {
+                ended: Some((80, 150)),
+                ..listed("p.spanned", 8, None)
+            },
         ];
         let spent = |turns, timed, turn_ms| Worked {
             turns,
@@ -1774,6 +1786,7 @@ mod tests {
         let last = HashMap::from([
             ("p.old".to_owned(), spent(1, 1, 10)),
             ("p.long".to_owned(), spent(1, 0, 0)),
+            ("p.spanned".to_owned(), spent(1, 1, 70)),
         ]);
         let rows_now = rows(
             &tasks,
@@ -1806,6 +1819,7 @@ mod tests {
                 ("p.untimed", 2, None, false, 0, 0),
                 // Ended in this period: counted with its turn's time.
                 ("p.crossed", 0, Some(100), false, 0, 0),
+                ("p.spanned", 0, Some(70), false, 0, 0),
             ]
         );
         let before = rows(&tasks, &last, &by_id(&[(3, 1)]), &HashMap::new(), (0, 100));
@@ -1814,7 +1828,11 @@ mod tests {
             .collect();
         // p.long had not ended when that period did; p.b's turn started
         // after it.
-        assert_eq!(shown, [("p.old", false), ("p.long", true)]);
+        // p.spanned's turn had not ended either.
+        assert_eq!(
+            shown,
+            [("p.old", false), ("p.long", true), ("p.spanned", true)]
+        );
         assert_eq!(before[0]["person_messages"], 1);
         assert_eq!(Tasks::before(&before), (0, 1));
     }
