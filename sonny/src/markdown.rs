@@ -463,6 +463,10 @@ impl Draw<'_> {
             self.across.push(range.clone());
         }
         if let Some(Leaf::Table(_)) = &self.leaf {
+            // A cell's footnote is drawn with the cell, and counted here.
+            if let Event::FootnoteReference(_) = event {
+                self.top_notes += 1;
+            }
             if let Event::End(TagEnd::Table) = event {
                 let Some(Leaf::Table(table)) = self.leaf.take() else {
                     return;
@@ -2895,6 +2899,20 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(words, "___");
+        // A table pointing at a footnote goes out once the note is read.
+        let cited = "| A |\n|---|\n| x[^n] |\n\n[^n]: The source.\n\nAfter.";
+        assert_eq!(
+            streamed(Markdown::default(), cited, 40),
+            whole(&Markdown::default(), cited, 40)
+        );
+        let mut reader = Markdown::default();
+        for line in cited.lines() {
+            reader.feed(line, 40, false);
+        }
+        assert!(
+            !reader.waiting,
+            "a resolved footnote keeps the table waiting"
+        );
         // Quote marks deep on one line are read once each.
         let deep = format!("{} x", ">".repeat(20_000));
         assert!(!whole(&reply, &deep, 40).is_empty());
