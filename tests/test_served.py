@@ -179,7 +179,7 @@ class ServedToolTests(ModelFixture):
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', **made)
         self.keeps_its_tools(self.host(), 'calc.lead', **made)
-        output = self.call('calc.lead', 'start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': f'Fix {repo}/calc.py.'})
+        output = self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': f'Fix {repo}/calc.py.'})
         self.assertTrue(output.startswith('Started calc.fix: '), output)
         worktree = self.path / '.agent/worktrees/calc.fix'
         [task] = self.daemon.request('bots', name='calc.fix')['result']['bots']
@@ -205,20 +205,20 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(prompts[0]['text'], f'Fix {worktree}/calc.py.')
         # With a task still there, another start says why it is separate
         # work, or is refused with the tasks it could go to.
-        refused = json.loads(self.call('calc.lead', 'start_task', {'title': 'Fix the sums', 'name': 'docs', 'brief': 'Docs.'}))
+        refused = json.loads(self.call('calc.lead', 'start_task', {'name': 'docs', 'brief': 'Docs.'}))
         self.assertEqual(refused['error'], 'tasks_exist')
         self.assertIn('calc.fix (', refused['detail'])
         self.assertEqual(self.daemon.request('bots', name='calc.docs')['result']['bots'], [])
         # Its name is taken now, so a second start is refused, and nothing
         # is left behind.
         refused = json.loads(self.call('calc.lead', 'start_task',
-                                       {'title': 'Fix the sums again', 'name': 'fix', 'brief': 'Again.', 'reason': 'Another fix.'}))
+                                       {'name': 'fix', 'brief': 'Again.', 'reason': 'Another fix.'}))
         self.assertEqual(refused['error'], 'task_not_started')
         self.assertTrue(worktree.is_dir())
         # In `full`, with no gate to ask, a task runs unconfined, as its
         # lead does.
         self.daemon.request('configure', bot='calc.lead', approve=[])
-        output = self.call('calc.lead', 'start_task', {'title': 'Fix the sums', 'name': 'free', 'brief': 'Go.', 'reason': 'Separate.'})
+        output = self.call('calc.lead', 'start_task', {'name': 'free', 'brief': 'Go.', 'reason': 'Separate.'})
         self.assertTrue(output.startswith('Started calc.free: '), output)
         free = self.daemon.request('inspect', bot='calc.free')['result']['settings']
         self.assertEqual((free['sandbox'], free['writable'], free['network']), ('danger-full-access', [], False))
@@ -236,7 +236,7 @@ class ServedToolTests(ModelFixture):
                             instructions='Lead.', declare=[dict(declared('start_task', inherit=False),
                                                                 expire_ms=120_000)])
         self.host()
-        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
         turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['message']
         pid = self.path / 'setup.pid'
         deadline = time.monotonic() + 30
@@ -270,7 +270,7 @@ class ServedToolTests(ModelFixture):
                             instructions='Lead.', declare=[dict(declared('start_task', inherit=False),
                                                                 expire_ms=120_000)])
         old = self.host()
-        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
         turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['message']
         deadline = time.monotonic() + 30
         while not pids.exists() or not pids.read_text().strip():
@@ -303,7 +303,7 @@ class ServedToolTests(ModelFixture):
                             instructions='Lead.', declare=[declared('start_task', inherit=False)],
                             approve=['start_task'], approver='manual')
         self.host()
-        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
         turn = self.daemon.request('submit', bot='calc.lead', request_id='deny', prompt='script')['result']['message']
         deadline = time.monotonic() + 10
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
