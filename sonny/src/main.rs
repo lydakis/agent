@@ -740,11 +740,15 @@ impl App {
 
     /// What needs the person outside the window's project, followed for as
     /// long as the window is open where **Projects** shows: started for
-    /// the project the window is in, again when it moves to another, and
+    /// the project the window is in once its own footer is counted, so the
+    /// window's start comes first, again when it moves to another, and
     /// again a few seconds after it stopped, as when the daemon went.
     fn elsewhere_tick(&mut self) {
         if !self.projects_here() {
             self.other_projects = None;
+            return;
+        }
+        if self.counts.is_none() {
             return;
         }
         let project = self.scope().project;
