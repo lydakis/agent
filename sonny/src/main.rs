@@ -5724,14 +5724,15 @@ struct Counted {
 /// their rows' mark ([`rows_mark`]: what decides each one's group, and a
 /// running one's history, whose newest items can hold a question), this
 /// window's own open question and calls, and the done marks beside the
-/// store (a lead elsewhere can mark a task without it moving). None when
-/// the daemon could not be asked.
-async fn standing(client: &Client, rows: u64, local: Local) -> Option<u64> {
+/// store (a lead elsewhere can mark a task without it moving); and the
+/// calls listed, where the daemon could list them.
+async fn standing(client: &Client, rows: u64, local: Local) -> (u64, Option<Vec<needs::Held>>) {
     use std::hash::{Hash, Hasher};
     let mut mark = std::collections::hash_map::DefaultHasher::new();
     (rows, local).hash(&mut mark);
-    needs::listing(client, None).await.ok().hash(&mut mark);
-    Some(mark.finish())
+    let held = needs::listing(client, None).await.ok();
+    held.hash(&mut mark);
+    (mark.finish(), held)
 }
 
 /// A window's own question and calls, and when the done marks beside the
@@ -12717,9 +12718,9 @@ impl App {
                 ..failed(reads)
             };
             // Counted again once the lead it lists for changes.
-            let Some(mark) = standing(&client, rows ^ name_key(&scope.lead), local).await else {
-                return Some(unread(listed, (latest, seen)));
-            };
+            // The calls waiting on someone, listed once for the mark and
+            // for the rows.
+            let (mark, held) = standing(&client, rows ^ name_key(&scope.lead), local).await;
             if was == Some(mark) {
                 return Some(Counted {
                     mark: Some(mark),
@@ -12741,7 +12742,7 @@ impl App {
                 details: false,
                 fill: false,
                 readers: Some(&readers),
-                held: None,
+                held: held.as_deref(),
             };
             let Ok(read) = read_status_of(
                 &client,
