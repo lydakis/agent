@@ -5887,8 +5887,10 @@ struct App {
     tasking: Option<tokio::task::JoinHandle<TasksRead>>,
     /// A read for the open card, under way beside the loop.
     card_read: Option<tokio::task::JoinHandle<CardRead>>,
-    /// Where `/status`'s rows land as they are read, while it opens.
-    filling: Option<Filling>,
+    /// `/status` filling in as it opens, beside the loop: where its rows
+    /// land as they are read, and the read, which ends whole. Other cards
+    /// read meanwhile; the card's own refreshes wait for it.
+    filling: Option<(Filling, tokio::task::JoinHandle<CardRead>)>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
     /// The words view's hints on the turn being drawn.
@@ -14012,6 +14014,9 @@ impl App {
         if let Some(job) = self.card_read.take() {
             job.abort();
         }
+        if let Some((_, job)) = self.filling.take() {
+            job.abort();
+        }
         let filling = Filling::default();
         let fill = Fill {
             came: filling.clone(),
@@ -14020,8 +14025,8 @@ impl App {
             take: self.status_read.is_empty(),
             keep: std::mem::take(&mut self.reads_unkept),
         };
-        self.card_read = Some(self.read_status_beside(Some(fill)));
-        self.filling = Some(filling);
+        let job = self.read_status_beside(Some(fill));
+        self.filling = Some((filling, job));
         self.watch = Some(Watch {
             project: self.scope().project,
             rows: Vec::new(),
@@ -14448,7 +14453,10 @@ impl App {
             watch.read = Instant::now();
             return;
         }
-        self.card_read = Some(self.read_status_beside(None));
+        // The card's rows read again once it has filled in.
+        if self.filling.is_none() {
+            self.card_read = Some(self.read_status_beside(None));
+        }
     }
 
     /// `/status` read again beside the loop: its alerts, then its rows.
@@ -14511,7 +14519,6 @@ impl App {
     /// What `/status` read is kept, the card open or not.
     fn card_came(&mut self, read: CardRead) {
         if let CardRead::Status(alerts, read) = read {
-            self.filling = None;
             match read {
                 Some((read, latest, seen)) => {
                     self.reads_came(latest, seen);
@@ -14557,12 +14564,16 @@ impl App {
     /// The rows `/status` read so far as it opened, as they land, and its
     /// read once whole.
     async fn status_filled(&mut self) {
-        let came = (self.filling.as_ref()).and_then(|filling| filling.lock().ok()?.take());
+        let Some((filling, job)) = &self.filling else {
+            return;
+        };
+        let came = filling.lock().ok().and_then(|mut came| came.take());
+        let ended = job.is_finished();
         if let Some((alerts, read)) = came {
             self.status_landed(alerts, *read);
         }
-        if self.filling.is_some()
-            && let Some(job) = self.card_read.take_if(|job| job.is_finished())
+        if ended
+            && let Some((_, job)) = self.filling.take()
             && let Ok(read) = job.await
         {
             self.card_came(read);
@@ -14585,7 +14596,15 @@ impl App {
         let (project, rows) = self.status_kept(read);
         let named = self.screen.last_agent();
         let width = self.width.max(40);
-        let Some(watch) = &mut self.watch else {
+        // Into `/status`'s card, not another that took its place.
+        let Some(watch) = self.watch.as_mut().filter(|watch| {
+            watch.background.is_none()
+                && watch.usage.is_none()
+                && watch.audit.is_none()
+                && watch.commons.is_none()
+                && watch.memory.is_none()
+                && watch.sky.is_none()
+        }) else {
             return;
         };
         watch.rows = rows;
@@ -14733,7 +14752,7 @@ impl App {
     /// `/status` as it lands once every row is read.
     #[cfg(test)]
     async fn status_whole(&mut self) {
-        if let Some(job) = self.card_read.take()
+        if let Some((_, job)) = self.filling.take()
             && let Ok(read) = job.await
         {
             self.card_came(read);
