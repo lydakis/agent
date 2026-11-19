@@ -128,8 +128,8 @@ pub struct SetGoing {
     pub bot: String,
     /// Its name as the conversation says it, `fix`.
     pub name: String,
-    /// Its title: a started task's, as `start_task` set it, or the first
-    /// line of the message sent.
+    /// Its title: the first line of the brief that started it, or of the
+    /// message sent.
     pub title: String,
 }
 

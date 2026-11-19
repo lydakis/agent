@@ -1172,14 +1172,16 @@ def automation_notes(parts, out):
 
 
 def titles(parts, out):
-    """Each task's title as the lead set it with `start_task`, beside its
-    name, for T1: whether a title reads as work the person would know."""
+    """Each task's title as the lead set it with `start_task`, its brief's
+    first line, beside its name, for T1: whether a title reads as work the
+    person would know."""
     lines = []
     for p in parts:
         for c in p['calls']:
             given = c['input'] if isinstance(c['input'], dict) else {}
-            if c['name'] == 'start_task' or ('title' in given and 'brief' in given):
-                lines.append(f"- {given.get('name', '?')}: {given.get('title') or '(no title)'}")
+            if c['name'] == 'start_task' or ('name' in given and 'brief' in given):
+                first = next((line.strip() for line in str(given.get('brief', '')).splitlines() if line.strip()), '')
+                lines.append(f"- {given.get('name', '?')}: {first or '(no title)'}")
     (out / 'titles.md').write_text('\n'.join(lines) + '\n' if lines else '(no task started)\n')
 
 

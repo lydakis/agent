@@ -9024,11 +9024,8 @@ mod tests {
         assert_eq!(seen["b"].turn, Some(3));
         assert_eq!(seen["b"].through, Some(12));
         assert!(!seen["b"].itself);
-        // `c`'s person moved on: every question before is set aside, so
-        // the nodes since say it whole, with no read of the rest.
-        assert_eq!(seen["c"].through, Some(12));
-        assert_eq!(seen["c"].turn, Some(3));
-        assert!(seen["c"].ask.is_none());
+        // `c`'s person moved on: read whole again.
+        assert_eq!(seen["c"].through, Some(4));
         let ops = asked.lock().unwrap();
         assert_eq!(
             *ops,
@@ -9038,6 +9035,8 @@ mod tests {
                 "history_nodes b 11",
                 "history_items b null",
                 "history_nodes c 11",
+                "history_items c null",
+                "history_nodes c null",
                 "history_items c null",
             ]
         );

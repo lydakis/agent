@@ -1116,6 +1116,8 @@ struct StatusRead {
     /// The agents whose history moved since it was read, in the listing's
     /// order, left to read beside the card ([`StatusView::fill`]).
     unread: Vec<String>,
+    /// Of those, the ones with no title, whose first line is read too.
+    untitled: std::collections::HashSet<String>,
 }
 
 /// The agents of `scope` as `/status` shows them, and footers and leads
@@ -1280,6 +1282,8 @@ async fn read_status_of(
     let mut listed_here: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let (mut fresh, mut whole) = (false, true);
     let mut unread_here = Vec::new();
+    let mut untitled_here = std::collections::HashSet::new();
+    let mut later = Vec::new();
     // Side chats are not the project's agents.
     for bot in listed {
         let name = bot.name.as_str();
@@ -1310,14 +1314,25 @@ async fn read_status_of(
         if prune {
             listed_here.insert(name);
         }
+        // Its title as noted, else, with none, its first line read once.
+        let mut title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
+        let untitled = title.is_none()
+            && bot.head.is_some()
+            && (bot.bot_id).is_some_and(|id| !crate::title::asked(name, id));
         // An idle agent no event moved stands as the last count built it,
-        // its row left where it is kept; one that moved is built again.
+        // its row left where it is kept; one that moved, or whose title
+        // changed, is built again.
         let key = name_key(name);
         if let Some((rows_kept, again)) = &mut reuse
             && let Some((at, row)) = rows_kept.get_mut(&key)
             && row.bot == name
         {
-            if bot.running_turn.is_none() && name != view.bot && !again.contains(name) {
+            if bot.running_turn.is_none()
+                && name != view.bot
+                && !again.contains(name)
+                && !untitled
+                && row.title == title.as_deref().unwrap_or("")
+            {
                 *at = counted;
                 kept_here_now += 1;
                 continue;
@@ -1328,13 +1343,36 @@ async fn read_status_of(
         // the card fills, beside it: a row not read yet says what the
         // listing does.
         let head = json!([bot.bot_id, bot.head]);
-        let unread = !is_read(bot, &head, status_read, asks_seen);
-        if unread {
+        let stale = !is_read(bot, &head, status_read, asks_seen);
+        if stale || untitled {
             match view.fill {
-                true => unread_here.push(name.to_owned()),
+                true => {
+                    unread_here.push(name.to_owned());
+                    if untitled {
+                        untitled_here.insert(name.to_owned());
+                    }
+                }
                 false => {
-                    fresh = true;
-                    whole &= read_agent(client, bot, status_read, asks_seen, view.readers).await;
+                    if stale {
+                        fresh = true;
+                        whole &=
+                            read_agent(client, bot, status_read, asks_seen, view.readers).await;
+                    }
+                    // A first line its history read did not hold waits
+                    // until every row's history is read.
+                    let known = (status_read.get(name))
+                        .is_some_and(|(seen, latest)| *seen == head && latest.first.is_some());
+                    if untitled && !known {
+                        later.push(bot);
+                    } else if untitled {
+                        // One that failed leaves the count to read again.
+                        let read = read_title(client, &store, bot, status_read).await;
+                        whole &= read;
+                        if read {
+                            title =
+                                (bot.bot_id).and_then(|id| crate::title::noted(&store, name, id));
+                        }
+                    }
                 }
             }
         }
@@ -1457,7 +1495,7 @@ async fn read_status_of(
         needs.asked(name, ask.clone().filter(|_| !resolved));
         read.push(name.to_owned());
         // One not read yet says nothing of its question.
-        if !running && !(unread && view.fill) {
+        if !running && !(stale && view.fill) {
             idle.push(name.to_owned());
         }
         if let Some(ask) = &ask {
@@ -1508,7 +1546,6 @@ async fn read_status_of(
             false => seat_profile(&store, name, false, std::path::Path::new("")),
         }
         .unwrap_or_default();
-        let title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
         rows.push(status::Row {
             name: short(name, &project, &lead),
             bot: name.to_owned(),
@@ -1557,6 +1594,26 @@ async fn read_status_of(
     if prune {
         status_read.retain(|name, _| listed_here.contains(name.as_str()));
     }
+    if !later.is_empty() {
+        let at: HashMap<&str, usize> = (rows.iter().enumerate())
+            .map(|(at, row)| (row.bot.as_str(), at))
+            .collect();
+        let mut noted = Vec::new();
+        for bot in later {
+            let read = read_title(client, &store, bot, status_read).await;
+            whole &= read;
+            if read
+                && let Some(title) =
+                    (bot.bot_id).and_then(|id| crate::title::noted(&store, &bot.name, id))
+                && let Some(&at) = at.get(bot.name.as_str())
+            {
+                noted.push((at, title));
+            }
+        }
+        for (at, title) in noted {
+            rows[at].title = title;
+        }
+    }
     // The rows a count kept go back, but for those of agents it did not
     // find listed: the rows read here are the ones that moved.
     if let (Some(kept), Some((mut left, _))) = (kept_here, reuse) {
@@ -1591,6 +1648,7 @@ async fn read_status_of(
         fresh,
         whole,
         unread: unread_here,
+        untitled: untitled_here,
     })
 }
 
@@ -1667,6 +1725,7 @@ async fn fill_status(
             return (alerts, None);
         };
         let mut unread = std::mem::take(&mut read.unread);
+        let untitled = std::mem::take(&mut read.untitled);
         unread.retain(|name| !failed.contains(name));
         let owed = owed.get_or_insert_with(|| unread.iter().cloned().collect());
         let still: std::collections::HashSet<&str> = unread.iter().map(String::as_str).collect();
@@ -1690,21 +1749,30 @@ async fn fill_status(
             read.whole &= failed.is_empty();
             return (alerts, Some(Box::new(read)));
         }
-        // The rows on screen first, then the rest as the card lists them.
+        let agents: HashMap<&str, &standing::Agent> = (listed.iter())
+            .map(|bot| (bot.name.as_str(), bot))
+            .collect();
+        let stale = |name: &str| {
+            (agents.get(name)).is_some_and(|bot| {
+                !is_read(bot, &json!([bot.bot_id, bot.head]), status_read, asks_seen)
+            })
+        };
+        // The rows on screen first, then the rest as the card lists them:
+        // what each is doing before the first lines of those with no title.
         let at: HashMap<&str, usize> = (read.rows.iter().enumerate())
             .map(|(at, row)| (row.bot.as_str(), at))
             .collect();
         let place = |name: &String| at.get(name.as_str()).copied().unwrap_or(usize::MAX);
-        unread.sort_by_cached_key(place);
+        unread.sort_by_cached_key(|name| {
+            let at = place(name);
+            (at >= shown, at >= shown && !stale(name), at)
+        });
         let on_screen = unread.iter().take_while(|name| place(name) < shown).count();
         drop(at);
         if let Ok(mut came) = came.lock() {
             *came = Some((alerts.clone(), Box::new(read)));
         }
         woken.notify_one();
-        let agents: HashMap<&str, &standing::Agent> = (listed.iter())
-            .map(|bot| (bot.name.as_str(), bot))
-            .collect();
         // The rows on screen drawn as soon as they are read; the rest on
         // the listing as the card reads it again.
         let screen = (std::mem::replace(&mut first, false))
@@ -1723,7 +1791,18 @@ async fn fill_status(
                 continue;
             };
             fresh = true;
-            if !read_agent(client, bot, status_read, asks_seen, view.readers).await {
+            let moved = !is_read(bot, &json!([bot.bot_id, bot.head]), status_read, asks_seen);
+            let read = read_agent(client, bot, status_read, asks_seen, view.readers).await;
+            // Only one with no title, so a lead keeps its project's. Off
+            // screen, a first line its history read did not hold waits
+            // until every row's history is read.
+            let later = screen.is_none()
+                && moved
+                && (status_read.get(name)).is_none_or(|(_, latest)| latest.first.is_none());
+            let titled = !untitled.contains(name)
+                || later
+                || read_title(client, options_store, bot, status_read).await;
+            if !(read & titled) {
                 failed.insert(name.clone());
             }
         }
@@ -1841,74 +1920,16 @@ async fn read_agent(
         },
         None => None,
     };
-    // A turn ended since its question was read, and its history moved
-    // since its latest was: both read at once where they can be.
-    let both = if let Some(last) = ended
-        && bot.head.is_some()
-        && let Some((seen, latest)) = status_read.get(name)
-        && *seen != head
-        && seen[0] == head[0]
-        && let Some(from) = latest.from
-        && let Some((turn, was)) = asks_seen.get(name)
-        && *turn != last.turn
-    {
-        read_both(client, name, last.turn, from, was).await
-    } else {
-        Both::Apart
-    };
-    match both {
-        Both::Read(read) => {
-            let (latest, seen) = *read;
-            status_read.insert(name.to_owned(), (head.clone(), latest));
-            match (seen, ended) {
-                (Some(seen), Some(last)) => {
-                    asks_seen.insert(name.to_owned(), (last.turn, seen));
-                }
-                _ => whole = false,
-            }
-        }
-        Both::Failed => {
-            status_read.remove(name);
-            whole = false;
-        }
-        Both::Apart => whole &= read_apart(client, bot, &head, ended, status_read, asks_seen).await,
-    }
-    // What it read, for the others to take.
-    if let Some(readers) = readers
-        && let Ok(mut shared) = readers.reads.lock()
-    {
-        if let Some(read) = status_read.get(name) {
-            shared.latest.insert(name.to_owned(), read.clone());
-        }
-        if let Some(seen) = asks_seen.get(name) {
-            shared.seen.insert(name.to_owned(), seen.clone());
-        }
-    }
-    whole
-}
-
-/// [`read_agent`]'s reads of `bot` taken apart: its latest once its
-/// history moved, and its question once a turn ended since it was read.
-async fn read_apart(
-    client: &Client,
-    bot: &standing::Agent,
-    head: &Value,
-    ended: Option<&standing::Ended>,
-    status_read: &mut HashMap<String, (Value, Latest)>,
-    asks_seen: &mut HashMap<String, (i64, Seen)>,
-) -> bool {
-    let name = bot.name.as_str();
-    let mut whole = true;
     // No history yet: nothing asked of the daemon for it, however many
     // such agents a project holds.
     match status_read.get(name) {
         _ if bot.head.is_none() => {
-            status_read.insert(name.to_owned(), (head.clone(), Latest::default()));
+            status_read.insert(name.to_owned(), (head, Latest::default()));
         }
-        Some((seen, _)) if seen == head => {}
+        Some((seen, _)) if *seen == head => {}
         _ => match read_latest(client, name).await {
             Some(latest) => {
-                status_read.insert(name.to_owned(), (head.clone(), latest));
+                status_read.insert(name.to_owned(), (head, latest));
             }
             None => {
                 status_read.remove(name);
@@ -1928,6 +1949,17 @@ async fn read_apart(
                 asks_seen.insert(name.to_owned(), (last, seen));
             }
             None => whole = false,
+        }
+    }
+    // What it read, for the others to take.
+    if let Some(readers) = readers
+        && let Ok(mut shared) = readers.reads.lock()
+    {
+        if let Some(read) = status_read.get(name) {
+            shared.latest.insert(name.to_owned(), read.clone());
+        }
+        if let Some(seen) = asks_seen.get(name) {
+            shared.seen.insert(name.to_owned(), seen.clone());
         }
     }
     whole
@@ -2109,35 +2141,106 @@ pub(crate) fn keep_beside(file: &std::path::Path, bytes: &[u8]) {
     let _ = agent_client::files::replace_mode(file, bytes, 0o600);
 }
 
-/// How many of an agent's newest nodes `/status` reads for its latest
-/// step, question and pull request.
-const LATEST: usize = 4;
-
 /// `bot`'s latest step, question and pull request; none when a read
 /// failed, which an empty history is not.
+/// Note `bot`'s title from its first message's first line, read once
+/// from its history: an agent none was noted for as it started, as a
+/// helper is, or a task started before tasks had titles. False where the
+/// read failed, which the next read tries again.
+async fn read_title(
+    client: &Client,
+    store: &std::path::Path,
+    bot: &standing::Agent,
+    status_read: &HashMap<String, (Value, Latest)>,
+) -> bool {
+    let name = bot.name.as_str();
+    let Some(id) = bot.bot_id.filter(|_| bot.head.is_some()) else {
+        return true;
+    };
+    if !crate::title::ask(name, id).await {
+        return true;
+    }
+    // A read let go before it ends, its card closed, is asked again.
+    struct Reading<'a>(&'a str, i64, bool);
+    impl Drop for Reading<'_> {
+        fn drop(&mut self) {
+            crate::title::answered(self.0, self.1, self.2);
+        }
+    }
+    let mut reading = Reading(name, id, false);
+    if crate::title::noted(store, name, id).is_some() {
+        reading.2 = true;
+        return true;
+    }
+    // Its whole history read for `/status` already holds it.
+    let head = json!([bot.bot_id, bot.head]);
+    let known = (status_read.get(name))
+        .filter(|(seen, _)| *seen == head)
+        .and_then(|(_, latest)| latest.first.clone());
+    let first = async {
+        if known.is_some() {
+            return known;
+        }
+        let asked = json!({"bot": name, "limit": 4, "oldest_first": true});
+        let page = client.request("history_nodes", asked).await.ok()?;
+        let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        // The oldest page comes newest first, as every page does.
+        nodes.sort_unstable();
+        let read = client
+            .request("history_items", json!({"bot": name, "nodes": nodes}))
+            .await
+            .ok()?;
+        // Oldest first, as the nodes were asked for. An item too large to
+        // read before the first message leaves it with no title: read
+        // again, it would be as large.
+        for entry in read["items"].as_array().into_iter().flatten() {
+            if !entry["error"].is_null() {
+                return Some(String::new());
+            }
+            let said = responses(&entry["item"])
+                .into_iter()
+                .find(|item| item["role"] == "user");
+            if let Some(said) = said {
+                return Some(text(&said));
+            }
+        }
+        Some(String::new())
+    };
+    let first = first.await;
+    if let Some(first) = &first {
+        let title = crate::title::of_message(first);
+        if !title.is_empty() {
+            // Written off the loop: a backfill writes one for each agent.
+            crate::title::note_later(store, name, id, &title);
+        }
+    }
+    reading.2 = first.is_some();
+    reading.2
+}
+
 async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
     let page = client
-        .request("history_nodes", json!({"bot": bot, "limit": LATEST}))
+        .request("history_nodes", json!({"bot": bot, "limit": 4}))
         .await
         .ok()?;
-    let listed = page["nodes"].as_array().cloned().unwrap_or_default();
-    let nodes: Vec<i64> = listed.iter().filter_map(|n| n["node"].as_i64()).collect();
+    let nodes: Vec<i64> = page["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    // Each node's turn, which names an ask with its call.
+    let turns: HashMap<i64, i64> = (page["nodes"].as_array().into_iter().flatten())
+        .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
+        .collect();
     let read = client
         .request("history_items", json!({"bot": bot, "nodes": nodes}))
         .await
         .ok()?;
-    let entries = read["items"].as_array().cloned().unwrap_or_default();
-    Some(latest_of(&listed, &entries))
-}
-
-/// What [`read_latest`] reads from the newest nodes `listed` (as
-/// `history_nodes` lists them, newest first) and their `entries`.
-fn latest_of(listed: &[Value], entries: &[Value]) -> Latest {
-    // Each node's turn, which names an ask with its call.
-    let turns: HashMap<i64, i64> = (listed.iter())
-        .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
-        .collect();
     // Newest first, as the nodes were asked for.
+    let entries = read["items"].as_array().cloned().unwrap_or_default();
     let items: Vec<Value> = entries.iter().map(|entry| entry["item"].clone()).collect();
     let pr = items
         .iter()
@@ -2168,74 +2271,22 @@ fn latest_of(listed: &[Value], entries: &[Value]) -> Latest {
                 })
         })
         .collect();
-    Latest {
+    // A page with none older holds the first message, when every item on
+    // it came back whole: kept as the title it makes, not the whole brief.
+    let whole =
+        entries.len() == nodes.len() && entries.iter().all(|entry| entry["error"].is_null());
+    let first = (page["next_from"].is_null() && !nodes.is_empty() && whole).then(|| {
+        (flat.iter().rev())
+            .find(|item| item["role"] == "user")
+            .map(|item| crate::title::of_message(&text(item)))
+            .unwrap_or_default()
+    });
+    Some(Latest {
         ask: asks::open(&flat),
         pr,
-        step: App::step(entries),
-        from: listed.iter().filter_map(|n| n["node"].as_i64()).min(),
-    }
-}
-
-/// What [`read_both`] found.
-enum Both {
-    /// `bot`'s latest, and its question gone on from what was read, none
-    /// when a whole scan it took failed.
-    Read(Box<(Latest, Option<Seen>)>),
-    /// Read them apart: the nodes since are too many, or too few to hold
-    /// its newest.
-    Apart,
-    Failed,
-}
-
-/// [`read_latest`] and [`needs::scan_since`] for `bot`, whose turn `last`
-/// ended since `was` was read, in one read where they meet: the nodes
-/// past the newest read before and past `from`, the oldest its latest
-/// was read from, listed at once, then the newest few and those since
-/// read at once. Half the reads a finished turn takes apart.
-async fn read_both(client: &Client, bot: &str, last: i64, from: i64, was: &Seen) -> Both {
-    let Some(through) = was.through else {
-        return Both::Apart;
-    };
-    let ask = json!({"bot": bot, "limit": needs::SCANNED, "min_node": from.min(through + 1)});
-    let Ok(page) = client.request("history_nodes", ask).await else {
-        return Both::Failed;
-    };
-    let listed = page["nodes"].as_array().cloned().unwrap_or_default();
-    // Node ids grow along a history, so with as many past `from` its
-    // newest are among them.
-    if !page["next_from"].is_null() || listed.len() < LATEST {
-        return Both::Apart;
-    }
-    // Newest first: those since `through` lead, as the newest do.
-    let since = (listed.iter())
-        .take_while(|n| n["node"].as_i64().is_some_and(|node| node > through))
-        .count();
-    let Ok(read) = needs::Since::of(&listed[..since], Some(last), was, through) else {
-        return Both::Apart;
-    };
-    let nodes: Vec<i64> = (listed.iter().take(since.max(LATEST)))
-        .filter_map(|n| n["node"].as_i64())
-        .collect();
-    let (entries, short) = needs::entries(client, bot, &nodes).await;
-    if short {
-        return Both::Failed;
-    }
-    let newest: std::collections::HashSet<i64> = nodes.iter().take(LATEST).copied().collect();
-    let at = |entry: &&Value| entry["node"].as_i64().unwrap_or(0);
-    let latest: Vec<Value> = (entries.iter())
-        .filter(|entry| newest.contains(&at(entry)))
-        .cloned()
-        .collect();
-    let latest = latest_of(&listed[..LATEST], &latest);
-    let after: Vec<Value> = (entries.into_iter())
-        .filter(|entry| entry["node"].as_i64().is_some_and(|node| node > through))
-        .collect();
-    let last = read.last;
-    let seen = match read.seen(bot, was, needs::of_entries(&after)) {
-        Some(seen) => Some(seen),
-        None => needs::scan(client, bot, last).await,
-    };
-    Both::Read(Box::new((latest, seen)))
+        step: App::step(&entries),
+        first,
+    })
 }
 
 /// Open `bot`, a lead of `project`, in that project's own home, the
@@ -5127,7 +5178,7 @@ const ZEN_ENDS: &str = "End zen and hear what was kept";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
-const SHORTCUTS: [(&str, &str); 22] = [
+const SHORTCUTS: [(&str, &str); 24] = [
     ("enter", "send, or steer the running turn"),
     ("tab", "queue for after the running turn"),
     ("↑↓", "earlier prompts, past the first or last row"),
@@ -5142,6 +5193,11 @@ const SHORTCUTS: [(&str, &str); 22] = [
     ("pgup pgdn", "scroll"),
     ("tab", "with nothing typed, keys to the pane"),
     ("←", "with nothing typed, every project"),
+    ("→", "with nothing typed, keys to the pane"),
+    (
+        "alt+← alt+→",
+        "with nothing typed, the agent above or below",
+    ),
     ("ctrl+\\", "keys to the pane and back"),
     ("ctrl+[ ctrl+]", "hide the pane, show it again"),
     ("ctrl+g", "open the pane's agent in the main view"),
@@ -5151,6 +5207,18 @@ const SHORTCUTS: [(&str, &str); 22] = [
     ("ctrl+c", "copy the selection, clear, or quit"),
     ("ctrl+l", "draw the screen again"),
 ];
+
+/// The agent `alt+→` (`down`) or `alt+←` goes to from `here` in the
+/// pane's list of the project's agents (`listed`, the lead first): the
+/// next or the one before, around the ends; the lead from one not listed.
+fn stepped<'a>(listed: &[&'a str], here: &str, down: bool) -> Option<&'a str> {
+    let lead = listed.first()?;
+    Some(match listed.iter().position(|bot| *bot == here) {
+        Some(at) if down => listed[(at + 1) % listed.len()],
+        Some(at) => listed[(at + listed.len() - 1) % listed.len()],
+        None => lead,
+    })
+}
 
 /// Whether Enter runs the menu's pick (`picked`): when what is `typed`
 /// begins its name, or the person `moved` to it with the arrows. A name
@@ -5842,10 +5910,10 @@ struct Latest {
     pr: Option<String>,
     /// The question it asked the person and has no answer to yet.
     ask: Option<asks::Ask>,
-    /// The oldest of the newest nodes it was read from, from which the
-    /// next read lists on ([`read_both`]).
-    #[serde(default)]
-    from: Option<i64>,
+    /// Its first message's first line, cut as a title, when the page read
+    /// holds its whole history: a title found with no read of its own.
+    #[serde(skip)]
+    first: Option<String>,
 }
 
 /// `/status` in the pane, its timers ticking and its rows read again
@@ -10439,7 +10507,7 @@ impl App {
         let task = started::Task {
             bot,
             name,
-            title: arguments["title"].as_str().unwrap_or("").trim().to_owned(),
+            title: crate::title::of_message(arguments["brief"].as_str().unwrap_or("")),
             state: "starting".into(),
         };
         // Its name opens it at once, where it was drawn before it was made.
@@ -10480,7 +10548,7 @@ impl App {
             served::START => (
                 started::STARTED,
                 self.started_bot(arguments, output),
-                arguments["title"].as_str().unwrap_or(""),
+                crate::title::of_message(arguments["brief"].as_str().unwrap_or("")),
             ),
             "spawn_agent" => {
                 // One the daemon refused started nothing.
@@ -10492,7 +10560,7 @@ impl App {
                 (
                     started::STARTED,
                     self.started_bot(arguments, output),
-                    arguments["message"].as_str().unwrap_or(""),
+                    arguments["message"].as_str().unwrap_or("").to_owned(),
                 )
             }
             "send_message" => {
@@ -10514,7 +10582,7 @@ impl App {
                 (
                     started::SENT,
                     to.to_owned(),
-                    arguments["message"].as_str().unwrap_or(""),
+                    arguments["message"].as_str().unwrap_or("").to_owned(),
                 )
             }
             // A workflow it started has a row of its own.
@@ -10535,7 +10603,7 @@ impl App {
             verb,
             name: self.hint_name(&bot),
             bot,
-            title: started::first(title),
+            title: started::first(&title),
         };
         self.turn_hints.set.push(going);
     }
@@ -16575,6 +16643,10 @@ impl App {
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
+                    // The list, with no page open: nothing to close.
+                    KeyCode::Left if key.modifiers.is_empty() && view.depth() == 0 => {
+                        self.left_ends();
+                    }
                     _ => {
                         let paged = view.depth();
                         match view.key(*key, pane.screen.in_view()) {
@@ -16627,6 +16699,9 @@ impl App {
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
+                    KeyCode::Left if key.modifiers.is_empty() && view.left_ends() => {
+                        self.left_ends();
+                    }
                     _ => match view.key(*key, pane.screen.in_view()) {
                         memory::Key::Close => self.close_pane(true),
                         memory::Key::Scroll(up) => pane.screen.scroll(if up { 1 } else { -1 }),
@@ -16674,6 +16749,8 @@ impl App {
                     KeyCode::Char(' ') if reading => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
+                    // The list of threads: nothing to close.
+                    KeyCode::Left if key.modifiers.is_empty() && !reading => self.left_ends(),
                     _ => {
                         if view.key(*key) == commons::Key::Close {
                             self.close_pane(true);
@@ -16703,6 +16780,8 @@ impl App {
                     KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
+                    // Nothing in `/audit` opens or closes.
+                    KeyCode::Left if key.modifiers.is_empty() => self.left_ends(),
                     _ => match view.key(*key) {
                         audit::Key::Stay => {}
                         audit::Key::Close => self.close_pane(true),
@@ -16825,6 +16904,8 @@ impl App {
                     KeyCode::Left | KeyCode::Backspace if pane.goes_back() => {
                         self.step_pane(true);
                     }
+                    // At the first page, the keys back to the conversation.
+                    KeyCode::Left if key.modifiers.is_empty() => self.pane_keys = false,
                     KeyCode::Right if pane.can_go(false) => self.go(false),
                     // A page of text: ↑↓ pick its links in view, as Lynx
                     // does, and scroll where none is left that way.
@@ -16850,9 +16931,15 @@ impl App {
                 }
                 return true;
             }
-            // Ctrl+\, or Tab with nothing typed, puts the keys in the pane.
+            // Ctrl+\, or Tab with nothing typed, puts the keys in the pane;
+            // so does `→` with nothing typed, where **Projects** is `←`.
+            let right = key.code == KeyCode::Right
+                && key.modifiers.is_empty()
+                && self.zen.is_none()
+                && self.options.side.is_none()
+                && !self.options.embedded;
             if switches(key)
-                || key.code == KeyCode::Tab
+                || (key.code == KeyCode::Tab || right)
                     && self.input.is_empty()
                     && self.picker.is_none()
                     && self.agents.is_none()
@@ -16989,8 +17076,8 @@ impl App {
             Picked::Group(group) => {
                 if watch.open.contains(&group) != open {
                     watch.toggle(group);
-                } else if !open && self.pane.as_ref().is_some_and(pane::Pane::goes_back) {
-                    self.step_pane(true);
+                } else if !open {
+                    self.left_ends();
                 }
             }
             Picked::Agent(bot) if open => watch.helpers_of(&bot, Some(true)),
@@ -17008,12 +17095,38 @@ impl App {
                         watch.pick = (card_picks(watch, width).iter())
                             .position(|picked| *picked == Picked::Group(group));
                     }
-                    None if self.pane.as_ref().is_some_and(pane::Pane::goes_back) => {
-                        self.step_pane(true);
-                    }
-                    None => {}
+                    None => self.left_ends(),
                 }
             }
+        }
+    }
+
+    /// `←` with nothing left to close in the pane: its previous page, as
+    /// `‹` goes, and at the first page the keys back to the conversation.
+    fn left_ends(&mut self) {
+        match self.pane.as_ref().is_some_and(pane::Pane::goes_back) {
+            true => {
+                self.step_pane(true);
+            }
+            false => self.pane_keys = false,
+        }
+    }
+
+    /// `alt+←` or `alt+→` with nothing typed: the window becomes the
+    /// agent above or below this one in the pane's list of the project's
+    /// agents, around its ends, as a multiplexer's previous and next tab.
+    /// From an agent the list does not show, either goes to the lead.
+    fn step_agent(&mut self, down: bool) {
+        let listed: Vec<&str> = (self.margin.agents().listed.iter())
+            .filter(|agent| agent.run.is_none())
+            .map(|agent| agent.bot.as_str())
+            .collect();
+        let Some(to) = stepped(&listed, &self.bot, down) else {
+            return;
+        };
+        if to != self.bot {
+            let to = to.to_owned();
+            self.switch_window(to);
         }
     }
 
@@ -18170,6 +18283,17 @@ impl App {
                         Ok(None) => self.notice = Some("no picture on the clipboard".into()),
                         Err(error) => self.notice = Some(error),
                     },
+                    // With nothing typed, the agent above or below in the
+                    // pane's list of the project's agents. A terminal that
+                    // sends alt+← as alt+b is taken at its word.
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('b') | KeyCode::Char('f')
+                        if self.input.is_empty()
+                            && self.projects_here()
+                            && (alt
+                                || ctrl && matches!(key.code, KeyCode::Left | KeyCode::Right)) =>
+                    {
+                        self.step_agent(matches!(key.code, KeyCode::Right | KeyCode::Char('f')))
+                    }
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
@@ -20437,7 +20561,7 @@ impl App {
                         }
                         // Its title is its first message's first line,
                         // noted by its id.
-                        let first = crate::title::first_line(&brief);
+                        let first = crate::title::of_message(&brief);
                         let asked = json!({"bot": lead.bot});
                         let noted = match self.client.request("inspect", asked).await {
                             Ok(record) => match record["bot_id"].as_i64() {
@@ -20528,7 +20652,6 @@ impl App {
         let start = task::Start {
             name: short.clone(),
             // Its title is its first message's first line.
-            title: crate::title::first_line(&brief),
             brief,
             // Named even when every task runs as it, so its model and
             // tools apply; its words are told once.
@@ -23048,54 +23171,44 @@ fn watch_card(
     watch: &Watch,
     width: usize,
 ) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
+    // Each running turn's time counts on from when the rows were read.
     let since = watch.read.elapsed().as_secs();
-    let rows: Vec<status::Row> = watch
-        .rows
-        .iter()
-        .cloned()
-        .map(|mut row| {
-            if row.running {
-                row.seconds = row.seconds.map(|s| s + since);
-            }
-            row
-        })
-        .collect();
+    let rows = &watch.rows;
+    let card = |details| {
+        status::card_after(
+            &watch.project,
+            rows,
+            since,
+            width,
+            &watch.open,
+            details,
+            &watch.helpers,
+        )
+    };
+    let quiet = card(status::Details::Quiet);
     // The agent picked from the keys says more: its place among the rows
     // is the same with or without that.
-    let listed = status::card(
-        &watch.project,
-        &rows,
-        width,
-        &watch.open,
-        status::Details::Quiet,
-        &watch.helpers,
-    );
-    let picked = (watch.pick)
-        .and_then(|at| {
-            picks_in_order(&listed.named, &listed.folds)
-                .into_iter()
-                .nth(at)
-        })
-        .and_then(|(_, picked)| match picked {
-            Picked::Agent(bot) => Some(bot),
-            Picked::Group(_) => None,
-        });
     let status::Card {
         lines: mut card,
         named,
         folds,
         helpers,
-    } = status::card(
-        &watch.project,
-        &rows,
-        width,
-        &watch.open,
-        match watch.more {
-            true => status::Details::Picked(picked.as_deref()),
-            false => status::Details::Quiet,
-        },
-        &watch.helpers,
-    );
+    } = match watch.more {
+        true => {
+            let picked = (watch.pick)
+                .and_then(|at| {
+                    picks_in_order(&quiet.named, &quiet.folds)
+                        .into_iter()
+                        .nth(at)
+                })
+                .and_then(|(_, picked)| match picked {
+                    Picked::Agent(bot) => Some(bot),
+                    Picked::Group(_) => None,
+                });
+            card(status::Details::Picked(picked.as_deref()))
+        }
+        false => quiet,
+    };
     // What is broken goes under the heading, and the agents under that.
     let mut above: Vec<Line<'static>> = Vec::new();
     // An alert that opens a view does so on a click on its first line.
@@ -25916,6 +26029,10 @@ mod tests {
                         turns.fetch_add(1, Ordering::SeqCst);
                         json!({"turns": [], "next_before": null})
                     }
+                    // Its first line, for its title: none.
+                    "history_nodes" if asked["oldest_first"] == true => {
+                        json!({"nodes": [], "next_from": null})
+                    }
                     "history_nodes" => {
                         read.fetch_add(1, Ordering::SeqCst);
                         json!({"nodes": [], "next_from": null})
@@ -25949,85 +26066,6 @@ mod tests {
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
         assert_eq!(turn_reads.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn a_finished_turn_is_read_in_one_listing_and_one_read_as_apart() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        type History = Arc<std::sync::Mutex<Vec<(i64, i64, Value)>>>;
-        let said = |role: &str, text: &str| {
-            let kind = if role == "user" {
-                "input_text"
-            } else {
-                "output_text"
-            };
-            json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]})
-        };
-        // Node, turn, item; two turns ended.
-        let history: History = Arc::new(std::sync::Mutex::new(vec![
-            (10, 1, said("user", "hi")),
-            (11, 1, said("assistant", "first")),
-            (12, 2, said("user", "more")),
-            (13, 2, said("assistant", "second")),
-        ]));
-        let reads = Arc::new(AtomicUsize::new(0));
-        let (kept, counted) = (history.clone(), reads.clone());
-        let client = daemon_answering(move |asked| {
-            let history = kept.lock().unwrap();
-            match asked["op"].as_str().unwrap_or_default() {
-                "history_nodes" => {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    let floor = asked["min_node"].as_i64().unwrap_or(0);
-                    let limit = asked["limit"].as_u64().unwrap() as usize;
-                    let past: Vec<&(i64, i64, Value)> = history
-                        .iter()
-                        .rev()
-                        .filter(|(n, _, _)| *n >= floor)
-                        .collect();
-                    let nodes: Vec<Value> = (past.iter().take(limit))
-                        .map(|(node, turn, _)| json!({"node": node, "turn": turn}))
-                        .collect();
-                    let next = past.get(limit).map(|(node, _, _)| json!(node));
-                    json!({"nodes": nodes, "next_from": next})
-                }
-                "history_items" => {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    let items: Vec<Value> = (asked["nodes"].as_array().unwrap().iter())
-                        .filter_map(|node| history.iter().find(|(n, _, _)| json!(n) == *node))
-                        .map(|(node, _, item)| json!({"node": node, "item": item}))
-                        .collect();
-                    json!({"items": items})
-                }
-                _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
-            }
-        })
-        .await;
-        let agent = |head: i64, turn: i64| {
-            standing::kept(json!({"name": "shop.t1", "bot_id": 1, "head": head,
-                "last": {"turn": turn, "status": "completed"}}))
-            .unwrap()
-        };
-        let (mut latest, mut seen) = (HashMap::new(), HashMap::new());
-        assert!(read_agent(&client, &agent(13, 2), &mut latest, &mut seen, None).await);
-        // A third turn ends, its question read on from the second's.
-        history.lock().unwrap().extend([
-            (20, 3, said("user", "go")),
-            (21, 3, said("assistant", "third")),
-        ]);
-        reads.store(0, Ordering::SeqCst);
-        assert!(read_agent(&client, &agent(21, 3), &mut latest, &mut seen, None).await);
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-        // What reading them apart finds.
-        let apart = read_latest(&client, "shop.t1").await.unwrap();
-        let whole = needs::scan(&client, "shop.t1", Some(3)).await.unwrap();
-        let (head, read) = &latest["shop.t1"];
-        assert_eq!(*head, json!([1, 21]));
-        assert_eq!(
-            (&read.step, &read.pr, &read.ask),
-            (&apart.step, &apart.pr, &apart.ask)
-        );
-        assert_eq!(read.from, Some(12));
-        assert_eq!(seen["shop.t1"], (3, whole));
     }
 
     #[tokio::test]
@@ -26133,6 +26171,10 @@ mod tests {
                     };
                     let last = if ran.load(Ordering::SeqCst) { 9 } else { 2 };
                     json!({"bots": [bot(1, 1), bot(2, last)], "next_after": null})
+                }
+                // Its first line, for its title: none.
+                "history_nodes" if asked["oldest_first"] == true => {
+                    json!({"nodes": [], "next_from": null})
                 }
                 "history_nodes" => {
                     read.fetch_add(1, Ordering::SeqCst);
@@ -26376,6 +26418,10 @@ mod tests {
                     "bots" => json!({"bots": [{"name": "shop.t1", "bot_id": 1, "head": 1,
                 "status": "completed", "running_turn": null,
                 "last": {"turn": 1, "status": "completed"}}], "next_after": null}),
+                    // Its first line, for its title: none.
+                    "history_nodes" if asked["oldest_first"] == true => {
+                        json!({"nodes": [], "next_from": null})
+                    }
                     "history_nodes" => {
                         read.fetch_add(1, Ordering::SeqCst);
                         json!({"nodes": [], "next_from": null})
@@ -26499,6 +26545,180 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(app.counts, Some(counts));
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_title_takes_its_first_line_once_and_a_noted_one_is_kept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let firsts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let asked = firsts.clone();
+        let read_first = |firsts: &std::sync::Mutex<Vec<String>>| {
+            let mut read = firsts.lock().unwrap().clone();
+            read.sort();
+            read
+        };
+        let snapshot = json!([
+            {"name": "titled.helper", "bot_id": 2, "head": 5, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.kept", "bot_id": 3, "head": 4, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.short", "bot_id": 4, "head": 8, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.big", "bot_id": 5, "head": 10, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.odd", "bot_id": 6, "head": 12, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.lead", "bot_id": 1, "head": 2, "workspace": "WORKSPACE",
+                "last": {"turn": 1, "status": "completed"}},
+        ]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted_reads = reads.clone();
+        let dir = std::env::temp_dir().join(unique("sonny-first-line"));
+        // The lead's project has a title of its own.
+        let folder = dir.join("titled");
+        std::fs::create_dir_all(folder.join(".agents")).unwrap();
+        std::fs::write(
+            folder.join(agent_client::project::FILE),
+            "name = \"titled\"\ntitle = \"Tally the logins\"\n",
+        )
+        .unwrap();
+        let snapshot: Value = serde_json::from_str(
+            &snapshot
+                .to_string()
+                .replace("WORKSPACE", folder.to_str().unwrap()),
+        )
+        .unwrap();
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
+            "follow" => json!({"following": ask["bot"]}),
+            "history_nodes" if ask["oldest_first"] == true => {
+                asked
+                    .lock()
+                    .unwrap()
+                    .push(ask["bot"].as_str().unwrap().to_owned());
+                if ask["bot"] == "titled.odd" {
+                    return json!({"nodes": [{"node": 12, "turn": 1}, {"node": 11, "turn": 1}], "next_from": null});
+                }
+                // The oldest page, newest first as every page comes.
+                json!({"nodes": [{"node": 3, "turn": 2}, {"node": 1, "turn": 1}], "next_from": null})
+            }
+            // Its whole history on its newest page, with none older.
+            "history_nodes" if ask["bot"] == "titled.short" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [{"node": 8, "turn": 1}, {"node": 7, "turn": 1}], "next_from": null})
+            }
+            "history_nodes" if ask["bot"] == "titled.big" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [{"node": 10, "turn": 1}, {"node": 9, "turn": 1}], "next_from": null})
+            }
+            "history_nodes" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [], "next_from": null})
+            }
+            // Its first message too large to read.
+            "history_items" if ask["nodes"] == json!([11, 12]) => json!({"items": [
+                {"node": 11, "error": "item_too_large"},
+                {"node": 12, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Not the first either"}]}}]}),
+            // Its items too large for one answer: only the newest came.
+            "history_items" if ask["nodes"] == json!([10, 9]) => json!({"items": [
+                {"node": 10, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Not the first"}]}}]}),
+            "history_items" if ask["nodes"] == json!([8, 7]) => json!({"items": [
+                {"node": 8, "item": {"role": "assistant", "content": [{"type": "output_text",
+                    "text": "Counted."}]}},
+                {"node": 7, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Count the coins\nBoth jars."}]}}]}),
+            "history_items" if ask["nodes"] == json!([1, 3]) => json!({"items": [
+                {"node": 1, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "\nFix the flaky login test\nIt fails one run in ten."}]}},
+                {"node": 3, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Also check the logout"}]}}]}),
+            "history_items" => json!({"items": []}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let store = dir.join("state.sqlite");
+        crate::title::note(&store, "titled.kept", 3, "Keep the cache warm").unwrap();
+        let mut app = app(client);
+        app.bot = "titled.lead".into();
+        app.options.store = store.clone();
+        let counted = async |app: &mut App| {
+            app.counted_at = None;
+            app.count_agents().await;
+            if let Some(job) = &app.counting {
+                while !job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            app.counted_at = Some(Instant::now());
+            app.count_agents().await;
+        };
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        counted(&mut app).await;
+        // The helper's first line, cut from its first message, noted once.
+        assert_eq!(
+            crate::title::noted(&store, "titled.helper", 2).as_deref(),
+            Some("Fix the flaky login test")
+        );
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
+        // One whose first message is too large to read has no title.
+        assert_eq!(crate::title::noted(&store, "titled.odd", 6), None);
+        // One whose newest page did not all come reads its first line.
+        assert_eq!(
+            crate::title::noted(&store, "titled.big", 5).as_deref(),
+            Some("Fix the flaky login test")
+        );
+        // One whose newest page holds its whole history takes its first
+        // line from that page, with no read of its own.
+        assert_eq!(
+            crate::title::noted(&store, "titled.short", 4).as_deref(),
+            Some("Count the coins")
+        );
+        // Read again after it moved: its title is not.
+        app.follower.as_ref().unwrap().moved("titled.helper");
+        counted(&mut app).await;
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
+        // A title noted as it started is never read, nor replaced.
+        assert_eq!(
+            crate::title::noted(&store, "titled.kept", 3).as_deref(),
+            Some("Keep the cache warm")
+        );
+        // The rows the count keeps carry the titles.
+        let mut titles = crate::title::Titles::read(&store);
+        assert_eq!(
+            titles.named("titled.helper", Some(2), None).as_deref(),
+            Some("Fix the flaky login test")
+        );
+        assert!(reads.load(Ordering::SeqCst) > 0);
+        // `/status` filling in reads none either, and the lead keeps its
+        // project's title.
+        app.status_read.clear();
+        app.asks_seen.clear();
+        app.status().await;
+        app.status_whole().await;
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
+        assert_eq!(crate::title::noted(&store, "titled.lead", 1), None);
+        assert_eq!(
+            titles
+                .named("titled.lead", Some(1), folder.to_str())
+                .as_deref(),
+            Some("Tally the logins")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -28035,6 +28255,44 @@ mod tests {
         assert_eq!(bar("• Noted what shop.fix said."), Some(0));
         assert_eq!(bar("Push it"), None);
         assert_eq!(bar("Pushing."), None);
+    }
+
+    #[test]
+    fn alt_arrows_step_through_the_projects_agents_around_the_ends() {
+        let listed = ["calc.lead", "calc.readme", "calc.halves"];
+        assert_eq!(stepped(&listed, "calc.lead", true), Some("calc.readme"));
+        assert_eq!(stepped(&listed, "calc.lead", false), Some("calc.halves"));
+        assert_eq!(stepped(&listed, "calc.halves", true), Some("calc.lead"));
+        assert_eq!(stepped(&listed, "calc.readme", false), Some("calc.lead"));
+        // From an agent the list does not show, both go to the lead.
+        assert_eq!(stepped(&listed, "calc.divide", true), Some("calc.lead"));
+        assert_eq!(stepped(&listed, "calc.divide", false), Some("calc.lead"));
+        assert_eq!(stepped(&[], "calc.lead", true), None);
+    }
+
+    #[tokio::test]
+    async fn right_with_nothing_typed_gives_the_pane_the_keys_and_left_takes_them_back() {
+        let mut app = app(zen_daemon().await);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.pane = Some(pane::Pane::margin());
+        // Words typed: the arrows move the cursor, as before.
+        app.input.set("fix it");
+        app.key(key(KeyCode::Left)).await;
+        app.key(key(KeyCode::Right)).await;
+        assert!(!app.pane_keys);
+        assert!(app.projects.is_none());
+        app.input.set("");
+        app.key(key(KeyCode::Right)).await;
+        assert!(app.pane_keys);
+        // At the pane's first page, with nothing to close, `←` gives the
+        // keys back; it does not close the pane.
+        app.key(key(KeyCode::Left)).await;
+        assert!(!app.pane_keys);
+        assert!(app.pane.is_some());
+        // In zen they do nothing.
+        app.zen = Some("the rounding".into());
+        app.key(key(KeyCode::Right)).await;
+        assert!(!app.pane_keys);
     }
 
     #[test]
@@ -29973,7 +30231,7 @@ mod tests {
         // started and sent under it.
         app.daemon(turn_event("accepted", 1, json!({"node": 7})))
             .await;
-        let start = json!({"name": "readme", "title": "Say how cents round", "brief": "Say how cents round\nmore"});
+        let start = json!({"name": "readme", "brief": "Say how cents round\nmore"});
         app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
         let send = json!({"to": "calc.fix", "message": "Check div too.\nThanks"});
         app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
@@ -30413,7 +30671,7 @@ mod tests {
         app.pending.clear();
         app.daemon(turn_event("accepted", 2, json!({"node": 9})))
             .await;
-        let start = json!({"name": "readme", "title": "Say how cents round", "brief": "Say how cents round"});
+        let start = json!({"name": "readme", "brief": "Say how cents round"});
         let started = json!({"name": served::START, "call_id": "s1"});
         app.daemon(turn_event("tool_started", 2, started)).await;
         app.commit_call("s1", Some(2), served::START, &start, "calc.readme/1", false);
@@ -30471,7 +30729,7 @@ mod tests {
             .await;
         app.daemon(turn_event("accepted", 5, json!({"node": 19})))
             .await;
-        let start = json!({"name": "docs", "title": "Write the docs", "brief": "Write the docs"});
+        let start = json!({"name": "docs", "brief": "Write the docs"});
         app.commit_call("s5", Some(5), served::START, &start, "calc.docs/1", false);
         // As reconnecting leaves it: still following the turn that ended.
         app.running.as_mut().unwrap().turn = 4;
@@ -32715,7 +32973,7 @@ mod tests {
         );
         app.read_tasks_through().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ● many  working");
+        assert_eq!(rows[1], "  ● Fix many  many  working");
     }
 
     #[tokio::test]
@@ -32790,13 +33048,13 @@ mod tests {
         let arguments = json!({"name": "add", "brief": "Fix add"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.add/1", false);
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ● add  working");
+        assert_eq!(drawn(&mut app)[1], "  ● Fix add  add  working");
         // Idle, the stopped message never ran: the turn before it says
         // what the task did.
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         app.tasks_read = None;
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ○ add  idle");
+        assert_eq!(drawn(&mut app)[1], "  ○ Fix add  add  idle");
     }
 
     #[tokio::test]
@@ -32836,8 +33094,8 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let start = |app: &mut App, name: &str| {
-            let arguments = json!({"name": name, "title": format!("Fix {name}"),
-                "brief": format!("Fix {name} now")});
+            let arguments =
+                json!({"name": name, "brief": format!("Fix {name}\nNow, with a test.")});
             let output = format!("calc.{name}/1");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         };
@@ -33154,8 +33412,8 @@ mod tests {
         }
         app.read_tasks_through().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ○ quiet  no reply");
-        assert_eq!(rows[2], "  ✗ bad    failed");
+        assert_eq!(rows[1], "  ○ Fix quiet  quiet  no reply");
+        assert_eq!(rows[2], "  ✗ Fix bad    bad    failed");
     }
 
     #[test]
@@ -33297,7 +33555,7 @@ mod tests {
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ? ask  needs you");
+        assert_eq!(drawn(&mut app)[1], "  ? Fix ask  ask  needs you");
         // Its history is read once for the turn it ended.
         app.tasks_read = None;
         app.read_tasks_through().await;
@@ -33562,19 +33820,26 @@ mod tests {
         assert!(app.pane.is_some() && app.pane_keys);
         let press = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         // A key the view does not list is not typed into the composer,
-        // `q` included; ← at the first page and `h` neither move the keys.
+        // `q` included.
         for code in [
             KeyCode::Char('q'),
             KeyCode::Char('x'),
             KeyCode::Char('/'),
-            KeyCode::Left,
-            KeyCode::Char('h'),
             KeyCode::Char('j'),
             KeyCode::Char('k'),
         ] {
             app.key(press(code)).await;
             assert!(app.pane.is_some() && app.pane_keys, "{code:?}");
             assert!(app.input.is_empty(), "{code:?}");
+        }
+        // ← at the first page, with nothing to close, gives the keys back
+        // and leaves the pane open, and so does `h`, which is `←` in every
+        // pane; `→` with nothing typed takes them again.
+        for code in [KeyCode::Left, KeyCode::Char('h')] {
+            app.key(press(code)).await;
+            assert!(app.pane.is_some() && !app.pane_keys, "{code:?}");
+            app.key(press(KeyCode::Right)).await;
+            assert!(app.pane_keys, "{code:?}");
         }
         // Tab with nothing typed moves the keys, both ways; Esc closes.
         app.key(press(KeyCode::Tab)).await;
@@ -36799,11 +37064,13 @@ mod tests {
         app.key(key(KeyCode::Char('i'))).await;
         assert_eq!(picks(&app).len(), 3);
         assert!(app.input.is_empty() && app.pane_keys);
-        // ← on the open heading folds it; again, at the first page, nothing.
+        // ← on the open heading folds it; again, at the first page, it
+        // gives the keys back to the conversation, the pane left open.
         app.key(key(KeyCode::Left)).await;
+        assert!(app.pane_keys);
         app.key(key(KeyCode::Left)).await;
         assert_eq!(picks(&app).len(), 2);
-        assert!(app.pane.is_some() && app.pane_keys);
+        assert!(app.pane.is_some() && !app.pane_keys);
         assert_eq!(
             status_keys(app.watch.as_ref().unwrap(), true),
             "↑↓ pick · enter open · →← fold · m more · esc close"
