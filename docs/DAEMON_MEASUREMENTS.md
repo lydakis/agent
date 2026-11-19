@@ -11088,7 +11088,9 @@ is unchanged.
   keeps for reuse.
   - jemalloc returns these pages after 10 s, but only while the process
     is still allocating. Codex starts no background thread, so a process
-    that goes idle keeps them.
+    that goes idle keeps them. (Corrected 11-19: an idle daemon does give
+    them back. 15 s after the burst it holds less than with musl's
+    allocator; see "Allocators compared in the static Linux build".)
   - With the pages returned at once (`dirty_decay_ms:0,muzzy_decay_ms:0`
     at run time), the footprint after turns read 23.1 MiB, about base,
     and the quiet window 21.9 MiB.
@@ -12313,3 +12315,218 @@ A one-off store screen (release build, a file store, one group commit of
 `interrupt` does) then a plain submit, 74 to 81 µs. Replacing costs what
 withdrawing and sending already cost, plus one indexed read of the
 replaced message and a savepoint, within the rounds' spread.
+
+## Automations judged by their parts (#1207)
+
+A turn's end (`finish`) now denies a held step of a call a message lifted,
+which outlived its turn before. It looks for such steps, and for the steps of
+a yielded call that wait on, only when one of the turn's steps waits: every
+waiting step is in the store's in-memory list, so a turn with none (nearly
+every turn) runs neither query, where main ran the second one at every turn
+end. A client's `approve_step` naming one of the bot's own tools runs the
+same plan `run_step` does and writes one audit row; no screen sends one.
+
+The Perf workflow's matched screens on 75140fc against main (e83c185), two
+alternating rounds on one runner; the gate passed, store work per turn
+unchanged:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.330 | 0.335 | +1.5 |
+| lifecycle | p95 turn, ms | 573.7 | 574.0 | +0.1 |
+| lifecycle | peak RSS, MiB | 26.6 | 26.1 | -1.7 |
+| completion | release to terminal p99, ms | 6.49 | 6.59 | +1.5 |
+| admission | lone submit CPU, ms | 24.06 | 23.94 | -0.5 |
+| admission | burst submit p99, ms | 2.726 | 2.740 | +0.5 |
+| footprint | idle RSS, MiB | 17.5 | 17.4 | -0.5 |
+| footprint | per idle bot, KiB | 1.81 | 1.91 | +5.4 |
+| footprint | RSS after a turn each, MiB | 52.1 | 51.9 | -0.4 |
+| footprint | CPU per turn, ms | 0.679 | 0.661 | -2.5 |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 18.75 | +50.0 |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 4.37 | 4.32 | -1.3 |
+| sonny | quiet window CPU, ms/s | 0.38 | 0.57 | +50.0 |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | 0.0 |
+| sonny | sky replay CPU per 1k lines, ms | 7.75 | 7.65 | -1.4 |
+
+The two Sonny rows at +50% are one or two CPU ticks over a few seconds
+(10x1 sends 4,000 deltas to one lead, the quiet window draws nothing), in
+code this change does not touch (the lookout and the window); the gate
+warns only when the head's best run is worse than the base's worst, and it
+did not.
+
+## Speeds and context windows as bot settings (#1208)
+
+`[speeds]` and `[context_windows]` became bot settings that each turn
+reads, in place of the daemon's `--speeds` and `--context-window` flags.
+The tables are shared, not copied: a pattern table is one reference-counted
+slice, so a turn that shapes its provider for a faster speed takes the
+bot's `speeds` with a count bump, as main took the flag's table, and a
+turn at standard speed does not touch it. The window is looked up once a
+turn, as before.
+
+Main is f06b14a, and the change is the pull request's head on it, both
+release builds on the 4-CPU Linux container. The Perf workflow's four
+daemon screens ran alternately, base then head, two rounds, and
+`bench.perf_gate` compared the medians:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.40 | 43.53 | +0.3 |
+| admission | burst submit p99, ms | 5.56 | 5.24 | -5.8 |
+| completion | release to terminal p99, ms | 13.06 | 12.55 | -3.9 |
+| footprint | idle RSS, MiB | 17.64 | 17.33 | -1.7 |
+| footprint | per idle bot, KiB | 1.70 | 1.72 | +0.9 |
+| footprint | RSS after a turn each, MiB | 35.86 | 34.07 | -5.0 |
+| footprint | CPU per turn, ms | 0.97 | 0.93 | -4.1 |
+| lifecycle | CPU, s | 0.70 | 0.68 | -3.6 |
+| lifecycle | p95 turn, ms | 590.9 | 588.0 | -0.5 |
+| lifecycle | peak RSS, MiB | 27.01 | 26.72 | -1.1 |
+
+Store work per turn counted the same on both sides. Every move is inside
+the spread main shows against itself in the sections above.
+
+## A bot's namespace in place of its name's first dot (protocol 96)
+
+`list_agents` and `spawn_agent` read the caller's `namespace` setting,
+already in hand with its other settings, where they cut its name at the
+first dot: no store job is added or changed. Schema 108 gives each bot made
+before its name up to the first dot, one `UPDATE` of `bots`: on a store of
+10,001 bots (10,000 dotted), 21.6 ms once, at the first start after an
+upgrade (synthetic store, this container, 2026-11-19).
+
+Reading the reviewer's person's words with a `messages` read
+(`from: ["person"]`, `before`, `newest`, `words`) in place of `prompts`'
+`persons` budget was measured and kept out: one review round's reads took
+a median of 0.62 ms on main against 0.79 with a lead of 40 messages, and
+1.2 ms against 11.9 (daemon CPU 0.9 against 8.8 ms) with 10,000 bots and a
+lead of 20,000 messages, a 20th of them the person's. The reviewer looks at
+up to 256 of the person's messages and a `messages` row costs about 116,000
+instructions to build (`callgrind`), a third of it copying the finished page
+once more (`json!` over the `Vec`), where `prompts` reads ids and lengths and
+loads only the words that fit.
+
+## Allocators compared in the static Linux build
+
+2026-11-19, Linux x86_64 cloud VM, 4 CPUs, 15 GiB. All builds are static
+musl release builds of `7860d0e` (the commit before #1158), built with
+`musl-gcc`. They differ only in the allocator:
+
+- **musl:** musl's own allocator, as 0.10.1 shipped.
+- **jemalloc:** `tikv-jemallocator` 0.7.0 with `narenas_ratio:0.25`, as
+  #1158 and Codex ship it.
+- **purge thread:** the same jemalloc binary with
+  `_RJEM_MALLOC_CONF=background_thread:true`, so freed pages go back on
+  their 10 s schedule even while the process sleeps.
+- **jemalloc daemon, musl windows:** the jemalloc daemon with musl's Sonny,
+  with and without the purge thread.
+- **mimalloc:** `mimalloc` 0.1.52 (mimalloc v2, defaults) in both
+  binaries.
+
+Each setup ran twice, alternating, with the rig and stores of the #1158
+section above. The hot-path screen is `bench/perf_gate.py`'s, musl as
+base, two rounds. The memory-after-a-burst rows are `bench.footprint`
+with readings taken 15 s and 60 s after the burst, three rounds each.
+
+### Low end: one window, 10 agents, after a minute idle
+
+| Setup | Daemon RSS, MiB | Window RSS, MiB | Window open, ms | Key p99, ms | Turn p50, ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| musl | 15.2 to 15.4 | 20.8 to 21.2 | 92 to 104 | 2.2 to 2.7 | 39.9 to 40.2 |
+| jemalloc | 16.9 to 17.2 | 22.0 to 22.2 | 101 to 1539 | 2.1 to 2.9 | 40.0 |
+| purge thread | 17.9 to 18.0 | 22.8 to 23.0 | 62 to 97 | 2.0 to 3.3 | 39.0 to 40.2 |
+| jemalloc daemon, musl windows | 16.7 to 18.5 | 20.8 to 21.6 | 85 to 2452 | 2.0 to 2.5 | 39.4 to 39.9 |
+| mimalloc | 33.1 to 37.3 | 39.2 to 39.7 | 83 to 1693 | 2.2 to 2.6 | 39.0 to 39.8 |
+
+The 1.5 to 2.5 s opens were single runs. Thirty more opens alternating
+musl and jemalloc had none: musl opened in 69 to 104 ms (median 79),
+jemalloc in 59 to 86 ms (median 69).
+
+### High end: 10,000 agents (1,000 in the busy project), 30 busy, one key a second per window
+
+| Windows | Setup | Key p99, ms | Worst key, ms | Window open, s | Daemon CPU, % | Daemon RSS, MiB | Window RSS, MiB |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | musl | 6309 to 6803 | 21196 to 23102 | 22.4 to 23.3 | 201 to 202 | 33.4 to 33.5 | 65.8 to 67.2 |
+| 100 | jemalloc | 608 to 713 | 977 to 1023 | 4.6 to 4.7 | 145 to 146 | 36.3 to 37.2 | 31.2 to 31.6 |
+| 100 | purge thread | 576 to 642 | 992 to 1171 | 4.7 | 144 to 147 | 43.3 to 48.5 | 31.8 to 32.0 |
+| 100 | jemalloc daemon, musl windows | 618 to 671 | 903 to 1163 | 4.7 to 5.3 | 140 to 142 | 36.1 to 39.8 | 31.7 to 31.9 |
+| 100 | mimalloc | 633 to 717 | 943 to 996 | 4.5 to 5.1 | 144 to 147 | 76.9 to 77.6 | 51.0 to 51.3 |
+| 200 | musl | 12340 to 12390 | 44209 to 44615 | 42.9 to 43.4 | 180 to 181 | 35.9 to 36.1 | 52.5 to 52.6 |
+| 200 | jemalloc | 1408 to 1498 | 2115 to 2322 | 8.7 to 9.0 | 133 to 136 | 43.9 to 48.7 | 29.7 |
+| 200 | purge thread | 1318 to 1750 | 1723 to 2876 | 8.6 to 10.2 | 132 to 137 | 45.3 to 63.5 | 30.0 |
+| 200 | jemalloc daemon, musl windows | 1656 to 2082 | 2469 to 3348 | 9.5 to 10.3 | 125 | 47.7 to 49.7 | 30.2 to 30.3 |
+| 200 | mimalloc | 1278 to 1480 | 1954 to 2348 | 7.7 to 8.7 | 132 to 137 | 75.2 to 83.1 | 42.3 to 44.0 |
+
+With the purge thread and musl's windows together, the 200-window rows
+match the jemalloc-daemon row (key p99 1.7 to 2.3 s).
+
+### The daemon after a burst: 1,000 bots, one turn each
+
+| Setup | 1 s after, MiB | 15 s after, MiB | 60 s after, MiB | CPU per turn, ms | Threads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| musl | 24.3 to 25.0 | 24.3 to 25.0 | 23.8 to 24.5 | 1.2 to 1.4 | 5 |
+| jemalloc | 30.0 to 33.9 | 22.5 to 23.6 | 21.9 to 22.9 | 0.9 to 1.3 | 5 |
+| purge thread | 30.5 to 33.5 | 23.9 to 26.5 | 22.7 to 23.4 | 0.9 to 1.0 | 6 |
+| mimalloc | 35.4 to 38.1 | 39.6 to 45.5 | 38.5 to 44.4 | 0.9 to 1.0 | 5 |
+
+### Hot-path screen against musl
+
+| Measure | jemalloc | purge thread | mimalloc |
+| --- | ---: | ---: | ---: |
+| admission lone submit CPU | -15.1% | -11.8% | -19.0% |
+| admission burst submit p99 | -5.4% | -3.7% | -7.6% |
+| completion p99 | -16.4% | -14.2% | -19.4% |
+| footprint idle RSS | +10.0% | +10.1% | +62.9% |
+| footprint per idle bot | +32.6% | +35.5% | +102.9% |
+| footprint RSS 1 s after a turn each | +45.0% | +43.3% | +77.5% |
+| footprint CPU per turn | -20.0% | -20.0% | -20.5% |
+| lookout CPU per 1k deltas | -22% to -33% | -18% to -31% | -13% to -29% |
+| quiet window CPU | +3.0% | +11.8% | +3.0% |
+| quiet window RSS | +30.0% | +31.3% | +134.4% |
+| sky replay CPU per 1k lines | -72.3% | -73.0% | -72.0% |
+| sky replay RSS | -1.2% | -7.3% | +40.1% |
+| lifecycle CPU | -18.5% | -14.4% | -13.0% |
+| lifecycle p95 turn | -1.9% | -1.2% | -1.3% |
+| lifecycle peak RSS | -0.5% | +0.3% | +44.0% |
+
+### What this shows
+
+- **jemalloc's memory cost is a peak, not a hold.** The daemon holds
+  more one second after a burst, but within 15 s it gives the pages back
+  without a purge thread and settles below musl's (22 to 23 against 24
+  to 25 MiB). The +45% footprint row and the #1158 section's "an idle
+  process keeps them" describe that first second. What stays is a fixed
+  1 to 2 MiB per process: the daemon idles at 16.9 to 17.2 MiB against
+  15.2 to 15.4, a window at 22.0 to 22.2 against 20.8 to 21.2.
+- **The purge thread buys nothing here.** It adds a thread and about
+  1 MiB idle per process, and the burst settles no lower.
+- **jemalloc in the daemon alone is worse at the high end.** musl's
+  windows save 0.5 to 1 MiB each at the low end, but at 200 windows key
+  p99 is 1.7 to 2.1 s against 1.4 to 1.5 s, and each window spends about 20%
+  more CPU.
+- **mimalloc matches jemalloc on speed and costs far more memory:** about
+  twice the idle RSS in both binaries, and 40 to 45 MiB after a burst
+  that jemalloc settles to 22 to 23 MiB.
+- **jemalloc as Codex ships it stays.** Nothing tested removes its fixed
+  1 to 2 MiB per process, and every alternative is slower, heavier or
+  both.
+
+Other Rust projects, read 2026-11-19 at the revisions below:
+
+- **ripgrep** links jemalloc only into its musl builds, because musl's
+  allocator "appears to slow down ripgrep quite a bit"
+  (BurntSushi/ripgrep `fdf7d95`, `crates/core/main.rs`).
+- **uv** uses jemalloc on Linux and macOS and mimalloc on Windows
+  (astral-sh/uv `469fe65`,
+  `crates/uv-performance-memory-allocator/src/lib.rs`).
+- **ruff** does the same (astral-sh/ruff `e69185f`,
+  `crates/ruff/src/main.rs`).
+- **Codex** links jemalloc into its Linux musl builds
+  (openai/codex `b9559ff`, `codex-rs/cli/Cargo.toml`). Its
+  `codex-rs/.cargo/config.toml` gives the reason for its one setting:
+  "Roughly one arena per four CPUs reduces idle RSS after Linux musl
+  conversations unload."
+- **Deno** sets no global allocator (denoland/deno `d8c551b`,
+  `cli/main.rs`).
+- **Zed** uses mimalloc only behind an optional `mimalloc` feature
+  (zed-industries/zed `4e161e7`, `crates/zed/src/main.rs` and
+  `crates/zed/Cargo.toml`).

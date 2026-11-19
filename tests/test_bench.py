@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import psutil
 
+from bench import lead_cache
 from bench.events import Events
 from bench.processes import Process, Tree
 from bench.report import compare
@@ -115,6 +116,35 @@ class EventTests(unittest.TestCase):
     def test_parallel_turns_on_one_agent_are_rejected(self):
         with self.assertRaises(ValueError):
             self.events.add({"event": "turn_start", "agent": "bob", "turn": "1"}, 0.3)
+
+
+class LeadCacheTests(unittest.TestCase):
+    def test_a_prefix_cache_reuses_whole_blocks_past_its_minimum(self):
+        self.assertEqual(lead_cache.cached_tokens(4 * 1023), 0)
+        self.assertEqual(lead_cache.cached_tokens(4 * 1024), 1024)
+        self.assertEqual(lead_cache.cached_tokens(4 * (1024 + 200)), 1024 + 128)
+
+    def test_diff_names_the_part_of_the_request_that_moved(self):
+        import json
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from pathlib import Path
+
+        def request(instructions, *said):
+            return {'tools': [{'name': 'exec'}], 'instructions': instructions,
+                    'input': [{'role': 'user', 'content': text} for text in said]}
+        rows = [request('lead', 'one'), request('lead', 'one', 'two'),
+                request('lead, with a fact saved', 'one', 'two', 'three'),
+                request('lead, with a fact saved', 'summary')]
+        with tempfile.TemporaryDirectory() as out:
+            (Path(out) / 'requests.jsonl').write_text(''.join(
+                json.dumps({'n': n, 'key': 'k-1', 'shared': 0, 'request': r}) + '\n'
+                for n, r in enumerate(rows, 1)))
+            with redirect_stdout(StringIO()):
+                totals, moves = lead_cache.diff(out, show=0)
+        self.assertEqual(totals['k-1']['requests'], 4)
+        self.assertEqual(moves, {'k-1': {'instructions': 1, 'input': 1}})
 
 
 class ReportTests(unittest.TestCase):

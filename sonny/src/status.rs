@@ -698,6 +698,17 @@ pub fn agents_lines(
     if agents.is_empty() {
         return Vec::new();
     }
+    agents_drawn(agents, here, width)
+}
+
+/// [`agents_lines`] drawn whatever it lists, the lead's row alone too:
+/// as **Projects** draws the picked project's agents, with no margin
+/// under them.
+pub fn agents_drawn(
+    agents: &Agents,
+    here: &str,
+    width: usize,
+) -> Vec<(Line<'static>, Option<String>)> {
     // `/status`'s head. Too long for its row, done and then idle give
     // way, as in the footer, then the title is cut at a word.
     let mut counted: Vec<(Group, String)> = (GROUPS.into_iter())

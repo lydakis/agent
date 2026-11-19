@@ -154,6 +154,16 @@ pub fn is_internal(bot: &str) -> bool {
     bot.starts_with(INTERNAL)
 }
 
+/// The namespace Sonny gives the agent named `bot` in the daemon: its
+/// name up to the first dot, which its agent tools list (`shop.*`) and name
+/// the agents it starts in (`shop.NAME`); `None` for a name with none
+/// before a dot.
+pub fn namespace(bot: &str) -> Option<&str> {
+    bot.split_once('.')
+        .map(|(namespace, _)| namespace)
+        .filter(|namespace| !namespace.is_empty())
+}
+
 /// The project `bot` leads: `shop` for its first lead, `shop.lead`, and
 /// for another lead of the same folder, `shop.lead.NAME`; `None` for any
 /// other bot, a lead's side chat (`shop.lead.side-1a2b`) included.
@@ -491,9 +501,9 @@ pub fn plain(dir: &Path) -> Result<String, String> {
 }
 
 /// The folder's instructions for a lead, when they are not the ones it
-/// `held` last: a lead takes its folder's as its window opens and at each
-/// idle point after. With what was left out of them, which the lead goes
-/// without either way.
+/// `held` last: a lead takes its folder's as its window opens, and only
+/// then, as Codex reads its instructions once as a session starts. With
+/// what was left out of them, which the lead goes without either way.
 pub fn review(
     dir: &Path,
     held: &str,

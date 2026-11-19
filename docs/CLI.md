@@ -38,24 +38,24 @@ a variable a bot or caller sets with `--env` is still set.
 
 A model's context window, which sets where its bots compact unless they set
 `--compact-tokens`, is what its provider lists, else the window Anthropic
-publishes for a Claude model, else 200K. `serve --context-window
-PROVIDER/MODEL=TOKENS`, repeatable, sets it instead for every model whose path
-matches, with `*` and `?` wildcards: `bedrock/*` for every Bedrock model,
+publishes for a Claude model, else 200K. A bot's `context_windows` setting
+sets it instead for every model whose `PROVIDER/MODEL` path matches a
+pattern, with `*` and `?` wildcards: `bedrock/*` for every Bedrock model,
 `bedrock/*openai.*` for OpenAI's there, or one exact model. The most specific
 pattern wins (an exact path over any wildcard, then the most characters that
-are not wildcards, then the first by name), and it wins over the provider's listing, so a window can be set lower
-on purpose. A client that starts a daemon passes `[context_windows]` from
-`~/.agent/config.toml`; the daemon announces them in `ready` as
-`context_windows`, and a running daemon keeps the ones it started with.
+are not wildcards, then the first by name), and it wins over the provider's
+listing, so a window can be set lower on purpose.
 A bot's `--speed` reaches only the models that serve that tier; its calls
 on any other run at standard. The daemon's own list names exact model ids
-(each provider's in `ready.providers.NAME.speeds`), and `serve --speeds
-PROVIDER/MODEL=TIERS`, repeatable, sets the tiers past standard (`fast`,
-`ultrafast`, comma-separated, or none) for every model whose path matches,
-ranked as `--context-window` patterns are and over the daemon's list: for
-a model the list does not name, or to take a tier from one it does. A
-client passes `[speeds]` from `~/.agent/config.toml`, and `ready.speeds`
-announces them.
+(each provider's in `ready.providers.NAME.speeds`), and a bot's `speeds`
+setting gives the tiers past standard (`fast`, `ultrafast`, or `[]` for
+none) for every model whose path matches, ranked as `context_windows`
+patterns are and over the daemon's list: for a model the list does not name,
+or to take a tier from one it does. `agent run --new` gives a bot the
+person's `[context_windows]` and `[speeds]` from `~/.agent/config.toml`, and
+each `agent run` from outside a bot's turn sends them again when they
+changed, so an edit reaches a bot's next turn with no daemon restart. A bot
+made by another takes its creator's.
 `serve --protect NAME` keeps NAME at the top of a sandboxed bot's
 writable folders read-only and from being made, and `--protect-existing NAME`
 keeps it read-only where it exists; a client passes `.git`, `.agents` and
@@ -326,7 +326,7 @@ tries its held turns at once.
   `--approval-hold`, `--max-output-tokens`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
   folder), `--network`, `--trailer` (`sender`, `time`, both comma-separated, or `""` for no line), `--quiet-background`, `--hold`, `--unix-socket` (repeatable: an
-  absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
+  absolute socket, or folder of them, its commands reach), `--namespace` (the group its agent tools list and name the bots it makes in) and `--outputs` (made absolute; a new
   bot gets `outputs` beside the store without it); they are not daemon options,
   and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 

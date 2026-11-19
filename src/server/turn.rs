@@ -570,8 +570,8 @@ impl Finished {
 }
 
 /// The provider as a bot's settings shape its calls: its output bound,
-/// cache lifetime and speed. The bot's defaults borrow it
-/// unchanged.
+/// cache lifetime, speed and the tiers its `speeds` say models serve. The
+/// bot's defaults borrow it unchanged.
 pub fn shaped<'p>(
     provider: &'p Provider,
     settings: &Settings,
@@ -580,6 +580,7 @@ pub fn shaped<'p>(
         settings.max_output_tokens,
         settings.cache_hour(),
         settings.speed(),
+        &settings.speeds,
     )
 }
 
@@ -590,7 +591,12 @@ fn shaped_other<'p>(
     provider: &'p Provider,
     settings: &Settings,
 ) -> Result<std::borrow::Cow<'p, Provider>> {
-    provider.shaped(settings.max_output_tokens, settings.cache_hour(), None)
+    provider.shaped(
+        settings.max_output_tokens,
+        settings.cache_hour(),
+        None,
+        &agent_runtime::provider::Speeds::default(),
+    )
 }
 
 /// Of `asked`, the tools an agent `me` makes is given: those `me` has, and
@@ -2975,8 +2981,13 @@ impl Turn {
         }
         let shaped = shaped(provider, self.settings())?;
         let provider: &Provider = &shaped;
-        self.window
-            .get_or_init(|| agent_runtime::provider::context_window(provider, model));
+        self.window.get_or_init(|| {
+            agent_runtime::provider::context_window(
+                provider,
+                &self.settings().context_windows,
+                model,
+            )
+        });
         let workspace = PathBuf::from(&context.workspace);
         // What this turn's commands and children get.
         let environment = commands_environment(
@@ -5996,7 +6007,7 @@ impl Turn {
                 after,
                 limit,
             } => {
-                let name = name.or_else(|| self.project_agents());
+                let name = name.or_else(|| self.namespace_agents());
                 let page = request(json!({"op":"bots","name":name,"active":running,
                     "open":!closed,"limit":limit,"after":after.as_str()}))
                 .await?;
@@ -6032,7 +6043,7 @@ impl Turn {
                 limit,
                 ..
             } => {
-                let name = name.or_else(|| self.project_agents());
+                let name = name.or_else(|| self.namespace_agents());
                 let page = request(json!({"op":"approvals","after":after.as_i64().unwrap_or(0),
                     "limit":limit}))
                 .await?;
@@ -6053,8 +6064,14 @@ impl Turn {
                         if start.len() < arguments.len() {
                             start.push('…');
                         }
-                        json!({"bot":call["bot"],"turn":call["turn"],"tool":call["name"],
-                            "arguments":start,"waiting_on":call["gates"]})
+                        let mut row = json!({"bot":call["bot"],"turn":call["turn"],
+                            "tool":call["name"],"arguments":start,"waiting_on":call["gates"]});
+                        // One a message lifted, or its client yielded, waits
+                        // on past its turn, under the handle it answers.
+                        if call["handle"].is_string() {
+                            row["handle"] = call["handle"].clone();
+                        }
+                        row
                     })
                     .collect();
                 json!({"approvals":calls,"next_after":page["next_after"]})
@@ -6247,12 +6264,11 @@ impl Turn {
     }
 
     /// The whole name of an agent this one makes named `name`: a name
-    /// with no dot is in this one's project, the part of its name before
-    /// the first dot; one with a dot is whole already. A bot whose name
-    /// has no dot has no project.
+    /// with no dot is in this one's namespace, as its client set it; one
+    /// with a dot, or made by a bot with no namespace, is whole already.
     fn spawned_name(&self, name: &str) -> String {
-        match self.bot.split_once('.') {
-            Some((project, _)) if !name.contains('.') => format!("{project}.{name}"),
+        match &self.settings().namespace {
+            Some(namespace) if !name.contains('.') => format!("{namespace}.{name}"),
             _ => name.to_owned(),
         }
     }
@@ -6395,11 +6411,10 @@ impl Turn {
         ))
     }
 
-    /// This bot's project's agents, as a name pattern: those named as it
-    /// is up to the first dot, or every agent for a name with none.
-    fn project_agents(&self) -> Option<String> {
-        let (project, _) = self.bot.split_once('.')?;
-        Some(format!("{project}.*"))
+    /// The bots in this one's namespace, as a name pattern, or every bot
+    /// for one with none.
+    fn namespace_agents(&self) -> Option<String> {
+        (self.settings().namespace.as_ref()).map(|namespace| format!("{namespace}.*"))
     }
 
     async fn history_audit(

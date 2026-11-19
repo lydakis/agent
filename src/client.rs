@@ -511,6 +511,12 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.settings.insert("outputs".to_owned(), json!(path));
                         options.settings_flags.push(flag.to_owned());
                     }
+                    "--namespace" => {
+                        options
+                            .settings
+                            .insert("namespace".to_owned(), json!(value));
+                        options.settings_flags.push(flag.to_owned());
+                    }
                     "--unix-socket" => {
                         let path = std::path::absolute(&value)?;
                         let path = path
@@ -1324,16 +1330,6 @@ fn spawn_daemon(
     let file = config()?;
     for pattern in file.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
-    }
-    for (pattern, tokens) in &file.context_windows {
-        command
-            .arg("--context-window")
-            .arg(format!("{pattern}={tokens}"));
-    }
-    for (pattern, tiers) in &file.speeds {
-        command
-            .arg("--speeds")
-            .arg(format!("{pattern}={}", tiers.join(",")));
     }
     for (pattern, model) in &file.fallbacks {
         command.arg("--fallbacks").arg(format!("{pattern}={model}"));
@@ -2195,6 +2191,13 @@ fn run(options: &Options) -> Result<i32> {
         if let Some(ms) = config()?.hold_ms {
             settings.entry("hold_ms").or_insert(json!(ms));
         }
+        // The tiers and windows the person says models have, as Sonny gives
+        // its agents; each `run` sends them again as they change.
+        for (key, table) in agent_client::config::model_tables(&config()?) {
+            if !table.is_null() {
+                settings.entry(key).or_insert(table);
+            }
+        }
         // Cut outputs go whole to a folder beside the store, as the
         // summary prompt goes by default; --outputs names another.
         if let Some(outputs) = agent_client::policy::outputs_beside(&options.store) {
@@ -2239,6 +2242,26 @@ fn run(options: &Options) -> Result<i32> {
         let record = connection.request("inspect", json!({"bot":bot}))?;
         if answered_by_auto(&record) {
             require_approver(&mut connection)?;
+        }
+        // The person's `[speeds]` and `[context_windows]` as they are now,
+        // for the bot's next turn, as Sonny keeps its agents on them. Not
+        // from inside a bot's turn, whose socket configures no bot.
+        if std::env::var_os("AGENT_BOT_ID").is_none() {
+            // Against what it will have once the daemon takes a change kept
+            // for its turn's end, so a file put back undoes that one too.
+            let mut settings = record["settings"].clone();
+            if let Some(Value::Object(kept)) = record["configure_pending"].get("settings") {
+                for (name, value) in kept {
+                    settings[name] = value.clone();
+                }
+            }
+            let changed = agent_client::config::model_tables_changed(&config()?, &settings);
+            if !changed.is_empty() {
+                connection.request(
+                    "configure",
+                    json!({"bot": bot, "bot_id": record["bot_id"], "settings": changed}),
+                )?;
+            }
         }
     }
     // Existing bots keep their model and effort unless --model or

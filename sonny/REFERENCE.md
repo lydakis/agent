@@ -107,6 +107,26 @@ chat keeps to its agent, and `/new` is for the main window only.
 
 ![/switch listing every agent, then narrowed by typing fix, in Flexoki dark and light](../docs/sonny/switch-picker.png)
 
+### Projects
+
+`/projects`, or `←` with nothing typed, shows every project in the
+conversation's place, and the pane beside it shows the picked project's
+agents, so you go from one lead to another without a multiplexer. A row is
+a project, and a project is its lead: the mark of its most pressing agent,
+its title (its name where it has none), and its counts as the footer writes
+them. The project you are in is bold. A project whose folder is inside
+another's hangs under it, and a superlead's row says a muted `superlead`.
+Rows keep the order of their titles, so none moves when an agent starts or
+ends a turn. Projects none of whose agents had a turn in seven days fold to
+`▸ N idle projects`. `↑` `↓` pick, `enter` or `→` goes to the picked
+project's lead as `/switch` does, `←` goes to the project that holds it,
+`ctrl+f` narrows the rows by title and name, and `esc` puts back the
+conversation and what the pane showed. The empty composer says
+`← projects`. Zen, a side chat and an agent shown beside keep you where you
+are: `←` there does nothing.
+
+![Projects at 150, 120, 60 and 44 columns: a superlead with two projects under it, a third outside it, four idle projects folded; the pane shows the picked project's agents where there is room](../docs/sonny/projects-projects.png)
+
 ### Creating an agent
 
 `/new [NAME]`, in a lead's window, starts an agent from its folder in three
@@ -335,7 +355,7 @@ The project's wins, then the config's, then `lead` and `task`. A name that
 is not a profile in the folder's or the person's `.agents/agents` (nor one
 Sonny ships) stops the lead or task from being made, with
 `profile_not_found`. The profile is read when the lead's instructions are
-composed, so a change takes at the lead's next idle point. `extends`, `skills` and
+composed, so a change takes when a window next opens on the lead. `extends`, `skills` and
 `sandbox` work in any profile ([CLIENT.md](../docs/CLIENT.md)): a task or
 workflow worker started in a profile with a `sandbox` runs in it, never
 looser than its permissions row would give it, and a lead runs in its
@@ -856,10 +876,10 @@ has something on it, or is off the screen, no time shows.
   `sonny-config` skill. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
-  agent when it is made, `trailer` and `hold`, every agent Sonny made
-  takes within seconds of the file changing, or, at work, once its turn
-  ends. `[fallbacks]`, like `[speeds]` and `[context_windows]`, is the
-  daemon's: every agent takes it once the daemon starts again.
+  agent when it is made, `trailer`, `hold`, `[speeds]` and
+  `[context_windows]`, every agent Sonny made takes within seconds of the
+  file changing, or, at work, once its turn ends: no restart. `[fallbacks]`
+  is the daemon's: every agent takes it once the daemon starts again.
 
   ![/config: the Models group under its bold name, a model set in ink and the defaults muted](../docs/sonny/config-groups.png)
 
