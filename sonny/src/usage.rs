@@ -1826,12 +1826,16 @@ mod tests {
         let shown: Vec<_> = (before.iter())
             .map(|row| (row["bot"].as_str().unwrap(), row["running"] == true))
             .collect();
-        // p.long had not ended when that period did; p.b's turn started
-        // after it.
-        // p.spanned's turn had not ended either.
+        // p.long had not ended when that period did, nor had p.crossed's
+        // and p.spanned's turns; p.b's turn started after it.
         assert_eq!(
             shown,
-            [("p.old", false), ("p.long", true), ("p.spanned", true)]
+            [
+                ("p.old", false),
+                ("p.long", true),
+                ("p.crossed", true),
+                ("p.spanned", true)
+            ]
         );
         assert_eq!(before[0]["person_messages"], 1);
         assert_eq!(Tasks::before(&before), (0, 1));
