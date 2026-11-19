@@ -1166,6 +1166,10 @@ def blind():
         # Agents' messages to each other, for rows where calls count.
         if (RUNS / run_name / 'messages.md').exists():
             text += '\n\n## Messages between agents\n\n' + (RUNS / run_name / 'messages.md').read_text()
+        # Z1 and Z2 score the automation's runs and what reached the lead,
+        # before the paths that name the arm are hidden.
+        if DAY is QUIET and (RUNS / run_name / 'automation.md').exists():
+            text += '\n\n' + (RUNS / run_name / 'automation.md').read_text()
         text = re.sub(re.escape(str(ROOT)) + r'/[0-9a-f]{8}-' + re.escape(run_name), str(ROOT / 'RUN'), text)
         if run_name in builds:
             build = builds[run_name]
@@ -1176,9 +1180,6 @@ def blind():
         # T1 scores each task's title as the lead set it.
         if (RUNS / run_name / 'titles.md').exists():
             text += '\n\n## Titles the lead set\n\n' + (RUNS / run_name / 'titles.md').read_text()
-        # Z1 and Z2 score the automation's runs and what reached the lead.
-        if DAY is QUIET and (RUNS / run_name / 'automation.md').exists():
-            text += '\n\n' + (RUNS / run_name / 'automation.md').read_text()
         # C1 scores what main ended up holding: carry it under the same name.
         if (RUNS / run_name / 'main.txt').exists():
             text += '\n### MAIN AT THE END (scoring only)\n\n```\n' + (RUNS / run_name / 'main.txt').read_text() + '```\n'

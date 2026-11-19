@@ -149,7 +149,7 @@ class BlindTests(unittest.TestCase):
                 "CREATE TABLE turns(id INTEGER PRIMARY KEY, bot TEXT, status TEXT, reply_node INTEGER);"
                 "CREATE TABLE nodes(id INTEGER PRIMARY KEY, item BLOB);")
             said = {'type': 'message', 'role': 'assistant',
-                    'content': [{'type': 'output_text', 'text': 'Tests pass, nothing to report.'}]}
+                    'content': [{'type': 'output_text', 'text': 'Tests pass in /work/a/target/release.'}]}
             db.execute("INSERT INTO nodes VALUES (1, ?)", (json.dumps(said),))
             db.executemany("INSERT INTO messages VALUES (?, ?, ?, ?)", [
                 (5, 'shop.watch', 5, 'automation'), (7, 'shop.watch', 7, None), (9, 'shop.watch', 9, 'automation')])
@@ -172,7 +172,7 @@ class BlindTests(unittest.TestCase):
             self.assertEqual((run / 'automation.md').read_text(),
                              '## Turns an automation started\n\n'
                              '- shop.watch/5 completed: (empty reply)\n'
-                             '- shop.watch/9 completed: "Tests pass, nothing to report."\n'
+                             '- shop.watch/9 completed: "Tests pass in /work/a/target/release."\n'
                              '\n## Notes to the lead about them\n\n'
                              'shop.watch replied to automation, completed: Tests pass\n')
             # Read again, the notes are not added twice.
@@ -183,6 +183,8 @@ class BlindTests(unittest.TestCase):
                 role_eval.blind()
             [blind] = list((out / 'blind').iterdir())
             self.assertIn('- shop.watch/5 completed: (empty reply)', blind.read_text())
+            # A path that names the arm is hidden there too.
+            self.assertIn('- shop.watch/9 completed: "Tests pass in /BUILD."', blind.read_text())
 
 
 class ConfinedTests(unittest.TestCase):
