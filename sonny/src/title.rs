@@ -129,13 +129,23 @@ impl Titles {
     /// The title of `bot`, a row of the daemon's `bots`.
     pub fn of(&mut self, bot: &serde_json::Value) -> Option<String> {
         let name = bot["name"].as_str()?;
-        if let Some(title) = self.noted.of(name, bot["bot_id"].as_i64()) {
+        self.named(name, bot["bot_id"].as_i64(), bot["workspace"].as_str())
+    }
+
+    /// The title of the agent `name`, with its `bot_id` and `workspace`.
+    pub fn named(
+        &mut self,
+        name: &str,
+        id: Option<i64>,
+        workspace: Option<&str>,
+    ) -> Option<String> {
+        if let Some(title) = self.noted.of(name, id) {
             return Some(title);
         }
         if !crate::project::is_lead(name) {
             return None;
         }
-        self.project(bot["workspace"].as_str().unwrap_or(""))
+        self.project(workspace.unwrap_or(""))
     }
 
     /// The title of the project in `folder`, as its file gives it.
