@@ -5924,6 +5924,7 @@ impl Turn {
                 delivery,
                 interrupt,
                 quotes,
+                replaces,
                 request_id,
             } => {
                 let mut delivery = delivery;
@@ -5952,7 +5953,7 @@ impl Turn {
                 let sent = request(json!({"op":"submit","bot":to,"request_id":request_id,
                     "prompt":message,"delivery":delivery,
                     "from":{"bot":self.bot,"turn":self.turn},
-                    "quotes":(!quotes.is_empty()).then_some(quotes)}))
+                    "quotes":(!quotes.is_empty()).then_some(quotes),"replaces":replaces}))
                 .await?;
                 let mut interrupted = Value::Null;
                 if let Some(turn) = running
@@ -5971,6 +5972,21 @@ impl Turn {
                 }
                 if !interrupted.is_null() {
                     answer["interrupted_turn"] = interrupted;
+                }
+                // What became of the message this one replaces.
+                let replaced = &sent["replaced"];
+                match replaced["status"].as_str() {
+                    None => {}
+                    Some("taken") => {
+                        answer["taken"] = replaced["handle"].clone();
+                        answer["taken_turn"] = replaced["turn"].clone();
+                    }
+                    // Still in line only for a retry of a send that
+                    // replaced nothing.
+                    Some("queued" | "ready" | "attached") => {
+                        answer["waiting"] = replaced["handle"].clone();
+                    }
+                    Some(_) => answer["replaced"] = replaced["handle"].clone(),
                 }
                 answer
             }

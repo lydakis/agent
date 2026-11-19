@@ -1437,6 +1437,16 @@ pub struct Binding<'a> {
     /// The bot starts a line of its own, at depth 0, though it has a creator.
     pub starts_line: bool,
 }
+/// What became of the message a submission replaces: withdrawn by it
+/// while still in line, or how it had ended already.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replaced {
+    pub message: i64,
+    /// `withdrawn`, `failed` (it never reached the bot), or `taken`.
+    pub status: String,
+    /// The turn that took it in, when one did.
+    pub turn: Option<i64>,
+}
 #[derive(Debug)]
 pub struct Started {
     pub turn: i64,
@@ -4112,6 +4122,7 @@ impl Database {
             self.files_gone.len(),
             self.calls_ended.len(),
         );
+        let announced = self.outcomes.len();
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -4123,6 +4134,7 @@ impl Database {
             self.stepped.truncate(stepped);
             self.files_gone.truncate(files);
             self.calls_ended.truncate(ended);
+            self.outcomes.truncate(announced);
             self.restore_steps(gone);
             self.recount_pending()?;
         }
@@ -8855,6 +8867,76 @@ impl Database {
             )],
             outcome,
         ))
+    }
+    /// Withdraw message `message` of bot `name` for the submission
+    /// `request_id` that replaces it, if it is still in line; a message
+    /// already taken in, or ended, stays as it is and says how. Only its
+    /// own sender may replace it: the same bot, or client, and person.
+    /// A retry of the submission withdraws nothing.
+    pub fn replace(
+        &mut self,
+        name: &str,
+        message: i64,
+        request_id: &str,
+        options: &TurnOptions,
+    ) -> Result<Replaced> {
+        type Row = (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+        );
+        let row: Option<Row> = self
+            .conn
+            .prepare_cached(
+                "SELECT status,turn,from_bot,origin,person,
+                    EXISTS(SELECT 1 FROM messages WHERE bot=?2 AND request_id=?3)
+                 FROM messages WHERE id=?1 AND bot=?2",
+            )?
+            .query_row(params![message, name, request_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .optional()?;
+        let Some((status, turn, from_bot, origin, person, resent)) = row else {
+            return Err(
+                Error::with("turn_not_found", format!("{name} has no message {message}"))
+                    .facts(json!({"bot":name,"message":message})),
+            );
+        };
+        let sender = options
+            .from
+            .as_ref()
+            .map(|(bot, _)| bot)
+            .or(options.origin.as_ref());
+        if from_bot.as_ref().or(origin.as_ref()) != sender || person != options.person {
+            return Err(Error::with(
+                "not_permitted",
+                format!("{name}/{message} has another sender; only its sender may replace it"),
+            )
+            .facts(json!({"bot":name,"message":message})));
+        }
+        if !resent && matches!(status.as_str(), "queued" | "ready" | "attached") {
+            self.end_queued(message, &Error::new("cancelled"))?;
+            return Ok(Replaced {
+                message,
+                status: "withdrawn".to_owned(),
+                turn: None,
+            });
+        }
+        Ok(Replaced {
+            message,
+            status,
+            turn,
+        })
     }
     /// Deliver a bounded prefix of queued steers into the running turn,
     /// and attached messages with them unless `attached` is false (a reply
