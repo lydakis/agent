@@ -1213,13 +1213,16 @@ impl Worker {
 
     /// Whether the task's window was set aside for room, as the work sent
     /// so far left it: closed for room, or not opened for want of it.
+    #[cfg(test)]
     pub fn aside(&self, bot: &str) -> bool {
         self.aside.lock().is_ok_and(|aside| {
             aside.0.contains(bot) || aside.1.as_ref().is_some_and(|kept| (kept.was)(bot))
         })
     }
 
-    /// [`Worker::aside`], asked from beside the window.
+    /// Whether a task's window was set aside for room, as the work sent so
+    /// far left it, asked from beside the window: closed for room, or not
+    /// opened for want of it.
     pub fn asides(&self) -> impl Fn(&str) -> bool + Send + Sync + 'static {
         let aside = self.aside.clone();
         move |bot| {
