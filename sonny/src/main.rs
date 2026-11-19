@@ -1692,10 +1692,7 @@ async fn read_title(
         let title = crate::title::of_message(first);
         if !title.is_empty() {
             // Written off the loop: a backfill writes one for each agent.
-            let (store, bot) = (store.to_owned(), name.to_owned());
-            let noted =
-                tokio::task::spawn_blocking(move || crate::title::note(&store, &bot, id, &title));
-            let _ = noted.await;
+            crate::title::note_later(store, name, id, &title);
         }
     }
     reading.2 = first.is_some();
@@ -22457,54 +22454,44 @@ fn watch_card(
     watch: &Watch,
     width: usize,
 ) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
+    // Each running turn's time counts on from when the rows were read.
     let since = watch.read.elapsed().as_secs();
-    let rows: Vec<status::Row> = watch
-        .rows
-        .iter()
-        .cloned()
-        .map(|mut row| {
-            if row.running {
-                row.seconds = row.seconds.map(|s| s + since);
-            }
-            row
-        })
-        .collect();
+    let rows = &watch.rows;
+    let card = |details| {
+        status::card_after(
+            &watch.project,
+            rows,
+            since,
+            width,
+            &watch.open,
+            details,
+            &watch.helpers,
+        )
+    };
+    let quiet = card(status::Details::Quiet);
     // The agent picked from the keys says more: its place among the rows
     // is the same with or without that.
-    let listed = status::card(
-        &watch.project,
-        &rows,
-        width,
-        &watch.open,
-        status::Details::Quiet,
-        &watch.helpers,
-    );
-    let picked = (watch.pick)
-        .and_then(|at| {
-            picks_in_order(&listed.named, &listed.folds)
-                .into_iter()
-                .nth(at)
-        })
-        .and_then(|(_, picked)| match picked {
-            Picked::Agent(bot) => Some(bot),
-            Picked::Group(_) => None,
-        });
     let status::Card {
         lines: mut card,
         named,
         folds,
         helpers,
-    } = status::card(
-        &watch.project,
-        &rows,
-        width,
-        &watch.open,
-        match watch.more {
-            true => status::Details::Picked(picked.as_deref()),
-            false => status::Details::Quiet,
-        },
-        &watch.helpers,
-    );
+    } = match watch.more {
+        true => {
+            let picked = (watch.pick)
+                .and_then(|at| {
+                    picks_in_order(&quiet.named, &quiet.folds)
+                        .into_iter()
+                        .nth(at)
+                })
+                .and_then(|(_, picked)| match picked {
+                    Picked::Agent(bot) => Some(bot),
+                    Picked::Group(_) => None,
+                });
+            card(status::Details::Picked(picked.as_deref()))
+        }
+        false => quiet,
+    };
     // What is broken goes under the heading, and the agents under that.
     let mut above: Vec<Line<'static>> = Vec::new();
     // An alert that opens a view does so on a click on its first line.

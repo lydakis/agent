@@ -40,10 +40,10 @@ struct Names {
 static NAMES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Names>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// Each title read or noted, by its agent's name and id.
-static READ: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(String, i64), String>>,
-> = std::sync::LazyLock::new(Default::default);
+/// Each title read or noted, by its folder, then its agent's name and id.
+type Read = std::collections::HashMap<PathBuf, std::collections::HashMap<(String, i64), String>>;
+static READ: std::sync::LazyLock<std::sync::Mutex<Read>> =
+    std::sync::LazyLock::new(Default::default);
 
 fn changed_at(dir: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(dir).and_then(|meta| meta.modified()).ok()
@@ -51,7 +51,9 @@ fn changed_at(dir: &Path) -> Option<std::time::SystemTime> {
 
 /// What was read or noted of `bot` in `dir`, for every listing after.
 fn known(dir: &Path, bot: &str, id: i64, title: &str) {
-    (READ.lock().unwrap_or_else(|e| e.into_inner())).insert((bot.to_owned(), id), title.to_owned());
+    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    let read = read.entry(dir.to_owned()).or_default();
+    read.insert((bot.to_owned(), id), title.to_owned());
     let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
     (names.entry(dir.to_owned()).or_default().names).insert(bot.into());
 }
@@ -59,16 +61,50 @@ fn known(dir: &Path, bot: &str, id: i64, title: &str) {
 /// Note `title` as the title of `bot`, the agent of id `id`: its id
 /// first, so an agent given the name later takes none of it.
 pub fn note(store: &Path, bot: &str, id: i64, title: &str) -> std::io::Result<()> {
+    write(&folder(store), bot, id, title)
+}
+
+/// [`note`], written by a thread of its own: known to this process at
+/// once, and on disk after, so a backfill of many waits on no file.
+pub fn note_later(store: &Path, bot: &str, id: i64, title: &str) {
+    type Job = (PathBuf, String, i64, String);
+    static WRITER: std::sync::LazyLock<std::sync::Mutex<Option<std::sync::mpsc::Sender<Job>>>> =
+        std::sync::LazyLock::new(|| {
+            let (send, take) = std::sync::mpsc::channel::<Job>();
+            let spawned = std::thread::Builder::new()
+                .name("titles".into())
+                .spawn(move || {
+                    for (dir, bot, id, title) in take {
+                        let _ = write(&dir, &bot, id, &title);
+                    }
+                });
+            std::sync::Mutex::new(spawned.ok().map(|_| send))
+        });
     let dir = folder(store);
-    std::fs::create_dir_all(&dir)?;
-    let before = changed_at(&dir);
-    std::fs::write(dir.join(bot), format!("{id}\n{}\n", title.trim()))?;
-    let after = changed_at(&dir);
     known(&dir, bot, id, title.trim());
+    let job = (dir, bot.to_owned(), id, title.to_owned());
+    let writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let unsent = match writer.as_ref() {
+        Some(send) => send.send(job).err().map(|unsent| unsent.0),
+        None => Some(job),
+    };
+    drop(writer);
+    // No thread to write it: written here.
+    if let Some((dir, bot, id, title)) = unsent {
+        let _ = write(&dir, &bot, id, &title);
+    }
+}
+
+fn write(dir: &Path, bot: &str, id: i64, title: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let before = changed_at(dir);
+    std::fs::write(dir.join(bot), format!("{id}\n{}\n", title.trim()))?;
+    let after = changed_at(dir);
+    known(dir, bot, id, title.trim());
     // Its own note leaves the names as read: only another's reads them again.
     let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(names) = names
-        .get_mut(&dir)
+        .get_mut(dir)
         .filter(|names| names.at.is_some() && names.at == before)
     {
         names.at = after;
@@ -110,19 +146,7 @@ impl Noted {
             return None;
         }
         drop(names);
-        let key = (bot.to_owned(), id);
-        let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(title) = read.get(&key) {
-            return Some(title.clone());
-        }
-        let text = std::fs::read_to_string(self.dir.join(bot)).ok()?;
-        let (noted, title) = text.split_once('\n')?;
-        if noted.trim().parse::<i64>().ok()? != id {
-            return None;
-        }
-        let title = Some(title.trim().to_owned()).filter(|title| !title.is_empty())?;
-        read.insert(key, title.clone());
-        Some(title)
+        noted_in(&self.dir, bot, id)
     }
 }
 
@@ -138,17 +162,23 @@ pub fn of_message(message: &str) -> String {
 
 /// The title noted for `bot`, the agent of id `id`, read from its file.
 pub fn noted(store: &Path, bot: &str, id: i64) -> Option<String> {
+    noted_in(&folder(store), bot, id)
+}
+
+/// [`noted`] in the folder `dir`: each read once for the process.
+fn noted_in(dir: &Path, bot: &str, id: i64) -> Option<String> {
     let key = (bot.to_owned(), id);
-    if let Some(title) = (READ.lock().unwrap_or_else(|e| e.into_inner())).get(&key) {
+    let read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(title) = read.get(dir).and_then(|read| read.get(&key)) {
         return Some(title.clone());
     }
-    let dir = folder(store);
+    drop(read);
     let text = std::fs::read_to_string(dir.join(bot)).ok()?;
     let (noted, title) = text.split_once('\n')?;
     let title = (noted.trim().parse::<i64>().ok()? == id)
         .then(|| title.trim().to_owned())
         .filter(|title| !title.is_empty())?;
-    known(&dir, bot, id, &title);
+    known(dir, bot, id, &title);
     Some(title)
 }
 
