@@ -261,6 +261,15 @@ pub fn name_agents(
     names: &[&str],
     after: impl Fn(&str) -> bool,
 ) -> Vec<Line<'static>> {
+    // Each name looked up by its length where a word starts, the longest
+    // first, not every name tried at every character: a card of thousands
+    // of agents is read through once.
+    let set: std::collections::HashSet<&str> = (names.iter().copied())
+        .filter(|name| !name.is_empty())
+        .collect();
+    let mut lengths: Vec<usize> = set.iter().map(|name| name.len()).collect();
+    lengths.sort_unstable_by(|a, b| b.cmp(a));
+    lengths.dedup();
     let mut before = String::new();
     let mut out = Vec::new();
     for row in rows {
@@ -279,22 +288,25 @@ pub fn name_agents(
             let mut at = 0;
             while at < text.len() {
                 // The longest name that fits: `lead review` over `lead`.
-                let found = (names.iter())
-                    .filter(|name| !name.is_empty() && text[at..].starts_with(**name))
-                    .filter(|name| !text[at + name.len()..].starts_with(name_char))
-                    .filter(|_| !text[..at].ends_with(name_char))
+                let found = (!text[..at].ends_with(name_char))
+                    .then(|| {
+                        lengths.iter().find_map(|&len| {
+                            let name = *set.get(text.get(at..at + len)?)?;
+                            (!text[at + len..].starts_with(name_char)).then_some(name)
+                        })
+                    })
+                    .flatten()
                     .filter(|_| {
                         let context = format!("{said}{}", &text[..at]);
                         after(&format!("{} ", context.trim_end()))
-                    })
-                    .max_by_key(|name| name.len());
+                    });
                 match found {
                     Some(name) => {
                         if from < at {
                             spans.push(Span::styled(text[from..at].to_owned(), style));
                         }
                         let blue = style.fg(Color::Blue).remove_modifier(Modifier::DIM);
-                        spans.push(Span::styled((*name).to_owned(), blue));
+                        spans.push(Span::styled(name.to_owned(), blue));
                         at += name.len();
                         from = at;
                     }

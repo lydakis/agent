@@ -1,106 +1,278 @@
 //! An agent's title: a few words the person knows its work by, beside its
-//! name, which stays the handle. A task's is set by `start_task`; one the
-//! person starts with `/new` takes its first message's first line; a lead
-//! with none of its own takes its project's, which the project file keeps
-//! where the person can change it. The daemon keeps none: Sonny notes each
-//! beside the store, as it notes the profile a task was started as.
+//! name, which stays the handle. Every agent's is its first message's first
+//! line, as Codex names a thread from its first message: a task's brief or
+//! a `/new` agent's message noted as it starts, any other (a helper, a task
+//! started before titles) read once from its history and noted. A lead with
+//! none of its own takes its project's, which the project file keeps where
+//! the person can change it. The daemon keeps none: Sonny notes each beside
+//! the store, as it notes the profile a task was started as.
 use std::path::{Path, PathBuf};
 
-/// The most characters a task's title takes.
+/// The most characters a title takes.
 pub const MOST: usize = 60;
 
 /// Where Sonny keeps the title each agent was started with: beside the
-/// store, one file per agent.
-fn file(store: &Path, bot: &str) -> PathBuf {
-    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
-    let mut dir = store.into_os_string();
-    dir.push(".titles");
-    PathBuf::from(dir).join(bot)
+/// store, one file per agent, in this folder, found once for each store.
+fn folder(store: &Path) -> PathBuf {
+    static FOUND: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut found = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+    (found.entry(store.to_owned()))
+        .or_insert_with(|| {
+            let store =
+                agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
+            let mut dir = store.into_os_string();
+            dir.push(".titles");
+            PathBuf::from(dir)
+        })
+        .clone()
+}
+
+/// The names noted in each folder, read whole only once the folder
+/// changed since (its modified time), and as it was when read.
+#[derive(Default)]
+struct Names {
+    at: Option<std::time::SystemTime>,
+    names: std::collections::HashSet<std::ffi::OsString>,
+}
+
+static NAMES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Names>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Each title read or noted, by its folder, then its agent's name and id.
+type Read = std::collections::HashMap<PathBuf, std::collections::HashMap<(String, i64), String>>;
+static READ: std::sync::LazyLock<std::sync::Mutex<Read>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn changed_at(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir).and_then(|meta| meta.modified()).ok()
+}
+
+/// What was read or noted of `bot` in `dir`, for every listing after.
+fn known(dir: &Path, bot: &str, id: i64, title: &str) {
+    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    let read = read.entry(dir.to_owned()).or_default();
+    read.insert((bot.to_owned(), id), title.to_owned());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    (names.entry(dir.to_owned()).or_default().names).insert(bot.into());
 }
 
 /// Note `title` as the title of `bot`, the agent of id `id`: its id
 /// first, so an agent given the name later takes none of it.
 pub fn note(store: &Path, bot: &str, id: i64, title: &str) -> std::io::Result<()> {
-    let file = file(store, bot);
-    std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/")))?;
-    std::fs::write(file, format!("{id}\n{}\n", title.trim()))
+    write(&folder(store), bot, id, title)
+}
+
+/// [`note`], written by a thread of its own: known to this process at
+/// once, and on disk after, so a backfill of many waits on no file.
+pub fn note_later(store: &Path, bot: &str, id: i64, title: &str) {
+    type Job = (PathBuf, String, i64, String);
+    static WRITER: std::sync::LazyLock<std::sync::Mutex<Option<std::sync::mpsc::Sender<Job>>>> =
+        std::sync::LazyLock::new(|| {
+            let (send, take) = std::sync::mpsc::channel::<Job>();
+            let spawned = std::thread::Builder::new()
+                .name("titles".into())
+                .spawn(move || {
+                    // Behind the daemon and the loop on a busy machine: what
+                    // it writes is known to the window already. On Linux a
+                    // thread has a niceness of its own.
+                    #[cfg(target_os = "linux")]
+                    // SAFETY: setpriority changes only this thread's niceness.
+                    unsafe {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    }
+                    // Written once the notes stop coming for a moment, all
+                    // together: while /status fills, the disk is left to the
+                    // daemon, and the folder is made and its time read once.
+                    while let Ok(job) = take.recv() {
+                        let mut jobs = vec![job];
+                        while let Ok(job) = take.recv_timeout(std::time::Duration::from_secs(1)) {
+                            jobs.push(job);
+                        }
+                        let _ = write_all(&jobs);
+                    }
+                });
+            std::sync::Mutex::new(spawned.ok().map(|_| send))
+        });
+    let dir = folder(store);
+    known(&dir, bot, id, title.trim());
+    let job = (dir, bot.to_owned(), id, title.to_owned());
+    let writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let unsent = match writer.as_ref() {
+        Some(send) => send.send(job).err().map(|unsent| unsent.0),
+        None => Some(job),
+    };
+    drop(writer);
+    // No thread to write it: written here.
+    if let Some((dir, bot, id, title)) = unsent {
+        let _ = write(&dir, &bot, id, &title);
+    }
+}
+
+fn write(dir: &Path, bot: &str, id: i64, title: &str) -> std::io::Result<()> {
+    write_all(&[(dir.to_owned(), bot.to_owned(), id, title.to_owned())])
+}
+
+/// Write each title noted, each folder made and its time read once for
+/// the run of notes in it (a window's are all in its store's).
+fn write_all(jobs: &[(PathBuf, String, i64, String)]) -> std::io::Result<()> {
+    let mut done = Ok(());
+    for run in jobs.chunk_by(|a, b| a.0 == b.0) {
+        let dir = &run[0].0;
+        let made = !dir.is_dir();
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            done = Err(error);
+            continue;
+        }
+        let before = changed_at(dir);
+        for (dir, bot, id, title) in run {
+            match std::fs::write(dir.join(bot), format!("{id}\n{}\n", title.trim())) {
+                Ok(()) => known(dir, bot, *id, title.trim()),
+                Err(error) => done = Err(error),
+            }
+        }
+        let after = changed_at(dir);
+        // Its own notes leave the names as read, in a folder they made
+        // too: only another's reads them again.
+        let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(names) = names.get_mut(dir).filter(|names| match names.at {
+            Some(_) => names.at == before,
+            None => made,
+        }) {
+            names.at = after;
+        }
+    }
+    done
 }
 
 /// The titles noted beside a store, for a listing of many agents: the
-/// folder read once, and each title read once for each agent, by its
-/// id, since a title is set when its agent starts and never changes.
+/// folder read again only once it changed, and each title read once for
+/// each agent, by its id, since a title is set when its agent starts and
+/// never changes.
 pub struct Noted {
     dir: PathBuf,
-    names: std::collections::HashSet<std::ffi::OsString>,
 }
-
-/// Each title read, by its agent's name and id.
-static READ: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(String, i64), String>>,
-> = std::sync::LazyLock::new(Default::default);
 
 impl Noted {
     pub fn read(store: &Path) -> Self {
-        let dir = file(store, "-")
-            .parent()
-            .unwrap_or(Path::new("/"))
-            .to_owned();
-        let names = (std::fs::read_dir(&dir).into_iter().flatten())
-            .filter_map(|entry| Some(entry.ok()?.file_name()))
-            .collect();
-        Self { dir, names }
+        let dir = folder(store);
+        let at = changed_at(&dir);
+        let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        let names = names.entry(dir.clone()).or_default();
+        if at.is_none() || names.at != at {
+            names.names = (std::fs::read_dir(&dir).into_iter().flatten())
+                .filter_map(|entry| Some(entry.ok()?.file_name()))
+                .collect();
+            names.at = at;
+        }
+        Self { dir }
     }
 
     /// The title noted for `bot`, the agent of id `id`: none where it
     /// was noted for another agent of that name.
     pub fn of(&self, bot: &str, id: Option<i64>) -> Option<String> {
         let id = id?;
-        if !self.names.contains(std::ffi::OsStr::new(bot)) {
-            return None;
-        }
+        // One read or noted here, its file written yet or not.
+        let read = READ.lock().unwrap_or_else(|e| e.into_inner());
         let key = (bot.to_owned(), id);
-        let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(title) = read.get(&key) {
+        if let Some(title) = read.get(&self.dir).and_then(|read| read.get(&key)) {
             return Some(title.clone());
         }
-        let text = std::fs::read_to_string(self.dir.join(bot)).ok()?;
-        let (noted, title) = text.split_once('\n')?;
-        if noted.trim().parse::<i64>().ok()? != id {
+        drop(read);
+        let names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        if !(names.get(&self.dir))
+            .is_some_and(|names| names.names.contains(std::ffi::OsStr::new(bot)))
+        {
             return None;
         }
-        let title = Some(title.trim().to_owned()).filter(|title| !title.is_empty())?;
-        read.insert(key, title.clone());
-        Some(title)
+        drop(names);
+        noted_in(&self.dir, bot, id)
     }
 }
 
-/// A `start_task` title as given, or why it is not one: words on one line,
-/// [`MOST`] characters at most.
-pub fn checked(title: &str) -> Result<String, String> {
-    let title = title.trim();
-    if title.is_empty() {
-        return Err("a task starts with a title: a few words the person knows the work by".into());
-    }
-    if title.contains(['\n', '\r']) {
-        return Err("a title is one line".into());
-    }
-    let count = title.chars().count();
-    if count > MOST {
-        return Err(format!(
-            "a title takes {MOST} characters at most, and this one has {count}"
-        ));
-    }
-    Ok(title.to_owned())
-}
-
-/// The title of an agent the person starts with its first message,
-/// `message`: that message's first line with words on it.
-pub fn first_line(message: &str) -> String {
-    (message.lines())
+/// The title of an agent whose first message is `message`: that
+/// message's first line with words on it, cut at a word to [`MOST`].
+pub fn of_message(message: &str) -> String {
+    let line = (message.lines())
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .to_owned()
+        .unwrap_or("");
+    cut(line, MOST)
+}
+
+/// The title noted for `bot`, the agent of id `id`, read from its file.
+pub fn noted(store: &Path, bot: &str, id: i64) -> Option<String> {
+    noted_in(&folder(store), bot, id)
+}
+
+/// [`noted`] in the folder `dir`: each read once for the process.
+fn noted_in(dir: &Path, bot: &str, id: i64) -> Option<String> {
+    let key = (bot.to_owned(), id);
+    let read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(title) = read.get(dir).and_then(|read| read.get(&key)) {
+        return Some(title.clone());
+    }
+    drop(read);
+    let text = std::fs::read_to_string(dir.join(bot)).ok()?;
+    let (noted, title) = text.split_once('\n')?;
+    let title = (noted.trim().parse::<i64>().ok()? == id)
+        .then(|| title.trim().to_owned())
+        .filter(|title| !title.is_empty())?;
+    known(dir, bot, id, &title);
+    Some(title)
+}
+
+/// The agents, by name and id, whose first line was asked for, each
+/// with whether its read ended: each is read once, whichever of a
+/// window's reads gets to it first, and the others wait for that one.
+static ASKED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, i64), bool>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Woken as each read of a first line ends.
+static READ_ENDED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Whether `bot`'s first line was asked for already.
+pub fn asked(bot: &str, id: i64) -> bool {
+    let asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    asked.contains_key(&(bot.to_owned(), id))
+}
+
+/// Take `bot`'s first line to read: true for the read that takes it,
+/// false once another read of it ended, which this one waits for.
+pub async fn ask(bot: &str, id: i64) -> bool {
+    let key = (bot.to_owned(), id);
+    loop {
+        let ended = READ_ENDED.notified();
+        tokio::pin!(ended);
+        ended.as_mut().enable();
+        {
+            let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+            match asked.get(&key) {
+                None => {
+                    asked.insert(key, false);
+                    return true;
+                }
+                Some(true) => return false,
+                Some(false) => {}
+            }
+        }
+        ended.await;
+    }
+}
+
+/// `bot`'s first line was read, and noted where it has words; or, where
+/// the read failed, the next read asks again.
+pub fn answered(bot: &str, id: i64, read: bool) {
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    match read {
+        true => asked.insert((bot.to_owned(), id), true),
+        false => asked.remove(&(bot.to_owned(), id)),
+    };
+    drop(asked);
+    READ_ENDED.notify_waiters();
 }
 
 /// The title a project's file gives it (`project::read`'s `title`).
@@ -159,11 +331,20 @@ impl Titles {
     }
 }
 
+/// The columns `title` takes: a byte each when every byte is a printable
+/// ASCII character, as nearly every title is, without decoding it.
+pub fn width(title: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    match title.bytes().all(|byte| (0x20..0x7f).contains(&byte)) {
+        true => title.len(),
+        false => title.width(),
+    }
+}
+
 /// `title` cut to `room` columns at a word, with `…`; where no word fits,
 /// cut where the room ends; with room for no more than the `…`, none.
 pub fn cut(title: &str, room: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    if title.width() <= room {
+    if width(title) <= room {
         return title.to_owned();
     }
     if room < 2 {
@@ -175,7 +356,7 @@ pub fn cut(title: &str, room: usize) -> String {
             true => word.to_owned(),
             false => format!("{kept} {word}"),
         };
-        if next.width() + 1 > room {
+        if width(&next) + 1 > room {
             break;
         }
         kept = next;
@@ -191,18 +372,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_title_is_words_on_one_line_of_sixty_characters_at_most() {
+    fn a_listing_sees_its_own_notes_and_another_window_s() {
+        let dir = std::env::temp_dir().join(format!("sonny-titles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        note(&store, "calc.fix", 2, "Fix the sums").unwrap();
         assert_eq!(
-            checked("  Round half cents to even ").as_deref(),
-            Ok("Round half cents to even")
+            Noted::read(&store).of("calc.fix", Some(2)).as_deref(),
+            Some("Fix the sums")
         );
-        assert!(checked("   ").is_err());
-        assert!(checked("Round half cents\nto even").is_err());
-        let sixty = "a".repeat(MOST);
-        assert_eq!(checked(&sixty), Ok(sixty.clone()));
-        assert!(checked(&format!("{sixty}b")).unwrap_err().contains("61"));
-        // Characters, not bytes.
-        assert!(checked(&"é".repeat(MOST)).is_ok());
+        // Another agent of that name takes none of it.
+        assert_eq!(Noted::read(&store).of("calc.fix", Some(9)), None);
+        // Another window's note, written straight to the folder.
+        std::fs::write(folder(&store).join("calc.docs"), "3\nDocument the sums\n").unwrap();
+        assert_eq!(
+            Noted::read(&store).of("calc.docs", Some(3)).as_deref(),
+            Some("Document the sums")
+        );
+        assert_eq!(
+            noted(&store, "calc.docs", 3).as_deref(),
+            Some("Document the sums")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_line_noted_shows_before_its_file_is_written() {
+        let dir = std::env::temp_dir().join(format!("sonny-later-{}", std::process::id()));
+        let store = dir.join("state.sqlite");
+        note_later(&store, "calc.sum", 4, "Sum the column");
+        // No folder yet: the listing reads none, and shows it all the same.
+        assert_eq!(
+            Noted::read(&store).of("calc.sum", Some(4)).as_deref(),
+            Some("Sum the column")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_title_s_width_is_its_columns() {
+        assert_eq!(width("Sum the column"), 14);
+        // Wide characters take two columns, and anything else what
+        // unicode-width counts.
+        assert_eq!(width("Sum 合計"), 8);
+        let tab = "Sum\tit";
+        assert_eq!(width(tab), unicode_width::UnicodeWidthStr::width(tab));
     }
 
     #[test]
@@ -219,12 +433,19 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_started_by_the_person_takes_its_first_line() {
+    fn an_agent_takes_its_first_message_s_first_line_cut_at_a_word() {
         assert_eq!(
-            first_line("\n  Tally the invoices  \nby month"),
+            of_message("\n  Tally the invoices  \nby month"),
             "Tally the invoices"
         );
-        assert_eq!(first_line(""), "");
+        assert_eq!(of_message(""), "");
+        let long = "Round every half cent to the nearest even cent in the ledger and the invoices";
+        let title = of_message(long);
+        assert_eq!(
+            title,
+            "Round every half cent to the nearest even cent in the…"
+        );
+        assert!(title.chars().count() <= MOST);
     }
 
     #[test]
