@@ -2329,7 +2329,19 @@ and the copy is checked (it opens, passes `PRAGMA integrity_check`, and is at
 that version); the two newest copies are kept. A store that cannot be copied,
 for a full disk say, is not migrated: opening fails with
 `store_backup_failed`, which says why, and the store stays as it was. To go
-back a release, stop the daemon and put the copy in the store's place. Schema 18 requires each bot's tool selection. Older stores with bots
+back a release, stop the daemon and put the copy in the store's place, or
+keep what changed since with `agent migrate --schema N`: with no daemon
+owning the store (`store_already_owned` otherwise), it copies the store the
+same way and takes it back to schema N with each step's way back, newest
+first, in one transaction. Every step from 106 (0.10.1) on has one
+(`store_schema_unsupported` below it); `agent migrate` with no `--schema`
+brings a store forward as a start does. Schema 109 names a declared tool's
+`lift` `yields` (#1203) in every list the store keeps, in place, so the list
+moves to the digest of its new bytes and the bots, creation records and kept
+`configure`s that name it follow; its way back names it `lift` again. 108's
+way back removes the `namespace`, `speeds` and `context_windows` settings,
+which older releases refuse, and 107's puts each bot's instructions back in
+its row. Schema 18 requires each bot's tool selection. Older stores with bots
 but no recorded selection are refused with `store_migration_tools_unknown`;
 their data and schema version remain intact. Keep those stores and use a new
 store path. Empty stores can migrate. Schema 19 rebuilds cache counters from

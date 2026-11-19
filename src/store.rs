@@ -36,6 +36,58 @@ type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 /// and `-shm` it makes beside the main file that file's mode, so one mode
 /// set here covers all three. A store or sidecar an earlier daemon left
 /// looser is tightened; they hold every conversation in the clear.
+/// The file whose lock says which process owns the store at `path`.
+fn owner_lock(path: &Path) -> Result<File> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".owner-lock");
+    // Append rather than replace the suffix, so distinct files sharing a
+    // stem still have distinct ownership locks.
+    Ok(OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(lock_path)?)
+}
+
+/// `agent migrate`: bring the store at `path` to schema `to`, the
+/// binary's own when `None`, while no daemon owns it. Forward is what a
+/// daemon's start does; back takes each step's way back, for an older
+/// release. Gives the schema it was at and the one it is at.
+pub fn migrate(path: &Path, to: Option<i32>) -> Result<(i32, i32)> {
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| Error::with("store_missing", format!("{}: {error}", path.display())))?;
+    let lock = owner_lock(&path)?;
+    if lock.try_lock().is_err() {
+        return crate::fail("store_already_owned");
+    }
+    let conn = Connection::open(&path)?;
+    let from: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    match to {
+        Some(to) if to < from || (to == from && to < Database::SCHEMA) => {
+            Database::migrate_down(&conn, to)?;
+            Ok((from, to))
+        }
+        None => {
+            Database::initialize(conn)?;
+            Ok((from, Database::SCHEMA))
+        }
+        Some(to) if to == Database::SCHEMA => {
+            Database::initialize(conn)?;
+            Ok((from, to))
+        }
+        Some(to) => Err(Error::with(
+            "store_schema_unsupported",
+            format!(
+                "store schema {from} goes forward to {} or back to {} through {from}, not {to}",
+                Database::SCHEMA,
+                Database::SCHEMA_DOWN_TO
+            ),
+        )),
+    }
+}
+
 fn owner_only(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     match OpenOptions::new()
@@ -764,17 +816,7 @@ impl Store {
                         }
                         Err(error) => return Err(error.into()),
                     };
-                    let mut lock_path = path.as_os_str().to_os_string();
-                    lock_path.push(".owner-lock");
-                    // Append rather than replace the suffix, so distinct files
-                    // sharing a stem still have distinct ownership locks.
-                    let lock = OpenOptions::new()
-                        .create(true)
-                        .truncate(false)
-                        .read(true)
-                        .write(true)
-                        .mode(0o600)
-                        .open(lock_path)?;
+                    let lock = owner_lock(&path)?;
                     match lock.try_lock() {
                         Ok(()) => {}
                         Err(_) if wait.is_none() => return crate::fail("store_already_owned"),

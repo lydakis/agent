@@ -461,6 +461,16 @@ An errored first result or a timeout with no resolved result exits 1.
 `--timeout 0` polls once and prints the same JSON result with unresolved
 handles marked pending. Completed successful handles can still return exit 0.
 
+## Migrate
+
+`agent migrate [--store PATH] [--schema N]` changes the schema of a store no
+daemon owns (`store_already_owned` while one does). With no `--schema` it
+brings the store forward to this release's schema, as the daemon's start
+does; with an older N it takes it back to schema N for an older release, each
+step undone newest first, down to 106 (0.10.1). Either way the store is first
+copied to `<store>.schema-<version>.backup`. It prints
+`{"store","from","schema"}`.
+
 ## Connection and startup
 
 Every client command accepts `--store` and `--socket`. Client store selection is explicit

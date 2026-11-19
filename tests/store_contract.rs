@@ -23528,6 +23528,224 @@ fn schema_108_keeps_each_bots_first_dot_group_as_its_namespace() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A declared tool that yields, as Sonny's exec, browser and desktop do.
+fn yielding_tool(name: &str) -> Declared {
+    serde_json::from_value(json!({"name": name, "description": "A tool.",
+        "parameters": {"type": "object"}, "answered_by": "sonny", "yields": true,
+        "kind": "browser"}))
+    .unwrap()
+}
+
+/// Schema 109: a declared tool's `lift` is `yields`. A store whose lists
+/// still say `lift`, as every store 0.10.1 wrote with a tool that took it
+/// does, has each list renamed in place and moved to the digest of its new
+/// bytes, the very list a client declaring it now sends; the bots holding
+/// it, a keyed creation's record and a kept `configure` follow.
+#[test]
+fn schema_109_names_a_lifted_tool_yields() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema109-yields-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let tools = vec![yielding_tool("exec"), tool_named("react")];
+    let list = ToolList::new(tools.clone()).unwrap();
+    let quiet = ToolList::new(vec![tool_named("margin")]).unwrap();
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        for (name, declared) in [("lead", &list), ("lead.task", &list), ("quiet", &quiet)] {
+            db.create(
+                name,
+                Some("/synthetic"),
+                Binding {
+                    declared: Some(declared),
+                    request_id: Some("once"),
+                    starts_line: false,
+                    ..binding()
+                },
+            )
+            .unwrap();
+        }
+    }
+    // As 0.10.1 wrote them: the same bytes with `lift` where `yields` is.
+    let new_json = list.json().unwrap().to_owned();
+    let old_json = new_json.replace("\"yields\":true", "\"lift\":true");
+    assert_ne!(old_json, new_json);
+    let old_digest = agent_runtime::tools::digest_of(&old_json).to_string();
+    let kept = json!({"declare": serde_json::from_str::<Value>(&old_json).unwrap(),
+        "model": "synthetic-model"});
+    let old = Connection::open(&path).unwrap();
+    old.execute(
+        "UPDATE tool_lists SET digest=?1,tools=?2 WHERE digest=?3",
+        [&old_digest, &old_json, list.digest().unwrap()],
+    )
+    .unwrap();
+    old.execute(
+        "UPDATE bots SET declared=?1,creation=json_set(creation,'$.request.declare',?1)
+         WHERE declared=?2",
+        [&old_digest, list.digest().unwrap()],
+    )
+    .unwrap();
+    old.execute(
+        "UPDATE bots SET configure_pending=? WHERE name='lead.task'",
+        [kept.to_string()],
+    )
+    .unwrap();
+    old.execute_batch("PRAGMA user_version=108;").unwrap();
+    drop(old);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    for name in ["lead", "lead.task"] {
+        let bot = db.inspect(name).unwrap();
+        assert_eq!(**bot.declared, tools, "{name}");
+        assert_eq!(bot.declared.digest(), list.digest(), "{name}");
+    }
+    assert_eq!(
+        db.inspect("quiet").unwrap().declared.digest(),
+        quiet.digest()
+    );
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM tool_lists"), 2);
+    let renamed: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT tools FROM tool_lists WHERE digest=?",
+            [list.digest().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(renamed, new_json);
+    let pending = db
+        .kept_configure(db.inspect("lead.task").unwrap().bot_id)
+        .unwrap();
+    let declare: Vec<Declared> =
+        serde_json::from_value(pending.unwrap()["declare"].clone()).unwrap();
+    assert_eq!(declare, tools);
+    // A resend of the creation, with the list as a client declares it now,
+    // is the same request.
+    let (again, event) = db
+        .create(
+            "lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&list),
+                request_id: Some("once"),
+                starts_line: false,
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!((again.name.as_str(), event), ("lead", None));
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite.schema-108.backup"));
+}
+
+/// Each step from 0.10.1's schema has a way back: `agent migrate --schema
+/// 106` leaves a store 0.10.1 reads (instructions in each bot's row, no
+/// setting it does not know, `lift`), and a start of this release brings
+/// it forward again to the same bots, byte for byte where it keeps bytes.
+#[test]
+fn a_store_goes_back_to_0_10_1_and_forward_again() {
+    let dir = std::env::temp_dir().join(format!("agent-schema-down-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.sqlite");
+    let tools = vec![yielding_tool("exec"), tool_named("react")];
+    let list = ToolList::new(tools.clone()).unwrap();
+    let settings: Settings = serde_json::from_value(json!({"namespace": "shop",
+        "speeds": {"openai/synthetic-model": ["fast"]}, "context_windows": {"openai/*": 64000}}))
+    .unwrap();
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut lead = Binding {
+            declared: Some(&list),
+            settings: settings.clone(),
+            ..binding()
+        };
+        lead.compaction_instructions = Some("keep decisions");
+        db.create("shop.lead", Some("/synthetic"), lead).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    }
+    let before = |db: &Database, name: &str| {
+        let bot = db.inspect(name).unwrap();
+        (
+            bot.instructions,
+            bot.compaction_instructions,
+            bot.declared.json().map(str::to_owned),
+            bot.declared.digest().map(str::to_owned),
+        )
+    };
+    let (lead, bob) = {
+        let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        (before(&db, "shop.lead"), before(&db, "Bob"))
+    };
+    // Below the oldest step with a way back, or past this release: refused.
+    for to in [Database::SCHEMA_DOWN_TO - 1, Database::SCHEMA + 1] {
+        let refused = agent_runtime::store::migrate(&path, Some(to)).unwrap_err();
+        assert_eq!(refused.code, "store_schema_unsupported", "{to}");
+    }
+    assert_eq!(
+        agent_runtime::store::migrate(&path, Some(106)).unwrap(),
+        (Database::SCHEMA, 106)
+    );
+    assert_eq!(count(&path, "PRAGMA user_version"), 106);
+    assert!(
+        dir.join(format!("state.sqlite.schema-{}.backup", Database::SCHEMA))
+            .is_file()
+    );
+    // 0.10.1's shape: what it reads, and nothing it refuses.
+    let conn = Connection::open(&path).unwrap();
+    let (instructions, compaction, settings_left, declared): (String, String, String, String) =
+        conn.query_row(
+            "SELECT instructions,compaction_instructions,COALESCE(settings,'{}'),
+                (SELECT tools FROM tool_lists WHERE digest=bots.declared)
+             FROM bots WHERE name='shop.lead'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (instructions.as_str(), compaction.as_str()),
+        ("test", "keep decisions")
+    );
+    let settings_left: Value = serde_json::from_str(&settings_left).unwrap();
+    for gone in ["namespace", "speeds", "context_windows"] {
+        assert!(settings_left.get(gone).is_none(), "{settings_left}");
+    }
+    assert_eq!(
+        declared,
+        list.json()
+            .unwrap()
+            .replace("\"yields\":true", "\"lift\":true")
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='bot_instructions'"
+        ),
+        0
+    );
+    drop(conn);
+    // Back to this release, as a start brings it.
+    assert_eq!(
+        agent_runtime::store::migrate(&path, None).unwrap(),
+        (106, Database::SCHEMA)
+    );
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(before(&db, "shop.lead"), lead);
+    assert_eq!(before(&db, "Bob"), bob);
+    // The namespace comes back from the name, as 108 gives it.
+    assert_eq!(
+        db.inspect("shop.lead")
+            .unwrap()
+            .settings
+            .namespace
+            .as_deref(),
+        Some("shop")
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A page of one bot's messages, as `messages` read them before it took a
 /// selector.
 fn messages_page(

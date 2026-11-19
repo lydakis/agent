@@ -3693,7 +3693,10 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 108;
+    pub const SCHEMA: i32 = 109;
+    /// The oldest schema [`Database::migrate_down`] takes a store back to:
+    /// each step from it on has a way back.
+    pub const SCHEMA_DOWN_TO: i32 = 106;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -20543,7 +20546,221 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
 
+    // Schema 109: a declared tool's `lift` is `yields` (#1203), in every
+    // list the store keeps and every `configure` kept for a turn's end.
+    if from < 109 {
+        rename_declared(conn, "lift", "yields")?;
+    }
+
     Ok(())
+}
+
+impl Database {
+    /// Take the store `conn` opens back from its schema to `to`, for a
+    /// release that knows only `to`: each step's way back, newest first,
+    /// in one transaction, after the store is copied as an upgrade copies
+    /// it. Gives the schema it was at. The store must not be open
+    /// elsewhere; [`crate::store::migrate`] holds its owner lock.
+    pub fn migrate_down(conn: &Connection, to: i32) -> Result<i32> {
+        let from: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if from > Self::SCHEMA {
+            return fail_with(
+                "store_schema_newer",
+                format!("store schema {from}, binary supports {}", Self::SCHEMA),
+            );
+        }
+        if to < Self::SCHEMA_DOWN_TO || to > from {
+            return fail_with(
+                "store_schema_unsupported",
+                format!(
+                    "store schema {from} goes back to {} through {from}, not {to}",
+                    Self::SCHEMA_DOWN_TO
+                ),
+            );
+        }
+        if to == from {
+            return Ok(from);
+        }
+        back_up(conn, from)?;
+        // Dropping a table others point at, as SQLite's rebuild steps ask:
+        // checked below before the commit.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let tx = conn.unchecked_transaction()?;
+        migrate_back(&tx, from, to)?;
+        let broken: Option<String> = tx
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(table) = broken {
+            return fail_with(
+                "store_migration_invalid",
+                format!("foreign keys in {table}"),
+            );
+        }
+        tx.pragma_update(None, "user_version", to)?;
+        tx.commit()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Ok(from)
+    }
+}
+
+/// Each step's way back, from schema `from` to `to`, newest first: the
+/// store as a release at `to` wrote it, so that release opens it.
+fn migrate_back(conn: &Connection, from: i32, to: i32) -> Result<()> {
+    // 109 -> 108: `yields` is `lift` again.
+    if from >= 109 && to < 109 {
+        rename_declared(conn, "yields", "lift")?;
+    }
+    // 108 -> 107: no `namespace` setting; a bot's group is its name up to
+    // its first dot again. The speed and context window tables bots took
+    // as settings with it (#1208) go too: older releases take them as
+    // daemon flags, and refuse settings they do not know.
+    if from >= 108 && to < 108 {
+        conn.execute_batch(
+            "UPDATE bots SET settings=json_remove(settings,'$.namespace','$.speeds','$.context_windows')
+             WHERE json_type(settings,'$.namespace') IS NOT NULL
+                OR json_type(settings,'$.speeds') IS NOT NULL
+                OR json_type(settings,'$.context_windows') IS NOT NULL;
+             UPDATE bots SET configure_pending=json_remove(configure_pending,
+                     '$.settings.namespace','$.settings.speeds','$.settings.context_windows')
+             WHERE json_type(configure_pending,'$.settings') IS NOT NULL;",
+        )?;
+    }
+    // 107 -> 106: each bot's instructions back in its row.
+    if from >= 107 && to < 107 {
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN instructions TEXT NOT NULL DEFAULT '';
+             ALTER TABLE bots ADD COLUMN compaction_instructions TEXT;
+             UPDATE bots SET (instructions,compaction_instructions)=
+                 (SELECT instructions,compaction_instructions FROM bot_instructions i
+                  WHERE i.id=bots.id);
+             DROP TABLE bot_instructions;",
+        )?;
+    }
+    Ok(())
+}
+
+/// 108 <-> 109: every declared tool's `old` field named `new`, in place.
+/// A list is kept once under the digest of its bytes, so a list that
+/// changes moves to its new digest, and the bots holding it, the records
+/// of creations that declared it and kept `configure`s naming it follow.
+/// A kept `configure` holding its tools whole has them renamed there.
+fn rename_declared(conn: &Connection, old: &str, new: &str) -> Result<()> {
+    let invalid = |_| Error::new("store_migration_invalid_declared");
+    let lists: Vec<(String, String)> = conn
+        .prepare("SELECT digest,tools FROM tool_lists")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (digest, json) in lists {
+        let Some(json) = renamed_fields(&json, old, new).map_err(invalid)? else {
+            continue;
+        };
+        let moved = crate::tools::digest_of(&json);
+        conn.execute(
+            "INSERT OR IGNORE INTO tool_lists(digest,tools) VALUES (?,?)",
+            params![&*moved, json],
+        )?;
+        conn.execute(
+            "UPDATE bots SET declared=?1 WHERE declared=?2",
+            params![&*moved, digest],
+        )?;
+        conn.execute(
+            "UPDATE bots SET creation=json_set(creation,'$.request.declare',?1)
+             WHERE json_type(creation,'$.request.declare')='text'
+               AND json_extract(creation,'$.request.declare')=?2",
+            params![&*moved, digest],
+        )?;
+        conn.execute(
+            "UPDATE bots SET configure_pending=json_set(configure_pending,'$.declare',?1)
+             WHERE json_type(configure_pending,'$.declare')='text'
+               AND json_extract(configure_pending,'$.declare')=?2",
+            params![&*moved, digest],
+        )?;
+        conn.execute("DELETE FROM tool_lists WHERE digest=?", [digest])?;
+    }
+    let kept: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT id,configure_pending FROM bots
+             WHERE json_type(configure_pending,'$.declare')='array'",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, pending) in kept {
+        let mut pending: Value = serde_json::from_str(&pending).map_err(invalid)?;
+        let mut changed = false;
+        for tool in pending["declare"].as_array_mut().into_iter().flatten() {
+            if let Some(tool) = tool.as_object_mut()
+                && let Some(value) = tool.remove(old)
+            {
+                tool.insert(new.to_owned(), value);
+                changed = true;
+            }
+        }
+        if changed {
+            conn.execute(
+                "UPDATE bots SET configure_pending=? WHERE id=?",
+                params![serde_json::to_string(&pending)?, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The JSON array of objects `json` with each object's `old` field named
+/// `new` where it stands, every other byte as it was: the bytes a release
+/// that names the field `new` writes for the same tools. `None` when no
+/// object has the field.
+fn renamed_fields(json: &str, old: &str, new: &str) -> serde_json::Result<Option<String>> {
+    struct Fields<'a>(Vec<(String, &'a RawValue)>);
+    impl<'de: 'a, 'a> serde::Deserialize<'de> for Fields<'a> {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct Visit;
+            impl<'de> serde::de::Visitor<'de> for Visit {
+                type Value = Fields<'de>;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a declared tool")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> std::result::Result<Fields<'de>, A::Error> {
+                    let mut fields = Vec::new();
+                    while let Some(field) = map.next_entry()? {
+                        fields.push(field);
+                    }
+                    Ok(Fields(fields))
+                }
+            }
+            d.deserialize_map(Visit)
+        }
+    }
+    let tools: Vec<Fields> = serde_json::from_str(json)?;
+    if !(tools.iter()).any(|tool| tool.0.iter().any(|(name, _)| name == old)) {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(json.len() + 8);
+    out.push('[');
+    for (i, tool) in tools.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        for (j, (name, value)) in tool.0.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            let name = if name == old { new } else { name };
+            out.push_str(&serde_json::to_string(name)?);
+            out.push(':');
+            out.push_str(value.get());
+        }
+        out.push('}');
+    }
+    out.push(']');
+    Ok(Some(out))
 }
 /// 103 -> 104: a turn parked on a call's verdict says who holds the call
 /// and since when. No session serves a tag while the store opens, so a
