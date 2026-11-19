@@ -58,6 +58,7 @@ mod lookout;
 #[cfg(target_os = "macos")]
 mod mac;
 mod margin;
+mod markdown;
 mod math;
 mod mcp;
 mod mcp_import;
@@ -12292,21 +12293,10 @@ impl App {
                 )),
             }
         }
-        let mut markdown = open.markdown.clone();
-        if !open.partial.is_empty()
-            && let Some(line) = markdown.line(&open.partial)
-        {
-            let lead = match open.lines == 0 && !transcript::heading(&open.partial) {
-                true => "• ",
-                false => "  ",
-            };
-            rows.extend(transcript::wrap_lines(
-                line,
-                width,
-                Line::from(lead),
-                markdown.rest(),
-            ));
-        }
+        // The block still open, its line still coming read as it will once
+        // its marks close.
+        let prose = self.prose().min(width);
+        rows.extend(open.markdown.open(&open.partial, prose, open.lines == 0));
         match &self.bar {
             Some(bar) => self.bar_open(rows, bar.slot),
             None => rows,
@@ -25843,7 +25833,9 @@ mod tests {
             app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 3, "text": text}))
                 .await;
         }
-        let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
+        let open = app.live.as_ref().unwrap();
+        let shown = open.markdown.open(&open.partial, 100, open.lines == 0);
+        let live: Vec<String> = (open.rows.iter().chain(&shown))
             .map(|row| row.to_string())
             .collect();
         let replayed: Vec<String> = transcript::reply("    example()\n", 100, Path::new(""))
@@ -25911,7 +25903,9 @@ mod tests {
         for text in ["    ", "example()\n"] {
             app.daemon(said(text)).await;
         }
-        let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
+        let open = app.live.as_ref().unwrap();
+        let shown = open.markdown.open(&open.partial, 100, open.lines == 0);
+        let live: Vec<String> = (open.rows.iter().chain(&shown))
             .map(|row| row.to_string())
             .collect();
         let replayed: Vec<String> = transcript::reply("    example()\n", 100, Path::new(""))
@@ -28630,7 +28624,7 @@ mod tests {
         app.height = 8;
         app.daemon(turn_event("accepted", 1, json!({"request_id": "r1"})))
             .await;
-        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Here:\n"}))
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Here:\n\n"}))
             .await;
         // A row stands for a picture held back with the words; drawn, it
         // is twelve rows, more than half the screen.
