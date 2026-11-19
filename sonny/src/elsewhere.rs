@@ -1,6 +1,13 @@
 //! What needs the person in the other projects: the footer's
 //! `? 1 elsewhere`, and where `alt+n` goes once this project has no one.
 //!
+//! One follow for every window of a store: the first window to open takes
+//! a lock beside the store and follows; the others hear what it found on
+//! a socket beside the store, one line each time it changes, and each
+//! leaves out its own project. When that window closes, another takes the
+//! lock and follows on. So a hundred windows cost the daemon and the
+//! machine what one does.
+//!
 //! It reads what `/status` reads, the way the sky and `/switch` do, on a
 //! connection of its own: the calls held for the person ([`needs::listing`])
 //! and each idle agent's question as of its last turn, taken from what any
@@ -19,12 +26,14 @@
 //! nothing read again.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client::Client;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, watch};
 
 use crate::needs::{self, Seen};
@@ -54,11 +63,22 @@ pub const NARROW: [&str; 7] = [
     "turn_finished",
 ];
 
-/// Every project but the window's, followed while the window is open.
+/// Every project's agents that need the person, followed while the window
+/// is open: by this window, or heard from the one that follows.
 pub struct Elsewhere {
-    /// The agents of other projects that need the person.
-    pub waiting: watch::Receiver<Waiting>,
+    /// What needs the person in every project.
+    pub waiting: watch::Receiver<Shared>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// What the window that follows tells the others: every project's agents
+/// that need the person, in the order **Projects** lists their projects.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Shared {
+    /// Each project's place in **Projects**, by name.
+    pub order: HashMap<String, usize>,
+    /// Each agent with its project's place and its project.
+    pub agents: Vec<(usize, String, String)>,
 }
 
 /// The agents of other projects that need the person, in the order
@@ -71,6 +91,19 @@ pub struct Waiting {
     pub agents: Vec<(usize, String)>,
 }
 
+impl Shared {
+    /// What needs the person outside `project`.
+    pub fn outside(&self, project: &str) -> Waiting {
+        Waiting {
+            here: self.order.get(project).copied().unwrap_or(0),
+            agents: (self.agents.iter())
+                .filter(|(_, of, _)| of != project)
+                .map(|(place, _, bot)| (*place, bot.clone()))
+                .collect(),
+        }
+    }
+}
+
 impl Drop for Elsewhere {
     fn drop(&mut self) {
         self.task.abort();
@@ -78,12 +111,12 @@ impl Drop for Elsewhere {
 }
 
 impl Elsewhere {
-    /// Follows what needs the person outside `project`, waking the window
-    /// (`woken`) when it changes.
-    pub fn start(socket: PathBuf, store: PathBuf, project: String, woken: Arc<Notify>) -> Self {
-        let (tell, waiting) = watch::channel(Waiting::default());
+    /// Follows what needs the person in every project, or hears it from
+    /// the window that does, waking the window (`woken`) when it changes.
+    pub fn start(socket: PathBuf, store: PathBuf, woken: Arc<Notify>) -> Self {
+        let (tell, waiting) = watch::channel(Shared::default());
         let task = tokio::spawn(async move {
-            follow(socket, store, project, tell, woken).await;
+            share(&socket, &store, &tell, &woken).await;
         });
         Elsewhere { waiting, task }
     }
@@ -94,21 +127,126 @@ impl Elsewhere {
     }
 }
 
-/// Whether `bot` is an agent of a project other than `project`, of those
-/// in `projects` (each by name): not one of Sonny's own (a leading dot),
-/// nor a side chat, which `/status` leaves out too. A side chat is named
-/// as `/side` names one, but for the tasks in `named_as_sides`, listed
-/// with such a name though no side chat's record.
-pub fn other(
-    bot: &str,
-    project: &str,
-    projects: &HashMap<String, usize>,
-    named_as_sides: &HashSet<String>,
-) -> bool {
+/// The lock the window that follows holds, and the socket it tells the
+/// others on, beside `store`.
+fn beside(store: &Path) -> (PathBuf, PathBuf) {
+    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
+    let at = |end: &str| {
+        let mut path = store.as_os_str().to_owned();
+        path.push(end);
+        PathBuf::from(path)
+    };
+    (at(".elsewhere.lock"), at(".elsewhere.sock"))
+}
+
+/// Follow, where no window of the store does; else hear the one that does,
+/// and follow once it is gone. Ends when the daemon goes.
+async fn share(socket: &Path, store: &Path, tell: &watch::Sender<Shared>, woken: &Notify) {
+    let (lock, told) = beside(store);
+    let mut missed = 0;
+    loop {
+        if let Ok(Some(held)) = crate::scheduler::locked(&lock) {
+            lead(socket, store, &told, tell, woken).await;
+            drop(held);
+            return;
+        }
+        match UnixStream::connect(&told).await {
+            Ok(stream) => {
+                missed = 0;
+                hear(stream, tell, woken).await;
+            }
+            // The window that took the lock is still making its socket.
+            Err(_) => {
+                missed = (missed + 1).min(7);
+                tokio::time::sleep(Duration::from_millis(40 << missed)).await;
+            }
+        }
+    }
+}
+
+/// The socket the window that follows tells the others on, gone with it.
+struct Told(PathBuf);
+
+impl Drop for Told {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Follow every project, and tell each window that connects what needs
+/// the person, at once and each time it changes.
+async fn lead(
+    socket: &Path,
+    store: &Path,
+    told: &Path,
+    tell: &watch::Sender<Shared>,
+    woken: &Notify,
+) {
+    let _ = std::fs::remove_file(told);
+    let listener = UnixListener::bind(told).ok();
+    let _told = listener.as_ref().map(|_| Told(told.to_owned()));
+    let mut hearing = tokio::task::JoinSet::new();
+    let following = follow(socket, store, tell, woken);
+    tokio::pin!(following);
+    loop {
+        tokio::select! {
+            () = &mut following => return,
+            Ok((stream, _)) = async { listener.as_ref().unwrap().accept().await }, if listener.is_some() => {
+                hearing.spawn(tell_on(stream, tell.subscribe()));
+            }
+            Some(_) = hearing.join_next(), if !hearing.is_empty() => {}
+        }
+    }
+}
+
+/// What needs the person, to a window that connected: now, and again each
+/// time it changes, one line each.
+async fn tell_on(stream: UnixStream, mut shared: watch::Receiver<Shared>) {
+    let (mut read, mut write) = stream.into_split();
+    shared.mark_changed();
+    let mut gone = [0u8; 1];
+    loop {
+        let line = serde_json::to_string(&*shared.borrow_and_update()).unwrap_or_default();
+        if write
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        tokio::select! {
+            changed = shared.changed() => if changed.is_err() { return },
+            // The window closed.
+            _ = tokio::io::AsyncReadExt::read(&mut read, &mut gone) => return,
+        }
+    }
+}
+
+/// What the window that follows tells, until it goes.
+async fn hear(stream: UnixStream, tell: &watch::Sender<Shared>, woken: &Notify) {
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(mut shared) = serde_json::from_str::<Shared>(&line) else {
+            continue;
+        };
+        if tell.send_if_modified(|was| {
+            let moved = *was != shared;
+            *was = std::mem::take(&mut shared);
+            moved
+        }) {
+            woken.notify_one();
+        }
+    }
+}
+
+/// Whether `bot` is an agent of a project: not one of Sonny's own (a
+/// leading dot), nor a side chat, which `/status` leaves out too. A side
+/// chat is named as `/side` names one, but for the tasks in
+/// `named_as_sides`, listed with such a name though no side chat's record.
+pub fn other(bot: &str, named_as_sides: &HashSet<String>) -> bool {
     !bot.starts_with('.')
         && bot.contains('.')
         && (crate::side_source(bot).is_none() || named_as_sides.contains(bot))
-        && project_in(bot, projects) != project
 }
 
 /// The project `bot` is an agent of: the longest start of its name that
@@ -120,23 +258,17 @@ pub fn project_in<'a>(bot: &'a str, projects: &HashMap<String, usize>) -> &'a st
         .unwrap_or_else(|| bot.split_once('.').map_or(bot, |(of, _)| of))
 }
 
-async fn follow(
-    socket: PathBuf,
-    store: PathBuf,
-    project: String,
-    tell: watch::Sender<Waiting>,
-    woken: Arc<Notify>,
-) {
+/// Follow every project, telling what needs the person in `tell`.
+async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>, woken: &Notify) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64);
     // From now: where things stand comes from the reads below, and an
     // event that lands while they run is applied after them.
-    let Some((mut client, mut events)) = follow_wide(&socket, json!({"since_ms": now})).await
-    else {
+    let Some((mut client, mut events)) = follow_wide(socket, json!({"since_ms": now})).await else {
         return;
     };
-    let Some(seeded) = seed(&client, &store, &project).await else {
+    let Some(seeded) = seed(&client, store).await else {
         return;
     };
     let Seeded {
@@ -146,7 +278,7 @@ async fn follow(
         mut seen_of,
         running,
     } = seeded;
-    let theirs = |bot: &str| other(bot, &project, &order, &named_as_sides);
+    let theirs = |bot: &str| other(bot, &named_as_sides);
     // The agents followed narrowly, and whether each has waited since:
     // those that wait now, and those whose turn runs, to its end.
     let mut narrow: HashMap<String, bool> = HashMap::new();
@@ -166,7 +298,7 @@ async fn follow(
     // The agents a lead's turn marked done, by the lead: read again once
     // the turn ends, when the mark is beside the store.
     let mut marked: HashMap<String, Vec<String>> = HashMap::new();
-    tell_waiting(&needs, &project, &order, &tell, &woken);
+    tell_waiting(&needs, &order, tell, woken);
     loop {
         let Some(event) = events.recv().await else {
             return;
@@ -204,7 +336,7 @@ async fn follow(
             if let Some(seen) = needs::scan(&client, &due, turn).await
                 && needs.stirred(&due) == stirred
             {
-                let open = seen.clone().open(&store, &due, false);
+                let open = seen.clone().open(store, &due, false);
                 match open.is_some() {
                     true => seen_of.insert(due.clone(), seen),
                     false => seen_of.remove(&due),
@@ -217,7 +349,7 @@ async fn follow(
         if event["event"] == "turn_finished" {
             for done in marked.remove(&bot).unwrap_or_default() {
                 if let Some(seen) = seen_of.get(&done) {
-                    let open = seen.clone().open(&store, &done, false);
+                    let open = seen.clone().open(store, &done, false);
                     if open.is_none() {
                         seen_of.remove(&done);
                     }
@@ -227,7 +359,7 @@ async fn follow(
             }
         }
         if changed || read {
-            tell_waiting(&needs, &project, &order, &tell, &woken);
+            tell_waiting(&needs, &order, tell, woken);
         }
         if let Some(waited) = narrow.get_mut(&bot) {
             *waited |= needs.waits(&bot) || event["event"] == "turn_finished";
@@ -238,7 +370,7 @@ async fn follow(
         // on from this event, with nothing read again.
         if done_with(&narrow, &needs, &marked) {
             drop((client, events));
-            let Some(again) = follow_wide(&socket, json!({"after": cursor})).await else {
+            let Some(again) = follow_wide(socket, json!({"after": cursor})).await else {
                 return;
             };
             (client, events) = again;
@@ -293,7 +425,7 @@ struct Seeded {
 /// The calls held for the person, and each idle agent's question as of
 /// its last turn, as `/status` reads it: what a window kept, else read
 /// now. The listing of every agent goes once this is read.
-async fn seed(client: &Client, store: &std::path::Path, project: &str) -> Option<Seeded> {
+async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     let mut needs = needs::Needs::default();
     let held = needs::listing(client, None).await.ok()?;
     let (listed, _) = standing::list(client, "*.*").await.ok()?;
@@ -305,7 +437,7 @@ async fn seed(client: &Client, store: &std::path::Path, project: &str) -> Option
         })
         .map(|bot| bot.name.clone())
         .collect();
-    let theirs = |bot: &str| other(bot, project, &order, &named_as_sides);
+    let theirs = |bot: &str| other(bot, &named_as_sides);
     needs.held(held, theirs);
     let mut seen_of: HashMap<String, Seen> = HashMap::new();
     let mut running = Vec::new();
@@ -420,33 +552,31 @@ fn in_order(store: &std::path::Path, listed: &[standing::Agent]) -> HashMap<Stri
     order
 }
 
-/// The agents of other projects waiting on the person, in the order
+/// Every project's agents waiting on the person, in the order
 /// **Projects** lists their projects (one made since, after), told to the
-/// window when they changed.
+/// windows when they changed.
 fn tell_waiting(
     needs: &needs::Needs,
-    project: &str,
     order: &HashMap<String, usize>,
-    tell: &watch::Sender<Waiting>,
+    tell: &watch::Sender<Shared>,
     woken: &Notify,
 ) {
-    let place = |bot: &str| (order.get(project_in(bot, order)).copied()).unwrap_or(usize::MAX);
-    // Only the other projects' agents are followed, so every one waiting.
-    let mut agents: Vec<(usize, String)> = (needs.waiting())
-        .map(|bot| (place(bot), bot.to_owned()))
+    let mut agents: Vec<(usize, String, String)> = (needs.waiting())
+        .map(|bot| {
+            let project = project_in(bot, order);
+            let place = order.get(project).copied().unwrap_or(usize::MAX);
+            (place, project.to_owned(), bot.to_owned())
+        })
         .collect();
     agents.sort();
-    let mut waiting = Waiting {
-        here: order.get(project).copied().unwrap_or(0),
-        agents,
-    };
-    if tell.send_if_modified(|was| {
-        let moved = *was != waiting;
-        *was = std::mem::take(&mut waiting);
-        moved
-    }) {
-        woken.notify_one();
+    if tell.borrow().agents == agents && tell.borrow().order == *order {
+        return;
     }
+    tell.send_replace(Shared {
+        order: order.clone(),
+        agents,
+    });
+    woken.notify_one();
 }
 
 /// Every agent that needs the person, in the order `alt+n` goes round
@@ -484,20 +614,50 @@ mod tests {
                 .map(|(name, at)| (name.to_owned(), at))
                 .into();
         let sides: HashSet<String> = ["site.side-feed".to_owned()].into();
-        let other = |bot, project| other(bot, project, &projects, &sides);
-        assert!(other("site.lead", "tally"));
-        assert!(other("books.fix", "tally"));
-        assert!(!other("tally.readme", "tally"));
-        assert!(!other(".sky.lead", "tally"));
+        // Every window's: what its own project holds is left out below.
+        let other = |bot| other(bot, &sides);
+        assert!(other("site.lead"));
+        assert!(other("books.fix"));
+        assert!(!other(".sky.lead"));
         // A side chat is left out, as `/status` leaves it.
-        assert!(!other("site.lead.side-1a2b", "tally"));
+        assert!(!other("site.lead.side-1a2b"));
         // A task named like one, which its record says it is not.
-        assert!(other("site.side-feed", "tally"));
+        assert!(other("site.side-feed"));
         // A project named with a dot is its own, not the one it starts with.
-        assert!(other("shop.web.lead", "shop"));
-        assert!(other("shop.web.page", "shop"));
-        assert!(!other("shop.webby", "shop"));
-        assert!(other("shop.fix", "shop.web"));
+        let waiting = [
+            "tally.readme",
+            "shop.web.lead",
+            "shop.web.page",
+            "shop.webby",
+            "shop.fix",
+        ];
+        let shared = Shared {
+            order: projects.clone(),
+            agents: (waiting.iter())
+                .map(|bot| {
+                    let project = project_in(bot, &projects);
+                    (projects[project], project.to_owned(), (*bot).to_owned())
+                })
+                .collect(),
+        };
+        let outside = |project: &str| -> Vec<String> {
+            (shared.outside(project).agents.into_iter())
+                .map(|(_, bot)| bot)
+                .collect()
+        };
+        assert_eq!(
+            outside("shop"),
+            ["tally.readme", "shop.web.lead", "shop.web.page"]
+        );
+        assert_eq!(
+            outside("tally"),
+            ["shop.web.lead", "shop.web.page", "shop.webby", "shop.fix"]
+        );
+        assert_eq!(
+            outside("shop.web"),
+            ["tally.readme", "shop.webby", "shop.fix"]
+        );
+        assert_eq!(shared.outside("shop.web").here, 3);
         assert_eq!(project_in("shop.web.page", &projects), "shop.web");
         assert_eq!(project_in("new.lead", &projects), "new");
     }
@@ -524,7 +684,9 @@ mod tests {
     /// daemon's event comes, with no read on a timer; one in the window's
     /// own project is not. Every agent is followed for the few events of
     /// a turn; the held one's calls only from its approval on, and once it
-    /// no longer waits, the connection is made again.
+    /// no longer waits, the connection is made again. One window of the
+    /// store follows, the others hear it, and one of them follows on once
+    /// it closes.
     #[tokio::test]
     async fn an_approval_in_another_project_is_told_as_its_event_comes() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -577,11 +739,16 @@ mod tests {
             }
         });
         let woken = Arc::new(Notify::new());
-        let open = Elsewhere::start(socket, dir.join("state.sqlite"), "tally".into(), woken);
+        let store = dir.join("state.sqlite");
+        let open = Elsewhere::start(socket.clone(), store.clone(), woken.clone());
         let mut waiting = open.waiting.clone();
         let held = |bot: &str, call: &str, cursor: i64| {
             json!({"cursor": cursor, "bot": bot, "turn": 1, "event": "approval_requested",
                 "data": {"calls": [{"call_id": call, "gates": ["manual"], "name": "shell"}]}})
+        };
+        let started = |bot: &str, call: &str, cursor: i64| {
+            json!({"cursor": cursor, "bot": bot, "turn": 1, "event": "tool_started",
+                "data": {"call_id": call, "name": "shell"}})
         };
         let wait = std::time::Duration::from_secs(5);
         let op = |request: &Value| request["op"].as_str().unwrap_or("").to_owned();
@@ -594,31 +761,38 @@ mod tests {
         );
         assert_eq!(first["kinds"], json!(WIDE));
         while op(&requests.recv().await.unwrap().1) != "bots" {}
-        // Its own project's approval, then another's.
+        // A second window of the store hears the first: it follows nothing.
+        let second = Elsewhere::start(socket, store, woken);
+        let mut heard = second.waiting.clone();
+        // An approval in each project.
         go.send(held("tally.readme", "c1", 7)).unwrap();
         go.send(held("site.fix", "c2", 8)).unwrap();
-        tokio::time::timeout(wait, waiting.wait_for(|bots| !bots.agents.is_empty()))
-            .await
-            .unwrap()
-            .unwrap();
         let names = |waiting: &Waiting| -> Vec<String> {
             waiting.agents.iter().map(|(_, bot)| bot.clone()).collect()
         };
-        assert_eq!(names(&waiting.borrow()), ["site.fix"]);
-        // The held agent's calls, from its approval on; not the other's.
-        let (_, narrow) = requests.recv().await.unwrap();
-        assert_eq!(
-            narrow,
-            json!({"id": narrow["id"], "op": "follow", "bot": "site.fix",
-            "after": 8, "kinds": NARROW})
-        );
-        // Allowed, it starts: no one elsewhere, and a new connection.
-        go.send(
-            json!({"cursor": 9, "bot": "site.fix", "turn": 1, "event": "tool_started",
-            "data": {"call_id": "c2", "name": "shell"}}),
-        )
-        .unwrap();
-        tokio::time::timeout(wait, waiting.wait_for(|bots| bots.agents.is_empty()))
+        for shared in [&mut waiting, &mut heard] {
+            tokio::time::timeout(wait, shared.wait_for(|shared| shared.agents.len() == 2))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // Each window leaves out its own project's.
+        assert_eq!(names(&waiting.borrow().outside("tally")), ["site.fix"]);
+        assert_eq!(names(&heard.borrow().outside("site")), ["tally.readme"]);
+        // The held agents' calls, each from its approval on.
+        for (bot, after) in [("tally.readme", 7), ("site.fix", 8)] {
+            let (at, narrow) = requests.recv().await.unwrap();
+            assert_eq!(at, 1);
+            assert_eq!(
+                narrow,
+                json!({"id": narrow["id"], "op": "follow", "bot": bot,
+                "after": after, "kinds": NARROW})
+            );
+        }
+        // Allowed, they start: no one waits, and a new connection.
+        go.send(started("tally.readme", "c1", 9)).unwrap();
+        go.send(started("site.fix", "c2", 10)).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| shared.agents.is_empty()))
             .await
             .unwrap()
             .unwrap();
@@ -627,10 +801,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            (again, op(&follow), follow["bot"].clone()),
-            (2, "follow".into(), json!("*.*"))
+            (
+                again,
+                op(&follow),
+                follow["bot"].clone(),
+                follow["after"].clone()
+            ),
+            (2, "follow".into(), json!("*.*"), json!(10))
         );
+        // The first window closes: the second follows on, on its own.
         drop(open);
+        let (at, follow) = tokio::time::timeout(wait, requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (at, op(&follow), follow["bot"].clone()),
+            (3, "follow".into(), json!("*.*"))
+        );
+        go.send(held("tally.readme", "c3", 11)).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| shared.agents.len() == 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(names(&heard.borrow().outside("site")), ["tally.readme"]);
+        drop(second);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

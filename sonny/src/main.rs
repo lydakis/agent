@@ -738,11 +738,11 @@ impl App {
         }));
     }
 
-    /// What needs the person outside the window's project, followed for as
-    /// long as the window is open where **Projects** shows: started for
-    /// the project the window is in once its own footer is counted, so the
-    /// window's start comes first, again when it moves to another, and
-    /// again a few seconds after it stopped, as when the daemon went.
+    /// What needs the person in every project, followed for as long as
+    /// the window is open where **Projects** shows, by one window of the
+    /// store for all ([`elsewhere`]): started once the window's own footer
+    /// is counted, so the window's start comes first, and again a few
+    /// seconds after it stopped, as when the daemon went.
     fn elsewhere_tick(&mut self) {
         if !self.projects_here() {
             self.other_projects = None;
@@ -751,21 +751,17 @@ impl App {
         if self.counts.is_none() {
             return;
         }
-        let project = self.scope().project;
         let again = match &self.other_projects {
             None => true,
-            Some((open, of, at)) => {
-                *of != project || open.ended() && at.elapsed() >= ELSEWHERE_AGAIN
-            }
+            Some((open, at)) => open.ended() && at.elapsed() >= ELSEWHERE_AGAIN,
         };
         if again {
             let open = elsewhere::Elsewhere::start(
                 self.options.socket.clone(),
                 self.store(),
-                project.clone(),
                 self.woken.clone(),
             );
-            self.other_projects = Some((open, project, Instant::now()));
+            self.other_projects = Some((open, Instant::now()));
         }
     }
 
@@ -773,10 +769,10 @@ impl App {
     /// footer's `?` does not count already (a superlead's `/status` lists
     /// the projects it holds), in the order **Projects** lists them.
     fn elsewhere_waiting(&self) -> elsewhere::Waiting {
-        let Some((open, _, _)) = &self.other_projects else {
+        let Some((open, _)) = &self.other_projects else {
             return elsewhere::Waiting::default();
         };
-        let mut waiting = open.waiting.borrow().clone();
+        let mut waiting = open.waiting.borrow().outside(&self.scope().project);
         waiting.agents.retain(|(_, bot)| {
             !self.status_bots.contains(bot)
                 && !(self.fleet.as_ref())
@@ -6114,10 +6110,9 @@ struct App {
     /// The footer's needs-you count, which beats a few times when it
     /// rises; kept as the footer is drawn, from what it counts.
     needs_pulse: std::cell::Cell<look::Pulse>,
-    /// What needs the person in the other projects, followed on a
-    /// connection of its own for the project the window is in, and when
-    /// it started.
-    other_projects: Option<(elsewhere::Elsewhere, String, Instant)>,
+    /// What needs the person in every project, followed by one window of
+    /// the store for all, and when it started.
+    other_projects: Option<(elsewhere::Elsewhere, Instant)>,
     /// The footer's `elsewhere`, which beats as the needs-you count does.
     elsewhere_pulse: std::cell::Cell<look::Pulse>,
     /// The reply text the current model call has streamed.
