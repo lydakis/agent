@@ -4698,8 +4698,9 @@ struct Counted {
     /// read again, with their [`rows_mark`]; none when a read failed, so
     /// the window takes a fresh snapshot.
     listed: Option<(Vec<standing::Agent>, u64)>,
-    /// This window's agent's own tasks, as the margin lists them, when read.
-    own: Option<Vec<status::Own>>,
+    /// The project's agents, as the pane lists them above the margin,
+    /// when read.
+    agents: Option<status::Agents>,
     /// The rows the count built, for the next; none builds every row again.
     kept: Option<Built>,
 }
@@ -11557,8 +11558,8 @@ impl App {
             if let Some(tasks) = counted.tasks {
                 self.tasks_read(tasks);
             }
-            if let Some(own) = counted.own {
-                self.margin.set_tasks(own);
+            if let Some(agents) = counted.agents {
+                self.margin.set_agents(agents, &self.bot);
             }
             self.kept_rows = counted.kept.unwrap_or_default();
             if let Some((latest, seen)) = counted.reads {
@@ -11645,7 +11646,7 @@ impl App {
                 reads: Some(reads),
                 tasks: None,
                 listed: None,
-                own: None,
+                agents: None,
                 kept: None,
             };
             let (mut listed, mut kept_mark) = (listed, kept_mark);
@@ -11685,7 +11686,7 @@ impl App {
                     reads: Some((latest, seen)),
                     tasks: None,
                     listed: Some((listed, rows)),
-                    own: None,
+                    agents: None,
                     kept: Some(kept_rows),
                 });
             }
@@ -11728,7 +11729,7 @@ impl App {
             if let Some(bots) = &bots {
                 kept_rows.bots = bots.clone();
             }
-            let own = status::own(&built, &bot);
+            let agents = status::agents(read.title.as_ref().unwrap_or(&read.project), &built);
             // The tasks' lines, each made once for a row kept, and handed
             // over only once they say something new.
             let tasks =
@@ -11750,7 +11751,7 @@ impl App {
                 reads: Some((latest, seen)),
                 tasks,
                 listed: Some((listed, rows)),
-                own: Some(own),
+                agents: Some(agents),
                 kept: Some(kept_rows),
             })
         }));
@@ -14365,13 +14366,14 @@ impl App {
     }
 
     /// The agents `/status` and `/background` cover: the project's, and
-    /// its lead; a lone agent's only.
+    /// its lead; a lone agent's only. A task's window covers its lead's,
+    /// so it lists them as the lead's window does.
     fn scope(&self) -> background::Scope {
         let (project, lead) = match &self.project {
             Some(project) => (project.clone(), self.bot.clone()),
             None => (
                 self.bot.split('.').next().unwrap_or(&self.bot).to_owned(),
-                self.bot.clone(),
+                task_lead(&self.bot, self.listed.as_deref()),
             ),
         };
         let glob = if self.bot.contains('.') || self.project.is_some() {
@@ -14418,7 +14420,9 @@ impl App {
         self.counts = Some(status::counts(&read.rows));
         self.status_counted(status::bots(&read.rows));
         self.tasks_read(status::tasks(&mut read.rows));
-        self.margin.set_tasks(status::own(&read.rows, &self.bot));
+        let project = read.title.as_ref().unwrap_or(&read.project);
+        self.margin
+            .set_agents(status::agents(project, &read.rows), &self.bot);
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
@@ -22701,6 +22705,39 @@ fn clicked(link: &str, right: bool) -> Option<String> {
 }
 
 /// A bot's name in its project: `lead`, or what follows the project's dot.
+/// The lead a window of `bot` lists the agents of: `bot` itself when it
+/// is a lead or a lone agent, else the lead its line of makers leads to in
+/// `listed`, or its project's first lead until the listing says.
+fn task_lead(bot: &str, listed: Option<&[standing::Agent]>) -> String {
+    let Some((project, _)) = bot.split_once('.') else {
+        return bot.to_owned();
+    };
+    if project::is_lead(bot) {
+        return bot.to_owned();
+    }
+    let first = format!("{project}.lead");
+    let Some(listed) = listed else {
+        return first;
+    };
+    let makers: HashMap<&str, &str> = (listed.iter())
+        .map(|agent| (agent.name.as_str(), agent.maker()))
+        .collect();
+    let mut at = bot;
+    // A ring of makers leads to no lead.
+    for _ in 0..=makers.len() {
+        match makers.get(at) {
+            Some(maker) if project::lead_project(maker) == Some(project) => {
+                return (*maker).to_owned();
+            }
+            // Another project's lead: listed from its own project.
+            Some(maker) if project::is_lead(maker) => break,
+            Some(maker) if !maker.is_empty() => at = maker,
+            _ => break,
+        }
+    }
+    first
+}
+
 fn short(bot: &str, project: &str, lead: &str) -> String {
     if bot == lead {
         return "lead".into();
@@ -23191,6 +23228,33 @@ mod tests {
             }
         }
         mine
+    }
+
+    #[test]
+    fn a_tasks_window_lists_the_agents_of_the_lead_its_line_leads_to() {
+        let agent = |name: &str, maker: &str| standing::Agent {
+            name: name.into(),
+            created_by: Some(maker.into()).filter(|m: &String| !m.is_empty()),
+            ..Default::default()
+        };
+        let listed = [
+            agent("calc.lead", ""),
+            agent("calc.lead.docs", ""),
+            agent("calc.halves", "calc.lead"),
+            agent("calc.halves-a", "calc.halves"),
+            agent("calc.notes", "calc.lead.docs"),
+            agent("calc.loose", "shop.lead"),
+        ];
+        let lead = |bot| task_lead(bot, Some(&listed));
+        // A lead and a lone agent list their own.
+        assert_eq!(lead("calc.lead.docs"), "calc.lead.docs");
+        assert_eq!(lead("solo"), "solo");
+        // A task and its helper, the lead their line leads to.
+        assert_eq!(lead("calc.halves-a"), "calc.lead");
+        assert_eq!(lead("calc.notes"), "calc.lead.docs");
+        // Another project's lead, or no listing yet: the first lead.
+        assert_eq!(lead("calc.loose"), "calc.lead");
+        assert_eq!(task_lead("calc.notes", None), "calc.lead");
     }
 
     #[test]
