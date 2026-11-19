@@ -8217,7 +8217,7 @@ impl App {
                     self.place_picked(node);
                 }
             }
-            self.status_filled().await;
+            keyed |= self.status_filled().await;
             if self.pane.as_ref().is_some_and(pane::Pane::is_card)
                 && self.watch.as_ref().is_some_and(|w| {
                     w.read.elapsed() > STATUS_AGAIN
@@ -14676,10 +14676,14 @@ impl App {
 
     /// The rows `/status` read so far as it opened, as they land, and its
     /// read once whole.
-    async fn status_filled(&mut self) {
+    /// Whether the card's first rows came: they answer the person's
+    /// `/status`, so they draw at once, as a key does.
+    async fn status_filled(&mut self) -> bool {
         let Some((filling, job)) = &self.filling else {
-            return;
+            return false;
         };
+        let unlisted = |app: &Self| app.watch.as_ref().is_some_and(|watch| !watch.listed);
+        let was = unlisted(self);
         let came = filling.lock().ok().and_then(|mut came| came.take());
         let ended = job.is_finished();
         if let Some((alerts, read)) = came {
@@ -14691,6 +14695,7 @@ impl App {
         {
             self.card_came(read);
         }
+        was && !unlisted(self)
     }
 
     /// What `/status` read, in its card: its rows, with their times
