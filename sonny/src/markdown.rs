@@ -2739,6 +2739,10 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                         && words.chars().filter(|c| *c == mark).count() >= 3)
             }
             Some('`' | '~') => words.starts_with("```") || words.starts_with("~~~"),
+            // A definition, `[label]: /target` or `[^note]: words`.
+            Some('[') => words[1..]
+                .find(']')
+                .is_some_and(|end| words[end + 2..].starts_with(':')),
             Some(_) => {
                 escape = digits;
                 digits > 0
@@ -2901,6 +2905,18 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(words, "___");
+        // A definition written in a cell is words, and a link stays a link.
+        for (cell, seen) in [
+            ("[label]: /target", "[label]: /target"),
+            ("[^n]: A note.", "[^n]: A note."),
+            ("[x](/y) then a]: b", "x (/y) then a]: b"),
+        ] {
+            let words: String = inline(cell, Style::new())
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(words, seen);
+        }
         // A table pointing at a footnote goes out once the note is read.
         let cited = "| A |\n|---|\n| x[^n] |\n\n[^n]: The source.\n\nAfter.";
         assert_eq!(
