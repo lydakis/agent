@@ -205,9 +205,7 @@ impl Sender {
             if given.0.is_some() || given.1.is_some() {
                 match tokio::task::spawn_blocking(move || super::resolve(given)).await {
                     Ok(found) => request.resolved(found),
-                    Err(_) => {
-                        request.workspace_error = Some(Error::new("workspace_lookup_failed"))
-                    }
+                    Err(_) => request.workspace_error = Some(Error::new("workspace_lookup_failed")),
                 }
             }
         }

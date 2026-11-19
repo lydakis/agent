@@ -934,12 +934,7 @@ impl std::fmt::Debug for Capabilities {
 /// The root at `path`, with what stays read-only inside it: the protected
 /// folders at its top, a worktree's own git folder when it is inside the
 /// root, and the daemon's store and socket.
-fn root(
-    path: &Path,
-    daemon: &Daemon,
-    others: &[known::Known],
-    own: Option<&Path>,
-) -> Result<Root> {
+fn root(path: &Path, daemon: &Daemon, others: &[known::Known], own: Option<&Path>) -> Result<Root> {
     // A root is kept by its real path. One reached through a link now had
     // a link swapped in since, perhaps by a bot that may write the folder
     // above it, and would carry the sandbox wherever the link points.
@@ -1074,7 +1069,6 @@ fn root(
         for entry in std::fs::read_dir(&worktrees)
             .into_iter()
             .filter(|_| !cfg!(target_os = "linux"))
-            .into_iter()
             .flatten()
             .flatten()
         {
@@ -3873,7 +3867,11 @@ mod tests {
         std::fs::write(git.join("config"), "").unwrap();
         for name in ["mine", "theirs"] {
             std::fs::create_dir_all(git.join("worktrees").join(name)).unwrap();
-            std::fs::write(git.join("worktrees").join(name).join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                git.join("worktrees").join(name).join("commondir"),
+                "../..\n",
+            )
+            .unwrap();
             let checkout = base.join(name);
             std::fs::create_dir_all(&checkout).unwrap();
             std::fs::write(
@@ -3909,7 +3907,10 @@ mod tests {
                 command(&policy, "sh", &["-c", script, "sh", folder], false).unwrap();
             let status = sandboxed.current_dir(&mine).status().await.unwrap();
             assert!(status.success(), "its own worktree's HEAD is its to write");
-            assert!(worktrees.join("theirs/commondir").exists(), "no other is renamed");
+            assert!(
+                worktrees.join("theirs/commondir").exists(),
+                "no other is renamed"
+            );
             assert!(!worktrees.join("gone").exists());
             assert_eq!(
                 std::fs::read_to_string(worktrees.join("mine/commondir")).unwrap(),

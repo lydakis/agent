@@ -1138,7 +1138,8 @@ impl Line {
             if by_id == me {
                 return true;
             }
-            if crate::task::record_of_bot(by).is_some_and(|by| crate::project::is_lead_record(&by)) {
+            if crate::task::record_of_bot(by).is_some_and(|by| crate::project::is_lead_record(&by))
+            {
                 return false;
             }
             match crate::task::record_of_bot(by) {

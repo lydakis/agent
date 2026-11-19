@@ -1172,6 +1172,19 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
             dir.display()
         ));
     }
+    // Never Agent's own folder or one in it: its store, keys, rules and
+    // settings, which every sandbox keeps read-only, would be the new
+    // lead's folder to write.
+    let own = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".agent"))
+        .and_then(|own| own.canonicalize().ok());
+    if let Some(own) = own.filter(|own| dir.starts_with(own)) {
+        return Err(format!(
+            "project_invalid: {} is in {}, Agent's own folder",
+            dir.display(),
+            own.display()
+        ));
+    }
     Ok((dir, picks))
 }
 

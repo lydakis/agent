@@ -5253,10 +5253,11 @@ impl Service {
                 let sandboxed = (agent_runtime::store::SANDBOX.iter())
                     .any(|key| named.iter().any(|name| name == key));
                 if sandboxed {
-                    merged =
-                        tokio::task::spawn_blocking(move || confine(&mut merged, true).map(|()| merged))
-                            .await
-                            .map_err(|_| Error::new("sandbox_unavailable"))??;
+                    merged = tokio::task::spawn_blocking(move || {
+                        confine(&mut merged, true).map(|()| merged)
+                    })
+                    .await
+                    .map_err(|_| Error::new("sandbox_unavailable"))??;
                 }
                 Some(merged)
             }
@@ -5835,10 +5836,11 @@ impl Service {
                 turn::shaped(served, &settings)?;
                 // Checking for a sandbox and resolving folders touch the
                 // filesystem: off the runtime thread.
-                let settings =
-                    tokio::task::spawn_blocking(move || confine(&mut settings, false).map(|()| settings))
-                        .await
-                        .map_err(|_| Error::new("sandbox_unavailable"))??;
+                let settings = tokio::task::spawn_blocking(move || {
+                    confine(&mut settings, false).map(|()| settings)
+                })
+                .await
+                .map_err(|_| Error::new("sandbox_unavailable"))??;
                 if let Some(level) = &effort {
                     family.check_effort(level)?;
                 }
