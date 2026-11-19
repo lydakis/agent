@@ -1114,6 +1114,8 @@ struct StatusRead {
     /// The agents whose history moved since it was read, in the listing's
     /// order, left to read beside the card ([`StatusView::fill`]).
     unread: Vec<String>,
+    /// Of those, the ones with no title, whose first line is read too.
+    untitled: std::collections::HashSet<String>,
 }
 
 /// The agents of `scope` as `/status` shows them, and footers and leads
@@ -1261,6 +1263,8 @@ async fn read_status_of(
     let mut listed_here: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let (mut fresh, mut whole) = (false, true);
     let mut unread_here = Vec::new();
+    let mut untitled_here = std::collections::HashSet::new();
+    let mut later = Vec::new();
     // Side chats are not the project's agents.
     for bot in listed {
         let name = bot.name.as_str();
@@ -1289,14 +1293,20 @@ async fn read_status_of(
             continue;
         }
         listed_here.insert(name);
+        // Its title as noted, else, with none, its first line read once.
+        let mut title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
+        let untitled = title.is_none()
+            && bot.head.is_some()
+            && (bot.bot_id).is_some_and(|id| !crate::title::asked(name, id));
         // An idle agent no event moved, built as the last count built it.
         if let Some((rows_kept, again)) = &mut reuse
             && bot.running_turn.is_none()
             && name != view.bot
             && !again.contains(name)
+            && !untitled
             && let Some(row) = rows_kept
                 .remove(&name_key(name))
-                .filter(|row| row.bot == name)
+                .filter(|row| row.bot == name && row.title == title.as_deref().unwrap_or(""))
         {
             read.push(name.to_owned());
             idle.push(name.to_owned());
@@ -1307,13 +1317,36 @@ async fn read_status_of(
         // the card fills, beside it: a row not read yet says what the
         // listing does.
         let head = json!([bot.bot_id, bot.head]);
-        let unread = !is_read(bot, &head, status_read, asks_seen);
-        if unread {
+        let stale = !is_read(bot, &head, status_read, asks_seen);
+        if stale || untitled {
             match view.fill {
-                true => unread_here.push(name.to_owned()),
+                true => {
+                    unread_here.push(name.to_owned());
+                    if untitled {
+                        untitled_here.insert(name.to_owned());
+                    }
+                }
                 false => {
-                    fresh = true;
-                    whole &= read_agent(client, bot, status_read, asks_seen, view.readers).await;
+                    if stale {
+                        fresh = true;
+                        whole &=
+                            read_agent(client, bot, status_read, asks_seen, view.readers).await;
+                    }
+                    // A first line its history read did not hold waits
+                    // until every row's history is read.
+                    let known = (status_read.get(name))
+                        .is_some_and(|(seen, latest)| *seen == head && latest.first.is_some());
+                    if untitled && !known {
+                        later.push(bot);
+                    } else if untitled {
+                        // One that failed leaves the count to read again.
+                        let read = read_title(client, &store, bot, status_read).await;
+                        whole &= read;
+                        if read {
+                            title =
+                                (bot.bot_id).and_then(|id| crate::title::noted(&store, name, id));
+                        }
+                    }
                 }
             }
         }
@@ -1397,7 +1430,9 @@ async fn read_status_of(
                     .map(|(began, ended)| ended.saturating_sub(began) / 1000),
             ),
         };
-        let Latest { mut step, pr, ask } = latest;
+        let Latest {
+            mut step, pr, ask, ..
+        } = latest;
         // A question stays open until its answer lands, past work that
         // does not wait on it and messages that answer something else:
         // an idle agent's recent history is read once per turn it
@@ -1434,7 +1469,7 @@ async fn read_status_of(
         needs.asked(name, ask.clone().filter(|_| !resolved));
         read.push(name.to_owned());
         // One not read yet says nothing of its question.
-        if !running && !(unread && view.fill) {
+        if !running && !(stale && view.fill) {
             idle.push(name.to_owned());
         }
         if let Some(ask) = &ask {
@@ -1485,7 +1520,6 @@ async fn read_status_of(
             false => seat_profile(&store, name, false, std::path::Path::new("")),
         }
         .unwrap_or_default();
-        let title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
         rows.push(status::Row {
             name: short(name, &project, &lead),
             bot: name.to_owned(),
@@ -1528,6 +1562,26 @@ async fn read_status_of(
     }
     // Agents gone from the listing are forgotten with it.
     status_read.retain(|name, _| listed_here.contains(name.as_str()));
+    if !later.is_empty() {
+        let at: HashMap<&str, usize> = (rows.iter().enumerate())
+            .map(|(at, row)| (row.bot.as_str(), at))
+            .collect();
+        let mut noted = Vec::new();
+        for bot in later {
+            let read = read_title(client, &store, bot, status_read).await;
+            whole &= read;
+            if read
+                && let Some(title) =
+                    (bot.bot_id).and_then(|id| crate::title::noted(&store, &bot.name, id))
+                && let Some(&at) = at.get(bot.name.as_str())
+            {
+                noted.push((at, title));
+            }
+        }
+        for (at, title) in noted {
+            rows[at].title = title;
+        }
+    }
     // The project's title, from its lead's folder's file.
     let lead_folder = (listed.iter())
         .find(|bot| bot.name == lead)
@@ -1554,6 +1608,7 @@ async fn read_status_of(
         fresh,
         whole,
         unread: unread_here,
+        untitled: untitled_here,
     })
 }
 
@@ -1630,6 +1685,7 @@ async fn fill_status(
             return (alerts, None);
         };
         let mut unread = std::mem::take(&mut read.unread);
+        let untitled = std::mem::take(&mut read.untitled);
         unread.retain(|name| !failed.contains(name));
         let owed = owed.get_or_insert_with(|| unread.iter().cloned().collect());
         let still: std::collections::HashSet<&str> = unread.iter().map(String::as_str).collect();
@@ -1653,21 +1709,30 @@ async fn fill_status(
             read.whole &= failed.is_empty();
             return (alerts, Some(Box::new(read)));
         }
-        // The rows on screen first, then the rest as the card lists them.
+        let agents: HashMap<&str, &standing::Agent> = (listed.iter())
+            .map(|bot| (bot.name.as_str(), bot))
+            .collect();
+        let stale = |name: &str| {
+            (agents.get(name)).is_some_and(|bot| {
+                !is_read(bot, &json!([bot.bot_id, bot.head]), status_read, asks_seen)
+            })
+        };
+        // The rows on screen first, then the rest as the card lists them:
+        // what each is doing before the first lines of those with no title.
         let at: HashMap<&str, usize> = (read.rows.iter().enumerate())
             .map(|(at, row)| (row.bot.as_str(), at))
             .collect();
         let place = |name: &String| at.get(name.as_str()).copied().unwrap_or(usize::MAX);
-        unread.sort_by_cached_key(place);
+        unread.sort_by_cached_key(|name| {
+            let at = place(name);
+            (at >= shown, at >= shown && !stale(name), at)
+        });
         let on_screen = unread.iter().take_while(|name| place(name) < shown).count();
         drop(at);
         if let Ok(mut came) = came.lock() {
             *came = Some((alerts.clone(), Box::new(read)));
         }
         woken.notify_one();
-        let agents: HashMap<&str, &standing::Agent> = (listed.iter())
-            .map(|bot| (bot.name.as_str(), bot))
-            .collect();
         // The rows on screen drawn as soon as they are read; the rest on
         // the listing as the card reads it again.
         let screen = (std::mem::replace(&mut first, false))
@@ -1686,7 +1751,18 @@ async fn fill_status(
                 continue;
             };
             fresh = true;
-            if !read_agent(client, bot, status_read, asks_seen, view.readers).await {
+            let moved = !is_read(bot, &json!([bot.bot_id, bot.head]), status_read, asks_seen);
+            let read = read_agent(client, bot, status_read, asks_seen, view.readers).await;
+            // Only one with no title, so a lead keeps its project's. Off
+            // screen, a first line its history read did not hold waits
+            // until every row's history is read.
+            let later = screen.is_none()
+                && moved
+                && (status_read.get(name)).is_none_or(|(_, latest)| latest.first.is_none());
+            let titled = !untitled.contains(name)
+                || later
+                || read_title(client, options_store, bot, status_read).await;
+            if !(read & titled) {
                 failed.insert(name.clone());
             }
         }
@@ -2027,6 +2103,83 @@ pub(crate) fn keep_beside(file: &std::path::Path, bytes: &[u8]) {
 
 /// `bot`'s latest step, question and pull request; none when a read
 /// failed, which an empty history is not.
+/// Note `bot`'s title from its first message's first line, read once
+/// from its history: an agent none was noted for as it started, as a
+/// helper is, or a task started before tasks had titles. False where the
+/// read failed, which the next read tries again.
+async fn read_title(
+    client: &Client,
+    store: &std::path::Path,
+    bot: &standing::Agent,
+    status_read: &HashMap<String, (Value, Latest)>,
+) -> bool {
+    let name = bot.name.as_str();
+    let Some(id) = bot.bot_id.filter(|_| bot.head.is_some()) else {
+        return true;
+    };
+    if !crate::title::ask(name, id).await {
+        return true;
+    }
+    // A read let go before it ends, its card closed, is asked again.
+    struct Reading<'a>(&'a str, i64, bool);
+    impl Drop for Reading<'_> {
+        fn drop(&mut self) {
+            crate::title::answered(self.0, self.1, self.2);
+        }
+    }
+    let mut reading = Reading(name, id, false);
+    if crate::title::noted(store, name, id).is_some() {
+        reading.2 = true;
+        return true;
+    }
+    // Its whole history read for `/status` already holds it.
+    let head = json!([bot.bot_id, bot.head]);
+    let known = (status_read.get(name))
+        .filter(|(seen, _)| *seen == head)
+        .and_then(|(_, latest)| latest.first.clone());
+    let first = async {
+        if known.is_some() {
+            return known;
+        }
+        let asked = json!({"bot": name, "limit": 4, "oldest_first": true});
+        let page = client.request("history_nodes", asked).await.ok()?;
+        let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        // The oldest page comes newest first, as every page does.
+        nodes.sort_unstable();
+        let read = client
+            .request("history_items", json!({"bot": name, "nodes": nodes}))
+            .await
+            .ok()?;
+        // Oldest first, as the nodes were asked for. An item too large to
+        // read before the first message leaves it with no title: read
+        // again, it would be as large.
+        for entry in read["items"].as_array().into_iter().flatten() {
+            if !entry["error"].is_null() {
+                return Some(String::new());
+            }
+            let said = responses(&entry["item"])
+                .into_iter()
+                .find(|item| item["role"] == "user");
+            if let Some(said) = said {
+                return Some(text(&said));
+            }
+        }
+        Some(String::new())
+    };
+    let first = first.await;
+    if let Some(first) = &first {
+        let title = crate::title::of_message(first);
+        if !title.is_empty() {
+            // Written off the loop: a backfill writes one for each agent.
+            crate::title::note_later(store, name, id, &title);
+        }
+    }
+    reading.2 = first.is_some();
+    reading.2
+}
+
 async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
     let page = client
         .request("history_nodes", json!({"bot": bot, "limit": 4}))
@@ -2078,10 +2231,21 @@ async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
                 })
         })
         .collect();
+    // A page with none older holds the first message, when every item on
+    // it came back whole: kept as the title it makes, not the whole brief.
+    let whole =
+        entries.len() == nodes.len() && entries.iter().all(|entry| entry["error"].is_null());
+    let first = (page["next_from"].is_null() && !nodes.is_empty() && whole).then(|| {
+        (flat.iter().rev())
+            .find(|item| item["role"] == "user")
+            .map(|item| crate::title::of_message(&text(item)))
+            .unwrap_or_default()
+    });
     Some(Latest {
         ask: asks::open(&flat),
         pr,
         step: App::step(&entries),
+        first,
     })
 }
 
@@ -5688,6 +5852,10 @@ struct Latest {
     pr: Option<String>,
     /// The question it asked the person and has no answer to yet.
     ask: Option<asks::Ask>,
+    /// Its first message's first line, cut as a title, when the page read
+    /// holds its whole history: a title found with no read of its own.
+    #[serde(skip)]
+    first: Option<String>,
 }
 
 /// `/status` in the pane, its timers ticking and its rows read again
@@ -10281,7 +10449,7 @@ impl App {
         let task = started::Task {
             bot,
             name,
-            title: arguments["title"].as_str().unwrap_or("").trim().to_owned(),
+            title: crate::title::of_message(arguments["brief"].as_str().unwrap_or("")),
             state: "starting".into(),
         };
         // Its name opens it at once, where it was drawn before it was made.
@@ -10322,7 +10490,7 @@ impl App {
             served::START => (
                 started::STARTED,
                 self.started_bot(arguments, output),
-                arguments["title"].as_str().unwrap_or(""),
+                crate::title::of_message(arguments["brief"].as_str().unwrap_or("")),
             ),
             "spawn_agent" => {
                 // One the daemon refused started nothing.
@@ -10334,7 +10502,7 @@ impl App {
                 (
                     started::STARTED,
                     self.started_bot(arguments, output),
-                    arguments["message"].as_str().unwrap_or(""),
+                    arguments["message"].as_str().unwrap_or("").to_owned(),
                 )
             }
             "send_message" => {
@@ -10356,7 +10524,7 @@ impl App {
                 (
                     started::SENT,
                     to.to_owned(),
-                    arguments["message"].as_str().unwrap_or(""),
+                    arguments["message"].as_str().unwrap_or("").to_owned(),
                 )
             }
             // A workflow it started has a row of its own.
@@ -10377,7 +10545,7 @@ impl App {
             verb,
             name: self.hint_name(&bot),
             bot,
-            title: started::first(title),
+            title: started::first(&title),
         };
         self.turn_hints.set.push(going);
     }
@@ -20259,7 +20427,7 @@ impl App {
                         }
                         // Its title is its first message's first line,
                         // noted by its id.
-                        let first = crate::title::first_line(&brief);
+                        let first = crate::title::of_message(&brief);
                         let asked = json!({"bot": lead.bot});
                         let noted = match self.client.request("inspect", asked).await {
                             Ok(record) => match record["bot_id"].as_i64() {
@@ -20350,7 +20518,6 @@ impl App {
         let start = task::Start {
             name: short.clone(),
             // Its title is its first message's first line.
-            title: crate::title::first_line(&brief),
             brief,
             // Named even when every task runs as it, so its model and
             // tools apply; its words are told once.
@@ -22870,54 +23037,44 @@ fn watch_card(
     watch: &Watch,
     width: usize,
 ) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
+    // Each running turn's time counts on from when the rows were read.
     let since = watch.read.elapsed().as_secs();
-    let rows: Vec<status::Row> = watch
-        .rows
-        .iter()
-        .cloned()
-        .map(|mut row| {
-            if row.running {
-                row.seconds = row.seconds.map(|s| s + since);
-            }
-            row
-        })
-        .collect();
+    let rows = &watch.rows;
+    let card = |details| {
+        status::card_after(
+            &watch.project,
+            rows,
+            since,
+            width,
+            &watch.open,
+            details,
+            &watch.helpers,
+        )
+    };
+    let quiet = card(status::Details::Quiet);
     // The agent picked from the keys says more: its place among the rows
     // is the same with or without that.
-    let listed = status::card(
-        &watch.project,
-        &rows,
-        width,
-        &watch.open,
-        status::Details::Quiet,
-        &watch.helpers,
-    );
-    let picked = (watch.pick)
-        .and_then(|at| {
-            picks_in_order(&listed.named, &listed.folds)
-                .into_iter()
-                .nth(at)
-        })
-        .and_then(|(_, picked)| match picked {
-            Picked::Agent(bot) => Some(bot),
-            Picked::Group(_) => None,
-        });
     let status::Card {
         lines: mut card,
         named,
         folds,
         helpers,
-    } = status::card(
-        &watch.project,
-        &rows,
-        width,
-        &watch.open,
-        match watch.more {
-            true => status::Details::Picked(picked.as_deref()),
-            false => status::Details::Quiet,
-        },
-        &watch.helpers,
-    );
+    } = match watch.more {
+        true => {
+            let picked = (watch.pick)
+                .and_then(|at| {
+                    picks_in_order(&quiet.named, &quiet.folds)
+                        .into_iter()
+                        .nth(at)
+                })
+                .and_then(|(_, picked)| match picked {
+                    Picked::Agent(bot) => Some(bot),
+                    Picked::Group(_) => None,
+                });
+            card(status::Details::Picked(picked.as_deref()))
+        }
+        false => quiet,
+    };
     // What is broken goes under the heading, and the agents under that.
     let mut above: Vec<Line<'static>> = Vec::new();
     // An alert that opens a view does so on a click on its first line.
@@ -25738,6 +25895,10 @@ mod tests {
                         turns.fetch_add(1, Ordering::SeqCst);
                         json!({"turns": [], "next_before": null})
                     }
+                    // Its first line, for its title: none.
+                    "history_nodes" if asked["oldest_first"] == true => {
+                        json!({"nodes": [], "next_from": null})
+                    }
                     "history_nodes" => {
                         read.fetch_add(1, Ordering::SeqCst);
                         json!({"nodes": [], "next_from": null})
@@ -25876,6 +26037,10 @@ mod tests {
                     };
                     let last = if ran.load(Ordering::SeqCst) { 9 } else { 2 };
                     json!({"bots": [bot(1, 1), bot(2, last)], "next_after": null})
+                }
+                // Its first line, for its title: none.
+                "history_nodes" if asked["oldest_first"] == true => {
+                    json!({"nodes": [], "next_from": null})
                 }
                 "history_nodes" => {
                     read.fetch_add(1, Ordering::SeqCst);
@@ -26119,6 +26284,10 @@ mod tests {
                     "bots" => json!({"bots": [{"name": "shop.t1", "bot_id": 1, "head": 1,
                 "status": "completed", "running_turn": null,
                 "last": {"turn": 1, "status": "completed"}}], "next_after": null}),
+                    // Its first line, for its title: none.
+                    "history_nodes" if asked["oldest_first"] == true => {
+                        json!({"nodes": [], "next_from": null})
+                    }
                     "history_nodes" => {
                         read.fetch_add(1, Ordering::SeqCst);
                         json!({"nodes": [], "next_from": null})
@@ -26242,6 +26411,180 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(app.counts, Some(counts));
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_title_takes_its_first_line_once_and_a_noted_one_is_kept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let firsts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let asked = firsts.clone();
+        let read_first = |firsts: &std::sync::Mutex<Vec<String>>| {
+            let mut read = firsts.lock().unwrap().clone();
+            read.sort();
+            read
+        };
+        let snapshot = json!([
+            {"name": "titled.helper", "bot_id": 2, "head": 5, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.kept", "bot_id": 3, "head": 4, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.short", "bot_id": 4, "head": 8, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.big", "bot_id": 5, "head": 10, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.odd", "bot_id": 6, "head": 12, "last": {"turn": 1, "status": "completed"},
+                "created_by": "titled.lead"},
+            {"name": "titled.lead", "bot_id": 1, "head": 2, "workspace": "WORKSPACE",
+                "last": {"turn": 1, "status": "completed"}},
+        ]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted_reads = reads.clone();
+        let dir = std::env::temp_dir().join(unique("sonny-first-line"));
+        // The lead's project has a title of its own.
+        let folder = dir.join("titled");
+        std::fs::create_dir_all(folder.join(".agents")).unwrap();
+        std::fs::write(
+            folder.join(agent_client::project::FILE),
+            "name = \"titled\"\ntitle = \"Tally the logins\"\n",
+        )
+        .unwrap();
+        let snapshot: Value = serde_json::from_str(
+            &snapshot
+                .to_string()
+                .replace("WORKSPACE", folder.to_str().unwrap()),
+        )
+        .unwrap();
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
+            "follow" => json!({"following": ask["bot"]}),
+            "history_nodes" if ask["oldest_first"] == true => {
+                asked
+                    .lock()
+                    .unwrap()
+                    .push(ask["bot"].as_str().unwrap().to_owned());
+                if ask["bot"] == "titled.odd" {
+                    return json!({"nodes": [{"node": 12, "turn": 1}, {"node": 11, "turn": 1}], "next_from": null});
+                }
+                // The oldest page, newest first as every page comes.
+                json!({"nodes": [{"node": 3, "turn": 2}, {"node": 1, "turn": 1}], "next_from": null})
+            }
+            // Its whole history on its newest page, with none older.
+            "history_nodes" if ask["bot"] == "titled.short" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [{"node": 8, "turn": 1}, {"node": 7, "turn": 1}], "next_from": null})
+            }
+            "history_nodes" if ask["bot"] == "titled.big" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [{"node": 10, "turn": 1}, {"node": 9, "turn": 1}], "next_from": null})
+            }
+            "history_nodes" => {
+                counted_reads.fetch_add(1, Ordering::SeqCst);
+                json!({"nodes": [], "next_from": null})
+            }
+            // Its first message too large to read.
+            "history_items" if ask["nodes"] == json!([11, 12]) => json!({"items": [
+                {"node": 11, "error": "item_too_large"},
+                {"node": 12, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Not the first either"}]}}]}),
+            // Its items too large for one answer: only the newest came.
+            "history_items" if ask["nodes"] == json!([10, 9]) => json!({"items": [
+                {"node": 10, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Not the first"}]}}]}),
+            "history_items" if ask["nodes"] == json!([8, 7]) => json!({"items": [
+                {"node": 8, "item": {"role": "assistant", "content": [{"type": "output_text",
+                    "text": "Counted."}]}},
+                {"node": 7, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Count the coins\nBoth jars."}]}}]}),
+            "history_items" if ask["nodes"] == json!([1, 3]) => json!({"items": [
+                {"node": 1, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "\nFix the flaky login test\nIt fails one run in ten."}]}},
+                {"node": 3, "item": {"role": "user", "content": [{"type": "input_text",
+                    "text": "Also check the logout"}]}}]}),
+            "history_items" => json!({"items": []}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let store = dir.join("state.sqlite");
+        crate::title::note(&store, "titled.kept", 3, "Keep the cache warm").unwrap();
+        let mut app = app(client);
+        app.bot = "titled.lead".into();
+        app.options.store = store.clone();
+        let counted = async |app: &mut App| {
+            app.counted_at = None;
+            app.count_agents().await;
+            if let Some(job) = &app.counting {
+                while !job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            app.counted_at = Some(Instant::now());
+            app.count_agents().await;
+        };
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        counted(&mut app).await;
+        // The helper's first line, cut from its first message, noted once.
+        assert_eq!(
+            crate::title::noted(&store, "titled.helper", 2).as_deref(),
+            Some("Fix the flaky login test")
+        );
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
+        // One whose first message is too large to read has no title.
+        assert_eq!(crate::title::noted(&store, "titled.odd", 6), None);
+        // One whose newest page did not all come reads its first line.
+        assert_eq!(
+            crate::title::noted(&store, "titled.big", 5).as_deref(),
+            Some("Fix the flaky login test")
+        );
+        // One whose newest page holds its whole history takes its first
+        // line from that page, with no read of its own.
+        assert_eq!(
+            crate::title::noted(&store, "titled.short", 4).as_deref(),
+            Some("Count the coins")
+        );
+        // Read again after it moved: its title is not.
+        app.follower.as_ref().unwrap().moved("titled.helper");
+        counted(&mut app).await;
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
+        // A title noted as it started is never read, nor replaced.
+        assert_eq!(
+            crate::title::noted(&store, "titled.kept", 3).as_deref(),
+            Some("Keep the cache warm")
+        );
+        // The rows the count keeps carry the titles.
+        let mut titles = crate::title::Titles::read(&store);
+        assert_eq!(
+            titles.named("titled.helper", Some(2), None).as_deref(),
+            Some("Fix the flaky login test")
+        );
+        assert!(reads.load(Ordering::SeqCst) > 0);
+        // `/status` filling in reads none either, and the lead keeps its
+        // project's title.
+        app.status_read.clear();
+        app.asks_seen.clear();
+        app.status().await;
+        app.status_whole().await;
+        assert_eq!(
+            read_first(&firsts),
+            ["titled.big", "titled.helper", "titled.odd"]
+        );
+        assert_eq!(crate::title::noted(&store, "titled.lead", 1), None);
+        assert_eq!(
+            titles
+                .named("titled.lead", Some(1), folder.to_str())
+                .as_deref(),
+            Some("Tally the logins")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -29716,7 +30059,7 @@ mod tests {
         // started and sent under it.
         app.daemon(turn_event("accepted", 1, json!({"node": 7})))
             .await;
-        let start = json!({"name": "readme", "title": "Say how cents round", "brief": "Say how cents round\nmore"});
+        let start = json!({"name": "readme", "brief": "Say how cents round\nmore"});
         app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
         let send = json!({"to": "calc.fix", "message": "Check div too.\nThanks"});
         app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
@@ -30156,7 +30499,7 @@ mod tests {
         app.pending.clear();
         app.daemon(turn_event("accepted", 2, json!({"node": 9})))
             .await;
-        let start = json!({"name": "readme", "title": "Say how cents round", "brief": "Say how cents round"});
+        let start = json!({"name": "readme", "brief": "Say how cents round"});
         let started = json!({"name": served::START, "call_id": "s1"});
         app.daemon(turn_event("tool_started", 2, started)).await;
         app.commit_call("s1", Some(2), served::START, &start, "calc.readme/1", false);
@@ -30214,7 +30557,7 @@ mod tests {
             .await;
         app.daemon(turn_event("accepted", 5, json!({"node": 19})))
             .await;
-        let start = json!({"name": "docs", "title": "Write the docs", "brief": "Write the docs"});
+        let start = json!({"name": "docs", "brief": "Write the docs"});
         app.commit_call("s5", Some(5), served::START, &start, "calc.docs/1", false);
         // As reconnecting leaves it: still following the turn that ended.
         app.running.as_mut().unwrap().turn = 4;
@@ -32458,7 +32801,7 @@ mod tests {
         );
         app.read_tasks_through().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ● many  working");
+        assert_eq!(rows[1], "  ● Fix many  many  working");
     }
 
     #[tokio::test]
@@ -32533,13 +32876,13 @@ mod tests {
         let arguments = json!({"name": "add", "brief": "Fix add"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.add/1", false);
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ● add  working");
+        assert_eq!(drawn(&mut app)[1], "  ● Fix add  add  working");
         // Idle, the stopped message never ran: the turn before it says
         // what the task did.
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         app.tasks_read = None;
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ○ add  idle");
+        assert_eq!(drawn(&mut app)[1], "  ○ Fix add  add  idle");
     }
 
     #[tokio::test]
@@ -32579,8 +32922,8 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let start = |app: &mut App, name: &str| {
-            let arguments = json!({"name": name, "title": format!("Fix {name}"),
-                "brief": format!("Fix {name} now")});
+            let arguments =
+                json!({"name": name, "brief": format!("Fix {name}\nNow, with a test.")});
             let output = format!("calc.{name}/1");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         };
@@ -32897,8 +33240,8 @@ mod tests {
         }
         app.read_tasks_through().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ○ quiet  no reply");
-        assert_eq!(rows[2], "  ✗ bad    failed");
+        assert_eq!(rows[1], "  ○ Fix quiet  quiet  no reply");
+        assert_eq!(rows[2], "  ✗ Fix bad    bad    failed");
     }
 
     #[test]
@@ -33040,7 +33383,7 @@ mod tests {
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
         app.read_tasks_through().await;
-        assert_eq!(drawn(&mut app)[1], "  ? ask  needs you");
+        assert_eq!(drawn(&mut app)[1], "  ? Fix ask  ask  needs you");
         // Its history is read once for the turn it ended.
         app.tasks_read = None;
         app.read_tasks_through().await;

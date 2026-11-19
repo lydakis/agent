@@ -442,6 +442,20 @@ pub fn card(
     details: Details,
     helpers: &[String],
 ) -> Card {
+    card_after(project, rows, 0, width, open, details, helpers)
+}
+
+/// [`card`], `since` seconds after `rows` were read: each running turn's
+/// time counts on by that much.
+pub fn card_after(
+    project: &str,
+    rows: &[Row],
+    since: u64,
+    width: usize,
+    open: &[Group],
+    details: Details,
+    helpers: &[String],
+) -> Card {
     let mut named = Vec::new();
     let mut folds = Vec::new();
     let mut toggles = Vec::new();
@@ -477,7 +491,7 @@ pub fn card(
         .collect();
     let names = (titled.iter()).map(|(row, _)| row.name.width()).max();
     let titles = (titled.iter())
-        .map(|(row, indent)| indent + row.title.width())
+        .map(|(row, indent)| indent + crate::title::width(&row.title))
         .max()
         .unwrap_or(0)
         .min(width.saturating_sub(5 + names.unwrap_or(0)));
@@ -505,7 +519,15 @@ pub fn card(
         let showing = if shut { 0 } else { n };
         for row in in_group.iter().take(showing) {
             named.push((out.len(), row.bot.clone()));
-            out.extend(row_lines(row, width, "", titles, shown(row), trackers));
+            out.extend(row_lines(
+                row,
+                since,
+                width,
+                "",
+                titles,
+                shown(row),
+                trackers,
+            ));
             // A helper listed with what needs the person shows alone.
             let Some(helped) =
                 (under.get(&row.bot)).filter(|_| !helping.contains(row.bot.as_str()))
@@ -532,6 +554,7 @@ pub fn card(
                     named.push((out.len(), helper.bot.clone()));
                     out.extend(row_lines(
                         helper,
+                        since,
                         width,
                         "  ",
                         titles,
@@ -1089,6 +1112,7 @@ fn run_spans(
 /// name stay.
 fn row_lines(
     row: &Row,
+    since: u64,
     width: usize,
     indent: &str,
     titles: usize,
@@ -1098,7 +1122,7 @@ fn row_lines(
     let mut out = Vec::new();
     // How long the running turn has been at it, or the last one took.
     let time = match row.seconds {
-        Some(s) if row.running => crate::transcript::elapsed(s),
+        Some(s) if row.running => crate::transcript::elapsed(s + since),
         Some(s) => format!("took {}", crate::transcript::elapsed(s)),
         None => String::new(),
     };
@@ -1133,7 +1157,7 @@ fn row_lines(
                     time = None;
                 }
                 let title = crate::title::cut(&row.title, column);
-                let pad = column.saturating_sub(title.width());
+                let pad = column.saturating_sub(crate::title::width(&title));
                 spans.push(Span::raw(format!("{title}{}  ", " ".repeat(pad))));
             }
             // In the agents' color: a click opens it.
@@ -1213,7 +1237,7 @@ mod tests {
     fn a_workflow_s_row_draws_its_strip_where_the_counts_were() {
         use crate::workflow::view::{Counts, Live};
         let text = |row: &Row, width: usize| -> String {
-            let lines = row_lines(row, width, "", 0, false, false);
+            let lines = row_lines(row, 0, width, "", 0, false, false);
             assert_eq!(lines.len(), 1, "one row");
             lines[0].spans.iter().map(|s| s.content.as_ref()).collect()
         };
@@ -1252,7 +1276,7 @@ mod tests {
             " ● blind-role-eval-score Score · ✓✓✓ ✓●● · 19s"
         );
         // The run's name is bold in the text's own color: blue is an agent's.
-        let lines = row_lines(&row, 80, "", 0, false, false);
+        let lines = row_lines(&row, 0, 80, "", 0, false, false);
         let name = (lines[0].spans.iter())
             .find(|s| s.content == "blind-role-eval-score")
             .expect("the run's name");

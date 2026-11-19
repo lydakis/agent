@@ -152,14 +152,19 @@ Claude Code's agents take `isolation` each time.
 
 A task and a project each have a title beside their name: a few words you
 know the work by, as `Round half cents to even` beside `halves`. The name
-stays the handle you address, link and click. A lead sets a task's with
-`start_task`'s `title`, 60 characters at most, and a project's with
-`new_project`'s, which goes in `.agents/project.toml` as `title`, where you
-can change it; a folder that is a project already keeps its own, and one
-with none shows its name. A lead's title is its project's. An agent you
-start with `/new` takes its first message's first line. Sonny keeps each
-agent's beside the store (`STORE.titles/NAME`) with the agent's id, so one
-given the name later takes none of it; the daemon keeps none.
+stays the handle you address, link and click. Every agent's title is its
+first message's first line, cut at a word to 60 characters, as Codex names
+a thread from its first message: a task's is its brief's first line, which
+the lead writes as one, and one you start with `/new` takes yours. An agent
+started with none noted, such as a helper or a task started before tasks
+had titles, has its first line read once from its history, beside the
+window, and noted. A lead sets a project's with `new_project`'s `title`,
+which goes in `.agents/project.toml` as `title`, where you can change it; a
+folder that is a project already keeps its own, and one with none shows its
+name. A lead's title is its project's. Sonny keeps each agent's beside the
+store (`STORE.titles/NAME`) with the agent's id, so one given the name later
+takes none of it, and a noted title is never read again or replaced; the
+daemon keeps none.
 Every row that lists an agent leads with its title: `/status`, `/switch`
 and the tasks a lead started.
 
@@ -1512,7 +1517,7 @@ has something on it, or is off the screen, no time shows.
 - Every task works in a git worktree of its own, at the last commit on
   the branch `agent/NAME`, so only the lead works in the folder; outside
   git, tasks work in the lead's folder. The lead starts each task with its
-  `start_task` tool (`name`, `title`, `brief`, `setup`, `profile`, `model`,
+  `start_task` tool (`name`, `brief`, `setup`, `profile`, `model`,
   `effort`, `reason`), which makes its worktree, runs `.agents/setup`
   there with `setup`, starts the task with `agent run`, and leaves no
   folder behind when that fails. While the lead has tasks still there, a

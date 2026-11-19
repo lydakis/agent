@@ -1100,8 +1100,10 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
     match name {
         crate::served::START => {
             let mut said = said("Started", field("name")?);
-            if let Some(title) = field("title").filter(|title| !title.is_empty()) {
-                said.under.push(Line::from(title.to_owned()).italic().dim());
+            // Its title: its brief's first line.
+            let title = crate::title::of_message(field("brief").unwrap_or_default());
+            if !title.is_empty() {
+                said.under.push(Line::from(title).italic().dim());
             }
             Some(said)
         }
@@ -1617,14 +1619,14 @@ Keep the rest.'"#,
         assert_eq!(
             call(
                 "start_task",
-                serde_json::json!({"name": "fix", "title": "Fix the sums", "brief": "Fix it.\nThen test."})
+                serde_json::json!({"name": "fix", "brief": "Fix the sums\nThen test."})
             ),
             "Started fix"
         );
-        // Under it, the task's title, never its brief.
+        // Under it, the task's title, its brief's first line, never the rest.
         let said = declared(
             "start_task",
-            &serde_json::json!({"name": "fix", "title": "Fix the sums", "brief": "Fix it."}),
+            &serde_json::json!({"name": "fix", "brief": "\nFix the sums\nRound half cents to even."}),
             false,
         )
         .unwrap();
