@@ -326,7 +326,7 @@ tries its held turns at once.
   `--approval-hold`, `--max-output-tokens`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
   folder), `--network`, `--trailer` (`sender`, `time`, both comma-separated, or `""` for no line), `--quiet-background`, `--hold`, `--unix-socket` (repeatable: an
-  absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
+  absolute socket, or folder of them, its commands reach), `--namespace` (the group its agent tools list and name the bots it makes in) and `--outputs` (made absolute; a new
   bot gets `outputs` beside the store without it); they are not daemon options,
   and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 

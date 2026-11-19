@@ -5714,7 +5714,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
             "compact_keep":25,"compact_tokens":null,"post_turn_compact_percent":70,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
-            "approval_policy":null,"steps_only":null})
+            "approval_policy":null,"steps_only":null,"namespace":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -23261,6 +23261,49 @@ fn schema_107_moves_instructions_out_of_the_row() {
     assert_eq!(rows, 2);
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+/// Schema 108: the group a bot's agent tools list and name bots in is its
+/// `namespace` setting. A bot made before keeps the group its name gave
+/// it, the name up to its first dot; a bot with none, or with a setting
+/// of its own, is left as it was.
+#[test]
+fn schema_108_keeps_each_bots_first_dot_group_as_its_namespace() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema108-namespace-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        for name in ["shop.lead", "shop.fix.look", "Bob", ".lookout"] {
+            db.create(name, Some("/synthetic"), binding()).unwrap();
+        }
+        let own = Binding {
+            settings: Settings {
+                namespace: Some("web".to_owned()),
+                ..Settings::default()
+            },
+            ..binding()
+        };
+        db.create("shop.web", Some("/synthetic"), own).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE bots SET settings=json_remove(settings,'$.namespace') WHERE name<>'shop.web';
+             PRAGMA user_version=107;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let namespace = |name: &str| db.inspect(name).unwrap().settings.namespace;
+    assert_eq!(namespace("shop.lead").as_deref(), Some("shop"));
+    assert_eq!(namespace("shop.fix.look").as_deref(), Some("shop"));
+    assert_eq!(namespace("shop.web").as_deref(), Some("web"));
+    assert_eq!(namespace("Bob"), None);
+    assert_eq!(namespace(".lookout"), None);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// A page of one bot's messages, as `messages` read them before it took a

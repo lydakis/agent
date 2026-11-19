@@ -12313,3 +12313,23 @@ A one-off store screen (release build, a file store, one group commit of
 `interrupt` does) then a plain submit, 74 to 81 µs. Replacing costs what
 withdrawing and sending already cost, plus one indexed read of the
 replaced message and a savepoint, within the rounds' spread.
+
+## A bot's namespace in place of its name's first dot (protocol 96)
+
+`list_agents` and `spawn_agent` read the caller's `namespace` setting,
+already in hand with its other settings, where they cut its name at the
+first dot: no store job is added or changed. Schema 108 gives each bot made
+before its name up to the first dot, one `UPDATE` of `bots`: on a store of
+10,001 bots (10,000 dotted), 21.6 ms once, at the first start after an
+upgrade (synthetic store, this container, 2026-11-19).
+
+Reading the reviewer's person's words with a `messages` read
+(`from: ["person"]`, `before`, `newest`, `words`) in place of `prompts`'
+`persons` budget was measured and kept out: one review round's reads took
+a median of 0.62 ms on main against 0.79 with a lead of 40 messages, and
+1.2 ms against 11.9 (daemon CPU 0.9 against 8.8 ms) with 10,000 bots and a
+lead of 20,000 messages, a 20th of them the person's. The reviewer looks at
+up to 256 of the person's messages and a `messages` row costs about 116,000
+instructions to build (`callgrind`), a third of it copying the finished page
+once more (`json!` over the `Vec`), where `prompts` reads ids and lengths and
+loads only the words that fit.
