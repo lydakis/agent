@@ -2349,6 +2349,30 @@ class ModelListTests(ModelFixture):
         self.assertIn('another one', refused.stderr)
         self.assertFalse(self.catalog.exists())
 
+    def test_the_config_s_speeds_and_windows_reach_a_bot_at_each_run(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        provider = f'provider = "fixture=responses,{self.url}"\n'
+        config.write_text(provider + '[speeds]\n"fixture/*" = ["ultrafast", "fast"]\n')
+
+        def settings():
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(self.state) + '.sock')
+                lines = s.makefile('rw')
+                lines.readline()
+                lines.write(json.dumps({'id': 1, 'op': 'inspect', 'bot': 'Bob'}) + '\n')
+                lines.flush()
+                record = next(m for m in map(json.loads, lines) if m.get('id') == 1)['result']
+                return record['settings']['speeds'], record['settings']['context_windows']
+
+        self.agent('run', *self.store, '--model', 'fixture/synthetic-model', '--new', '--bot', 'Bob', 'hello')
+        self.assertEqual(settings(), ({'fixture/*': ['fast', 'ultrafast']}, {}))
+        # Edited with the daemon up: the next run sends the file as it is
+        # now, for that turn, with no restart.
+        config.write_text(provider + '[context_windows]\n"fixture/*" = 40000\n')
+        self.agent('run', *self.store, '--bot', 'Bob', 'again')
+        self.assertEqual(settings(), ({}, {'fixture/*': 40000}))
+
     def test_a_provider_whose_key_is_not_set_does_not_stop_the_daemon(self):
         config = self.home / '.agent' / 'config.toml'
         config.parent.mkdir(exist_ok=True)

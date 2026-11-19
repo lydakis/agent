@@ -2210,8 +2210,15 @@ fn run(options: &Options) -> Result<i32> {
         // for the bot's next turn, as Sonny keeps its agents on them. Not
         // from inside a bot's turn, whose socket configures no bot.
         if std::env::var_os("AGENT_BOT_ID").is_none() {
-            let changed =
-                agent_client::config::model_tables_changed(&config()?, &record["settings"]);
+            // Against what it will have once the daemon takes a change kept
+            // for its turn's end, so a file put back undoes that one too.
+            let mut settings = record["settings"].clone();
+            if let Some(Value::Object(kept)) = record["configure_pending"].get("settings") {
+                for (name, value) in kept {
+                    settings[name] = value.clone();
+                }
+            }
+            let changed = agent_client::config::model_tables_changed(&config()?, &settings);
             if !changed.is_empty() {
                 connection.request(
                     "configure",
