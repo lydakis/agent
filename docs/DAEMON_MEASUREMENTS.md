@@ -12313,3 +12313,72 @@ A one-off store screen (release build, a file store, one group commit of
 `interrupt` does) then a plain submit, 74 to 81 µs. Replacing costs what
 withdrawing and sending already cost, plus one indexed read of the
 replaced message and a savepoint, within the rounds' spread.
+
+## Automations judged by their parts (#1207)
+
+A turn's end (`finish`) now denies a held step of a call a message lifted,
+which outlived its turn before. It looks for such steps, and for the steps of
+a yielded call that wait on, only when one of the turn's steps waits: every
+waiting step is in the store's in-memory list, so a turn with none (nearly
+every turn) runs neither query, where main ran the second one at every turn
+end. A client's `approve_step` naming one of the bot's own tools runs the
+same plan `run_step` does and writes one audit row; no screen sends one.
+
+The Perf workflow's matched screens on 75140fc against main (e83c185), two
+alternating rounds on one runner; the gate passed, store work per turn
+unchanged:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.330 | 0.335 | +1.5 |
+| lifecycle | p95 turn, ms | 573.7 | 574.0 | +0.1 |
+| lifecycle | peak RSS, MiB | 26.6 | 26.1 | -1.7 |
+| completion | release to terminal p99, ms | 6.49 | 6.59 | +1.5 |
+| admission | lone submit CPU, ms | 24.06 | 23.94 | -0.5 |
+| admission | burst submit p99, ms | 2.726 | 2.740 | +0.5 |
+| footprint | idle RSS, MiB | 17.5 | 17.4 | -0.5 |
+| footprint | per idle bot, KiB | 1.81 | 1.91 | +5.4 |
+| footprint | RSS after a turn each, MiB | 52.1 | 51.9 | -0.4 |
+| footprint | CPU per turn, ms | 0.679 | 0.661 | -2.5 |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 18.75 | +50.0 |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 4.37 | 4.32 | -1.3 |
+| sonny | quiet window CPU, ms/s | 0.38 | 0.57 | +50.0 |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | 0.0 |
+| sonny | sky replay CPU per 1k lines, ms | 7.75 | 7.65 | -1.4 |
+
+The two Sonny rows at +50% are one or two CPU ticks over a few seconds
+(10x1 sends 4,000 deltas to one lead, the quiet window draws nothing), in
+code this change does not touch (the lookout and the window); the gate
+warns only when the head's best run is worse than the base's worst, and it
+did not.
+
+## Speeds and context windows as bot settings (#1208)
+
+`[speeds]` and `[context_windows]` became bot settings that each turn
+reads, in place of the daemon's `--speeds` and `--context-window` flags.
+The tables are shared, not copied: a pattern table is one reference-counted
+slice, so a turn that shapes its provider for a faster speed takes the
+bot's `speeds` with a count bump, as main took the flag's table, and a
+turn at standard speed does not touch it. The window is looked up once a
+turn, as before.
+
+Main is f06b14a, and the change is the pull request's head on it, both
+release builds on the 4-CPU Linux container. The Perf workflow's four
+daemon screens ran alternately, base then head, two rounds, and
+`bench.perf_gate` compared the medians:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.40 | 43.53 | +0.3 |
+| admission | burst submit p99, ms | 5.56 | 5.24 | -5.8 |
+| completion | release to terminal p99, ms | 13.06 | 12.55 | -3.9 |
+| footprint | idle RSS, MiB | 17.64 | 17.33 | -1.7 |
+| footprint | per idle bot, KiB | 1.70 | 1.72 | +0.9 |
+| footprint | RSS after a turn each, MiB | 35.86 | 34.07 | -5.0 |
+| footprint | CPU per turn, ms | 0.97 | 0.93 | -4.1 |
+| lifecycle | CPU, s | 0.70 | 0.68 | -3.6 |
+| lifecycle | p95 turn, ms | 590.9 | 588.0 | -0.5 |
+| lifecycle | peak RSS, MiB | 27.01 | 26.72 | -1.1 |
+
+Store work per turn counted the same on both sides. Every move is inside
+the spread main shows against itself in the sections above.

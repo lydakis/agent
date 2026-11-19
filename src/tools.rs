@@ -99,6 +99,11 @@ pub fn direct_only(name: &str) -> Option<&'static str> {
     Tool::parse(name).and_then(Tool::direct_only)
 }
 
+/// Whether `name` is one of the daemon's own tools.
+pub fn is_daemon_tool(name: &str) -> bool {
+    Tool::parse(name).is_some()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
     Echo,
@@ -269,7 +274,7 @@ impl Tool {
                 "required":["to","message"],"additionalProperties":false}),
             ),
             Tool::ListAgents => (
-                "List bots by name: each one's status, running turn, what it waits on, workspace, model, the bot that made it (created_by), and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, the bots named as this one is up to its first dot. running=true lists only those with a turn running. approvals=true lists instead the calls of those bots waiting on a gate, each with its bot, turn, tool, the start of its arguments, and the tags it waits on. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next. Agents closed with close_agent are left out unless closed=true, which lists them too, each with closed_ms.",
+                "List bots by name: each one's status, running turn, what it waits on, workspace, model, the bot that made it (created_by), and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, the bots named as this one is up to its first dot. running=true lists only those with a turn running. approvals=true lists instead the calls of those bots waiting on a gate, each with its bot, turn, tool, the start of its arguments, the tags it waits on, and the handle of one that waits on in the background. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next. Agents closed with close_agent are left out unless closed=true, which lists them too, each with closed_ms.",
                 json!({"type":"object","properties":{
                 "name":{"type":"string","minLength":1,"maxLength":256},
                 "running":{"type":"boolean"},
