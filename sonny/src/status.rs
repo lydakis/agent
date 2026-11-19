@@ -50,8 +50,15 @@ pub struct Row {
     pub group: Group,
     /// The workflow run this row is, whose strip stands where an
     /// agent's state does.
-    pub run: Option<crate::workflow::view::Live>,
+    pub run: Option<Box<crate::workflow::view::Live>>,
+    /// Its line in [`tasks`], once made: a row kept from one count to the
+    /// next keeps it.
+    pub line: Option<Task>,
 }
+
+/// A task as a template note's `tasks()` gives it, shared by every listing
+/// of the tasks that holds it.
+pub type Task = std::sync::Arc<serde_json::Value>;
 
 /// Where a task stands, as `/status` groups the tasks, in its order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -141,19 +148,30 @@ pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
 /// each its name, agent, state, group (`needs_you`, `working`, `idle`,
 /// `done`), whether a turn runs, its pull request and latest step, and
 /// the agent that made it.
-pub fn tasks(rows: &[Row]) -> Vec<serde_json::Value> {
-    (rows.iter())
+pub fn tasks(rows: &mut [Row]) -> Vec<Task> {
+    (rows.iter_mut())
         .filter(|row| row.name != "lead")
         .map(|row| {
-            // Times that hold still while nothing changes: when its turn
-            // started, or ended, in seconds, which `| ago` keeps current;
-            // and how long its last turn took, once it is over.
-            serde_json::json!({"name": row.name, "agent": row.bot, "state": row.state,
-                "group": row.group.key(), "running": row.running, "pr": row.pr,
-                "latest": row.latest, "at": row.at.map(|ms| ms / 1000),
-                "seconds": row.seconds.filter(|_| !row.running), "maker": row.maker})
+            (row.line.get_or_insert_with(|| {
+                // Times that hold still while nothing changes: when its turn
+                // started, or ended, in seconds, which `| ago` keeps current;
+                // and how long its last turn took, once it is over.
+                std::sync::Arc::new(serde_json::json!({"name": row.name, "agent": row.bot,
+                    "state": row.state, "group": row.group.key(), "running": row.running,
+                    "pr": row.pr, "latest": row.latest, "at": row.at.map(|ms| ms / 1000),
+                    "seconds": row.seconds.filter(|_| !row.running), "maker": row.maker}))
+            }))
+            .clone()
         })
         .collect()
+}
+
+/// Whether two listings of the tasks say the same: a task either holds is
+/// compared only where the two do not share it.
+pub fn same_tasks(one: &[Task], other: &[Task]) -> bool {
+    one.len() == other.len()
+        && (one.iter().zip(other))
+            .all(|(one, other)| std::sync::Arc::ptr_eq(one, other) || one == other)
 }
 
 /// The pull request `text` links last, as `owner/repo#N`: a GitHub pull
@@ -543,7 +561,7 @@ pub struct Own {
     pub group: Group,
     /// Its helpers' groups: each agent whose line of makers leads to it.
     pub helpers: Vec<Group>,
-    pub run: Option<crate::workflow::view::Live>,
+    pub run: Option<Box<crate::workflow::view::Live>>,
 }
 
 /// The tasks among `rows` that `bot` made and that need the person,
@@ -616,7 +634,7 @@ pub fn own_lines(own: &[Own], width: usize) -> Vec<(Line<'static>, Option<String
             // that has not ended works.
             let run = crate::workflow::view::Live {
                 phase: String::new(),
-                ..run.clone()
+                ..(**run).clone()
             };
             spans = vec![Span::raw(" "), mark("working")];
             spans.extend(run_spans(&run, width, &spans.clone(), None));
@@ -1091,7 +1109,7 @@ mod tests {
             running: true,
             seconds: Some(19),
             group: Group::Working,
-            run: Some(Live {
+            run: Some(Box::new(Live {
                 name: "blind-role-eval-score".into(),
                 phase: "Score".into(),
                 phases: vec![
@@ -1112,7 +1130,7 @@ mod tests {
                     ),
                 ],
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert_eq!(
@@ -1486,7 +1504,7 @@ mod tests {
                 state: "Score · 2 working, 3 finished".into(),
                 maker: "calc.lead".into(),
                 group: Group::Working,
-                run: Some(Live {
+                run: Some(Box::new(Live {
                     name: "blind-role-eval-score".into(),
                     phase: "Score".into(),
                     phases: vec![
@@ -1506,7 +1524,7 @@ mod tests {
                         ),
                     ],
                     ..Default::default()
-                }),
+                })),
                 ..Row::default()
             },
         ];
@@ -1571,7 +1589,7 @@ mod tests {
             ..row("sub", "done", Group::Done)
         };
         let lead = row("lead", "working", Group::Working);
-        let tasks = tasks(&[lead, working, done]);
+        let tasks = tasks(&mut [lead, working, done]);
         assert_eq!(tasks.len(), 2, "the lead is not a task");
         assert_eq!(
             (tasks[0]["at"].as_u64(), tasks[0]["seconds"].as_u64()),

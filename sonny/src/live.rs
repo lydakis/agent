@@ -330,7 +330,9 @@ mod tests {
 
     fn blanks() -> Blanks {
         Blanks {
-            tasks: Arc::new(vec![json!({"name": "calc.add", "state": "working"})]),
+            tasks: Arc::new(vec![Arc::new(
+                json!({"name": "calc.add", "state": "working"}),
+            )]),
             ..Default::default()
         }
     }
