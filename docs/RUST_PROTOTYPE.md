@@ -2728,8 +2728,7 @@ one person's agents. The reading
 view removes insignificant JSON whitespace from multiline provider items so
 each occupies one JSONL record. Single-line items need no whitespace rewrite;
 whitespace inside text strings remains intact. Pages
-contain at most 64 KiB of text. Optional `limit` (4–65,536 bytes) requests a
-smaller page.
+contain at most 64 KiB of text; the tool takes no size argument.
 The runtime also limits the encoded tool result, including escaping and page
 metadata, to half the input-byte allowance remaining after the current turn
 and its mandatory prefix (summary and bare omission notice).
