@@ -6048,6 +6048,10 @@ struct Latest {
     first: Option<String>,
 }
 
+/// What `esc` puts back when it drops a find in `/status`: the pick, the
+/// helpers shown and the folds open.
+type StatusBefore = (Option<usize>, Vec<String>, Vec<status::Group>);
+
 /// `/status` in the pane, its timers ticking and its rows read again
 /// every two seconds, until Esc.
 struct Watch {
@@ -6099,7 +6103,7 @@ struct Watch {
     drawn: std::cell::RefCell<Option<(CardFrom, Card)>>,
     /// `ctrl+f` in `/status`: what is typed narrows its rows; `esc` puts
     /// back the pick and the helpers shown as they were.
-    finding: Option<find::Find<(Option<usize>, Vec<String>, Vec<status::Group>)>>,
+    finding: Option<find::Find<StatusBefore>>,
 }
 
 /// `/status`'s card: its lines, whether a group folds, and the marks the
