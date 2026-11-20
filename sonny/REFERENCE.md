@@ -2403,7 +2403,11 @@ plan. A click on a row, or `enter` with it picked, goes to its agent.
 While Projects is open, the pane draws the picked project's agents the
 same way, with no row on the band.
 
-![The project's agents above the margin at 150, 120, 60 and 44 columns, from the lead's window and from a task's](../docs/sonny/margin-agents.png)
+![The project's agents above the margin at 150, 120, 60 and 44 columns, from the lead's window, from a task's and with Projects open, in a dark theme](../docs/sonny/margin-agents.png)
+
+![The same in a light theme](../docs/sonny/margin-agents-light.png)
+
+![The same with NO_COLOR: the agent you are on is its bold alone](../docs/sonny/margin-agents-no-color.png)
 
 The notes are kept by agent in
 `~/.agent/sonny/margin/`, with the newest node of the agent's history they

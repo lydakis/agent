@@ -2306,15 +2306,15 @@ mod tests {
         assert!(marks.contains(&(lead_row, Mark::Link(format!("{BUTTON}task/calc.lead")))));
         // A count that moves no row here (an idle agent's, a done one's)
         // draws nothing again; a row that moved does.
-        let drawn = margin.changes;
+        let changed = margin.changes;
         let mut counted = agents(vec![lead(), halves()]);
         counted.counts.idle = 4;
         margin.set_agents(counted, "calc.halves");
-        assert_eq!(margin.changes, drawn);
+        assert_eq!(margin.changes, changed);
         let mut moved = agents(vec![lead(), halves()]);
         moved.listed[1].state = "needs you".into();
         margin.set_agents(moved, "calc.halves");
-        assert_eq!(margin.changes, drawn + 1);
+        assert_eq!(margin.changes, changed + 1);
         // No task going: the plan and notes alone, drawn again.
         margin.set_agents(agents(vec![lead()]), "calc.lead");
         let text = drawn(&mut margin, Path::new("/"));
