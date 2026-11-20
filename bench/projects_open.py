@@ -158,6 +158,7 @@ def main():
         cpu = cpu_seconds(window.pid)
         time.sleep(10)
         result['closed_idle_cpu_pct'] = round((cpu_seconds(window.pid) - cpu) * 10, 2)
+        result['rss_idle_mib'] = round(rss_mib(window.pid), 1)
         # Another window, as `/switch` or `enter` on a project makes one (a
         # new process): its first open.
         window.close()

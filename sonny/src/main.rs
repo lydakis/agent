@@ -1267,7 +1267,7 @@ async fn read_projects(
                 state.each.insert(lead.name.clone(), read);
             }
         }
-        // What a window kept of its agents' histories, taken once.
+        // What a window kept of its agents' histories, where this holds none.
         if state.taken.insert(lead.name.clone())
             && theirs
                 .iter()
@@ -1321,17 +1321,20 @@ async fn read_projects(
         // What it read of histories, kept for the lead's window and the
         // next page in any window, as `/status` keeps its own: once the
         // project is quiet, not at each read while one of its agents runs.
+        // A quiet project's reads are let go here, as it is not read again
+        // until it moves: then taken again from beside the store.
         if read.as_ref().is_ok_and(|read| read.fresh) {
             state.unkept.insert(lead.name.clone());
         }
-        if keeps
-            && read.as_ref().is_ok_and(|read| read.whole)
-            && state.unkept.remove(&lead.name)
-        {
-            to_keep.push((lead.name.clone(), read_here.clone(), seen_here.clone()));
+        if keeps && read.as_ref().is_ok_and(|read| read.whole) {
+            state.taken.remove(&lead.name);
+            if state.unkept.remove(&lead.name) {
+                to_keep.push((lead.name.clone(), read_here, seen_here));
+            }
+        } else {
+            state.latest.extend(read_here);
+            state.seen.extend(seen_here);
         }
-        state.latest.extend(read_here);
-        state.seen.extend(seen_here);
         let Ok(read) = read else {
             return None;
         };
