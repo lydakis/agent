@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthStr;
 pub const IDLE_AFTER_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// A project as the page lists it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     /// Its lead, which `enter` goes to, by its own name.
     pub lead: String,
@@ -181,6 +181,11 @@ impl View {
         if !kept {
             self.pick = shown.first().map(|row| self.pick_of(*row));
         }
+    }
+
+    /// The projects as last read, taken as the page closes, to be kept.
+    pub fn take_projects(&mut self) -> Vec<Project> {
+        std::mem::take(&mut self.projects)
     }
 
     #[cfg(test)]
