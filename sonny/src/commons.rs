@@ -2618,33 +2618,73 @@ impl View {
     /// and scroll where none is left that way; `→` or `enter` follows the
     /// picked link.
     fn thread_key(&mut self, code: KeyCode, in_view: std::ops::Range<usize>) -> Key {
-        let Some(Page::Thread { link, links, .. }) = self.pages.last_mut() else {
-            return Key::Stay;
-        };
         match code {
-            KeyCode::Up | KeyCode::Down => {
-                let down = code == KeyCode::Down;
-                let shown: Vec<usize> = (0..links.len())
-                    .filter(|&at| in_view.contains(&links[at].0))
-                    .collect();
-                let next = match (*link, down) {
-                    (Some(at), true) => shown.iter().copied().find(|&s| s > at),
-                    (Some(at), false) => shown.iter().copied().rev().find(|&s| s < at),
-                    (None, true) => shown.first().copied(),
-                    (None, false) => shown.last().copied(),
-                };
-                match next {
-                    Some(at) => *link = Some(at),
-                    None => return Key::Scroll(!down),
-                }
-                Key::Stay
-            }
+            KeyCode::Up | KeyCode::Down => self.step_link(code == KeyCode::Down, in_view, None),
             KeyCode::Right | KeyCode::Enter => {
+                let Some(Page::Thread { link, links, .. }) = self.pages.last() else {
+                    return Key::Stay;
+                };
                 let target = link.and_then(|at| links.get(at)).map(|l| l.3.clone());
                 self.follow(target)
             }
             _ => Key::Stay,
         }
+    }
+
+    /// An arrow on a thread's page, with `posts` the screen it is drawn
+    /// on: see [`View::step_link`].
+    pub fn arrow(&mut self, down: bool, posts: &mut crate::screen::Screen) -> Key {
+        let in_view = posts.in_view();
+        self.step_link(down, in_view, Some(posts))
+    }
+
+    /// The pick moved down or up a thread's page. Its head's links and
+    /// the links its posts hold (`posts`, the screen's own) are one run,
+    /// the head's above: the pick goes to the next link that way in view,
+    /// whichever holds it, so one link is picked at a time and `enter`
+    /// follows that one; where none is left that way, the view scrolls.
+    fn step_link(
+        &mut self,
+        down: bool,
+        in_view: std::ops::Range<usize>,
+        mut posts: Option<&mut crate::screen::Screen>,
+    ) -> Key {
+        let Some(Page::Thread { link, links, .. }) = self.pages.last_mut() else {
+            return Key::Stay;
+        };
+        let shown: Vec<usize> = (0..links.len())
+            .filter(|&at| in_view.contains(&links[at].0))
+            .collect();
+        let in_posts = posts.as_ref().is_some_and(|s| s.picked_link().is_some());
+        if in_posts && let Some(screen) = posts.as_deref_mut() {
+            if screen.pick_link(down, false) {
+                return Key::Stay;
+            }
+            // Up past a post's first link: the head's last.
+            if !down && let Some(&at) = shown.last() {
+                screen.unpick_link();
+                *link = Some(at);
+                return Key::Stay;
+            }
+            return Key::Scroll(!down);
+        }
+        let mut post =
+            |down: bool| (posts.as_deref_mut()).is_some_and(|s| s.pick_link(down, false));
+        let next = match (*link, down) {
+            (Some(at), true) => shown.iter().copied().find(|&s| s > at),
+            (Some(at), false) => shown.iter().copied().rev().find(|&s| s < at),
+            (None, true) => shown.first().copied(),
+            // Nothing picked, up: the lowest link in view, a post's first.
+            (None, false) if post(false) => return Key::Stay,
+            (None, false) => shown.last().copied(),
+        };
+        match next {
+            Some(at) => *link = Some(at),
+            // Down past the head's last link: a post's first.
+            None if down && post(true) => *link = None,
+            None => return Key::Scroll(!down),
+        }
+        Key::Stay
     }
 
     /// Open what a link targets: a board as its page, an item as its

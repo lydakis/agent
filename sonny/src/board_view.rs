@@ -1146,6 +1146,71 @@ mod tests {
     }
 
     #[test]
+    fn the_arrows_pass_from_the_head_s_links_to_a_post_s_and_enter_follows_the_one_picked() {
+        let home = &commons("post-links");
+        // Sent twice: the first shows the lead the posts it missed.
+        for _ in 0..2 {
+            crate::commons::call(
+                home,
+                "shop.lead",
+                None,
+                "shop.lead",
+                None,
+                Some("shop"),
+                &json!({"reply": {"thread": "api", "text": "See [the spec](https://spec.example/errors)."}}),
+            )
+            .unwrap();
+        }
+        let mut view = View::open(home, "shop".into());
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Enter);
+        while !picked(&mut view, 80).contains("Add typed errors to the api") {
+            press(&mut view, KeyCode::Down);
+        }
+        press(&mut view, KeyCode::Enter);
+        // The page as the pane lays it: the post's link is the screen's.
+        let mut screen = crate::screen::Screen::default();
+        for line in view.card(80).0 {
+            match text(&line).contains("the spec") {
+                true => screen.push_linked(line, "https://spec.example/errors".into()),
+                false => screen.push(vec![line]),
+            }
+        }
+        let area = ratatui::layout::Rect::new(0, 0, 80, 40);
+        screen.render(area, &mut ratatui::buffer::Buffer::empty(area), |_| None);
+        let reversed = |view: &mut View| {
+            let (lines, _) = view.card(80);
+            (lines.iter().flat_map(|l| &l.spans))
+                .filter(|s| (s.style.add_modifier).contains(ratatui::style::Modifier::REVERSED))
+                .map(|s| s.content.to_string())
+                .collect::<Vec<_>>()
+        };
+        // The board, the holder, then the post's link: one pick at a time.
+        assert_eq!(view.arrow(true, &mut screen), crate::commons::Key::Stay);
+        assert_eq!(reversed(&mut view), ["shop/typed-errors"]);
+        view.arrow(true, &mut screen);
+        assert_eq!(reversed(&mut view), ["errors-2"]);
+        assert_eq!(screen.picked_link(), None);
+        assert_eq!(view.arrow(true, &mut screen), crate::commons::Key::Stay);
+        assert_eq!(screen.picked_link(), Some("https://spec.example/errors"));
+        assert!(reversed(&mut view).is_empty(), "{:?}", reversed(&mut view));
+        // Enter leaves the page's own links alone: the post's link is
+        // the one followed.
+        assert_eq!(press(&mut view, KeyCode::Enter), crate::commons::Key::Stay);
+        assert_eq!(view.depth(), 2);
+        // None left down the page: it scrolls. Up again is the holder.
+        assert_eq!(
+            view.arrow(true, &mut screen),
+            crate::commons::Key::Scroll(false)
+        );
+        assert_eq!(screen.picked_link(), Some("https://spec.example/errors"));
+        view.arrow(false, &mut screen);
+        assert_eq!(screen.picked_link(), None);
+        assert_eq!(reversed(&mut view), ["errors-2"]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn a_closing_post_shows_its_text_and_a_takeover_says_so() {
         let home = &commons("closing");
         let mut view = View::open(home, "shop".into());

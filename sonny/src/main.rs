@@ -16961,15 +16961,21 @@ impl App {
                     KeyCode::Left if key.modifiers.is_empty() && view.left_ends() => {
                         self.left_ends()
                     }
+                    // A thread's page: its head's links and its posts' are
+                    // one run of picks, as Lynx moves among a page's links.
+                    KeyCode::Up | KeyCode::Down | KeyCode::Char('k' | 'j')
+                        if reading
+                            && !(key.modifiers)
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
+                        if let commons::Key::Scroll(up) = view.arrow(down, &mut pane.screen) {
+                            pane.screen.scroll(if up { 1 } else { -1 });
+                        }
+                    }
                     _ => match view.key(*key, pane.screen.in_view()) {
                         commons::Key::Close => self.close_pane(true),
-                        // No link of the page's own that way: a link a
-                        // post holds, as Lynx picks, else a row.
-                        commons::Key::Scroll(up) => {
-                            if !pane.screen.pick_link(!up, false) {
-                                pane.screen.scroll(if up { 1 } else { -1 });
-                            }
-                        }
+                        commons::Key::Scroll(up) => pane.screen.scroll(if up { 1 } else { -1 }),
                         commons::Key::Open(url) => self.follow(&url),
                         commons::Key::Stay if view.depth() != depth => {
                             // A page opened or left starts at its top, or

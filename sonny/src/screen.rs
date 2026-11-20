@@ -995,6 +995,12 @@ impl Screen {
         }
     }
 
+    /// No link picked from the keys: the pick has moved to a link the
+    /// screen does not hold.
+    pub fn unpick_link(&mut self) {
+        self.link_pick = None;
+    }
+
     /// The address of the link picked from the keys, while it is in view.
     pub fn picked_link(&self) -> Option<&str> {
         let (row, _, url) = self.link_pick.as_ref()?;
