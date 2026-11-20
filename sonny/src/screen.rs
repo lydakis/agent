@@ -995,6 +995,12 @@ impl Screen {
         }
     }
 
+    /// No link picked from the keys: the pick has moved to a link the
+    /// screen does not hold.
+    pub fn unpick_link(&mut self) {
+        self.link_pick = None;
+    }
+
     /// The address of the link picked from the keys, while it is in view.
     pub fn picked_link(&self) -> Option<&str> {
         let (row, _, url) = self.link_pick.as_ref()?;
@@ -1010,6 +1016,9 @@ impl Screen {
         *self = Self {
             area: self.area,
             clicks: self.clicks.take(),
+            // Kept while the next draw finds the same link where it was,
+            // as a card drawn again with only its own pick moved does.
+            link_pick: self.link_pick.take(),
             ..Self::default()
         };
         self.push_marked(lines, marks);
@@ -1479,15 +1488,19 @@ impl Screen {
     /// changed.
     fn wrap(&mut self, width: usize) {
         if width != self.width {
+            // Laid again at another width, the rows a picked link was on
+            // are gone: it is picked again from the keys, never followed
+            // from where it was. Lines just replaced were laid at none: the
+            // draw keeps a pick only where its link still is.
+            if self.width != 0 {
+                self.link_pick = None;
+            }
             self.width = width;
             self.shown.clear();
             self.wrapped = 0;
             self.relaid = 0;
             self.selection = None;
             self.linked = None;
-            // Laid again, the rows a picked link was on are gone: it is
-            // picked again from the keys, never followed from where it was.
-            self.link_pick = None;
             self.laid += 1;
         }
         let before = self.shown.len();
@@ -1910,6 +1923,16 @@ impl Screen {
         if self.linked != Some((top, bottom, self.width, area)) {
             self.linked = Some((top, bottom, self.width, area));
             self.links = self.find_links(drawn, &file);
+            // A link picked from the keys and in view stays picked only
+            // where a link to the same place is still drawn.
+            if let Some((row, from, url)) = &self.link_pick
+                && (top..bottom).contains(row)
+                && !(self.links.iter()).any(|(y, f, _, u)| {
+                    top + usize::from(y - area.y) == *row && f == from && u == url
+                })
+            {
+                self.link_pick = None;
+            }
         }
         // The link picked from the keys, reversed as a list's pick is.
         if let Some((row, from, _)) = &self.link_pick
