@@ -31,43 +31,62 @@ pub use db::{
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 
-/// The WAL's checkpoints, off the writer: a thread takes the writer's
-/// asks, one at a time, each counted as the `checkpoint` operation from
-/// when it was asked for. Asks made while one runs become the next. It
-/// ends once the writer's connection, which holds the asking end, closes.
-/// The writer's own checkpoints are counted as `writer_checkpoint`, and
-/// what every checkpoint found is kept for `stats`.
+/// The WAL's checkpoints, off the writer, on the reader pool: once it is
+/// open, each of the writer's asks queues one checkpoint as a read, which
+/// the next free reader runs on its own connection, so no thread or
+/// connection is kept for them. Asks made while one waits are that one;
+/// once it starts, the next ask queues another. Each is counted as the
+/// `checkpoint` operation from when it was asked for. With no room in the
+/// queue the ask is dropped, and the writer checkpoints itself as the log
+/// grows, as SQLite would have. The writer's own checkpoints are counted
+/// as `writer_checkpoint`, and what every checkpoint found is kept for
+/// `stats`.
 fn checkpoints(
-    path: &Path,
     db: &mut Database,
+    pool: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<Pool>>>,
     counters: std::sync::Arc<Counters>,
-) -> Result<std::thread::JoinHandle<()>> {
-    let checkpointer = db::Checkpointer::new(path);
-    let running = checkpointer.running();
-    let (log, own_log, own_counters) =
-        (counters.log.clone(), counters.log.clone(), counters.clone());
-    let (ask, asked) = std::sync::mpsc::sync_channel::<std::time::Instant>(1);
-    let thread = std::thread::Builder::new()
-        .name("agent-storage-checkpoint".into())
-        .spawn(move || {
-            while let Ok(queued) = asked.recv() {
-                let started = std::time::Instant::now();
-                let found = checkpointer.checkpoint();
-                if let Ok((frames, copied)) = found {
-                    log.note(frames, copied);
-                }
-                counters.record("checkpoint", queued, started, found.is_err());
-            }
-        })?;
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let running = std::sync::Arc::<std::sync::Mutex<()>>::default();
+    let held = running.clone();
+    let (own_log, own_counters) = (counters.log.clone(), counters.clone());
+    let queued = std::sync::Arc::new(AtomicBool::new(false));
     db.checkpoint_aside(
         running,
         own_log,
         move || {
-            let _ = ask.try_send(std::time::Instant::now());
+            let Some(pool) = pool.get() else {
+                return;
+            };
+            if queued.swap(true, SeqCst) {
+                return;
+            }
+            let Ok(place) = pool.room.clone().try_acquire_owned() else {
+                queued.store(false, SeqCst);
+                return;
+            };
+            let asked = std::time::Instant::now();
+            let (queued, counters, running) = (queued.clone(), counters.clone(), held.clone());
+            pool.push(
+                Box::new(move |db: &Database| {
+                    queued.store(false, SeqCst);
+                    let started = std::time::Instant::now();
+                    let found = {
+                        let _running = running.lock().unwrap_or_else(|e| e.into_inner());
+                        db.checkpoint()
+                    };
+                    if let Ok((frames, copied)) = found
+                        && frames >= 0
+                    {
+                        counters.log.note(frames, copied);
+                    }
+                    counters.record("checkpoint", asked, started, found.is_err());
+                }),
+                place,
+            );
         },
         move |started, failed| own_counters.record("writer_checkpoint", started, started, failed),
-    )?;
-    Ok(thread)
+    )
 }
 
 /// The store's main file readable and writable by its owner alone, made so
@@ -776,16 +795,15 @@ impl Store {
         // Said once the owner lock is held, so a wait for it is bounded
         // here while the store's own opening, a migration perhaps, is not.
         let (locked, held) = oneshot::channel::<()>();
+        // The reader pool, once open, where the writer's checkpoints go.
+        let checkpoint_pool =
+            std::sync::Arc::<std::sync::OnceLock<std::sync::Arc<Pool>>>::default();
+        let worker_pool = checkpoint_pool.clone();
         std::thread::Builder::new()
             .name("agent-storage".into())
             .spawn(move || {
                 #[allow(clippy::type_complexity)]
-                let opened: Result<(
-                    Database,
-                    File,
-                    std::path::PathBuf,
-                    std::thread::JoinHandle<()>,
-                )> = (|| {
+                let opened: Result<(Database, File, std::path::PathBuf)> = (|| {
                     if let Some(parent) = path.parent() {
                         // A folder made here is the daemon's user's alone;
                         // one that exists keeps the mode its maker gave it.
@@ -854,11 +872,11 @@ impl Store {
                     }
                     owner_only(&path)?;
                     let mut db = Database::initialize(Connection::open(&path)?)?;
-                    let checkpoints = checkpoints(&path, &mut db, worker_counters.clone())?;
-                    Ok((db, lock, path, checkpoints))
+                    checkpoints(&mut db, worker_pool, worker_counters.clone())?;
+                    Ok((db, lock, path))
                 })();
                 match opened {
-                    Ok((mut db, _lock, path, checkpoints)) => {
+                    Ok((mut db, _lock, path)) => {
                         let mut watermark = match db.last_event_id() {
                             Ok(id) => id,
                             Err(error) => {
@@ -956,11 +974,8 @@ impl Store {
                                 publisher.blocking_send(publication).is_ok()
                             });
                         }
-                        // The writer's connection holds the checkpointer's
-                        // asking end: closed, it lets the checkpointer go,
-                        // which ends before the owner lock does.
+                        // Closed before the owner lock is let go.
                         drop(db);
-                        let _ = checkpoints.join();
                     }
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -1027,6 +1042,8 @@ impl Store {
         opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
+        // From here the writer's checkpoints go to the readers.
+        let _ = checkpoint_pool.set(pool.clone());
         let reader = std::sync::Arc::new(ReadQueue(pool));
         Ok((
             Self {

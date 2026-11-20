@@ -2331,20 +2331,20 @@ full-flush settings.
 Checkpoints run beside the writer, not in a commit. SQLite's own automatic
 checkpoint runs on the connection that committed, right after the commit,
 with two syncs every job queued behind that group waits for. Instead the
-writer asks a checkpoint thread, on a connection it opens for each one, to
-checkpoint (PASSIVE) each time the log grows by 1,000 pages, SQLite's own
-default. The log starts over only once a checkpoint has copied all of it
+writer queues a checkpoint (PASSIVE) on the reader pool each time the log
+grows by 1,000 pages, SQLite's own default; the next free reader runs it
+on its own connection, so no thread or connection is kept for it. The log starts over only once a checkpoint has copied all of it
 back, which one beside a busy writer may never do, so past 4,000 pages the
 writer checkpoints itself, as SQLite would have, and the next commit starts
-the log over; turned away while the thread runs, it asks the thread to go
-on. Past 64,000 pages it first waits out the thread's checkpoint. That is
+the log over; turned away while a reader's runs, it asks for another.
+Past 64,000 pages it first waits out the reader's checkpoint. That is
 pressure, not a bound: a reader keeps every frame after its snapshot in
 the log, however long it grows. A checkpoint that copies nothing new while
 frames are left found the log pinned by such a reader, and none gets
 further until it moves on, so the asks and the writer's own tries then
 wait for twice the growth each time, back to every 1,000 pages once one
 moves. `stats` reports `checkpoints`: `log_frames` and `copied_frames` at
-the last checkpoint, and how many found the log `pinned`; the thread's
+the last checkpoint, and how many found the log `pinned`; the readers'
 checkpoints are the `checkpoint` operation and the writer's own
 `writer_checkpoint`, each with its time.
 

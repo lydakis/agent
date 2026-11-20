@@ -2716,11 +2716,11 @@ pub const CHECKPOINT_PAGES: std::os::raw::c_int = 1000;
 /// back to.
 pub const CHECKPOINT_HELD: std::os::raw::c_int = 4 * CHECKPOINT_PAGES;
 /// The WAL pages after a commit past which the writer first waits out a
-/// checkpoint the checkpointer is running, so its own is not turned away:
+/// checkpoint a reader is running, so its own is not turned away:
 /// about 256 MiB. Pressure, not a bound: a reader that keeps its snapshot
 /// keeps every frame after it in the log, however long the log grows.
 pub const CHECKPOINT_PRESSED: std::os::raw::c_int = 64 * CHECKPOINT_PAGES;
-/// What the log's checkpoints found, the writer's and the checkpointer's:
+/// What the log's checkpoints found, the writer's and the readers':
 /// the frames in the log and those copied back at the last one, and how
 /// many copied nothing new while frames were left, because a reader still
 /// reads a snapshot they come after.
@@ -2759,44 +2759,6 @@ impl LogState {
         use std::sync::atomic::Ordering::Relaxed;
         json!({"log_frames": self.log.load(Relaxed), "copied_frames": self.copied.load(Relaxed),
             "pinned": self.pinned_count.load(Relaxed)})
-    }
-}
-/// Checkpoints of the WAL beside the writer, on a thread of their own, so
-/// a checkpoint's syncs hold no commit. PASSIVE, as SQLite's automatic
-/// checkpoint is: it copies back what no reader still needs and waits for
-/// no one; the writer goes on appending meanwhile. Each opens a connection
-/// for itself and closes it after, so an idle store holds none.
-pub struct Checkpointer {
-    path: std::path::PathBuf,
-    /// Held while a checkpoint runs, so the writer can wait one out.
-    running: Arc<std::sync::Mutex<()>>,
-}
-impl Checkpointer {
-    pub fn new(path: &std::path::Path) -> Self {
-        Self {
-            path: path.to_owned(),
-            running: Arc::default(),
-        }
-    }
-    /// What a checkpoint holds while it runs.
-    pub fn running(&self) -> Arc<std::sync::Mutex<()>> {
-        self.running.clone()
-    }
-    /// Checkpoint the WAL as far as its readers allow, answering the
-    /// frames in the log and those copied back.
-    pub fn checkpoint(&self) -> Result<(i64, i64)> {
-        let _running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = Connection::open(&self.path)?;
-        // Synced as the writer's own checkpoint was: the WAL before its
-        // pages are copied back, the database after, flushing the drive
-        // on macOS. It reads through no page cache of its own.
-        conn.execute_batch(&format!(
-            "PRAGMA synchronous=FULL; PRAGMA checkpoint_fullfsync=ON;
-            PRAGMA cache_size=-64; PRAGMA journal_size_limit={WAL_KEPT};"
-        ))?;
-        Ok(conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
-            Ok((r.get(1)?, r.get(2)?))
-        })?)
     }
 }
 /// Plans that don't depend on bound values: SQLite's query planner
@@ -3811,14 +3773,16 @@ impl Database {
 
     /// A second connection that only reads. The writer owns the file, its
     /// lock, migration, and recovery; this one sees a job's writes once that
-    /// job is answered and never takes the write lock. It can still run the
-    /// checkpoint SQLite makes when the last connection closes, so it syncs
-    /// checkpoints the way the writer does.
+    /// job is answered and never takes the write lock. It runs the
+    /// checkpoints the writer asks for, and the one SQLite makes when the
+    /// last connection closes, so it syncs checkpoints the way the writer
+    /// does.
     pub fn reader(conn: Connection, shared: Arc<Shared>) -> Result<Self> {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
         conn.execute_batch(&format!(
-            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;
+            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA synchronous=FULL;
+            PRAGMA checkpoint_fullfsync=ON;
             PRAGMA journal_size_limit={WAL_KEPT};"
         ))?;
         Ok(Self {
@@ -3843,11 +3807,40 @@ impl Database {
         })
     }
 
+    /// Checkpoint the WAL as far as the other readers allow, as SQLite's
+    /// automatic checkpoint does (PASSIVE), answering the frames in the log
+    /// and those copied back; both -1 when the writer's own checkpoint
+    /// holds the log. On a reader connection, which syncs the WAL before
+    /// its pages are copied back and the database after, flushing the
+    /// drive on macOS, as the writer's own checkpoint did. It reads no
+    /// page through the reader's cache.
+    pub fn checkpoint(&self) -> Result<(i64, i64)> {
+        let (mut log, mut copied) = (0, 0);
+        // SAFETY: the handle is this live connection's, used on its own
+        // thread, and the outputs are locals that outlive the call.
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_wal_checkpoint_v2(
+                self.conn.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_CHECKPOINT_PASSIVE,
+                &mut log,
+                &mut copied,
+            )
+        };
+        match code {
+            rusqlite::ffi::SQLITE_OK => Ok((log.into(), copied.into())),
+            rusqlite::ffi::SQLITE_BUSY => Ok((-1, -1)),
+            code => {
+                Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into())
+            }
+        }
+    }
+
     /// Ask `ask` for a checkpoint each time the WAL grows by
     /// [`CHECKPOINT_PAGES`], in place of SQLite's own, which runs the
     /// checkpoint on this connection right after the commit: two syncs,
     /// and every job queued behind that group would wait for them. A
-    /// [`Checkpointer`] on its own connection takes the ask. While a reader
+    /// reader connection takes the ask ([`Database::checkpoint`]). While a reader
     /// keeps the log from starting over, the commits after an ask add
     /// little to copy back, so they ask nothing until the log has grown as
     /// much again: as often as SQLite's own would have run.
@@ -3857,8 +3850,8 @@ impl Database {
     /// commits keep coming faster than it syncs. Past [`CHECKPOINT_HELD`]
     /// pages the writer checkpoints itself, as SQLite would have: nothing
     /// is appended meanwhile, so it copies back the whole log and the next
-    /// commit starts it over. While the checkpointer runs that is turned
-    /// away, so it asks the checkpointer to run again and the next commit
+    /// commit starts it over. While a reader's runs that is turned
+    /// away, so it asks for another and the next commit
     /// tries again; past [`CHECKPOINT_PRESSED`] the writer first waits out
     /// the checkpoint `running` holds. `own` is told how long each of the
     /// writer's own checkpoints took, and whether it failed.
@@ -3904,7 +3897,7 @@ impl Database {
                             };
                             own_at = pages.saturating_add(own_step);
                         }
-                        // The checkpointer is running: ask it to go on once
+                        // A reader's is running: ask for another once
                         // it is done, so on a disk slower than the commits
                         // it keeps checkpointing and the writer seldom
                         // syncs. Not while the log is pinned, where it
