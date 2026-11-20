@@ -54,8 +54,7 @@ impl Project {
     }
 
     fn found(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        self.title.to_lowercase().contains(&query) || self.name.to_lowercase().contains(&query)
+        crate::find::says(query, &self.title) || crate::find::says(query, &self.name)
     }
 }
 
@@ -108,8 +107,9 @@ pub struct View {
     pick: Option<Pick>,
     /// Whether the idle projects are listed in place of their fold.
     fold_open: bool,
-    /// What `ctrl+f` narrows the rows to, while finding.
-    pub finding: Option<String>,
+    /// What `ctrl+f` narrows the rows to, while finding, and the pick
+    /// as it was before.
+    pub finding: Option<crate::find::Find<Option<Pick>>>,
     /// Whether a read landed: until then the page says `reading…`.
     pub read: bool,
     /// The first row in view, kept so the pick stays in view.
@@ -242,7 +242,10 @@ impl View {
     pub fn shown(&self, now: u64) -> Vec<Shown> {
         let holders = self.holders();
         let idle = self.idle(now);
-        let keep: Vec<bool> = match self.finding.as_deref().filter(|q| !q.is_empty()) {
+        let keep: Vec<bool> = match (self.finding.as_ref())
+            .map(|find| find.query.as_str())
+            .filter(|q| !q.is_empty())
+        {
             Some(query) => {
                 let mut keep: Vec<bool> = self.projects.iter().map(|p| p.found(query)).collect();
                 for at in 0..self.projects.len() {
@@ -341,24 +344,19 @@ impl View {
         self.scrolled = false;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Finding: what is typed narrows the rows; the arrows still pick.
-        if let Some(query) = &mut self.finding {
-            match key.code {
-                KeyCode::Esc => {
-                    self.finding = None;
+        if let Some(find) = &mut self.finding {
+            match find.key(key) {
+                crate::find::Typed::Dropped => {
+                    // The rows and the pick as they were.
+                    self.pick = self.finding.take().and_then(|find| find.before);
                     self.settle(now);
                     return Act::Stay;
                 }
-                KeyCode::Backspace => {
-                    query.pop();
+                crate::find::Typed::Changed => {
                     self.found(now);
                     return Act::Stay;
                 }
-                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                    query.push(c);
-                    self.found(now);
-                    return Act::Stay;
-                }
-                _ => {}
+                crate::find::Typed::Other => {}
             }
         }
         let shown = self.shown(now);
@@ -412,8 +410,8 @@ impl View {
                 }
                 Act::Stay
             }
-            KeyCode::Char('f') if ctrl => {
-                self.finding = Some(String::new());
+            _ if crate::find::opens(key) => {
+                self.finding = Some(crate::find::Find::new(self.pick.clone()));
                 Act::Stay
             }
             KeyCode::Char('c') if ctrl => Act::Close,
@@ -432,10 +430,10 @@ impl View {
 
     /// Words pasted while finding, as if typed.
     pub fn paste(&mut self, text: &str, now: u64) {
-        let Some(query) = &mut self.finding else {
+        let Some(find) = &mut self.finding else {
             return;
         };
-        query.extend(text.chars().filter(|c| !c.is_control()));
+        find.paste(text);
         self.scrolled = false;
         self.found(now);
     }
@@ -445,7 +443,9 @@ impl View {
     /// because it holds a match.
     fn found(&mut self, now: u64) {
         let shown = self.shown(now);
-        let query = self.finding.clone().unwrap_or_default();
+        let query = (self.finding.as_ref())
+            .map(|find| find.query.clone())
+            .unwrap_or_default();
         let matches = |row: &Shown| match row {
             Shown::Project(at, _) => self.projects[*at].found(&query),
             Shown::Fold(..) => false,
@@ -491,7 +491,7 @@ impl View {
             None => Keys::new()
                 .pick()
                 .enter(Enter::Open)
-                .key("ctrl+f", "find")
+                .find()
                 .esc(Esc::Close),
         }
     }
@@ -518,7 +518,7 @@ impl View {
         let shown = self.shown(now);
         if shown.is_empty() {
             let said = match &self.finding {
-                Some(query) if !query.is_empty() => format!(" no project matches {query}"),
+                Some(find) if find.typed() => format!(" no project matches {}", find.query),
                 _ => " no project yet".to_owned(),
             };
             out.push(Line::from(said).dim());
@@ -874,6 +874,7 @@ mod tests {
     #[test]
     fn find_narrows_by_title_and_name_keeping_what_holds_a_match() {
         let mut view = rulebook();
+        let before = view.picked().map(|project| project.lead.clone());
         let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         view.key(&ctrl_f, NOW);
         for c in "ledg".chars() {
@@ -893,6 +894,8 @@ mod tests {
         assert_eq!(view.picked().unwrap().lead, "ledger.lead");
         assert_eq!(view.key(&KeyEvent::from(KeyCode::Esc), NOW), Act::Stay);
         assert_eq!(view.finding, None);
+        // The pick as it was before the find.
+        assert_eq!(view.picked().map(|project| project.lead.clone()), before);
         assert_eq!(view.key(&KeyEvent::from(KeyCode::Esc), NOW), Act::Close);
         // An idle project is found too.
         view.key(&ctrl_f, NOW);

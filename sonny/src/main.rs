@@ -36,6 +36,7 @@ mod embed;
 mod exec;
 mod footer;
 mod frames;
+mod find;
 mod fuzzy;
 mod git;
 mod haiku;
@@ -22105,7 +22106,9 @@ impl App {
             }
             // Finding in **Projects**: what is typed, where the
             // conversation's find has it.
-            if let Some(query) = (self.projects.as_ref()).and_then(|open| open.view.finding.clone())
+            if let Some(query) = (self.projects.as_ref())
+                .and_then(|open| open.view.finding.as_ref())
+                .map(|find| find.query.clone())
             {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
                 frame.render_widget(Paragraph::new(line), composer);
