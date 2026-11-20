@@ -4114,8 +4114,8 @@ async fn run() -> Result<(), String> {
         if let Some(first) = &first {
             args.extend(["--send-file".into(), first.display().to_string()]);
         }
-        let draft = (app.carry_draft && !app.input.trim().is_empty())
-            .then(|| attach::draft(&app.input, &app.pictures))
+        let draft = (app.carry_draft && (!app.input.trim().is_empty() || !app.quotes.is_empty()))
+            .then(|| drafted(&app.input, &app.pictures, &app.quotes))
             .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
         if let Some(draft) = &draft {
             args.extend(["--draft-file".into(), draft.display().to_string()]);
@@ -4142,8 +4142,8 @@ async fn run() -> Result<(), String> {
         }
         // The words, and the pictures behind their placeholders: a picture
         // pasted from the clipboard has no file to come back from.
-        let draft = (!app.input.trim().is_empty())
-            .then(|| attach::draft(&app.input, &app.pictures))
+        let draft = (!app.input.trim().is_empty() || !app.quotes.is_empty())
+            .then(|| drafted(&app.input, &app.pictures, &app.quotes))
             .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
         if let Some(draft) = &draft {
             args.extend(["--draft-file".into(), draft.display().to_string()]);
@@ -8848,6 +8848,7 @@ impl App {
                 let (text, pictures) = attach::undraft(&draft);
                 self.input.set(&text);
                 self.pictures = pictures;
+                self.quotes = undrafted_quotes(&draft);
             }
             let _ = std::fs::remove_file(&file);
         }
@@ -19084,7 +19085,9 @@ impl App {
         if let Some(ask) = answering.clone().filter(|ask| ask.task.is_some()) {
             let pictures = self.placed(&prompt);
             let typed = (*self.input).to_owned();
-            let back = (typed, std::mem::take(&mut self.pictures));
+            let quotes = std::mem::take(&mut self.quotes);
+            let prompt = noted(prompt, &quotes);
+            let back = (typed, std::mem::take(&mut self.pictures), quotes);
             self.answer_task(&ask, &prompt, &pictures, Some(back));
             self.input.clear();
             self.notice = None;
@@ -19380,13 +19383,11 @@ impl App {
             Then::Composed {
                 typed,
                 pictures,
-                mut quotes,
+                quotes,
                 ..
             } => {
                 self.give_back(&typed, pictures);
-                // In front of any quoted since, as they were picked first.
-                quotes.retain(|quote| !self.quotes.contains(quote));
-                self.quotes.splice(0..0, quotes);
+                self.quotes_back(quotes);
             }
             Then::Zen(_, typed) => self.give_back(&typed, Vec::new()),
             Then::Ran(_) => {
@@ -19449,14 +19450,21 @@ impl App {
         ask: &asks::Ask,
         prompt: &str,
         pictures: &[attach::Picture],
-        back: Option<(String, Vec<Option<attach::Picture>>)>,
+        back: Option<(String, Vec<Option<attach::Picture>>, Vec<Quote>)>,
     ) {
         let Some(task) = ask.task.clone() else {
             self.notice = Some("that question is not a task's".into());
             return;
         };
-        let submitted = json!({"bot": task.bot, "prompt": prompt,
+        let mut submitted = json!({"bot": task.bot, "prompt": prompt,
             "delivery": "steer", "images": attach::submitted(pictures)});
+        // The messages quoted over the answer go with it, as with any.
+        let named = (back.iter().flat_map(|(.., quotes)| quotes))
+            .filter_map(|quote| quote.named.clone())
+            .collect::<Vec<_>>();
+        if !named.is_empty() {
+            submitted["quotes"] = json!(named);
+        }
         let (client, ask, prompt) = (self.client.clone(), ask.clone(), prompt.to_owned());
         self.write(async move {
             let reply = answer_once(&client, &ask.id, submitted).await;
@@ -19472,8 +19480,9 @@ impl App {
             Ok(reply) => reply,
             Err(error) => {
                 self.notice = Some(error);
-                if let Some((typed, pictures)) = back {
+                if let Some((typed, pictures, quotes)) = back {
                     self.give_back(&typed, pictures);
+                    self.quotes_back(quotes);
                 }
                 return;
             }
@@ -23012,6 +23021,13 @@ impl App {
         self.pane_keys = false;
     }
 
+    /// Quotes that did not go, back over the composer: in front of any
+    /// quoted since, as they were picked first.
+    fn quotes_back(&mut self, mut quotes: Vec<Quote>) {
+        quotes.retain(|quote| !self.quotes.contains(quote));
+        self.quotes.splice(0..0, quotes);
+    }
+
     /// The rows over the composer naming the messages quoted, each by
     /// its first line, muted as the question an answer answers is.
     fn quoting_over(&self, width: usize) -> Vec<Line<'static>> {
@@ -24062,8 +24078,27 @@ struct Sent {
     then: Then,
 }
 
+/// What is being written, as a window keeps it for the one it becomes
+/// ([`attach::draft`]), with the messages it quotes under `quotes`.
+fn drafted(text: &str, pictures: &[Option<attach::Picture>], quotes: &[Quote]) -> String {
+    let draft = attach::draft(text, pictures);
+    if quotes.is_empty() {
+        return draft;
+    }
+    let mut draft: Value = serde_json::from_str(&draft).unwrap_or_default();
+    draft["quotes"] = json!(quotes);
+    draft.to_string()
+}
+
+/// The quotes [`drafted`] kept, none from a draft without them.
+fn undrafted_quotes(draft: &str) -> Vec<Quote> {
+    (serde_json::from_str::<Value>(draft).ok())
+        .and_then(|draft| serde_json::from_value(draft["quotes"].clone()).ok())
+        .unwrap_or_default()
+}
+
 /// A message quoted over what the person writes ([`App::quote`]).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Quote {
     /// Its words, whose first line the row over the composer shows.
     said: String,
@@ -24202,8 +24237,8 @@ struct Answering {
 struct TaskAnswering {
     ask: asks::Ask,
     prompt: String,
-    /// What the person typed, and its pictures, should it not go.
-    back: Option<(String, Vec<Option<attach::Picture>>)>,
+    /// What the person typed, its pictures and quotes, should it not go.
+    back: Option<(String, Vec<Option<attach::Picture>>, Vec<Quote>)>,
 }
 
 /// The picks a `configure` sent ([`App::configure`]): the bot's once the
@@ -31824,6 +31859,27 @@ mod tests {
             noted("You asked (a1): Merge?\n\nYes".into(), &quotes[2..]),
             "You asked (a1): Merge?\n\n> ✎ Plan\n> Ship it\n\nYes"
         );
+    }
+
+    #[test]
+    fn a_draft_carried_to_another_window_keeps_its_quotes() {
+        let quotes = vec![
+            Quote {
+                said: "Fixed.".into(),
+                named: Some(json!({"bot": "shop.lead", "item": 3})),
+            },
+            Quote {
+                said: "✎ Plan".into(),
+                named: None,
+            },
+        ];
+        let kept = drafted("ship it", &[], &quotes);
+        assert_eq!(attach::undraft(&kept).0, "ship it");
+        assert_eq!(undrafted_quotes(&kept), quotes);
+        // One without quotes keeps the shape it had.
+        let plain = drafted("ship it", &[], &[]);
+        assert_eq!(plain, attach::draft("ship it", &[]));
+        assert!(undrafted_quotes(&plain).is_empty());
     }
 
     #[tokio::test]

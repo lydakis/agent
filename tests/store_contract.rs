@@ -3131,6 +3131,24 @@ fn a_quote_copies_the_agents_words_at_an_item_of_its_history() {
         send(&mut db, "q6", vec![reply]),
         Err("invalid_quote".into())
     );
+    // A fork whose source is gone still quotes the words it holds, as its
+    // own: their turn went with the source.
+    db.finish(turn, None).unwrap();
+    db.fork("Bob", "Branch", Fork::default()).unwrap();
+    db.delete_bot("Bob").unwrap();
+    db.create("Dave", Some("/synthetic"), binding()).unwrap();
+    let options = TurnOptions {
+        quotes: vec![quote_item("Branch", looking)],
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin("Dave", "d1", "and this", true, &options, allow_provider)
+        .unwrap();
+    let node = started.entry.unwrap()["data"]["node"].as_i64().unwrap();
+    assert_eq!(
+        read_item(&db, "Dave", node).unwrap()["content"][2]["text"],
+        "[Quoted, written by the agent Branch:]"
+    );
 }
 
 #[test]

@@ -12503,9 +12503,10 @@ impl Database {
         Ok(())
     }
     /// The agent's words at `item` in `bot`'s history, as a quote keeps
-    /// them, written in the turn that holds the item: a message of the
-    /// agent's with text, in a turn running or ended. A message with a
-    /// number is quoted by it.
+    /// them, written in the turn that holds the item (`bot`'s own once a
+    /// fork's source and its turns are gone): a message of the agent's
+    /// with text, in a turn running or ended. A message with a number is
+    /// quoted by it.
     fn quote_item(&self, bot: &str, item: i64) -> Result<Value> {
         let missing = || {
             Error::with(
@@ -12548,14 +12549,16 @@ impl Database {
             true => assistant_text(&said),
             false => String::new(),
         };
-        let (Some(turn), Some(owner)) = (turn, owner) else {
-            return Err(missing());
-        };
         if text.trim().is_empty() {
             return Err(missing());
         }
         let mut quote = json!({"bot":bot,"item":item});
-        authored(&mut quote, Some((owner, turn)), None, None);
+        match (turn, owner) {
+            (Some(turn), Some(owner)) => authored(&mut quote, Some((owner, turn)), None, None),
+            // A deleted fork source's turn is gone; its words are the
+            // fork's history now.
+            _ => quote["from"] = json!({"bot":bot}),
+        }
         quote["text"] = json!(text);
         Ok(quote)
     }
@@ -18677,6 +18680,9 @@ fn quote_author(quote: &Value) -> String {
             true => format!("written by the agent {bot}"),
             false => format!("written by the agent {bot} in {bot}/{turn}"),
         };
+    }
+    if let Some(bot) = from["bot"].as_str() {
+        return format!("written by the agent {bot}");
     }
     match (quote["origin"].as_str(), quote["person"].as_str()) {
         (Some(origin), _) => format!("sent by {origin}"),
