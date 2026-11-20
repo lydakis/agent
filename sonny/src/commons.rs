@@ -2278,13 +2278,15 @@ impl View {
 
     /// The list's rows in order: the boards, the fold, then the threads.
     /// While finding, the boards that match or hold an item that does,
-    /// with those items hung under them, then the threads that match.
+    /// with those items hung under them, then the threads that match,
+    /// an item hung under its board not again among them.
     fn rows(&self) -> Vec<Row> {
         let (open, finished) = self.boards_split();
         let query = (self.finding.as_ref())
             .filter(|find| find.typed())
             .map(|find| find.query.clone());
         let mut rows = Vec::new();
+        let mut hung_threads = std::collections::HashSet::new();
         match &query {
             Some(query) => {
                 for at in open.iter().chain(&finished) {
@@ -2296,6 +2298,7 @@ impl View {
                         continue;
                     }
                     rows.push(Row::Board(*at));
+                    hung_threads.extend(hung.iter().map(|item| self.items[*item].thread.as_str()));
                     rows.extend(hung.into_iter().map(Row::Hung));
                 }
             }
@@ -2311,6 +2314,9 @@ impl View {
         }
         for (at, thread) in self.threads.iter().enumerate() {
             if !self.in_scope(thread) || (self.is_item(thread) && !self.more) {
+                continue;
+            }
+            if hung_threads.contains(thread["thread"].as_str().unwrap_or_default()) {
                 continue;
             }
             // A thread says it in its title or who wrote in it, as its row
@@ -2676,7 +2682,10 @@ impl View {
                 let Some(Page::Thread { link, links, .. }) = self.pages.last() else {
                     return Key::Stay;
                 };
-                let target = link.and_then(|at| links.get(at)).map(|l| l.3.clone());
+                // A link scrolled out of view is not followed.
+                let target = (link.and_then(|at| links.get(at)))
+                    .filter(|l| in_view.contains(&l.0))
+                    .map(|l| l.3.clone());
                 self.follow(target)
             }
             _ => Key::Stay,

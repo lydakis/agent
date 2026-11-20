@@ -1231,6 +1231,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn enter_leaves_a_head_link_scrolled_out_of_view_alone() {
+        let home = &commons("head-out-of-view");
+        let mut view = View::open(home, "shop".into());
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Enter);
+        while !picked(&mut view, 80).contains("Add typed errors to the api") {
+            press(&mut view, KeyCode::Down);
+        }
+        press(&mut view, KeyCode::Enter);
+        view.card(80);
+        // The board's link picked, then the head scrolled away.
+        press(&mut view, KeyCode::Down);
+        let depth = view.depth();
+        let enter = KeyEvent::from(KeyCode::Enter);
+        assert_eq!(view.key(enter, 40..80), crate::commons::Key::Stay);
+        assert_eq!(view.depth(), depth);
+        // In view again, it is followed.
+        view.key(enter, 0..40);
+        assert_eq!(view.depth(), depth + 1);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn a_closing_post_shows_its_text_and_a_takeover_says_so() {
         let home = &commons("closing");
         let mut view = View::open(home, "shop".into());
@@ -1360,6 +1383,32 @@ pub(crate) mod tests {
         assert_eq!(picked(&mut view, 80), before);
         assert!(!card(&mut view, 80).iter().any(|l| l.starts_with("find")));
         assert_eq!(press(&mut view, KeyCode::Esc), crate::commons::Key::Close);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn with_m_a_find_shows_an_item_once_under_its_board() {
+        let home = &commons("find-m");
+        let mut view = View::open(home, "shop".into());
+        press(&mut view, KeyCode::Char('m'));
+        ctrl_f(&mut view);
+        typed(&mut view, "error");
+        let lines = card(&mut view, 80);
+        let enums = lines
+            .iter()
+            .filter(|l| l.contains("Remove the old error enum"));
+        assert_eq!(enums.count(), 1, "{lines:#?}");
+        // The pick passes down every match, none of them twice.
+        let mut seen = Vec::new();
+        for _ in 0..12 {
+            seen.push(picked(&mut view, 80));
+            press(&mut view, KeyCode::Down);
+        }
+        seen.dedup();
+        let mut once = seen.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(seen.len(), once.len(), "{seen:#?}");
         let _ = std::fs::remove_dir_all(home);
     }
 
