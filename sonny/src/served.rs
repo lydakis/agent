@@ -157,9 +157,10 @@ fn start() -> Value {
                     "description": "A short name for the task, valid as a git branch name, that no agent of \
                         this project has yet; Sonny puts your project's name and a dot before it."},
                 "brief": {"type": "string", "minLength": 1,
-                    "description": "Everything the task needs, since it never sees your conversation. \
-                        Its first line is the title the person knows the task by, so write it as one: \
-                        a few words, 60 characters at most, as Round half cents to even."},
+                    "description": format!("Everything the task needs, since it never sees your \
+                        conversation. Its first line is the title the person knows the task by, so \
+                        write it as one: a sentence that starts with its verb, {} characters at most, \
+                        as Round half cents to even.", crate::title::WRITTEN)},
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
@@ -263,8 +264,9 @@ fn project() -> Value {
             "properties": {
                 "folder": {"type": "string", "minLength": 1, "description": "The project's folder, absolute."},
                 "title": {"type": "string", "minLength": 1,
-                    "description": "What the person calls the project, as Tally invoices; they \
-                        can change it in its file."},
+                    "description": format!("What the person calls the project, in two or three \
+                        words written as a sentence, {} characters at most, as Tally invoices; they \
+                        can change it in its file.", crate::title::WRITTEN)},
                 "model": {"type": "string", "minLength": 1,
                     "description": "The lead's PROVIDER/MODEL, as the person picked; else yours."},
                 "effort": {"type": "string", "minLength": 1, "description": "The lead's effort level."},
@@ -2669,6 +2671,42 @@ mod tests {
         assert_eq!(running(&json!({})), Duration::ZERO);
         // Every other wait is the call's whole time.
         assert!(left(&call(now + 600_000)) > Duration::from_secs(598));
+    }
+
+    #[test]
+    fn whoever_writes_a_title_is_told_it_is_a_sentence_of_30_characters_at_most() {
+        let said = |tool: Value, field: &str| {
+            tool["parameters"]["properties"][field]["description"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let brief = said(start(), "brief");
+        assert!(
+            brief.contains(
+                "Its first line is the title the person knows the task by, so write it \
+                as one: a sentence that starts with its verb, 30 characters at most, as Round half \
+                cents to even."
+            ),
+            "{brief}"
+        );
+        let title = said(project(), "title");
+        assert!(
+            title.contains(
+                "in two or three words written as a sentence, 30 characters at most, \
+                as Tally invoices"
+            ),
+            "{title}"
+        );
+        // The examples keep the rule they teach.
+        for example in ["Round half cents to even", "Tally invoices"] {
+            assert!(example.chars().count() <= crate::title::WRITTEN);
+        }
+        // 30 is for whoever writes one; Sonny keeps 60 of what was written.
+        assert_eq!(crate::title::WRITTEN, 30);
+        assert_eq!(crate::title::MOST, 60);
     }
 
     #[test]

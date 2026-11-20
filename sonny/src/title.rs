@@ -8,8 +8,14 @@
 //! the store, as it notes the profile a task was started as.
 use std::path::{Path, PathBuf};
 
-/// The most characters a title takes.
+/// The most characters a title takes: what Sonny keeps of a first line
+/// no one wrote as a title, cut at a word, changing no letter of it.
 pub const MOST: usize = 60;
+
+/// The most characters a title written for the person takes, a task's by
+/// its lead and a project's: what the pane's row holds beside a name. The
+/// tools that take one say so; Sonny keeps [`MOST`] of what was written.
+pub const WRITTEN: usize = 30;
 
 /// Where Sonny keeps the title each agent was started with: beside the
 /// store, one file per agent, in this folder, found once for each store.
