@@ -138,6 +138,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             fallback,
             declare,
             settings,
+            profile,
             ..
         } => (
             // A bot that takes its creator's declared tools shows them too,
@@ -153,6 +154,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                 compaction_instructions,
                 compaction_model,
                 fallback,
+                profile,
             ))
             .map(|bytes| {
                 bytes
@@ -164,7 +166,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                         }
                     }
             }),
-            output::encoded_len(&(bot, created_by)),
+            output::encoded_len(&(bot, created_by, profile)),
             // The workspace, the writable folders, the Unix sockets,
             // canonical, the command rules and the variables, which the
             // reply's settings repeat; a bot another makes takes its
@@ -381,6 +383,9 @@ enum Command {
         /// a creator. Refused on a sandboxed bot's own socket.
         #[serde(default)]
         starts_line: bool,
+        /// The profile its client composed it from, by name: kept on the
+        /// bot and listed with it. The daemon reads nothing for it.
+        profile: Option<String>,
     },
     /// A bot's record, as `inspect` gives it, and the path of its own
     /// socket, which listens while this session lasts: so a client can run
@@ -433,6 +438,10 @@ enum Command {
         compaction_instructions: Option<Option<String>>,
         #[serde(default, deserialize_with = "present")]
         compaction_model: Option<Option<String>>,
+        /// The profile its instructions are composed from now, as `create`
+        /// takes it; `null` removes the bot's.
+        #[serde(default, deserialize_with = "present")]
+        profile: Option<Option<String>>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -1905,6 +1914,12 @@ struct Configure {
         skip_serializing_if = "Option::is_none"
     )]
     compaction_model: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    profile: Option<Option<String>>,
 }
 
 impl Configure {
@@ -1924,6 +1939,7 @@ impl Configure {
             && self.fallback.is_none()
             && self.compaction_instructions.is_none()
             && self.compaction_model.is_none()
+            && self.profile.is_none()
     }
 
     /// This change over `older`, one kept before it: what the two would
@@ -1963,7 +1979,8 @@ impl Configure {
             declare,
             fallback,
             compaction_instructions,
-            compaction_model
+            compaction_model,
+            profile
         );
         merged
     }
@@ -5182,6 +5199,7 @@ impl Service {
             fallback,
             compaction_instructions,
             compaction_model,
+            profile,
         } = change;
         if effort.is_some() && model.is_none() {
             return fail_with("invalid_effort", "effort goes with model");
@@ -5196,6 +5214,9 @@ impl Service {
                 self.registry.tool_count() + MAX_DECLARED,
             )?),
         };
+        if let Some(Some(profile)) = &profile {
+            name("profile", profile)?;
+        }
         for (text, what) in [
             (instructions.as_ref(), "instructions"),
             (
@@ -5400,6 +5421,11 @@ impl Service {
                             .into_iter()
                             .map(String::from),
                         );
+                        if let Some(profile) = &profile
+                            && db.set_profile(&bot_name, Some(id), profile.as_deref())?
+                        {
+                            changed.push("profile".into());
+                        }
                         Ok((changed, kin))
                     };
                     if let Some(turn) = running {
@@ -5806,6 +5832,7 @@ impl Service {
                 declare,
                 request_id,
                 starts_line,
+                profile,
             } => {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
@@ -5832,6 +5859,9 @@ impl Service {
                 name("bot", &bot)?;
                 if let Some(creator) = &created_by {
                     name("created_by", creator)?;
+                }
+                if let Some(profile) = &profile {
+                    name("profile", profile)?;
                 }
                 let path = workspace_error.map_or(Ok(path), Err)?;
                 // The daemon supplies no agent behavior: who creates a bot
@@ -5935,6 +5965,7 @@ impl Service {
                                 declared: declare.as_ref(),
                                 request_id: request_id.as_deref(),
                                 starts_line,
+                                profile: profile.as_deref(),
                             },
                         )?;
                         let cursor = event.as_ref().and_then(|e| e["cursor"].as_i64());
@@ -6228,6 +6259,7 @@ impl Service {
                 fallback,
                 compaction_instructions,
                 compaction_model,
+                profile,
             } => {
                 let change = Configure {
                     instructions,
@@ -6241,6 +6273,7 @@ impl Service {
                     fallback,
                     compaction_instructions,
                     compaction_model,
+                    profile,
                 };
                 self.configure(bot, bot_id, change).await
             }
@@ -8552,6 +8585,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 let turn = db
@@ -8753,6 +8787,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 let turn = db
@@ -9018,6 +9053,7 @@ mod tests {
             declared: None,
             request_id: None,
             starts_line: false,
+            profile: None,
         };
         let in_use = |providers: &[&str]| {
             let providers: Vec<String> = providers.iter().map(|p| (*p).to_owned()).collect();
@@ -9081,6 +9117,7 @@ mod tests {
             declared: None,
             request_id: None,
             starts_line: false,
+            profile: None,
         };
         let turn = store
             .op("create", move |db| {
@@ -9352,6 +9389,7 @@ mod tests {
                                 declared: None,
                                 request_id: None,
                                 starts_line: false,
+                                profile: None,
                             },
                         )?;
                         let turn = db
@@ -9956,6 +9994,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 // No slot was free when it was accepted, so it queued.
@@ -10045,6 +10084,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )
                 .map(|_| ())
@@ -10402,6 +10442,7 @@ mod tests {
             declare: None,
             request_id: None,
             starts_line: false,
+            profile: None,
         }
     }
     #[test]
@@ -11704,6 +11745,7 @@ mod tests {
                             declared: None,
                             request_id: None,
                             starts_line: false,
+                            profile: None,
                         },
                     )?;
                     creator = Some(bot);
@@ -11992,6 +12034,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 let turn = db

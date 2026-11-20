@@ -30,7 +30,7 @@ const POSTS: usize = 256;
 const READ_BYTES: usize = 40 * 1024;
 /// The most of one listing's threads, newest first: the rest come with
 /// `from`.
-const LIST_BYTES: usize = 40 * 1024;
+const LIST_BYTES: usize = crate::served::PAGE_BYTES;
 const READS: &str = ".reads";
 /// The invites of the last week, and how many threads ever sent any:
 /// `{"sent": [{"thread", "at", "bot", "golden", "answered"}], "count",
@@ -1150,25 +1150,13 @@ fn list(
         threads.push(thread);
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t["at"].as_i64().unwrap_or(0)));
-    let of = threads.len();
-    let (mut shown, mut size) = (Vec::new(), 0);
-    for mut thread in threads.into_iter().skip(from) {
+    for thread in &mut threads {
         let at = thread["at"].as_i64().unwrap_or(0);
         thread["last_when"] = json!(when(at));
         thread.as_object_mut().map(|t| t.remove("at"));
-        size += thread.to_string().len();
-        if !shown.is_empty() && size > bytes {
-            break;
-        }
-        shown.push(thread);
     }
-    let next = from + shown.len();
-    let mut listed = json!({"dir": dir, "threads": shown,
-        "invites": budget(sent, agents(dir))});
-    if next < of {
-        listed["next"] = json!(next);
-        listed["of"] = json!(of);
-    }
+    let mut listed = json!({"dir": dir, "invites": budget(sent, agents(dir))});
+    crate::served::paged(&mut listed, "threads", threads, from, bytes);
     Ok(listed)
 }
 

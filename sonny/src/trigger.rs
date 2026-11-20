@@ -3348,9 +3348,9 @@ pub fn cli(args: &[String]) -> i32 {
     1
 }
 
-/// A `triggers` call: `add` one, or `remove`, `fire` or `show` one by
-/// name; with none, every trigger. Run as `add` and the rest run from an
-/// agent's shell, for the calling agent.
+/// An `automations` call: `add` one, or `remove`, `run` or `read` one by
+/// name; with none, a page of the caller's own from `from`, their rows
+/// whole until [`index`] makes each the line the listing shows.
 pub fn tool(arguments: &Value, caller: &Caller) -> Result<Value, String> {
     let places = Places::home()?;
     let named = |key: &str| arguments[key].as_str().filter(|name| !name.is_empty());
@@ -3366,10 +3366,13 @@ pub fn tool(arguments: &Value, caller: &Caller) -> Result<Value, String> {
         return fire_as(&places, name, &ring, reviewed)
             .map(|file| fired(&places, name, &file, FIRE_WAIT));
     }
-    if let Some(name) = named("show") {
-        return own(&places, name, caller).ok_or_else(|| format!("automation_not_found: {name}"));
+    if let Some(name) = named("read") {
+        return own(&places, name, caller).ok_or_else(|| {
+            format!("automation_not_found: {name}: a call with nothing lists yours")
+        });
     }
-    Ok(with_scheduler(list_of(&places, caller)))
+    let from = arguments["from"].as_u64().unwrap_or(0) as usize;
+    Ok(with_scheduler(list_of(&places, caller, from)))
 }
 
 /// A listing of automations, and the scheduler's state when it lists
@@ -3484,10 +3487,14 @@ pub fn standing(places: &Places, name: &str, caller: &Caller) -> Option<(Trigger
     Some((trigger, mine))
 }
 
-/// The first page, in name order, of the automations `caller` has a part
-/// in, as the agent's own tool lists them; the person's `sonny automation
-/// list` lists every one ([`list`]). Each one's row is read to tell.
-fn list_of(places: &Places, caller: &Caller) -> Value {
+/// A page, in name order, of the automations `caller` has a part in, from
+/// the `from`th, as the agent's own tool lists them; the person's `sonny
+/// automation list` lists every one ([`list`]). Each one's row is read to
+/// tell, and only the page's rows are kept, whole: the page holds as many
+/// as their [`index`] lines fit, as every tool that lists pages them
+/// ([`crate::served::paged`]), which the tool host makes them once it has
+/// added how their last turns ended.
+fn list_of(places: &Places, caller: &Caller, from: usize) -> Value {
     let mut names = std::collections::BTreeSet::new();
     for dir in [&places.jobs, &places.state] {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -3500,22 +3507,116 @@ fn list_of(places: &Places, caller: &Caller) -> Value {
             }
         }
     }
-    let mut rows = Vec::new();
-    let mut next = None;
+    let (mut rows, mut of, mut size, mut full) = (Vec::new(), 0, 0, false);
     for name in names {
         let Some(row) = own(places, &name, caller) else {
             continue;
         };
-        if rows.len() == PAGE_SIZE {
-            next = rows
-                .last()
-                .and_then(|r: &Value| r["name"].as_str().map(str::to_owned));
-            break;
+        of += 1;
+        if of <= from || full {
+            continue;
+        }
+        size += index(&row).to_string().len() + 1;
+        if !rows.is_empty() && size > crate::served::PAGE_BYTES {
+            full = true;
+            continue;
         }
         rows.push(row);
     }
-    json!({"automations": rows, "next_after": next})
+    let next = from + rows.len();
+    let mut listed = json!({"automations": rows});
+    if next < of {
+        listed["next"] = json!(next);
+        listed["of"] = json!(of);
+    }
+    listed
 }
+
+/// An automation's line in the agent's listing, from its whole row: what
+/// it takes to pick it. Its name, when it runs, the agent it messages,
+/// when its last run was and how it went (and how the turn it sent ended,
+/// once the tool host added that), and any problem: why its last run or
+/// its turn failed, or what keeps it from running.
+pub fn index(row: &Value) -> Value {
+    let mut line = json!({"name": row["name"]});
+    for key in ["when", "bot"] {
+        if row[key].is_string() {
+            line[if key == "bot" { "agent" } else { key }] = row[key].clone();
+        }
+    }
+    let last = &row["last"];
+    if let Some(outcome) = last["outcome"].as_str() {
+        let mut said = match last["fired_ms"].as_u64() {
+            Some(ms) => format!(
+                "{} {outcome}",
+                crate::lookout::sources::clock(u128::from(ms))
+            ),
+            None => outcome.to_owned(),
+        };
+        if let Some(status) = last["turn_status"].as_str() {
+            said.push_str(&format!(", turn {status}"));
+        }
+        line["last"] = json!(said);
+    }
+    // An `if` that fails keeps the last run as it was, and stops the
+    // next: that is its problem first.
+    let checked = &row["checked"];
+    let check = (checked["gate"] == "failed").then(|| {
+        (checked["detail"].as_str())
+            .filter(|detail| !detail.is_empty())
+            .map_or_else(
+                || "its if could not check".to_owned(),
+                |detail| format!("its if failed: {detail}"),
+            )
+    });
+    let problem = check.or_else(|| {
+        [&row["problem"], &last["turn_error"]]
+            .into_iter()
+            .chain((last["outcome"] == "failed").then_some(&last["detail"]))
+            .find_map(|said| said.as_str().filter(|said| !said.is_empty()))
+            .map(str::to_owned)
+    });
+    if let Some(problem) = problem {
+        line["problem"] = json!(crate::lookout::sources::cut(&problem, PROBLEM_CHARS));
+    }
+    for key in ["missed", "ended", "shadow"] {
+        if row[key] == true {
+            line[key] = json!(true);
+        }
+    }
+    line
+}
+
+/// A page of [`list_of`], each row made its [`index`] line, as many as
+/// [`crate::served::PAGE_BYTES`] holds with what the tool host added
+/// since the page was chosen (how each one's last turn ended), the rest
+/// left to `next`, as [`crate::served::paged`] pages.
+pub fn indexed(listed: &mut Value, from: usize) {
+    let rows = match listed["automations"].take() {
+        Value::Array(rows) => rows,
+        _ => Vec::new(),
+    };
+    let shown = rows.len();
+    let of = listed["of"].as_u64().map_or(from + shown, |of| of as usize);
+    let lines = rows.iter().map(index).collect();
+    let mut page = json!({});
+    crate::served::paged(
+        &mut page,
+        "automations",
+        lines,
+        0,
+        crate::served::PAGE_BYTES,
+    );
+    let kept = page["automations"].as_array().map_or(0, Vec::len);
+    listed["automations"] = page["automations"].take();
+    if from + kept < of {
+        listed["next"] = json!(from + kept);
+        listed["of"] = json!(of);
+    }
+}
+
+/// The most of a problem an automation's line says: `read` says the rest.
+const PROBLEM_CHARS: usize = 160;
 
 /// The `add` arguments a `triggers` call's `add` names.
 fn add_args(asked: &Value) -> Vec<String> {
@@ -7805,21 +7906,21 @@ pub(crate) mod tests {
                 .collect()
         };
         assert_eq!(
-            names(list_of(&w.places, &caller(1))),
+            names(list_of(&w.places, &caller(1), 0)),
             ["a-messages-it", "b-answers-it", "c-it-started"]
         );
         assert_eq!(
-            names(list_of(&w.places, &caller(2))),
+            names(list_of(&w.places, &caller(2), 0)),
             ["d-another-s", "e-another-s-start"]
         );
-        assert!(names(list_of(&w.places, &caller(3))).is_empty());
+        assert!(names(list_of(&w.places, &caller(3), 0)).is_empty());
         // No id or no store to match is no one's.
-        assert!(names(list_of(&w.places, &Caller::default())).is_empty());
+        assert!(names(list_of(&w.places, &Caller::default(), 0)).is_empty());
         let unknown = Caller {
             store: None,
             ..caller(1)
         };
-        assert!(names(list_of(&w.places, &unknown)).is_empty());
+        assert!(names(list_of(&w.places, &unknown, 0)).is_empty());
         assert!(own(&w.places, "f-a-predecessor-s", &caller(1)).is_none());
         assert!(own(&w.places, "g-another-store-s", &caller(1)).is_none());
         // The person's list holds every one.
@@ -7835,16 +7936,175 @@ pub(crate) mod tests {
         .unwrap();
         assert!(own(&w.places, "h-ended", &caller(1)).is_some());
         assert!(own(&w.places, "h-ended", &caller(5)).is_none());
-        // A page fills with the asker's own past others' names.
-        for i in 0..PAGE_SIZE + 1 {
-            write(&mine(&format!("z-{i:03}"), bot("p.lead", 1), None));
+        // A page fills with the asker's own past others' names, as many
+        // as their lines fit, and from goes on where next says.
+        for i in 0..1500 {
+            write(&mine(&format!("z-{i:04}"), bot("p.lead", 1), None));
         }
-        let page = list_of(&w.places, &caller(2));
+        let page = list_of(&w.places, &caller(2), 0);
         assert_eq!(names(page.clone()), ["d-another-s", "e-another-s-start"]);
-        assert!(page["next_after"].is_null());
-        let page = list_of(&w.places, &caller(1));
-        assert_eq!(names(page.clone()).len(), PAGE_SIZE);
-        assert_eq!(page["next_after"], json!(format!("z-{:03}", PAGE_SIZE - 5)));
+        assert!(page.get("next").is_none(), "{page}");
+        let first = list_of(&w.places, &caller(1), 0);
+        let shown = names(first.clone()).len();
+        assert!((100..1504).contains(&shown), "{shown}");
+        assert_eq!(
+            (&first["next"], &first["of"]),
+            (&json!(shown), &json!(1504))
+        );
+        let lines: usize = (first["automations"].as_array().unwrap().iter())
+            .map(|row| index(row).to_string().len() + 1)
+            .sum();
+        assert!(lines <= crate::served::PAGE_BYTES, "{lines}");
+        let mut seen = names(first);
+        let mut from = shown;
+        while from < 1504 {
+            let page = list_of(&w.places, &caller(1), from);
+            seen.extend(names(page.clone()));
+            from = page["next"].as_u64().map_or(1504, |next| next as usize);
+        }
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!((seen.len(), sorted), (1504, seen));
+        // Past the end, nothing.
+        assert!(names(list_of(&w.places, &caller(1), 1504)).is_empty());
+    }
+
+    /// Sixty automations of one lead, each with a message as agents write
+    /// them and a last run that sent a turn, one failed. The world they
+    /// are in, and the lead, as it asks.
+    fn sixty(tag: &str) -> (World, Caller) {
+        let w = World::new(tag);
+        std::fs::create_dir_all(&w.places.jobs).unwrap();
+        for n in 0..60 {
+            let t = Trigger {
+                name: format!("watch-{n:02}"),
+                target: Target::Bot {
+                    name: "p.lead".into(),
+                    id: 1,
+                },
+                when: ["every 30m", "every 1h", "cron 0 9 * * 1-5"][n % 3].into(),
+                message: format!(
+                    "Check PR #{n}'s CI and reviews. If CI is red, read the failing job's log and fix what \
+                     broke in a task of its own; if a reviewer asked for changes, make them and reply on \
+                     the thread. Stop when the PR is merged or closed, and remove this automation then. \
+                     Say nothing when nothing changed since the last run."
+                ),
+                ..trigger()
+            };
+            std::fs::write(
+                w.places.job(&t.name),
+                definition(Path::new("/A/app"), &t, &fired(), &[]),
+            )
+            .unwrap();
+            let last = match n {
+                7 => {
+                    json!({"outcome": "failed", "detail": "bot_busy: p.lead's turn ran past the run's wait"})
+                }
+                _ => {
+                    json!({"outcome": "sent", "turn": 100 + n, "handle": format!("p.lead/{}", 100 + n)})
+                }
+            };
+            let kept = Kept {
+                sent: 3,
+                ..Kept::default()
+            };
+            record_last(&w.places, &t, &last, &kept).unwrap();
+        }
+        let caller = Caller {
+            id: Some(1),
+            store: Some("00ab".into()),
+        };
+        (w, caller)
+    }
+
+    /// A call with nothing lists one line each, a fifth or less of what
+    /// it listed when it gave each row whole; read gives one whole.
+    #[test]
+    fn a_listing_is_one_line_each_and_read_gives_one_whole() {
+        let (w, caller) = sixty("sixty-bare");
+        let page = list_of(&w.places, &caller, 0);
+        let rows = page["automations"].as_array().unwrap().clone();
+        assert_eq!(rows.len(), 60);
+        assert!(page.get("next").is_none(), "{page}");
+        // What a call with nothing answered before: every row whole, as
+        // many as 64, with where the next page started.
+        let before = json!({"automations": rows, "next_after": null})
+            .to_string()
+            .len();
+        let mut shown = page.clone();
+        indexed(&mut shown, 0);
+        let lines: Vec<Value> = shown["automations"].as_array().unwrap().clone();
+        let after = shown.to_string().len();
+        eprintln!("60 automations, a call with nothing: {before} characters before, {after} now");
+        assert!(after * 5 <= before, "{after} of {before}");
+        let line = &lines[0];
+        assert_eq!(line["name"], "watch-00");
+        assert_eq!(line["when"], "every 30m");
+        assert_eq!(line["agent"], "p.lead");
+        assert!(line["last"].as_str().unwrap().ends_with(" sent"), "{line}");
+        assert!(line.get("message").is_none(), "{line}");
+        let failed = &lines[7];
+        assert!(
+            failed["last"].as_str().unwrap().ends_with(" failed"),
+            "{failed}"
+        );
+        assert_eq!(
+            failed["problem"],
+            "bot_busy: p.lead's turn ran past the run's wait"
+        );
+        // How the turn its last run sent ended, once the tool host says.
+        let mut ended = rows[1].clone();
+        ended["last"]["turn_status"] = json!("failed");
+        ended["last"]["turn_error"] = json!("login expired");
+        let line = index(&ended);
+        assert!(
+            line["last"]
+                .as_str()
+                .unwrap()
+                .ends_with(" sent, turn failed"),
+            "{line}"
+        );
+        assert_eq!(line["problem"], "login expired");
+        // What the tool host adds once the page is chosen (how each one's
+        // last turn ended) still fits: the rest goes to next.
+        let ended: Vec<Value> = (0..400)
+            .map(|n| {
+                let mut row = rows[n % 60].clone();
+                row["name"] = json!(format!("w-{n:03}"));
+                row["last"]["turn_status"] = json!("interrupted");
+                row["last"]["turn_error"] = json!("x".repeat(400));
+                row
+            })
+            .collect();
+        let mut ended = json!({"automations": ended, "next": 450, "of": 1000});
+        indexed(&mut ended, 50);
+        assert!(
+            ended.to_string().len() <= crate::served::PAGE_BYTES + 64,
+            "{}",
+            ended.to_string().len()
+        );
+        let kept = ended["automations"].as_array().unwrap().len();
+        assert!((1..400).contains(&kept), "{kept}");
+        assert_eq!(
+            (&ended["next"], &ended["of"]),
+            (&json!(50 + kept), &json!(1000))
+        );
+        // An if that fails keeps the last run, and is the problem.
+        let mut broken = rows[2].clone();
+        broken["checked"] = json!({"gate": "failed", "detail": "gh: not logged in"});
+        let line = index(&broken);
+        assert!(line["last"].as_str().unwrap().ends_with(" sent"), "{line}");
+        assert_eq!(line["problem"], "its if failed: gh: not logged in");
+        // Read gives it whole, its message too.
+        let whole = own(&w.places, "watch-03", &caller).unwrap();
+        assert!(
+            whole["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Check PR #3")
+        );
+        assert_eq!(whole, rows[3]);
     }
 
     #[test]

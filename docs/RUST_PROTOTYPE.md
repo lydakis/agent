@@ -1243,7 +1243,7 @@ transactions from [rusqlite](https://docs.rs/rusqlite/0.41.1/rusqlite/).
 
 Current limits: 8 MiB / 4,096 items of model context per request (stored
 history is unbounded), 1 MiB input prompt (`prompt_limit` past it, as
-Codex bounds a person's input; protocol 98, from 256 KiB, so a reviewer's
+Codex bounds a person's input; protocol 99, from 256 KiB, so a reviewer's
 prompt holds a large change whole), 64 KiB instructions, no bound of
 the daemon's own on one reply (the model's own output cap bounds it; see
 [Replies the model's cap cuts short](#replies-the-models-cap-cuts-short)), 64 KiB JSON-encoded
@@ -1956,6 +1956,21 @@ generations below the bot that starts the bot's line, which `--max-depth` bounds
 true` on `create` makes a bot with a creator start a line of its own, at 0, and is refused on a
 sandboxed bot's own socket (`not_permitted`), since a confined bot that could start lines could make
 bots without end.
+
+`profile` on `create` names the profile the client composed the bot from
+(1 to 128 of `A-Z a-z 0-9 . _ -`, else `invalid_name` with `field:
+"profile"`). The daemon reads nothing for it: it keeps the name on the bot,
+written in the commit that makes it, and the record, the `created` event
+and `bots` pages carry it when set (protocol 98, schema 110). A fork keeps
+its source's, on its record and its `forked` event. `spawn_agent` sends the
+profile it composed a new agent from; the CLI sends `--profile ROLE`'s
+ROLE, or `--profile-name ROLE` for instructions a client composed itself,
+as Sonny's `start_task` does. A keyed creation counts it in its
+idempotency. `configure` takes `profile` too, for instructions composed
+again in another role, and `null` removes it; changed, it is named in the
+answer's `changed`. Bots made before schema 110 have none; Sonny moves the
+roles it noted beside the store for the agents it started onto them once,
+with `configure`.
 
 `from: {bot, turn}` on `submit` says a bot's model wrote the prompt, in
 that turn; a prompt without it is a person's. The CLI sends it from

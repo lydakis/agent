@@ -115,7 +115,7 @@ this replaced:
   the smallest judge window (200K tokens) at its effective 95% less 256
   tokens, counted at 4 bytes a token as Codex counts text, less the
   judge's instructions, about 728 KiB. It fits one daemon prompt, 1 MiB as
-  Codex bounds a person's input (256 KiB until protocol 98, which bound it
+  Codex bounds a person's input (256 KiB until protocol 99, which bound it
   at 240 KiB). The CLI's `auto` gate
   lapses at 105 s to fit the longer budget.
 - **The breaker is Codex's:** 3 denials in a row, or 10 among the turn's
