@@ -9156,10 +9156,10 @@ impl Database {
                 let size = row.get::<_, i64>(2)? as usize;
                 // Its words with the words it quotes, which it takes in too.
                 let held = row.get::<_, i64>(5)? as usize;
-                if size > STEER_BATCH_BYTES.saturating_sub(bytes) {
-                    // An oversized store-level prompt must not spin forever.
-                    // Protocol prompts are already capped at this same limit.
-                    more = !steers.is_empty();
+                // The first is always taken in, as its pictures are: one
+                // prompt may be longer than a batch.
+                if !steers.is_empty() && size > STEER_BATCH_BYTES.saturating_sub(bytes) {
+                    more = true;
                     break;
                 }
                 // Quoted words count past the first steer's, which admission
@@ -12374,9 +12374,11 @@ impl Database {
     /// The most calls a `prompts` read looks through, past its `bytes`, for
     /// the files they wrote; more leave `written_more`.
     pub const PROMPTS_SCANNED: usize = 256;
+    /// The most bytes a prompt's words may have, as its clients know it.
+    pub const PROMPT_BYTES: usize = agent_client::PROMPT_BYTES;
     /// The most bytes a prompt's words and the words it quotes may have
     /// together, as many as its words alone may.
-    pub const QUOTED_BYTES: usize = 256 * 1024;
+    pub const QUOTED_BYTES: usize = Self::PROMPT_BYTES;
     /// The most quotes a prompt may hold, those its quoted prompts bring
     /// counted too: each is a part of the item, with a line naming it.
     pub const QUOTES: usize = 64;
