@@ -1252,9 +1252,11 @@ the daemon's own on one reply (the model's own output cap bounds it; see
 tool call id without NUL, unique within its turn (a longer one, one with a
 NUL, or one an earlier call of the response or turn used fails the response
 with `invalid_tool_call_id`, so every gated call can be listed and answered
-by a command naming it alone), a 16 MiB response stream, over HTTP or a
-socket, which also bounds one SSE frame (an endpoint that never stops; no
-model writes that much), and the configurable
+by a command naming it alone), 64 MiB for one event of a response (an SSE
+frame or a WebSocket message, held whole until it ends; Codex's WebSocket
+message bound), no bound on a whole response (as in Codex and Pi: the model's
+output cap ends it, and a stream that stops sending content stalls out), and
+the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission, when bounded, has a 60-second timeout and releases its permit when
 response headers arrive. Both live providers hold headers until the first
@@ -2647,7 +2649,7 @@ call, which reads it. The cap cutting `max_drops` replies of a turn in a row
 facts on its `turn_finished`, since each can cost a whole reply's output. The
 turn keeps the count, so a park or a restart counts on; a reply it keeps sets
 it back to none. The daemon puts
-no bound of its own on a reply under the 16 MiB response stream: events carry
+no bound of its own on a reply: events carry
 previews of calls (2 KiB of arguments), text streams live in pieces of at most
 128 KiB, and a history read answers `item_too_large` for one item past a line.
 
