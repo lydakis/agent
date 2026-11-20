@@ -55,6 +55,9 @@ struct Walk<A> {
     attached: A,
     /// What the composer was given.
     shown: String,
+    /// What it was given attached: a quote or picture added or taken
+    /// away edits it as words do.
+    with: A,
 }
 
 impl<A: Clone + Default + PartialEq> Recall<A> {
@@ -82,9 +85,15 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
         }
     }
 
-    /// Whether the composer holds `text` as recalled, unchanged.
+    /// Whether the composer holds `text` as recalled.
     pub fn showing(&self, text: &str) -> bool {
         self.walk.as_ref().is_some_and(|walk| walk.shown == text)
+    }
+
+    /// Whether the composer holds `text` with `attached` as recalled,
+    /// unchanged.
+    fn unchanged(&self, text: &str, attached: &A) -> bool {
+        (self.walk.as_ref()).is_some_and(|walk| walk.shown == text && walk.with == *attached)
     }
 
     /// Notes `prompt` sent with `attached`, of `bytes`, and ends any
@@ -121,7 +130,7 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
     /// `current` with `attached`, which becomes what that prompt was sent
     /// with; none when there is none older.
     pub fn older(&mut self, current: &str, attached: &mut A) -> Option<String> {
-        if !self.showing(current) {
+        if !self.unchanged(current, attached) {
             self.walk = None;
         }
         self.read_file();
@@ -135,13 +144,14 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
             Some(walk) => (walk.draft, walk.attached),
             None => (current.to_owned(), std::mem::take(attached)),
         };
-        *attached = with;
         self.walk = Some(Walk {
             back: to,
             draft,
             attached: draft_attached,
             shown: text.clone(),
+            with: with.clone(),
         });
+        *attached = with;
         Some(text)
     }
 
@@ -149,7 +159,7 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
     /// set aside, `attached` becoming what it has; none when the composer
     /// holds no recalled prompt.
     pub fn newer(&mut self, current: &str, attached: &mut A) -> Option<String> {
-        if !self.showing(current) {
+        if !self.unchanged(current, attached) {
             self.walk = None;
             return None;
         }
@@ -165,6 +175,7 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
                 self.walk = Some(Walk {
                     back: to,
                     shown: text.clone(),
+                    with: attached.clone(),
                     ..walk
                 });
                 Some(text)
@@ -203,16 +214,19 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
         let (text, with) = self.nth(back);
         let (text, with) = (text.to_owned(), with.cloned().unwrap_or_default());
         let (draft, draft_attached) = match self.walk.take() {
-            Some(walk) if walk.shown == current => (walk.draft, walk.attached),
+            Some(walk) if walk.shown == current && walk.with == *attached => {
+                (walk.draft, walk.attached)
+            }
             _ => (current.to_owned(), std::mem::take(attached)),
         };
-        *attached = with;
         self.walk = Some(Walk {
             back,
             draft,
             attached: draft_attached,
             shown: text.clone(),
+            with: with.clone(),
         });
+        *attached = with;
         Some(text)
     }
 
@@ -362,6 +376,23 @@ mod tests {
         recall.sent("three", (), 0);
         assert!(!recall.showing("three"));
         assert_eq!(walk(&mut recall, "↑", String::new()), ["three"]);
+    }
+
+    #[test]
+    fn a_recall_with_its_attachments_changed_is_a_draft_of_its_own() {
+        let mut recall = Recall::default();
+        recall.sent("one", vec![], 0);
+        recall.sent("two", vec!["quote"], 0);
+        let mut attached = Vec::new();
+        assert_eq!(recall.older("", &mut attached).as_deref(), Some("two"));
+        // The quote taken away, the words alike: an edit, as of the words.
+        attached.clear();
+        assert_eq!(recall.newer("two", &mut attached), None);
+        assert!(attached.is_empty());
+        assert_eq!(recall.older("two", &mut attached).as_deref(), Some("two"));
+        assert_eq!(attached, ["quote"]);
+        assert_eq!(recall.newer("two", &mut attached).as_deref(), Some("two"));
+        assert!(attached.is_empty(), "the edit came back as the draft");
     }
 
     #[test]

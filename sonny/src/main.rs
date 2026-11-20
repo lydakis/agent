@@ -20124,13 +20124,18 @@ impl App {
     }
 
     /// The question in focus that sending `typed` answers: any words but
-    /// a command, a line for the shell, or nothing; and a line for the
+    /// a command, a line for the shell, or nothing (a quote alone is
+    /// words); and a line for the
     /// shell when the question is a step to run here ([`asks::runs_here`]),
     /// from its `!` on, as words are from their first letter.
     fn answers(&self, typed: &str) -> Option<&asks::Ask> {
         let typed = typed.trim_start();
         let ask = self.asking()?;
-        let words = !typed.trim().is_empty() && !typed.starts_with(['/', '!']);
+        // A quote alone is words, as it was typed into them.
+        let words = match typed.trim().is_empty() {
+            true => !self.quotes.is_empty(),
+            false => !typed.starts_with(['/', '!']),
+        };
         let runs = typed.starts_with('!') && asks::runs_here(ask);
         (words || runs).then_some(ask)
     }
@@ -24153,7 +24158,10 @@ fn noted(prompt: String, quotes: &[Quote]) -> String {
     match asks::split(&prompt) {
         Some((_, answer)) => {
             let question = &prompt[..prompt.len() - answer.len()];
-            format!("{question}{quoted}\n\n{answer}")
+            match answer.is_empty() {
+                true => format!("{question}{quoted}"),
+                false => format!("{question}{quoted}\n\n{answer}"),
+            }
         }
         None => format!("{quoted}\n\n{prompt}"),
     }
@@ -29696,6 +29704,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_quote_alone_answers_the_question_in_focus() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(words_sent(asked).to_owned());
+            }
+            json!({"message": 2, "turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        app.asked("c0", Some(1), &json!({"question": "Bump it?"}));
+        app.quote("Keep the old one.");
+        // The row over the composer says it answers, as words would.
+        assert!(app.answering_over(80).is_some());
+        app.submit().await;
+        app.beside_done().await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["You asked (ask:1/c0): Bump it?\n\n> Keep the old one."]
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_command_goes_with_the_next_message() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -31895,6 +31927,11 @@ mod tests {
         assert_eq!(
             noted("You asked (a1): Merge?\n\nYes".into(), &quotes[1..]),
             "You asked (a1): Merge?\n\n> ✎ Plan\n> Ship it\n\nYes"
+        );
+        // A quote alone answers with itself.
+        assert_eq!(
+            noted("You asked (a1): Merge?\n\n".into(), &quotes[1..]),
+            "You asked (a1): Merge?\n\n> ✎ Plan\n> Ship it"
         );
     }
 
