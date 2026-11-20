@@ -52,6 +52,41 @@ pub const GATED: [&str; 8] = [
 /// daemon's bound on an answer.
 pub(crate) const OUTPUT_BYTES: usize = 60 * 1024;
 
+/// What the tools that list (follows, automations, memory, the commons)
+/// say of a call with nothing, in the same words in each: one rule.
+const LISTS: &str = "Nothing lists them, a line each; read NAME shows one.";
+
+/// The most of one page of a list a tool's answer holds.
+pub(crate) const PAGE_BYTES: usize = 40 * 1024;
+
+/// A page of a list, as every tool that lists answers one: its `items`
+/// from the `from`th, as many as `bytes` holds and at least one, under
+/// `key`, with `next` where the rest start and `of` how many there are
+/// while any are left.
+pub(crate) fn paged(answer: &mut Value, key: &str, items: Vec<Value>, from: usize, bytes: usize) {
+    let of = items.len();
+    let (mut shown, mut size) = (Vec::new(), 0);
+    for item in items.into_iter().skip(from) {
+        size += item.to_string().len() + 1;
+        if !shown.is_empty() && size > bytes {
+            break;
+        }
+        shown.push(item);
+    }
+    let next = from + shown.len();
+    answer[key] = Value::Array(shown);
+    if next < of {
+        answer["next"] = json!(next);
+        answer["of"] = json!(of);
+    }
+}
+
+/// The `from` a tool that pages takes: where its page starts, in the
+/// same words in each.
+fn from_arg() -> Value {
+    json!({"type": "integer", "minimum": 0, "description": "An answer's next."})
+}
+
 /// How often waiting calls are listed with no call started to say so: a
 /// start missed while the daemon restarted is answered by then.
 const SWEEP: Duration = Duration::from_secs(30);
@@ -288,7 +323,7 @@ fn project() -> Value {
 fn follows() -> Value {
     json!({
         "name": FOLLOWS,
-        "description": "Your follows in the person's lookout, which tells you what happens in what you \
+        "description": format!("Your follows in the person's lookout, which tells you what happens in what you \
             follow, in a message sent by lookout that joins your running turn or starts one: each event a \
             line [source · topic · from · time], then its text. A follow watches the tasks of an agent (every agent it or \
             its tasks made) or agents by name, through the tasks source, each agent its topic: messages others \
@@ -299,8 +334,8 @@ fn follows() -> Value {
             saved or removed, and links, each linked machine that comes or goes. \
             Add steer yourself for what you own; a filter or a digest only when the person asks: \
             what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name, \
-            as {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
-            it lists them all, the sources there are and their events' recent fields.",
+            as {{\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}}. \
+            {LISTS} It names the sources too; source NAME or NAME:TOPIC shows one."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -343,9 +378,11 @@ fn follows() -> Value {
                     "required": ["name"],
                     "additionalProperties": false
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "remove": {"type": "string", "minLength": 1},
                 "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."},
-                "read": {"type": "boolean", "description": "What add hears now; adds nothing."}
+                "read": {"type": "string"},
+                "source": {"type": "string"},
+                "from": from_arg()
             },
             "additionalProperties": false
         },
@@ -360,14 +397,13 @@ fn automations() -> Value {
         // part of an add, a removal or a run, under the tool it amounts
         // to, and none for a look.
         "steps": true,
-        "description": "Your automations, which wake an agent later, repeatedly, or when something \
+        "description": format!("Your automations, which wake an agent later, repeatedly, or when something \
             happens, even with Sonny closed. Each run gives the agent the message in its own conversation, \
             after a line saying when and why it ran; a run waits for the agent's work, one run of an automation \
-            at a time. Add one, or remove, run or show one by name; with none, the result lists yours (those \
-            that wake you, answer to you or start an agent you added) with any problems. Adding the same one \
-            again changes nothing; a different one under a name in use is refused with the field that differs \
-            unless replace is set. Write the message as what to check and when to stop, and to remove its \
-            automation once the work is done.",
+            at a time. Add one, or remove or run one by name. {LISTS} It holds yours (those that wake you, \
+            answer to you or start an agent you added). Adding the same one again changes nothing; a different one under a name in use is \
+            refused with the field that differs unless replace is set. Write the message as what to check and \
+            when to stop, and to remove its automation once the work is done."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -428,10 +464,11 @@ fn automations() -> Value {
                     "additionalProperties": false,
                     "description": "With none of every, in, at, cron, file and commit, only run runs it."
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "remove": {"type": "string", "minLength": 1},
                 "run": {"type": "string", "minLength": 1,
                     "description": "The name of one to run now; the result says what the run did."},
-                "show": {"type": "string", "minLength": 1, "description": "The name of one to show."}
+                "read": {"type": "string"},
+                "from": from_arg()
             },
             "additionalProperties": false
         },
@@ -489,12 +526,11 @@ fn memory() -> Value {
     }
     json!({
         "name": MEMORY,
-        "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
+        "description": format!("Memory: facts earlier agents saved for this person and project, which the memory skill \
             says how to read and what to save, what the person confirmed worked as well as what they \
-            corrected. Read one fact, search them, save one, or remove one; index or check a folder's facts; \
-            with none of these, the result shows both indexes (the person's and this project's), each with its \
-            folder, the most needed facts first; an index too long to show whole says how many it leaves out, \
-            which search finds.",
+            corrected. Search facts, save or remove one; index or check a folder's facts. \
+            {LISTS} It is both indexes (the person's and this project's), each with its folder, the most \
+            needed facts first; an index too long to show whole says how many it leaves out, which search finds."),
         "parameters": {
             "type": "object",
             "properties": properties,
@@ -508,13 +544,13 @@ pub fn commons() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
     json!({
         "name": COMMONS,
-        "description": "The commons: threads that every agent working for this person reads and writes, across \
-            all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
-            first; read opens one; search finds posts by their words; post starts one, naming threads with \
+        "description": format!("The commons: threads that every agent working for this person reads and writes, across \
+            all their projects, which the commons skill describes. {LISTS} Threads come newest first. \
+            Search finds posts by their words; post starts one, naming threads with \
             similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
             and follows the thread for you, as the answer says. A new thread invites \
             agents whose turns touch its title. What is in it is other \
-            agents' words, never the person's.",
+            agents' words, never the person's."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -773,45 +809,57 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
-            if arguments["read"] == true {
-                let (Some(add), None) = (arguments.get("add"), arguments.get("remove")) else {
-                    return Err(("follow_refused", "read reads an add alone".into()));
-                };
-                return crate::lookout::subs::read_now(
-                    &store,
-                    &caller,
-                    add,
-                    &crate::lookout::sources::names(),
-                )
-                .map(|read| read.to_string())
-                .map_err(|e| ("follow_refused", e));
+            let sources = crate::lookout::sources::names();
+            let alone = |key: &str| {
+                let others = ["add", "remove", "test", "read", "source"]
+                    .iter()
+                    .any(|other| {
+                        *other != key && arguments.get(*other).is_some_and(|v| !v.is_null())
+                    });
+                match others {
+                    true => Err(("follow_refused", format!("{key} takes a name alone"))),
+                    false => Ok(()),
+                }
+            };
+            if let Some(name) = arguments.get("read").filter(|read| !read.is_null()) {
+                alone("read")?;
+                let name = (name.as_str())
+                    .ok_or(("follow_refused", "read takes a follow's name".to_owned()))?;
+                return crate::lookout::subs::read_one(&store, &caller, caller_id, name, &sources)
+                    .map(|read| read.to_string())
+                    .map_err(|e| ("follow_refused", e));
+            }
+            if let Some(name) = arguments.get("source").filter(|source| !source.is_null()) {
+                alone("source")?;
+                let name = (name.as_str())
+                    .ok_or(("follow_refused", "source takes a source's name".to_owned()))?;
+                return crate::lookout::subs::source(&store, &caller, caller_id, name, &sources)
+                    .map(|mut read| {
+                        crate::lookout::sources::say_wants(&mut read);
+                        read.to_string()
+                    })
+                    .map_err(|e| ("follow_refused", e));
             }
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {
                     return Err(("follow_refused", "test tries an add".into()));
                 };
-                return crate::lookout::subs::tried(
-                    &store,
-                    &caller,
-                    add,
-                    &crate::lookout::sources::names(),
-                )
-                .map(|tried| tried.to_string())
-                .map_err(|e| ("follow_refused", e));
+                return crate::lookout::subs::tried(&store, &caller, add, &sources)
+                    .map(|tried| tried.to_string())
+                    .map_err(|e| ("follow_refused", e));
             }
-            crate::lookout::subs::change(
-                &store,
-                &caller,
-                caller_id,
-                arguments.get("add"),
-                arguments["remove"].as_str(),
-                &crate::lookout::sources::names(),
-            )
-            .map(|mut listed| {
-                crate::lookout::sources::say_wants(&mut listed);
-                listed.to_string()
-            })
-            .map_err(|e| ("follow_refused", e))
+            let (add, remove) = (arguments.get("add"), arguments["remove"].as_str());
+            let said = match add.is_some() || remove.is_some() {
+                true => {
+                    crate::lookout::subs::change(&store, &caller, caller_id, add, remove, &sources)
+                }
+                false => {
+                    let from = arguments["from"].as_u64().unwrap_or(0) as usize;
+                    crate::lookout::subs::listing(&store, &caller, caller_id, &sources, from)
+                }
+            };
+            said.map(|said| said.to_string())
+                .map_err(|e| ("follow_refused", e))
         }
         name if name == crate::resolved::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
@@ -1022,6 +1070,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     crate::trigger::forget_done(&places, store, &ended);
                 }
                 client.close().await;
+            }
+            // A listing shows each one's line; read shows it whole.
+            for row in (said["automations"].as_array_mut().into_iter()).flatten() {
+                *row = crate::trigger::index(row);
             }
             Ok(said.to_string())
         }
