@@ -29,6 +29,10 @@ jobs:
       github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # The gate reads the commit's Test runs.
+      actions: read
     outputs:
       tag: ${{ steps.source.outputs.tag }}
       commit: ${{ steps.source.outputs.commit }}
@@ -65,6 +69,14 @@ jobs:
             exit 1
           fi
           printf 'tag=%s\ncommit=%s\n' "$RELEASE_TAG" "$commit" >> "$GITHUB_OUTPUT"
+      - name: Require a green test run
+        # A release ships only a commit Test passed whole: a test.yml run
+        # pushed for it with every job and step a success, a skipped one
+        # failing. The gate is main's, as checked out above.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: python3 release/green_gate.py "$GITHUB_REPOSITORY" "$RELEASE_COMMIT"
 
   package:
     needs: resolve
