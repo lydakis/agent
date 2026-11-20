@@ -1811,10 +1811,15 @@ fn setup(host: &str, rest: &[String]) -> Result<(), String> {
     let command = match found(host)? {
         Some(command) => command,
         None => {
-            let version = env!("CARGO_PKG_VERSION");
-            println!("Sonny is not on {host}; installing {version} there…");
+            // This release there; a build from main (0.0.0) is no release,
+            // so the latest one.
+            let (shown, pinned) = match env!("CARGO_PKG_VERSION") {
+                "0.0.0" => ("the latest release".to_owned(), String::new()),
+                version => (version.to_owned(), format!("SONNY_VERSION={version} ")),
+            };
+            println!("Sonny is not on {host}; installing {shown} there…");
             let install = format!(
-                "curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | SONNY_VERSION={version} sh"
+                "curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | {pinned}sh"
             );
             let status = std::process::Command::new("ssh")
                 .args(["-t", "--", host, &install])
