@@ -9490,7 +9490,7 @@ impl App {
                     (self.screen).put_under_with(screen::Tag::End(node), tag, row, buttons);
                 }
                 Wrote::Reacted(_, _, None) => {}
-                Wrote::Quoted(said, named) => self.quote(&said, Some(named)),
+                Wrote::Quoted(said, named) => self.quote(&said, named),
                 // Taken away once the agent will hear of it; kept to close
                 // again when it could not be told.
                 Wrote::NoteClosed(id, None) => {
@@ -19094,6 +19094,7 @@ impl App {
             return;
         }
         if answering.is_none()
+            && self.quotes.is_empty()
             && let Some(emoji) = transcript::shortcodes(&prompt)
                 .or_else(|| transcript::reaction(&prompt).map(str::to_owned))
         {
@@ -24104,27 +24105,30 @@ struct Quote {
     said: String,
     /// What `submit`'s `quotes` takes for it: `{bot, message}` for a
     /// message with a number, `{bot, item}` for the agent's own words;
-    /// none for a margin note, which goes as its words ([`noted`]).
+    /// none for a margin note or a message with no number that is not
+    /// the agent's, which goes as its words ([`noted`]).
     named: Option<Value>,
 }
 
 /// What names the message at `node` of `bot`'s history to the daemon, as
 /// `history_items` read it: its number, by its handle, where it has one,
-/// else its item.
-fn quoted(read: &Value, bot: &str, node: i64) -> Value {
+/// else its item when it is the agent's words. Anything else, such as a
+/// prompt a fork took from a source since deleted, has nothing to name
+/// it, and goes as its words, as a margin note does.
+fn quoted(read: &Value, bot: &str, node: i64) -> Option<Value> {
     let numbered = (read["handle"].as_str())
         .and_then(|handle| handle.rsplit_once('/'))
         .and_then(|(bot, message)| Some((bot, message.parse::<i64>().ok()?)));
     match numbered {
-        Some((bot, message)) => json!({"bot": bot, "message": message}),
-        None => json!({"bot": bot, "item": node}),
+        Some((bot, message)) => Some(json!({"bot": bot, "message": message})),
+        None if read["item"]["role"] == "assistant" => Some(json!({"bot": bot, "item": node})),
+        None => None,
     }
 }
 
-/// `prompt` with the margin notes among `quotes` before the person's own
-/// words, quoted as Markdown quotes, the first [`QUOTE_LINES`] of each:
-/// a note has no number for the daemon to copy it by. An answer keeps its
-/// question first.
+/// `prompt` with the quotes nothing names to the daemon, margin notes
+/// among them, before the person's own words, quoted as Markdown quotes,
+/// the first [`QUOTE_LINES`] of each. An answer keeps its question first.
 fn noted(prompt: String, quotes: &[Quote]) -> String {
     let notes: Vec<String> = (quotes.iter())
         .filter(|quote| quote.named.is_none())
@@ -24210,8 +24214,8 @@ enum Wrote {
     /// of it, and the calls of this bot's round still waiting.
     Answered(Box<Answering>, agent_client::Result<Value>, Option<Value>),
     /// A message read to quote where the person writes: its words, and
-    /// what names it to the daemon.
-    Quoted(String, Value),
+    /// what names it to the daemon, if anything does.
+    Quoted(String, Option<Value>),
     /// A margin note the agent was told was taken away, and why the
     /// daemon refused to tell it.
     NoteClosed(String, Option<String>),
@@ -31801,6 +31805,37 @@ mod tests {
             asked["quotes"],
             json!([{"bot": "shop.lead", "item": 9}, {"bot": "shop.lead", "message": 7}])
         );
+        assert!(app.quotes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_quote_nothing_names_goes_as_its_words_and_an_emoji_with_a_quote_is_sent() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            // A prompt a fork took from a source since deleted: no number,
+            // and not the agent's words.
+            Some("history_items") => json!({"items": [{"node": 5,
+                "item": {"role": "user", "content": "Fork me"}}]}),
+            Some("submit") => {
+                seen.lock().unwrap().push(asked.clone());
+                json!({"message": 12, "turn": 12})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.press("reply/5").await;
+        app.beside_done().await;
+        assert_eq!(app.quotes[0].named, None);
+        // An emoji under a quote is a message with it, not a reaction.
+        app.input.set(":+1:");
+        app.submit().await;
+        app.beside_done().await;
+        let asked = sent.lock().unwrap()[0].clone();
+        assert_eq!(asked["prompt"], "> Fork me\n\n:+1:");
+        assert_eq!(asked["quotes"], Value::Null);
         assert!(app.quotes.is_empty());
     }
 
