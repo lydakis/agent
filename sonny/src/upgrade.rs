@@ -258,30 +258,50 @@ fn store_files(store: &Path) {
 }
 
 /// The migrations that need a whole listing of the store's agents, at a
-/// window's start, off its way: none listed once each is done.
+/// window's start, off its way: none listed once each is done. One window
+/// of the store runs them at a time, holding a lock beside its record, so
+/// windows that open together list the agents once between them; one that
+/// stops short leaves them to the next window that starts.
 pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    migrate_from_listing(client, store, home);
+}
+
+/// [`from_listing`] for the person whose HOME is `home`; the task that
+/// runs them, when this window does.
+fn migrate_from_listing(
+    client: std::sync::Arc<agent_client::Client>,
+    store: &Path,
+    home: Option<std::path::PathBuf>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let record = beside(store);
-    let nested = !done(&record, crate::approvals::NESTED_GONE);
     let migrated = home.as_ref().map(|home| home.join(".agent/sonny/migrated"));
-    let projects = (migrated.as_ref()).is_some_and(|it| !done(it, crate::commons::PROJECTS));
+    let left = |record: &Path| {
+        let nested = !done(record, crate::approvals::NESTED_GONE);
+        let projects = (migrated.as_ref()).is_some_and(|it| !done(it, crate::commons::PROJECTS));
+        (nested, projects)
+    };
+    if left(&record) == (false, false) {
+        return None;
+    }
+    let Ok(Some(held)) = crate::scheduler::locked(&lock(&record)) else {
+        return None;
+    };
+    // Read again under the lock: a window that held it may have just
+    // finished them.
+    let (nested, projects) = left(&record);
     if !nested && !projects {
-        return;
+        return None;
     }
     let store = store.to_path_buf();
-    tokio::spawn(async move {
-        let (bots, whole) = crate::lookout::listed(&client).await;
-        if !whole {
+    Some(tokio::spawn(async move {
+        let _held = held;
+        let Some(bots) = listing(&client).await else {
             return;
-        }
-        // What Sonny's walk of the repositories inside agents' folders
-        // gave them leaves their sandboxes.
-        if nested {
-            crate::approvals::nested_gone(client.clone(), &bots, &store);
-        }
+        };
         // Old commons posts name their authors' projects: each thread is
         // rewritten, off the loop.
-        if let Some(home) = home.filter(|_| projects) {
+        let named = (home.filter(|_| projects)).map(|home| {
             let records: std::collections::HashMap<String, serde_json::Value> = (bots.iter())
                 .filter_map(|bot| {
                     let name = bot["name"].as_str()?.to_owned();
@@ -290,9 +310,56 @@ pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) 
                     Some((name, kept))
                 })
                 .collect();
-            tokio::task::spawn_blocking(move || crate::commons::projects(&home, &records));
+            tokio::task::spawn_blocking(move || crate::commons::projects(&home, &records))
+        });
+        // What Sonny's walk of the repositories inside agents' folders
+        // gave them leaves their sandboxes.
+        if nested {
+            crate::approvals::nested_gone(&client, &bots, &store).await;
         }
-    });
+        if let Some(named) = named {
+            let _ = named.await;
+        }
+    }))
+}
+
+/// What the migrations read of each agent the daemon lists.
+const LISTED: [&str; 5] = ["name", "bot_id", "workspace", "created_by", "created_by_id"];
+
+/// Every agent the daemon lists, with only what the migrations read of
+/// each ([`LISTED`]), each page let go once read; none when a page could
+/// not be read.
+async fn listing(client: &agent_client::Client) -> Option<Vec<serde_json::Value>> {
+    use serde_json::Value;
+    let mut bots = Vec::new();
+    let mut after = Value::Null;
+    loop {
+        let mut page = client
+            .request("bots", serde_json::json!({"limit": 256, "after": after}))
+            .await
+            .ok()?;
+        let Value::Array(listed) = page["bots"].take() else {
+            return None;
+        };
+        bots.extend(listed.into_iter().map(|mut bot| {
+            let kept = (LISTED.iter())
+                .filter_map(|field| Some(((*field).to_owned(), bot.get_mut(*field)?.take())))
+                .collect();
+            Value::Object(kept)
+        }));
+        match page["next_after"].take() {
+            Value::Null => return Some(bots),
+            next => after = next,
+        }
+    }
+}
+
+/// The lock the window running [`from_listing`]'s migrations holds, beside
+/// their `record`.
+fn lock(record: &Path) -> std::path::PathBuf {
+    let mut lock = record.as_os_str().to_owned();
+    lock.push(".lock");
+    lock.into()
 }
 
 /// The record beside `store` of what was done once for it.
@@ -392,6 +459,71 @@ fn overdue(now: &str, steps: &[Step], migrations: &[Migration]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// The listing the migrations read keeps only what they read of each
+    /// agent, over every page.
+    #[tokio::test]
+    async fn the_migrations_listing_keeps_only_what_they_read() {
+        let client = crate::tests::daemon_answering(|request| {
+            let bot = |name: &str, id: i64| {
+                json!({"name": name, "bot_id": id, "workspace": "/w", "created_by": "p.lead",
+                    "created_by_id": 1, "status": "idle", "instructions": "x".repeat(4096),
+                    "last": {"turn": 3, "status": "done"}})
+            };
+            match request["after"].as_str() {
+                None => json!({"bots": [bot("p.a", 2), bot("p.b", 3)], "next_after": "p.b"}),
+                Some(_) => json!({"bots": [bot("p.c", 4)], "next_after": null}),
+            }
+        })
+        .await;
+        let bots = listing(&client).await.unwrap();
+        assert_eq!(bots.len(), 3);
+        assert_eq!(
+            bots[2],
+            json!({"name": "p.c", "bot_id": 4, "workspace": "/w", "created_by": "p.lead",
+                "created_by_id": 1})
+        );
+    }
+
+    /// Windows that open together list the agents for the migrations once
+    /// between them: one runs them while the others leave them, and none
+    /// lists them again once they are done.
+    #[tokio::test]
+    async fn one_window_at_a_time_runs_the_migrations_from_a_listing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("sonny-from-listing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        let store = dir.join("state.sqlite");
+        let listed = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = listed.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            if request["op"] == "bots" {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            json!({"bots": [{"name": "p.a", "bot_id": 2}], "next_after": null})
+        })
+        .await;
+        let home = Some(dir.join("home"));
+        // Another window runs them.
+        let held = crate::scheduler::locked(&lock(&beside(&store)))
+            .unwrap()
+            .unwrap();
+        assert!(migrate_from_listing(client.clone(), &store, home.clone()).is_none());
+        drop(held);
+        let ran = migrate_from_listing(client.clone(), &store, home.clone()).unwrap();
+        ran.await.unwrap();
+        assert_eq!(listed.load(Ordering::SeqCst), 1);
+        assert!(done(&beside(&store), crate::approvals::NESTED_GONE));
+        assert!(done(
+            &dir.join("home/.agent/sonny/migrated"),
+            crate::commons::PROJECTS
+        ));
+        assert!(migrate_from_listing(client, &store, home).is_none());
+        assert_eq!(listed.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The lookout passes events on and does nothing else (AGENTS.md): no
     /// migration runs in it, nor any of the work they do.
