@@ -1409,6 +1409,7 @@ mod tests {
         }
         for b in 0..50 {
             act(&home, "shop.fix", &format!("b{b:02}-00"), "claim", "on it");
+            act(&home, "shop.fix", &format!("b{b:02}-01"), "claim", "on it");
             act(&home, "shop.fix", &format!("b{b:02}-01"), "done", "fixed");
         }
         let best = |runs: usize, mut f: Box<dyn FnMut() + '_>| -> Duration {
