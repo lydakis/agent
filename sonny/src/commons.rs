@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 /// The most of one post.
 const POST_BYTES: usize = 16 * 1024;
 /// The most posts a thread holds; a longer conversation starts a new one.
-const POSTS: usize = 256;
+pub(crate) const POSTS: usize = 256;
 /// The most of one read's posts, so a read fits a served tool's answer:
 /// the rest come with `from`.
 const READ_BYTES: usize = 40 * 1024;
@@ -845,19 +845,21 @@ fn invite_submit(bot: &str, thread: &str, note: String, golden: bool) -> Value {
 fn add(dir: &Path, name: &str, post: &Value, reader: &str) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = lock(dir)?;
-    add_locked(dir, name, post, reader)
+    add_locked(dir, name, post, reader, true)
 }
 
-/// `add`, under the lock the caller holds, its name checked.
+/// `add`, under the lock the caller holds, its name checked; `capped`,
+/// refused once the thread holds [`POSTS`].
 pub(crate) fn add_locked(
     dir: &Path,
     name: &str,
     post: &Value,
     reader: &str,
+    capped: bool,
 ) -> Result<Value, String> {
     let path = dir.join(format!("{name}.jsonl"));
     let earlier = posts(&path)?;
-    if earlier.len() >= POSTS {
+    if capped && earlier.len() >= POSTS {
         return Err(format!(
             "commons_full: {name} holds {POSTS} posts; start a new thread that names it"
         ));
@@ -1007,10 +1009,20 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
                     shown[key] = post[key].clone();
                 }
             }
+            // What a board's post did, as the item's history.
+            for key in ["do", "board", "needs", "labels", "for", "took_from"] {
+                if !post[key].is_null() {
+                    shown[key] = post[key].clone();
+                }
+            }
             shown
         })
         .collect();
-    Ok(json!({"thread": name, "title": title, "posts": shown}))
+    let mut shown = json!({"thread": name, "title": title, "posts": shown});
+    if let Some(item) = crate::board::item(&posts) {
+        shown["item"] = item;
+    }
+    Ok(shown)
 }
 
 /// An agent's read of a thread from its post `from`, as many posts as
@@ -1204,8 +1216,12 @@ pub(crate) fn list(
         let mut opening = (thread.as_object_mut())
             .and_then(|t| t.remove(OPENING))
             .unwrap_or(Value::Null);
-        // A filter sees where an item stands as its first post's own.
+        // A filter sees where an item stands as its first post's own: what
+        // the item has since cleared is gone from it too.
         if let (Some(fields), Some(item)) = (opening.as_object_mut(), thread["item"].as_object()) {
+            for key in crate::board::CHANGING {
+                fields.remove(key);
+            }
             fields.extend(item.iter().map(|(key, value)| (key.clone(), value.clone())));
         }
         if !matched(filter, &opening) {
@@ -1321,12 +1337,36 @@ fn search(
         let title = first["title"].as_str().unwrap_or_default();
         let every = holds(title);
         let mut whole = true;
+        // An item's posts each show where it stands, as the listing's
+        // first post does, waiting while a need is not done.
+        let mut item = crate::board::item(&posts);
+        if let Some(item) = &mut item {
+            let done = |need: &str| {
+                (crate::commons::posts(&dir.join(format!("{need}.jsonl"))).ok())
+                    .and_then(|posts| crate::board::item(&posts))
+                    .is_some_and(|it| it["state"] == "done")
+            };
+            if crate::board::waiting(item, &done) {
+                item["state"] = json!("waiting");
+            }
+        }
+        let seen = |post: &Value| match (&item, post) {
+            (Some(Value::Object(item)), Value::Object(fields)) => {
+                // The post's own fields stand: by is who wrote it.
+                let mut fields = fields.clone();
+                for (key, value) in item {
+                    fields.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+                matched(filter, &Value::Object(fields))
+            }
+            _ => matched(filter, post),
+        };
         // A thread's matches fit a page on their own: past that, how many
         // more there are and the post to read from.
         let (mut matches, mut held, mut more) = (Vec::new(), 0, None);
         let hits = (posts.iter().enumerate())
             .filter(|(_, post)| every || holds(post["text"].as_str().unwrap_or_default()))
-            .filter(|(_, post)| matched(filter, post));
+            .filter(|(_, post)| seen(post));
         for (n, post) in hits {
             if let Some((count, _)) = &mut more {
                 *count += 1;
@@ -1367,6 +1407,9 @@ fn search(
         let mut thread = json!({"thread": name, "title": title, "started_by": first["by"],
             "posts": posts.len(), "last_by": last["by"], "last_when": when(at),
             "matches": matches});
+        if let Some(item) = &item {
+            thread["item"] = item.clone();
+        }
         if let Some((count, from)) = more {
             thread["more_matches"] = json!(count);
             thread["read_from"] = json!(from);

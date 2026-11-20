@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// What every agent of Sonny's leans on: the lead's and tasks' roles (and
 /// the superlead's, which a project opts into), the memory, plan, margin, zen,
-/// coordination, commons, workflow and automation skills, the nightly cleanup's,
+/// coordination, commons, board, workflow and automation skills, the nightly cleanup's,
 /// agent-browser's and agent-desktop's own when they are installed, and `~/.agent/memory` and
 /// `~/.agent/automation`, which run this Sonny. Written at each start, so they
 /// lead to this copy.
@@ -27,8 +27,10 @@ pub fn install_own() {
     // `[sonny] commons = false`: agents go without it.
     if crate::commons::on() {
         install("commons", include_str!("../skills/commons/SKILL.md"));
+        install("board", include_str!("../skills/board/SKILL.md"));
     } else {
         remove("commons");
+        remove("board");
     }
     // `[sonny.workflows] enabled = false`: agents go without it.
     if crate::workflow::on() {

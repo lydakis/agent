@@ -94,25 +94,20 @@ impl Sub {
         }
     }
 
-    /// What a task's agent working from a board follows: the commons'
-    /// posts on its items, at the commons source's digest, and an item
-    /// opening there as it comes, cutting into a busy turn, so a worker
-    /// that finished one hears of the next.
-    pub fn board(board: &str, owner: Option<i64>) -> Sub {
-        Sub {
-            name: format!("board.{}", board.replace('/', ".")),
-            tasks_of: Vec::new(),
-            agents: Vec::new(),
-            sources: vec![COMMONS_SOURCE.to_owned()],
-            filter: Some(serde_json::json!({"board": [board]})),
-            digest: None,
-            steer: Some(serde_json::json!({"opened": [{"exists": true}]})),
-            owner,
-            until: None,
-            runs: None,
-            made: None,
-            outlives_close: true,
+    /// `name` as a subscription may hold it: one too long is cut, and
+    /// ends in a digest of the whole, so it stays within [`NAME_MAX`] and
+    /// two names never become one.
+    pub fn bounded(mut name: String) -> String {
+        if name.len() > NAME_MAX {
+            let digest = super::digest(&name);
+            let mut cut = NAME_MAX - digest.len() - 1;
+            while !name.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            name.truncate(cut);
+            name = format!("{name}.{digest}");
         }
+        name
     }
 
     /// Which subscription it is, for its counts: all it says, and the
@@ -1801,6 +1796,21 @@ fn parse(value: &Value) -> Result<Sub, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_name_is_bounded_and_stays_apart() {
+        assert_eq!(
+            Sub::bounded("board.shop.errors".into()),
+            "board.shop.errors"
+        );
+        let (one, two) = (
+            Sub::bounded(format!("board.shop.{}.{}", "a".repeat(64), "b".repeat(64))),
+            Sub::bounded(format!("board.shop.{}.{}", "a".repeat(64), "c".repeat(64))),
+        );
+        assert!(one.len() <= NAME_MAX && two.len() <= NAME_MAX);
+        assert_ne!(one, two);
+        assert!(named_plainly(&one));
+    }
 
     #[test]
     fn the_goals_folder_goes_once_and_subscriptions_stay() {
