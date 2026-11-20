@@ -1572,6 +1572,27 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(state['persons_words'], [{'text': 'answer coworkers yourself'}])
         self.assertNotIn('persons_words_cut', state)
 
+    def test_a_change_to_the_persons_skills_waits_for_the_person(self):
+        # The judge would allow it: only the person may.
+        self.judge.answer = lambda round, id: .05
+        daemon = self.daemon()
+        home = self.path / 'home'
+        (home / '.agents/skills').mkdir(parents=True)
+        (self.path / 'skill').mkdir()
+        _, lines = self.approver(daemon, env={'HOME': str(home)})
+        copy = f'shell:cp -r {self.path}/skill {home}/.agents/skills/publish'
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt=copy)['result']['message']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertIn("it reaches `~/.agents`, where the person's skills, agent profiles and standing "
+                      'instructions are kept, which only the person may allow', self.denial(daemon, turn))
+        self.assertFalse((home / '.agents/skills/publish').exists())
+        # Its own folder's skills are its work, the judge's to weigh.
+        own = 'shell:mkdir -p .agents/skills/x && printf ok > .agents/skills/x/SKILL.md'
+        turn = daemon.request('submit', bot='Bob', request_id='b', prompt=own)['result']['message']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertFalse(self.poll(daemon, turn).get('denied'))
+        self.assertEqual((self.path / '.agents/skills/x/SKILL.md').read_text(), 'ok')
+
     def test_a_round_has_the_configured_time_and_a_hung_check_says_where_it_was(self):
         release = threading.Event()
         self.addCleanup(release.set)

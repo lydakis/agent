@@ -642,6 +642,23 @@ as one.
   reads words, so one that spells the name another way is left to the
   reviewer, and a command an allow rule lets out is not reviewed at all, as in
   Codex.
+- **The person's skills, agent profiles and standing instructions are
+  theirs too** (2026-11-20). A task ran an escalated `cp -r` of its
+  worktree's skill over a live skill in `~/.agents/skills`, one that
+  publishes pages in the person's name, and the reviewer allowed it on the
+  task's own word, though no reviewer had read the new skill; the same
+  reviewer refused a lead's config edit two hours before. Every agent reads
+  a skill, a profile or an AGENTS.md as the person's own, so a change there
+  reaches every agent after it. `~/.agents/skills`, `~/.agents/agents` and
+  `~/.agents/AGENTS.md` join `~/.agent` in the one list of kept places
+  (`approver::KEPT`), matched the same ways (a write, edit or patch by the
+  path it resolves to, the real path too; a command out of the sandbox by
+  its path words), and with the same verdict: the reviewer may refuse, and
+  what it would allow waits for the person, told the place holds the
+  person's skills, agent profiles and standing instructions. A folder the
+  agent was given (a task's worktree and the skills in it) is still its
+  own, and reading `~/.agents` stays unjudged. Codex keeps `.agents`
+  read-only in a writable workspace.
 - **An escalated `agent` command that works inside is refused at once**
   (2026-11-14). Agents asked to run `agent run`, `ls` and the like
   outside their sandbox out of habit, though their own socket answers them

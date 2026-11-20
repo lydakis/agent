@@ -361,13 +361,23 @@ pub fn verdict(assessment: &Value) -> Option<Verdict> {
     }
 }
 
-/// A call's verdict when it reaches the agent's home: the judge may refuse
-/// it, never allow it, so what it would allow waits for a person.
-pub fn own_home(verdict: Verdict) -> Verdict {
+/// A call's verdict when it reaches a place [`Home`] keeps for the person:
+/// the judge may refuse it, never allow it, so what it would allow waits
+/// for a person, told what the place holds.
+pub fn own_home(verdict: Verdict, kept: Kept) -> Verdict {
+    let place = match kept {
+        Kept::Agent => {
+            "`~/.agent`, where the person's settings, command rules and scheduled jobs are kept"
+        }
+        Kept::Agents => {
+            "`~/.agents`, where the person's skills, agent profiles and standing instructions \
+             are kept"
+        }
+    };
     match verdict {
         Verdict::Allow => Verdict::Doubt(format!(
-            "not allowed on review alone: it reaches `~/.agent`, where the person's settings, \
-             command rules and scheduled jobs are kept, which only the person may allow. {ASK}"
+            "not allowed on review alone: it reaches {place}, which only the person may allow. \
+             {ASK}"
         )),
         denied => denied,
     }
@@ -435,18 +445,40 @@ pub fn names_daemon_start(text: &str) -> bool {
     })
 }
 
-/// The agent's home, `~/.agent`, as a planned call may name it. What is
-/// kept there runs outside every sandbox or says how each one is made (the
-/// settings, the command rules, the scheduler's jobs), so the judge's word
-/// alone never lets a call reach it, as Claude Code's `--restricted` keeps
-/// the classifier from its own paths; the person may. The folders in it the
-/// agent was given, such as a task's worktree, are its own.
+/// What a place [`Home`] keeps for the person holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// `~/.agent`: the settings, command rules and scheduler's jobs.
+    Agent,
+    /// In `~/.agents`: the skills, agent profiles and standing
+    /// instructions every agent reads.
+    Agents,
+}
+
+/// The places only the person may let a call reach, each as a path word
+/// names it: the agent's home, `~/.agent`, and in `~/.agents` the skills,
+/// the agent profiles and the standing instructions. A skill, a profile
+/// or AGENTS.md is read as the person's own by every agent; the rest runs
+/// outside every sandbox or says how each one is made.
+pub const KEPT: [(&str, Kept); 4] = [
+    (".agent", Kept::Agent),
+    (".agents/skills", Kept::Agents),
+    (".agents/agents", Kept::Agents),
+    (".agents/AGENTS.md", Kept::Agents),
+];
+
+/// The places [`KEPT`] names, as a planned call may name them: the judge's
+/// word alone never lets a call reach one, as Claude Code's `--restricted`
+/// keeps the classifier from its own paths, and Codex keeps `.agents`
+/// read-only in a writable workspace; the person may. The folders in them
+/// the agent was given, such as a task's worktree, are its own.
 #[derive(Debug, Clone, Default)]
 pub struct Home {
     /// `$HOME`, which `~` and `$HOME` in a command stand for.
     pub home: std::path::PathBuf,
-    /// `~/.agent`, as `$HOME` spells it and by its real path.
-    pub agent: Vec<std::path::PathBuf>,
+    /// Each place in [`KEPT`], as `$HOME` spells it and by its real path,
+    /// with what it holds.
+    pub kept: Vec<(std::path::PathBuf, Kept)>,
     /// The folders the agent may write, its own and the writable ones.
     pub given: Vec<std::path::PathBuf>,
     /// Folders in the home that hold agents' work folders, such as Sonny's
@@ -458,16 +490,20 @@ pub struct Home {
 }
 
 impl Home {
-    fn under_agent(&self, path: &std::path::Path) -> bool {
-        self.agent.iter().any(|agent| path.starts_with(agent))
+    /// The kept place holding `path`, if one does.
+    fn kept_at(&self, path: &std::path::Path) -> Option<Kept> {
+        (self.kept.iter())
+            .find(|(place, _)| path.starts_with(place))
+            .map(|(_, kept)| *kept)
     }
 
-    /// Whether a given folder holds `path`: in the agent's home, only one
-    /// given there by name, since a folder holding the home (a lead in
-    /// `$HOME`) leaves it read-only, as its sandbox does.
+    /// Whether a given folder holds `path`: in a kept place, only one given
+    /// there by name, since a folder holding the place (a lead in `$HOME`)
+    /// leaves it read-only, as its sandbox does.
     fn given_holds(&self, path: &std::path::Path) -> bool {
         self.given.iter().any(|given| {
-            path.starts_with(given) && (!self.under_agent(path) || self.under_agent(given))
+            path.starts_with(given)
+                && (self.kept_at(path).is_none() || self.kept_at(given).is_some())
         }) || self.in_work(path)
     }
 
@@ -482,36 +518,39 @@ impl Home {
         })
     }
 
-    /// Whether a file a write, edit or patch changes, by its absolute
-    /// path, is in the agent's home outside the folders it was given there.
-    pub fn reaches(&self, path: &std::path::Path) -> bool {
+    /// The kept place a file a write, edit or patch changes is in, by its
+    /// absolute path, outside the folders the agent was given there.
+    pub fn reaches(&self, path: &std::path::Path) -> Option<Kept> {
         let path = lexical(path);
-        self.under_agent(&path) && !self.given_holds(&path)
+        self.kept_at(&path).filter(|_| !self.given_holds(&path))
     }
 
-    /// Whether a command's text names a `.agent` folder outside the folders
-    /// the agent was given: every path word holding `.agent` as a whole
-    /// part, or the home by one of its absolute spellings (its real path
-    /// need not hold the name), with `~`, `$HOME` and `${HOME}` read as the
-    /// home and a relative one read from `folder`. Read by its words alone, so a
+    /// The kept place a command's text names outside the folders the agent
+    /// was given: a path word holding one of [`KEPT`] as a whole part, or a
+    /// place by one of its absolute spellings (its real path need not hold
+    /// the name), with `~`, `$HOME` and `${HOME}` read as the home and a
+    /// relative one read from `folder`. Read by its words alone, so a
     /// command that spells the name another way is left to the judge.
-    pub fn named_by(&self, text: &str, folder: Option<&std::path::Path>) -> bool {
+    pub fn named_by(&self, text: &str, folder: Option<&std::path::Path>) -> Option<Kept> {
         let part =
             |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
         let ends = |c: char| c.is_whitespace() || "'\"`;|&()<>=:,".contains(c);
-        // `.agent` anywhere, and the home by each of its absolute spellings,
-        // its real one too, which need not hold the name.
-        let spelled: Vec<String> = (self.agent.iter())
-            .map(|agent| agent.to_string_lossy().into_owned())
+        // Each place's name anywhere, and each place by its absolute
+        // spellings, its real one too, which need not hold the name.
+        let spelled: Vec<(String, Kept)> = (self.kept.iter())
+            .map(|(place, kept)| (place.to_string_lossy().into_owned(), *kept))
             .collect();
-        let needles = std::iter::once(".agent").chain(spelled.iter().map(String::as_str));
-        let at: Vec<(usize, usize)> = needles
-            .flat_map(|needle| text.match_indices(needle).map(|(at, n)| (at, n.len())))
-            .filter(|&(at, len)| {
+        let needles = (KEPT.iter().map(|(name, kept)| (*name, *kept)))
+            .chain(spelled.iter().map(|(place, kept)| (place.as_str(), *kept)));
+        let at: Vec<(usize, usize, Kept)> = needles
+            .flat_map(|(needle, kept)| {
+                (text.match_indices(needle)).map(move |(at, n)| (at, n.len(), kept))
+            })
+            .filter(|&(at, len, _)| {
                 !part(text[..at].chars().next_back()) && !part(text[at + len..].chars().next())
             })
             .collect();
-        at.into_iter().any(|(at, _)| {
+        at.into_iter().find_map(|(at, _, kept)| {
             let start = text[..at]
                 .char_indices()
                 .rev()
@@ -528,9 +567,9 @@ impl Home {
             let path = match (path.is_absolute(), folder) {
                 (true, _) => lexical(path),
                 (false, Some(folder)) => lexical(&folder.join(path)),
-                (false, None) => return true,
+                (false, None) => return Some(kept),
             };
-            !self.given_holds(&path)
+            (!self.given_holds(&path)).then_some(kept)
         })
     }
 }
@@ -798,8 +837,9 @@ pub struct Planned {
     /// Files this turn wrote that the call names, whole, with their paths:
     /// what it would run.
     pub files: Vec<(String, String)>,
-    /// It reaches the agent's home ([`Home`]): only a person may allow it.
-    pub own_home: bool,
+    /// The kept place it reaches ([`Home`]), if any: only a person may
+    /// allow it.
+    pub own_home: Option<Kept>,
     /// Outside its sandbox, it may start a daemon
     /// ([`names_daemon_start`]): only a person may allow it.
     pub starts_daemon: bool,
@@ -1970,7 +2010,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"git push"}),
                 files: Vec::new(),
-                own_home: false,
+                own_home: None,
                 starts_daemon: false,
             }],
             transcript: transcript.finish(),
@@ -2019,7 +2059,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"gh release edit v1 --draft=false"}),
                 files: Vec::new(),
-                own_home: false,
+                own_home: None,
                 starts_daemon: false,
             }],
             decisions,
@@ -2090,7 +2130,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"ls"}),
                 files: Vec::new(),
-                own_home: false,
+                own_home: None,
                 starts_daemon: false,
             }],
             request: vec![Words {
@@ -2199,7 +2239,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"sh deploy.sh"}),
                 files: vec![("deploy.sh".into(), "make deploy".into())],
-                own_home: false,
+                own_home: None,
                 starts_daemon: false,
             }],
             allowed: vec![Allowed {
@@ -2358,9 +2398,12 @@ mod tests {
     fn home() -> Home {
         Home {
             home: "/Users/me".into(),
-            agent: vec!["/Users/me/.agent".into()],
+            kept: (KEPT.iter())
+                .map(|(name, kept)| (format!("/Users/me/{name}").into(), *kept))
+                .collect(),
             given: vec![
                 "/Users/me".into(),
+                "/Users/me/code/shop".into(),
                 "/Users/me/.agent/worktrees/shop-fix".into(),
                 "/Users/me/.agent/sonny/zen".into(),
             ],
@@ -2371,10 +2414,13 @@ mod tests {
     #[test]
     fn a_call_reaching_the_agent_s_home_is_never_allowed_on_the_judge_s_word() {
         assert!(
-            matches!(own_home(Verdict::Allow), Verdict::Doubt(r) if r.contains("only the person may allow"))
+            matches!(own_home(Verdict::Allow, Kept::Agent), Verdict::Doubt(r) if r.contains("only the person may allow"))
         );
+        // Told what the place holds.
+        assert!(matches!(own_home(Verdict::Allow, Kept::Agents),
+            Verdict::Doubt(r) if r.contains("it reaches `~/.agents`, where the person's skills, agent profiles and standing instructions are kept")));
         assert_eq!(
-            own_home(Verdict::Deny("no".into())),
+            own_home(Verdict::Deny("no".into()), Kept::Agents),
             Verdict::Deny("no".into())
         );
         // The policy no longer calls the scheduler's jobs ordinary work.
@@ -2486,7 +2532,7 @@ mod tests {
     #[test]
     fn a_file_in_the_agent_s_home_is_reached_but_in_the_folders_given_there() {
         let home = home();
-        let reaches = |path: &str| home.reaches(std::path::Path::new(path));
+        let reaches = |path: &str| home.reaches(std::path::Path::new(path)).is_some();
         assert!(reaches("/Users/me/.agent/automations/jobs/x.json"));
         assert!(reaches("/Users/me/.agent/config.toml"));
         assert!(reaches("/Users/me/.agent"));
@@ -2499,7 +2545,18 @@ mod tests {
         assert!(!reaches("/Users/me/.agent/worktrees/shop-fix/src/main.rs"));
         assert!(!reaches("/Users/me/.agent/sonny/zen/focus"));
         assert!(!reaches("/Users/me/notes.md"));
-        assert!(!reaches("/Users/me/.agents/skills/x/SKILL.md"));
+        // The person's skills, agent profiles and standing instructions.
+        assert_eq!(
+            home.reaches(std::path::Path::new("/Users/me/.agents/skills/x/SKILL.md")),
+            Some(Kept::Agents)
+        );
+        assert!(reaches("/Users/me/.agents/agents/r.md"));
+        assert!(reaches("/Users/me/.agents/AGENTS.md"));
+        assert!(reaches("/Users/me/.agents/skills"));
+        assert!(!reaches("/Users/me/.agents/notes.md"));
+        assert!(!reaches("/Users/me/.agents/AGENTS.md.bak"));
+        // A skill in a folder the agent was given is its work.
+        assert!(!reaches("/Users/me/code/shop/.agents/skills/x/SKILL.md"));
         // Beside its worktree, among the agents' work: the judge's to weigh.
         assert!(!reaches("/Users/me/.agent/worktrees/shop-fix-notes.md"));
         assert!(!reaches("/Users/me/.agent/worktrees/shop-pay/README.md"));
@@ -2514,7 +2571,7 @@ mod tests {
     fn a_command_names_the_agent_s_home_however_it_spells_the_home() {
         let home = home();
         let folder = Some(std::path::Path::new("/Users/me/code/shop"));
-        let named = |text: &str| home.named_by(text, folder);
+        let named = |text: &str| home.named_by(text, folder).is_some();
         for text in [
             "echo x > ~/.agent/automations/jobs/x.json",
             "cp job.json $HOME/.agent/automations/jobs/",
@@ -2534,14 +2591,26 @@ mod tests {
             "rm -rf ~/.agent/worktrees",
             "rm ~/.agent/worktrees/.folders/shop-fix",
             "cp x ~/.agent/worktrees/shop-fix/../../rules/default.rules",
+            // The person's skills, agent profiles and standing instructions.
+            "cp -r ./skill ~/.agents/skills/x",
+            "rm -rf $HOME/.agents/skills/publish",
+            "cat r.md > /Users/me/.agents/agents/r.md",
+            "echo rule >> ${HOME}/.agents/AGENTS.md",
         ] {
             assert!(named(text), "{text}");
         }
+        assert_eq!(
+            home.named_by("cp -r ./skill ~/.agents/skills/x", folder),
+            Some(Kept::Agents)
+        );
+        assert_eq!(home.named_by("rm -rf ~/.agent", folder), Some(Kept::Agent));
         for text in [
             "cargo test",
             "git -C ~/.agent/worktrees/shop-fix push origin HEAD",
-            "ls ~/.agents/skills",
             "cat ./.agent/notes.md",
+            // Its own folder's skills are its work.
+            "cp -r skill .agents/skills/x",
+            "echo x > ~/.agents/notes.md",
             "grep -r agent .",
             "echo my.agent.name",
             "rm -rf ~/.agent/sonny/zen/old",
@@ -2552,6 +2621,6 @@ mod tests {
             assert!(!named(text), "{text}");
         }
         // With no folder, a relative one could be anywhere.
-        assert!(home.named_by("cat .agent/x", None));
+        assert!(home.named_by("cat .agent/x", None).is_some());
     }
 }
