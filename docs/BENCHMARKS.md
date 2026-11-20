@@ -141,9 +141,8 @@ fresh store bound to the synthetic provider and drives its stdio JSONL protocol
 from the observer (`bench/daemon_driver.py`), creating one bot per agent and
 submitting the workload's turns. Only the daemon is charged to the target; the
 observer translates its responses and `text_delta` events into the fixed-size
-chunk protocol. Rust captures therefore include SQLite durability, WAL with
-`synchronous=NORMAL` since 2026-11-20 and FULL before (`durability:
-sqlite_wal_synchronous_normal` in the profile, `sqlite_full` before), so `compare` against the ephemeral
+chunk protocol. Rust captures therefore include SQLite FULL durability
+(`durability: sqlite_full` in the profile), so `compare` against the ephemeral
 Pi, Codex, and FX profiles is exploratory only. Rust captures before 2026-09-15
 used a removed `agent benchmark` subcommand that bypassed the protocol and
 SQLite; they are not comparable with later ones.
@@ -282,9 +281,9 @@ connections to the server and the fixture.
 
 - *Durability:* opencode writes sessions, messages, and parts to its own SQLite
   database (WAL, `synchronous=NORMAL`) in the private data folder. The profile
-  records `sqlite_wal_synchronous_normal`. This is not Pi/Codex/FX's
-  ephemeral state; it is the setting Rust's store has had since 2026-11-20
-  (FULL before). The undocumented in-memory database flag is not used.
+  records `sqlite_wal_synchronous_normal`. This is neither Pi/Codex/FX's
+  ephemeral state nor Rust's FULL durability. The undocumented in-memory
+  database flag is not used.
 - *Project:* opencode walks up to the nearest `.git`, adopts that repository as
   its project, and writes a project-id file into its git folder. Captures live
   inside this repository, so the adapter first runs `git init` on the private
@@ -695,7 +694,7 @@ requires a measured advantage or a feature gap after that reuse assessment.
 
 By default these drive the stdio service (`agent serve` without `--socket`, bound to the
 synthetic Responses provider through `--provider openai=responses,URL`) and
-exercise SQLite durability (WAL, `synchronous=NORMAL`), tool round trips,
+exercise SQLite FULL durability, tool round trips,
 kill/restart, exact resume/replay/item retrieval, idempotent submission, and
 historical forks. Shell mode validates an actual workspace artifact; forked
 workspaces must remain untouched. The separate fixture validates every prior
@@ -792,8 +791,7 @@ The adapter calls the exported `openNodeSqliteDatabase()`, sets
 unless they hold, then passes the database to `SqliteStorage.open()`. The
 `ready` event and the result record (`durability`) state the setting. With
 `--synchronous normal` the package default is kept and the run is recorded as
-`sqlite_wal_synchronous_normal`; Agent has only NORMAL since 2026-11-20
-(FULL before, as measured here). Under strace, one bot
+`sqlite_wal_synchronous_normal`; Agent has only FULL. Under strace, one bot
 and ten text turns of this workload's 20 × 25 ms streaming made 3.1
 `fsync`/`fdatasync` calls per turn in Agent, 9.0 in Pi Durable at FULL (one per
 commit, including partial-answer commits), and none in Pi Durable at NORMAL

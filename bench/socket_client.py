@@ -41,7 +41,7 @@ class Connection:
         self.worker = threading.Thread(target=read, daemon=True)
         self.worker.start()
         try:
-            self.receive(lambda e: e.get('event') == 'ready')
+            self.ready = self.receive(lambda e: e.get('event') == 'ready')
         except Exception:
             self.close()
             raise

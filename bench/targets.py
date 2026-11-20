@@ -37,7 +37,7 @@ def engine_target(engine, root, binary=None):
         executable = binary.resolve() if binary else root / ".local/target/release/agent"
         if not executable.exists():
             raise ValueError("build the Rust release target with cargo build --release --locked first")
-        metadata = {"engine": "rust", "comparison_profile": profile(engine), "durability": "sqlite_wal_synchronous_normal", "tools_exercised": False,
+        metadata = {"engine": "rust", "comparison_profile": profile(engine), "durability": "sqlite_full", "tools_exercised": False,
                     "binary_sha256": file_hash(executable),
                     "cargo_lock_sha256": None if binary else file_hash(root / "Cargo.lock"),
                     "version": subprocess.check_output([str(executable), "--version"],

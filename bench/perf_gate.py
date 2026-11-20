@@ -21,8 +21,9 @@ from pathlib import Path
 WARN = 0.15
 # Store work whose count depends on timing: how jobs fell into group
 # commits, how often the scheduler looked for ready turns, and how often
-# the log was checkpointed, which waits on what readers still hold.
-TIMED = {'commit', 'next_ready', 'checkpoint'}
+# the log was checkpointed, by the checkpointer or the writer itself,
+# which waits on what readers still hold.
+TIMED = {'commit', 'next_ready', 'checkpoint', 'writer_checkpoint'}
 
 
 def measured(path):

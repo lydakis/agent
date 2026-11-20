@@ -263,7 +263,7 @@ class EngineIntegrationTests(unittest.TestCase):
             self.assertGreaterEqual(result['target']['processes'], 2)
         else:
             self.assertEqual(result['target']['processes'], 1)
-        self.assertEqual(metadata['durability'], 'sqlite_wal_synchronous_normal' if engine == 'rust' else 'ephemeral')
+        self.assertEqual(metadata['durability'], 'sqlite_full' if engine == 'rust' else 'ephemeral')
         if engine == 'fx':
             # libfx 0.0.16 fetches the catalog once per turn; 0.0.8 did once per agent.
             self.assertEqual(result['provider']['catalog_requests'], 12)

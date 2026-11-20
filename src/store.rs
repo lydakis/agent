@@ -35,6 +35,8 @@ type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 /// asks, one at a time, each counted as the `checkpoint` operation from
 /// when it was asked for. Asks made while one runs become the next. It
 /// ends once the writer's connection, which holds the asking end, closes.
+/// The writer's own checkpoints are counted as `writer_checkpoint`, and
+/// what every checkpoint found is kept for `stats`.
 fn checkpoints(
     path: &Path,
     db: &mut Database,
@@ -42,19 +44,29 @@ fn checkpoints(
 ) -> Result<std::thread::JoinHandle<()>> {
     let checkpointer = db::Checkpointer::new(path);
     let running = checkpointer.running();
+    let (log, own_log, own_counters) =
+        (counters.log.clone(), counters.log.clone(), counters.clone());
     let (ask, asked) = std::sync::mpsc::sync_channel::<std::time::Instant>(1);
     let thread = std::thread::Builder::new()
         .name("agent-storage-checkpoint".into())
         .spawn(move || {
             while let Ok(queued) = asked.recv() {
                 let started = std::time::Instant::now();
-                let failed = checkpointer.checkpoint().is_err();
-                counters.record("checkpoint", queued, started, failed);
+                let found = checkpointer.checkpoint();
+                if let Ok((frames, copied)) = found {
+                    log.note(frames, copied);
+                }
+                counters.record("checkpoint", queued, started, found.is_err());
             }
         })?;
-    db.checkpoint_aside(running, move || {
-        let _ = ask.try_send(std::time::Instant::now());
-    })?;
+    db.checkpoint_aside(
+        running,
+        own_log,
+        move || {
+            let _ = ask.try_send(std::time::Instant::now());
+        },
+        move |started, failed| own_counters.record("writer_checkpoint", started, started, failed),
+    )?;
     Ok(thread)
 }
 
@@ -378,6 +390,8 @@ where
 #[derive(Default)]
 pub struct Counters {
     inner: std::sync::Mutex<Inner>,
+    /// What the WAL's checkpoints found.
+    log: std::sync::Arc<db::LogState>,
 }
 #[derive(Default, Clone)]
 struct Inner {
@@ -1046,6 +1060,7 @@ impl Store {
             "cache_kib": readers.cache_kib,
         });
         drop(readers);
+        stats["checkpoints"] = self.counters.log.json();
         stats["bytes"] = size("").into();
         stats["wal_bytes"] = size("-wal").into();
         stats
@@ -1846,27 +1861,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commits_wait_for_no_sync_and_checkpoints_flush_the_drive() {
+    async fn commits_sync_plainly_and_checkpoints_flush_the_drive() {
         let store = scratch_store("fullfsync").await;
-        // synchronous: 1 is NORMAL, 2 FULL.
         let writer = store
-            .call(|db| {
-                Ok((
-                    db.pragma("synchronous"),
-                    db.pragma("fullfsync"),
-                    db.pragma("checkpoint_fullfsync"),
-                ))
-            })
+            .call(|db| Ok((db.pragma("fullfsync"), db.pragma("checkpoint_fullfsync"))))
             .await
             .unwrap();
-        assert_eq!(writer, (1, 0, 1));
+        assert_eq!(writer, (0, 1));
         let reader = store
-            .read("pragma", |db| {
-                Ok((db.pragma("synchronous"), db.pragma("checkpoint_fullfsync")))
-            })
+            .read("pragma", |db| Ok(db.pragma("checkpoint_fullfsync")))
             .await
             .unwrap();
-        assert_eq!(reader, (1, 1));
+        assert_eq!(reader, 1);
     }
 
     #[tokio::test]
@@ -1907,49 +1913,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_log_a_reader_holds_is_checkpointed_once_for_each_thousand_pages() {
-        let store = scratch_store("held-log").await;
+    async fn a_log_a_reader_pins_is_checkpointed_ever_less_often_until_it_lets_go() {
+        let store = scratch_store("pinned-log").await;
         store
             .call(|db| Ok(db.connection().execute_batch("CREATE TABLE b(x BLOB)")?))
             .await
             .unwrap();
-        // A reader in a transaction from the start keeps every page it
-        // could read in the log, so the log never starts over.
-        let reader = Connection::open(scratch_path("held-log")).unwrap();
+        // A reader in a transaction from the start keeps every frame after
+        // its snapshot in the log: no checkpoint copies them back.
+        let reader = Connection::open(scratch_path("pinned-log")).unwrap();
         reader
             .execute_batch("BEGIN; SELECT count(*) FROM b;")
             .unwrap();
-        // About 3,500 pages of WAL, in commits of 10: asks at about
-        // 1,000, 2,000 and 3,000, and short of where the writer
-        // checkpoints itself.
-        for _ in 0..350 {
-            (store.call(|db| {
-                db.connection().execute_batch(
-                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10)
-                    INSERT INTO b SELECT randomblob(4000) FROM n",
-                )?;
-                Ok(())
-            }))
-            .await
-            .unwrap();
-        }
-        let checkpoints = || {
-            store.stats()["operations"]["checkpoint"]["count"]
+        let pages = |commits: usize| {
+            let store = store.clone();
+            async move {
+                for _ in 0..commits {
+                    (store.call(|db| {
+                        db.connection().execute_batch(
+                            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10)
+                            INSERT INTO b SELECT randomblob(4000) FROM n",
+                        )?;
+                        Ok(())
+                    }))
+                    .await
+                    .unwrap();
+                }
+            }
+        };
+        let count = |op: &str| {
+            store.stats()["operations"][op]["count"]
                 .as_u64()
                 .unwrap_or(0)
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while checkpoints() < 3 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{} checkpoints ran",
-                checkpoints()
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(checkpoints(), 3);
+        let settle = || async {
+            let mut seen = count("checkpoint");
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                if count("checkpoint") == seen {
+                    break;
+                }
+                seen = count("checkpoint");
+            }
+        };
+        // About 8,900 pages, in commits of 11. Asks at about 1,000, 2,000
+        // and 3,000 pages; the second copies nothing new, so the next waits
+        // for 2,000 more, then 4,000. The writer tries itself at 4,000,
+        // finds the log pinned, and tries again at 6,000, then 10,000, not
+        // every 1,000.
+        pages(800).await;
+        settle().await;
+        assert_eq!(count("writer_checkpoint"), 2);
+        assert!(
+            count("checkpoint") <= 5,
+            "{} checkpoints",
+            count("checkpoint")
+        );
+        let found = &store.stats()["checkpoints"];
+        let (log, copied) = (
+            found["log_frames"].as_i64().unwrap(),
+            found["copied_frames"].as_i64().unwrap(),
+        );
+        assert!(log > 8000 && copied < 200, "{found}");
+        assert!(found["pinned"].as_u64().unwrap() >= 3, "{found}");
+        // Once the reader lets go, the writer's next try copies it all
+        // back, and the log starts over.
         reader.execute_batch("COMMIT").unwrap();
+        pages(150).await;
+        settle().await;
+        let frames: i64 = Connection::open(scratch_path("pinned-log"))
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
+            .unwrap();
+        // Some 1,650 pages came after the reader let go, on top of the
+        // 8,900 it held.
+        assert!(frames < 2000, "the WAL went on from {frames} frames");
     }
 
     #[tokio::test]

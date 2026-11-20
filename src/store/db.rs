@@ -2715,12 +2715,52 @@ pub const CHECKPOINT_PAGES: std::os::raw::c_int = 1000;
 /// as [`Database::checkpoint_aside`] says: about the 16 MiB a log is cut
 /// back to.
 pub const CHECKPOINT_HELD: std::os::raw::c_int = 4 * CHECKPOINT_PAGES;
-/// The WAL pages after a commit past which the writer waits for the
-/// checkpointer before checkpointing itself: about 256 MiB, a bound on the
-/// disk the log takes. Only a disk whose syncs take a second or more
-/// while it takes writes at once lets a log grow that far: on one that is
-/// slow to write as well, the writes themselves wait.
-pub const CHECKPOINT_MOST: std::os::raw::c_int = 64 * CHECKPOINT_PAGES;
+/// The WAL pages after a commit past which the writer first waits out a
+/// checkpoint the checkpointer is running, so its own is not turned away:
+/// about 256 MiB. Pressure, not a bound: a reader that keeps its snapshot
+/// keeps every frame after it in the log, however long the log grows.
+pub const CHECKPOINT_PRESSED: std::os::raw::c_int = 64 * CHECKPOINT_PAGES;
+/// What the log's checkpoints found, the writer's and the checkpointer's:
+/// the frames in the log and those copied back at the last one, and how
+/// many copied nothing new while frames were left, because a reader still
+/// reads a snapshot they come after.
+#[derive(Default)]
+pub struct LogState {
+    log: std::sync::atomic::AtomicI64,
+    copied: std::sync::atomic::AtomicI64,
+    pinned: std::sync::atomic::AtomicBool,
+    pinned_count: std::sync::atomic::AtomicU64,
+}
+impl LogState {
+    /// Note what a checkpoint found, answering whether it moved: copied
+    /// frames it had not, finished the log, or found it started over.
+    pub fn note(&self, log: i64, copied: i64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let was_log = self.log.swap(log, Relaxed);
+        let was_copied = self.copied.swap(copied, Relaxed);
+        let moved = copied >= log || copied > was_copied || log < was_log;
+        self.pinned.store(!moved, Relaxed);
+        if !moved {
+            self.pinned_count.fetch_add(1, Relaxed);
+        }
+        moved
+    }
+    /// The log started over: nothing is pinned in it.
+    fn started_over(&self) {
+        self.pinned
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// The last checkpoint copied nothing new while frames were left.
+    pub fn pinned(&self) -> bool {
+        self.pinned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// For `stats`.
+    pub fn json(&self) -> Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        json!({"log_frames": self.log.load(Relaxed), "copied_frames": self.copied.load(Relaxed),
+            "pinned": self.pinned_count.load(Relaxed)})
+    }
+}
 /// Checkpoints of the WAL beside the writer, on a thread of their own, so
 /// a checkpoint's syncs hold no commit. PASSIVE, as SQLite's automatic
 /// checkpoint is: it copies back what no reader still needs and waits for
@@ -2742,19 +2782,21 @@ impl Checkpointer {
     pub fn running(&self) -> Arc<std::sync::Mutex<()>> {
         self.running.clone()
     }
-    /// Checkpoint the WAL as far as its readers allow.
-    pub fn checkpoint(&self) -> Result<()> {
+    /// Checkpoint the WAL as far as its readers allow, answering the
+    /// frames in the log and those copied back.
+    pub fn checkpoint(&self) -> Result<(i64, i64)> {
         let _running = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let conn = Connection::open(&self.path)?;
         // Synced as the writer's own checkpoint was: the WAL before its
         // pages are copied back, the database after, flushing the drive
         // on macOS. It reads through no page cache of its own.
         conn.execute_batch(&format!(
-            "PRAGMA synchronous=NORMAL; PRAGMA checkpoint_fullfsync=ON;
+            "PRAGMA synchronous=FULL; PRAGMA checkpoint_fullfsync=ON;
             PRAGMA cache_size=-64; PRAGMA journal_size_limit={WAL_KEPT};"
         ))?;
-        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
-        Ok(())
+        Ok(conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+            Ok((r.get(1)?, r.get(2)?))
+        })?)
     }
 }
 /// Plans that don't depend on bound values: SQLite's query planner
@@ -3776,8 +3818,8 @@ impl Database {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
         conn.execute_batch(&format!(
-            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA synchronous=NORMAL;
-            PRAGMA checkpoint_fullfsync=ON; PRAGMA journal_size_limit={WAL_KEPT};"
+            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;
+            PRAGMA journal_size_limit={WAL_KEPT};"
         ))?;
         Ok(Self {
             conn,
@@ -3803,47 +3845,88 @@ impl Database {
 
     /// Ask `ask` for a checkpoint each time the WAL grows by
     /// [`CHECKPOINT_PAGES`], in place of SQLite's own, which runs the
-    /// checkpoint on this connection right after the commit: two syncs
-    /// under NORMAL, and every job queued behind that group would wait for
-    /// them. A [`Checkpointer`] on its own connection takes the ask. While
-    /// a reader keeps the log from starting over, the commits after an ask
-    /// add little to copy back, so they ask nothing until the log has grown
-    /// as much again: as often as SQLite's own would have run.
+    /// checkpoint on this connection right after the commit: two syncs,
+    /// and every job queued behind that group would wait for them. A
+    /// [`Checkpointer`] on its own connection takes the ask. While a reader
+    /// keeps the log from starting over, the commits after an ask add
+    /// little to copy back, so they ask nothing until the log has grown as
+    /// much again: as often as SQLite's own would have run.
     ///
     /// The WAL starts over only once a checkpoint has copied all of it
     /// back, and a checkpoint beside the writer never catches up while
     /// commits keep coming faster than it syncs. Past [`CHECKPOINT_HELD`]
     /// pages the writer checkpoints itself, as SQLite would have: nothing
     /// is appended meanwhile, so it copies back the whole log and the next
-    /// commit starts it over. While the checkpointer runs that is busy, so
-    /// it asks the checkpointer to run again and the next commit tries
-    /// again; past [`CHECKPOINT_MOST`] the writer
-    /// waits out the checkpoint `running` holds first, so the log stays
-    /// bounded however slow the disk.
+    /// commit starts it over. While the checkpointer runs that is turned
+    /// away, so it asks the checkpointer to run again and the next commit
+    /// tries again; past [`CHECKPOINT_PRESSED`] the writer first waits out
+    /// the checkpoint `running` holds. `own` is told how long each of the
+    /// writer's own checkpoints took, and whether it failed.
+    ///
+    /// Every checkpoint is noted in `log`. One that copied nothing new
+    /// while frames were left found the log pinned by a reader, and no
+    /// checkpoint gets further until that reader moves on: the asks and
+    /// the writer's own tries then wait for twice the growth each time,
+    /// and go back to every [`CHECKPOINT_PAGES`] once one moves.
     pub fn checkpoint_aside(
         &mut self,
         running: Arc<std::sync::Mutex<()>>,
+        log: Arc<LogState>,
         mut ask: impl FnMut() + Send + 'static,
+        mut own: impl FnMut(std::time::Instant, bool) + Send + 'static,
     ) -> Result<()> {
-        // The log's pages at the last ask, or 0 once it started over.
-        let mut asked = 0;
+        // The log's pages after the last commit; at the last ask, and the
+        // growth before the next; the writer's next try, and the growth
+        // after it.
+        let mut last: std::os::raw::c_int = 0;
+        let (mut asked, mut ask_step): (std::os::raw::c_int, _) = (0, CHECKPOINT_PAGES);
+        let (mut own_at, mut own_step) = (CHECKPOINT_HELD, CHECKPOINT_PAGES);
         self.conn
             .wal_hook(Some(move |wal: &mut rusqlite::hooks::Wal, pages| {
-                if pages < asked {
-                    asked = 0;
+                if pages < last {
+                    (asked, ask_step) = (0, CHECKPOINT_PAGES);
+                    (own_at, own_step) = (CHECKPOINT_HELD, CHECKPOINT_PAGES);
+                    log.started_over();
                 }
-                if pages >= CHECKPOINT_MOST {
-                    let _running = running.lock().unwrap_or_else(|e| e.into_inner());
+                last = pages;
+                if pages >= own_at {
+                    let _running = (pages >= CHECKPOINT_PRESSED)
+                        .then(|| running.lock().unwrap_or_else(|e| e.into_inner()));
+                    let started = std::time::Instant::now();
                     // The commit has been made whatever this answers.
-                    let _ = wal.checkpoint();
-                } else if pages >= CHECKPOINT_HELD {
-                    // Busy while the checkpointer runs: ask it to go on
-                    // once it is done, so on a disk slower than the commits
-                    // it keeps checkpointing and the writer seldom syncs.
-                    if wal.checkpoint().is_err() {
-                        ask();
+                    match wal.checkpoint_v2(rusqlite::wal::CheckpointMode::PASSIVE) {
+                        Ok((frames, copied)) => {
+                            own(started, false);
+                            own_step = if log.note(frames.into(), copied.into()) {
+                                CHECKPOINT_PAGES
+                            } else {
+                                own_step.saturating_mul(2)
+                            };
+                            own_at = pages.saturating_add(own_step);
+                        }
+                        // The checkpointer is running: ask it to go on once
+                        // it is done, so on a disk slower than the commits
+                        // it keeps checkpointing and the writer seldom
+                        // syncs. Not while the log is pinned, where it
+                        // would copy nothing.
+                        Err(rusqlite::Error::SqliteFailure(e, _))
+                            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+                        {
+                            if !log.pinned() {
+                                ask();
+                            }
+                        }
+                        Err(_) => {
+                            own(started, true);
+                            own_at = pages.saturating_add(own_step);
+                        }
                     }
-                } else if pages >= asked + CHECKPOINT_PAGES {
+                } else if pages >= asked.saturating_add(ask_step) {
+                    ask_step = if log.pinned() {
+                        ask_step.saturating_mul(2)
+                    } else {
+                        CHECKPOINT_PAGES
+                    };
                     asked = pages;
                     ask();
                 }
@@ -3861,15 +3944,14 @@ impl Database {
     }
 
     pub fn initialize(conn: Connection) -> Result<Self> {
-        // NORMAL in WAL mode, as Codex's state database and SQLite's own
-        // advice for WAL have it: a commit writes the WAL and is answered
-        // without waiting for the disk, and only a checkpoint syncs (the
-        // WAL before it copies pages back, the database after). An answer
-        // survives a daemon crash or kill, since what the daemon wrote is
-        // the OS's; an OS crash or power loss can take back the last
-        // commits, never corrupting the store. On macOS checkpoints flush
-        // the drive (F_FULLFSYNC) to keep the WAL and database in order;
-        // elsewhere that pragma changes nothing.
+        // FULL syncs the WAL before a commit is answered. An answer survives
+        // a daemon crash, but on macOS plain fsync can leave writes in the
+        // drive's cache: an OS crash or power loss can lose recent commits.
+        // Per-commit F_FULLFSYNC doubled daemon CPU on the light path, so it
+        // is off. Checkpoints retain full flushing to preserve WAL/database
+        // write ordering; this does not make later commits durable across
+        // an OS crash or power loss.
+        // Elsewhere both change nothing.
         //
         // Each job runs in a savepoint inside its group's transaction, and
         // SQLite journals the pages a savepoint changes so it can roll back
@@ -3880,7 +3962,7 @@ impl Database {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
             PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;",
         )?;

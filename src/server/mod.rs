@@ -2776,7 +2776,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "fallbacks":config.fallbacks.json(),
-        "durability":"sqlite_wal_synchronous_normal","partial_text_durable":false});
+        "durability":"sqlite_full","partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
     let mut callers: HashMap<u64, i64> = HashMap::new();
@@ -7206,9 +7206,12 @@ impl Service {
                 let deadline = timeout_ms.map(|t| handles::now_ms() + t);
                 let reader = store.reader();
                 // Registered here, so a result told from now on reaches it
-                // and its session's close lets it go; the results already
-                // stored are read beside the loop, which a slow disk would
-                // otherwise hold for every handle's read in turn.
+                // and its session's close lets it go. What the registry
+                // holds settles now; the results only the store has are
+                // read beside the loop, which a slow disk would otherwise
+                // hold for every handle's read in turn, on the observation
+                // lane's reader seats, each given back once its batch is
+                // read: a wait left waiting holds none.
                 let generation = self.handles.register(
                     waiter,
                     &handles,
@@ -7220,10 +7223,18 @@ impl Service {
                         reader: reader.clone(),
                     },
                 );
-                let registry = self.handles.clone();
-                tokio::spawn(async move {
-                    (registry.settle(&reader, waiter, generation, &handles, deadline)).await;
-                });
+                let stored = self.handles.settle_held(waiter, generation, &handles);
+                if stored.is_empty() {
+                    self.handles
+                        .settle_deadline(waiter, generation, &handles, deadline);
+                } else {
+                    let (registry, seats) = (self.handles.clone(), self.lane.seats());
+                    tokio::spawn(async move {
+                        (registry.settle_stored(&reader, Some(&seats), waiter, generation, stored))
+                            .await;
+                        registry.settle_deadline(waiter, generation, &handles, deadline);
+                    });
+                }
                 // The response is sent by the completion, not by this dispatch.
                 Err(Error::new("deferred"))
             }
@@ -10800,6 +10811,54 @@ mod tests {
         let answer: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(answer["id"], json!("w"));
         assert!(answer["result"]["results"]["A/1"].is_object(), "{answer}");
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_wait_reads_its_handles_a_batch_to_a_seat_and_stops_once_answered() {
+        let dir = scratch("wait-batches");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        requests(&mut service, vec![create("A", &dir)], &output).await;
+        let lookups = || {
+            store.stats()["operations"]["wait_lookup"]["count"]
+                .as_u64()
+                .unwrap_or(0)
+        };
+        // Every reader seat the lane has, taken.
+        let seats = service.lane.seats();
+        let taken = seats.clone().acquire_many_owned(2).await.unwrap();
+        let (daemon, client) = tokio::io::duplex(1 << 16);
+        let asker = Output::writer(daemon);
+        // More handles than one batch; any of them answers the wait.
+        let command = Command::Wait {
+            handles: (1..=handles::LOOKUP_BATCH as i64 + 4)
+                .map(|n| format!("A/{n}"))
+                .collect(),
+            timeout_ms: Some(10_000),
+            any: true,
+        };
+        let deferred = service.dispatch(command, 1, &asker, json!("w"), Bound::default());
+        assert_eq!(deferred.await.unwrap_err().code, "deferred");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(lookups(), 0, "a wait read without a seat");
+        drop(taken);
+        let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(client));
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the wait is answered")
+            .unwrap()
+            .unwrap();
+        let answer: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(answer["id"], json!("w"));
+        // The first batch answered it, so the second is never read, and
+        // the seat went back with the batch.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(lookups(), 1);
+        assert_eq!(seats.available_permits(), 2);
         drop(service);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
