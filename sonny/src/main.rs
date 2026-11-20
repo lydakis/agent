@@ -16,6 +16,7 @@ mod attach;
 mod audit;
 mod background;
 mod banner;
+mod board;
 mod boot;
 mod browser;
 mod budget;
@@ -21051,6 +21052,7 @@ impl App {
             env,
             made_by: Some(self.bot.clone()),
             providers: Value::Null,
+            board: None,
         };
         let (here, project, starter) = (dir.to_owned(), project.to_owned(), self.bot.clone());
         tokio::task::spawn_blocking(move || {
