@@ -115,6 +115,15 @@ def main():
         time.sleep(5)
 
         def busy(n):
+            # A worker that stops on an error leaves fewer busy agents than
+            # asked: the measure stops too.
+            try:
+                work(n)
+            except Exception as error:  # noqa: BLE001
+                failed.append(f'busy {n}: {error}')
+                stop.set()
+
+        def work(n):
             connection = connect(sock, daemon)
             # Tasks of the last ten projects, whose windows show only the
             # footer.
