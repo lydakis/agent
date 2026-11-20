@@ -315,7 +315,7 @@ pub fn tool() -> Value {
             wakes you at the deadline unless they answered or wrote to you since; that wake is \
             Sonny's, never their answer, so it allows nothing that needs their own words. If they \
             pick another after you went ahead, undo what you did and follow their pick. A step only \
-            the person can take, such as a sign-in or a command needing their own terminal, is an \
+            the person can take, such as a sign-in or a command in their own terminal, is an \
             ask too: no options, put the exact line to run in command, what it unblocks in why, and \
             wait; their next message says how it went. Any other question with nothing to choose \
             between goes in your reply.",
@@ -333,7 +333,7 @@ pub fn tool() -> Value {
                         "properties": {
                             "label": {"type": "string", "description": "The option, in a few words."},
                             "explanation": {"type": "string",
-                                "description": "What the person will see, keep, wait for or give up if they pick it, one sentence in their words; how it works goes in why."}
+                                "description": "What the person will see, keep, wait for or give up if they pick it, one sentence in their words; why says how it works."}
                         },
                         "required": ["label", "explanation"],
                         "additionalProperties": false
@@ -2738,7 +2738,7 @@ mod tests {
         // transactional saves"), so that goes to `why` by name.
         assert!(explanation.contains("What the person will see, keep, wait for or give up"));
         assert!(explanation.contains("in their words"));
-        assert!(explanation.contains("how it works goes in why"));
+        assert!(explanation.contains("why says how it works"));
         let why = tool["parameters"]["properties"]["why"]["description"]
             .as_str()
             .unwrap();
