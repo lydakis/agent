@@ -452,8 +452,8 @@ shape: the fields its last 200 events had (an object's own fields named
 with dots, as `meta.team`), their kinds, and its last 8 events cut short
 (strings at 120 characters, lists at 8 items), in
 `STORE.sources/.shapes/NAME.json`, written by a thread of its own so a
-source whose fields keep changing never holds up the lookout. Every
-`follows` call's answer lists the sources under `sources`, each
+source whose fields keep changing never holds up the lookout. A
+`follows` call with `source` NAME shows a source whole under `source`,
 with its shape. A field shows an example only from the newest of those
 events one of the caller's follows hears, by source, topic and
 filter (a filter is not trusted with an event that was cut), so no agent
@@ -472,10 +472,20 @@ the answer says so under `unseen`: it hears nothing until one does.
 
 A call that adds or removes one answers with that change alone: one
 added comes back under `follows` with, when it hears sources, the
-same `test` a try gives (below); one removed, with `removed`. Every
-follow, the sources there are and their events' recent fields come
-with a call that sends neither, so twenty changes no longer repeat the
-whole listing twenty times.
+same `test` a try gives (below); one removed, with `removed`. A call
+with nothing lists them as the other tools that list do (automations,
+memory, the commons): one line each, its name, whom and what it hears
+(`tasks_of`, `agents`, `sources`), its `until` and `runs`, how many
+events it heard in the last day (`lately`) and a source it names that is
+not there now (`problem`); with them the sources there are, each by
+`name` with its shape's `events`, and the `lookout`. A long list comes in
+pages: `next` in the answer says where the rest start, as `from`, and
+`of` how many there are. `read` NAME shows one of the caller's follows
+whole, as `add` would take it again, with what it told lately (`heard`,
+`notes`, `steers`, `last`) and what its sources say now (below); `source`
+NAME shows one source whole. Thirty follows over four sources listed
+about 8,000 characters when the listing gave every follow whole and every
+source's fields; one line each lists about 2,300.
 
 To try a follow before adding it, a call sends it as `add` with
 `"test": true`. Nothing is added; the answer's `test` says what it would
@@ -484,7 +494,7 @@ have heard of its sources' last 24 hours: how many events there were
 many of those steer, by the source's mark or the follow's `steer`
 (`steers`), and about how many notes they would have been with its
 digest or its sources' (`notes`), with the newest 3 it hears as examples,
-outside content as the listing's are. For this the lookout keeps what
+outside content as a source's are. For this the lookout keeps what
 each source printed, a command's and Sonny's own `memory` and `links`
 alike, in `STORE.sources/.recent/NAME.jsonl`, an
 event a line: a day of it, at most 2,000 events and 4 MiB, an event's
@@ -505,30 +515,29 @@ watches bots says so under `untested`.
 → {"test": {"since": "Fri 7 Nov 05:10", "events": 412, "heard": 9, "steers": 1, "notes": 9, "examples": […]}, "examples": "The fields' examples are…"}
 ```
 
-To know what a source says now without following it, a call sends a
-follow as `add` with `"read": true`, as it would a `test`, and nothing
-is added: Kubernetes reads a resource with `get` or follows it with
-`watch` by one selector, and Alertmanager's alerts API reads the alerts
-it holds by a route's matchers or a receiver's name. The add names
-sources as any does, `NAME` or `NAME:TOPIC`, with a `filter` if it wants
-one; an add that names nothing but its `name` reads the caller's follow
-of that name, what it hears. Each source answers with its status as kept
+To know what a source says now without following it, a call sends
+`source` NAME, or `NAME:TOPIC` for one topic, as Kubernetes reads a
+resource with `get` and follows it with `watch`, and Alertmanager's alerts
+API reads the alerts it holds by a route's matchers or a receiver's name;
+`read` NAME says the same of what a follow of the caller's hears, through
+its filter. Nothing is added. Each source answers with its status as kept
 above: the newest event of each topic it hears, and of the source
 itself, newest first, as data (`topic`, `from`, `at`, `text`, `id`,
 `url`, the other fields under `fields`, `cut` when it was kept cut), a
-cleared topic left out; and `down`, the lookout's word, while the source
-is down. `outside` says the text comes from outside, as the listing's
-examples do. An answer holds what a tool's answer shows, 60 KiB, and
-`more` counts the topics past it. The commons and what agents do keep nothing
-here (`unread`): the commons tool and the history tool read them. A read
-costs one read of one file a source, each line read for its topic alone
-and whole only when it is a topic's newest word, whatever the number of
-agents: about 2 ms for one topic.
+cleared topic left out, under `now`; and `down`, the lookout's word, while
+the source is down. `outside` says the text comes from outside, as the
+shape's examples do. An answer holds what a tool's answer shows, 60 KiB,
+and `more` counts the topics past it. The commons and what agents do keep
+nothing here (`unread`): the commons tool and the history tool read them.
+A read costs one read of one file a source, each line read for its topic
+alone and whole only when it is a topic's newest word, whatever the
+number of agents: about 2 ms for one topic.
 
 ```
-{"add": {"name": "red", "sources": ["prs"], "filter": {"state": ["red"]}}, "read": true}
-→ {"read": [{"source": "prs", "topics": [{"topic": "12", "from": "ci", "at": "Sat 14 Nov 22:10", "text": "#12 red", "id": "prs/88", "fields": {"state": "red"}}]}], "outside": "What a read gives is…"}
-{"add": {"name": "leads"}, "read": true}
+{"source": "prs:12"}
+→ {"source": {"name": "prs", "events": 41, "fields": {…}, "topics": ["12", "9"], "now": [{"topic": "12", "from": "ci", "at": "Sat 14 Nov 22:10", "text": "#12 red", "id": "prs/88", "fields": {"state": "red"}}]}, "outside": "What a read gives is…"}
+{"read": "leads"}
+→ {"follow": {"name": "leads", "agents": ["web.lead"], "sources": ["prs"], "lately": {…}}, "now": [{"source": "prs", "topics": […]}], "lookout": {…}}
 ```
 
 What sources said goes in the follower's next note, with what the tasks

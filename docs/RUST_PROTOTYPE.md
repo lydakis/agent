@@ -1955,6 +1955,21 @@ true` on `create` makes a bot with a creator start a line of its own, at 0, and 
 sandboxed bot's own socket (`not_permitted`), since a confined bot that could start lines could make
 bots without end.
 
+`profile` on `create` names the profile the client composed the bot from
+(1 to 128 of `A-Z a-z 0-9 . _ -`, else `invalid_name` with `field:
+"profile"`). The daemon reads nothing for it: it keeps the name on the bot,
+written in the commit that makes it, and the record, the `created` event
+and `bots` pages carry it when set (protocol 98, schema 110). A fork keeps
+its source's, on its record and its `forked` event. `spawn_agent` sends the
+profile it composed a new agent from; the CLI sends `--profile ROLE`'s
+ROLE, or `--profile-name ROLE` for instructions a client composed itself,
+as Sonny's `start_task` does. A keyed creation counts it in its
+idempotency. `configure` takes `profile` too, for instructions composed
+again in another role, and `null` removes it; changed, it is named in the
+answer's `changed`. Bots made before schema 110 have none; Sonny moves the
+roles it noted beside the store for the agents it started onto them once,
+with `configure`.
+
 `from: {bot, turn}` on `submit` says a bot's model wrote the prompt, in
 that turn; a prompt without it is a person's. The CLI sends it from
 `AGENT_BOT` and `AGENT_TURN`, and refuses a shell environment that has one
@@ -2329,7 +2344,18 @@ and the copy is checked (it opens, passes `PRAGMA integrity_check`, and is at
 that version); the two newest copies are kept. A store that cannot be copied,
 for a full disk say, is not migrated: opening fails with
 `store_backup_failed`, which says why, and the store stays as it was. To go
-back a release, stop the daemon and put the copy in the store's place. Schema 18 requires each bot's tool selection. Older stores with bots
+back a release, stop the daemon and put the copy in the store's place, or
+keep what changed since with `release/store_down.py STORE N`: on a store no
+daemon holds, it copies the store beside itself and takes it back to schema
+N with each step's way back, newest first, in one transaction. Every step
+from 106 (0.10.1) on has one there, and each new step adds its own. Schema
+109 names a declared tool's `lift` `yields` (#1203) in every list the store
+keeps, in place, so the list moves to the digest of its new bytes and the
+bots, creation records and kept `configure`s that name it follow; its way
+back changes nothing, since 0.10.2 at 108 reads `yields`. 108's way back
+removes the `namespace`, `speeds` and `context_windows` settings, which
+older releases refuse, and 107's puts each bot's instructions back in its
+row and names `yields` `lift` again, as 0.10.1 reads it. Schema 18 requires each bot's tool selection. Older stores with bots
 but no recorded selection are refused with `store_migration_tools_unknown`;
 their data and schema version remain intact. Keep those stores and use a new
 store path. Empty stores can migrate. Schema 19 rebuilds cache counters from
@@ -3017,7 +3043,16 @@ conversation (the `fork` request, with its `checkpoint`, `allow` and
 `expire_ms`), taking no instructions, profile, model, effort, tools,
 settings or compaction. One `request_id`, the call's own unless the model
 names one, keys both the making and the message, so a call made again
-makes and sends nothing new. The models the person lists in
+makes and sends nothing new. What it reads of the person's file system (the
+files composed for it, and its folder and writable folders by their real
+paths, as `create` resolves them) is read off the runtime thread and waited
+on with no time of its own: a file system that never answers (a mount whose
+server is gone) holds the call until a steer for the turn comes while it waits, which ends
+it as `folder_unanswered`, naming the file or folder still unanswered,
+with nothing made, or until the turn is interrupted. A read that never
+answers keeps its thread, which nothing takes back, so each folder is read
+by one call at a time: one made again waits behind it, as steerable, rather
+than holding another thread. The models the person lists in
 `~/.agent/models`, with their notes, are named in its `model` parameter,
 read as the daemon starts. `close_agent` closes an agent the caller made:
 the `close` request marks it (`closed_ms` on its record, kept first,

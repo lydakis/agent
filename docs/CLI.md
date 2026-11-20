@@ -240,7 +240,10 @@ tries its held turns at once.
   opt-in on the CLI, what Sonny composes for its agents, and exclusive with
   `--instructions`. `--profile ROLE` composes the same text with that role
   last, and takes the role's `model` and `tools` unless `--model` or
-  `--tools` names them; a missing role is `profile_not_found`. `fork` takes
+  `--tools` names them; a missing role is `profile_not_found`. The bot
+  keeps ROLE as its `profile`, which `inspect` and `ls` show.
+  `--profile-name ROLE` keeps ROLE so for instructions a client composed
+  itself (with `--instructions`), reading nothing. `fork` takes
   none of these: a fork is an exact copy of its source, instructions
   included.
   With `run`, instructions and token budget apply to new identities;

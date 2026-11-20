@@ -109,6 +109,13 @@ listed with why, so the window opens, says what is missing, and tells the
 lead with its next model call (George, 11-08: a broken skill link is no
 reason for Sonny not to open). A lead whose own role file cannot be used runs
 as Sonny's role of that name, and says so.
+Only regular files are read, each opened without waiting: a FIFO, socket or
+device named like an instructions file, memory index or worktree's `.git` is
+`instructions_unreadable` ("it is not a regular file") rather than a read that
+waits until another program writes to it. A caller may run the composition
+under `noting`, which keeps the path each read waits on its file system for
+until it answers, so a wait that never ends (a mount whose server is gone) can
+say where it is held.
 Skill discovery visits workspace overrides first and accounts each index row
 against the remaining byte budget before reading more paths or file heads.
 It fails as soon as the index cannot fit, then sorts only the bounded result. It also stops at

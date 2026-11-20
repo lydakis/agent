@@ -116,6 +116,9 @@ struct Options {
     agents: bool,
     /// A new bot's role: `.agents/agents/ROLE.md` in the workspace or home.
     profile: Option<String>,
+    /// The profile a client composed a new bot's instructions from itself,
+    /// kept on the bot by name; nothing is read for it.
+    profile_name: Option<String>,
     detach: bool,
     no_spawn: bool,
     /// `start --replace`: the daemon running now is replaced, whatever
@@ -208,6 +211,7 @@ fn parse(args: &[String]) -> Result<Options> {
         new: false,
         agents: false,
         profile: None,
+        profile_name: None,
         detach: false,
         no_spawn: false,
         replace: false,
@@ -297,6 +301,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--model" => options.model = Some(value),
                     "--profile" => options.profile = Some(value),
+                    "--profile-name" => options.profile_name = Some(value),
                     "--delivery" => options.delivery = Some(value),
                     "--approval" => {
                         options.approval = Some(value);
@@ -2210,7 +2215,10 @@ fn run(options: &Options) -> Result<i32> {
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
             "compaction_model":options.compaction_model,"fallback":fallback,
-            "settings":settings,"request_id":request_id});
+            "settings":settings,"request_id":request_id,
+            // The role it is composed in, or the one its client composed
+            // it in, kept on the bot.
+            "profile":options.profile.as_ref().or(options.profile_name.as_ref())});
         if let Value::Object(mut gate) = requested_gate(options, &tools)? {
             // The tools its creator declared, which it inherits, held by
             // its own gate too where its creator's gates hold them, so a
