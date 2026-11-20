@@ -309,6 +309,23 @@ async fn serve(settings: Settings) -> Result<i32> {
             &format!("a reviewer's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
         ));
     }
+    // The judge's input is sized to its model's own window, as Codex's
+    // guardian sizes its reviewer's: the window the daemon gives it, from
+    // the person's windows, its provider's listing, or the daemon's
+    // default. A listing not given in time is the default's. Read before
+    // the tag's lease is taken, which a slow listing would let lapse;
+    // none is asked for when the person's windows name the judge's.
+    let named_by_person =
+        (settings.windows.keys()).any(|pattern| agent_client::config::matches(pattern, &named));
+    let listing = match named_by_person {
+        true => Value::Null,
+        false => tokio::time::timeout(LISTING, client.request("provider_models", json!({})))
+            .await
+            .ok()
+            .and_then(|listed| listed.ok())
+            .unwrap_or_default(),
+    };
+    let window = agent_client::models::window(&settings.windows, &listing, &named);
     let served = client
         .request(
             "serve_approvals",
@@ -343,16 +360,6 @@ async fn serve(settings: Settings) -> Result<i32> {
         made => made?,
     };
     retire_old_base(&client, &tag).await;
-    // The judge's input is sized to its model's own window, as Codex's
-    // guardian sizes its reviewer's: the window the daemon gives it, from
-    // the person's windows, its provider's listing, or the daemon's
-    // default. A listing not given in time is the default's.
-    let listing = tokio::time::timeout(LISTING, client.request("provider_models", json!({})))
-        .await
-        .ok()
-        .and_then(|listed| listed.ok())
-        .unwrap_or_default();
-    let window = agent_client::models::window(&settings.windows, &listing, &named);
     let shared = Arc::new(Shared {
         client,
         judge: Judge {
