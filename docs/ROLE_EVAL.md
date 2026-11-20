@@ -122,9 +122,11 @@ time in words beside a clock.
 `--day quiet` asks whether a task's automation run that finds nothing ends
 with an empty reply, which the lookout drops, so its lead hears nothing of it,
 as `task.md` says. The person asks for a task that runs the tests every two
-minutes with an automation of its own and tells the lead only when they fail,
-the run waits six minutes while the tests keep passing, then the person asks
-what they need to know and has the check taken off. Its output sits under
+minutes with an automation of its own, saying nothing of when to speak, the
+run waits six minutes while the tests keep passing, then the person asks what
+they need to know and has the check taken off. Note whether the lead's
+`start_task` brief told the task to end quiet runs empty: such a run tests
+the brief, not `task.md`. Its output sits under
 `.local/role-eval/<model>/quiet/`, with `automation.md`: every turn an
 automation started, whose it was and its reply as the lookout reads it, and
 the notes that woke the lead about one. `blind` adds it to each transcript.

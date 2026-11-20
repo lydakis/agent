@@ -325,7 +325,7 @@ pub fn tool() -> Value {
                 "question": {"type": "string",
                     "description": "The question, verb first, in the person's own words, in about twelve words."},
                 "why": {"type": "string",
-                    "description": "What the answer decides and the facts the person needs to choose, written out here in a sentence or three, since this card may be all they see."},
+                    "description": "What the answer decides and the facts the person needs to choose, how each option works among them, written out here in a sentence or three, since this card may be all they see."},
                 "options": {"type": "array",
                     "description": "2 to 4 options, each a different way forward; none with command.",
                     "items": {
@@ -333,7 +333,7 @@ pub fn tool() -> Value {
                         "properties": {
                             "label": {"type": "string", "description": "The option, in a few words."},
                             "explanation": {"type": "string",
-                                "description": "What the person will see or get if they pick it, in their own words, in one sentence."}
+                                "description": "What the person will notice if they pick it, as they would say it: what they will see, keep, wait for or give up, leaving how it works to why; one sentence."}
                         },
                         "required": ["label", "explanation"],
                         "additionalProperties": false
@@ -2733,8 +2733,16 @@ mod tests {
             ["explanation"]["description"]
             .as_str()
             .unwrap();
-        assert!(explanation.contains("What the person will see or get if they pick it"));
-        assert!(explanation.contains("in their own words"));
+        // Sol, 11-20: told only to say what they see or get, every option
+        // still said how it works ("a local SQLite database with
+        // transactional saves"), so that goes to `why` by name.
+        assert!(explanation.contains("What the person will notice if they pick it"));
+        assert!(explanation.contains("see, keep, wait for or give up"));
+        assert!(explanation.contains("leaving how it works to why"));
+        let why = tool["parameters"]["properties"]["why"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(why.contains("how each option works"));
         // Said there alone, not again in the tool's description.
         let description = tool["description"].as_str().unwrap();
         assert!(!description.contains("each option"));

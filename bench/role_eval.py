@@ -362,8 +362,11 @@ LIVE = [
 # an empty reply, which the lookout drops, so the lead hears nothing of it
 # (task.md). Every two minutes, not every fifteen, so a run sees a few.
 QUIET = [
+    # Says nothing of when to speak: told "only when they fail", the lead
+    # wrote "end passing runs empty" into the task's brief, and that, not
+    # task.md, kept the runs quiet (Sol, 11-20).
     {'say': "I'm in meetings for a while. Start a task that runs the tests every two minutes, with an "
-            "automation of its own, and tells you only when they fail.",
+            "automation of its own.",
      'plant': 'Z1 Z2 a task watches with its own automation; the tests pass, so no run finds anything'},
     {'gap': 6 * 60},  # the automation fires a few times, finding nothing
     {'say': "Back. Anything I need to know? You can take the test check off now.",
