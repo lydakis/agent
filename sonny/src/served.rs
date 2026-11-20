@@ -1031,6 +1031,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 store: client.as_ref().and_then(|c| c.store()).map(str::to_owned),
             };
             // A trigger's add runs on a runtime of its own.
+            let from = arguments["from"].as_u64().unwrap_or(0) as usize;
             let arguments = arguments.clone();
             let mut said =
                 tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
@@ -1071,9 +1072,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 }
                 client.close().await;
             }
-            // A listing shows each one's line; read shows it whole.
-            for row in (said["automations"].as_array_mut().into_iter()).flatten() {
-                *row = crate::trigger::index(row);
+            // A listing shows each one's line, as many as fit now that
+            // they say how their turns ended; read shows one whole.
+            if said["automations"].is_array() {
+                crate::trigger::indexed(&mut said, from);
             }
             Ok(said.to_string())
         }

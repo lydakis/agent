@@ -3587,6 +3587,34 @@ pub fn index(row: &Value) -> Value {
     line
 }
 
+/// A page of [`list_of`], each row made its [`index`] line, as many as
+/// [`crate::served::PAGE_BYTES`] holds with what the tool host added
+/// since the page was chosen (how each one's last turn ended), the rest
+/// left to `next`, as [`crate::served::paged`] pages.
+pub fn indexed(listed: &mut Value, from: usize) {
+    let rows = match listed["automations"].take() {
+        Value::Array(rows) => rows,
+        _ => Vec::new(),
+    };
+    let shown = rows.len();
+    let of = listed["of"].as_u64().map_or(from + shown, |of| of as usize);
+    let lines = rows.iter().map(index).collect();
+    let mut page = json!({});
+    crate::served::paged(
+        &mut page,
+        "automations",
+        lines,
+        0,
+        crate::served::PAGE_BYTES,
+    );
+    let kept = page["automations"].as_array().map_or(0, Vec::len);
+    listed["automations"] = page["automations"].take();
+    if from + kept < of {
+        listed["next"] = json!(from + kept);
+        listed["of"] = json!(of);
+    }
+}
+
 /// The most of a problem an automation's line says: `read` says the rest.
 const PROBLEM_CHARS: usize = 160;
 
@@ -8004,8 +8032,10 @@ pub(crate) mod tests {
         let before = json!({"automations": rows, "next_after": null})
             .to_string()
             .len();
-        let lines: Vec<Value> = rows.iter().map(index).collect();
-        let after = json!({"automations": lines}).to_string().len();
+        let mut shown = page.clone();
+        indexed(&mut shown, 0);
+        let lines: Vec<Value> = shown["automations"].as_array().unwrap().clone();
+        let after = shown.to_string().len();
         eprintln!("60 automations, a call with nothing: {before} characters before, {after} now");
         assert!(after * 5 <= before, "{after} of {before}");
         let line = &lines[0];
@@ -8036,6 +8066,30 @@ pub(crate) mod tests {
             "{line}"
         );
         assert_eq!(line["problem"], "login expired");
+        // What the tool host adds once the page is chosen (how each one's
+        // last turn ended) still fits: the rest goes to next.
+        let ended: Vec<Value> = (0..400)
+            .map(|n| {
+                let mut row = rows[n % 60].clone();
+                row["name"] = json!(format!("w-{n:03}"));
+                row["last"]["turn_status"] = json!("interrupted");
+                row["last"]["turn_error"] = json!("x".repeat(400));
+                row
+            })
+            .collect();
+        let mut ended = json!({"automations": ended, "next": 450, "of": 1000});
+        indexed(&mut ended, 50);
+        assert!(
+            ended.to_string().len() <= crate::served::PAGE_BYTES + 64,
+            "{}",
+            ended.to_string().len()
+        );
+        let kept = ended["automations"].as_array().unwrap().len();
+        assert!((1..400).contains(&kept), "{kept}");
+        assert_eq!(
+            (&ended["next"], &ended["of"]),
+            (&json!(50 + kept), &json!(1000))
+        );
         // An if that fails keeps the last run, and is the problem.
         let mut broken = rows[2].clone();
         broken["checked"] = json!({"gate": "failed", "detail": "gh: not logged in"});
