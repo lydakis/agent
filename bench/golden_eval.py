@@ -808,22 +808,7 @@ def main():
     ap.add_argument('--base', help='the arm the others are compared against in the report')
     a = ap.parse_args()
     bins = {arm: str(Path(d).resolve()) for arm, d in (b.split('=', 1) for b in a.bin)}
-    settings = {}
-    for item in a.code_mode:
-        arm, _, mode = item.partition('=')
-        if mode not in ('on', 'off'):
-            ap.error(f'--code-mode {item}: on or off')
-        settings.setdefault(arm, {})['code_mode'] = mode == 'on'
-    for item in a.set:
-        arm, _, pair = item.partition(':')
-        key, eq, value = pair.partition('=')
-        if not (arm and key and eq):
-            ap.error(f'--set {item}: ARM:KEY=VALUE')
-        try:
-            value = json.loads(value)
-        except ValueError:
-            pass
-        settings.setdefault(arm, {})[key] = value
+    settings = role_eval.arm_settings(ap, a.code_mode, a.set)
     if a.cmd == 'one':
         one(a.case, a.arm, a.n, bins, a.model, a.provider, settings.get(a.arm))
     elif a.cmd == 'all':
