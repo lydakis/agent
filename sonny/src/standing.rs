@@ -72,6 +72,25 @@ pub struct Agent {
     pub workspace: Option<String>,
     /// The profile it was made in, which the daemon keeps on it.
     pub profile: Option<String>,
+    /// Whether it is closed (its `closed_ms` set): never kept.
+    #[serde(rename = "closed_ms", deserialize_with = "is_set")]
+    pub closed: bool,
+}
+
+/// Whether a row's field is set, whatever it holds.
+fn is_set<'de, D: serde::Deserializer<'de>>(field: D) -> Result<bool, D::Error> {
+    use serde::Deserialize;
+    Ok(Option::<serde::de::IgnoredAny>::deserialize(field)?.is_some())
+}
+
+/// A page of the `bots` listing, read for the fields a window keeps of
+/// each row, the rest of each passed over unbuilt.
+#[derive(serde::Deserialize)]
+struct Page {
+    #[serde(default)]
+    bots: Vec<Agent>,
+    next_after: Option<String>,
+    cursor: Option<i64>,
 }
 
 /// How a turn ended, as a `bots` row's `last` says it.
@@ -93,15 +112,11 @@ impl Agent {
     }
 }
 
-/// `row`, a `bots` row, as a window keeps it; none for a row that is not
-/// one, or for an agent closed, which a window's project leaves out as
-/// Codex's thread list leaves archived threads out, until a message
-/// opens it again.
-pub fn kept(row: Value) -> Option<Agent> {
-    if !row["closed_ms"].is_null() {
-        return None;
-    }
-    serde_json::from_value(row).ok()
+/// Whether a window keeps `agent`, a `bots` row: not once it is closed,
+/// which a window's project leaves out as Codex's thread list leaves
+/// archived threads out, until a message opens it again.
+fn kept(agent: &Agent) -> bool {
+    !agent.closed
 }
 
 /// Every agent `pattern` names but those closed, every page, with the
@@ -116,15 +131,11 @@ pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<A
         if let Some(after) = &after {
             ask["after"] = json!(after);
         }
-        let page = client.request("bots", ask).await?;
-        cursor = cursor.or(page["cursor"].as_i64());
-        listed.extend(
-            (page["bots"].as_array().into_iter().flatten())
-                .cloned()
-                .filter_map(kept),
-        );
-        match page["next_after"].as_str() {
-            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
+        let page: Page = client.request_as("bots", ask).await?;
+        cursor = cursor.or(page.cursor);
+        listed.extend(page.bots.into_iter().filter(kept));
+        match page.next_after {
+            Some(next) if after.as_ref() != Some(&next) => after = Some(next),
             _ => break,
         }
     }
@@ -151,14 +162,10 @@ pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Agen
         if let Some(after) = &after {
             ask["after"] = json!(after);
         }
-        let page = client.request("bots", ask).await?;
-        rows.extend(
-            (page["bots"].as_array().into_iter().flatten())
-                .cloned()
-                .filter_map(kept),
-        );
-        match page["next_after"].as_str() {
-            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
+        let page: Page = client.request_as("bots", ask).await?;
+        rows.extend(page.bots.into_iter().filter(kept));
+        match page.next_after {
+            Some(next) if after.as_ref() != Some(&next) => after = Some(next),
             _ => return Ok(rows),
         }
     }
@@ -461,9 +468,11 @@ mod tests {
 
     #[test]
     fn a_closed_agent_is_left_out_and_shows_again_once_open() {
-        let closed = json!({"name": "shop.fix", "head": 3, "closed_ms": 1700000000000_i64});
-        assert_eq!(kept(closed), None);
-        let open = json!({"name": "shop.fix", "head": 4});
-        assert_eq!(kept(open), Some(agent("shop.fix", 4)));
+        let row = |row: Value| serde_json::from_value::<Agent>(row).unwrap();
+        let closed = row(json!({"name": "shop.fix", "head": 3, "closed_ms": 1700000000000_i64}));
+        assert!(!kept(&closed));
+        let open = row(json!({"name": "shop.fix", "head": 4, "closed_ms": null, "unread": 2}));
+        assert!(kept(&open));
+        assert_eq!(open, agent("shop.fix", 4));
     }
 }
