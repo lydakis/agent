@@ -947,6 +947,28 @@ the board): an item opening there cuts into its turn, and the board's
 other posts reach it at the commons source's digest. Its brief ends with a
 line saying how to take the board's items.
 
+`/commons` draws boards from the same summaries, with no model call and no
+daemon call (Sonny Rulebook v54, Commons): a **Boards** section over
+Threads, a row a board, this window's project's first, then by name;
+finished boards (every item done or canceled, no post in seven days) fold
+into one last row. `m` lists every item among the threads. A board opens as
+its page, a section a state, and an item as its thread, with a row for
+where it stands and a muted row per action. `ctrl+f` finds in the list and
+on a board's page. A holder is `closed` when the window's last count of
+agents no longer lists it. In `/status` and the pane's list of agents a
+task with several agents is one row, its agents under it (**StatusView**,
+**Pane**); boards add nothing to either.
+
+![/commons with boards, at 150, 120, 60 and 44 columns](sonny/commons-boards.png)
+
+![/commons with m: every item among the threads](sonny/commons-boards-m.png)
+
+![An item's page: where it stands, then its posts](sonny/commons-item-page.png)
+
+![ctrl+f typed in /commons](sonny/commons-find.png)
+
+![The pane at rest: a task with four agents, those that need you or work under it](sonny/pane-task-agents.png)
+
 ## Pause
 
 `/pause REASON` stops every agent of every project at once, through the

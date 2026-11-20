@@ -1172,7 +1172,10 @@ has something on it, or is off the screen, no time shows.
   pressing agent; `←` folds its agents to `▸ 4 agents, 2 working`, and `→`
   opens them; they start open. `←` on one of its agents folds the task.
   The head and the footer still count each agent. A task with one agent
-  is one row, as any. As threads in a claude.ai project are
+  is one row, as any.
+
+  ![A task with four agents in /status, at 150, 120, 60 and 44 columns](../docs/sonny/status-task-agents.png)
+ As threads in a claude.ai project are
   resolved, a task marks itself done with the `mark_done` tool once
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
@@ -1380,6 +1383,8 @@ has something on it, or is off the screen, no time shows.
   ![/commons in the pane](../docs/sonny/commons.png)
 
   ![/commons with boards over the threads, at 150, 120, 60 and 44 columns](../docs/sonny/commons-boards.png)
+
+  ![A board's page: a section a state, a failure's reason under its item](../docs/sonny/commons-board-page.png)
 - `/memory` shows, in the pane beside the conversation, what agents saved to
   memory: Work under way, newest first, with how long since each was saved;
   This project's facts; and Everywhere, the facts kept in every project,
