@@ -185,6 +185,16 @@ impl Shared {
         self.order.get(project_in(bot, &self.order)).copied()
     }
 
+    /// Whether `bot` needs the person, as this follow has it; `None` for
+    /// one it does not follow (`closed`, a side chat, one of no project,
+    /// or any before it told anything), which its own reads tell.
+    pub fn waits(&self, bot: &str, closed: bool) -> Option<bool> {
+        if self.order.is_empty() || closed || !other(bot, &HashSet::new()) {
+            return None;
+        }
+        Some(self.agents.iter().any(|(_, _, waiting)| waiting == bot))
+    }
+
     /// What needs the person outside `project`.
     pub fn outside(&self, project: &str) -> Waiting {
         Waiting {
@@ -1558,6 +1568,23 @@ mod tests {
             head(&second, "site.lead") == Some(9) && head(&first, "site.lead") == Some(9)
         })
         .await;
+    }
+
+    /// What the follow says of an agent is the whole word only for an open
+    /// agent of a project, once it told anything.
+    #[test]
+    fn the_follow_answers_only_for_the_open_agents_of_a_project_it_told() {
+        assert_eq!(Shared::default().waits("shop.fix", false), None);
+        let shared = Shared {
+            order: HashMap::from([("shop".to_owned(), 0)]),
+            agents: vec![(0, "shop".to_owned(), "shop.fix".to_owned())],
+        };
+        assert_eq!(shared.waits("shop.fix", false), Some(true));
+        assert_eq!(shared.waits("shop.lead", false), Some(false));
+        assert_eq!(shared.waits("shop.fix", true), None);
+        assert_eq!(shared.waits("calc", false), None);
+        assert_eq!(shared.waits(".sky", false), None);
+        assert_eq!(shared.waits("shop.lead.side-ab12", false), None);
     }
 
     /// An approval held in another project is told the window as the

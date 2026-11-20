@@ -21305,24 +21305,44 @@ impl App {
         if !typed.is_empty() {
             picker.narrow(typed.to_owned());
         }
-        self.switch_asks(&mut picker);
+        let closed: std::collections::HashSet<String> = (bots.iter())
+            .filter(|bot| !bot["closed_ms"].is_null())
+            .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
+            .collect();
+        self.switch_asks(&mut picker, &closed);
         self.agents = Some(picker);
     }
 
     /// The questions open of the agents `picker` lists, as `/status` and
-    /// the sky read them: each idle one's last turn, as any window or sky
-    /// read it, or, where none did, read now beside the open list, each
-    /// marked as its read comes back ([`App::switch_asked`]) and kept for
-    /// the next. An agent nobody looked at in another project may well be
-    /// the one asking.
-    fn switch_asks(&mut self, picker: &mut switch::Picker) {
+    /// the sky read them: an open agent of a project as the store's one
+    /// follow (the footer's `← ? N`) has it, with no read; any other (a
+    /// closed one, a side chat, one of no project), or every one while
+    /// that follow has told nothing yet, from its last turn, as any window
+    /// or sky read it, or, where none did, read now beside the open list,
+    /// each marked as its read comes back ([`App::switch_asked`]) and kept
+    /// for the next. An agent nobody looked at in another project may well
+    /// be the one asking. `closed` are the agents listed closed.
+    fn switch_asks(
+        &mut self,
+        picker: &mut switch::Picker,
+        closed: &std::collections::HashSet<String>,
+    ) {
         let store = self.store();
         let identity = self.client.identity().map(str::to_owned);
         let kept = kept_seen(&store, identity.as_deref());
         let mut read: HashMap<String, (i64, Seen)> = HashMap::new();
         let mut unread = Vec::new();
         let mut open = Vec::new();
+        let shared = (self.other_projects.as_ref()).map(|(open, _)| open.waiting.borrow().clone());
         for (name, turn) in picker.ended() {
+            match (shared.as_ref()).and_then(|shared| shared.waits(name, closed.contains(name))) {
+                Some(true) => {
+                    open.push((name.to_owned(), turn));
+                    continue;
+                }
+                Some(false) => continue,
+                None => {}
+            }
             let had = [self.asks_seen.get(name), kept.get(name)];
             match had.into_iter().flatten().find(|(at, _)| *at == turn) {
                 Some((_, seen)) => {
