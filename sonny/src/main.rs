@@ -3816,6 +3816,8 @@ async fn run() -> Result<(), String> {
         }
     };
     trigger::restamp_at_start(client.identity(), client.store());
+    // Before the lead's instructions are composed again from its profile.
+    upgrade::profiles_on_agents(&client, &options.store).await;
     upgrade::from_listing(client.clone(), &options.store);
     // A lead made just now starts in the row new leads start in.
     let mut fresh = false;
@@ -26057,6 +26059,13 @@ mod tests {
             json!({"name": "shop.fix", "bot_id": 2}),
             json!({"name": "shop.kept", "bot_id": 3, "profile": "lead"}),
         ];
+        // A note that cannot be read leaves every note where it is, for
+        // the next start.
+        std::fs::create_dir(notes.join("shop.unread")).unwrap();
+        assert!(!task::profiles_onto_agents(&client, &bots, &store).await);
+        assert!(notes.join("shop.fix").exists());
+        assert!(asked.lock().unwrap().is_empty());
+        std::fs::remove_dir(notes.join("shop.unread")).unwrap();
         assert!(task::profiles_onto_agents(&client, &bots, &store).await);
         let asked: Vec<Value> = (asked.lock().unwrap().iter())
             .map(|ask| {
@@ -26071,6 +26080,38 @@ mod tests {
         assert!(!notes.exists());
         // Nothing left: done again at once.
         assert!(task::profiles_onto_agents(&client, &bots, &store).await);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lead_s_noted_profile_is_on_it_once_the_move_is_awaited() {
+        let dir = std::env::temp_dir().join(unique("sonny-profiles-awaited"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let mut notes = agent_client::socket::canonical_store(&store)
+            .unwrap()
+            .into_os_string();
+        notes.push(".profiles");
+        let notes = std::path::PathBuf::from(notes);
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("shop.lead"), "planner\n").unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |ask| {
+            seen.lock().unwrap().push(ask["op"].clone());
+            match ask["op"].as_str() {
+                Some("bots") => json!({"bots": [{"name": "shop.lead", "bot_id": 1}],
+                    "next_after": null, "cursor": 0}),
+                _ => json!({"bot": ask["bot"], "changed": ["profile"]}),
+            }
+        })
+        .await;
+        upgrade::profiles_on_agents(&client, &store).await;
+        assert_eq!(*asked.lock().unwrap(), [json!("bots"), json!("configure")]);
+        assert!(!notes.exists());
+        // Done once: no listing again.
+        upgrade::profiles_on_agents(&client, &store).await;
+        assert_eq!(asked.lock().unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

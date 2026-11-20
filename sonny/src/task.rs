@@ -597,17 +597,27 @@ pub async fn profiles_onto_agents(
     dir.push(".profiles");
     let dir = PathBuf::from(dir);
     let read = dir.clone();
-    let Ok(notes) = tokio::task::spawn_blocking(move || -> Vec<(String, String)> {
-        let entries = std::fs::read_dir(&read).into_iter().flatten().flatten();
-        entries
-            .filter_map(|entry| {
-                let name = entry.file_name().into_string().ok()?;
-                let text = std::fs::read_to_string(entry.path()).ok()?;
-                Some((name, text.trim().to_owned()))
-            })
-            .collect()
-    })
-    .await
+    // A note that cannot be read leaves the move undone, the folder kept
+    // for the next start: none is dropped unread.
+    let Ok(Ok(notes)) =
+        tokio::task::spawn_blocking(move || -> std::io::Result<Vec<(String, String)>> {
+            let entries = match std::fs::read_dir(&read) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                entries => entries?,
+            };
+            let mut notes = Vec::new();
+            for entry in entries {
+                let entry = entry?;
+                // Notes are named for agents; no agent's name is anything else.
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                let text = std::fs::read_to_string(entry.path())?;
+                notes.push((name, text.trim().to_owned()));
+            }
+            Ok(notes)
+        })
+        .await
     else {
         return false;
     };

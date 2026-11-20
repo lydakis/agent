@@ -271,8 +271,7 @@ pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) 
     let nested = !done(&record, crate::approvals::NESTED_GONE);
     let migrated = home.as_ref().map(|home| home.join(".agent/sonny/migrated"));
     let projects = (migrated.as_ref()).is_some_and(|it| !done(it, crate::commons::PROJECTS));
-    let profiles = !done(&record, crate::task::PROFILES_ON_AGENTS);
-    if !nested && !projects && !profiles {
+    if !nested && !projects {
         return;
     }
     let store = store.to_path_buf();
@@ -280,10 +279,6 @@ pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) 
         let (bots, whole) = crate::lookout::listed(&client).await;
         if !whole {
             return;
-        }
-        // The profiles noted for the agents Sonny started go onto them.
-        if profiles && crate::task::profiles_onto_agents(&client, &bots, &store).await {
-            once(&record, crate::task::PROFILES_ON_AGENTS, || true);
         }
         // What Sonny's walk of the repositories inside agents' folders
         // gave them leaves their sandboxes.
@@ -304,6 +299,20 @@ pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) 
             tokio::task::spawn_blocking(move || crate::commons::projects(&home, &records));
         }
     });
+}
+
+/// The profiles Sonny noted beside `store` for the agents it started go
+/// onto them, awaited before a lead's instructions are composed again from
+/// its profile: a whole listing, until it is done once.
+pub async fn profiles_on_agents(client: &agent_client::Client, store: &Path) {
+    let record = beside(store);
+    if done(&record, crate::task::PROFILES_ON_AGENTS) {
+        return;
+    }
+    let (bots, whole) = crate::lookout::listed(client).await;
+    if whole && crate::task::profiles_onto_agents(client, &bots, store).await {
+        once(&record, crate::task::PROFILES_ON_AGENTS, || true);
+    }
 }
 
 /// The record beside `store` of what was done once for it.
