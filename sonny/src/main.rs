@@ -6206,8 +6206,9 @@ struct App {
     /// What `/context` read, and the width its card was last laid at.
     context_read: Option<(context::Parts, Option<usize>)>,
     input: prompt::Prompt,
-    /// The prompts sent before, which Up and Down bring back.
-    recall: recall::Recall<Vec<Option<attach::Picture>>>,
+    /// The prompts sent before, which Up and Down bring back, with the
+    /// pictures and quotes each went with.
+    recall: recall::Recall<Attached>,
     /// Lines waiting to be written into the conversation, and what marks
     /// the rows of some, by their place among them.
     pending: Vec<Line<'static>>,
@@ -18537,7 +18538,7 @@ impl App {
                     // and what was being written.
                     KeyCode::Up => {
                         if !self.input.up(self.prose())
-                            && let Some(text) = self.recall.older(&self.input, &mut self.pictures)
+                            && let Some(text) = self.recalled(recall::Recall::older)
                         {
                             self.input.set(&text);
                             // One of several rows starts at its top, so Up
@@ -18549,7 +18550,7 @@ impl App {
                     }
                     KeyCode::Down => {
                         if !self.input.down(self.prose())
-                            && let Some(text) = self.recall.newer(&self.input, &mut self.pictures)
+                            && let Some(text) = self.recalled(recall::Recall::newer)
                         {
                             self.input.set(&text);
                         }
@@ -18646,6 +18647,22 @@ impl App {
         }
     }
 
+    /// A step through the prompts sent before, from what the composer
+    /// holds: what it was sent with, pictures and quotes, swapped for
+    /// what the composer had.
+    fn recalled(
+        &mut self,
+        step: impl FnOnce(&mut recall::Recall<Attached>, &str, &mut Attached) -> Option<String>,
+    ) -> Option<String> {
+        let mut attached = (
+            std::mem::take(&mut self.pictures),
+            std::mem::take(&mut self.quotes),
+        );
+        let text = step(&mut self.recall, &self.input, &mut attached);
+        (self.pictures, self.quotes) = attached;
+        text
+    }
+
     /// Ctrl+R: the list of prompts sent before, over the composer.
     fn search(&mut self) {
         let prompts = (self.recall.all().into_iter())
@@ -18681,8 +18698,9 @@ impl App {
                             (search.found.get(search.pick)).map(|(at, _)| search.prompts[*at].0);
                         self.searching = None;
                         if let Some(back) = back
-                            && let Some(text) =
-                                self.recall.jump(back, &self.input, &mut self.pictures)
+                            && let Some(text) = self.recalled(|recall, current, attached| {
+                                recall.jump(back, current, attached)
+                            })
                         {
                             self.input.set(&text);
                         }
@@ -18754,7 +18772,12 @@ impl App {
             false => Vec::new(),
         };
         let bytes = (attached.iter().flatten()).map(|p| p.data.len()).sum();
-        self.recall.sent(&prompt, attached, bytes);
+        // A command leaves the quotes for the message they go with.
+        let quotes = match prompt.starts_with('/') {
+            true => Vec::new(),
+            false => self.quotes.clone(),
+        };
+        self.recall.sent(&prompt, (attached, quotes), bytes);
         // A command run, so the menu ranks it first next time.
         let word = prompt.split_whitespace().next().unwrap_or_default();
         if COMMANDS.iter().any(|(name, _)| *name == word) && !self.new_brief() {
@@ -24097,6 +24120,9 @@ fn undrafted_quotes(draft: &str) -> Vec<Quote> {
         .and_then(|draft| serde_json::from_value(draft["quotes"].clone()).ok())
         .unwrap_or_default()
 }
+
+/// What a prompt sent before went with: its pictures and its quotes.
+type Attached = (Vec<Option<attach::Picture>>, Vec<Quote>);
 
 /// A message quoted over what the person writes ([`App::quote`]).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -37622,8 +37648,9 @@ mod tests {
     #[tokio::test]
     async fn up_and_down_past_the_rows_walk_the_prompts_sent() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        app.recall.sent("/status", Vec::new(), 0);
-        app.recall.sent("first line\nsecond line", Vec::new(), 0);
+        app.recall.sent("/status", Attached::default(), 0);
+        app.recall
+            .sent("first line\nsecond line", Attached::default(), 0);
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         // A draft of two rows: Up moves through it before going back.
         app.input.set("draft\nmore");
@@ -37668,9 +37695,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recalled_prompt_comes_back_with_its_quotes() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("submit") => json!({"message": 12, "turn": 12}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.recall = recall::Recall::default();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let quoted = Quote {
+            said: "Merged it.".into(),
+            named: Some(json!({"bot": "shop.lead", "item": 9})),
+        };
+        app.quote(&quoted.said, quoted.named.clone());
+        app.input.set("do that instead");
+        app.submit().await;
+        app.beside_done().await;
+        assert!(app.quotes.is_empty());
+        // A draft quoting something else waits while Up goes back.
+        app.quote("Other.", None);
+        app.input.set("draft");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "do that instead");
+        assert_eq!(app.quotes, [quoted]);
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "draft");
+        assert_eq!(app.quotes.len(), 1);
+        assert_eq!(app.quotes[0].said, "Other.");
+    }
+
+    #[tokio::test]
     async fn up_in_a_prompt_taller_than_the_composer_reaches_its_top_lines() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        app.recall.sent("sent before", Vec::new(), 0);
+        app.recall.sent("sent before", Attached::default(), 0);
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let long: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
         app.input.set(&long.join("\n"));
@@ -37710,7 +37768,7 @@ mod tests {
     async fn ctrl_r_finds_a_prompt_sent_before_and_leaves_it_to_edit() {
         let mut app = app(daemon_answering(|_| json!({})).await);
         for prompt in ["fix the rounding", "tag 0.2\nand push", "fix the readme"] {
-            app.recall.sent(prompt, Vec::new(), 0);
+            app.recall.sent(prompt, Attached::default(), 0);
         }
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let ctrl = |c| {
