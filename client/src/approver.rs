@@ -17,14 +17,28 @@ use std::borrow::Cow;
 /// calls being judged take none of it: they are shown whole.
 pub const STATE_TOKENS: usize = 32_000;
 pub const EARLIER_TOKENS: usize = 16_000;
-/// The judge's input budget, as Codex's is its reviewer model's input limit
-/// less a margin: the most the whole state may take as text. A judge's
-/// prompt is one daemon turn's, at most 256 KiB, and the round's ids and
-/// keys take the rest; that is well inside the smallest context window a
-/// judge model has (200K tokens), so it is what binds. The calls being
+/// The smallest context window a judge model has, in tokens: what the
+/// daemon takes for a model it knows nothing more of, and Claude's before
+/// Claude 5 (`provider::context_window`).
+pub const JUDGE_WINDOW_TOKENS: usize = 200_000;
+/// The judge's input budget, as Codex's guardian takes its reviewer model's:
+/// the window's effective share (95%) less a margin of 256 tokens, counted
+/// at 4 bytes a token as Codex estimates text, less the judge's
+/// instructions; and within one daemon prompt, [`crate::PROMPT_BYTES`]
+/// (1 MiB, as Codex bounds a person's input), less room for the round's
+/// ids and keys. The most the whole state may take as text. The calls being
 /// judged, and the files they run, are shown whole within it and the rest
 /// is fitted around them; a round they alone overflow goes to the person.
-pub const STATE_BYTES: usize = 240 * 1024;
+pub const STATE_BYTES: usize = {
+    let window = (JUDGE_WINDOW_TOKENS * 95 / 100 - 256) * 4 - JUDGE_INSTRUCTIONS.len();
+    let prompt = crate::PROMPT_BYTES - 16 * 1024;
+    if window < prompt { window } else { prompt }
+};
+// It fits the smallest window as Codex counts it, and one daemon prompt.
+const _: () = assert!(
+    (STATE_BYTES + JUDGE_INSTRUCTIONS.len()).div_ceil(4) <= JUDGE_WINDOW_TOKENS * 95 / 100 - 256
+        && STATE_BYTES + 16 * 1024 <= crate::PROMPT_BYTES
+);
 /// What the judge is shown of the agent's own history, as Codex's
 /// synchronous reviewer bounds it: each model message and each tool entry
 /// cut to its share, the newest kept within what messages and tool entries
@@ -2170,19 +2184,20 @@ mod tests {
                 message: None,
             }],
             transcript: transcript.finish(),
-            instructions: vec![("/w/AGENTS.md".into(), "\"".repeat(60 * 1024))],
+            instructions: vec![("/w/AGENTS.md".into(), "\"".repeat(STATE_BYTES / 2))],
             ..Intent::default()
         };
         let State::Built(state) = build(&intent, &Redactor::default()) else {
             panic!()
         };
-        assert!(model_prompt(&state, &["c1"]).len() <= 256 * 1024);
+        assert!(model_prompt(&state, &["c1"]).len() <= crate::PROMPT_BYTES);
         assert!(state.to_string().len() <= STATE_BYTES);
         // The judge is told, in Codex's words, how to read what remains.
         assert_eq!(state["context_omission"], OMISSION);
-        // A 200 KiB script the call runs and a 200 KiB write are each shown
-        // whole, and the rest fitted around them, the newest kept.
-        let script = "echo step\n".repeat(200 * 1024 / 10);
+        // A script of most of the budget the call runs, and a write of it,
+        // are each shown whole, and the rest fitted around them, the newest
+        // kept.
+        let script = "echo step\n".repeat(STATE_BYTES * 95 / 100 / 11);
         for planned in [
             Planned {
                 arguments: json!({"command":"sh monitor.sh","sandbox_permissions":"require_escalated"}),
@@ -2200,7 +2215,7 @@ mod tests {
             let State::Built(state) = build(&whole, &Redactor::default()) else {
                 panic!()
             };
-            assert!(model_prompt(&state, &["c1"]).len() <= 256 * 1024);
+            assert!(model_prompt(&state, &["c1"]).len() <= crate::PROMPT_BYTES);
             assert_eq!(state["planned_calls"][0]["arguments"], planned.arguments);
             if let Some((path, content)) = planned.files.first() {
                 assert_eq!(

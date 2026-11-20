@@ -116,13 +116,13 @@ class BlindTests(unittest.TestCase):
             update = lambda u: {'t': 0, 'm': {'method': 'session/update', 'params': {'update': u}}}
             rows = [{'t': 0, 'sent': {'method': 'session/prompt', 'params': {'prompt': [{'text': 'Fix it'}]}}},
                     update({'sessionUpdate': 'tool_call', 'name': 'start_task', 'rawInput': {
-                        'name': 'halves', 'brief': 'Round half cents to even\n\nIn calc.py.'}}),
+                        'name': 'halves', 'title': 'Round half cents to even', 'brief': 'Round...'}}),
                     update({'sessionUpdate': 'tool_call', 'name': 'start_task', 'rawInput': {
                         'name': 'readme', 'brief': 'Check it'}})]
             (run / 'acp.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
             role_eval.transcript(run)
             self.assertEqual((run / 'titles.md').read_text(),
-                             '- halves: Round half cents to even\n- readme: Check it\n')
+                             '- halves: Round half cents to even\n- readme: (no title)\n')
             with mock.patch.object(role_eval, 'OUT', out), mock.patch.object(role_eval, 'RUNS', runs):
                 role_eval.blind()
             [blind] = list((out / 'blind').iterdir())
