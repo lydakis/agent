@@ -244,7 +244,7 @@ pub fn tool() -> Value {
             such as to acknowledge it, to show you are looking into it, or for good news. A reaction never \
             replaces an answer: when the person asked something, answer in words. When a reaction is all \
             their message needs, react and end your turn without words. `remove` takes off a reaction you \
-            added, such as one that said you were looking into it, once you have answered. React only to \
+            added, such as a looking-into-it one once you have answered. React only to \
             the person, never to another agent's messages. With `agent`, it reacts to the person's newest \
             message in that agent instead, such as what they wrote in one of your tasks that you picked up.",
         "parameters": {
