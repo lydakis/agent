@@ -97,10 +97,12 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
     }
 
     /// Notes `prompt` sent with `attached`, of `bytes`, and ends any
-    /// walk. Older prompts let go of their attachments past the budget.
+    /// walk: one with no words is kept for what it has attached. Older
+    /// prompts let go of their attachments past the budget, and one with
+    /// no words goes with them.
     pub fn sent(&mut self, prompt: &str, attached: A, bytes: usize) {
         self.walk = None;
-        if prompt.is_empty()
+        if (prompt.is_empty() && attached == A::default())
             || (self.mine.last()).is_some_and(|last| last.0 == prompt && last.1 == attached)
         {
             return;
@@ -121,7 +123,9 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
         }
         // The oldest go past the words' budget; the newest always stays.
         self.mine.drain(..from.min(self.mine.len() - 1));
-        if let Some(file) = &self.file {
+        (self.mine).retain(|(text, attached, _)| !text.is_empty() || *attached != A::default());
+        // The file keeps words alone.
+        if let Some(file) = self.file.as_ref().filter(|_| !prompt.is_empty()) {
             let _ = append(file, prompt, now_ms());
         }
     }
@@ -200,7 +204,7 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
         let mut seen = std::collections::HashSet::new();
         (1..=self.len())
             .map(|back| (back, self.nth(back).0))
-            .filter(|(_, text)| seen.insert(*text))
+            .filter(|(_, text)| !text.is_empty() && seen.insert(*text))
             .collect()
     }
 
@@ -393,6 +397,28 @@ mod tests {
         assert_eq!(attached, ["quote"]);
         assert_eq!(recall.newer("two", &mut attached).as_deref(), Some("two"));
         assert!(attached.is_empty(), "the edit came back as the draft");
+    }
+
+    #[test]
+    fn one_sent_with_no_words_comes_back_for_what_it_had_attached() {
+        let dir = std::env::temp_dir().join(format!("sonny-recall-bare-{}", std::process::id()));
+        let file = dir.join("history.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut recall = Recall::kept(&file, 2);
+        recall.sent("one", vec![], 0);
+        recall.sent("", vec!["quote"], 1);
+        recall.sent("", vec![], 0);
+        let mut attached = Vec::new();
+        assert_eq!(recall.older("", &mut attached).as_deref(), Some(""));
+        assert_eq!(attached, ["quote"]);
+        assert_eq!(recall.older("", &mut attached).as_deref(), Some("one"));
+        // Search lists words; the file keeps them alone.
+        assert_eq!(recall.all(), [(2, "one")]);
+        assert_eq!(read(&file, i64::MAX), ["one"]);
+        // Past the budget it has nothing left to bring back, and goes.
+        recall.sent("two", vec!["big"; 2], 2);
+        assert_eq!(recall.mine.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
