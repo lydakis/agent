@@ -20,8 +20,9 @@ from pathlib import Path
 # A median this far past the base's is worth a look.
 WARN = 0.15
 # Store work whose count depends on timing: how jobs fell into group
-# commits, and how often the scheduler looked for ready turns.
-TIMED = {'commit', 'next_ready'}
+# commits, how often the scheduler looked for ready turns, and how often
+# the log was checkpointed, which waits on what readers still hold.
+TIMED = {'commit', 'next_ready', 'checkpoint'}
 
 
 def measured(path):
