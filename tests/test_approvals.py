@@ -1244,12 +1244,6 @@ class PromptReadTests(ModelFixture):
                                         origin='tasks')['error'], 'invalid_person')
         self.assertEqual(client.request('submit', bot='Bob', request_id='q0', prompt='hi',
                                         quotes=[{'bot': 'Bob', 'message': 0}])['error'], 'invalid_quote')
-        # A quote names a message or an item, never both or neither; only
-        # a message has a reply.
-        for shape in ({'bot': 'Bob'}, {'bot': 'Bob', 'message': first, 'item': 1},
-                      {'bot': 'Bob', 'item': 0}, {'bot': 'Bob', 'item': 1, 'reply': True}):
-            self.assertEqual(client.request('submit', bot='Bob', request_id='qs', prompt='hi',
-                                            quotes=[shape])['error'], 'invalid_quote', shape)
         self.assertEqual(client.request('submit', bot='Bob', request_id='q1', prompt='hi',
                                         quotes=[{'bot': 'Bob', 'message': second + 99}])['error'], 'quote_not_found')
         third = client.request('submit', bot='Bob', request_id='q2', prompt='as asked', person='ana',

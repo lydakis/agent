@@ -1594,17 +1594,12 @@ pub struct Lapsed {
     /// wakes, and the newest queued steer.
     pub parked: Option<(i64, i64)>,
 }
-/// Words a prompt quotes, from `bot`'s history: exactly its `message`,
-/// or with `reply` the last message with text the turn that took it in
-/// ended with; or the agent's own words at a history `item`, which has
-/// no number of its own. One of `message` and `item`.
+/// A message whose words a prompt quotes: exactly that message, or with
+/// `reply` the last message with text the turn that took it in ended with.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct QuoteRef {
     pub bot: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item: Option<i64>,
+    pub message: i64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reply: bool,
 }
@@ -12371,26 +12366,9 @@ impl Database {
         for QuoteRef {
             bot,
             message,
-            item,
             reply,
         } in quotes
         {
-            let message = match (message, item) {
-                (Some(message), None) => message,
-                (None, Some(item)) if !reply => {
-                    let quote = self.quote_item(bot, *item)?;
-                    bytes += quote["text"].as_str().map_or(0, str::len) + Self::QUOTE_BYTES;
-                    copied.push(quote);
-                    self.quote_bounds(copied.len(), bytes)?;
-                    continue;
-                }
-                _ => {
-                    return fail_with(
-                        "invalid_quote",
-                        "a quote names a message, or an item without reply",
-                    );
-                }
-            };
             type Row = (
                 Option<i64>,
                 Option<String>,
@@ -12474,93 +12452,28 @@ impl Database {
                     copied.push(inner);
                 }
             }
-            self.quote_bounds(copied.len(), bytes)?;
+            if copied.len() > Self::QUOTES {
+                return Err(Error::with(
+                    "quote_too_large",
+                    format!(
+                        "a prompt may hold {} quotes, those its quoted prompts quote counted",
+                        Self::QUOTES
+                    ),
+                )
+                .facts(json!({"limit":Self::QUOTES})));
+            }
+            if bytes > Self::QUOTED_BYTES {
+                return Err(Error::with(
+                    "quote_too_large",
+                    format!(
+                        "a prompt and the words it quotes may have {} bytes together",
+                        Self::QUOTED_BYTES
+                    ),
+                )
+                .facts(json!({"limit":Self::QUOTED_BYTES})));
+            }
         }
         Ok(Some(serde_json::to_string(&copied)?))
-    }
-    /// Refused past [`Self::QUOTES`] quotes or [`Self::QUOTED_BYTES`].
-    fn quote_bounds(&self, quotes: usize, bytes: usize) -> Result<()> {
-        if quotes > Self::QUOTES {
-            return Err(Error::with(
-                "quote_too_large",
-                format!(
-                    "a prompt may hold {} quotes, those its quoted prompts quote counted",
-                    Self::QUOTES
-                ),
-            )
-            .facts(json!({"limit":Self::QUOTES})));
-        }
-        if bytes > Self::QUOTED_BYTES {
-            return Err(Error::with(
-                "quote_too_large",
-                format!(
-                    "a prompt and the words it quotes may have {} bytes together",
-                    Self::QUOTED_BYTES
-                ),
-            )
-            .facts(json!({"limit":Self::QUOTED_BYTES})));
-        }
-        Ok(())
-    }
-    /// The agent's words at `item` in `bot`'s history, as a quote keeps
-    /// them, written in the turn that holds the item (`bot`'s own once a
-    /// fork's source and its turns are gone): a message of the agent's
-    /// with text, in a turn running or ended. A message with a number is
-    /// quoted by it.
-    fn quote_item(&self, bot: &str, item: i64) -> Result<Value> {
-        let missing = || {
-            Error::with(
-                "quote_not_found",
-                format!("{bot} has no words at item {item}"),
-            )
-            .facts(json!({"bot":bot,"item":item}))
-        };
-        let head = match self.inspect(bot) {
-            Ok(found) => found.head,
-            Err(error) if error.code == "bot_not_found" => return Err(missing()),
-            Err(error) => return Err(error),
-        };
-        if !self.in_lineage(head, item)? {
-            return Err(missing());
-        }
-        type Row = (Vec<u8>, Option<i64>, Option<i64>, Option<String>);
-        let row: Option<Row> = self
-            .conn
-            .prepare_cached(
-                "SELECT COALESCE(d.item,n.item),n.message,s.turn,t.bot FROM nodes n
-                 LEFT JOIN declined d ON d.node=n.id JOIN lineage l ON l.node=n.id
-                 LEFT JOIN nodes s ON s.id=l.start LEFT JOIN turns t ON t.id=s.turn
-                 WHERE n.id=?",
-            )?
-            .query_row([item], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .optional()?;
-        let Some((raw, message, turn, owner)) = row else {
-            return Err(missing());
-        };
-        if let Some(message) = message {
-            return Err(Error::with(
-                "quote_not_found",
-                format!("item {item} is message {message}: quote it by its number"),
-            )
-            .facts(json!({"bot":bot,"item":item,"message":message})));
-        }
-        let said: Value = serde_json::from_slice(&raw)?;
-        let text = match said["role"] == "assistant" {
-            true => assistant_text(&said),
-            false => String::new(),
-        };
-        if text.trim().is_empty() {
-            return Err(missing());
-        }
-        let mut quote = json!({"bot":bot,"item":item});
-        match (turn, owner) {
-            (Some(turn), Some(owner)) => authored(&mut quote, Some((owner, turn)), None, None),
-            // A deleted fork source's turn is gone; its words are the
-            // fork's history now.
-            _ => quote["from"] = json!({"bot":bot}),
-        }
-        quote["text"] = json!(text);
-        Ok(quote)
     }
     /// The last message with text a finished turn streamed, whole: what it
     /// ended with.
@@ -13696,7 +13609,7 @@ impl Database {
                     .map(|quote| {
                         serde_json::from_value(
                             json!({"bot":quote["bot"],"message":quote["message"],
-                            "item":quote["item"],"reply":quote["reply"] == true}),
+                            "reply":quote["reply"] == true}),
                         )
                     })
                     .collect::<serde_json::Result<_>>()?;
@@ -18681,9 +18594,6 @@ fn quote_author(quote: &Value) -> String {
             false => format!("written by the agent {bot} in {bot}/{turn}"),
         };
     }
-    if let Some(bot) = from["bot"].as_str() {
-        return format!("written by the agent {bot}");
-    }
     match (quote["origin"].as_str(), quote["person"].as_str()) {
         (Some(origin), _) => format!("sent by {origin}"),
         (None, Some(person)) => format!("written by {person}"),
@@ -18751,19 +18661,16 @@ fn after_words(
     let mut quotes: Vec<Value> = serde_json::from_str(&quotes).map_err(bad)?;
     for quote in &mut quotes {
         if sender {
-            let bot = quote["bot"].as_str().unwrap_or_default();
-            parts.push(match (quote["reply"] == true, quote["message"].as_i64()) {
-                (true, Some(message)) => format!(
-                    "[Quoted from the reply to message {bot}/{message}, {}:]",
-                    quote_author(quote)
-                ),
-                (false, Some(message)) => format!(
-                    "[Quoted from message {bot}/{message}, {}:]",
-                    quote_author(quote)
-                ),
-                // The agent's words, which have no number of their own.
-                _ => format!("[Quoted, {}:]", quote_author(quote)),
-            });
+            let what = match quote["reply"] == true {
+                true => "the reply to message",
+                false => "message",
+            };
+            parts.push(format!(
+                "[Quoted from {what} {}/{}, {}:]",
+                quote["bot"].as_str().unwrap_or_default(),
+                quote["message"],
+                quote_author(quote)
+            ));
         }
         let text = match quote.as_object_mut().and_then(|q| q.remove("text")) {
             Some(Value::String(text)) => text,

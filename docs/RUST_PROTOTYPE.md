@@ -1989,27 +1989,18 @@ prompt with a `person` is no consent to the approver, which answers to the
 daemon's own person only. A command run from a bot's sandboxed tool cannot
 send one (it would speak as a person from inside an agent).
 
-`quotes`, a list of `{bot, message, reply?}` or `{bot, item}`, copies other messages'
+`quotes`, a list of `{bot, message, reply?}`, copies other messages'
 words into the prompt: a message's own words, or with `reply: true` the
-last message the finished turn it opened ended with; or (protocol 98) the
-agent's own words at a history `item` of `bot`'s, which have no number: a
-message of the agent's with text, in a turn running or ended, the one a
-reply ended with or one before it. A client that shows the agent's every
-message quotes the one the person picked so; an item that holds a message
-is quoted by its number. The daemon copies them at submit, so
+last message the finished turn it opened ended with. The daemon copies them at submit, so
 what a quote says is what that turn holds, never what the sender retyped,
 and keeps who first wrote them: a quoted prompt's own quotes come along
 with their writers. Each quote is a text part after the sender's line,
 behind a line naming it, `[Quoted from message BOT/N, written by a
 person:]` or `[Quoted from the reply to message BOT/N, written by the agent
-BOT:]` or, for an item, `[Quoted, written by the agent BOT in BOT/TURN:]`
-(`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
+BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
 in NAME/TURN`); a `trailer` without `sender` leaves the lines out too. A message that
 does not exist, the reply to one that opened no turn, or a turn that ended without a reply
-(or whose events were pruned before schema 70), an item outside `bot`'s
-history, with no words of the agent's, or holding a message, is `quote_not_found`;
-a quote naming both or neither of `message` and `item`, either below 1, or an
-item with `reply`, is `invalid_quote`; a
+(or whose events were pruned before schema 70) is `quote_not_found`; a
 reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
 quoted prompts bring counted (marked `nested` in the record, which a retry
 leaves out), or words and quotes past 256 KiB together, each quote's line
