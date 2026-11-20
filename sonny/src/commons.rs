@@ -1352,8 +1352,12 @@ fn search(
         }
         let seen = |post: &Value| match (&item, post) {
             (Some(Value::Object(item)), Value::Object(fields)) => {
-                // The post's own fields stand: by is who wrote it.
+                // The post's own fields stand, by being who wrote it, but
+                // for what the item has changed since, which is the item's.
                 let mut fields = fields.clone();
+                for key in crate::board::CHANGING {
+                    fields.remove(key);
+                }
                 for (key, value) in item {
                     fields.entry(key.clone()).or_insert_with(|| value.clone());
                 }
