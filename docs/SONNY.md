@@ -32,9 +32,16 @@ Sonny's agents add and change automations with the `automations` tool, which
 Sonny's tool host answers outside the agent's sandbox, since an automation runs
 as the person outside it: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
-and `message`), `remove`, `run` or `show` NAME, or nothing to list them.
-An agent lists and shows only its own: those that wake it, send their answers
-to it, or start an agent it added; `sonny automation list` lists every one.
+and `message`), `remove`, `run` or `read` NAME, or nothing to list them.
+Nothing lists them as the other tools that list do (follows, memory, the
+commons): one line each, its name, when it runs (`when`), the agent it
+messages (`agent`), when its last run was and how it went (`last`, with how
+the turn it sent ended once known), and any `problem`, `missed` or `ended`;
+a long list comes in pages, `next` in the answer saying where the rest
+start, as `from`. `read` NAME shows one whole, its message and last result
+too. An agent lists and reads only its own: those that wake it, send their
+answers to it, or start an agent it added; `sonny automation list` lists
+every one.
 A look acts on nothing and runs as any read does, also for an agent whose
 sandbox no one reviews. An add, a removal or a run is judged by its parts,
 never as a whole, as a script's calls are: each part that reaches past the
@@ -491,12 +498,18 @@ and date alone, newest first, then the person's own (`user`, `feedback`), then t
 each group by `confirmed` count, then `verified` date, newest first. An
 index has no limit and a save is never refused for room. A new agent's
 instructions, and `show`, take each index's head
-([`memory::head`](../client/src/memory.rs)): whole lines from the top
-within 16 KiB, then a line saying how many facts it leaves out, which
-`search` finds, as Claude Code loads the first 200 lines of its MEMORY.md
-and reads the rest on demand. Both heads fit an agent's instructions
-beside its AGENTS.md files and role. Keeping memory small is the nightly
-cleanup's job, never a working agent's. A `work` fact is work under way
+([`memory::head`](../client/src/memory.rs)) within 16 KiB: the whole index
+when it fits; else every fact still, in the index's order, each
+description shortened alike by the steps the skills list takes (160, 80,
+then 40 characters, a cut one ending in `…`, then names alone), the first
+that fits, as Codex loads a short form of every memory and Claude Code a
+line per topic; and only when names alone pass 16 KiB, names from the top
+as many as fit, then a line saying how many facts it leaves out, which
+`search` finds. Both heads fit an agent's instructions beside its
+AGENTS.md files and role. Keeping memory small is the nightly cleanup's
+job, never a working agent's: `cleanup start` lists each index whose
+names alone pass the head (`over_head`), and the cleanup folds related
+facts into one per subject until they fit. A `work` fact is work under way
 that a later agent may pick up, saved again as it moves; the cleanup
 retires one not saved in over three days, as Codex and Copilot drop
 memories by age, after keeping any lesson in it as a lasting fact. The
@@ -712,10 +725,14 @@ and never removes a lasting fact for its age alone.
 first `cleanup start`, never pushed. `cleanup start` commits what agents
 saved since the last cleanup, records that commit, the fact count and the
 paths of the `work` facts in `.cleanup`, and lists the facts saved and removed since then, which the
-agent reads first rather than every fact; a second `start` before `finish` says `"duplicate": true` and
+agent reads first rather than every fact, and each index whose facts by
+name alone pass 16 KiB (`over_head`: its path, fact count, `names_bytes`
+and `head_bytes`); a second `start` before `finish` says `"duplicate": true` and
 keeps the first. `cleanup finish` commits the cleanup and returns what it
-removed, added and changed. A cleanup that removed more than a quarter of
-the lasting facts, and more than two, is `loss_guard` (the `work` facts it
+removed, added and changed, and `folded`, the removed facts whose whole
+text, white space aside, a fact the cleanup added or changed now holds. A
+cleanup that removed more than a quarter of
+the lasting facts, and more than two, not counting folded ones, is `loss_guard` (the `work` facts it
 started with are left out of both counts, since work under way ends): `finish` takes memory back
 to the start with a new commit, puts back what other agents saved or removed
 meanwhile, and the refused cleanup stays in history for the person to read.
@@ -970,8 +987,16 @@ protocol would otherwise leave the old daemon running), and even when it
 names the same version, as a nightly's next commit does: the old one
 stops at once, its running turns park and
 continue on the new one, and the new one waits on the store, so nothing
-started meanwhile takes it. Then the companions start on the new Sonny,
-and the scripts in `~/.agent`, every automation and the scheduler's job
+started meanwhile takes it. Then the companions are checked: the lookout,
+the tool host and the reviewer (when one is kept) each on the new Sonny's
+build, by a name that leads to its program, and running with no restart
+for five seconds. One that is not is replaced with the new Sonny's and
+watched again, up to fifteen seconds. A line says each: `Companion
+sonny-lookout: ok`, `replaced (was 0.10.1)`, `started (none was kept)`,
+or `still failing (exits 1, 3 restarts; its log: ...)`, and one still
+failing makes the upgrade exit non-zero. A daemon the upgrade could not
+start leaves them unchecked, and says so: once it runs, `sonny upgrade`
+puts them on the new build. Then the scripts in `~/.agent`, every automation and the scheduler's job
 are written again by the path that outlives a release. A line names each
 skill or role of Sonny's whose new text waits beside the person's edited
 copy (`Your lead role (~/.agents/agents/lead.md) is kept; Sonny's new text
@@ -989,10 +1014,15 @@ finished by `sonny update` or by opening a Sonny window: until one runs,
 the daemon, the scripts in `~/.agent`, automations and the scheduler's job
 stay on the old release. The companions are the exception: a window puts
 them on its own build only when it starts the daemon itself (none ran, or
-one of an older protocol it replaces), and otherwise adds only one the
-daemon keeps none of, since replacing a running tool host stops the
-scripts it runs; `sonny update` replaces them. A plain `agent start`
-replaces only the daemon.
+one of an older protocol it replaces), and otherwise adds one the daemon
+keeps none of and replaces one an older release of Sonny started (by the
+version its `SONNY_BUILD` names); one of a newer release, or another
+build of its own version, it leaves running, since replacing a running
+tool host stops the scripts it runs, and `sonny update` replaces those. A plain `agent start`
+replaces only the daemon, and brings the companions back as they were
+kept: by names that still lead to the old program, which runs on, removed
+from its install, until the first window of the new release opens, or
+`sonny upgrade` runs.
 
 Each open window notes the program it started from. When it loses the
 daemon and the Sonny installed where it runs from is another program

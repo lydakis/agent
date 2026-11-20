@@ -306,6 +306,63 @@ async fn yields(yield_ms: Option<u64>) {
         None => std::future::pending().await,
     }
 }
+/// Each folder's holds and its read.
+type FolderReads = HashMap<String, (usize, Arc<FolderRead>)>;
+/// The folders a turn reads for an agent it makes, each read by one at a
+/// time ([`Turn::on_folder`]), with the path its reader waits on. A folder
+/// is held while a call waits on it or a read of it runs, counted under
+/// the lock, and forgotten when the last hold ends.
+static FOLDER_READS: std::sync::LazyLock<std::sync::Mutex<FolderReads>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn folder_reads() -> std::sync::MutexGuard<'static, FolderReads> {
+    FOLDER_READS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One hold on a folder in [`FOLDER_READS`]: the last to end forgets it.
+struct FolderHold {
+    folder: String,
+    entry: Arc<FolderRead>,
+}
+impl FolderHold {
+    fn new(folder: &str) -> Self {
+        let mut reads = folder_reads();
+        let (holds, entry) = reads.entry(folder.to_owned()).or_default();
+        *holds += 1;
+        FolderHold {
+            folder: folder.to_owned(),
+            entry: entry.clone(),
+        }
+    }
+    fn again(&self) -> Self {
+        FolderHold::new(&self.folder)
+    }
+}
+impl Drop for FolderHold {
+    fn drop(&mut self) {
+        let mut reads = folder_reads();
+        if let Some((holds, _)) = reads.get_mut(&self.folder) {
+            *holds -= 1;
+            if *holds == 0 {
+                reads.remove(&self.folder);
+            }
+        }
+    }
+}
+
+struct FolderRead {
+    one: Arc<tokio::sync::Semaphore>,
+    waiting: agent_client::policy::Waiting,
+}
+impl Default for FolderRead {
+    fn default() -> Self {
+        FolderRead {
+            one: Arc::new(tokio::sync::Semaphore::new(1)),
+            waiting: Default::default(),
+        }
+    }
+}
+
 /// The last lines of output a command that yields reports, as Codex hands
 /// back what a yielded command wrote so far.
 const YIELD_LINES: usize = 20;
@@ -6020,6 +6077,7 @@ impl Turn {
                             "last",
                             "workspace",
                             "created_by",
+                            "profile",
                             "closed_ms",
                         ] {
                             if !bot[field].is_null() {
@@ -6123,6 +6181,7 @@ impl Turn {
                         ("model", model.is_some()),
                         ("effort", effort.is_some()),
                         ("settings", settings.is_some()),
+                        ("profile", profile.is_some()),
                     ] {
                         if given {
                             asked.push(field.to_owned());
@@ -6166,6 +6225,26 @@ impl Turn {
                     // `create` takes no `allow`, so their tools are those
                     // it may call.
                     create["tools"] = json!(kept_tools(&create["tools"], &me));
+                    // Its folder and those it may write, found by their real
+                    // paths as `create` finds them on its way in, here where
+                    // a steer ends a wait on a file system that never answers.
+                    let folder = create["workspace"].as_str().unwrap_or_default().to_owned();
+                    let writable = (create["settings"]["writable"].as_array()).map(|folders| {
+                        (folders.iter())
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    });
+                    self.on_folder(&folder, {
+                        let folder = folder.clone();
+                        move || {
+                            let (folder, writable) = super::resolve((Some(folder), writable));
+                            folder.transpose()?;
+                            writable.map(|(found, _)| found).transpose()?;
+                            Ok(())
+                        }
+                    })
+                    .await?;
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
                     // This call made again, after its folder's files or this
@@ -6281,7 +6360,8 @@ impl Turn {
     /// for the folder, in the profile's role); the role's tools or its own,
     /// search kept to a model that has it; its settings, in the role's
     /// sandbox unless the call names one (`sandbox_asked`), with why the
-    /// daemon will refuse a new agent in it when it is looser.
+    /// daemon will refuse a new agent in it when it is looser; and the
+    /// profile's name, which the agent keeps.
     #[allow(clippy::too_many_arguments)]
     async fn spawned(
         &self,
@@ -6311,7 +6391,7 @@ impl Turn {
                 // None of the folders kept from its sandbox is read for it,
                 // through a link its folder holds.
                 let hidden = self.registry.daemon().unreadable.clone();
-                tokio::task::spawn_blocking(move || agent_client::policy::hiding(&hidden, || {
+                self.on_folder(&workspace, move || agent_client::policy::hiding(&hidden, || {
                     let folder = std::path::Path::new(&folder);
                     let failed = |error: agent_client::policy::Failure| {
                         Error::with(error.code(), error.to_string())
@@ -6337,10 +6417,11 @@ impl Turn {
                             .map_err(failed)?;
                     Ok::<_, Error>((role, composed.text))
                 }))
-                .await
-                .map_err(|_| Error::new("profile_unreadable"))??
+                .await?
             }
         };
+        // The profile it is composed from, kept on it by name.
+        let profile = role.as_ref().map(|role| role.name.clone());
         let own = format!(
             "{}/{}",
             me["provider"].as_str().unwrap_or_default(),
@@ -6406,9 +6487,70 @@ impl Turn {
             json!({"bot":name,"workspace":workspace,"model":model,"effort":effort,
             "instructions":instructions,"tools":tools,"settings":settings,
             "compaction_instructions":me["compaction_instructions"],
-            "compaction_model":compaction_model}),
+            "compaction_model":compaction_model,"profile":profile}),
             looser,
         ))
+    }
+
+    /// `read`, which waits on the person's file system (the folder a new
+    /// agent works in and the files composed for it), run off the runtime
+    /// thread. That file system is outside the daemon and may never answer,
+    /// as a mount whose server is gone does not: no time ends the wait, but
+    /// a steer for this turn that comes while it waits does, as a steer
+    /// ends whatever waits on someone, with what it waited on, so the turn
+    /// takes the steer and nothing is made. A steer already waiting for the
+    /// boundary as the read starts leaves it be: a read that answers is
+    /// work, as a command is. An interrupt ends it as it ends any call.
+    /// A read that never answers keeps its thread, which nothing can take
+    /// back, so a folder is read by one at a time: those after it wait for
+    /// it, as steerable, rather than each holding another thread.
+    async fn on_folder<T: Send + 'static>(
+        &self,
+        folder: &str,
+        read: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let steered = self.lift.notify.notified();
+        tokio::pin!(steered);
+        steered.as_mut().enable();
+        let since = std::time::Instant::now();
+        let hold = FolderHold::new(folder);
+        let entry = &hold.entry;
+        let unanswered = || {
+            let at = (entry
+                .waiting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone())
+            .map_or_else(|| folder.to_owned(), |path| path.display().to_string());
+            Err(Error::with(
+                "folder_unanswered",
+                format!(
+                    "{at} had not answered after {} ms when a message for this agent ended the wait; nothing was made, and the call can be made again",
+                    since.elapsed().as_millis()
+                ),
+            ))
+        };
+        let turn = tokio::select! {
+            biased;
+            turn = entry.one.clone().acquire_owned() => turn.expect("a folder's turn is never closed"),
+            () = &mut steered => return unanswered(),
+        };
+        // The read holds the folder until it ends, though this call may
+        // stop waiting on it first.
+        let reading = hold.again();
+        let read = tokio::task::spawn_blocking(move || {
+            let noted = reading.entry.waiting.clone();
+            let done = agent_client::policy::noting(noted, read);
+            // The turn ends before the hold does.
+            drop(turn);
+            drop(reading);
+            done
+        });
+        tokio::select! {
+            biased;
+            done = read => done.map_err(|_| Error::new("folder_read_failed"))?,
+            () = &mut steered => unanswered(),
+        }
     }
 
     /// The bots in this one's namespace, as a name pattern, or every bot
@@ -8945,6 +9087,7 @@ mod tests {
                             declared: None,
                             request_id: None,
                             starts_line: false,
+                            profile: None,
                         },
                     )?;
                     let turn = db
@@ -9171,6 +9314,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 Ok(db
@@ -9315,6 +9459,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 let turn = (db.begin(
@@ -9573,5 +9718,127 @@ mod tests {
             ..shape(Anthropic, &four)
         };
         assert_eq!(choice(stripped), (Some(4), Some(1850), Some(7401)));
+    }
+
+    /// A read of the person's folder that never answers (a mount whose
+    /// server is gone, as a channel no one sends on stands in for here)
+    /// holds a spawn only until a steer comes: no time ends it, the steer
+    /// ends it with what it waited on, and one that answers is its answer.
+    #[tokio::test]
+    async fn a_steer_ends_a_folder_read_that_never_answers() {
+        let dir = std::env::temp_dir().join(format!("agent-folder-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let task = Turn {
+            aheads: Default::default(),
+            ahead: None,
+            after: Default::default(),
+            tailing: Default::default(),
+            identity: 0,
+            bot: "Bob".into(),
+            turn: 1,
+            store,
+            fallbacks: Default::default(),
+            providers: Arc::default(),
+            registry: Registry::new("echo").unwrap(),
+            hub: Hub::default(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            background_failures: mpsc::unbounded_channel().0,
+            settings: Default::default(),
+            rules: Default::default(),
+            given_rules: Default::default(),
+            ruled: Default::default(),
+            window: Default::default(),
+            resumed: None,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            tokens: Arc::default(),
+            read_results: Default::default(),
+            side: Default::default(),
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        // One that answers is its answer, though a steer already waits
+        // for the boundary.
+        task.lift.arm();
+        let read = task.on_folder("/somewhere", || Ok(7)).await.unwrap();
+        assert_eq!(read, 7);
+        // One that never answers waits, with no time of its own...
+        let (answer, stuck) = std::sync::mpsc::channel::<()>();
+        let reading = move || {
+            let _ = stuck.recv();
+            Ok(())
+        };
+        let waiting = task.on_folder(dir.to_str().unwrap(), reading);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "a read that has not answered is waited on"
+        );
+        // ...until a steer for the turn comes, which ends it, naming the
+        // folder it read.
+        task.lift.arm();
+        let error = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("a steer ends the wait")
+            .unwrap_err();
+        assert_eq!(error.code, "folder_unanswered");
+        let detail = error.detail.unwrap();
+        assert!(detail.starts_with(dir.to_str().unwrap()), "{detail}");
+        assert!(detail.contains("nothing was made"), "{detail}");
+        // Made again, the call takes no second thread while the first read
+        // waits: it waits behind it, and a steer ends that wait too.
+        let started = Arc::new(AtomicBool::new(false));
+        let again = task.on_folder(dir.to_str().unwrap(), {
+            let started = started.clone();
+            move || {
+                started.store(true, Relaxed);
+                Ok(())
+            }
+        });
+        tokio::pin!(again);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut again)
+                .await
+                .is_err()
+        );
+        task.lift.arm();
+        let error = again.await.unwrap_err();
+        assert_eq!(error.code, "folder_unanswered");
+        assert!(!started.load(Relaxed), "no second read started");
+        // Once the file system answers, the first read's thread is let go
+        // and the folder forgotten, with no other call to read it...
+        let held = || folder_reads().contains_key(dir.to_str().unwrap());
+        assert!(held());
+        let _ = answer.send(());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while held() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the folder is forgotten when its read ends");
+        // ...and it is read again.
+        task.on_folder(dir.to_str().unwrap(), || Ok(()))
+            .await
+            .unwrap();
+        assert!(!held());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_is_forgotten_when_its_last_hold_ends_at_once() {
+        // Holds that end together, as a cut call's and its read's can.
+        for round in 0..2000 {
+            let folder = format!("/held-together/{round}");
+            let first = FolderHold::new(&folder);
+            let second = first.again();
+            let ends = [first, second].map(|hold| std::thread::spawn(move || drop(hold)));
+            ends.into_iter().for_each(|end| end.join().unwrap());
+            assert!(!folder_reads().contains_key(&folder), "{folder}");
+        }
     }
 }

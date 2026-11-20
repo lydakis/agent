@@ -1572,6 +1572,27 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(state['persons_words'], [{'text': 'answer coworkers yourself'}])
         self.assertNotIn('persons_words_cut', state)
 
+    def test_a_change_to_the_persons_skills_waits_for_the_person(self):
+        # The judge would allow it: only the person may.
+        self.judge.answer = lambda round, id: .05
+        daemon = self.daemon()
+        home = self.path / 'home'
+        (home / '.agents/skills').mkdir(parents=True)
+        (self.path / 'skill').mkdir()
+        _, lines = self.approver(daemon, env={'HOME': str(home)})
+        copy = f'shell:cp -r {self.path}/skill {home}/.agents/skills/publish'
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt=copy)['result']['message']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertIn("it reaches `~/.agents`, where the person's skills, agent profiles and standing "
+                      'instructions are kept, which only the person may allow', self.denial(daemon, turn))
+        self.assertFalse((home / '.agents/skills/publish').exists())
+        # Its own folder's skills are its work, the judge's to weigh.
+        own = 'shell:mkdir -p .agents/skills/x && printf ok > .agents/skills/x/SKILL.md'
+        turn = daemon.request('submit', bot='Bob', request_id='b', prompt=own)['result']['message']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertFalse(self.poll(daemon, turn).get('denied'))
+        self.assertEqual((self.path / '.agents/skills/x/SKILL.md').read_text(), 'ok')
+
     def test_a_round_has_the_configured_time_and_a_hung_check_says_where_it_was(self):
         release = threading.Event()
         self.addCleanup(release.set)
@@ -1955,11 +1976,15 @@ class AutoApproverTests(ModelFixture):
             [planned] = [c for c in round['state']['planned_calls'] if c['id'] == id]
             return .9 if planned['tool'] == 'shell' and 'DANGER' in json.dumps(planned) else .05
         self.judge.answer = shell_danger
+        # A 200 KiB script, as a monitor rewrites its own: written, then run.
+        big = '# step\n' * (200 * 1024 // 7) + 'printf ok\n'
+        # Past the judge's input budget whole, within what a write takes.
+        huge = 'x' * (1020 * 1024) + '\nprintf ok\n'
         self.model.call_script = [('write', {'path': 'run.sh', 'content': 'printf DANGER'}),
                                   ('shell', {'command': 'sh run.sh'}),
-                                  ('write', {'path': 'big.sh', 'content': 'x' * (49 * 1024) + 'printf ok'}),
+                                  ('write', {'path': 'big.sh', 'content': big}),
                                   ('shell', {'command': 'sh ./big.sh'}),
-                                  ('write', {'path': 'huge.sh', 'content': 'x' * (65 * 1024) + 'printf ok'})]
+                                  ('write', {'path': 'huge.sh', 'content': huge})]
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
         self.addCleanup(daemon.close)
         daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell', 'write'], approver='auto',
@@ -1968,24 +1993,42 @@ class AutoApproverTests(ModelFixture):
         turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, turn, 'script-1').startswith(REJECTED))
-        # A file too large to show is shown by its size, and what it does is
-        # not known: a call that runs it is not allowed on the judge's word.
-        self.assertTrue(self.denial(daemon, turn, 'script-3').startswith('not reviewed whole'))
-        # Nor is a write too large to show whole: a call need not name the
-        # file to run it (a Makefile, a hook).
-        self.assertTrue(self.denial(daemon, turn, 'script-4').startswith('not reviewed whole'))
-        asked = [self.judge.requests.get(timeout=5) for _ in range(5)]
+        # The 200 KiB write and the call that runs it are judged whole, and
+        # allowed on the judge's word: no person is asked.
+        self.assertFalse(self.poll(daemon, turn, 'script-2').get('denied'))
+        self.assertFalse(self.poll(daemon, turn, 'script-3').get('denied'))
+        self.assertEqual((self.path / 'big.sh').read_text(), big)
+        # Only a call too long for the judge's input budget goes to the
+        # person; where nobody can be asked in time it is denied.
+        self.assertTrue(self.denial(daemon, turn, 'script-4').startswith(
+            'not reviewed: the call is too long to show'))
+        asked = [self.judge.requests.get(timeout=5) for _ in range(4)]
+        self.assertTrue(self.judge.requests.empty())
         [shell] = asked[1]['state']['planned_calls']
         self.assertEqual(shell['files_it_names'], [{'path': 'run.sh', 'content': 'printf DANGER'}])
         self.assertEqual(asked[1]['state']['already_allowed'],
                          [{'tool': 'write', 'arguments': {'path': 'run.sh', 'bytes': 13}, 'status': 'succeeded'}])
         [write] = asked[2]['state']['planned_calls']
-        self.assertEqual(write['arguments'], {'path': 'big.sh', 'content': 'x' * (49 * 1024) + 'printf ok'})
+        self.assertEqual(write['arguments'], {'path': 'big.sh', 'content': big})
         [shell] = asked[3]['state']['planned_calls']
-        self.assertEqual(shell['files_it_names'], [{'path': 'big.sh', 'content': f'[{49 * 1024 + 9} bytes, too long to show]'}])
-        [write] = asked[4]['state']['planned_calls']
-        self.assertEqual((write['arguments']['path'], write['arguments']['bytes']), ('huge.sh', 65 * 1024 + 9))
-        self.assertIn('bytes not shown]', write['arguments']['content'])
+        self.assertEqual(shell['files_it_names'], [{'path': 'big.sh', 'content': big}])
+
+    def test_a_file_too_long_for_the_judge_goes_to_the_person(self):
+        self.judge.answer = lambda round, id: .05
+        huge = 'x' * (1020 * 1024) + '\nprintf ok\n'
+        self.model.call_script = [('write', {'path': 'huge.sh', 'content': huge}),
+                                  ('shell', {'command': 'sh huge.sh'})]
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
+                       approve_expire_ms=15000)
+        self.approver(daemon)
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertTrue(self.denial(daemon, turn, 'script-1').startswith(
+            'not reviewed: the call is too long to show'))
+        # The judge was never asked: what it would see is not the whole.
+        self.assertTrue(self.judge.requests.empty())
 
     def test_an_ungated_write_too_long_to_preview_still_shows_its_file(self):
         def shell_danger(round, id):

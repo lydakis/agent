@@ -1100,10 +1100,8 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
     match name {
         crate::served::START => {
             let mut said = said("Started", field("name")?);
-            // Its title: its brief's first line.
-            let title = crate::title::of_message(field("brief").unwrap_or_default());
-            if !title.is_empty() {
-                said.under.push(Line::from(title).italic().dim());
+            if let Some(title) = field("title").filter(|title| !title.is_empty()) {
+                said.under.push(Line::from(title.to_owned()).italic().dim());
             }
             Some(said)
         }
@@ -1136,7 +1134,11 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
             Some(match (arguments["add"]["name"].as_str(), field("remove")) {
                 (Some(added), _) => said("Followed", added),
                 (None, Some(removed)) => said("Unfollowed", removed),
-                (None, None) => said("Listed follows", ""),
+                (None, None) => match (field("read"), field("source")) {
+                    (Some(read), _) => said("Read the follow", read),
+                    (None, Some(source)) => said("Read the source", source),
+                    (None, None) => said("Listed follows", ""),
+                },
             })
         }
         crate::served::MEMORY => Some(
@@ -1173,7 +1175,8 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 arguments["add"].is_object(),
                 field("remove"),
                 field("run").or(field("fire")),
-                field("show"),
+                // `show`, as read was named before 11-20, in history.
+                field("read").or(field("show")),
             ) {
                 (true, ..) => {
                     // As the automation script's add says it.
@@ -1619,14 +1622,14 @@ Keep the rest.'"#,
         assert_eq!(
             call(
                 "start_task",
-                serde_json::json!({"name": "fix", "brief": "Fix the sums\nThen test."})
+                serde_json::json!({"name": "fix", "title": "Fix the sums", "brief": "Fix it.\nThen test."})
             ),
             "Started fix"
         );
-        // Under it, the task's title, its brief's first line, never the rest.
+        // Under it, the task's title, never its brief.
         let said = declared(
             "start_task",
-            &serde_json::json!({"name": "fix", "brief": "\nFix the sums\nRound half cents to even."}),
+            &serde_json::json!({"name": "fix", "title": "Fix the sums", "brief": "Fix it."}),
             false,
         )
         .unwrap();

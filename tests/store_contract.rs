@@ -59,6 +59,7 @@ fn binding() -> Binding<'static> {
         declared: None,
         request_id: None,
         starts_line: false,
+        profile: None,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -11176,7 +11177,12 @@ fn every_steer_joins_the_running_turn_which_keeps_its_own_folder_and_model() {
 
 #[test]
 fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
-    for (prompt, count, batch) in [("small".into(), 70, 32), ("é".repeat(128 * 1024), 3, 1)] {
+    // A steer longer than a batch is taken in alone, never left waiting.
+    for (prompt, count, batch) in [
+        ("small".into(), 70, 32),
+        ("é".repeat(128 * 1024), 3, 1),
+        ("y".repeat(Database::PROMPT_BYTES), 2, 1),
+    ] {
         let mut db = db();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         let first = db
@@ -11799,6 +11805,7 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
         settings: settings.clone(),
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     {
@@ -11845,6 +11852,7 @@ fn schema_98_hidden_senders_become_an_empty_trailer() {
         settings: settings.clone(),
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     {
@@ -12009,6 +12017,7 @@ fn schema_100_declared_tools_move_to_lists_by_digest() {
                 Binding {
                     request_id: Some("once"),
                     starts_line: false,
+                    profile: None,
                     ..binding()
                 },
             )
@@ -12043,6 +12052,7 @@ fn schema_100_declared_tools_move_to_lists_by_digest() {
                 declared: Some(&list),
                 request_id: Some("once"),
                 starts_line: false,
+                profile: None,
                 ..binding()
             },
         )
@@ -17284,6 +17294,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
     let keyed = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     let (bob, event) = db.create("Bob", Some("/synthetic"), keyed()).unwrap();
@@ -17318,6 +17329,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
                 Binding {
                     request_id,
                     starts_line: false,
+                    profile: None,
                     ..binding()
                 },
             )
@@ -17370,6 +17382,7 @@ fn a_resent_keyed_fork_gets_its_fork_wherever_the_source_moved() {
     let made = Binding {
         request_id: Some("branch"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     db.create("Made", Some("/synthetic"), made).unwrap();
@@ -17406,6 +17419,7 @@ fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
     let keyed = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     let (kay, _) = db.create("Kay", Some("/synthetic"), keyed()).unwrap();
@@ -17435,6 +17449,7 @@ fn schema_43_bots_were_made_without_a_key() {
     let keyed = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     assert_eq!(
@@ -17594,6 +17609,7 @@ fn a_keyed_creation_resends_after_its_instructions_change() {
     let made = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     let (bot, _) = db.create("Bob", None, made()).unwrap();
@@ -17618,6 +17634,7 @@ fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
     let made = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     {
@@ -18632,8 +18649,15 @@ fn calls_are_timed_by_the_model_that_answered_and_the_daemon_by_turn() {
 
 /// A store at `path` with Bob's turn, timed when `model_ms` is not 0, that
 /// ran a command and a read together, started 1 and 0.5 s before they ended,
-/// 2 s into the turn.
-fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, request: &str) -> i64 {
+/// 2 s into the turn. Returns the turn and the wall-clock milliseconds from
+/// just before the calls start to just after both end: the most real time the
+/// store can add to the second the command was moved back.
+fn clocked_turn(
+    path: &std::path::Path,
+    db: &mut Database,
+    model_ms: u64,
+    request: &str,
+) -> (i64, i64) {
     let turn = db
         .begin(
             "Bob",
@@ -18651,6 +18675,7 @@ fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, reques
     let read = read_call(&read_id);
     db.append(turn, vec![item], &[shell.clone(), read.clone()], None)
         .unwrap();
+    let calls = std::time::Instant::now();
     db.tool_start(turn, &shell, false, false).unwrap();
     db.tool_start(turn, &read, false, false).unwrap();
     let conn = Connection::open(path).unwrap();
@@ -18671,6 +18696,7 @@ fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, reques
     .unwrap();
     db.tool_finish(turn, &shell_id, &result("ok")).unwrap();
     db.tool_finish(turn, &read_id, &result("ok")).unwrap();
+    let calls_ms = i64::try_from(calls.elapsed().as_millis()).unwrap() + 1;
     let usage = Usage {
         input_tokens: 100,
         output_tokens: 40,
@@ -18681,7 +18707,7 @@ fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, reques
     db.append(turn, vec![assistant("done")], &[], Some(&usage))
         .unwrap();
     db.finish(turn, None).unwrap();
-    turn
+    (turn, calls_ms)
 }
 
 #[test]
@@ -18699,7 +18725,7 @@ fn each_turn_counts_its_calls_and_their_time_once() {
         },
     )
     .unwrap();
-    clocked_turn(&path, &mut db, 2_000, "1");
+    let (_, calls_ms) = clocked_turn(&path, &mut db, 2_000, "1");
     // A turn with no timed call is left out of the time.
     clocked_turn(&path, &mut db, 0, "2");
     let usage = db
@@ -18713,9 +18739,14 @@ fn each_turn_counts_its_calls_and_their_time_once() {
         })
         .unwrap();
     let time = &usage["time"];
-    // The two calls ran together: 1 s, not 1.5.
+    // The two calls ran together: 1 s plus the real time they took, not
+    // 1.5 s plus that time twice. The real time is measured, so a slow runner
+    // can't fail it.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
-    assert!((1_000..1_400).contains(&tool_ms), "{time}");
+    assert!(
+        (1_000..=1_000 + calls_ms).contains(&tool_ms),
+        "{time} calls_ms={calls_ms}"
+    );
     assert_eq!(
         [
             &time["turns"],
@@ -18855,9 +18886,9 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
         )
         .unwrap();
         clocked_turn(&path, &mut db, 0, "1");
-        let timed = clocked_turn(&path, &mut db, 2_000, "2");
-        let lifted = clocked_turn(&path, &mut db, 2_000, "3");
-        let pruned = clocked_turn(&path, &mut db, 2_000, "4");
+        let (timed, _) = clocked_turn(&path, &mut db, 2_000, "2");
+        let (lifted, _) = clocked_turn(&path, &mut db, 2_000, "3");
+        let (pruned, _) = clocked_turn(&path, &mut db, 2_000, "4");
         // The third turn's read went to the background, as a lifted call
         // does: its row ended with its process, not in its turn. Its
         // command ran as a terminal does, with a process of its own that
@@ -23528,6 +23559,119 @@ fn schema_108_keeps_each_bots_first_dot_group_as_its_namespace() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A declared tool that yields, as Sonny's exec, browser and desktop do.
+fn yielding_tool(name: &str) -> Declared {
+    serde_json::from_value(json!({"name": name, "description": "A tool.",
+        "parameters": {"type": "object"}, "answered_by": "sonny", "yields": true,
+        "kind": "browser"}))
+    .unwrap()
+}
+
+/// Schema 109: a declared tool's `lift` is `yields`. A store whose lists
+/// still say `lift`, as every store 0.10.1 wrote with a tool that took it
+/// does, has each list renamed in place and moved to the digest of its new
+/// bytes, the very list a client declaring it now sends; the bots holding
+/// it, a keyed creation's record and a kept `configure` follow.
+#[test]
+fn schema_109_names_a_lifted_tool_yields() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema109-yields-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let tools = vec![yielding_tool("exec"), tool_named("react")];
+    let list = ToolList::new(tools.clone()).unwrap();
+    let quiet = ToolList::new(vec![tool_named("margin")]).unwrap();
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        for (name, declared) in [("lead", &list), ("lead.task", &list), ("quiet", &quiet)] {
+            db.create(
+                name,
+                Some("/synthetic"),
+                Binding {
+                    declared: Some(declared),
+                    request_id: Some("once"),
+                    starts_line: false,
+                    profile: None,
+                    ..binding()
+                },
+            )
+            .unwrap();
+        }
+    }
+    // As 0.10.1 wrote them: the same bytes with `lift` where `yields` is.
+    let new_json = list.json().unwrap().to_owned();
+    let old_json = new_json.replace("\"yields\":true", "\"lift\":true");
+    assert_ne!(old_json, new_json);
+    let old_digest = agent_runtime::tools::digest_of(&old_json).to_string();
+    let kept = json!({"declare": serde_json::from_str::<Value>(&old_json).unwrap(),
+        "model": "synthetic-model"});
+    let old = Connection::open(&path).unwrap();
+    old.execute(
+        "UPDATE tool_lists SET digest=?1,tools=?2 WHERE digest=?3",
+        [&old_digest, &old_json, list.digest().unwrap()],
+    )
+    .unwrap();
+    old.execute(
+        "UPDATE bots SET declared=?1,creation=json_set(creation,'$.request.declare',?1)
+         WHERE declared=?2",
+        [&old_digest, list.digest().unwrap()],
+    )
+    .unwrap();
+    old.execute(
+        "UPDATE bots SET configure_pending=? WHERE name='lead.task'",
+        [kept.to_string()],
+    )
+    .unwrap();
+    old.execute_batch("PRAGMA user_version=108;").unwrap();
+    drop(old);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    for name in ["lead", "lead.task"] {
+        let bot = db.inspect(name).unwrap();
+        assert_eq!(**bot.declared, tools, "{name}");
+        assert_eq!(bot.declared.digest(), list.digest(), "{name}");
+    }
+    assert_eq!(
+        db.inspect("quiet").unwrap().declared.digest(),
+        quiet.digest()
+    );
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM tool_lists"), 2);
+    let renamed: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT tools FROM tool_lists WHERE digest=?",
+            [list.digest().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(renamed, new_json);
+    let pending = db
+        .kept_configure(db.inspect("lead.task").unwrap().bot_id)
+        .unwrap();
+    let declare: Vec<Declared> =
+        serde_json::from_value(pending.unwrap()["declare"].clone()).unwrap();
+    assert_eq!(declare, tools);
+    // A resend of the creation, with the list as a client declares it now,
+    // is the same request.
+    let (again, event) = db
+        .create(
+            "lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&list),
+                request_id: Some("once"),
+                starts_line: false,
+                profile: None,
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!((again.name.as_str(), event), ("lead", None));
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite.schema-108.backup"));
+}
+
 /// A page of one bot's messages, as `messages` read them before it took a
 /// selector.
 fn messages_page(
@@ -24193,4 +24337,109 @@ fn a_held_step_of_a_lifted_call_ends_with_its_turn() {
         let calls = db.tool_calls("sonny", 0, 10).unwrap();
         assert_eq!(calls["calls"][0]["call_id"], "c1", "{calls}");
     }
+}
+
+/// Schema 110: the profile a bot was composed from, as its client named
+/// it, is kept on the bot when it is made, shown by `inspect`, its
+/// `created` event and `bots` pages, and kept by a fork; a keyed resend
+/// naming another is another request. `configure` names another, or none.
+#[test]
+fn a_bot_keeps_the_profile_it_was_made_in() {
+    let mut db = db();
+    let (made, event) = db
+        .create(
+            "shop.fix",
+            Some("/synthetic"),
+            Binding {
+                profile: Some("reviewer"),
+                request_id: Some("fix"),
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!(made.profile.as_deref(), Some("reviewer"));
+    assert_eq!(event.unwrap()["data"]["profile"], json!("reviewer"));
+    db.create("shop.plain", Some("/synthetic"), binding())
+        .unwrap();
+    let record = serde_json::to_value(db.inspect("shop.plain").unwrap()).unwrap();
+    assert!(record.get("profile").is_none(), "{record}");
+    let (_, forked) = db
+        .fork("shop.fix", "shop.fix-copy", Fork::default())
+        .unwrap();
+    assert_eq!(forked.unwrap()["data"]["profile"], json!("reviewer"));
+    let page = db
+        .list(None, 256, Some("shop.*"), false, None, false, None)
+        .unwrap();
+    let listed = |name: &str| {
+        (page["bots"].as_array().unwrap().iter())
+            .find(|bot| bot["name"] == name)
+            .unwrap()
+            .get("profile")
+            .cloned()
+    };
+    assert_eq!(listed("shop.fix"), Some(json!("reviewer")));
+    assert_eq!(listed("shop.fix-copy"), Some(json!("reviewer")));
+    assert_eq!(listed("shop.plain"), None);
+    // The same request again gets the bot it made; another profile is
+    // another request.
+    let mut again = |profile| {
+        db.create(
+            "shop.fix",
+            Some("/synthetic"),
+            Binding {
+                profile,
+                request_id: Some("fix"),
+                ..binding()
+            },
+        )
+    };
+    assert_eq!(again(Some("reviewer")).unwrap().1, None);
+    let refused = again(Some("task")).unwrap_err();
+    assert_eq!(refused.code, "idempotency_conflict");
+    assert_eq!(refused.facts.unwrap()["field"], json!("profile"));
+    // Named again, or let go.
+    assert!(db.set_profile("shop.plain", None, Some("task")).unwrap());
+    assert!(!db.set_profile("shop.plain", None, Some("task")).unwrap());
+    assert_eq!(
+        db.inspect("shop.plain").unwrap().profile.as_deref(),
+        Some("task")
+    );
+    assert!(db.set_profile("shop.fix", None, None).unwrap());
+    assert_eq!(db.inspect("shop.fix").unwrap().profile, None);
+}
+
+/// Schema 110: a store from before it takes the profile column at start,
+/// the bots made before it with none. release/store_down.py takes it back.
+#[test]
+fn a_store_from_109_takes_profiles_with_none_on_its_bots() {
+    let dir = std::env::temp_dir().join(format!("agent-schema110-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.sqlite");
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("shop.fix", Some("/synthetic"), binding())
+            .unwrap();
+    }
+    // The store as 109 wrote it: what store_down.py's step leaves.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE bots DROP COLUMN profile; PRAGMA user_version=109;")
+        .unwrap();
+    let has_column = || {
+        count(
+            &path,
+            "SELECT COUNT(*) FROM pragma_table_info('bots') WHERE name='profile'",
+        )
+    };
+    assert_eq!(has_column(), 0);
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        count(&path, "PRAGMA user_version"),
+        i64::from(Database::SCHEMA)
+    );
+    assert_eq!(has_column(), 1);
+    assert_eq!(db.inspect("shop.fix").unwrap().profile, None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

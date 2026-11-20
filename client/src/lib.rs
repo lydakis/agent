@@ -121,7 +121,11 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 97;
+pub const PROTOCOL: u64 = 99;
+/// The most bytes a prompt's words may have in one `submit`: 1 MiB, as
+/// Codex bounds a person's input (`MAX_USER_INPUT_TEXT_CHARS`), so a
+/// reviewer's prompt can hold a large change whole (protocol 99).
+pub const PROMPT_BYTES: usize = 1024 * 1024;
 static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 /// Name this process's connections as `program` (such as `window` or
 /// `reviewer`): each later [`Client::connect`] says it in its first line,
