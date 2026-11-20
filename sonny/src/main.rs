@@ -794,8 +794,8 @@ impl App {
     /// projects' as **Projects** lists them, from the one after this
     /// project's around ([`elsewhere::round`]).
     fn next_needing(&mut self) {
-        let mut local: Vec<String> = (self.margin.agents().listed.iter())
-            .filter(|agent| agent.run.is_none() && agent.group == status::Group::NeedsYou)
+        let mut local: Vec<String> = (self.margin.agents().steps())
+            .filter(|agent| agent.group == status::Group::NeedsYou)
             .map(|agent| agent.bot.clone())
             .collect();
         if let Some(fleet) = &self.fleet {
@@ -16773,7 +16773,9 @@ impl App {
                 match (key.code, picked) {
                     // Enter goes to the picked agent; on a heading it
                     // does the heading's one thing, opening or folding.
-                    (KeyCode::Enter, Some(Picked::Agent(bot))) => self.open_picked(&bot),
+                    (KeyCode::Enter, Some(Picked::Agent(bot) | Picked::Task(_, bot))) => {
+                        self.open_picked(&bot)
+                    }
                     // `→` goes into a workflow's row, as `enter` does.
                     (KeyCode::Right, Some(Picked::Agent(bot)))
                         if workflow::view::split(&bot).1.is_some() =>
@@ -17282,9 +17284,29 @@ impl App {
                     self.left_ends();
                 }
             }
+            // A task's agents start open: its fold is in `helpers` when
+            // shut.
+            Picked::Task(task, _) => {
+                if watch.helpers.contains(&task) == open {
+                    watch.helpers_of(&task, Some(!open));
+                } else if !open {
+                    self.left_ends();
+                }
+            }
             Picked::Agent(bot) if open => watch.helpers_of(&bot, Some(true)),
             Picked::Agent(bot) if watch.helpers.contains(&bot) => {
                 watch.helpers_of(&bot, Some(false))
+            }
+            // `←` on one of a task's agents folds the task, the pick on it.
+            Picked::Agent(bot)
+                if let Some(at) = status::task_of(&bot).and_then(|(task, _)| {
+                    (card_picks(watch, width).iter())
+                        .position(|p| matches!(p, Picked::Task(t, _) if t == task))
+                }) =>
+            {
+                let task = status::task_of(&bot).map(|(task, _)| task.to_owned());
+                watch.helpers_of(&task.unwrap_or_default(), Some(true));
+                watch.pick = Some(at);
             }
             Picked::Agent(bot) => {
                 let group = (watch.rows.iter())
@@ -17319,8 +17341,7 @@ impl App {
     /// agents, around its ends, as a multiplexer's previous and next tab.
     /// From an agent the list does not show, either goes to the lead.
     fn step_agent(&mut self, down: bool) {
-        let listed: Vec<&str> = (self.margin.agents().listed.iter())
-            .filter(|agent| agent.run.is_none())
+        let listed: Vec<&str> = (self.margin.agents().steps())
             .map(|agent| agent.bot.as_str())
             .collect();
         let Some(to) = stepped(&listed, &self.bot, down) else {
@@ -17588,6 +17609,21 @@ impl App {
                         watch.pick = Some(at);
                     }
                     watch.toggle(group_of(id));
+                }
+            }
+            // A task's row in `/status`, picked: its most pressing agent.
+            "agents" => {
+                let width = self.width.max(40);
+                if let Some(watch) = &mut self.watch
+                    && let Some(picked) =
+                        Picked::from_link(&format!("{}agents/{id}", screen::BUTTON))
+                {
+                    if let Some(at) = card_picks(watch, width).iter().position(|p| *p == picked) {
+                        watch.pick = Some(at);
+                    }
+                    if let Picked::Task(_, bot) = picked {
+                        self.open_picked(&bot);
+                    }
                 }
             }
             // A task's helpers in `/status`: shown under it, or folded.
@@ -21133,7 +21169,7 @@ impl App {
             .then(|| watch.pick.and_then(|at| picks.get(at).cloned()))
             .flatten()
             .and_then(|picked| match picked {
-                Picked::Agent(bot) => Some(bot),
+                Picked::Agent(bot) | Picked::Task(_, bot) => Some(bot),
                 Picked::Group(_) => None,
             })
             .filter(|bot| *bot != self.bot)
@@ -23468,16 +23504,17 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
         named,
         folds,
         helpers,
+        tasks,
     } = match watch.more {
         true => {
             let picked = (watch.pick)
                 .and_then(|at| {
-                    picks_in_order(&quiet.named, &quiet.folds)
+                    picks_in_order(&quiet.named, &quiet.folds, &quiet.tasks)
                         .into_iter()
                         .nth(at)
                 })
                 .and_then(|(_, picked)| match picked {
-                    Picked::Agent(bot) => Some(bot),
+                    Picked::Agent(bot) | Picked::Task(_, bot) => Some(bot),
                     Picked::Group(_) => None,
                 });
             card(status::Details::Picked(picked.as_deref()))
@@ -23508,10 +23545,11 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
     let below = |at: usize| at + if at >= 1 { added } else { 0 };
     // The rows the keys pick first, in the order they are drawn: each
     // agent, and each heading that opens and folds its group.
-    let folding = !folds.is_empty() || !helpers.is_empty();
-    let mut marks: Vec<(usize, screen::Mark)> = (picks_in_order(&named, &folds).into_iter())
-        .map(|(at, picked)| (below(at), screen::Mark::Link(picked.link())))
-        .collect();
+    let folding = !folds.is_empty() || !helpers.is_empty() || !tasks.is_empty();
+    let mut marks: Vec<(usize, screen::Mark)> = (picks_in_order(&named, &folds, &tasks)
+        .into_iter())
+    .map(|(at, picked)| (below(at), screen::Mark::Link(picked.link())))
+    .collect();
     marks.extend(opening);
     marks.extend(helpers.into_iter().map(|(at, bot)| {
         let link = format!("{}helpers/{bot}", screen::BUTTON);
@@ -23602,12 +23640,13 @@ fn row_marks(lines: &[Line<'static>], starts: &[usize]) -> Vec<(usize, screen::M
     marks
 }
 
-/// A row `/status`'s keys pick: an agent, or the heading of a group that
-/// folds.
+/// A row `/status`'s keys pick: an agent, the heading of a group that
+/// folds, or a task with several agents, with its most pressing one.
 #[derive(Clone, Debug, PartialEq)]
 enum Picked {
     Agent(String),
     Group(status::Group),
+    Task(String, String),
 }
 
 impl Picked {
@@ -23616,6 +23655,7 @@ impl Picked {
         match self {
             Picked::Agent(bot) => format!("{}task/{bot}", screen::BUTTON),
             Picked::Group(group) => format!("{}group/{}", screen::BUTTON, group_id(*group)),
+            Picked::Task(task, bot) => format!("{}agents/{task}/{bot}", screen::BUTTON),
         }
     }
 
@@ -23625,21 +23665,29 @@ impl Picked {
         if let Some(bot) = button.strip_prefix("task/") {
             return Some(Picked::Agent(bot.to_owned()));
         }
+        if let Some((task, bot)) = button
+            .strip_prefix("agents/")
+            .and_then(|t| t.split_once('/'))
+        {
+            return Some(Picked::Task(task.to_owned(), bot.to_owned()));
+        }
         button
             .strip_prefix("group/")
             .map(|id| Picked::Group(group_of(id)))
     }
 }
 
-/// The agents and the folding groups' headings of a card, by the row
-/// each is drawn on, in that order.
+/// The agents, the folding groups' headings and the tasks with several
+/// agents of a card, by the row each is drawn on, in that order.
 fn picks_in_order(
     named: &[(usize, String)],
     folds: &[(usize, status::Group)],
+    tasks: &[(usize, String, String)],
 ) -> Vec<(usize, Picked)> {
     let mut picks: Vec<(usize, Picked)> = (named.iter())
         .map(|(at, bot)| (*at, Picked::Agent(bot.clone())))
         .chain(folds.iter().map(|(at, group)| (*at, Picked::Group(*group))))
+        .chain((tasks.iter()).map(|(at, task, bot)| (*at, Picked::Task(task.clone(), bot.clone()))))
         .collect();
     picks.sort_by_key(|(at, _)| *at);
     picks
@@ -37377,6 +37425,74 @@ mod tests {
             status_keys(app.watch.as_ref().unwrap(), true),
             "↑↓ pick · enter open · →← fold · m more · esc close"
         );
+    }
+
+    #[tokio::test]
+    async fn status_folds_a_task_s_agents_and_enter_goes_to_its_most_pressing() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let row = |n: u32, state: &str, group| status::Row {
+            name: format!("errors.{n}"),
+            bot: format!("calc.errors.{n}"),
+            title: "Move shop to typed errors".into(),
+            state: state.into(),
+            running: group == status::Group::Working,
+            group,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![
+                row(1, "working", status::Group::Working),
+                row(2, "needs you", status::Group::NeedsYou),
+            ],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: Some(0),
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);
+        let picked = |app: &App| picks(app)[app.watch.as_ref().unwrap().pick.unwrap()].clone();
+        let task = Picked::Task("calc.errors".into(), "calc.errors.2".into());
+        let agent = |n: u32| Picked::Agent(format!("calc.errors.{n}"));
+        // They start open, in the order of their names.
+        assert_eq!(picks(&app), [task.clone(), agent(1), agent(2)]);
+        // ← on the task's row folds them; → opens them.
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picks(&app), std::slice::from_ref(&task));
+        let lines = watch_card(app.watch.as_ref().unwrap(), 80).0;
+        let row: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            row.trim_end(),
+            "  ? Move shop to typed errors  ▸ 2 agents, 1 needs you, 1 working"
+        );
+        app.key(key(KeyCode::Right)).await;
+        assert_eq!(picks(&app).len(), 3);
+        // ← on one of its agents folds the task, the pick on its row.
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(picked(&app), agent(1));
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picks(&app), std::slice::from_ref(&task));
+        assert_eq!(picked(&app), task);
+        // `enter` on it goes to the agent whose mark it shows: here, this
+        // window's own, so the view closes.
+        app.bot = "calc.errors.2".into();
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.pane.is_none() || !app.pane.as_ref().unwrap().is_card());
     }
 
     #[tokio::test]

@@ -2224,6 +2224,8 @@ mod tests {
             lead: name == "lead",
             helpers: Vec::new(),
             run: None,
+            of: 0,
+            agents: Vec::new(),
         };
         let agents = |listed: Vec<Listed>| Agents {
             project: "Tally invoices".into(),

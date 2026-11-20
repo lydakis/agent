@@ -540,6 +540,9 @@ pub fn action_words(post: &Value, here: &str) -> Option<String> {
     })
 }
 
+/// A link on a row: the row, its columns from and to, and what it opens.
+pub type Linked = (usize, usize, usize, Target);
+
 /// The row under an item's name, which says where it stands: `item on
 /// BOARD`, its state and holder, who it is for, how many items it needs,
 /// its labels. The board, the holder and the items it needs are links,
@@ -549,7 +552,7 @@ pub fn item_head(
     here: &str,
     present: &Present,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<(usize, usize, usize, Target)>) {
+) -> (Vec<Line<'static>>, Vec<Linked>) {
     let mut parts: Vec<Vec<(Span<'static>, Option<Target>)>> = Vec::new();
     parts.push(vec![
         (Span::raw("item on ").dim(), None),
