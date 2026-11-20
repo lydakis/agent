@@ -256,7 +256,11 @@ CASES = [
     {'id': 'recover-context', 'area': 'history',
      # The lead's model is told its context holds this many tokens, so the
      # long outputs below push the first message out of it.
-     'window': 40_000,
+     # 60,000 puts the threshold at 27,000 (a window less 33,000): the lead's
+     # role and tools alone are about 15,000, and its rounds reach 31,000 by
+     # the third ask. At 40,000 the threshold, 7,000, sat under the role
+     # itself, so no cut ever came (11-20).
+     'window': 60_000,
      'steps': [
          {'say': FIRST},
          {'say': "Run `python3 -m pydoc datetime.datetime` and tell me in one line which methods deal with "
@@ -526,20 +530,22 @@ class View:
         return [args for call, args in calls.items() if ended.get(call) == 'completed']
 
     def automation_calls(self):
-        """The arguments of the lead's completed `automations` calls: by
-        `sonny acp` for the tool, and by the trail for code-mode steps,
-        which `sonny acp` shows only as their `exec`."""
+        """The arguments of every completed `automations` call: the lead's
+        by `sonny acp` for the tool and by the trail for code-mode steps,
+        which `sonny acp` shows only as their `exec`, and any other agent's
+        by the trail, as a task the lead started may set it up."""
         found = self.completed('automations')
-        for r in self.lead_rows:
-            if r['step'] and r['tool'] == 'automations' and r['outcome'] == 'completed':
+        for r in self.rows:
+            if (r['tool'] == 'automations' and r['outcome'] == 'completed'
+                    and (r['step'] or r['bot'] != LEAD)):
                 found.append(arguments(r))
         return [a for a in found if isinstance(a, dict)]
 
     def scripts(self, verb):
-        """The words of the lead's completed shell commands that run the
+        """The words of any agent's completed shell commands that run the
         automation script's `verb`."""
         found = []
-        for r in self.lead_rows:
+        for r in self.rows:
             command = arguments(r).get('command') if r['tool'] == 'shell' and r['outcome'] == 'completed' else None
             if not isinstance(command, str):
                 continue

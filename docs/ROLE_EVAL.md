@@ -269,7 +269,7 @@ lead's checkout clean. The lookout checks read only the lead's turns a note
 started: `lookout-quiet` passes when every one of them ends with an empty
 reply, as lead.md asks of news not worth interrupting the person for.
 
-`recover-context` tells the lead's model its context holds 40,000 tokens
+`recover-context` tells the lead's model its context holds 60,000 tokens
 (`[context_windows]` in the run's config), gives it a codename and a
 sentence, then three asks with long command output, then asks for the first
 message word for word. A summary keeps the gist, so quoting the sentence

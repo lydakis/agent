@@ -575,6 +575,16 @@ class BurstLedgerTests(unittest.TestCase):
         self.assertEqual((row['delegated_s'], summary['handled']), (40, 1))
         self.assertEqual(summary['person_approvals'], {'lead': 1, 'others': 1})
 
+    def test_an_edit_counts_as_the_lead_s_own_only_inside_the_repository(self):
+        repo = '/r/shop'
+        inside = self.ledger.in_repo
+        self.assertTrue(inside(json.dumps({'path': '.gitignore', 'content': '__pycache__/'}), repo))
+        self.assertTrue(inside(json.dumps({'path': '/r/shop/.gitignore'}), repo))
+        self.assertTrue(inside(json.dumps({'input': '*** Begin Patch\n*** Add File: shop/clock.py\n'}), repo))
+        self.assertFalse(inside(json.dumps({'path': '$SONNY_STATE/handoff.md', 'content': 'gitignore'}), repo))
+        self.assertFalse(inside(json.dumps({'path': '/h/.agent/sonny/state/notes.md'}), repo))
+        self.assertTrue(inside('not json', repo))
+
     def test_each_arm_takes_its_own_code_mode_and_settings(self):
         import argparse
         settings = role_eval.arm_settings(argparse.ArgumentParser(), ['direct=off', 'code=on'],

@@ -99,6 +99,30 @@ LEDGER = {
     "B4 the person's call: drop 3.9": {'said': r"3\.9"},
 }
 
+def in_repo(text, repo):
+    """Whether an edit call's arguments touch the repository: a path in
+    it, relative (the lead works at its root) or absolute under it, or no
+    path to tell by. A lead's notes in its own state folder are not the
+    ask's code."""
+    try:
+        args = json.loads(text)
+    except ValueError:
+        args = None
+    paths = []
+    if isinstance(args, dict):
+        for key in ('path', 'file_path'):
+            if isinstance(args.get(key), str):
+                paths.append(args[key])
+        for value in args.values():
+            if isinstance(value, str):
+                paths += re.findall(r'\*\*\* (?:Update|Add|Delete) File: (\S+)', value)
+    if not paths:
+        return True
+    root = str(Path(repo).resolve())
+    return any(not (p.startswith('/') or p.startswith('$') or p.startswith('~'))
+               or str(Path(p).resolve()).startswith(root) for p in paths)
+
+
 # A lead's call that hands work to another agent: a task started, or a
 # message sent to one, by a tool or by `agent run` in a shell.
 DELEGATES = re.compile(r'^(start_task|\S*(message|send|steer|tell)\S*) |agent"? run|AGENT_BIN\S* run')
@@ -396,7 +420,7 @@ def ledger(out, agent, repo, env, events, timeline, lookout_log, resources=None,
             delegated = next((t for t, name, text in calls
                               if t >= after and DELEGATES.search(f'{name} {text}') and key.search(text)), None)
             itself = next((t for t, name, text in calls
-                           if t >= after and name in EDITS and key.search(text)), None)
+                           if t >= after and name in EDITS and key.search(text) and in_repo(text, repo)), None)
             row['delegated_s'] = delegated and round(delegated - after)
             row['edited_itself_s'] = itself and round(itself - after)
             row['on_main'] = checked(agent, repo, env, 'main', spec['check'])

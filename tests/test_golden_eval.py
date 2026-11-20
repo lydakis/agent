@@ -162,6 +162,17 @@ class ScoreTests(unittest.TestCase):
                                   'automations.json': '{"automations": [{"name": "branches"}]}'})
             self.assertEqual(set(self.score('schedule', view).values()), {False})
 
+    def test_an_automation_a_task_set_up_counts(self):
+        add = json.dumps({'add': {'name': 'branches', 'cron': '0 9 * * 1-5'}})
+        with tempfile.TemporaryDirectory() as tmp:
+            view = run_dir(tmp, [part('person', 'Set.'), part('person', 'Gone.')],
+                           [row('automations', bot='shop.branches', preview=add),
+                            row('automations', bot='shop.branches', preview=add, outcome='denied')],
+                           files={'acp.jsonl': self.acp(('automations', {'remove': 'branches'}, 'completed')),
+                                  'automations.json': '{"automations": []}'})
+            self.assertEqual(set(self.score('schedule', view).values()), {True})
+            self.assertEqual(len(view.automation('add')), 1)
+
     @staticmethod
     def answer(text):
         """`acp.jsonl` with an early prompt answered with the codename at 2,
@@ -391,7 +402,7 @@ class SetupTests(unittest.TestCase):
                     golden_eval.one('recover-context', 'A', 1, {'A': str(bins)}, 'chatgpt/gpt-6.1-sol',
                                     settings={'code_mode': True, 'history_step': True})
             self.assertIn('code_mode = true\nhistory_step = true\n', seen['config'])
-            self.assertTrue(seen['config'].endswith('\n[context_windows]\n"chatgpt/gpt-6.1-sol" = 40000\n'))
+            self.assertTrue(seen['config'].endswith('\n[context_windows]\n"chatgpt/gpt-6.1-sol" = 60000\n'))
 
     def test_an_arm_s_setting_replaces_a_default_rather_than_repeating_it(self):
         with tempfile.TemporaryDirectory() as tmp:
