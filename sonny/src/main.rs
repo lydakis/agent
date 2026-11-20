@@ -21956,7 +21956,7 @@ impl App {
                 open.side = at;
                 let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
                 let drawn = (open.view.picked())
-                    .map(|project| status::agents_drawn(&project.agents, &self.bot, width))
+                    .map(|project| status::agents_drawn(&project.agents, None, width))
                     .unwrap_or_default();
                 for (row, (line, goes)) in drawn.into_iter().enumerate() {
                     let y = at.y + row as u16;
