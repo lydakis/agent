@@ -51,7 +51,7 @@ pub const KINDS: [&str; 18] = [
 /// An agent as a window keeps it: the fields of a `bots` row a count
 /// reads, typed, so a window that keeps every agent of a large fleet keeps
 /// a little of each.
-#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Agent {
     pub name: String,
@@ -75,7 +75,7 @@ pub struct Agent {
 }
 
 /// How a turn ended, as a `bots` row's `last` says it.
-#[derive(Clone, Debug, Default, PartialEq, Hash, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Ended {
     pub turn: i64,
@@ -272,6 +272,36 @@ impl Follower {
     pub fn snapshot_waits(&self) -> bool {
         self.changes.lock().unwrap().snapshot.is_some()
     }
+}
+
+/// A connection of its own following the agents `pattern` names, with the
+/// task that takes its events to the follow; `woken` is told when
+/// something arrives, and when the connection goes.
+pub async fn follow_apart(
+    socket: &std::path::Path,
+    pattern: &str,
+    woken: &Arc<Notify>,
+) -> Option<(
+    Arc<Client>,
+    Arc<Mutex<Follower>>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (client, mut events) = Client::connect(socket).await.ok()?;
+    let follower = Arc::new(Mutex::new(Follower::start(
+        client.clone(),
+        pattern.to_owned(),
+        woken.clone(),
+    )));
+    let (heard, woken) = (follower.clone(), woken.clone());
+    let drain = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let Ok(mut follower) = heard.lock() {
+                follower.heard(&event);
+            }
+        }
+        woken.notify_one();
+    });
+    Some((client, follower, drain))
 }
 
 impl Drop for Follower {
