@@ -68,10 +68,6 @@ const PERSON_BYTES: usize = 3_600;
 /// the words above are left out, and the judge is told.
 const CHAIN: usize = 8;
 const DELEGATING: usize = 64;
-/// How much of a file written this turn a judged call that names it is
-/// shown: a larger one only by its size, and the call is not allowed on the
-/// judge's word alone.
-const FILE_BYTES: u64 = 48 * 1024;
 /// The most history nodes read for the transcript, newest first, and how
 /// many bodies one read asks for. Codex reads the whole conversation; past
 /// this the rest is left out, and the judge is told.
@@ -756,10 +752,6 @@ async fn judge(
                 .iter()
                 .map(|call| {
                     let verdict = policy::verdict(&answers[&call.id])?;
-                    let verdict = match call.unseen {
-                        true => policy::unseen(verdict),
-                        false => verdict,
-                    };
                     Some(match (call.own_home, call.starts_daemon) {
                         (true, _) => policy::own_home(verdict),
                         (_, true) => policy::starts_daemon(verdict),
@@ -1022,16 +1014,16 @@ const UNNAMED: &str = "[left out: too long to read back]";
 /// A file the turn wrote, as a judged call that names it would run it.
 enum Written {
     Whole(String),
-    /// Past `FILE_BYTES`, by its size: a part of it shown could not be
-    /// redacted with what names a secret, nor tell what the rest does.
-    TooLong(u64),
+    /// Past `limit`: it cannot be shown whole within the judge's input
+    /// budget, so neither can the round.
+    TooLong,
 }
 
 /// A file the turn wrote: only a regular file, opened without waiting on a
-/// FIFO or device, whole within `FILE_BYTES`, read no further whatever size
-/// it reported.
-fn written_file(file: &Path) -> Option<Written> {
-    use std::io::{Read, Seek, SeekFrom};
+/// FIFO or device, whole within `limit`, read no further whatever size it
+/// reported.
+fn written_file(file: &Path, limit: usize) -> Option<Written> {
+    use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut opened = std::fs::OpenOptions::new()
         .read(true)
@@ -1043,13 +1035,13 @@ fn written_file(file: &Path) -> Option<Written> {
     }
     let mut head = Vec::new();
     (&mut opened)
-        .take(FILE_BYTES + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut head)
         .ok()?;
-    if head.len() as u64 <= FILE_BYTES {
+    if head.len() <= limit {
         return Some(Written::Whole(String::from_utf8_lossy(&head).into_owned()));
     }
-    Some(Written::TooLong(opened.seek(SeekFrom::End(0)).ok()?))
+    Some(Written::TooLong)
 }
 
 enum Unjudged {
@@ -1137,16 +1129,17 @@ async fn intent(
         }
     }
     let mut planned = Vec::with_capacity(calls.len());
-    // The files each call changes, read before its contents are clipped
-    // for showing, which can leave out a patch's file lines.
+    // The files each call changes.
     let mut changes = Vec::with_capacity(calls.len());
-    // Past this the state is too long to judge anyway: stop reading.
+    // What the calls and the files they run take, each shown whole: past
+    // the judge's input budget the round is too long to judge anyway, so
+    // reading stops.
     let mut size = 0;
     for (index, call) in calls.iter().enumerate() {
         let whole = call["arguments"].is_object()
             && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
             && call["arguments_omitted"].as_u64().unwrap_or(0) == 0;
-        let mut arguments = match whole {
+        let arguments = match whole {
             true => call["arguments"].clone(),
             false => {
                 let item = node_item(client, bot, &call["node"]).await?;
@@ -1155,13 +1148,9 @@ async fn intent(
             }
         };
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
-        let mut unseen = false;
         changes.push(changed_paths(&tool, &arguments));
-        if changes_files(&tool) {
-            (arguments, unseen) = policy::shown_change(&arguments, &shared.redactor);
-        }
         size += arguments.to_string().len();
-        if size > PROMPT_BYTES {
+        if size > policy::STATE_BYTES {
             return Err(Unjudged::TooLong);
         }
         planned.push(Planned {
@@ -1169,7 +1158,6 @@ async fn intent(
             tool,
             arguments,
             files: Vec::new(),
-            unseen,
             own_home: false,
             starts_daemon: false,
         });
@@ -1281,9 +1269,11 @@ async fn intent(
     }
     allowed_cut |= read["written_more"] == true;
     // A call that names a file this turn wrote is judged with that file
-    // whole, as it is on disk now: what the call would run, or by its size. One that an
+    // whole, as it is on disk now: what the call would run. One that an
     // earlier call of this round writes or edits is not on disk yet as the
-    // call will find it, so it points to that call instead.
+    // call will find it, so it points to that call instead. Files that
+    // cannot be shown whole within the judge's input budget leave the round
+    // too long to judge.
     let workspace = read["workspace"].as_str().map(PathBuf::from);
     let mut changing: Vec<(String, String)> = Vec::new();
     let changed_by_call = changes.clone();
@@ -1312,15 +1302,15 @@ async fn intent(
             let file = workspace
                 .as_deref()
                 .map_or_else(|| PathBuf::from(path), |w| w.join(path));
+            let limit = policy::STATE_BYTES.saturating_sub(size);
             // Off the runtime thread: a slow mount must not hold up renewal.
-            let read = tokio::task::spawn_blocking(move || written_file(&file));
+            let read = tokio::task::spawn_blocking(move || written_file(&file, limit));
             match read.await.map_err(|_| Unjudged::Failed)? {
-                Some(Written::Whole(content)) => call.files.push((path.clone(), content)),
-                Some(Written::TooLong(bytes)) => {
-                    call.files
-                        .push((path.clone(), format!("[{bytes} bytes, too long to show]")));
-                    call.unseen = true;
+                Some(Written::Whole(content)) => {
+                    size += path.len() + content.len();
+                    call.files.push((path.clone(), content));
                 }
+                Some(Written::TooLong) => return Err(Unjudged::TooLong),
                 None => {}
             }
         }
@@ -2175,21 +2165,29 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let small = dir.join("run.sh");
         std::fs::write(&small, "echo hi\n").unwrap();
-        assert!(matches!(written_file(&small), Some(Written::Whole(text)) if text == "echo hi\n"));
-        // A larger one only by its size.
+        let limit = policy::STATE_BYTES;
+        assert!(
+            matches!(written_file(&small, limit), Some(Written::Whole(text)) if text == "echo hi\n")
+        );
+        // A 200 KiB script is read whole: no cut short of the judge's budget.
         let large = dir.join("large.sh");
-        std::fs::write(&large, "a".repeat(FILE_BYTES as usize + 100)).unwrap();
+        let script = "echo hi\n".repeat(200 * 1024 / 8);
+        std::fs::write(&large, &script).unwrap();
+        assert!(
+            matches!(written_file(&large, limit), Some(Written::Whole(text)) if text == script)
+        );
+        // One past what is left of the budget cannot be shown whole.
         assert!(matches!(
-            written_file(&large),
-            Some(Written::TooLong(bytes)) if bytes == FILE_BYTES + 100
+            written_file(&large, script.len() - 1),
+            Some(Written::TooLong)
         ));
         // A FIFO with no writer is skipped, not waited on.
         let fifo = dir.join("fifo");
         let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: path is a NUL-terminated string that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        assert!(written_file(&fifo).is_none());
-        assert!(written_file(&dir.join("gone")).is_none());
+        assert!(written_file(&fifo, limit).is_none());
+        assert!(written_file(&dir.join("gone"), limit).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
