@@ -762,7 +762,16 @@ fn entry_row(entry: &Entry) -> String {
 
 /// How short each summary may become, in characters, before entries are
 /// left out: Codex trims its skill descriptions before it drops skills.
-const SUMMARY_STEPS: [usize; 4] = [160, 80, 40, 0];
+/// The skills list and each memory index's head shorten by these steps.
+pub(crate) const SUMMARY_STEPS: [usize; 4] = [160, 80, 40, 0];
+
+/// The first of [`SUMMARY_STEPS`] at which a list takes at most `room`
+/// bytes, `size` saying how many it takes when each summary keeps that many
+/// characters; none when not even bare names fit. Steps after the one
+/// that fits are never sized.
+pub(crate) fn summary_step(room: usize, mut size: impl FnMut(usize) -> usize) -> Option<usize> {
+    SUMMARY_STEPS.into_iter().find(|&chars| size(chars) <= room)
+}
 
 /// A list of `entries` within `room` bytes, with the entries it lists:
 /// whole when it fits; else each summary shortened, step by step; else
@@ -783,17 +792,19 @@ fn fit(kind: Kind, entries: Vec<Entry>, room: usize) -> (String, Vec<Entry>) {
         }
         block
     };
-    for chars in SUMMARY_STEPS {
-        let whole = block(&entries, chars);
-        if whole.len() <= room {
-            let kept = (entries.into_iter())
-                .map(|entry| Entry {
-                    summary: entry.summary.chars().take(chars).collect(),
-                    ..entry
-                })
-                .collect();
-            return (whole, kept);
-        }
+    // The step that fits is the last one rendered.
+    let mut whole = String::new();
+    if let Some(chars) = summary_step(room, |chars| {
+        whole = block(&entries, chars);
+        whole.len()
+    }) {
+        let kept = (entries.into_iter())
+            .map(|entry| Entry {
+                summary: entry.summary.chars().take(chars).collect(),
+                ..entry
+            })
+            .collect();
+        return (whole, kept);
     }
     let total = entries.len();
     let mut kept = entries;

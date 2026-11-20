@@ -4,8 +4,9 @@
 //! every task's worktree share one copy whatever is committed. Each folder's
 //! `MEMORY.md` is an index generated from the facts' front matter, every
 //! fact in it, most needed first; a new agent starts with its head
-//! ([`HEAD`]), as Claude Code loads the first 200 lines of its own, and
-//! `search` reaches the rest. A save is never refused for room: the
+//! ([`HEAD`]): every fact, each description shortened alike to fit, as
+//! Codex loads a short form of every memory, and `search` reaches the
+//! whole of each. A save is never refused for room: the
 //! nightly cleanup keeps memory small. The daemon knows nothing of memory.
 //!
 //! `~/.agent/memory`, a script Sonny writes, shows the indexes, reads,
@@ -27,7 +28,8 @@ use std::{
 /// A fact file, front matter included: at most this.
 const LIMIT: usize = 16 * 1024;
 /// How much of an index a new agent's instructions take, and `show` gives:
-/// its head, whole lines in the index's order, then a line saying how many
+/// its head ([`head`]), every fact in the index's order with descriptions
+/// shortened to fit, or past that names alone and a line saying how many
 /// facts it leaves out, which `search` finds. Both indexes' heads fit an
 /// agent's instructions (60 KiB) beside its AGENTS.md files and role.
 pub const HEAD: usize = 16 * 1024;
@@ -929,21 +931,54 @@ fn render_index(dir: &Path, facts: &[Fact]) -> String {
     text
 }
 
-/// What a new agent reads of an index: whole lines from the top, each that
-/// still fits within [`HEAD`], then how many facts it leaves out and how
-/// to find them.
+/// What a new agent reads of an index: the whole index when it fits
+/// within [`HEAD`]; else every line still, in the index's order, each
+/// description shortened alike by the skills list's steps
+/// ([`crate::policy::SUMMARY_STEPS`]), the first that fits, a cut one
+/// ending in `…`, down to names alone; else names alone from the top, as
+/// many as fit, then how many facts it leaves out and how to find them.
 pub fn head(index: &str) -> String {
     if index.len() <= HEAD {
         return index.to_owned();
     }
+    // What each step takes, in one pass that stops once names alone, the
+    // shortest, pass the head: then no step fits.
+    let steps = crate::policy::SUMMARY_STEPS;
+    let mut sizes = [0; crate::policy::SUMMARY_STEPS.len()];
+    let mut lines = Vec::new();
+    for line in index.split_inclusive('\n').map(Line::of) {
+        for (size, chars) in sizes.iter_mut().zip(steps) {
+            *size += line.len(chars);
+        }
+        lines.push(line);
+        if line_names(&sizes) > HEAD {
+            break;
+        }
+    }
+    let size =
+        |chars| (steps.iter().zip(sizes)).find_map(|(&at, size)| (at == chars).then_some(size));
+    if let Some(chars) =
+        crate::policy::summary_step(HEAD, |chars| size(chars).unwrap_or(usize::MAX))
+    {
+        let mut kept = String::with_capacity(HEAD);
+        for line in &lines {
+            line.push(&mut kept, chars);
+        }
+        return kept;
+    }
     // Room for the closing line.
     let room = HEAD - 256;
-    let mut kept = String::new();
+    let mut kept = String::with_capacity(HEAD);
     let mut left = 0;
     for line in index.split_inclusive('\n') {
-        if kept.len() + line.len() <= room {
-            kept.push_str(line);
-        } else if line.starts_with("- ") {
+        if left == 0 {
+            let line = Line::of(line);
+            if kept.len() + line.len(0) <= room {
+                line.push(&mut kept, 0);
+                continue;
+            }
+        }
+        if line.starts_with("- ") {
             left += 1;
         }
     }
@@ -953,6 +988,74 @@ pub fn head(index: &str) -> String {
         ));
     }
     kept
+}
+
+/// Of the bytes each step takes, those of names alone, the last step.
+fn line_names(sizes: &[usize]) -> usize {
+    sizes.last().copied().unwrap_or_default()
+}
+
+/// How many bytes an index's head takes with names alone, every fact
+/// listed: past [`HEAD`], the nightly cleanup folds facts by subject.
+fn names_only(index: &str) -> usize {
+    (index.split_inclusive('\n'))
+        .map(|line| Line::of(line).len(0))
+        .sum()
+}
+
+/// One line of an index: a fact's `- NAME (TYPE, ...` and its
+/// description, or any other line as it is.
+struct Line<'a> {
+    whole: &'a str,
+    fact: Option<(&'a str, &'a str)>,
+}
+
+impl<'a> Line<'a> {
+    fn of(whole: &'a str) -> Self {
+        let fact = (whole.starts_with("- "))
+            .then(|| whole.trim_end_matches('\n').split_once("): "))
+            .flatten();
+        Self { whole, fact }
+    }
+
+    /// The fact's part before its description and what `chars`
+    /// characters keep of the description: none when the line stays
+    /// whole, as one with no description or one short enough does.
+    fn cut(&self, chars: usize) -> Option<(&'a str, &'a str)> {
+        let (fact, description) = self.fact?;
+        if chars == 0 {
+            return Some((fact, ""));
+        }
+        let (at, _) = description.char_indices().nth(chars)?;
+        Some((fact, description[..at].trim_end()))
+    }
+
+    /// Write the line with its description cut to `chars` characters,
+    /// ending in `…` when cut, and left out at none.
+    fn push(&self, out: &mut String, chars: usize) {
+        match self.cut(chars) {
+            None => out.push_str(self.whole),
+            Some((fact, _)) if chars == 0 => {
+                out.push_str(fact);
+                out.push_str(")\n");
+            }
+            Some((fact, kept)) => {
+                out.push_str(fact);
+                out.push_str("): ");
+                out.push_str(kept);
+                out.push_str("…\n");
+            }
+        }
+    }
+
+    /// How many bytes [`Line::push`] writes, without writing it.
+    fn len(&self, chars: usize) -> usize {
+        match self.cut(chars) {
+            None => self.whole.len(),
+            Some((fact, _)) if chars == 0 => fact.len() + ")\n".len(),
+            Some((fact, kept)) => fact.len() + "): ".len() + kept.len() + "…\n".len(),
+        }
+    }
 }
 
 /// The facts in `dirs` (each a scope: the person's, or a project's by
@@ -1553,9 +1656,30 @@ fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Val
         .collect();
     Ok(
         json!({"started": commit, "facts": facts, "saved": saved, "removed": removed,
-        "unread": unread(root)?, "stale_work": stale_work, "since_ms": since_ms,
-        "duplicate": duplicate}),
+        "unread": unread(root)?, "stale_work": stale_work, "over_head": over_head(root)?,
+        "since_ms": since_ms, "duplicate": duplicate}),
     )
+}
+
+/// Each index, by path under `root`, whose facts by name alone take more
+/// than the [`HEAD`] a new agent starts with, so its head leaves facts
+/// out: the cleanup folds related facts into one per subject until they
+/// fit. With its fact count and how many bytes the names take.
+fn over_head(root: &Path) -> Result<Vec<Value>, String> {
+    let mut over = Vec::new();
+    for dir in scopes(root)? {
+        let facts = facts(&dir)?;
+        let names = names_only(&render_index(&dir, &facts));
+        if names > HEAD {
+            let index = dir.join(INDEX);
+            let index = index.strip_prefix(root).unwrap_or(&index);
+            over.push(
+                json!({"index": index, "facts": facts.len(), "names_bytes": names,
+                "head_bytes": HEAD}),
+            );
+        }
+    }
+    Ok(over)
 }
 
 /// When the last finished cleanup started, in unix milliseconds, from
@@ -1587,6 +1711,17 @@ fn fact_changes(listing: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         }
     }
     (removed, added, changed)
+}
+
+/// A fact file's text after its front matter.
+fn body(text: &str) -> &str {
+    text.split_once("\n---\n").map_or(text, |(_, body)| body)
+}
+
+/// `text` with every run of white space one space, so a fact folded into
+/// another reads the same whatever lines it was wrapped to.
+fn words(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Note a fact another agent saved (`now` its text) or removed (none)
@@ -1729,9 +1864,23 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     let work: Vec<&str> = (open["work"].as_array().into_iter().flatten())
         .filter_map(Value::as_str)
         .collect();
-    let lost = (removed.iter())
-        .filter(|path| !work.contains(&path.as_str()))
-        .count();
+    // A fact whose whole text a fact the cleanup saved now holds was
+    // folded into it, not lost.
+    let holders: Vec<String> = (added.iter().chain(&changed))
+        .filter_map(|path| std::fs::read_to_string(root.join(path)).ok())
+        .map(|text| words(body(&text)))
+        .collect();
+    let mut folded = Vec::new();
+    let mut lost = 0;
+    for path in removed.iter().filter(|path| !work.contains(&path.as_str())) {
+        let text = git(root, &["show", &format!("{start}:{path}")]).unwrap_or_default();
+        let text = words(body(&text));
+        if !text.is_empty() && holders.iter().any(|holder| holder.contains(&text)) {
+            folded.push(path.clone());
+        } else {
+            lost += 1;
+        }
+    }
     let before = (before as usize).saturating_sub(work.len());
     let limit = (before / 4).max(2);
     if lost > limit {
@@ -1749,7 +1898,8 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     }
     std::fs::remove_file(&state).map_err(|e| format!("memory_failed: {}: {e}", state.display()))?;
     Ok(
-        json!({"commit": head, "facts": after, "removed": removed, "added": added, "changed": changed}),
+        json!({"commit": head, "facts": after, "removed": removed, "folded": folded,
+            "added": added, "changed": changed}),
     )
 }
 
@@ -1787,7 +1937,7 @@ fn refuse(root: &Path, state: &Path, open: &Value, start: &str) -> Result<Value,
     };
     let (lost, before, limit) = (&refused["lost"], &refused["before"], &refused["limit"]);
     Err(format!(
-        "loss_guard: the cleanup removed {lost} of {before} lasting facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}"
+        "loss_guard: the cleanup removed {lost} of {before} lasting facts, not folded whole into a fact it saved, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}"
     ))
 }
 
@@ -3044,7 +3194,7 @@ mod tests {
         }
         let refused = run_(&["cleanup", "finish"]).unwrap_err();
         assert!(
-            refused.starts_with("loss_guard: the cleanup removed 3 of 4 lasting facts, above 2"),
+            refused.starts_with("loss_guard: the cleanup removed 3 of 4 lasting facts, not folded whole into a fact it saved, above 2"),
             "{refused}"
         );
         use std::os::unix::fs::PermissionsExt;
@@ -3298,7 +3448,7 @@ mod tests {
         // loss and closing it with agent 8's fact gone.
         let refused = as_(Some("7"), &["cleanup", "finish"]).unwrap_err();
         assert!(
-            refused.starts_with("loss_guard: the cleanup removed 3 of 4 lasting facts, above 2"),
+            refused.starts_with("loss_guard: the cleanup removed 3 of 4 lasting facts, not folded whole into a fact it saved, above 2"),
             "{refused}"
         );
         assert!(
@@ -3556,6 +3706,203 @@ mod tests {
                 .unwrap()
                 .contains("(work, ")
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `n` lasting facts, every fourth a `reference`, each index line
+    /// about `line` bytes, and `work` facts at work, as `dir`'s index
+    /// lists them.
+    fn facts_of(n: usize, work: usize, line: usize) -> Vec<Fact> {
+        let kinds = ["feedback", "user", "project", "reference"];
+        let mut all = Vec::new();
+        for i in 0..n + work {
+            let mut fact = Fact {
+                name: match i < n {
+                    true => format!("rule-about-subject-{i:03}"),
+                    false => format!("work-under-way-{i:03}"),
+                },
+                kind: match i < n {
+                    true => kinds[i % 4].into(),
+                    false => "work".into(),
+                },
+                description: String::new(),
+                source: "lead/1".into(),
+                verified: format!("2026-11-{:02}", 1 + i % 19),
+                external: false,
+                live: false,
+                confirmed: (i % 3) as u32,
+                pushed_back: 0,
+            };
+            let words = "the person wants it done this way and says why ".repeat(20);
+            let room = line.saturating_sub(fact.line().len());
+            fact.description = words[..room].trim().to_owned();
+            all.push(fact);
+        }
+        all
+    }
+
+    /// How many bytes `index` takes with each description cut to `chars`,
+    /// sized as [`head`] sizes it and checked against the lines it writes.
+    fn at_step(index: &str, chars: usize) -> usize {
+        let lines: Vec<Line> = index.split_inclusive('\n').map(Line::of).collect();
+        let mut written = String::new();
+        for line in &lines {
+            line.push(&mut written, chars);
+        }
+        let sized: usize = lines.iter().map(|line| line.len(chars)).sum();
+        assert_eq!(sized, written.len());
+        sized
+    }
+
+    /// The facts a head names, in its order.
+    fn named(head: &str) -> Vec<&str> {
+        (head.lines())
+            .filter_map(|line| {
+                line.strip_prefix("- ")?
+                    .split_once(" (")
+                    .map(|(name, _)| name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_fact_is_named_in_the_head_its_descriptions_shortened_alike_to_fit() {
+        let dir = Path::new("/m");
+        // The person's index on 11-19: 148 facts, lines of about 441 bytes,
+        // of which today's head showed 36.
+        let facts = facts_of(148, 0, 441);
+        let index = render_index(dir, &facts);
+        assert!(index.len() > HEAD * 3, "{}", index.len());
+        let top = head(&index);
+        assert!(top.len() <= HEAD, "{}", top.len());
+        // Every fact, in the index's order, a reference fact among them,
+        // which sorts last.
+        assert_eq!(named(&top), named(&index));
+        assert!(top.contains("- rule-about-subject-003 (reference, "));
+        assert!(!top.contains("more facts are in"), "{top}");
+        // Each description shortened to the first step that fits: here 40
+        // characters, a cut one ending in `…`.
+        let cut: Vec<&str> = (top.lines())
+            .filter_map(|line| line.split_once("): ").map(|(_, d)| d))
+            .collect();
+        assert_eq!(cut.len(), 148);
+        for description in &cut {
+            let kept = description.strip_suffix('…').expect(description);
+            assert!(kept.chars().count() <= 40, "{description}");
+        }
+        assert!(at_step(&index, 80) > HEAD);
+        assert_eq!(at_step(&index, 40), top.len());
+        for chars in crate::policy::SUMMARY_STEPS {
+            at_step(&index, chars);
+        }
+        // An index that fits is given whole, and a head changes only when
+        // the index does, so a new agent's instructions stay cached.
+        let small = render_index(dir, &facts[..20]);
+        assert!(small.len() <= HEAD);
+        assert_eq!(head(&small), small);
+        assert_eq!(head(&index), top);
+    }
+
+    #[test]
+    fn an_index_whose_names_do_not_fit_names_the_most_needed_and_counts_the_rest() {
+        let dir = Path::new("/m");
+        // The largest project on 11-19: 381 facts, 63 of them work, of
+        // which today's head showed 94.
+        let facts = facts_of(318, 63, 441);
+        let index = render_index(dir, &facts);
+        assert!(names_only(&index) > HEAD);
+        assert_eq!(names_only(&index), at_step(&index, 0));
+        let top = head(&index);
+        assert!(top.len() <= HEAD, "{}", top.len());
+        // The index's first facts, work first, by names alone.
+        let all = named(&index);
+        let shown = named(&top);
+        assert_eq!(&all[..shown.len()], &shown[..]);
+        assert!(shown.len() > 200, "{}", shown.len());
+        assert!(shown[0].starts_with("work-under-way-"));
+        assert!(!top.contains("): "), "{top}");
+        assert!(
+            top.ends_with(&format!(
+                "\n{} more facts are in this folder's MEMORY.md, not shown here; the memory tool's search finds them.\n",
+                all.len() - shown.len()
+            )),
+            "{top}"
+        );
+    }
+
+    #[test]
+    fn the_cleanup_hears_of_an_index_whose_names_pass_the_head() {
+        let root = temp("over-head");
+        repo(&root).unwrap();
+        let project = root.join("projects/small");
+        std::fs::create_dir_all(&project).unwrap();
+        for (dir, facts) in [
+            (&root, facts_of(318, 63, 441)),
+            (&project, facts_of(10, 0, 441)),
+        ] {
+            for fact in &facts {
+                let file = dir.join(format!("{}.md", fact.name));
+                std::fs::write(file, fact.render("x")).unwrap();
+            }
+        }
+        let run_ = |line: &[&str]| run(&root, &root, &args(line), &no_stdin);
+        let started = run_(&["cleanup", "start"]).unwrap();
+        let index = render_index(&root, &facts(&root).unwrap());
+        assert_eq!(
+            started["over_head"],
+            json!([{"index": "MEMORY.md", "facts": 381, "names_bytes": names_only(&index),
+                "head_bytes": HEAD}])
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn facts_the_cleanup_folds_into_one_whole_are_no_loss_and_cut_ones_are() {
+        let root = temp("fold");
+        let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
+        let run_ = |line: &[&str]| run(&root, &root, &args(line), &no_stdin);
+        repo(&root).unwrap();
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let text = |name: &str| format!("Build slot rule {name}: wait\nfor slot {name} first.");
+        for name in names {
+            save_user(&root, name, &format!("slot rule {name}"), &text(name)).unwrap();
+        }
+        // A fold that keeps only some of what it took in lost the rest.
+        run_(&["cleanup", "start"]).unwrap();
+        save_user(
+            &root,
+            "build-slots",
+            "every slot rule",
+            &format!("{}\n\n{}", text("a"), text("b")),
+        )
+        .unwrap();
+        for name in &names[..5] {
+            run_(&["rm", name, "--user"]).unwrap();
+        }
+        let refused = run_(&["cleanup", "finish"]).unwrap_err();
+        assert!(
+            refused.starts_with("loss_guard: the cleanup removed 3 of 8 lasting facts, not folded whole into a fact it saved, above 2"),
+            "{refused}"
+        );
+        assert_eq!(code(Err(refused)), "loss_guard");
+        assert!(root.join("e.md").exists() && !root.join("build-slots.md").exists());
+        // One that keeps every fact's whole text, however wrapped, lost
+        // nothing.
+        run_(&["cleanup", "start"]).unwrap();
+        let whole: Vec<String> = (names[..6].iter())
+            .map(|name| format!("- {}", text(name).replace('\n', " ")))
+            .collect();
+        save_user(&root, "build-slots", "every slot rule", &whole.join("\n")).unwrap();
+        for name in &names[..6] {
+            run_(&["rm", name, "--user"]).unwrap();
+        }
+        let done = run_(&["cleanup", "finish"]).unwrap();
+        let six: Vec<String> = names[..6].iter().map(|name| format!("{name}.md")).collect();
+        assert_eq!(
+            (done["removed"].clone(), done["folded"].clone()),
+            (json!(six), json!(six))
+        );
+        assert_eq!(done["facts"], 3);
         std::fs::remove_dir_all(root).unwrap();
     }
 

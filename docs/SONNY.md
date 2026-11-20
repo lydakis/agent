@@ -491,12 +491,18 @@ and date alone, newest first, then the person's own (`user`, `feedback`), then t
 each group by `confirmed` count, then `verified` date, newest first. An
 index has no limit and a save is never refused for room. A new agent's
 instructions, and `show`, take each index's head
-([`memory::head`](../client/src/memory.rs)): whole lines from the top
-within 16 KiB, then a line saying how many facts it leaves out, which
-`search` finds, as Claude Code loads the first 200 lines of its MEMORY.md
-and reads the rest on demand. Both heads fit an agent's instructions
-beside its AGENTS.md files and role. Keeping memory small is the nightly
-cleanup's job, never a working agent's. A `work` fact is work under way
+([`memory::head`](../client/src/memory.rs)) within 16 KiB: the whole index
+when it fits; else every fact still, in the index's order, each
+description shortened alike by the steps the skills list takes (160, 80,
+then 40 characters, a cut one ending in `…`, then names alone), the first
+that fits, as Codex loads a short form of every memory and Claude Code a
+line per topic; and only when names alone pass 16 KiB, names from the top
+as many as fit, then a line saying how many facts it leaves out, which
+`search` finds. Both heads fit an agent's instructions beside its
+AGENTS.md files and role. Keeping memory small is the nightly cleanup's
+job, never a working agent's: `cleanup start` lists each index whose
+names alone pass the head (`over_head`), and the cleanup folds related
+facts into one per subject until they fit. A `work` fact is work under way
 that a later agent may pick up, saved again as it moves; the cleanup
 retires one not saved in over three days, as Codex and Copilot drop
 memories by age, after keeping any lesson in it as a lasting fact. The
@@ -712,10 +718,14 @@ and never removes a lasting fact for its age alone.
 first `cleanup start`, never pushed. `cleanup start` commits what agents
 saved since the last cleanup, records that commit, the fact count and the
 paths of the `work` facts in `.cleanup`, and lists the facts saved and removed since then, which the
-agent reads first rather than every fact; a second `start` before `finish` says `"duplicate": true` and
+agent reads first rather than every fact, and each index whose facts by
+name alone pass 16 KiB (`over_head`: its path, fact count, `names_bytes`
+and `head_bytes`); a second `start` before `finish` says `"duplicate": true` and
 keeps the first. `cleanup finish` commits the cleanup and returns what it
-removed, added and changed. A cleanup that removed more than a quarter of
-the lasting facts, and more than two, is `loss_guard` (the `work` facts it
+removed, added and changed, and `folded`, the removed facts whose whole
+text, white space aside, a fact the cleanup added or changed now holds. A
+cleanup that removed more than a quarter of
+the lasting facts, and more than two, not counting folded ones, is `loss_guard` (the `work` facts it
 started with are left out of both counts, since work under way ends): `finish` takes memory back
 to the start with a new commit, puts back what other agents saved or removed
 meanwhile, and the refused cleanup stays in history for the person to read.
