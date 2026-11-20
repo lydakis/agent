@@ -741,9 +741,11 @@ async fn check_companions(
             restart(client, kept).await?;
         }
     }
+    // Read again: a run restarted above is listed by its replacement only
+    // from now on.
+    let mut listed = crate::companions(client).await?;
     let mut settled = vec![false; names.len()];
     let deadline = tokio::time::Instant::now() + watch.until;
-    let mut listed = after;
     loop {
         let now = now_ms();
         for ((name, program), settled) in names.iter().zip(settled.iter_mut()) {
@@ -1269,6 +1271,24 @@ mod tests {
         assert_eq!(
             still_failing(&[crate::TOOL_HOST]),
             Err(format!("sonny-tool-host is still failing on {VERSION}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_companion_is_watched_by_its_new_run() {
+        // This build's, running for 10 s after two restarts: restarted, and
+        // the new run, which exits, is what is watched.
+        let mut restarting = all_this_build();
+        restarting[1]["restarts"] = serde_json::json!(2);
+        restarting[1]["started_ms"] = serde_json::json!(now_ms() - 10_000);
+        let (client, _, removed) = daemon_keeping(restarting, tool_host_exits).await;
+        let checked = check_companions(&client, Path::new("/s/state.sqlite"), &QUICK)
+            .await
+            .unwrap();
+        assert_eq!(*removed.lock().unwrap(), [crate::TOOL_HOST]);
+        assert!(
+            matches!(&checked[1].1, Checked::Failing(why) if why.starts_with("exits 1, 3 restarts")),
+            "{checked:?}"
         );
     }
 
