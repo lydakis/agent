@@ -153,13 +153,21 @@ def main():
             worker.start()
         time.sleep(5)
 
+        def up(when):
+            # A window that exited costs nothing and would read as a cheap
+            # one: the run is refused.
+            for window in windows:
+                window.check(when)
+
         def spell(name):
+            up(f'before {name}')
             cpu = (sum(cpu_seconds(p) for p in pids), cpu_seconds(daemon.pid))
             ops, sent, read = tap.counts()
             moved = [io(p) for p in pids]
             done, at = turns[0], time.monotonic()
             time.sleep(args.seconds)
             took = time.monotonic() - at
+            up(f'after {name}')
             ops2, sent2, read2 = tap.counts()
             moved2 = [io(p) for p in pids]
             result[name] = {
@@ -195,6 +203,7 @@ def main():
         first.wait('conversation', lambda line: 'Message' in line, 30)
         time.sleep(3)
         spell('closed_again')
+        up('at the end')
         rss = [rss_mib(p) for p in pids]
         result['rss_mib'] = {'first': round(rss[0], 1), 'others_mean': round(sum(rss[1:]) / max(1, len(rss) - 1), 1),
                              'total': round(sum(rss), 1)}
