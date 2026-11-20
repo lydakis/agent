@@ -540,7 +540,8 @@ struct Lanes {
     replaying: HashMap<String, i64>,
     /// The events heard and not yet given, by cursor.
     held: BTreeMap<i64, Vec<Value>>,
-    /// Those with no cursor, given first.
+    /// Those given as they came: with no cursor, or heard once every
+    /// follow was live with nothing held.
     loose: VecDeque<Value>,
 }
 
@@ -569,7 +570,11 @@ impl Lanes {
             }
             return;
         }
-        let Some(cursor) = event["cursor"].as_i64() else {
+        // Every follow live and nothing held: as it comes, in the order
+        // the daemon published it.
+        let cursor = event["cursor"].as_i64();
+        let Some(cursor) = cursor.filter(|_| !self.replaying.is_empty() || !self.held.is_empty())
+        else {
             self.loose.push_back(event);
             return;
         };
