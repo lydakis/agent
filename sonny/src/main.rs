@@ -6672,8 +6672,9 @@ struct App {
     /// runs, so there is one copy.
     listed: Option<Vec<standing::Agent>>,
     /// The lead a task's window lists the agents of, with the agent it was
-    /// found for, as the last count's listing said: kept while a count
-    /// holds the listing, so a read beside it lists for the same lead.
+    /// found for, as the last count's listing said: found once a count,
+    /// not each time a frame asks, and kept while a count holds the
+    /// listing, so a read beside it lists for the same lead.
     listed_lead: Option<(String, String)>,
     rows_mark: Option<u64>,
     folded: Option<(bool, u64)>,
@@ -15824,9 +15825,9 @@ impl App {
             Some(project) => (project.clone(), self.bot.clone()),
             None => (
                 self.bot.split('.').next().unwrap_or(&self.bot).to_owned(),
-                match (&self.listed, &self.listed_lead) {
-                    (None, Some((bot, lead))) if *bot == self.bot => lead.clone(),
-                    (listed, _) => task_lead(&self.bot, listed.as_deref()),
+                match (&self.listed_lead, &self.listed) {
+                    (Some((bot, lead)), _) if *bot == self.bot => lead.clone(),
+                    (_, listed) => task_lead(&self.bot, listed.as_deref()),
                 },
             ),
         };
