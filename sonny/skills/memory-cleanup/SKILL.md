@@ -84,7 +84,9 @@ of it ends `tool_unserved`, run the same command with
      for that scope names every fact, with no closing line of facts left
      out. A fact holds at most
      16 KiB: split a subject that would pass that into its parts. A fact
-     with no related fact stays as it is. `finish` counts a removed fact
+     with no related fact stays as it is, and so does one with a
+     `pushed back` count: its count keeps counting against what it says,
+     as step 5 weighs it. `finish` counts a removed fact
      whose whole text a fact you saved holds as folded, not lost.
 4. Call it with `said` true and `since_ms` as `start` gave it (leave it
    out when that is null). It lists what the person wrote to any agent
