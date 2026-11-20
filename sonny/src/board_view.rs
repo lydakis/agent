@@ -1386,4 +1386,70 @@ mod tests {
         assert!(!view.keys().contains("m "), "{}", view.keys());
         let _ = std::fs::remove_dir_all(home);
     }
+
+    /// What 50 boards of 20 items each, 1,000 items, cost `/commons`: to
+    /// open, to draw, to draw again, to read again with nothing changed
+    /// and with one thread changed, a board's page, and the list with `m`.
+    #[test]
+    #[ignore = "timing: cargo test --release -p sonny fifty_boards -- --ignored --nocapture"]
+    fn fifty_boards_and_a_thousand_items_cost() {
+        use std::time::{Duration, Instant};
+        let home = home("cost");
+        for b in 0..50 {
+            for i in 0..20 {
+                add(
+                    &home,
+                    "shop.lead",
+                    &format!("shop/board-{b:02}"),
+                    &format!("b{b:02}-{i:02}"),
+                    &format!("Fix item {i} of board {b}"),
+                    json!({"labels": {"kind": "bug"}}),
+                );
+            }
+        }
+        for b in 0..50 {
+            act(&home, "shop.fix", &format!("b{b:02}-00"), "claim", "on it");
+            act(&home, "shop.fix", &format!("b{b:02}-01"), "done", "fixed");
+        }
+        let best = |runs: usize, mut f: Box<dyn FnMut() + '_>| -> Duration {
+            (0..runs)
+                .map(|_| {
+                    let at = Instant::now();
+                    f();
+                    at.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let at = Instant::now();
+        let mut view = View::open(&home, "shop".into());
+        let open = at.elapsed();
+        let at = Instant::now();
+        view.card_rows(120);
+        let first = at.elapsed();
+        let redraw = best(20, Box::new(|| drop(view.card_rows(120))));
+        let reread = best(20, Box::new(|| view.reload()));
+        // One thread changed: claimed, then released, each read and drawn.
+        let changed = (0..10)
+            .map(|n| {
+                let what = if n % 2 == 0 { "claim" } else { "release" };
+                act(&home, "shop.fix", "b07-05", what, "x");
+                let at = Instant::now();
+                view.reload();
+                view.card_rows(120);
+                at.elapsed()
+            })
+            .min()
+            .unwrap();
+        press(&mut view, KeyCode::Enter);
+        let page = best(20, Box::new(|| drop(view.card_rows(120))));
+        press(&mut view, KeyCode::Left);
+        press(&mut view, KeyCode::Char('m'));
+        let items = best(20, Box::new(|| drop(view.card_rows(120))));
+        println!(
+            "open {open:?} · first draw {first:?} · redraw {redraw:?} · read again, nothing changed {reread:?} \
+             · one thread changed, read and drawn {changed:?} · a board's page {page:?} · with m {items:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
