@@ -529,7 +529,7 @@ struct Seeded {
 async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     let mut needs = needs::Needs::default();
     let held = needs::listing(client, None).await.ok()?;
-    let (listed, _) = standing::list(client, "*.*").await.ok()?;
+    let listed = standing::list(client, "*.*").await.ok()?;
     let order = in_order(store, &listed);
     let named_as_sides: HashSet<String> = (listed.iter())
         .filter(|bot| {

@@ -198,14 +198,14 @@ async fn held_daemon(
                         _ => json!({}),
                     };
                     let answer = json!({"id": asked["id"], "result": result});
-                    let follow = asked["op"] == "follow";
+                    let follow = (asked["op"] == "follow").then(|| asked["bot"].clone());
                     let write = write.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(held).await;
                         let mut write = write.lock().await;
                         let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
-                        if follow {
-                            let live = json!({"event": "follow_live"});
+                        if let Some(bot) = follow {
+                            let live = json!({"event": "follow_live", "bot": bot});
                             let _ = write.write_all(format!("{live}\n").as_bytes()).await;
                         }
                     });
