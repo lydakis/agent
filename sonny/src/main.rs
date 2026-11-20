@@ -20109,7 +20109,7 @@ impl App {
     /// before it was asked never answers it, as Codex keeps its draft
     /// apart from its questions. The one being answered keeps its focus.
     fn keep_draft(&mut self) {
-        if self.asking().is_none() && !self.input.trim().is_empty() {
+        if self.asking().is_none() && (!self.input.trim().is_empty() || !self.quotes.is_empty()) {
             self.chatting = true;
         }
         if self.focus.is_none() {
@@ -29683,6 +29683,16 @@ mod tests {
                 "You asked (ask:3/c1): Bump it?\n\nnot yet"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_question_asked_under_a_quote_leaves_the_reply_the_persons_own() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        // A quote over the composer is a reply begun before any words.
+        app.quote("Merge it?");
+        app.asked("c0", Some(1), &json!({"question": "Bump it?"}));
+        assert!(app.asking().is_none());
+        assert!(app.answering_over(80).is_none());
     }
 
     #[tokio::test]
