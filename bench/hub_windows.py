@@ -100,7 +100,18 @@ def main():
             window.wait('composer', lambda line: 'Message' in line, 300)
         result['windows_started_s'] = round(time.monotonic() - began, 1)
         pids = [w.pid for w in windows]
-        time.sleep(15)
+        # A fresh store and home: every window starts Sonny's one-time
+        # upgrade work (a whole listing, each agent looked at), which a
+        # person's store did once long ago. Measured from when the windows
+        # are quiet again, so what is left is what they cost every day.
+        began = time.monotonic()
+        while time.monotonic() - began < 600:
+            before = sum(tap.counts()[0].values())
+            time.sleep(2)
+            if sum(tap.counts()[0].values()) - before < 20:
+                break
+        result['windows_quiet_s'] = round(time.monotonic() - began, 1)
+        time.sleep(5)
 
         def busy(n):
             connection = connect(sock, daemon)

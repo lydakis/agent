@@ -90,8 +90,13 @@ pub struct Elsewhere {
 /// window asks for them.
 #[derive(Clone, Debug, Default)]
 pub struct Rows {
-    /// Moves on with each change, so a reader knows whether anything did.
+    /// Moves on with each change, so a reader knows whether anything did;
+    /// never back, and from a different start in each window that follows,
+    /// so rows listed again after a pause or by another window never pass
+    /// for ones already read.
     pub version: u64,
+    /// Whether every row is in: a listing was told since the follow began.
+    pub whole: bool,
     pub agents: BTreeMap<String, standing::Agent>,
 }
 
@@ -110,6 +115,7 @@ impl Rows {
     fn take(&mut self, moved: &Moved) {
         if moved.all {
             self.agents.clear();
+            self.whole = true;
         }
         for name in &moved.gone {
             self.agents.remove(name);
@@ -351,8 +357,15 @@ struct Book {
 
 impl Book {
     fn new() -> Self {
+        // Where this window's versions start: the time, so another window
+        // following after it starts elsewhere.
+        let start = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+            .map_or(1, |since| since.as_micros() as u64);
         Book {
-            rows: Default::default(),
+            rows: std::sync::Mutex::new(Rows {
+                version: start,
+                ..Default::default()
+            }),
             moved: broadcast::channel(64).0,
             asking: watch::channel(0).0,
         }
@@ -364,7 +377,7 @@ impl Book {
         self.asking.send_modify(|asking| *asking += 1);
         let moved = self.moved.subscribe();
         let kept = (self.rows.lock().ok())
-            .filter(|rows| rows.version > 0)
+            .filter(|rows| rows.whole)
             .map(|rows| rows.all());
         (Asking(self), kept, moved)
     }
@@ -380,6 +393,15 @@ impl Book {
         };
         rows.take(&moved);
         let _ = self.moved.send(Arc::new(moved));
+    }
+}
+
+/// A task ended when dropped.
+struct Ended(tokio::task::JoinHandle<()>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -435,6 +457,8 @@ async fn follow_rows(socket: &Path, book: &Book) {
         else {
             return;
         };
+        // Ended however this does, dropped with the window's hub included.
+        let drain = Ended(drain);
         let followed = async {
             loop {
                 woken.notified().await;
@@ -447,7 +471,9 @@ async fn follow_rows(socket: &Path, book: &Book) {
                         set: snapshot,
                         ..Default::default()
                     });
-                } else if !changes.moved.is_empty() {
+                }
+                // Moved since the listing, or since the last of these.
+                if !changes.moved.is_empty() {
                     let names: Vec<String> = changes.moved.into_iter().collect();
                     let Ok(set) = standing::rows(&client, &names).await else {
                         return;
@@ -461,23 +487,20 @@ async fn follow_rows(socket: &Path, book: &Book) {
                         ..Default::default()
                     });
                 }
-                if drain.is_finished() {
+                if drain.0.is_finished() {
                     return;
                 }
             }
         };
         tokio::select! {
-            () = followed => {
-                drain.abort();
-                return;
-            }
+            () = followed => return,
             _ = asking.wait_for(|asking| *asking == 0) => {}
         }
         // None asks: the follow is let go, and what it kept.
-        drain.abort();
+        drop(drain);
         if let Ok(mut rows) = book.rows.lock() {
             rows.agents.clear();
-            rows.version = 0;
+            rows.whole = false;
         }
     }
 }
@@ -504,7 +527,7 @@ async fn rows_here(book: &Book, here: &Here) {
                     Ok(_) => {}
                     // Too far behind: every row again.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let all = book.rows.lock().ok().filter(|rows| rows.version > 0).map(|rows| rows.all());
+                        let all = book.rows.lock().ok().filter(|rows| rows.whole).map(|rows| rows.all());
                         if let Some(all) = all {
                             at = all.version;
                             here.take(&all);
@@ -573,7 +596,7 @@ async fn tell_on(stream: UnixStream, mut shared: watch::Receiver<Shared>, book: 
                     Ok(moved) if moved.version > *at => (*moved).clone(),
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let all = book.rows.lock().ok().filter(|rows| rows.version > 0).map(|rows| rows.all());
+                        let all = book.rows.lock().ok().filter(|rows| rows.whole).map(|rows| rows.all());
                         match all {
                             Some(all) => all,
                             None => continue,
@@ -1371,6 +1394,7 @@ mod tests {
         until("the rows kept", || head(&first, "site.lead") == Some(9)).await;
         assert_eq!(*follows.lock().unwrap(), 1);
         // None asks any more: what each held is let go, and the follow too.
+        let read = second.rows(|rows| rows.unwrap().version);
         second.want_rows(false);
         first.want_rows(false);
         assert!(second.rows(|rows| rows.is_none()));
@@ -1379,6 +1403,8 @@ mod tests {
         second.want_rows(true);
         until("every row again", || head(&second, "site.lead") == Some(9)).await;
         assert_eq!(*follows.lock().unwrap(), 2);
+        // Listed anew, never at a version already read.
+        assert!(second.rows(|rows| rows.unwrap().version) > read);
     }
 
     /// An approval held in another project is told the window as the
