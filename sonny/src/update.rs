@@ -106,6 +106,7 @@ fn tarball_name(version: &str, arch: &str) -> String {
 
 /// Whether `latest` is a newer release than `current`, as Codex compares
 /// them: plain `MAJOR.MINOR.PATCH` only, so a prerelease is never offered.
+/// A build from main is 0.0.0, older than any release.
 fn is_newer(latest: &str, current: &str) -> Option<bool> {
     Some(parse_version(latest)? > parse_version(current)?)
 }
@@ -795,6 +796,9 @@ mod tests {
         // A prerelease is never offered, as Codex never offers one.
         assert_eq!(is_newer("0.10.0-rc.1", "0.9.4"), None);
         assert_eq!(is_newer("0.9.5", "0.9.5-rc.1"), None);
+        // A build from main says 0.0.0: every release is newer than it.
+        assert_eq!(is_newer("0.0.1", "0.0.0"), Some(true));
+        assert_eq!(is_newer("0.10.2", "0.0.0"), Some(true));
     }
 
     #[test]

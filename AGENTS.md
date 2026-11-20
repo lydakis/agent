@@ -34,7 +34,9 @@ correctness, and performance; earlier Agent revisions impose no requirements.
 - Sonny's own one-off upgrade work (outside the store's schema) lives in
   [sonny/src/upgrade.rs](sonny/src/upgrade.rs) and names the release it
   retires at, two after the one it ships in; a test fails once Sonny reaches
-  it, and the work is deleted then. A mechanical rewrite is a migration in
+  it (main says 0.0.0, so the release build's tests, at the tag's version,
+  are the ones that fail; [release/README.md](release/README.md) checks
+  before the tag), and the work is deleted then. A mechanical rewrite is a migration in
   code, run by `upgrade::once`: of files Sonny writes, and of a key renamed
   or retyped in the person's `~/.agent/config.toml`, kept only when the
   rewritten file reads as the same settings and left alone otherwise, so an
