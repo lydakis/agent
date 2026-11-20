@@ -600,15 +600,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
 /// daemon keeps now (0.10.3).
 pub const PROFILES_ON_AGENTS: &str = "profiles-on-agents";
 
-/// [`PROFILES_ON_AGENTS`] for the daemon of `store`, whose agents `bots`
-/// lists: each note in the folder `STORE.profiles` named for an agent with
-/// no profile of its own goes onto it with `configure`, and the folder goes
-/// once every note is taken or its agent is gone. Whether it is done.
-pub async fn profiles_onto_agents(
-    client: &agent_client::Client,
-    bots: &[Value],
-    store: &Path,
-) -> bool {
+/// [`PROFILES_ON_AGENTS`] for the daemon of `store`: each note in the
+/// folder `STORE.profiles` named for an agent with no profile of its own
+/// goes onto it with `configure`, and the folder goes once every note is
+/// taken or its agent is gone. Only the agents noted are read, by name.
+/// Whether it is done.
+pub async fn profiles_onto_agents(client: &agent_client::Client, store: &Path) -> bool {
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
     let mut dir = store.into_os_string();
     dir.push(".profiles");
@@ -636,6 +633,10 @@ pub async fn profiles_onto_agents(
         })
         .await
     else {
+        return false;
+    };
+    let noted: Vec<&str> = notes.iter().map(|(name, _)| name.as_str()).collect();
+    let Some(bots) = rows_named(client, &noted).await else {
         return false;
     };
     let by_name: std::collections::HashMap<&str, &Value> = (bots.iter())
@@ -668,6 +669,27 @@ pub async fn profiles_onto_agents(
         all = gone.await.unwrap_or(false);
     }
     all
+}
+
+/// The `bots` rows of the agents `names`, closed or not, 256 names a
+/// request and every page of each; none where a read failed.
+async fn rows_named(client: &agent_client::Client, names: &[&str]) -> Option<Vec<Value>> {
+    let mut rows = Vec::new();
+    for chunk in names.chunks(256) {
+        let mut after = Value::Null;
+        loop {
+            let asked = json!({"names": chunk, "limit": 256, "after": after});
+            let mut page = client.request("bots", asked).await.ok()?;
+            if let Value::Array(bots) = page["bots"].take() {
+                rows.extend(bots);
+            }
+            match page["next_after"].take() {
+                next @ Value::String(_) if next != after => after = next,
+                _ => break,
+            }
+        }
+    }
+    Some(rows)
 }
 
 /// Whether two paths name one folder, links followed.
