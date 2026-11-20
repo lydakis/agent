@@ -172,6 +172,14 @@ class ScoreTests(unittest.TestCase):
                                   'automations.json': '{"automations": []}'})
             self.assertEqual(set(self.score('schedule', view).values()), {True})
             self.assertEqual(len(view.automation('add')), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            # The trail cuts a long call's preview: its start still shows the add.
+            cut = '{"add": {"name": "branches", "cron": "0 9 * * 1-5", "prompt": "Look at this repo\'s bran'
+            view = run_dir(tmp, [part('person', 'Set.'), part('person', 'Gone.')],
+                           [row('automations', bot='shop.branches', preview=cut)],
+                           files={'acp.jsonl': self.acp(('automations', {'remove': 'branches'}, 'completed')),
+                                  'automations.json': '{"automations": []}'})
+            self.assertEqual(set(self.score('schedule', view).values()), {True})
 
     @staticmethod
     def answer(text):
@@ -402,7 +410,7 @@ class SetupTests(unittest.TestCase):
                     golden_eval.one('recover-context', 'A', 1, {'A': str(bins)}, 'chatgpt/gpt-6.1-sol',
                                     settings={'code_mode': True, 'history_step': True})
             self.assertIn('code_mode = true\nhistory_step = true\n', seen['config'])
-            self.assertTrue(seen['config'].endswith('\n[context_windows]\n"chatgpt/gpt-6.1-sol" = 60000\n'))
+            self.assertTrue(seen['config'].endswith('\n[context_windows]\n"chatgpt/gpt-6.1-sol" = 55000\n'))
 
     def test_an_arm_s_setting_replaces_a_default_rather_than_repeating_it(self):
         with tempfile.TemporaryDirectory() as tmp:

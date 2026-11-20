@@ -135,12 +135,21 @@ CODENAME = r'HERON-7731'
 
 
 def arguments(row):
-    """A trail row's arguments: its preview is their JSON, cut at 2048
-    characters; a cut or plain preview is its text as a command."""
+    """A trail row's arguments: its preview is their JSON, which the trail
+    cuts (at 256 characters on 11-20); a plain preview is its text as a
+    command. A cut `automations` call keeps what its start shows: an add
+    with its cron, or a remove."""
+    preview = row['preview'] or '{}'
     try:
-        args = json.loads(row['preview'] or '{}')
+        args = json.loads(preview)
     except ValueError:
-        return {'command': row['preview']}
+        if row.get('tool') == 'automations' and preview.lstrip().startswith('{'):
+            cron = re.search(r'"cron"\s*:\s*"([^"]+)"', preview)
+            if re.search(r'"add"\s*:', preview):
+                return {'add': {'cron': cron.group(1)} if cron else {}}
+            if re.search(r'"remove"\s*:', preview):
+                return {'remove': True}
+        return {'command': preview}
     return args if isinstance(args, dict) else {}
 
 
@@ -256,11 +265,12 @@ CASES = [
     {'id': 'recover-context', 'area': 'history',
      # The lead's model is told its context holds this many tokens, so the
      # long outputs below push the first message out of it.
-     # 60,000 puts the threshold at 27,000 (a window less 33,000): the lead's
-     # role and tools alone are about 15,000, and its rounds reach 31,000 by
-     # the third ask. At 40,000 the threshold, 7,000, sat under the role
-     # itself, so no cut ever came (11-20).
-     'window': 60_000,
+     # 55,000 puts the threshold at 22,000 (a window less 33,000): the lead's
+     # role and tools alone are about 15,000, and its rounds reach about
+     # 27,000 (direct) and 28,000 (code mode) by the last ask. At 40,000 the
+     # threshold, 7,000, sat under the role itself, so no cut ever came; at
+     # 60,000 (27,000) only code mode crossed it (11-20).
+     'window': 55_000,
      'steps': [
          {'say': FIRST},
          {'say': "Run `python3 -m pydoc datetime.datetime` and tell me in one line which methods deal with "
