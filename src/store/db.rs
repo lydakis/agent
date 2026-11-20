@@ -3693,7 +3693,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 108;
+    pub const SCHEMA: i32 = 109;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -20543,7 +20543,134 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
 
+    // Schema 109: a declared tool's `lift` is `yields` (#1203), in every
+    // list the store keeps and every `configure` kept for a turn's end.
+    if from < 109 {
+        migrate_declared_field(conn, "lift", "yields")?;
+    }
+
     Ok(())
+}
+
+/// Every declared tool's `old` field named `new`, in place: `lift` to
+/// `yields` going to 109. release/store_down.py takes it back.
+/// A list is kept once under the digest of its bytes, so a list that
+/// changes moves to its new digest, and the bots holding it, the records
+/// of creations that declared it and kept `configure`s naming it follow.
+/// A kept `configure` holding its tools whole has them renamed there.
+fn migrate_declared_field(conn: &Connection, old: &str, new: &str) -> Result<()> {
+    let invalid = |_| Error::new("store_migration_invalid_declared");
+    let lists: Vec<(String, String)> = conn
+        .prepare("SELECT digest,tools FROM tool_lists")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (digest, json) in lists {
+        let Some(json) = renamed_fields(&json, old, new).map_err(invalid)? else {
+            continue;
+        };
+        let moved = crate::tools::digest_of(&json);
+        conn.execute(
+            "INSERT OR IGNORE INTO tool_lists(digest,tools) VALUES (?,?)",
+            params![&*moved, json],
+        )?;
+        conn.execute(
+            "UPDATE bots SET declared=?1 WHERE declared=?2",
+            params![&*moved, digest],
+        )?;
+        conn.execute(
+            "UPDATE bots SET creation=json_set(creation,'$.request.declare',?1)
+             WHERE json_type(creation,'$.request.declare')='text'
+               AND json_extract(creation,'$.request.declare')=?2",
+            params![&*moved, digest],
+        )?;
+        conn.execute(
+            "UPDATE bots SET configure_pending=json_set(configure_pending,'$.declare',?1)
+             WHERE json_type(configure_pending,'$.declare')='text'
+               AND json_extract(configure_pending,'$.declare')=?2",
+            params![&*moved, digest],
+        )?;
+        conn.execute("DELETE FROM tool_lists WHERE digest=?", [digest])?;
+    }
+    let kept: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT id,configure_pending FROM bots
+             WHERE json_type(configure_pending,'$.declare')='array'",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, pending) in kept {
+        let mut pending: Value = serde_json::from_str(&pending).map_err(invalid)?;
+        let mut changed = false;
+        for tool in pending["declare"].as_array_mut().into_iter().flatten() {
+            if let Some(tool) = tool.as_object_mut()
+                && let Some(value) = tool.remove(old)
+            {
+                tool.insert(new.to_owned(), value);
+                changed = true;
+            }
+        }
+        if changed {
+            conn.execute(
+                "UPDATE bots SET configure_pending=? WHERE id=?",
+                params![serde_json::to_string(&pending)?, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The JSON array of objects `json` with each object's `old` field named
+/// `new` where it stands, every other byte as it was: the bytes a release
+/// that names the field `new` writes for the same tools. `None` when no
+/// object has the field.
+fn renamed_fields(json: &str, old: &str, new: &str) -> serde_json::Result<Option<String>> {
+    struct Fields<'a>(Vec<(String, &'a RawValue)>);
+    impl<'de: 'a, 'a> serde::Deserialize<'de> for Fields<'a> {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct Visit;
+            impl<'de> serde::de::Visitor<'de> for Visit {
+                type Value = Fields<'de>;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a declared tool")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> std::result::Result<Fields<'de>, A::Error> {
+                    let mut fields = Vec::new();
+                    while let Some(field) = map.next_entry()? {
+                        fields.push(field);
+                    }
+                    Ok(Fields(fields))
+                }
+            }
+            d.deserialize_map(Visit)
+        }
+    }
+    let tools: Vec<Fields> = serde_json::from_str(json)?;
+    if !(tools.iter()).any(|tool| tool.0.iter().any(|(name, _)| name == old)) {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(json.len() + 8);
+    out.push('[');
+    for (i, tool) in tools.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        for (j, (name, value)) in tool.0.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            let name = if name == old { new } else { name };
+            out.push_str(&serde_json::to_string(name)?);
+            out.push(':');
+            out.push_str(value.get());
+        }
+        out.push('}');
+    }
+    out.push(']');
+    Ok(Some(out))
 }
 /// 103 -> 104: a turn parked on a call's verdict says who holds the call
 /// and since when. No session serves a tag while the store opens, so a
