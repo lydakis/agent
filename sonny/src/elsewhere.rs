@@ -1443,6 +1443,14 @@ mod tests {
                                     if write.write_all(format!("{out}\n").as_bytes()).await.is_err() {
                                         break;
                                     }
+                                    // Nothing to replay: each follow is live at once.
+                                    if request["op"] == "follow" {
+                                        let live = json!({"event": "follow_live",
+                                            "bot": request["bot"], "cursor": 0});
+                                        if write.write_all(format!("{live}\n").as_bytes()).await.is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
                                 Some(event) = events.recv() => {
                                     if write.write_all(format!("{event}\n").as_bytes()).await.is_err() {
