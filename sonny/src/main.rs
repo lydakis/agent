@@ -927,14 +927,16 @@ impl App {
     /// While **Projects** is open, every project read again once its
     /// follow says an agent moved, and while one runs at most every
     /// [`STATUS_AGAIN`], as `/status` reads its own: never oftener.
-    async fn projects_tick(&mut self) {
+    /// Whether it set the page: a read that lands is drawn now, not with
+    /// the idle frame a second on, though nothing else woke the window.
+    async fn projects_tick(&mut self) -> bool {
         // A read the page left under way is taken as it ends, though the
         // page stays closed.
         if let Some(kept) = &mut self.projects_kept {
             kept.landed();
         }
         let Some(open) = &mut self.projects else {
-            return;
+            return false;
         };
         // The agents with a question open, as the store's one follow of
         // every project keeps them: no history is read here.
@@ -944,7 +946,9 @@ impl App {
                 .collect(),
             None => Default::default(),
         };
+        let mut set = false;
         if let Some(job) = open.job.take_if(|job| job.is_finished()) {
+            set = true;
             match job.await {
                 Ok(Some(read)) => {
                     open.view.set(read.projects, now_ms());
@@ -957,10 +961,10 @@ impl App {
             }
         }
         if open.job.is_some() || open.read_at.is_some_and(|at| at.elapsed() < STATUS_AGAIN) {
-            return;
+            return set;
         }
         let Some((shared, _)) = &self.other_projects else {
-            return;
+            return set;
         };
         // Every agent's row, once in and moved since the last read (or the
         // questions open did, or the last read was short).
@@ -975,7 +979,7 @@ impl App {
                 )
             })
         }) else {
-            return;
+            return set;
         };
         open.read_at = Some(Instant::now());
         let (client, woken) = (self.client.clone(), self.woken.clone());
@@ -997,6 +1001,7 @@ impl App {
             woken.notify_one();
             read
         }));
+        set
     }
 
     /// A key, a click or the wheel while **Projects** is open: it has the
@@ -9251,7 +9256,7 @@ impl App {
             self.recheck_task_answers().await;
             self.settle_task_asks().await;
             self.count_agents().await;
-            self.projects_tick().await;
+            changed |= self.projects_tick().await;
             self.elsewhere_tick();
             self.read_references().await;
             self.read_names().await;
@@ -29108,6 +29113,45 @@ mod tests {
         written["store"] = json!("another store");
         std::fs::write(&file, written.to_string()).unwrap();
         assert!(take_projects(&store, client.identity()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_that_lands_while_the_page_is_open_is_drawn_at_once() {
+        let job = tokio::spawn(async {
+            Some(ProjectsRead {
+                projects: vec![projects::Project {
+                    lead: "alpha.lead".into(),
+                    ..Default::default()
+                }],
+                state: ProjectsState::default(),
+                whole: true,
+                waiting: Default::default(),
+                version: 7,
+            })
+        });
+        while !job.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.projects = Some(Box::new(ProjectsOpen {
+            view: projects::View::new("x.lead"),
+            job: Some(job),
+            read_at: Some(Instant::now()),
+            state: ProjectsState::default(),
+            whole: true,
+            waiting: Default::default(),
+            version: None,
+            page: Rect::default(),
+            side: Rect::default(),
+        }));
+        // The read set the page: the window draws it now, though nothing
+        // else woke it.
+        assert!(app.projects_tick().await);
+        let open = app.projects.as_ref().unwrap();
+        assert_eq!(open.view.projects()[0].lead, "alpha.lead");
+        assert_eq!(open.version, Some(7));
+        // Nothing landed since: nothing to draw.
+        assert!(!app.projects_tick().await);
     }
 
     #[tokio::test]

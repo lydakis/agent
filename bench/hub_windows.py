@@ -45,6 +45,16 @@ def io(pid):
         return 0, 0
 
 
+def anon_mib(pid):
+    try:
+        for line in Path(f'/proc/{pid}/status').read_text().splitlines():
+            if line.startswith('RssAnon:'):
+                return int(line.split()[1]) / 1024
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    return 0.0
+
+
 def quantile(values, q):
     values = sorted(values)
     return values[min(len(values) - 1, int(round(q * (len(values) - 1))))]
@@ -204,6 +214,13 @@ def main():
         time.sleep(3)
         spell('closed_again')
         up('at the end')
+        # What each window holds of its own (heap and stack), apart from the
+        # binary's pages, which read higher for whichever file was written
+        # last.
+        anon = [anon_mib(p) for p in pids]
+        result['anon_mib'] = {'first': round(anon[0], 1),
+                              'others_mean': round(sum(anon[1:]) / max(1, len(anon) - 1), 1),
+                              'total': round(sum(anon), 1)}
         rss = [rss_mib(p) for p in pids]
         result['rss_mib'] = {'first': round(rss[0], 1), 'others_mean': round(sum(rss[1:]) / max(1, len(rss) - 1), 1),
                              'total': round(sum(rss), 1)}
