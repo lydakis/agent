@@ -1873,35 +1873,25 @@ mod tests {
             .call(|db| Ok(db.connection().execute_batch("CREATE TABLE b(x BLOB)")?))
             .await
             .unwrap();
-        // About 1,500 pages of WAL, in commits of 50.
-        for _ in 0..30 {
-            (store.call(|db| {
-                db.connection().execute_batch(
-                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<50)
-                    INSERT INTO b SELECT randomblob(4000) FROM n",
-                )?;
-                Ok(())
-            }))
-            .await
-            .unwrap();
-        }
+        // About 1,100 pages of WAL in one commit, which asks for a
+        // checkpoint with nothing appended after it.
+        (store.call(|db| {
+            db.connection().execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1100)
+                INSERT INTO b SELECT randomblob(4000) FROM n",
+            )?;
+            Ok(())
+        }))
+        .await
+        .unwrap();
         let checkpoints = || store.stats()["operations"]["checkpoint"]["count"].as_u64();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while checkpoints().is_none_or(|n| n == 0) {
             assert!(std::time::Instant::now() < deadline, "no checkpoint ran");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        // Asks made while one ran run after it; once none is left, all of
-        // the log is copied back, so the next commit starts it over and
-        // the log holds that commit alone.
-        let mut seen = checkpoints();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if checkpoints() == seen {
-                break;
-            }
-            seen = checkpoints();
-        }
+        // All of the log is copied back, so the next commit starts it over
+        // and the log holds that commit alone.
         (store.call(|db| Ok(db.connection().execute("INSERT INTO t VALUES (1)", [])?)))
             .await
             .unwrap();
@@ -1911,6 +1901,52 @@ mod tests {
             .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
             .unwrap();
         assert!(log < 10, "the WAL went on from {log} frames");
+    }
+
+    #[tokio::test]
+    async fn a_log_a_reader_holds_is_checkpointed_once_for_each_thousand_pages() {
+        let store = scratch_store("held-log").await;
+        store
+            .call(|db| Ok(db.connection().execute_batch("CREATE TABLE b(x BLOB)")?))
+            .await
+            .unwrap();
+        // A reader in a transaction from the start keeps every page it
+        // could read in the log, so the log never starts over.
+        let reader = Connection::open(scratch_path("held-log")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM b;")
+            .unwrap();
+        // About 3,500 pages of WAL, in commits of 10: asks at about
+        // 1,000, 2,000 and 3,000, and short of where the writer
+        // checkpoints itself.
+        for _ in 0..350 {
+            (store.call(|db| {
+                db.connection().execute_batch(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10)
+                    INSERT INTO b SELECT randomblob(4000) FROM n",
+                )?;
+                Ok(())
+            }))
+            .await
+            .unwrap();
+        }
+        let checkpoints = || {
+            store.stats()["operations"]["checkpoint"]["count"]
+                .as_u64()
+                .unwrap_or(0)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while checkpoints() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} checkpoints ran",
+                checkpoints()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(checkpoints(), 3);
+        reader.execute_batch("COMMIT").unwrap();
     }
 
     #[tokio::test]

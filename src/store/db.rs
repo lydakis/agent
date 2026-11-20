@@ -3794,11 +3794,14 @@ impl Database {
         })
     }
 
-    /// Ask `ask` for a checkpoint once a commit leaves the WAL at
-    /// [`CHECKPOINT_PAGES`] or more, in place of SQLite's own, which runs
-    /// the checkpoint on this connection right after the commit: two syncs
+    /// Ask `ask` for a checkpoint each time the WAL grows by
+    /// [`CHECKPOINT_PAGES`], in place of SQLite's own, which runs the
+    /// checkpoint on this connection right after the commit: two syncs
     /// under NORMAL, and every job queued behind that group would wait for
-    /// them. A [`Checkpointer`] on its own connection takes the ask.
+    /// them. A [`Checkpointer`] on its own connection takes the ask. While
+    /// a reader keeps the log from starting over, the commits after an ask
+    /// add little to copy back, so they ask nothing until the log has grown
+    /// as much again: as often as SQLite's own would have run.
     ///
     /// The WAL starts over only once a checkpoint has copied all of it
     /// back, and a checkpoint beside the writer never catches up while
@@ -3814,15 +3817,21 @@ impl Database {
         running: Arc<std::sync::Mutex<()>>,
         mut ask: impl FnMut() + Send + 'static,
     ) -> Result<()> {
+        // The log's pages at the last ask, or 0 once it started over.
+        let mut asked = 0;
         self.conn
             .wal_hook(Some(move |wal: &mut rusqlite::hooks::Wal, pages| {
+                if pages < asked {
+                    asked = 0;
+                }
                 if pages >= CHECKPOINT_MOST {
                     let _running = running.lock().unwrap_or_else(|e| e.into_inner());
                     // The commit has been made whatever this answers.
                     let _ = wal.checkpoint();
                 } else if pages >= CHECKPOINT_HELD {
                     let _ = wal.checkpoint();
-                } else if pages >= CHECKPOINT_PAGES {
+                } else if pages >= asked + CHECKPOINT_PAGES {
+                    asked = pages;
                     ask();
                 }
                 Ok(())
