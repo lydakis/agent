@@ -71,6 +71,7 @@ def main():
     parser.add_argument('--seconds', type=float, default=20)
     parser.add_argument('--opens', type=int, default=20)
     parser.add_argument('--out', required=True)
+    parser.add_argument('--trim', action='store_true', help="give the first window's freed heap back (gdb, glibc) before reading what it holds")
     args = parser.parse_args()
     agent, sonny = (str(Path(p).resolve()) for p in (args.agent, args.sonny))
     # Where the seed's agents work (`bench.projects_open` made them there).
@@ -221,6 +222,15 @@ def main():
         result['anon_mib'] = {'first': round(anon[0], 1),
                               'others_mean': round(sum(anon[1:]) / max(1, len(anon) - 1), 1),
                               'total': round(sum(anon), 1)}
+        if args.trim:
+            # What the first window holds once the allocator gives back
+            # what was freed: what it keeps, apart from what it let go.
+            subprocess.run(['gdb', '-p', str(pids[0]), '-batch', '-ex', 'call (int)malloc_trim(0)',
+                            '-ex', f'call (int)malloc_info(0, (void*)fopen("{args.out}.malloc.xml", "w"))',
+                            '-ex', 'call (int)fflush(0)'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            result['anon_mib']['first_trimmed'] = round(anon_mib(pids[0]), 1)
+            result['first_fds'] = len(os.listdir(f'/proc/{pids[0]}/fd'))
         rss = [rss_mib(p) for p in pids]
         result['rss_mib'] = {'first': round(rss[0], 1), 'others_mean': round(sum(rss[1:]) / max(1, len(rss) - 1), 1),
                              'total': round(sum(rss), 1)}

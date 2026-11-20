@@ -1123,7 +1123,7 @@ const EVERY_PROJECT: &str = "*.*";
 async fn read_projects(
     client: &Client,
     store: &std::path::Path,
-    listed: &[standing::Agent],
+    listed: &[Arc<standing::Agent>],
     bot: &str,
     asks: &[asks::Ask],
     approvals: &[Value],
@@ -1146,7 +1146,7 @@ async fn read_projects(
             }
         }
     }
-    let leads: Vec<&standing::Agent> = (listed.iter())
+    let leads: Vec<&standing::Agent> = (listed.iter().map(|bot| &**bot))
         .filter(|bot| {
             project::is_lead(&bot.name)
                 && bot.maker().is_empty()
@@ -1173,7 +1173,7 @@ async fn read_projects(
         under
             .entry(lead_of(&bot.name, &makers))
             .or_default()
-            .push(bot.clone());
+            .push((**bot).clone());
     }
     for lead in leads {
         let Some(name) = project::lead_project(&lead.name) else {
@@ -29011,18 +29011,20 @@ mod tests {
         let home = std::env::temp_dir().join(unique("projects-kept"));
         let store = home.join("state.sqlite");
         std::fs::create_dir_all(&home).unwrap();
-        let agent = |name: &str, id: i64, maker: Option<&str>| standing::Agent {
-            name: name.into(),
-            bot_id: Some(id),
-            head: Some(1),
-            created_by: maker.map(str::to_owned),
-            workspace: Some(home.to_string_lossy().into_owned()),
-            last: Some(standing::Ended {
-                turn: 1,
-                status: "completed".into(),
+        let agent = |name: &str, id: i64, maker: Option<&str>| {
+            Arc::new(standing::Agent {
+                name: name.into(),
+                bot_id: Some(id),
+                head: Some(1),
+                created_by: maker.map(str::to_owned),
+                workspace: Some(home.to_string_lossy().into_owned()),
+                last: Some(standing::Ended {
+                    turn: 1,
+                    status: "completed".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
+            })
         };
         let mut listed = vec![
             agent("alpha.lead", 1, None),
@@ -29036,7 +29038,7 @@ mod tests {
             client: &Client,
             store: &std::path::Path,
             asked: &std::sync::Mutex<Vec<String>>,
-            listed: &[standing::Agent],
+            listed: &[Arc<standing::Agent>],
             waiting: &[&str],
             state: &mut ProjectsState,
         ) -> Vec<String> {
@@ -29073,7 +29075,7 @@ mod tests {
         assert_eq!(marks(&state)[1], before[1]);
         // A task moved: its project alone is counted again.
         let before = marks(&state);
-        listed[3].head = Some(2);
+        Arc::make_mut(&mut listed[3]).head = Some(2);
         page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
         assert_eq!(marks(&state)[0], before[0]);
         assert_ne!(marks(&state)[1], before[1]);

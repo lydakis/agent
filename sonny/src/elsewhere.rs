@@ -103,7 +103,9 @@ pub struct Rows {
     pub version: u64,
     /// Whether every row is in: a listing was told since the follow began.
     pub whole: bool,
-    pub agents: BTreeMap<String, standing::Agent>,
+    /// Shared with the change that told each and the reads counted from
+    /// them: a row is copied once, as it comes.
+    pub agents: BTreeMap<String, Arc<standing::Agent>>,
 }
 
 /// A change of [`Rows`], as told to the windows: every row (`all`), or
@@ -113,7 +115,7 @@ pub struct Rows {
 struct Moved {
     version: u64,
     all: bool,
-    set: Vec<standing::Agent>,
+    set: Vec<Arc<standing::Agent>>,
     gone: Vec<String>,
 }
 
@@ -492,7 +494,7 @@ async fn follow_rows(socket: &Path, book: &Book) {
                 if let Some(snapshot) = changes.snapshot {
                     book.tell(Moved {
                         all: true,
-                        set: snapshot,
+                        set: snapshot.into_iter().map(Arc::new).collect(),
                         ..Default::default()
                     });
                 }
@@ -507,7 +509,7 @@ async fn follow_rows(socket: &Path, book: &Book) {
                         .filter(|name| !set.iter().any(|row| row.name == *name))
                         .collect();
                     book.tell(Moved {
-                        set,
+                        set: set.into_iter().map(Arc::new).collect(),
                         gone,
                         ..Default::default()
                     });
