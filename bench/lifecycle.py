@@ -50,6 +50,14 @@ def read_items(client, engine, bot, page):
         assert client.request('entry', bot=bot, entry=entry['id'])['result']['entry'] == entry
 
 
+def durability_of(engine, ready):
+    """The durability the target says it has as it starts: Agent names it in
+    `ready`, the Pi Durable adapter names its SQLite setting."""
+    if engine == 'pi-durable':
+        return 'sqlite_full' if ready.get('synchronous') == 'full' else 'sqlite_wal_synchronous_normal'
+    return ready.get('durability')
+
+
 def run_once(binary, directory, config, mode, toolset, transport='stdio', memory_detail=False,
              engine='rust', synchronous='full'):
     if engine != 'rust' and transport != 'stdio':
@@ -66,6 +74,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
     done = threading.Event()
     started, observer_cpu = time.monotonic(), time.process_time()
     phase, sample_work = 'startup', 0
+    durability = None
 
     def measure():
         nonlocal sample_work
@@ -123,6 +132,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
             trees.append(Tree(client.process.pid))
             return client
         client = connect()
+        durability = durability_of(engine, client.ready)
         sampler = threading.Thread(target=measure, daemon=True)
         sampler.start()
         time.sleep(.45)
@@ -219,6 +229,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
                   quality_warnings=['sampler exceeded 10% of wall time'] if sample_work/(time.monotonic()-started)>.1 else [])
     if stats['peak_active_requests'] < config['concurrency']:
         result['quality_warnings'].append('configured provider concurrency not achieved')
+    result['durability'] = durability
     return result
 
 
@@ -233,8 +244,9 @@ def main():
     parser.add_argument('--transport', choices=('stdio', 'socket'), default='stdio')
     parser.add_argument('--memory-detail', action='store_true', help='sample PSS/USS where supported; adds observer overhead')
     parser.add_argument('--engine', choices=('rust', 'pi-durable'), default='rust')
-    parser.add_argument('--synchronous', choices=('full', 'normal'), default='full',
-                        help="Pi Durable's SQLite synchronous setting; Agent always uses FULL")
+    parser.add_argument('--synchronous', choices=('full', 'normal'),
+                        help="Pi Durable's SQLite synchronous setting (default full); Agent's is "
+                             "the one its binary names as it starts")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     out = args.out.resolve()
@@ -242,8 +254,9 @@ def main():
         parser.error('run from repository root with a new output under .local')
     if args.mode == 'shell' and 'shell' not in args.tools.split(','):
         parser.error('shell workload requires the shell tool')
-    if args.engine == 'rust' and args.synchronous != 'full':
-        parser.error('Agent has one durability setting, synchronous=FULL')
+    if args.engine == 'rust' and args.synchronous:
+        parser.error("Agent's durability is the one its binary names as it starts")
+    args.synchronous = args.synchronous or 'full'
     if args.engine != 'rust' and args.transport != 'stdio':
         parser.error('only Agent has a socket transport')
     try:
@@ -257,16 +270,18 @@ def main():
     sources = {str(p.relative_to(root)):file_hash(p) for p in sorted((root/'bench').glob('*.py'))}
     sources['bench/adapters/pi-durable.mjs'] = file_hash(PI_DURABLE_ADAPTER)
     battery = psutil.sensors_battery()
-    durability = 'sqlite_full' if args.synchronous == 'full' else 'sqlite_wal_synchronous_normal'
-    record = dict(schema='lifecycle_v3',engine=args.engine,durability=durability,**target,
+    def contract(durability):
+        return (f'{durability}; '
+                + ('exact resume; committed transcript re-read, no event replay' if args.engine == 'pi-durable'
+                   else 'exact resume/replay')
+                + '; historical completed fork; no repeated tools')
+    # What the target says as it starts, set from its first run.
+    record = dict(schema='lifecycle_v3',engine=args.engine,durability=None,**target,
                   created_at=datetime.now(timezone.utc).isoformat(),
                   observer_sha256=digest(sources),workload=config,toolset=args.tools,mode=args.mode,
                   transport=args.transport,followers_per_bot=1 if args.transport == 'socket' else 0,
                   memory_detail=args.memory_detail,
-                  contract=f'{durability}; '
-                           + ('exact resume; committed transcript re-read, no event replay' if args.engine == 'pi-durable'
-                              else 'exact resume/replay')
-                           + '; historical completed fork; no repeated tools',
+                  contract=None,
                   host=dict(system=platform.system(),architecture=platform.machine(),host_id=digest(platform.node()),
                             python=platform.python_version(),psutil=psutil.__version__,external_power=battery.power_plugged if battery else None),
                   sampling=dict(idle_seconds=.45,interval_seconds=.2,group_discovery_seconds=.5,timeout_seconds=30,rss_limit_mib=512,process_limit=process_limit(config, args.mode)),runs=[])
@@ -276,6 +291,8 @@ def main():
         run = run_once(args.binary.resolve(),directory,config,args.mode,args.tools,args.transport,args.memory_detail,
                        args.engine,args.synchronous)
         run['warmup'] = index == 0
+        if record['durability'] is None and run['durability']:
+            record.update(durability=run['durability'], contract=contract(run['durability']))
         record['runs'].append(run)
         (out/'result.json').write_text(json.dumps(record,indent=2))
         print(f'run {index}: {run["status"]}',flush=True)

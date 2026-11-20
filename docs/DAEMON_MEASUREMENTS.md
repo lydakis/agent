@@ -12530,3 +12530,67 @@ Other Rust projects, read 2026-11-19 at the revisions below:
 - **Zed** uses mimalloc only behind an optional `mimalloc` feature
   (zed-industries/zed `4e161e7`, `crates/zed/src/main.rs` and
   `crates/zed/Cargo.toml`).
+
+## Checkpoints beside the writer, reads beside the loop (#1243)
+
+2026-11-20, Linux x86_64 cloud VM, 4 CPUs. Main is the merge base, `bc256a7`;
+both sides run FULL durability. The final change
+queues each checkpoint on the reader pool; the both-ends and slow-disk
+rounds below ran an earlier revision that checkpointed on a thread of its
+own, and the rows marked "final" were measured again on the final
+revision. Busy-disk rounds preload `bench/held/slow_sync.c` so every sync
+takes 300 ms or 1 s.
+
+### Matched screen (perf gate's benches, alternating, five rounds; final)
+
+| Bench | Measure | Main | Change |
+| --- | --- | ---: | ---: |
+| lifecycle, 32-bot socket echo | CPU, s | 0.71 (0.62 to 0.82) | 0.79 (0.69 to 0.85) |
+| lifecycle | p95 turn, ms | 592 | 589 |
+| lifecycle | peak RSS, MiB | 26.9 | 27.0 |
+| completion_burst | release to terminal p99, ms | 14.0 (11.0 to 17.5) | 15.7 (11.8 to 25.5) |
+| admission_burst | lone submit CPU, ms | 46.4 (35.5 to 53.0) | 48.8 (38.7 to 57.1) |
+| footprint | idle RSS, MiB | 17.6 | 17.4 |
+| footprint | per idle bot, KiB | 1.77 | 1.65 |
+| footprint | RSS after a turn each, MiB | 33.2 | 32.1 |
+| footprint | CPU per turn, ms | 1.14 | 1.12 |
+| footprint, static musl build | idle / after 1,000 bots / after a turn each, MiB | 14.03 / 16.35 / 29.6 | 13.59 / 16.24 / 29.7 |
+
+Every timing range overlaps main's. The first revision's own checkpoint
+thread read +0.1 MiB idle and +1.3 MiB after a turn each in the musl
+build (its allocator arena and the connection it opened for each
+checkpoint); running them on the readers took that back.
+
+### Both ends (static musl builds; medians)
+
+| Shape | Measure | Main | Change |
+| --- | --- | ---: | ---: |
+| 1 window, 10 agents (final, 5 rounds) | daemon RSS idle, MiB | 18.8 | 18.6 |
+| | turn p50 / p99, ms | 48.6 / 54.0 | 48.9 / 57.3 |
+| 32 windows, 10k agents (4 rounds; final 2) | loop held by `wait`, ms | 517 (final 745) | 14 (final 17) |
+| | daemon CPU, % / PSS, MiB | 118 / 29.3 (final 137 / 29.7) | 118 / 29.9 (final 137 / 29.9) |
+| 100 windows (7 rounds) | loop held by `wait`, ms | 668 | 15 |
+| | window open p50, ms | 3,790 | 3,830 |
+| | daemon CPU, % / PSS, MiB | 131 / 31.4 | 133 / 31.7 |
+| 200 windows (2 rounds) | loop held by `wait`, ms | 1,603 | 13 |
+| | daemon CPU, % / PSS, MiB | 155 / 36.4 | 153 / 36.7 |
+
+Two 100-window change rounds right after a container restart opened every
+window at 17 to 19 s and are in the range above; the five after them
+matched main's.
+
+### Busy disk (424 stored agents, 30 busy, 5 gated)
+
+| Disk | Measure | Main | Change |
+| --- | --- | ---: | ---: |
+| plain (3 rounds) | turns finished in 20 s | 7,348 | 7,709 |
+| every sync 300 ms (3 rounds; final 2) | turns finished | 244 (final 254) | 282 (final 285) |
+| | call taken p99, ms | 613 (final 912) | 609 (final 610) |
+| every sync 300 ms, 120 s | turns finished / scripts | 1,466 / 48 | 1,753 / 57 |
+| | call taken p99, ms | 1,523 | 912 |
+| every sync 300 ms, 100 windows (2 rounds) | loop held by `wait`, ms | 216 | 1 |
+| every sync 1 s | | fails | fails |
+
+At 1 s a sync, FULL commits on both sides wait 2 s each and the busy bots
+time out; the durability setting that follows this change measures what
+NORMAL does there.

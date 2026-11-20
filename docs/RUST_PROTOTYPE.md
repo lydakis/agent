@@ -1671,7 +1671,8 @@ does not, and each is one op:
   `size_bounds` (up to 1, 2, 4, 8, 16 and 32 jobs), and a latency histogram
   of each group's oldest job from queueing to its answer, with the slowest.
   A job whose group could not begin counts its whole wait as queued and
-  zero as ran. `agent stats [--pretty]`. Store sizes use the canonical
+  zero as ran. `agent stats [--pretty]`. `checkpoints` says what the WAL's last
+checkpoint found (see Durable state and recovery). Store sizes use the canonical
   database path established at open, including when the caller used a
   symlink. The counters cost three clock reads per job, three per group, and
   one short lock per group (per job on the reader), taken just before the
@@ -2325,7 +2326,29 @@ WAL/database write ordering at checkpoints. This protects database consistency,
 but does not make subsequent commits durable across an OS crash or power loss.
 Workspace writes have their own durability behavior and need not be lost
 together with the corresponding store records. Other platforms ignore both
-full-flush settings. The writer sets
+full-flush settings.
+
+Checkpoints run beside the writer, not in a commit. SQLite's own automatic
+checkpoint runs on the connection that committed, right after the commit,
+with two syncs every job queued behind that group waits for. Instead the
+writer queues a checkpoint (PASSIVE) on the reader pool each time the log
+grows by 1,000 pages, SQLite's own default; the next free reader runs it
+on its own connection, so no thread or connection is kept for it. The log starts over only once a checkpoint has copied all of it
+back, which one beside a busy writer may never do, so past 4,000 pages the
+writer checkpoints itself, as SQLite would have, and the next commit starts
+the log over; turned away while a reader's runs, it asks for another.
+Past 64,000 pages it first waits out the reader's checkpoint. That is
+pressure, not a bound: a reader keeps every frame after its snapshot in
+the log, however long it grows. A checkpoint that copies nothing new while
+frames are left found the log pinned by such a reader, and none gets
+further until it moves on, so the asks and the writer's own tries then
+wait for twice the growth each time, back to every 1,000 pages once one
+moves. `stats` reports `checkpoints`: `log_frames` and `copied_frames` at
+the last checkpoint, and how many found the log `pinned`; the readers'
+checkpoints are the `checkpoint` operation and the writer's own
+`writer_checkpoint`, each with its time.
+
+The writer sets
 `temp_store=MEMORY`: a job's savepoint journal (the pages it changed, kept so
 it can roll back alone) stays in memory and is freed when the job ends,
 instead of spilling past 64 KiB to a temporary file. Without it every

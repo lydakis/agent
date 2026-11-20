@@ -2708,6 +2708,59 @@ const STATEMENTS: usize = 256;
 /// Well above what a checkpoint every 1,000 pages leaves, so a steady log
 /// is never cut.
 const WAL_KEPT: i64 = 16 * 1024 * 1024;
+/// The WAL pages after a commit that ask for a checkpoint: SQLite's own
+/// default for its automatic checkpoint, about 4 MiB.
+pub const CHECKPOINT_PAGES: std::os::raw::c_int = 1000;
+/// The WAL pages after a commit past which the writer checkpoints itself,
+/// as [`Database::checkpoint_aside`] says: about the 16 MiB a log is cut
+/// back to.
+pub const CHECKPOINT_HELD: std::os::raw::c_int = 4 * CHECKPOINT_PAGES;
+/// The WAL pages after a commit past which the writer first waits out a
+/// checkpoint a reader is running, so its own is not turned away:
+/// about 256 MiB. Pressure, not a bound: a reader that keeps its snapshot
+/// keeps every frame after it in the log, however long the log grows.
+pub const CHECKPOINT_PRESSED: std::os::raw::c_int = 64 * CHECKPOINT_PAGES;
+/// What the log's checkpoints found, the writer's and the readers':
+/// the frames in the log and those copied back at the last one, and how
+/// many copied nothing new while frames were left, because a reader still
+/// reads a snapshot they come after.
+#[derive(Default)]
+pub struct LogState {
+    log: std::sync::atomic::AtomicI64,
+    copied: std::sync::atomic::AtomicI64,
+    pinned: std::sync::atomic::AtomicBool,
+    pinned_count: std::sync::atomic::AtomicU64,
+}
+impl LogState {
+    /// Note what a checkpoint found, answering whether it moved: copied
+    /// frames it had not, finished the log, or found it started over.
+    pub fn note(&self, log: i64, copied: i64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let was_log = self.log.swap(log, Relaxed);
+        let was_copied = self.copied.swap(copied, Relaxed);
+        let moved = copied >= log || copied > was_copied || log < was_log;
+        self.pinned.store(!moved, Relaxed);
+        if !moved {
+            self.pinned_count.fetch_add(1, Relaxed);
+        }
+        moved
+    }
+    /// The log started over: nothing is pinned in it.
+    fn started_over(&self) {
+        self.pinned
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// The last checkpoint copied nothing new while frames were left.
+    pub fn pinned(&self) -> bool {
+        self.pinned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// For `stats`.
+    pub fn json(&self) -> Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        json!({"log_frames": self.log.load(Relaxed), "copied_frames": self.copied.load(Relaxed),
+            "pinned": self.pinned_count.load(Relaxed)})
+    }
+}
 /// Plans that don't depend on bound values: SQLite's query planner
 /// stability guarantee. The store never runs ANALYZE, so no statistics
 /// could make a plan better for one value than another. Without it, SQLite
@@ -3720,14 +3773,16 @@ impl Database {
 
     /// A second connection that only reads. The writer owns the file, its
     /// lock, migration, and recovery; this one sees a job's writes once that
-    /// job is answered and never takes the write lock. It can still run the
-    /// checkpoint SQLite makes when the last connection closes, so it syncs
-    /// checkpoints the way the writer does.
+    /// job is answered and never takes the write lock. It runs the
+    /// checkpoints the writer asks for, and the one SQLite makes when the
+    /// last connection closes, so it syncs checkpoints the way the writer
+    /// does.
     pub fn reader(conn: Connection, shared: Arc<Shared>) -> Result<Self> {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
         conn.execute_batch(&format!(
-            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;
+            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA synchronous=FULL;
+            PRAGMA checkpoint_fullfsync=ON;
             PRAGMA journal_size_limit={WAL_KEPT};"
         ))?;
         Ok(Self {
@@ -3750,6 +3805,127 @@ impl Database {
             calls_ended: Vec::new(),
             call_ends: None,
         })
+    }
+
+    /// Checkpoint the WAL as far as the other readers allow, as SQLite's
+    /// automatic checkpoint does (PASSIVE), answering the frames in the log
+    /// and those copied back; both -1 when the writer's own checkpoint
+    /// holds the log. On a reader connection, which syncs the WAL before
+    /// its pages are copied back and the database after, flushing the
+    /// drive on macOS, as the writer's own checkpoint did. It reads no
+    /// page through the reader's cache.
+    pub fn checkpoint(&self) -> Result<(i64, i64)> {
+        let (mut log, mut copied) = (0, 0);
+        // SAFETY: the handle is this live connection's, used on its own
+        // thread, and the outputs are locals that outlive the call.
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_wal_checkpoint_v2(
+                self.conn.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_CHECKPOINT_PASSIVE,
+                &mut log,
+                &mut copied,
+            )
+        };
+        match code {
+            rusqlite::ffi::SQLITE_OK => Ok((log.into(), copied.into())),
+            rusqlite::ffi::SQLITE_BUSY => Ok((-1, -1)),
+            code => {
+                Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into())
+            }
+        }
+    }
+
+    /// Ask `ask` for a checkpoint each time the WAL grows by
+    /// [`CHECKPOINT_PAGES`], in place of SQLite's own, which runs the
+    /// checkpoint on this connection right after the commit: two syncs,
+    /// and every job queued behind that group would wait for them. A
+    /// reader connection takes the ask ([`Database::checkpoint`]). While a reader
+    /// keeps the log from starting over, the commits after an ask add
+    /// little to copy back, so they ask nothing until the log has grown as
+    /// much again: as often as SQLite's own would have run.
+    ///
+    /// The WAL starts over only once a checkpoint has copied all of it
+    /// back, and a checkpoint beside the writer never catches up while
+    /// commits keep coming faster than it syncs. Past [`CHECKPOINT_HELD`]
+    /// pages the writer checkpoints itself, as SQLite would have: nothing
+    /// is appended meanwhile, so it copies back the whole log and the next
+    /// commit starts it over. While a reader's runs that is turned
+    /// away, so it asks for another and the next commit
+    /// tries again; past [`CHECKPOINT_PRESSED`] the writer first waits out
+    /// the checkpoint `running` holds. `own` is told how long each of the
+    /// writer's own checkpoints took, and whether it failed.
+    ///
+    /// Every checkpoint is noted in `log`. One that copied nothing new
+    /// while frames were left found the log pinned by a reader, and no
+    /// checkpoint gets further until that reader moves on: the asks and
+    /// the writer's own tries then wait for twice the growth each time,
+    /// and go back to every [`CHECKPOINT_PAGES`] once one moves.
+    pub fn checkpoint_aside(
+        &mut self,
+        running: Arc<std::sync::Mutex<()>>,
+        log: Arc<LogState>,
+        mut ask: impl FnMut() + Send + 'static,
+        mut own: impl FnMut(std::time::Instant, bool) + Send + 'static,
+    ) -> Result<()> {
+        // The log's pages after the last commit; at the last ask, and the
+        // growth before the next; the writer's next try, and the growth
+        // after it.
+        let mut last: std::os::raw::c_int = 0;
+        let (mut asked, mut ask_step): (std::os::raw::c_int, _) = (0, CHECKPOINT_PAGES);
+        let (mut own_at, mut own_step) = (CHECKPOINT_HELD, CHECKPOINT_PAGES);
+        self.conn
+            .wal_hook(Some(move |wal: &mut rusqlite::hooks::Wal, pages| {
+                if pages < last {
+                    (asked, ask_step) = (0, CHECKPOINT_PAGES);
+                    (own_at, own_step) = (CHECKPOINT_HELD, CHECKPOINT_PAGES);
+                    log.started_over();
+                }
+                last = pages;
+                if pages >= own_at {
+                    let _running = (pages >= CHECKPOINT_PRESSED)
+                        .then(|| running.lock().unwrap_or_else(|e| e.into_inner()));
+                    let started = std::time::Instant::now();
+                    // The commit has been made whatever this answers.
+                    match wal.checkpoint_v2(rusqlite::wal::CheckpointMode::PASSIVE) {
+                        Ok((frames, copied)) => {
+                            own(started, false);
+                            own_step = if log.note(frames.into(), copied.into()) {
+                                CHECKPOINT_PAGES
+                            } else {
+                                own_step.saturating_mul(2)
+                            };
+                            own_at = pages.saturating_add(own_step);
+                        }
+                        // A reader's is running: ask for another once
+                        // it is done, so on a disk slower than the commits
+                        // it keeps checkpointing and the writer seldom
+                        // syncs. Not while the log is pinned, where it
+                        // would copy nothing.
+                        Err(rusqlite::Error::SqliteFailure(e, _))
+                            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+                        {
+                            if !log.pinned() {
+                                ask();
+                            }
+                        }
+                        Err(_) => {
+                            own(started, true);
+                            own_at = pages.saturating_add(own_step);
+                        }
+                    }
+                } else if pages >= asked.saturating_add(ask_step) {
+                    ask_step = if log.pinned() {
+                        ask_step.saturating_mul(2)
+                    } else {
+                        CHECKPOINT_PAGES
+                    };
+                    asked = pages;
+                    ask();
+                }
+                Ok(())
+            }))?;
+        Ok(())
     }
 
     /// Set this connection's page cache to `kib`, as a reader's share of
