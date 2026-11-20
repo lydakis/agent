@@ -1784,6 +1784,25 @@ class SwitchFamilyTests(unittest.TestCase):
         self.assertNotIn('reply:fourth', json.dumps(items))
         self.assert_all_freed(client, path, 'Bob')
 
+    def test_a_fork_in_the_translated_history_keeps_the_summary_made_before_it(self):
+        client, openai, anthropic, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        client.request('configure', bot='Bob', compaction_instructions='Summarize.')
+        for n, prompt in enumerate(('tool:first', 'second', 'third')):
+            self.run_turn(client, str(n), prompt)
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.run_turn(client, '3', 'fourth')
+        client.request('configure', bot='Bob', model='anthropic/synthetic-claude', effort='low')
+        record = client.request('inspect', bot='Bob')['result']
+        summary, head = record['compaction'], record['head']
+        # The summary sits where the copy of the node it was made at is, so
+        # a fork there keeps it rather than reading the family Bob left.
+        self.assertLess(summary, head)
+        fork = client.request('fork', source='Bob', bot='Copy', checkpoint=summary, workspace=str(path))
+        self.assertIn('result', fork, fork)
+        self.assertEqual(client.request('inspect', bot='Copy')['result']['compaction'], summary)
+        self.assert_all_freed(client, path, 'Bob', 'Copy')
+
     def test_turns_the_window_let_go_cross_for_the_first_summary(self):
         # No summary yet, and the window has let the first turns go: the
         # first summary on the new side reads from the first node, so all

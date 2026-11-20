@@ -4986,7 +4986,11 @@ impl Database {
                     "family_start": written.first_new,
                     "compaction": match (bot.compaction, compaction) {
                         (Some(version), Some((cut, pinned))) => {
-                            let at = written.head.ok_or(Error::new("storage_error"))?;
+                            // Made where the copy of the node it was made at
+                            // is, so a fork from there on keeps it.
+                            let at = (written.last.get(&version).copied().flatten())
+                                .or(written.head)
+                                .ok_or(Error::new("storage_error"))?;
                             let (summary, prompts, covered_from, covered_to): (String, String, i64, i64) = tx
                                 .prepare_cached(
                                     "SELECT summary,prompts,covered_from,covered_to FROM compactions WHERE node=?",
@@ -15890,6 +15894,17 @@ impl Database {
                     break;
                 }
                 version = previous;
+            }
+            // With no summary that applies, a summary would read what is
+            // older than the branch, which is in the family the source left.
+            if version.is_none() && family_root.is_some() {
+                return fail_with(
+                    "fork_before_switch",
+                    format!(
+                        "{source} switched to {} with a summary made after that point",
+                        parent.family
+                    ),
+                );
             }
             // Its family's items start where its source's do, and a window
             // with no start of its own starts no older.
