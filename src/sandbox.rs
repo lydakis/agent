@@ -3923,9 +3923,13 @@ mod tests {
             let script = "cd \"$1\" && { mv theirs gone || true; } && { mv mine gone || true; } \
                 && { echo x > mine/commondir || true; } && echo ok > mine/HEAD";
             let folder = worktrees.to_str().unwrap();
-            let (mut sandboxed, _ended) =
+            let (mut sandboxed, ended) =
                 command(&policy, "sh", &["-c", script, "sh", folder], false).unwrap();
+            let mut held = hold(&policy).await;
             let status = sandboxed.current_dir(&mine).status().await.unwrap();
+            drop(sandboxed);
+            held.waits_for(ended);
+            held.release();
             assert!(status.success(), "its own worktree's HEAD is its to write");
             assert!(
                 worktrees.join("theirs/commondir").exists(),
@@ -4112,16 +4116,33 @@ mod tests {
         let mut policy = Policy::new(Some(Mode::WorkspaceWrite), Some(&work), &[], true, &daemon)
             .unwrap()
             .unwrap();
-        let sandboxed = |policy: &Policy, program: &str, args: &[&str]| {
-            let (mut command, _ended) = command(policy, program, args, false).unwrap();
-            command
-                .current_dir(&work)
-                .env("GIT_SSH_COMMAND", &ssh_command)
+        // Run as the daemon runs one: its placeholders held first, so no
+        // other test's sandbox, letting the same ones go, holds their
+        // lock to remove them while bubblewrap's init takes its own.
+        async fn sandboxed(
+            policy: &Policy,
+            work: &Path,
+            ssh_command: &str,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<std::process::Output> {
+            let (mut command, ended) = command(policy, program, args, false).unwrap();
+            let mut held = hold(policy).await;
+            let output = command
+                .current_dir(work)
+                .env("GIT_SSH_COMMAND", ssh_command)
                 .output()
-        };
+                .await;
+            drop(command);
+            held.waits_for(ended);
+            held.release();
+            output
+        }
         let push = ["push", "-q", "origin", "HEAD:main"];
         // As it was: ssh, with no master open, can't make its socket.
-        let refused = sandboxed(&policy, "git", &push).await.unwrap();
+        let refused = sandboxed(&policy, &work, &ssh_command, "git", &push)
+            .await
+            .unwrap();
         let said = String::from_utf8_lossy(&refused.stderr).into_owned();
         assert!(!refused.status.success(), "pushed without the copy");
         assert!(said.contains("Read-only file system"), "{said}");
@@ -4133,7 +4154,9 @@ mod tests {
             &copy
         ));
         policy.owned.push((copy, ssh.join("config")));
-        let pushed = sandboxed(&policy, "git", &push).await.unwrap();
+        let pushed = sandboxed(&policy, &work, &ssh_command, "git", &push)
+            .await
+            .unwrap();
         assert!(
             pushed.status.success(),
             "{}",
@@ -4154,7 +4177,9 @@ mod tests {
             "echo",
             "reached",
         ];
-        let reached = sandboxed(&policy, "ssh", &plain).await.unwrap();
+        let reached = sandboxed(&policy, &work, &ssh_command, "ssh", &plain)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&reached.stdout), "reached\n");
         // A master the person opened, outside any sandbox, is joined.
         run(
@@ -4170,7 +4195,9 @@ mod tests {
         );
         let mut verbose = vec!["-v"];
         verbose.extend(plain);
-        let joined = sandboxed(&policy, "ssh", &verbose).await.unwrap();
+        let joined = sandboxed(&policy, &work, &ssh_command, "ssh", &verbose)
+            .await
+            .unwrap();
         let said = String::from_utf8_lossy(&joined.stderr).into_owned();
         assert!(joined.status.success(), "{said}");
         assert!(said.contains("mux_client_request_session"), "{said}");
