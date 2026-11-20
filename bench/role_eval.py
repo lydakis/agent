@@ -362,8 +362,11 @@ LIVE = [
 # an empty reply, which the lookout drops, so the lead hears nothing of it
 # (task.md). Every two minutes, not every fifteen, so a run sees a few.
 QUIET = [
+    # Says nothing of when to speak: told "only when they fail", the lead
+    # wrote "end passing runs empty" into the task's brief, and that, not
+    # task.md, kept the runs quiet (Sol, 11-20).
     {'say': "I'm in meetings for a while. Start a task that runs the tests every two minutes, with an "
-            "automation of its own, and tells you only when they fail.",
+            "automation of its own.",
      'plant': 'Z1 Z2 a task watches with its own automation; the tests pass, so no run finds anything'},
     {'gap': 6 * 60},  # the automation fires a few times, finding nothing
     {'say': "Back. Anything I need to know? You can take the test check off now.",
@@ -1172,16 +1175,14 @@ def automation_notes(parts, out):
 
 
 def titles(parts, out):
-    """Each task's title as the lead set it with `start_task`, its brief's
-    first line, beside its name, for T1: whether a title reads as work the
-    person would know."""
+    """Each task's title as the lead set it with `start_task`, beside its
+    name, for T1: whether a title reads as work the person would know."""
     lines = []
     for p in parts:
         for c in p['calls']:
             given = c['input'] if isinstance(c['input'], dict) else {}
-            if c['name'] == 'start_task' or ('name' in given and 'brief' in given):
-                first = next((line.strip() for line in str(given.get('brief', '')).splitlines() if line.strip()), '')
-                lines.append(f"- {given.get('name', '?')}: {first or '(no title)'}")
+            if c['name'] == 'start_task' or ('title' in given and 'brief' in given):
+                lines.append(f"- {given.get('name', '?')}: {given.get('title') or '(no title)'}")
     (out / 'titles.md').write_text('\n'.join(lines) + '\n' if lines else '(no task started)\n')
 
 

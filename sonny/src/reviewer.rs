@@ -44,10 +44,16 @@ pub struct Settings {
     /// `[reviewer] timeout_ms`: how long a round may wait for its verdict,
     /// every attempt included; unset, Codex's 90 s; 0, as long as it takes.
     pub timeout_ms: Option<u64>,
+    /// `[context_windows]`: the windows the person says models have, the
+    /// judge's among them.
+    pub windows: std::collections::BTreeMap<String, u64>,
 }
 
 /// The lease a tag is served under, renewed well inside it.
 const LEASE_MS: u64 = 5_000;
+/// How long the reviewer waits for the providers' listings, which give
+/// its judge's window, as `sonny acp` waits for them.
+const LISTING: Duration = Duration::from_secs(5);
 const RENEW: Duration = Duration::from_secs(1);
 /// Requests in flight at the daemon at once. Rounds past these queue for
 /// room one request at a time, never for a whole round, so a slow judge
@@ -132,6 +138,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), String> {
         effort: effort.or(config.reviewer.effort),
         note,
         timeout_ms: config.reviewer.timeout_ms,
+        windows: config.context_windows,
     };
     main(settings).map(drop).map_err(|error| {
         serde_json::json!({"error": error.code, "detail": error.detail}).to_string()
@@ -217,6 +224,9 @@ struct Judge {
     /// How long a round may wait for its verdict, from its announcement;
     /// 0 for as long as it takes.
     deadline_ms: u64,
+    /// What the state may take, in bytes, for the judge model's window
+    /// ([`policy::state_bytes`]).
+    budget: usize,
 }
 
 impl Judge {
@@ -299,6 +309,23 @@ async fn serve(settings: Settings) -> Result<i32> {
             &format!("a reviewer's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
         ));
     }
+    // The judge's input is sized to its model's own window, as Codex's
+    // guardian sizes its reviewer's: the window the daemon gives it, from
+    // the person's windows, its provider's listing, or the daemon's
+    // default. A listing not given in time is the default's. Read before
+    // the tag's lease is taken, which a slow listing would let lapse;
+    // none is asked for when the person's windows name the judge's.
+    let named_by_person =
+        (settings.windows.keys()).any(|pattern| agent_client::config::matches(pattern, &named));
+    let listing = match named_by_person {
+        true => Value::Null,
+        false => tokio::time::timeout(LISTING, client.request("provider_models", json!({})))
+            .await
+            .ok()
+            .and_then(|listed| listed.ok())
+            .unwrap_or_default(),
+    };
+    let window = agent_client::models::window(&settings.windows, &listing, &named);
     let served = client
         .request(
             "serve_approvals",
@@ -313,6 +340,10 @@ async fn serve(settings: Settings) -> Result<i32> {
     // as Codex's guardian does: the daemon refuses the sandbox where none
     // runs.
     let name = base_name(&tag);
+    let windows = match settings.windows.is_empty() {
+        true => Value::Null,
+        false => json!(settings.windows),
+    };
     let make = |tools: &'static [&'static str]| {
         judge::Base::make(
             &client,
@@ -321,6 +352,7 @@ async fn serve(settings: Settings) -> Result<i32> {
             settings.effort.as_deref(),
             policy::JUDGE_INSTRUCTIONS,
             tools,
+            &windows,
         )
     };
     let base = match make(&judge::LOOKING).await {
@@ -333,6 +365,7 @@ async fn serve(settings: Settings) -> Result<i32> {
         judge: Judge {
             base,
             deadline_ms: settings.timeout_ms.unwrap_or(policy::DEADLINE_MS),
+            budget: policy::state_bytes(window),
         },
         tag: tag.clone(),
         lease,
@@ -715,7 +748,7 @@ async fn judge(
         }
         Ok(Ok(intent)) => intent,
     };
-    let state = match policy::build(&intent, &shared.redactor) {
+    let state = match policy::build(&intent, &shared.redactor, shared.judge.budget) {
         State::TooLong => return Err(long("the calls are too long to show")),
         State::Built(state) => state,
     };
@@ -1175,7 +1208,7 @@ async fn intent(
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
         changes.push(changed_paths(&tool, &arguments));
         size += arguments.to_string().len();
-        if size > policy::STATE_BYTES {
+        if size > shared.judge.budget {
             return Err(Unjudged::TooLong);
         }
         planned.push(Planned {
@@ -1327,7 +1360,7 @@ async fn intent(
             let file = workspace
                 .as_deref()
                 .map_or_else(|| PathBuf::from(path), |w| w.join(path));
-            let limit = policy::STATE_BYTES.saturating_sub(size);
+            let limit = shared.judge.budget.saturating_sub(size);
             // Off the runtime thread: a slow mount must not hold up renewal.
             let read = tokio::task::spawn_blocking(move || written_file(&file, limit));
             match read.await.map_err(|_| Unjudged::Failed)? {
@@ -2257,7 +2290,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let small = dir.join("run.sh");
         std::fs::write(&small, "echo hi\n").unwrap();
-        let limit = policy::STATE_BYTES;
+        let limit = policy::state_bytes(200_000);
         assert!(
             matches!(written_file(&small, limit), Some(Written::Whole(text)) if text == "echo hi\n")
         );

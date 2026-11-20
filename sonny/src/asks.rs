@@ -299,8 +299,8 @@ pub fn tool() -> Value {
         "description": "Put a decision in front of the person: a fork in the road, an architectural \
             choice, or a step that cannot be undone, where their pick changes what you build. Sonny \
             shows it where you ask it. Check `sonny ask \
-            list` first: an answer there may settle yours. Ask once, one decision per call, and do \
-            not repeat it in your reply. When their pick approves an \
+            list` first: an answer there may settle yours. Ask once, one decision per call, and \
+            leave it out of your reply. When their pick approves an \
             action, say what in covers: their yes covers that action, target and revision alone, so \
             a new target or revision needs a new ask. \
             Their answer, a pick or words typed for it, comes as their next message, starting \
@@ -314,8 +314,8 @@ pub fn tool() -> Value {
             undone waits, and so does an ask you are unsure of or one they said to wait on. Sonny \
             wakes you at the deadline unless they answered or wrote to you since; that wake is \
             Sonny's, never their answer, so it allows nothing that needs their own words. If they \
-            pick another option after you went ahead, undo what you did and follow their pick. A step only \
-            the person can take, such as a sign-in or a command needing their own terminal, is an \
+            pick another after you went ahead, undo what you did and follow their pick. A step only \
+            the person can take, such as a sign-in or a command in their own terminal, is an \
             ask too: no options, put the exact line to run in command, what it unblocks in why, and \
             wait; their next message says how it went. Any other question with nothing to choose \
             between goes in your reply.",
@@ -325,7 +325,7 @@ pub fn tool() -> Value {
                 "question": {"type": "string",
                     "description": "The question, verb first, in the person's own words, in about twelve words."},
                 "why": {"type": "string",
-                    "description": "What the answer decides and the facts the person needs to choose, written out here in a sentence or three, since this card may be all they see."},
+                    "description": "What it decides, the facts the person needs and how each option works, in a sentence or three: this card may be all they see."},
                 "options": {"type": "array",
                     "description": "2 to 4 options, each a different way forward; none with command.",
                     "items": {
@@ -333,7 +333,7 @@ pub fn tool() -> Value {
                         "properties": {
                             "label": {"type": "string", "description": "The option, in a few words."},
                             "explanation": {"type": "string",
-                                "description": "What the person will see or get if they pick it, in their own words, in one sentence."}
+                                "description": "What the person will see, keep, wait for or give up if they pick it, one sentence in their words; why says how it works."}
                         },
                         "required": ["label", "explanation"],
                         "additionalProperties": false
@@ -2733,8 +2733,16 @@ mod tests {
             ["explanation"]["description"]
             .as_str()
             .unwrap();
-        assert!(explanation.contains("What the person will see or get if they pick it"));
-        assert!(explanation.contains("in their own words"));
+        // Sol, 11-20: told only to say what they see or get, every option
+        // still said how it works ("a local SQLite database with
+        // transactional saves"), so that goes to `why` by name.
+        assert!(explanation.contains("What the person will see, keep, wait for or give up"));
+        assert!(explanation.contains("in their words"));
+        assert!(explanation.contains("why says how it works"));
+        let why = tool["parameters"]["properties"]["why"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(why.contains("how each option works"));
         // Said there alone, not again in the tool's description.
         let description = tool["description"].as_str().unwrap();
         assert!(!description.contains("each option"));
