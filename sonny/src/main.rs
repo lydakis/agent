@@ -17119,6 +17119,7 @@ impl App {
             if switches(key)
                 || (key.code == KeyCode::Tab || right)
                     && self.input.is_empty()
+                    && self.quotes.is_empty()
                     && self.picker.is_none()
                     && self.agents.is_none()
                     && self.searching.is_none()
@@ -18025,7 +18026,7 @@ impl App {
                 self.kept.focused = Some(false);
                 match self.kept.showing {
                     // A message half typed keeps it, until sent or cleared.
-                    true if self.input.is_empty() => self.close_own(),
+                    true if self.blank() => self.close_own(),
                     true => {}
                     // Marked done by its lead while it rested here.
                     false => self.done_resting(true),
@@ -18402,20 +18403,20 @@ impl App {
                     KeyCode::Char('c') if ctrl => {
                         if self.input.is_empty() && self.making.is_some() {
                             self.making = None;
-                        } else if self.input.is_empty() && self.quotes.is_empty() {
+                        } else if self.blank() {
                             self.quit = true;
                         } else {
                             self.discard();
                         }
                     }
-                    KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
+                    KeyCode::Char('d') if ctrl && self.blank() => self.quit = true,
                     KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
                         if !ctrl
                             && !alt
                             && let Some(call) = self.waiting()
                             && self.paused.is_none()
-                            && self.input.is_empty()
+                            && self.blank()
                             && !self.new_brief() =>
                     {
                         // A call whose whole arguments could not be read
@@ -18431,7 +18432,7 @@ impl App {
                         if !ctrl
                             && !alt
                             && self.paused.is_none()
-                            && self.input.is_empty()
+                            && self.blank()
                             && !self.new_brief()
                             && let Some(prefix) = self.waiting().and_then(approvals::always) =>
                     {
@@ -18442,7 +18443,7 @@ impl App {
                     KeyCode::Char('y' | 'n' | 'a')
                         if !ctrl
                             && !alt
-                            && self.input.is_empty()
+                            && self.blank()
                             && self.waiting().is_none()
                             && self
                                 .approval_left
@@ -18471,7 +18472,7 @@ impl App {
                     // pane's list of the project's agents. A terminal that
                     // sends alt+← as alt+b is taken at its word.
                     KeyCode::Left | KeyCode::Right | KeyCode::Char('b') | KeyCode::Char('f')
-                        if self.input.is_empty()
+                        if self.blank()
                             && self.projects_here()
                             && (alt
                                 || ctrl && matches!(key.code, KeyCode::Left | KeyCode::Right)) =>
@@ -18493,7 +18494,7 @@ impl App {
                     // Codex and Claude Code.
                     KeyCode::Char('?')
                         if !alt
-                            && self.input.is_empty()
+                            && self.blank()
                             && self.asks.is_empty()
                             && self.waiting().is_none()
                             && self.react_to.is_none() =>
@@ -18514,7 +18515,7 @@ impl App {
                     KeyCode::Right if ctrl || alt => self.input.word_right(),
                     // With nothing typed, out to every project.
                     KeyCode::Left
-                        if self.input.is_empty()
+                        if self.blank()
                             && self.react_to.is_none()
                             && !self.new_brief()
                             && self.projects_here() =>
@@ -18573,9 +18574,7 @@ impl App {
                     // Drawn beside another conversation, Tab with nothing
                     // typed gives that one the keys back, while a turn
                     // runs too: there is nothing to queue.
-                    KeyCode::Tab if self.options.embedded && self.input.is_empty() => {
-                        embed::give_back()
-                    }
+                    KeyCode::Tab if self.options.embedded && self.blank() => embed::give_back(),
                     // Tab sends it to run once the running turn ends, as
                     // Codex queues; Enter steers.
                     KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
@@ -18617,13 +18616,13 @@ impl App {
                             // to do here, the conversation it is drawn
                             // beside has the keys again, and its next Esc
                             // closes this.
-                            match self.input.is_empty() {
+                            match self.blank() {
                                 true => embed::give_back(),
                                 false => self.discard(),
                             }
                         } else if self.options.side.is_some() {
                             // Back to the agent; the copy goes once idle.
-                            if self.input.is_empty() {
+                            if self.blank() {
                                 self.quit = true;
                             } else {
                                 self.discard();
@@ -18661,6 +18660,12 @@ impl App {
         let text = step(&mut self.recall, &self.input, &mut attached);
         (self.pictures, self.quotes) = attached;
         text
+    }
+
+    /// Whether nothing is being written: no words and no quotes over
+    /// them, so a key meant for the window is not taken from a reply.
+    fn blank(&self) -> bool {
+        self.input.is_empty() && self.quotes.is_empty()
     }
 
     /// Ctrl+R: the list of prompts sent before, over the composer.
@@ -18771,12 +18776,15 @@ impl App {
             true => attached,
             false => Vec::new(),
         };
-        let bytes = (attached.iter().flatten()).map(|p| p.data.len()).sum();
         // A command leaves the quotes for the message they go with.
         let quotes = match prompt.starts_with('/') {
             true => Vec::new(),
             false => self.quotes.clone(),
         };
+        let bytes = (attached.iter().flatten())
+            .map(|p| p.data.len())
+            .sum::<usize>()
+            + quotes.iter().map(|quote| quote.said.len()).sum::<usize>();
         self.recall.sent(&prompt, (attached, quotes), bytes);
         // A command run, so the menu ranks it first next time.
         let word = prompt.split_whitespace().next().unwrap_or_default();
@@ -20234,7 +20242,7 @@ impl App {
         self.kept.settled = Some(turn);
         match self.kept.done() {
             DoneWindow::Lead => {}
-            DoneWindow::Close if self.input.is_empty() => self.close_own(),
+            DoneWindow::Close if self.blank() => self.close_own(),
             DoneWindow::Close | DoneWindow::Stay => {
                 self.kept.showing = true;
                 self.commit(vec![done_line()]);
@@ -35363,6 +35371,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reply_under_a_quote_types_y_n_and_a_rather_than_answering_a_call() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({})
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        app.quote("Merged it.", Some(json!({"bot": "home.lead", "item": 9})));
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        for c in ['y', 'a', 'n'] {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+        app.beside_done().await;
+        assert_eq!(&*app.input, "yan");
+        assert!(app.waiting().is_some(), "the call still waits");
+        let asked = asked.lock().unwrap();
+        assert!(
+            !asked
+                .iter()
+                .any(|r| r.to_string().contains("allow") || r.to_string().contains("deny")),
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_tasks_request_allowed_here_then_denied_reads_its_final_verdict() {
         let client = daemon_answering(|request| match request["op"].as_str() {
             Some("audit") => json!({"rows": [
@@ -37702,7 +37744,8 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.recall = recall::Recall::default();
+        let file = std::env::temp_dir().join(format!("sonny-recall-quotes-{}", std::process::id()));
+        app.recall = recall::Recall::kept(&file, attach::MOST_BYTES);
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let quoted = Quote {
             said: "Merged it.".into(),
@@ -37723,6 +37766,7 @@ mod tests {
         assert_eq!(&*app.input, "draft");
         assert_eq!(app.quotes.len(), 1);
         assert_eq!(app.quotes[0].said, "Other.");
+        let _ = std::fs::remove_file(file);
     }
 
     #[tokio::test]
