@@ -1240,13 +1240,16 @@ class SummaryCopyTests(ModelFixture):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * size,
                                   **model)['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # It summarizes again as it ends, counted once that lands.
+        client.summarized('Bob', turn=turn)
         requests = self.requests()
-        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        index, after = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(after, len(requests) - 1)
         summary = requests[index]
         self.assertEqual(requests[index - 1]['model'], 'synthetic-large')
         self.assertEqual((summary['model'], summary['instructions'], summary['tools']),
                          ('synthetic-model', 'Summarize.', []))
-        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
+        self.assertEqual(self.request_of_its_own(client, 0), self.own_bytes(summary))
 
     def test_a_turn_after_one_that_failed_before_a_call_does_not_copy_it(self):
         self.model.bodies = []
@@ -1258,12 +1261,16 @@ class SummaryCopyTests(ModelFixture):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 600)['result']['message']
             ended = client.finished(turn)['data']
             self.assertEqual(ended['status'], 'failed' if n == 1 else 'completed', ended)
+        # The last turn summarizes again as it ends; that one is counted
+        # once it lands, so it never races the requests read here.
+        client.summarized('Bob', turn=turn)
         requests = self.requests()
-        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        index, after = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(after, len(requests) - 1)
         self.assertEqual(requests[index - 1]['input'][-1]['content'][0]['text'], '1' * 600)
         summary = requests[index]
         self.assertEqual((summary['instructions'], summary['tools']), ('Summarize.', []))
-        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
+        self.assertEqual(self.request_of_its_own(client, 0), self.own_bytes(summary))
 
     def test_a_turn_after_one_that_summarized_and_failed_before_a_call_does_not_copy_it(self):
         self.model.bodies = []
@@ -1271,7 +1278,9 @@ class SummaryCopyTests(ModelFixture):
         # request was refused: no call sent the view its summary left.
         self.model.refused_prompts = {'1' * 1200}
         client = self.start()
-        self.turn(client, '0', '0' * 1200)
+        # Under the threshold as it ends, so no summary starts after it to
+        # race the next turn's: that turn summarizes as it starts.
+        self.turn(client, '0', '0' * 300)
         self.requests()
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
