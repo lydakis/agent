@@ -18,7 +18,6 @@ taken back in one transaction, so a failure leaves it as it was. Every
 schema change adds its way back here, with its step in src/store/db.rs.
 """
 
-import fcntl
 import json
 import os
 import sqlite3
@@ -79,25 +78,12 @@ def back_107(conn):
 BACK = {109: back_109, 108: back_108, 107: back_107}
 
 
-def held(store):
-    """The daemon's owner lock, taken, or SystemExit while a daemon holds it."""
-    lock = open(store + ".owner-lock", "a")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock.close()
-        raise SystemExit("a daemon holds this store; stop it first (agent shutdown)")
-    return lock
-
-
 def down(store, to, dry=False):
     """Take `store` back to schema `to`; gives the schema it was at."""
     store = os.path.realpath(store)
     if not os.path.isfile(store):
         raise SystemExit(f"no store at {store}")
-    if os.stat(store).st_nlink != 1:
-        raise SystemExit("the store has another hard link, so another daemon lock; copy it first")
-    lock = held(store)
+    lock = store_lift_yields.held(store)
     try:
         # Autocommit, so the transaction below is the only one.
         conn = sqlite3.connect(store, isolation_level=None)

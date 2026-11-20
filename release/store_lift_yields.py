@@ -20,6 +20,7 @@ Usage: store_lift_yields.py up|down [STORE]   (default ~/.agent/state.sqlite)
        add --dry-run to count without writing.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -167,6 +168,20 @@ def migrate(conn, old, new):
     return counts
 
 
+def held(store):
+    """The daemon's owner lock on `store`, taken, or SystemExit while a
+    daemon holds the store, or while another hard link (another lock) does."""
+    if os.stat(store).st_nlink != 1:
+        raise SystemExit("the store has another hard link, so another daemon lock; copy it first")
+    lock = open(store + ".owner-lock", "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise SystemExit("a daemon holds this store; stop it first (agent shutdown)")
+    return lock
+
+
 def main(argv):
     args = [arg for arg in argv if arg != "--dry-run"]
     dry = len(args) != len(argv)
@@ -174,8 +189,14 @@ def main(argv):
         raise SystemExit(__doc__)
     old, new = RENAMES[args[0]]
     store = args[1] if len(args) == 2 else os.path.expanduser("~/.agent/state.sqlite")
+    store = os.path.realpath(store)
     if not os.path.isfile(store):
         raise SystemExit(f"no store at {store}")
+    with held(store):
+        report(store, old, new, dry)
+
+
+def report(store, old, new, dry):
     conn = sqlite3.connect(store, isolation_level=None, timeout=5)
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.execute("BEGIN IMMEDIATE")

@@ -1,4 +1,5 @@
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -130,6 +131,17 @@ class StoreLiftYields(unittest.TestCase):
         self.assertEqual(script.renamed_text(up, "yields", "lift"), text)
         self.assertIsNone(script.renamed_text(up, "lift", "yields"))
         self.assertIsNone(script.renamed_text("[]", "lift", "yields"))
+
+    def test_a_store_a_daemon_holds_is_refused(self):
+        before = self.rows()
+        with open(self.path + ".owner-lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(SystemExit, "a daemon holds this store"):
+                self.run_script("up")
+        os.link(self.path, self.path + ".alias")
+        with self.assertRaisesRegex(SystemExit, "another hard link"):
+            self.run_script("up")
+        self.assertEqual(self.rows(), before)
 
     def test_dry_run_writes_nothing(self):
         before = self.rows()
