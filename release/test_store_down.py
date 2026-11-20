@@ -28,6 +28,7 @@ CREATE INDEX switches_bot ON switches(bot_id,id);
 CREATE INDEX switches_left ON switches(left) WHERE left IS NOT NULL;
 CREATE TABLE translated(node INTEGER PRIMARY KEY, source INTEGER NOT NULL);
 CREATE INDEX translated_source ON translated(source);
+CREATE TABLE translating(bot_id INTEGER PRIMARY KEY, tip INTEGER);
 PRAGMA user_version=111;
 """
 
@@ -99,7 +100,7 @@ class StoreDownTest(unittest.TestCase):
         self.assertEqual(self.read(f"SELECT turn FROM nodes WHERE id={self.original}"), [(None,)])
         self.assertEqual(self.read("SELECT head FROM bots WHERE name='Helper'"), [(self.switched,)])
         self.assertNotIn("family_start", {row[1] for row in self.read("PRAGMA table_info(bots)")})
-        self.assertEqual(self.read("SELECT name FROM sqlite_master WHERE name IN ('switches','translated','bots_family_start')"), [])
+        self.assertEqual(self.read("SELECT name FROM sqlite_master WHERE name IN ('switches','translated','translating','bots_family_start')"), [])
         self.assertEqual(self.read("SELECT sql LIKE 'CREATE UNIQUE INDEX%' FROM sqlite_master WHERE name='nodes_turn'"),
                          [(1,)])
 
