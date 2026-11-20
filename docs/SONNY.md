@@ -947,6 +947,13 @@ the board): an item opening there cuts into its turn, and the board's
 other posts reach it at the commons source's digest. Its brief ends with a
 line saying how to take the board's items.
 
+How to use a board is the board skill's (`sonny/skills/board`), installed
+with the commons skill and removed with it when `[sonny] commons` is off:
+when work goes on a board rather than in a task, how to name a board, how
+to write and work an item, and how a lead splits work across a task's
+agents. The tool's own description only names its keys (George, 11-20:
+ship a skill rather than overload the tool's description).
+
 ## Pause
 
 `/pause REASON` stops every agent of every project at once, through the

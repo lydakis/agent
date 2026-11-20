@@ -373,8 +373,9 @@ fn follows() -> Value {
                                 asked_by (you, the person, an agent, automation), options, command, call, id and \
                                 removed. An AWS EventBridge event pattern: each field a list of values, any \
                                 matching, or a pattern for an object field; all must match, a list field when \
-                                any item does. Values are literals or the matchers prefix, suffix, \
-                                wildcard, equals-ignore-case, anything-but, numeric, exists; $or takes several. As {\"paths\": [{\"prefix\": \"src/\"}]}."},
+                                any item does. Values are strings, numbers, booleans, null or the \
+                                matchers prefix, suffix, wildcard, equals-ignore-case, anything-but, numeric, \
+                                exists; $or takes several patterns. As {\"paths\": [{\"prefix\": \"src/\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
                             "description": "Tell what it hears at most once this long, as 15m, over its sources' \
                                 digest. What steers never waits: the person's words, questions and approvals for \
@@ -458,8 +459,9 @@ fn automations() -> Value {
                             "description": "Caps each run's turn tokens, every request's input and history counted, \
                                 so one below the history ends each run at its first reply. Only when the person asks."},
                         "shadow": {"type": "boolean",
-                            "description": "A dry run: each run goes to a read-only copy of the agent, its answer \
-                                a report to you (or reply_to) of what it would have done. Replace it without \
+                            "description": "A dry run: each run goes to a read-only copy of the agent, anything \
+                                past reading refused, its answer a report to you (or reply_to) of what it would \
+                                have done. Replace it without \
                                 shadow once the reports match the job."},
                         "live": {"type": "boolean",
                             "description": "The message is a template like a live memory fact's, filled as each run starts."},
@@ -606,10 +608,8 @@ pub fn board() -> Value {
     let labels = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]}});
     json!({
         "name": BOARD,
-        "description": "Boards: work in the commons agents take, as the commons skill's Boards section says. \
-            An item is a thread on a board: open, waiting on needs, claimed, done, failed or canceled. \
-            open lists a board's open items, add starts one as post does, act moves one as reply adds. \
-            Only the board's project's agents take items.",
+        "description": "Boards: work in the commons that agents take, which the board skill describes. \
+            open lists a board's open items, add starts one as post does, act moves one as reply adds.",
         "parameters": {
             "type": "object",
             "properties": {
