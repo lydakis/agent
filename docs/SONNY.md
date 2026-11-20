@@ -997,12 +997,15 @@ finished by `sonny update` or by opening a Sonny window: until one runs,
 the daemon, the scripts in `~/.agent`, automations and the scheduler's job
 stay on the old release. The companions are the exception: a window puts
 them on its own build only when it starts the daemon itself (none ran, or
-one of an older protocol it replaces), and otherwise adds only one the
-daemon keeps none of, since replacing a running tool host stops the
-scripts it runs; `sonny update` replaces them. A plain `agent start`
+one of an older protocol it replaces), and otherwise adds one the daemon
+keeps none of and replaces one an older release of Sonny started (by the
+version its `SONNY_BUILD` names); one of a newer release, or another
+build of its own version, it leaves running, since replacing a running
+tool host stops the scripts it runs, and `sonny update` replaces those. A plain `agent start`
 replaces only the daemon, and brings the companions back as they were
 kept: by names that still lead to the old program, which runs on, removed
-from its install, until `sonny upgrade` replaces them.
+from its install, until the first window of the new release opens, or
+`sonny upgrade` runs.
 
 Each open window notes the program it started from. When it loses the
 daemon and the Sonny installed where it runs from is another program

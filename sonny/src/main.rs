@@ -2926,10 +2926,11 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
 /// What a start of Sonny's companions may do to those the daemon keeps.
 #[derive(Clone, Copy, PartialEq)]
 enum Companions {
-    /// Add those it keeps none of: what a window and an editor's session
-    /// do as they start or the daemon comes back. A window of another
-    /// build or path never replaces what runs, as replacing one stops the
-    /// scripts it runs.
+    /// Add those it keeps none of, and replace those an older Sonny
+    /// started: what a window and an editor's session do as they start or
+    /// the daemon comes back. One of a newer Sonny, or another build of
+    /// this version, is never replaced, as replacing one stops the scripts
+    /// it runs.
     Add,
     /// Replace them with this Sonny's, as `sonny upgrade` does, and as a
     /// window does that started the daemon itself, whose companions have
@@ -2953,7 +2954,7 @@ async fn start_companions(client: &Client, start: Companions) -> Result<(), Stri
         (LOOKOUT, named::LOOKOUT, "lookout"),
         (TOOL_HOST, named::TOOL_HOST, tool_host::NAME),
     ] {
-        if start == Companions::Add && kept_companion(&listed, name).is_some() {
+        if kept_companion(&listed, name).is_some_and(|kept| !replaces(kept, start, VERSION)) {
             continue;
         }
         let program = named::named(&me, program);
@@ -2961,6 +2962,23 @@ async fn start_companions(client: &Client, start: Companions) -> Result<(), Stri
     }
     keep_reviewer(client, &listed, None, start).await
 }
+
+/// Whether a start of companions `start` by Sonny `version` replaces the
+/// companion `kept`: always on [`Companions::Replace`]; on
+/// [`Companions::Add`] only one an older release of Sonny started, by the
+/// version in its `SONNY_BUILD`. One that names no version Sonny can read
+/// is left running.
+fn replaces(kept: &Value, start: Companions, version: &str) -> bool {
+    let started_by = (kept["env"]["SONNY_BUILD"].as_str())
+        .and_then(|build| build.split(' ').next())
+        .and_then(update::parse_version);
+    start == Companions::Replace
+        || started_by
+            .is_some_and(|theirs| update::parse_version(version).is_some_and(|ours| theirs < ours))
+}
+
+/// This Sonny's release.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The companions the daemon keeps, as it lists them.
 async fn companions(client: &Client) -> Result<Value, String> {
@@ -2982,7 +3000,7 @@ async fn keep_reviewer(
     model: Option<&str>,
     start: Companions,
 ) -> Result<(), String> {
-    if start == Companions::Add && kept_companion(listed, REVIEWER).is_some() {
+    if kept_companion(listed, REVIEWER).is_some_and(|kept| !replaces(kept, start, VERSION)) {
         return Ok(());
     }
     let me = named::me().map_err(|e| e.to_string())?;
@@ -33742,13 +33760,42 @@ mod tests {
         assert_eq!(removed, [OLD_REVIEWER]);
     }
 
+    #[test]
+    fn a_window_replaces_only_companions_an_older_sonny_started() {
+        let kept = |build: Option<&str>| match build {
+            Some(build) => json!({"env": {"SONNY_BUILD": build}}),
+            None => json!({"env": {}}),
+        };
+        // An older release's: replaced, by its version, not its digits.
+        for older in ["0.10.1 1", "0.9.5 1", "0.0.0 1"] {
+            assert!(
+                replaces(&kept(Some(older)), Companions::Add, "0.10.2"),
+                "{older}"
+            );
+        }
+        // A newer release's, another build of this one, or one that names
+        // no version: left running.
+        for build in [Some("0.10.3 1"), Some("0.10.2 9"), Some("nightly"), None] {
+            assert!(
+                !replaces(&kept(build), Companions::Add, "0.10.2"),
+                "{build:?}"
+            );
+        }
+        // A start of this build's own replaces whatever is kept.
+        assert!(replaces(
+            &kept(Some("0.10.3 1")),
+            Companions::Replace,
+            "0.10.2"
+        ));
+    }
+
     #[tokio::test]
     async fn a_window_adds_only_the_companions_the_daemon_keeps_none_of() {
-        // Kept by another build: a window of this one leaves them running,
+        // Kept by a newer Sonny: a window of this one leaves them running,
         // as replacing the tool host stops every script it runs.
         let other = |name: &str| {
             json!({"name": name, "command": "/other/sonny", "args": [],
-                "env": {"SONNY_BUILD": "0.9.5 1", named::PROGRAM: "/other/sonny"}})
+                "env": {"SONNY_BUILD": "999.0.0 1", named::PROGRAM: "/other/sonny"}})
         };
         let (added, removed) = companions_kept_from(
             json!([other(LOOKOUT), other(TOOL_HOST), other(REVIEWER)]),

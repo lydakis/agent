@@ -111,7 +111,7 @@ fn is_newer(latest: &str, current: &str) -> Option<bool> {
     Some(parse_version(latest)? > parse_version(current)?)
 }
 
-fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.trim().split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
