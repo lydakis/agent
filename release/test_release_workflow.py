@@ -49,6 +49,15 @@ class TriggerTest(unittest.TestCase):
 
 
 class LinuxBuildTest(unittest.TestCase):
+    def test_a_release_needs_a_green_test_run_of_its_commit(self):
+        text = (WORKFLOWS / "release.yml").read_text()
+        resolve = re.search(r"^  resolve:\n(.*?)(?=^  \w+:\n)", text, re.MULTILINE | re.DOTALL)[1]
+        self.assertIn("      actions: read\n", resolve)
+        steps = re.findall(r"^      - name: (.+)$", resolve, re.MULTILINE)
+        self.assertEqual(steps[-2:], ["Resolve approved release", "Require a green test run"])
+        self.assertIn('        run: python3 release/green_gate.py "$GITHUB_REPOSITORY" "$RELEASE_COMMIT"\n',
+                      resolve)
+
     def test_static_linux_builds_join_the_draft_the_package_job_made(self):
         workflow = (WORKFLOWS / "release.yml").read_text()
         job = workflow[workflow.index("\n  linux:\n"):]
