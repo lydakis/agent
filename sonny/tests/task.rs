@@ -201,16 +201,17 @@ impl Lab {
         self.scratch.join("state.sqlite")
     }
 
-    /// The profile Sonny noted the task `task` started as, beside the
-    /// store.
+    /// The profile the last task `agent run` started was given to keep
+    /// (`--profile-name`), which the daemon keeps on it, when `run` started
+    /// `task`.
     fn profile(&self, task: &str) -> Option<String> {
-        let store = std::fs::canonicalize(&self.scratch)
-            .unwrap()
-            .join("state.sqlite");
-        let file = PathBuf::from(format!("{}.profiles", store.display())).join(task);
-        std::fs::read_to_string(file)
-            .ok()
-            .map(|text| text.trim().to_owned())
+        let ran = self.ran();
+        let at = ran.iter().position(|arg| arg == "--bot")?;
+        if ran.get(at + 1).map(String::as_str) != Some(task) {
+            return None;
+        }
+        let at = ran.iter().position(|arg| arg == "--profile-name")?;
+        ran.get(at + 1).cloned()
     }
 
     /// What `agent run` was given, one argument a line.
@@ -260,8 +261,8 @@ fn a_task_starts_in_a_worktree_of_its_own_by_default() {
         lab.git(&worktree, &["branch", "--show-current"]),
         "agent/demo.fix"
     );
-    // Noted as running what the project tells every task, for /status
-    // and the footer, which nothing the daemon keeps names.
+    // Kept on it as running what the project tells every task, for
+    // /status, /usage and the footer.
     assert_eq!(lab.profile("demo.fix").as_deref(), Some("task"));
 }
 

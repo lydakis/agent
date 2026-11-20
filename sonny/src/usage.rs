@@ -1013,6 +1013,8 @@ struct Made<'a> {
     messages: u64,
     calls: u64,
     side: bool,
+    /// The profile it was made in, which the daemon keeps on it.
+    profile: Option<&'a str>,
 }
 
 impl<'a> Made<'a> {
@@ -1030,6 +1032,7 @@ impl<'a> Made<'a> {
                 "name": bot, "created_by": row["created_by"], "expire_ms": row["expire_ms"],
             }))
             .is_some(),
+            profile: row["profile"].as_str(),
         })
     }
     /// Whether it is a task: not a workflow's worker, a lead, a side chat,
@@ -1047,13 +1050,10 @@ impl<'a> Made<'a> {
 }
 
 impl Tasks {
-    /// The tasks among `made`, each one's done mark and role read by
-    /// `done` (with its last turn and whether one runs) and `role`.
-    pub fn tally(
-        made: &[Value],
-        done: impl Fn(&str, Option<i64>, bool) -> bool,
-        role: impl Fn(&str) -> Option<String>,
-    ) -> Self {
+    /// The tasks among `made`, each one's done mark read by `done` (with
+    /// its last turn and whether one runs), and its role the profile it
+    /// was made in.
+    pub fn tally(made: &[Value], done: impl Fn(&str, Option<i64>, bool) -> bool) -> Self {
         let mut tasks = Self::default();
         for made in made.iter().filter_map(Made::of).filter(Made::task) {
             tasks.worked += 1;
@@ -1075,7 +1075,7 @@ impl Tasks {
                 tasks.lengths[length].0 += alone;
                 tasks.lengths[length].1 += 1;
             }
-            let role = role(made.bot).unwrap_or_else(|| "no role".to_owned());
+            let role = made.profile.unwrap_or("no role").to_owned();
             match tasks.roles.iter_mut().find(|(name, ..)| *name == role) {
                 Some((_, without, of)) => {
                     *without += alone;
@@ -1305,13 +1305,9 @@ async fn tasks(
     let tally = move || {
         let this = rows(&tasks, &this, &wrote.0, &decided.0, (since, now));
         let last = last.map(|last| rows(&tasks, &last, &wrote.1, &decided.1, (before, since)));
-        let mut tasks = Tasks::tally(
-            &this,
-            |bot, last, running| {
-                crate::resolved::holds(crate::resolved::read(&store, bot), last, running)
-            },
-            |bot| crate::task::noted_profile(&store, bot),
-        );
+        let mut tasks = Tasks::tally(&this, |bot, last, running| {
+            crate::resolved::holds(crate::resolved::read(&store, bot), last, running)
+        });
         tasks.before = last.as_deref().map(Tasks::before);
         tasks
     };
@@ -1329,6 +1325,8 @@ struct Listed {
     ended: Option<(i64, i64)>,
     created_by: Value,
     expire_ms: Value,
+    /// The profile it was made in.
+    profile: Value,
 }
 
 /// Every agent another made in scope `name` (all of them with none) that
@@ -1364,6 +1362,7 @@ async fn listed(
                     .or(bot["last"]["turn"].as_i64()),
                 created_by: bot["created_by"].clone(),
                 expire_ms: bot["expire_ms"].clone(),
+                profile: bot["profile"].clone(),
             });
         }
         match &page["next_after"] {
@@ -1660,6 +1659,7 @@ fn rows(
             "running": running.is_some(), "last_turn": task.last,
             "person_messages": count(wrote), "person_calls": count(decided),
             "created_by": task.created_by, "expire_ms": task.expire_ms,
+            "profile": task.profile,
         }));
     }
     rows
@@ -1718,12 +1718,16 @@ mod tests {
         // A task with an untimed turn: counted, but by no length.
         let mut untimed = made("p.quick", 0, false, 0, 0);
         untimed["work_ms"] = Value::Null;
-        let rows = [&made_rows[..], &[side, untimed]].concat();
-        let tasks = Tasks::tally(
-            &rows,
-            |bot, _, _| bot == "p.fix-login" || bot == "p.migrate",
-            |bot| (bot == "p.migrate" || bot == "p.tidy").then(|| "backend".to_owned()),
-        );
+        let mut rows = [&made_rows[..], &[side, untimed]].concat();
+        // Each as the daemon keeps the profile it was made in.
+        for row in &mut rows {
+            if row["bot"] == "p.migrate" || row["bot"] == "p.tidy" {
+                row["profile"] = json!("backend");
+            }
+        }
+        let tasks = Tasks::tally(&rows, |bot, _, _| {
+            bot == "p.fix-login" || bot == "p.migrate"
+        });
         assert_eq!((tasks.worked, tasks.working, tasks.ended), (7, 1, 6));
         assert_eq!(tasks.alone, 3);
         // The running task's message is not counted until it ends.
@@ -1747,6 +1751,7 @@ mod tests {
             ended: None,
             created_by: json!("p.lead"),
             expire_ms: Value::Null,
+            profile: Value::Null,
         };
         let tasks = [
             listed("p.a", 1, None),

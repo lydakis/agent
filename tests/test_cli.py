@@ -1143,6 +1143,20 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue(text.endswith('# Role: reviewer\n\nYou review changes and report bugs only.'), text[-200:])
         self.assertEqual(request['model'], 'synthetic-model')
         self.assertEqual([t.get('name') for t in request['tools']], ['echo'])
+        # It keeps the role it was made in, which inspect and ls show.
+        store = ['--store', str(self.store)]
+        self.assertEqual(json.loads(self.agent('inspect', *store, '--bot', 'Rev').stdout)['profile'], 'reviewer')
+        # Instructions its client composed in a role of its own: the role
+        # is kept, nothing read for it.
+        self.agent('run', *self.common, '--instructions', 'Check it.', '--profile-name', 'checker', '--new',
+                   '--bot', 'Check', 'hello')
+        self.model.requests.get(timeout=5)
+        self.assertEqual(json.loads(self.agent('inspect', *store, '--bot', 'Check').stdout)['profile'], 'checker')
+        rows = {row['name']: row for row in json.loads(self.agent('ls', *store).stdout)}
+        self.assertEqual((rows['Rev']['profile'], rows['Check']['profile']), ('reviewer', 'checker'))
+        both_named = self.agent('run', *self.again, '--profile', 'reviewer', '--profile-name', 'x', '--new',
+                                '--bot', 'X', 'hello', check=False)
+        self.assertEqual(both_named.returncode, 2)
         missing = self.agent('run', *self.again, '--profile', 'nobody', '--new', '--bot', 'None', 'hello', check=False)
         self.assertEqual(missing.returncode, 1)
         self.assertIn('profile_not_found', missing.stderr)
