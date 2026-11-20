@@ -3913,7 +3913,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
-            CREATE INDEX IF NOT EXISTS bots_family_start ON bots(family_start);
+            CREATE INDEX IF NOT EXISTS bots_family_start ON bots(family_start) WHERE family_start IS NOT NULL;
             CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
                 request_id TEXT NOT NULL, delivery TEXT NOT NULL, status TEXT NOT NULL,
                 turn INTEGER, node INTEGER REFERENCES nodes(id), text TEXT NOT NULL,
