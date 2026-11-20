@@ -499,10 +499,15 @@ pub fn section_heading(state: State, n: usize, open: bool) -> Line<'static> {
 /// Whether an item answers a find on a board's page: its title, its
 /// holder or a label holds what was typed, case aside.
 pub fn found_on_page(item: &Item, query: &str) -> bool {
-    let query = query.to_lowercase();
-    item.title.to_lowercase().contains(&query)
-        || (item.holder.as_deref()).is_some_and(|h| h.to_lowercase().contains(&query))
-        || (item.labels.iter()).any(|(k, v)| format!("{k}={v}").to_lowercase().contains(&query))
+    let labels: Vec<String> = (item.labels.iter())
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    crate::projects::finds(
+        query,
+        [item.title.as_str(), item.holder.as_deref().unwrap_or("")]
+            .into_iter()
+            .chain(labels.iter().map(String::as_str)),
+    )
 }
 
 /// What one action post did to its item, in words: `claimed`,
@@ -633,9 +638,10 @@ pub enum Target {
 /// Whether an item is listed by a find in the list: its title, its board
 /// or its holder holds what was typed, case aside.
 pub fn found_in_list(item: &Item, query: &str) -> bool {
-    let query = query.to_lowercase();
-    item.title.to_lowercase().contains(&query)
-        || (item.holder.as_deref()).is_some_and(|h| h.to_lowercase().contains(&query))
+    crate::projects::finds(
+        query,
+        [item.title.as_str(), item.holder.as_deref().unwrap_or("")],
+    )
 }
 
 #[cfg(test)]

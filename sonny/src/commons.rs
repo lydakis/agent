@@ -2240,7 +2240,7 @@ impl View {
                     let hung: Vec<usize> = (board.items.iter().copied())
                         .filter(|item| crate::board_view::found_in_list(&self.items[*item], query))
                         .collect();
-                    if hung.is_empty() && !board.name.to_lowercase().contains(query.as_str()) {
+                    if hung.is_empty() && !crate::projects::finds(query, [board.name.as_str()]) {
                         continue;
                     }
                     rows.push(Row::Board(*at));
@@ -2514,7 +2514,7 @@ impl View {
         }
         .unwrap_or_default();
         let matches = |row: &Row| match row {
-            Row::Board(at) => self.boards[*at].name.to_lowercase().contains(&query),
+            Row::Board(at) => crate::projects::finds(&query, [self.boards[*at].name.as_str()]),
             Row::Hung(_) | Row::Thread(_) | Row::Item(_) => true,
             Row::Fold(_) | Row::Heading(_) => false,
         };

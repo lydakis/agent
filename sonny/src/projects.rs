@@ -54,9 +54,15 @@ impl Project {
     }
 
     fn found(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        self.title.to_lowercase().contains(&query) || self.name.to_lowercase().contains(&query)
+        finds(query, [self.title.as_str(), self.name.as_str()])
     }
+}
+
+/// Whether `ctrl+f`'s `query` is in any of `fields`, case aside: the one
+/// narrowing every list that finds by typing shares (Projects, `/commons`).
+pub fn finds<'a>(query: &str, fields: impl IntoIterator<Item = &'a str>) -> bool {
+    let query = query.to_lowercase();
+    (fields.into_iter()).any(|field| field.to_lowercase().contains(&query))
 }
 
 /// The state of the most pressing of `rows`, in **States**' order, the
