@@ -17010,9 +17010,12 @@ impl App {
             _ => key,
         };
         // `h` `j` `k` `l` are the arrows in every pane but a program's,
-        // unlisted.
+        // unlisted; typed into a find, they are letters.
         let arrow;
-        let key = match (self.pane_keys && !program && self.finding.is_none())
+        let commons_finds = (self.watch.as_ref())
+            .and_then(|w| w.commons.as_ref())
+            .is_some_and(|view| view.finding());
+        let key = match (self.pane_keys && !program && self.finding.is_none() && !commons_finds)
             .then(|| vim_arrow(key))
             .flatten()
         {
@@ -38385,6 +38388,50 @@ mod tests {
             status_keys(app.watch.as_ref().unwrap(), true),
             "↑↓ pick · enter open · →← fold · m more · esc close"
         );
+    }
+
+    #[tokio::test]
+    async fn h_j_k_l_typed_into_the_commons_find_are_letters() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let home = std::env::temp_dir().join(format!("sonny-commons-find-{}", std::process::id()));
+        app.open_pane(pane::Pane::card("commons", STATUS_KEYS));
+        app.pane_keys = true;
+        app.watch = Some(Watch {
+            project: "shop".into(),
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: Some(commons::View::open(&home, "shop".into())),
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+        });
+        let key = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        app.key(key(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        for c in "shjkl".chars() {
+            app.key(key(KeyCode::Char(c), KeyModifiers::NONE)).await;
+        }
+        let view = (app.watch.as_mut())
+            .and_then(|w| w.commons.as_mut())
+            .unwrap();
+        let (lines, _) = view.card(80);
+        let last: String = (lines.last().unwrap().spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(last, "find shjkl");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]

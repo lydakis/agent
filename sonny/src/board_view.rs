@@ -1180,16 +1180,15 @@ mod tests {
             press(&mut view, KeyCode::Down);
         }
         press(&mut view, KeyCode::Enter);
-        // The page as the pane lays it: the post's link is the screen's.
+        // The page laid on the pane's screen as the pane lays it after
+        // each key: the post's link is the screen's own.
         let mut screen = crate::screen::Screen::default();
-        for line in view.card(80).0 {
-            match text(&line).contains("the spec") {
-                true => screen.push_linked(line, "https://spec.example/errors".into()),
-                false => screen.push(vec![line]),
-            }
-        }
         let area = ratatui::layout::Rect::new(0, 0, 80, 40);
-        screen.render(area, &mut ratatui::buffer::Buffer::empty(area), |_| None);
+        let lay = |view: &mut View, screen: &mut crate::screen::Screen| {
+            screen.replace_marked(view.card(80).0, Vec::new());
+            screen.render(area, &mut ratatui::buffer::Buffer::empty(area), |_| None);
+        };
+        lay(&mut view, &mut screen);
         let reversed = |view: &mut View| {
             let (lines, _) = view.card(80);
             (lines.iter().flat_map(|l| &l.spans))
@@ -1199,24 +1198,37 @@ mod tests {
         };
         // The board, the holder, then the post's link: one pick at a time.
         assert_eq!(view.arrow(true, &mut screen), crate::commons::Key::Stay);
+        lay(&mut view, &mut screen);
         assert_eq!(reversed(&mut view), ["shop/typed-errors"]);
         view.arrow(true, &mut screen);
+        lay(&mut view, &mut screen);
         assert_eq!(reversed(&mut view), ["errors-2"]);
         assert_eq!(screen.picked_link(), None);
         assert_eq!(view.arrow(true, &mut screen), crate::commons::Key::Stay);
+        // Drawn again without the holder's pick, the post's stays.
+        lay(&mut view, &mut screen);
         assert_eq!(screen.picked_link(), Some("https://spec.example/errors"));
         assert!(reversed(&mut view).is_empty(), "{:?}", reversed(&mut view));
         // Enter leaves the page's own links alone: the post's link is
         // the one followed.
         assert_eq!(press(&mut view, KeyCode::Enter), crate::commons::Key::Stay);
         assert_eq!(view.depth(), 2);
-        // None left down the page: it scrolls. Up again is the holder.
+        // The post shows its address too, a link of its own; past it none
+        // is left down the page: it scrolls. Up twice is the holder again.
+        assert_eq!(view.arrow(true, &mut screen), crate::commons::Key::Stay);
+        lay(&mut view, &mut screen);
+        assert_eq!(screen.picked_link(), Some("https://spec.example/errors"));
         assert_eq!(
             view.arrow(true, &mut screen),
             crate::commons::Key::Scroll(false)
         );
+        lay(&mut view, &mut screen);
         assert_eq!(screen.picked_link(), Some("https://spec.example/errors"));
         view.arrow(false, &mut screen);
+        lay(&mut view, &mut screen);
+        assert_eq!(screen.picked_link(), Some("https://spec.example/errors"));
+        view.arrow(false, &mut screen);
+        lay(&mut view, &mut screen);
         assert_eq!(screen.picked_link(), None);
         assert_eq!(reversed(&mut view), ["errors-2"]);
         let _ = std::fs::remove_dir_all(home);
