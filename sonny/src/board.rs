@@ -25,6 +25,9 @@ pub const ACTIONS: [&str; 10] = [
 /// The most of an item's title, as of a task's: its verb first.
 pub const TITLE_CHARS: usize = 30;
 
+/// An item's fields that its actions change or clear after it is made.
+pub const CHANGING: [&str; 6] = ["for", "labels", "needs", "holder", "holder_id", "result"];
+
 /// Names a label never takes: what Sonny writes of an item.
 pub const PROTECTED: [&str; 7] = ["state", "holder", "board", "by", "project", "at", "do"];
 
@@ -94,8 +97,8 @@ pub fn valid_title(title: &str) -> Result<(), String> {
 /// `state` is open, claimed, done, failed or canceled; whether an open one
 /// waits on its needs is [`waiting`]'s, which knows the other items.
 ///
-/// `{board, state, by, at, labels, needs, for?, holder?, holder_id?, result?}`:
-/// `by` made it, `at` is its last action's time, `holder` holds a claimed
+/// `{board, state, by, by_id?, at, labels, needs, for?, holder?, holder_id?, result?}`:
+/// `by` made it, as the daemon knew it by `by_id`, `at` is its last action's time, `holder` holds a claimed
 /// one and did a done or failed one, `result` is a closing post's text.
 pub fn item(posts: &[Value]) -> Option<Value> {
     let mut item: Option<Value> = None;
@@ -108,6 +111,9 @@ pub fn item(posts: &[Value]) -> Option<Value> {
             if item.is_none() {
                 let mut made = json!({"board": post["board"], "state": "open", "by": post["by"],
                     "at": post["at"], "labels": {}, "needs": []});
+                if post["by_id"].is_i64() {
+                    made["by_id"] = post["by_id"].clone();
+                }
                 if action == "add" {
                     if post["labels"].is_object() {
                         made["labels"] = post["labels"].clone();
@@ -502,7 +508,11 @@ fn act(
                     }
                 }
                 "cancel" => {
-                    if it["by"].as_str() != Some(caller.name) {
+                    // The maker, not another agent later given its name.
+                    let maker_id = it["by_id"].as_i64();
+                    let made_it = it["by"].as_str() == Some(caller.name)
+                        && (maker_id.is_none() || caller.id.is_none() || maker_id == caller.id);
+                    if !made_it {
                         return Err(format!(
                             "board_not_yours: only {thread}'s maker, {}, cancels it",
                             it["by"].as_str().unwrap_or_default()
@@ -1090,6 +1100,48 @@ mod tests {
         let back = Sub::from_json(&one.to_json()).expect("reads back");
         assert_eq!(back.name, one.name);
         assert_eq!(back.filter, Some(json!({"board": [long]})));
+    }
+
+    #[test]
+    fn only_its_maker_cancels_an_item_not_a_later_agent_of_its_name() {
+        let home = home("cancel");
+        let as_id = |id: i64, arguments: Value| {
+            let caller = Caller {
+                name: "shop.lead",
+                id: Some(id),
+                reader: "shop.lead",
+                model: None,
+                project: Some("shop"),
+                profile: None,
+            };
+            call(&home, &caller, &arguments, &|_, _| false)
+        };
+        let made = as_id(1, add("store", "Type the store errors", json!({}))).unwrap();
+        assert_eq!(made["item"]["by_id"], 1);
+        let refused = as_id(2, act("store", "cancel")).unwrap_err();
+        assert!(refused.starts_with("board_not_yours"), "{refused}");
+        let canceled = as_id(1, act("store", "cancel")).unwrap();
+        assert_eq!(canceled["item"]["state"], "canceled");
+    }
+
+    #[test]
+    fn an_item_assigned_then_freed_lists_as_nobody_s() {
+        let home = home("unassigned");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(add(
+            "store",
+            "Type the store errors",
+            json!({"for": "reviewer"}),
+        ))
+        .unwrap();
+        let free = json!({"act": {"thread": "store", "do": "assign", "text": "y", "for": ""}});
+        lead(free).unwrap();
+        let listed = |filter: Value| {
+            let open = lead(json!({"open": "shop/errors", "filter": filter})).unwrap();
+            open["threads"].as_array().map_or(0, Vec::len)
+        };
+        assert_eq!(listed(json!({"for": ["reviewer"]})), 0);
+        assert_eq!(listed(json!({"for": [{"exists": false}]})), 1);
     }
 
     #[test]

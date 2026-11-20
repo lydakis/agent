@@ -1216,8 +1216,12 @@ pub(crate) fn list(
         let mut opening = (thread.as_object_mut())
             .and_then(|t| t.remove(OPENING))
             .unwrap_or(Value::Null);
-        // A filter sees where an item stands as its first post's own.
+        // A filter sees where an item stands as its first post's own: what
+        // the item has since cleared is gone from it too.
         if let (Some(fields), Some(item)) = (opening.as_object_mut(), thread["item"].as_object()) {
+            for key in crate::board::CHANGING {
+                fields.remove(key);
+            }
             fields.extend(item.iter().map(|(key, value)| (key.clone(), value.clone())));
         }
         if !matched(filter, &opening) {
