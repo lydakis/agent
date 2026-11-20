@@ -384,14 +384,6 @@ fn default_name(dir: &Path) -> Result<String, String> {
     Ok(info["name"].as_str().unwrap_or("project").to_owned())
 }
 
-/// The role `/new` made the lead `bot` in, noted beside the store `store`
-/// as a task's is; none for another lead, which runs as its project's.
-pub fn chosen(store: &Path, bot: &str) -> Option<String> {
-    is_lead(bot)
-        .then(|| crate::task::noted_profile(store, bot))
-        .flatten()
-}
-
 /// The lead's role: `chosen`, the profile `/new` made it in, else the one
 /// its project is set to, `lead` unless set otherwise; the folder's or the
 /// person's file, else Sonny's.
@@ -1017,18 +1009,20 @@ async fn create(
         web_search_off: config.web_search_off,
         ..Default::default()
     };
-    let made = make(client, dir, &role, &picks, bot).await?;
+    let made = make(client, dir, &role, &picks, bot, chosen).await?;
     Ok(made["created"] == true)
 }
 
 /// Make the project in `dir` with its lead in `role`, told the task rule;
-/// or `bot`, another lead of it.
+/// or `bot`, another lead of it. A role `chosen` by name, not the
+/// project's, is kept on the lead as its profile.
 async fn make(
     client: &Client,
     dir: &Path,
     role: &agent_client::policy::Profile,
     picks: &agent_client::project::Picks,
     bot: Option<&str>,
+    chosen: Option<&str>,
 ) -> Result<Value, String> {
     let instructions = folder(dir, role)?.text;
     // Gated and confined from the start, as a new lead's mode makes it,
@@ -1083,6 +1077,7 @@ async fn make(
         "declare": declare,
         "gate": gate,
         "settings": settings,
+        "profile": chosen,
     });
     agent_client::project::create(client, dir, &policy, client.providers(), picks, bot).await
 }
@@ -1104,7 +1099,7 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     let (client, _events) = Client::connect(&socket)
         .await
         .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
-    let mut made = make(&client, &dir, &role(&dir, None)?, &picks, None).await;
+    let mut made = make(&client, &dir, &role(&dir, None)?, &picks, None, None).await;
     if let Ok(made) = &mut made {
         open_new_lead(&client, &socket, caller, made).await;
         made.as_object_mut().map(|m| m.remove("record"));

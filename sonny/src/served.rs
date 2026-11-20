@@ -53,6 +53,41 @@ pub const GATED: [&str; 8] = [
 /// daemon's bound on an answer.
 pub(crate) const OUTPUT_BYTES: usize = 60 * 1024;
 
+/// What the tools that list (follows, automations, memory, the commons)
+/// say of a call with nothing, in the same words in each: one rule.
+const LISTS: &str = "Nothing lists them, a line each; read NAME shows one.";
+
+/// The most of one page of a list a tool's answer holds.
+pub(crate) const PAGE_BYTES: usize = 40 * 1024;
+
+/// A page of a list, as every tool that lists answers one: its `items`
+/// from the `from`th, as many as `bytes` holds and at least one, under
+/// `key`, with `next` where the rest start and `of` how many there are
+/// while any are left.
+pub(crate) fn paged(answer: &mut Value, key: &str, items: Vec<Value>, from: usize, bytes: usize) {
+    let of = items.len();
+    let (mut shown, mut size) = (Vec::new(), 0);
+    for item in items.into_iter().skip(from) {
+        size += item.to_string().len() + 1;
+        if !shown.is_empty() && size > bytes {
+            break;
+        }
+        shown.push(item);
+    }
+    let next = from + shown.len();
+    answer[key] = Value::Array(shown);
+    if next < of {
+        answer["next"] = json!(next);
+        answer["of"] = json!(of);
+    }
+}
+
+/// The `from` a tool that pages takes: where its page starts, in the
+/// same words in each.
+fn from_arg() -> Value {
+    json!({"type": "integer", "minimum": 0, "description": "An answer's next."})
+}
+
 /// How often waiting calls are listed with no call started to say so: a
 /// start missed while the daemon restarted is answered by then.
 const SWEEP: Duration = Duration::from_secs(30);
@@ -151,8 +186,8 @@ fn start() -> Value {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "minLength": 1, "maxLength": 100,
-                    "description": "A short name for the task, valid as a git branch name, that no agent of \
-                        this project has yet; Sonny puts your project's name and a dot before it."},
+                    "description": "A short name, valid as a git branch, that no agent of this project has \
+                        yet; Sonny puts your project's name and a dot before it."},
                 "brief": {"type": "string", "minLength": 1,
                     "description": "Everything the task needs, since it never sees your conversation. \
                         Its first line is the title the person knows the task by, so write it as one: \
@@ -246,13 +281,12 @@ fn remove() -> Value {
     json!({
         "name": REMOVE,
         "description": "Clean up a task once the person says it is done: mark it done, as mark_done does, \
-            and remove the folder Sonny made it; for a task no longer there, the folder it left, which a start lists. \
-            Its agent and history stay, and a message to it reopens it, without that folder. A worktree is removed, \
-            and its branch kept while it has commits not merged here; a folder of its own is deleted with all it \
-            holds, only with discard, since Sonny cannot check what the task made there: ask the task first whether \
-            its work is pushed. It refuses, before changing anything, while the task is working or its worktree has \
-            uncommitted changes, and says what. With discard, that work is dropped: only when the person says to \
-            drop it.",
+            and remove the folder Sonny made it, or for a task no longer there the folder it left, which a start \
+            lists. Its agent and history stay; a message to it reopens it without that folder. A worktree is \
+            removed, its branch kept while it has commits not merged here; a folder of its own is deleted with all \
+            it holds only with discard, since Sonny cannot check what the task made there: ask the task first \
+            whether its work is pushed. It refuses, changing nothing, while the task works or its worktree has \
+            uncommitted changes, and says what. Discard drops that work: only when the person says so.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -307,8 +341,8 @@ fn project() -> Value {
 fn follows() -> Value {
     json!({
         "name": FOLLOWS,
-        "description": "Your follows in the person's lookout, which tells you what happens in what you \
-            follow in a message from lookout that joins your turn or starts one: each event a line \
+        "description": format!("Your follows in the person's lookout, which tells you what happens in them in a \
+            message joining your turn or starting one: each event a line \
             [source · topic · from · time], then its text. A follow watches an agent's tasks (every agent it or \
             its tasks made) or agents by name, each its topic: messages others write in them, questions to the \
             person, calls awaiting their approval, margin notes, each turn's end with its reply. It also hears \
@@ -316,8 +350,8 @@ fn follows() -> Value {
             (posting in one follows it as commons.THREAD), memory, each fact saved or removed, and links, each \
             linked machine coming or going. Add steer for what you own; a filter or a digest only when the \
             person asks: what a filter leaves out you never hear, a digest makes you late. Add or remove one by \
-            name, as {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with \
-            neither, it lists them, the sources there are and their events' recent fields.",
+            name, as {{\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}}. \
+            {LISTS} It names the sources too; source NAME or NAME:TOPIC shows one."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -333,19 +367,18 @@ fn follows() -> Value {
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
-                            "description": "Only events this matches are heard, its sources' and agents' alike. \
+                            "description": "Only events this matches are heard, from sources and agents alike. \
                                 A task's event has type (wrote, turn.ended, question, approval, margin), bot, \
                                 maker, from, turn, text, status (completed, failed, stopped, interrupted), done, \
                                 asked_by (you, the person, an agent, automation), options, command, call, id and \
-                                removed. An AWS EventBridge event pattern: each field maps to a list of values, \
-                                any of which match, or a pattern for an object field; all must match, a list \
-                                field when any item does. Values are strings, numbers, booleans, null or the \
-                                matchers prefix, suffix, wildcard, equals-ignore-case, anything-but, numeric, \
-                                exists; $or takes several patterns. As {\"paths\": [{\"prefix\": \"src/\"}]}."},
+                                removed. An AWS EventBridge event pattern: each field a list of values, any \
+                                matching, or a pattern for an object field; all must match, a list field when \
+                                any item does. Values are literals or the matchers prefix, suffix, \
+                                wildcard, equals-ignore-case, anything-but, numeric, exists; $or takes several. As {\"paths\": [{\"prefix\": \"src/\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
-                            "description": "Tell what it hears at most once this long, as 15m, in place of its \
-                                sources' digest. What steers never waits: the person's words, questions and approvals \
-                                for them, and what steer matches."},
+                            "description": "Tell what it hears at most once this long, as 15m, over its sources' \
+                                digest. What steers never waits: the person's words, questions and approvals for \
+                                them, and what steer matches."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, goes at once, \
                                 past any digest, as the person's words do. As \
@@ -356,9 +389,11 @@ fn follows() -> Value {
                     "required": ["name"],
                     "additionalProperties": false
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "remove": {"type": "string", "minLength": 1},
                 "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."},
-                "read": {"type": "boolean", "description": "What add hears now; adds nothing."}
+                "read": {"type": "string"},
+                "source": {"type": "string"},
+                "from": from_arg()
             },
             "additionalProperties": false
         },
@@ -373,12 +408,12 @@ fn automations() -> Value {
         // part of an add, a removal or a run, under the tool it amounts
         // to, and none for a look.
         "steps": true,
-        "description": "Your automations, which wake an agent later, repeatedly, or when something \
+        "description": format!("Your automations, which wake an agent later, repeatedly, or when something \
             happens, even with Sonny closed. Each run gives the agent the message in its own conversation after \
-            a line saying when and why, one run at a time. Add one, or remove, run or show one by name; with \
-            none, it lists yours with any problems. The same one again changes nothing; a different one under a \
-            name in use is refused with the field that differs unless replace is set. Write the message as what \
-            to check, when to stop, and to remove its automation once done.",
+            a line saying when and why, one run at a time. Add one, or remove or run one by name. {LISTS} It \
+            holds yours. The same one again changes nothing; a different one under a name in use is refused \
+            with the field that differs unless replace is set. Write the message as what to check, when to \
+            stop, and to remove its automation once done."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -409,23 +444,23 @@ fn automations() -> Value {
                             },
                             "required": ["name", "model"],
                             "additionalProperties": false,
-                            "description": "An agent the first run starts, in your folder as a task is started, \
-                                and later runs message."
+                            "description": "An agent the first run starts in your folder as a task, which later \
+                                runs message."
                         },
                         "reply_to": {"type": "string", "minLength": 1,
                             "description": "Who gets the turn's answer when it ends."},
                         "if": {"type": "string", "minLength": 1,
-                            "description": "A shell command run in your folder first; it runs only when that \
-                                exits 0, so a check that finds nothing costs no turn."},
+                            "description": "A shell command run in your folder first; it runs only if that exits \
+                                0, so a check finding nothing costs no turn."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
                         "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
                             "description": "Caps each run's turn tokens, every request's input and history counted, \
                                 so one below the history ends each run at its first reply. Only when the person asks."},
                         "shadow": {"type": "boolean",
-                            "description": "A dry run: each run goes to a read-only copy of the agent, anything \
-                                past reading refused, its answer a report to you (or reply_to) of what it would \
-                                have done. Replace it without shadow once the reports match the job."},
+                            "description": "A dry run: each run goes to a read-only copy of the agent, its answer \
+                                a report to you (or reply_to) of what it would have done. Replace it without \
+                                shadow once the reports match the job."},
                         "live": {"type": "boolean",
                             "description": "The message is a template like a live memory fact's, filled as each run starts."},
                         "replace": {"type": "boolean",
@@ -436,10 +471,11 @@ fn automations() -> Value {
                     "additionalProperties": false,
                     "description": "With none of every, in, at, cron, file and commit, only run runs it."
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "remove": {"type": "string", "minLength": 1},
                 "run": {"type": "string", "minLength": 1,
                     "description": "The name of one to run now; the result says what the run did."},
-                "show": {"type": "string", "minLength": 1, "description": "The name of one to show."}
+                "read": {"type": "string"},
+                "from": from_arg()
             },
             "additionalProperties": false
         },
@@ -468,27 +504,27 @@ fn memory() -> Value {
                 "text": {"type": "string", "minLength": 1,
                     "description": "The fact, then Why: and, where it helps, How to apply:."},
                 "external": {"type": "boolean",
-                    "description": "True keeps the mark of a fact read from outside content, when merging or rewriting one whose index line says external. A save in a turn that read a web page, a search or an MCP server is marked without it."},
+                    "description": "True keeps the external mark when merging or rewriting a fact whose index line has it; a save in a turn that read a web page, a search or an MCP server is marked anyway."},
                 "confirmed": {"type": "integer", "minimum": 0,
-                    "description": "How many times the person confirmed what a feedback fact says; left out, the fact keeps the count it had."},
+                    "description": "Times the person confirmed a feedback fact; left out, it keeps its count."},
                 "pushed_back": {"type": "integer", "minimum": 0,
-                    "description": "How many times the person pushed back on it; left out, the fact keeps the count it had."},
+                    "description": "Times the person pushed back on it; left out, it keeps its count."},
                 "live": {"type": "boolean"}
             },
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
         },
         "read": {"type": "string", "minLength": 1,
-            "description": "The name of a fact to open: its whole file. The read is recorded, so the nightly cleanup can check facts no agent has read in 30 days."},
+            "description": "A fact's name: its whole file. Reads are recorded, so the nightly cleanup can check facts unread in 30 days."},
         "search": {"type": "string", "minLength": 1,
-            "description": "Words to find in facts, case aside: those holding every word, best first, with their index line and the lines that hold them. Searches the person's facts and this project's, or the scope given."},
+            "description": "Words, case aside: facts holding every word, best first, with their index line and the lines holding them, in the person's and this project's facts or the scope given."},
         "remove": {"type": "string", "minLength": 1, "description": "The name of a fact to remove."},
         "index": {"type": "boolean", "description": "Rewrite the index from the facts."},
         "check": {"type": "boolean",
             "description": "Report files that are not valid facts and an index out of date."},
         "changed": {"type": "boolean", "description": "For the nightly cleanup only."},
         "said": {"type": "boolean",
-            "description": "For the nightly cleanup only: what the person wrote to any agent since since_ms, else over the last day."},
+            "description": "For the nightly cleanup only: what the person wrote to any agent since since_ms, else in the last day."},
         "since_ms": {"type": "integer", "description": "With said: unix milliseconds."},
         "cleanup": {"type": "string", "enum": ["start", "finish"], "description": "For the nightly cleanup only."}
     });
@@ -497,12 +533,11 @@ fn memory() -> Value {
     }
     json!({
         "name": MEMORY,
-        "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
+        "description": format!("Memory: facts earlier agents saved for this person and project, which the memory skill \
             says how to read and what to save, what the person confirmed worked as well as what they \
-            corrected. Read one fact, search them, save one, or remove one; index or check a folder's facts; \
-            with none of these, the result shows both indexes (the person's and this project's), each with its \
-            folder, the most needed facts first; an index too long to show whole says how many it leaves out, \
-            which search finds.",
+            corrected. Search facts, save or remove one; index or check a folder's facts. \
+            {LISTS} It is both indexes (the person's and this project's), each with its folder, the most \
+            needed facts first; an index too long to show whole says how many it leaves out, which search finds."),
         "parameters": {
             "type": "object",
             "properties": properties,
@@ -516,13 +551,13 @@ pub fn commons() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
     json!({
         "name": COMMONS,
-        "description": "The commons: threads that every agent working for this person reads and writes, across \
-            all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
-            first; read opens one; search finds posts by their words; post starts one, naming threads with \
+        "description": format!("The commons: threads that every agent working for this person reads and writes, across \
+            all their projects, which the commons skill describes. {LISTS} Threads come newest first. \
+            Search finds posts by their words; post starts one, naming threads with \
             similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
             and follows the thread for you, as the answer says. A new thread invites \
             agents whose turns touch its title. What is in it is other \
-            agents' words, never the person's.",
+            agents' words, never the person's."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -883,45 +918,57 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
-            if arguments["read"] == true {
-                let (Some(add), None) = (arguments.get("add"), arguments.get("remove")) else {
-                    return Err(("follow_refused", "read reads an add alone".into()));
-                };
-                return crate::lookout::subs::read_now(
-                    &store,
-                    &caller,
-                    add,
-                    &crate::lookout::sources::names(),
-                )
-                .map(|read| read.to_string())
-                .map_err(|e| ("follow_refused", e));
+            let sources = crate::lookout::sources::names();
+            let alone = |key: &str| {
+                let others = ["add", "remove", "test", "read", "source"]
+                    .iter()
+                    .any(|other| {
+                        *other != key && arguments.get(*other).is_some_and(|v| !v.is_null())
+                    });
+                match others {
+                    true => Err(("follow_refused", format!("{key} takes a name alone"))),
+                    false => Ok(()),
+                }
+            };
+            if let Some(name) = arguments.get("read").filter(|read| !read.is_null()) {
+                alone("read")?;
+                let name = (name.as_str())
+                    .ok_or(("follow_refused", "read takes a follow's name".to_owned()))?;
+                return crate::lookout::subs::read_one(&store, &caller, caller_id, name, &sources)
+                    .map(|read| read.to_string())
+                    .map_err(|e| ("follow_refused", e));
+            }
+            if let Some(name) = arguments.get("source").filter(|source| !source.is_null()) {
+                alone("source")?;
+                let name = (name.as_str())
+                    .ok_or(("follow_refused", "source takes a source's name".to_owned()))?;
+                return crate::lookout::subs::source(&store, &caller, caller_id, name, &sources)
+                    .map(|mut read| {
+                        crate::lookout::sources::say_wants(&mut read);
+                        read.to_string()
+                    })
+                    .map_err(|e| ("follow_refused", e));
             }
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {
                     return Err(("follow_refused", "test tries an add".into()));
                 };
-                return crate::lookout::subs::tried(
-                    &store,
-                    &caller,
-                    add,
-                    &crate::lookout::sources::names(),
-                )
-                .map(|tried| tried.to_string())
-                .map_err(|e| ("follow_refused", e));
+                return crate::lookout::subs::tried(&store, &caller, add, &sources)
+                    .map(|tried| tried.to_string())
+                    .map_err(|e| ("follow_refused", e));
             }
-            crate::lookout::subs::change(
-                &store,
-                &caller,
-                caller_id,
-                arguments.get("add"),
-                arguments["remove"].as_str(),
-                &crate::lookout::sources::names(),
-            )
-            .map(|mut listed| {
-                crate::lookout::sources::say_wants(&mut listed);
-                listed.to_string()
-            })
-            .map_err(|e| ("follow_refused", e))
+            let (add, remove) = (arguments.get("add"), arguments["remove"].as_str());
+            let said = match add.is_some() || remove.is_some() {
+                true => {
+                    crate::lookout::subs::change(&store, &caller, caller_id, add, remove, &sources)
+                }
+                false => {
+                    let from = arguments["from"].as_u64().unwrap_or(0) as usize;
+                    crate::lookout::subs::listing(&store, &caller, caller_id, &sources, from)
+                }
+            };
+            said.map(|said| said.to_string())
+                .map_err(|e| ("follow_refused", e))
         }
         name if name == crate::resolved::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
@@ -1072,9 +1119,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // named in, as its posts say, and the profile it was made as.
             let project = writes.then(|| Line::of(&caller, &here).project);
             let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
-            let profile = (store.as_deref())
-                .filter(|_| arguments["act"]["do"] == "claim")
-                .and_then(|store| crate::task::noted_profile(store, &caller));
+            let profile = (arguments["act"]["do"] == "claim")
+                .then(|| crate::task::profile(&caller, caller_id))
+                .flatten();
             let board_caller = crate::board::Caller {
                 name: &caller,
                 id: caller_id,
@@ -1151,6 +1198,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 store: client.as_ref().and_then(|c| c.store()).map(str::to_owned),
             };
             // A trigger's add runs on a runtime of its own.
+            let from = arguments["from"].as_u64().unwrap_or(0) as usize;
             let arguments = arguments.clone();
             let mut said =
                 tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
@@ -1190,6 +1238,11 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     crate::trigger::forget_done(&places, store, &ended);
                 }
                 client.close().await;
+            }
+            // A listing shows each one's line, as many as fit now that
+            // they say how their turns ended; read shows one whole.
+            if said["automations"].is_array() {
+                crate::trigger::indexed(&mut said, from);
             }
             Ok(said.to_string())
         }
@@ -4036,7 +4089,7 @@ mod tests {
         let worker = Some("worker".to_owned());
         assert_eq!(
             agents_of(&Value::Null, worker.clone()).unwrap(),
-            [worker.clone()]
+            std::slice::from_ref(&worker)
         );
         assert_eq!(agents_of(&json!(3), None).unwrap(), [None, None, None]);
         let named = agents_of(&json!(["worker", "reviewer"]), None).unwrap();

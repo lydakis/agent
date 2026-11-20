@@ -1105,8 +1105,8 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.keeps_its_tools(self.host(), 'calc.lead', declare=tools)
         # A look acts on nothing, so it needs no reviewer.
         self.assertEqual(json.loads(self.call('calc.lead', 'automations', {})),
-                         {'automations': [], 'next_after': None})
-        missing = json.loads(self.call('calc.lead', 'automations', {'show': 'watch'}))
+                         {'automations': []})
+        missing = json.loads(self.call('calc.lead', 'automations', {'read': 'watch'}))
         self.assertIn('automation_not_found', missing['detail'])
         # One that starts an agent is a start, which leaves its sandbox, and
         # no one reviews it.

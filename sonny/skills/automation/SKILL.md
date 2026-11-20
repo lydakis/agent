@@ -131,9 +131,9 @@ instead, for example `*/10 8-18 * * 1-5` for every 10 minutes from 8:00 to
 
 Exit 0 from `if` runs, exit 1 skips the run with no model call, and any
 other exit, or one that runs past a minute, is a failed run that the
-automations list shows. Each
-automation's row there has `checked`: when its `if` last ran and what it said
-(`go`, `no` or `failed`), so a skipped run shows there too. Write `quiet`
+automations list shows. `read` with an
+automation's name shows it whole, with `checked`: when its `if` last ran and
+what it said (`go`, `no` or `failed`), so a skipped run shows there too. Write `quiet`
 at setup: a short script that only reads, and exits 0 only when it found
 that no source has anything past its bookmark and the newest run record is
 under an hour old. The `!` makes that a skip, and makes anything else a

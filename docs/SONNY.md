@@ -32,9 +32,16 @@ Sonny's agents add and change automations with the `automations` tool, which
 Sonny's tool host answers outside the agent's sandbox, since an automation runs
 as the person outside it: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
-and `message`), `remove`, `run` or `show` NAME, or nothing to list them.
-An agent lists and shows only its own: those that wake it, send their answers
-to it, or start an agent it added; `sonny automation list` lists every one.
+and `message`), `remove`, `run` or `read` NAME, or nothing to list them.
+Nothing lists them as the other tools that list do (follows, memory, the
+commons): one line each, its name, when it runs (`when`), the agent it
+messages (`agent`), when its last run was and how it went (`last`, with how
+the turn it sent ended once known), and any `problem`, `missed` or `ended`;
+a long list comes in pages, `next` in the answer saying where the rest
+start, as `from`. `read` NAME shows one whole, its message and last result
+too. An agent lists and reads only its own: those that wake it, send their
+answers to it, or start an agent it added; `sonny automation list` lists
+every one.
 A look acts on nothing and runs as any read does, also for an agent whose
 sandbox no one reviews. An add, a removal or a run is judged by its parts,
 never as a whole, as a script's calls are: each part that reaches past the

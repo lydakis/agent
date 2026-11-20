@@ -1003,4 +1003,49 @@ mod tests {
         }
         assert_eq!(project_of("shop.web/typed-errors"), "shop.web");
     }
+
+    /// How long a board's listing takes with 50 boards and 1,000 items,
+    /// half of them claimed and a fifth done: run by hand, in release.
+    #[test]
+    #[ignore]
+    fn listing_fifty_boards_of_a_thousand_items_takes() {
+        let home = home("timing");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        let made = std::time::Instant::now();
+        for n in 0..1000 {
+            let board = format!("shop/b{}", n % 50);
+            let name = format!("i{n}");
+            let mut item = add(&name, &format!("Fix item {n}"), json!({}));
+            item["add"]["board"] = json!(board);
+            lead(item).unwrap();
+            if n % 2 == 0 {
+                lead(act(&name, "claim")).unwrap();
+            }
+            if n % 10 == 0 {
+                lead(act(&name, "done")).unwrap();
+            }
+        }
+        eprintln!("made 1,000 items in {:?}", made.elapsed());
+        for round in 0..3 {
+            let started = std::time::Instant::now();
+            let open = lead(json!({"open": "shop/b7"})).unwrap();
+            let one = started.elapsed();
+            let started = std::time::Instant::now();
+            let all = commons::list(
+                &commons::dir(&home),
+                0,
+                commons::LIST_BYTES,
+                &mut commons::Summaries::new(),
+                &[],
+                Some(&json!({"state": ["open", "claimed", "waiting"]})),
+            )
+            .unwrap();
+            eprintln!(
+                "round {round}: one board's open items ({}) in {one:?}; every board's items ({} listed) in {:?}",
+                open["threads"].as_array().map_or(0, Vec::len),
+                all["threads"].as_array().map_or(0, Vec::len),
+                started.elapsed()
+            );
+        }
+    }
 }
