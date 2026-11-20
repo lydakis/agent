@@ -1311,9 +1311,11 @@ pub fn source(
     // What its shape and the examples' warning take is left out of what
     // its topics may fill.
     let reserve = source.to_string().len()
-        + examples
-            .then_some(super::sources::EXAMPLES.len())
-            .unwrap_or(0);
+        + if examples {
+            super::sources::EXAMPLES.len()
+        } else {
+            0
+        };
     let mut said = status(store, &reading, sources, reserve);
     if let Some(now) = said.as_object_mut().and_then(|said| said.remove("now")) {
         let now = now
