@@ -307,9 +307,49 @@ async fn yields(yield_ms: Option<u64>) {
     }
 }
 /// The folders a turn reads for an agent it makes, each read by one at a
-/// time ([`Turn::on_folder`]), with the path its reader waits on.
+/// time ([`Turn::on_folder`]), with the path its reader waits on. A folder
+/// is held while a call waits on it or a read of it runs, and forgotten
+/// when the last hold ends.
 static FOLDER_READS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<FolderRead>>>> =
     std::sync::LazyLock::new(Default::default);
+
+fn folder_reads() -> std::sync::MutexGuard<'static, HashMap<String, Arc<FolderRead>>> {
+    FOLDER_READS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One hold on a folder in [`FOLDER_READS`]: the last to end forgets it.
+struct FolderHold {
+    folder: String,
+    entry: Arc<FolderRead>,
+}
+impl FolderHold {
+    fn new(folder: &str) -> Self {
+        let entry = folder_reads().entry(folder.to_owned()).or_default().clone();
+        FolderHold {
+            folder: folder.to_owned(),
+            entry,
+        }
+    }
+    fn again(&self) -> Self {
+        FolderHold {
+            folder: self.folder.clone(),
+            entry: self.entry.clone(),
+        }
+    }
+}
+impl Drop for FolderHold {
+    fn drop(&mut self) {
+        let mut reads = folder_reads();
+        // The map's and this one's are the last.
+        if Arc::strong_count(&self.entry) == 2
+            && reads
+                .get(&self.folder)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+        {
+            reads.remove(&self.folder);
+        }
+    }
+}
 
 struct FolderRead {
     one: Arc<tokio::sync::Semaphore>,
@@ -6474,8 +6514,8 @@ impl Turn {
         tokio::pin!(steered);
         steered.as_mut().enable();
         let since = std::time::Instant::now();
-        let reads = || FOLDER_READS.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = reads().entry(folder.to_owned()).or_default().clone();
+        let hold = FolderHold::new(folder);
+        let entry = &hold.entry;
         let unanswered = || {
             let at = (entry
                 .waiting
@@ -6496,22 +6536,22 @@ impl Turn {
             turn = entry.one.clone().acquire_owned() => turn.expect("a folder's turn is never closed"),
             () = &mut steered => return unanswered(),
         };
-        let noted = entry.waiting.clone();
+        // The read holds the folder until it ends, though this call may
+        // stop waiting on it first.
+        let reading = hold.again();
         let read = tokio::task::spawn_blocking(move || {
-            let _turn = turn;
-            agent_client::policy::noting(noted, read)
+            let noted = reading.entry.waiting.clone();
+            let done = agent_client::policy::noting(noted, read);
+            // The turn ends before the hold does.
+            drop(turn);
+            drop(reading);
+            done
         });
-        let done = tokio::select! {
+        tokio::select! {
             biased;
             done = read => done.map_err(|_| Error::new("folder_read_failed"))?,
-            () = &mut steered => return unanswered(),
-        };
-        // Answered: the folder is forgotten when no other read waits on it.
-        let mut held = reads();
-        if Arc::strong_count(&entry) == 2 {
-            held.remove(folder);
+            () = &mut steered => unanswered(),
         }
-        done
     }
 
     /// The bots in this one's namespace, as a name pattern, or every bot
@@ -9771,17 +9811,22 @@ mod tests {
         assert_eq!(error.code, "folder_unanswered");
         assert!(!started.load(Relaxed), "no second read started");
         // Once the file system answers, the first read's thread is let go
-        // and the folder is read again.
+        // and the folder forgotten, with no other call to read it...
+        let held = || folder_reads().contains_key(dir.to_str().unwrap());
+        assert!(held());
         let _ = answer.send(());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while held() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the folder is forgotten when its read ends");
+        // ...and it is read again.
         task.on_folder(dir.to_str().unwrap(), || Ok(()))
             .await
             .unwrap();
-        assert!(
-            !FOLDER_READS
-                .lock()
-                .unwrap()
-                .contains_key(dir.to_str().unwrap())
-        );
+        assert!(!held());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
