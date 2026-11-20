@@ -70,6 +70,8 @@ pub struct Agent {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub workspace: Option<String>,
+    /// The profile it was made in, which the daemon keeps on it.
+    pub profile: Option<String>,
 }
 
 /// How a turn ended, as a `bots` row's `last` says it.
