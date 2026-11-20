@@ -4110,9 +4110,9 @@ impl Database {
         {
             db.switch_release(bot_id)?;
         }
-        let mut after = 0;
-        while let Some(next) = db.switch_reclaim(after)? {
-            after = next;
+        let mut at = Reclaim::default();
+        while let Some(next) = db.switch_reclaim(at)? {
+            at = next;
         }
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -4990,7 +4990,20 @@ impl Database {
                     None => Value::Null,
                 }
             }
-            (Some(back), Some(_)) => back.state.clone(),
+            // Back on the branch it left: the window starts where the
+            // other model's did, at its copy there, so the next request
+            // reads no more than that window did. A start in what was
+            // there before is found again from the head, within the limits.
+            (Some(back), Some(_)) => {
+                let mut state = back.state.clone();
+                let start = context_start
+                    .filter(|n| written.first.contains_key(n))
+                    .and_then(|n| written.first_of(n));
+                if let Some(object) = state.as_object_mut() {
+                    object.insert("context_start".into(), json!(start));
+                }
+                state
+            }
             (None, Some(_)) => json!({
                 "context_start": context_start.map(|n| written.first_of(n)),
                 "family_start": written.first_new,
@@ -5204,7 +5217,10 @@ impl Database {
                 head,
                 from_depth: node_depth(conn, back.node)? + 1,
                 root: Some(back.left),
-                wanted: plan.bot.work.read.into_iter().collect(),
+                wanted: [plan.bot.work.read, context_start]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             });
             plan.back = Some(back);
             return Ok(Some(plan));
@@ -5326,9 +5342,11 @@ impl Database {
     /// bot left, from switch rows after `after`, each freed down to what
     /// another bot still reaches. Each row looked at and each node freed
     /// counts toward the page. Where to go on from, or `None` when all of
-    /// it was looked at.
-    pub fn switch_reclaim(&mut self, after: i64) -> Result<Option<i64>> {
+    /// it was looked at. A sweep that freed anything starts over, since a
+    /// branch it freed may have held an earlier one (by its summary, say).
+    pub fn switch_reclaim(&mut self, at: Reclaim) -> Result<Option<Reclaim>> {
         let tx = self.conn.savepoint()?;
+        let Reclaim { after, mut freed } = at;
         let mut left = TRANSLATE_PAGE;
         loop {
             let row: Option<(i64, Option<i64>)> = tx
@@ -5345,13 +5363,14 @@ impl Database {
                     tx.prepare_cached("UPDATE translating SET tip=? WHERE id=?")?
                         .execute(params![tip, id])?;
                     tx.commit()?;
-                    return Ok(Some(after));
+                    return Ok(Some(Reclaim { after, freed }));
                 }
                 if node_reached(&tx, node, "", -1)? {
                     break;
                 }
                 tip = free_node(&tx, node, "")?;
                 left -= 1;
+                freed = true;
             }
             tx.prepare_cached("DELETE FROM translating WHERE id=?")?
                 .execute([id])?;
@@ -5361,7 +5380,10 @@ impl Database {
         loop {
             if left == 0 {
                 tx.commit()?;
-                return Ok(Some(cursor));
+                return Ok(Some(Reclaim {
+                    after: cursor,
+                    freed,
+                }));
             }
             let row: Option<(i64, Option<i64>)> = tx
                 .prepare_cached(
@@ -5371,14 +5393,20 @@ impl Database {
                 .optional()?;
             let Some((switch, at)) = row else {
                 tx.commit()?;
-                return Ok(None);
+                return Ok(freed.then_some(Reclaim::default()));
             };
             left -= 1;
-            match free_left(&tx, switch, at, "", -1, &mut left)? {
+            let before = left;
+            let done = free_left(&tx, switch, at, "", -1, &mut left)?;
+            freed |= left < before;
+            match done {
                 // Freed as far as the page goes: looked at again next.
                 None => {
                     tx.commit()?;
-                    return Ok(Some(switch - 1));
+                    return Ok(Some(Reclaim {
+                        after: switch - 1,
+                        freed,
+                    }));
                 }
                 Some(_) => cursor = switch,
             }
@@ -10474,7 +10502,16 @@ impl Database {
             None
         };
         let elided = stub.as_ref().map_or(0, |stub| (weight - stub.len()) as i64);
-        let head = insert_node(&tx, bot.head, &item, None, None, elided, pictured)?;
+        let head = insert_node(
+            &tx,
+            bot.head,
+            &item,
+            None,
+            None,
+            elided,
+            pictured,
+            Some(epoch_ms()),
+        )?;
         if head != next {
             return fail("storage_error");
         }
@@ -16587,9 +16624,9 @@ impl Database {
                     json!(totals[key].as_i64().unwrap_or(0) + piece[key].as_i64().unwrap_or(0));
             }
             if piece["done"] == true {
-                let mut after = 0;
-                while let Some(next) = self.switch_reclaim(after)? {
-                    after = next;
+                let mut at = Reclaim::default();
+                while let Some(next) = self.switch_reclaim(at)? {
+                    at = next;
                 }
                 return Ok(totals);
             }
@@ -22151,7 +22188,16 @@ fn node_with_turn(
     item: &[u8],
     turn: Option<i64>,
 ) -> Result<i64> {
-    insert_node(conn, parent, item, turn, None, 0, Pictured::default())
+    insert_node(
+        conn,
+        parent,
+        item,
+        turn,
+        None,
+        0,
+        Pictured::default(),
+        Some(epoch_ms()),
+    )
 }
 /// A node's pictures: how many, and what they add to its length beyond
 /// their weight.
@@ -22270,6 +22316,7 @@ fn prompt_node(
         Some(message),
         elided,
         prompted.pictured,
+        Some(epoch_ms()),
     )?;
     // How the prompt begins, kept here rather than parsed by each read.
     conn.prepare_cached("INSERT OR REPLACE INTO openings(node,text,chars) VALUES (?1,?2,?3)")?
@@ -22368,6 +22415,13 @@ fn has_ready(conn: &Connection, bot: &str) -> Result<bool> {
     Ok(conn
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM messages WHERE bot=? AND status='ready')")?
         .query_row([bot], |r| r.get(0))?)
+}
+/// Where `Database::switch_reclaim` goes on from: the switch row after
+/// which it looks next, and whether this sweep has freed anything yet.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Reclaim {
+    after: i64,
+    freed: bool,
 }
 /// What a translation wrote, by the source node each came from.
 #[derive(Default)]
@@ -22543,10 +22597,11 @@ impl Translation {
                 i64,
                 Option<Vec<u8>>,
                 Option<Vec<u8>>,
+                Option<i64>,
             );
-            let (item, turn, message, extra, count, stub, declined): Row = conn
+            let (item, turn, message, extra, count, stub, declined, written_ms): Row = conn
             .prepare_cached(
-                "SELECT n.item,n.turn,n.message,n.pictured,n.pictures,s.item,d.item FROM nodes n
+                "SELECT n.item,n.turn,n.message,n.pictured,n.pictures,s.item,d.item,n.written_ms FROM nodes n
                  LEFT JOIN stubs s ON s.node=n.id LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
             )?
             .query_row([old], |r| {
@@ -22558,6 +22613,7 @@ impl Translation {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             })?;
             // A result's stub and declined form are the same result: they
@@ -22623,6 +22679,7 @@ impl Translation {
                     message.filter(|_| lead),
                     elided,
                     pictured,
+                    written_ms,
                 )?;
                 if new != next {
                     return fail("storage_error");
@@ -22779,6 +22836,8 @@ fn next_node(conn: &Connection) -> Result<i64> {
 /// `pictured`: what the item's pictures add beyond their weight, which
 /// `total_bytes` leaves out: context accounting counts a picture at its
 /// token cost, and only a request's length counts its bytes.
+/// `written_ms`: when it was written; a translated copy keeps its source's.
+#[allow(clippy::too_many_arguments)]
 fn insert_node(
     conn: &Connection,
     parent: Option<i64>,
@@ -22787,6 +22846,7 @@ fn insert_node(
     message: Option<i64>,
     elided: i64,
     pictured: Pictured,
+    written_ms: Option<i64>,
 ) -> Result<i64> {
     let (bytes, depth, saved, thought): (i64, i64, i64, i64) = match parent {
         Some(id) => conn
@@ -22833,7 +22893,7 @@ fn insert_node(
         thought + thinking,
         pictured.extra,
         pictured.count,
-        epoch_ms(),
+        written_ms,
         message
     ])?;
 

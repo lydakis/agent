@@ -8346,12 +8346,12 @@ async fn delete_pieces(
 
 /// Free what switches left that no bot owns, a page per store job.
 async fn reclaim(store: &Store) -> Result<()> {
-    let mut after = 0;
+    let mut at = agent_runtime::store::Reclaim::default();
     while let Some(next) = store
-        .op("switch_reclaim", move |db| db.switch_reclaim(after))
+        .op("switch_reclaim", move |db| db.switch_reclaim(at))
         .await?
     {
-        after = next;
+        at = next;
     }
     Ok(())
 }

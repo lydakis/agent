@@ -5,8 +5,8 @@ use agent_runtime::{
     store::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Joined, Lifted,
-        Limit, Planning, ProcessKind, QuoteRef, Retained, Settings, Strip, Switch, Trailer,
-        TurnBudget, TurnOptions, Wake,
+        Limit, Planning, ProcessKind, QuoteRef, Reclaim, Retained, Settings, Strip, Switch,
+        Trailer, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome, ToolList},
 };
@@ -8088,9 +8088,9 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
         settings.context_items() as i64,
     );
     let reclaim = |db: &mut Database| {
-        let mut after = 0;
-        while let Some(next) = db.switch_reclaim(after).unwrap() {
-            after = next;
+        let mut at = Reclaim::default();
+        while let Some(next) = db.switch_reclaim(at).unwrap() {
+            at = next;
         }
     };
     // Let go after a page: what it wrote goes, and the bot is as it was.
@@ -8112,7 +8112,7 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
     // Let go, the bot is free at once, and what it wrote is freed a page
     // at a time.
     assert!(db.switch_release(pieces.bot_id()).unwrap());
-    assert!(db.switch_reclaim(0).unwrap().is_some());
+    assert!(db.switch_reclaim(Reclaim::default()).unwrap().is_some());
     assert!(nodes() > before);
     reclaim(&mut db);
     assert_eq!(nodes(), before);
@@ -8343,6 +8343,139 @@ fn a_deletion_takes_its_switch_rows_a_page_at_a_time() {
     assert!(pieces >= 5, "{pieces}");
     assert_eq!(rows(), 0);
     drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_way_back_starts_where_the_other_models_window_did_and_copies_keep_their_times() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-switch-back-window-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut small = db.inspect("Bob").unwrap().settings.clone();
+    small.context_items = Some(6);
+    db.set_settings("Bob", None, &["context_items".to_owned()], &small)
+        .unwrap();
+    let turn = begun(&mut db, "Bob", "r0");
+    db.append(turn, vec![assistant("a")], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let left = db.inspect("Bob").unwrap().head.unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let to = |family, provider, model| Switch {
+        provider,
+        model,
+        effort: None,
+        family,
+        custom: Default::default(),
+    };
+    db.switch_family(
+        "Bob",
+        None,
+        &to(Family::Anthropic, "anthropic", "synthetic-claude"),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let read = Connection::open(&path).unwrap();
+    // Each copy was written when its source was.
+    let (copies, moved): (i64, i64) = read
+        .query_row(
+            "SELECT count(*),COALESCE(SUM(n.written_ms IS NOT s.written_ms),0)
+             FROM translated t JOIN nodes n ON n.id=t.node JOIN nodes s ON s.id=t.source",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(copies >= 2, "{copies}");
+    assert_eq!(moved, 0);
+    // Many turns on the other side, then back: the window starts where the
+    // other model's did, not where it was when it left.
+    for n in 0..20 {
+        let turn = begun(&mut db, "Bob", &format!("r{}", n + 1));
+        let reply = serde_json::to_vec(
+            &json!({"role":"assistant","content":[{"type":"text","text":format!("b{n}")}]}),
+        )
+        .unwrap()
+        .into();
+        db.append(turn, vec![reply], &[], Some(&usage(100, 10, "m")))
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    db.switch_family(
+        "Bob",
+        None,
+        &to(Family::Responses, "openai", "synthetic-model"),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let head = db.inspect("Bob").unwrap().head.unwrap();
+    let (start, start_depth, head_depth): (i64, i64, i64) = read
+        .query_row(
+            "SELECT b.context_start,s.depth,h.depth FROM bots b JOIN nodes s ON s.id=b.context_start
+             JOIN nodes h ON h.id=b.head WHERE b.name='Bob'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(start > left, "{start} {left}");
+    assert!(head_depth - start_depth < 8, "{head_depth} {start_depth}");
+    assert!(
+        db.window("Bob", 1 << 30, 6)
+            .unwrap()
+            .is_some_and(|w| w.ids.len() <= 6)
+    );
+    assert!(head > left);
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_reclaim_sweeps_again_once_a_later_branch_lets_go_of_an_earlier_one() {
+    let path =
+        std::env::temp_dir().join(format!("agent-switch-sweep-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    for name in ["X", "Y"] {
+        db.create(name, Some("/synthetic"), binding()).unwrap();
+        let turn = begun(&mut db, name, "r1");
+        db.append(turn, vec![assistant("a")], &[], Some(&usage(100, 10, "m")))
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    let x = db.inspect("X").unwrap().head.unwrap();
+    let y = db.inspect("Y").unwrap().head.unwrap();
+    // Two branches no bot owns, the later one's summary made on the
+    // earlier one's: the earlier is held until the later is freed.
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch(&format!(
+        "UPDATE bots SET head=NULL,context_start=NULL,work_read=NULL;
+         UPDATE messages SET node=NULL;
+         DELETE FROM checkpoints;
+         INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to)
+            VALUES ({x},NULL,{x},'s','[]',0,0),({y},{x},{y},'s','[]',0,0);
+         INSERT INTO switches(bot_id,node,root,first,left,back,from_provider,from_family,from_model,
+            to_provider,to_family,to_model,state,at_ms)
+            VALUES (NULL,{x},NULL,{x},{x},0,'openai','responses','m','anthropic','anthropic','c','{{}}',0),
+                   (NULL,{y},NULL,{y},{y},0,'openai','responses','m','anthropic','anthropic','c','{{}}',0);"
+    ))
+    .unwrap();
+    let count = |sql: &str| -> i64 { raw.query_row(sql, [], |r| r.get(0)).unwrap() };
+    let nodes = count("SELECT count(*) FROM nodes");
+    let mut at = Reclaim::default();
+    while let Some(next) = db.switch_reclaim(at).unwrap() {
+        at = next;
+    }
+    assert_eq!(count("SELECT count(*) FROM switches"), 0);
+    assert_eq!(count("SELECT count(*) FROM compactions"), 0);
+    assert_eq!(count("SELECT count(*) FROM nodes"), nodes - 4);
+    drop(raw);
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
