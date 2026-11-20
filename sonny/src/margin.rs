@@ -1075,9 +1075,14 @@ impl Margin {
 
     /// The project's agents as `/status` read them now
     /// ([`crate::status::agents`]), in the window of `here`.
+    /// Only rows that moved draw it again: a count that changes what the
+    /// footer says and no row here (an idle agent's, a done one's) does
+    /// not.
     pub fn set_agents(&mut self, agents: crate::status::Agents, here: &str) {
-        if self.agents.0 != agents || self.agents.1 != here {
-            self.agents = (agents, here.to_owned());
+        let (was, at) = &self.agents;
+        let moved = was.project != agents.project || was.listed != agents.listed || at != here;
+        self.agents = (agents, here.to_owned());
+        if moved {
             self.changes += 1;
         }
     }
@@ -2261,8 +2266,10 @@ mod tests {
             text.find(what)
                 .unwrap_or_else(|| panic!("{what} in {text}"))
         };
-        assert!(at("Tally invoices · 2 working") < at("lead · waiting on halves"));
-        assert!(at(" ● Round half cents to even  halves") < at(" ───"));
+        // The first row is the project, which is its lead; no counts.
+        assert!(at("Tally invoices") < at(" lead") && at(" lead") < at("   ● Round half"));
+        assert!(!text.contains("working") && !text.contains(" · "), "{text}");
+        assert!(at("   ● Round half cents to even  halves") < at(" ───"));
         assert!(at(" ───") < at("Plan") && at("Plan") < at("Repro"));
         // The plan right under the rule.
         let rows: Vec<&str> = text.lines().collect();
@@ -2296,6 +2303,17 @@ mod tests {
             .position(|line| line.spans.iter().any(|s| s.content == "lead"))
             .unwrap();
         assert!(marks.contains(&(lead_row, Mark::Link(format!("{BUTTON}task/calc.lead")))));
+        // A count that moves no row here (an idle agent's, a done one's)
+        // draws nothing again; a row that moved does.
+        let changed = margin.changes;
+        let mut counted = agents(vec![lead(), halves()]);
+        counted.counts.idle = 4;
+        margin.set_agents(counted, "calc.halves");
+        assert_eq!(margin.changes, changed);
+        let mut moved = agents(vec![lead(), halves()]);
+        moved.listed[1].state = "needs you".into();
+        margin.set_agents(moved, "calc.halves");
+        assert_eq!(margin.changes, changed + 1);
         // No task going: the plan and notes alone, drawn again.
         margin.set_agents(agents(vec![lead()]), "calc.lead");
         let text = drawn(&mut margin, Path::new("/"));

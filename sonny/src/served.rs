@@ -188,10 +188,10 @@ fn start() -> Value {
                 "name": {"type": "string", "minLength": 1, "maxLength": 100,
                     "description": "A short name, valid as a git branch, that no agent of this project has \
                         yet; Sonny puts your project's name and a dot before it."},
+                "title": {"type": "string", "maxLength": crate::title::WRITTEN,
+                    "description": "Verb first, as Round half cents to even."},
                 "brief": {"type": "string", "minLength": 1,
-                    "description": "Everything the task needs, since it never sees your conversation. \
-                        Its first line is the title the person knows the task by, so write it as one: \
-                        a few words, 60 characters at most, as Round half cents to even."},
+                    "description": "Everything the task needs, since it never sees your conversation."},
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
@@ -220,7 +220,7 @@ fn start() -> Value {
                     "description": "Why none of your tasks still there should take this work, since a task \
                         given more keeps what it learned; without it, a start while you have tasks is refused, listing them."}
             },
-            "required": ["name", "brief"],
+            "required": ["name", "title", "brief"],
             "additionalProperties": false
         },
         "answered_by": TAG,
@@ -316,8 +316,9 @@ fn project() -> Value {
             "properties": {
                 "folder": {"type": "string", "minLength": 1, "description": "The project's folder, absolute."},
                 "title": {"type": "string", "minLength": 1,
-                    "description": "What the person calls the project, as Tally invoices; they \
-                        can change it in its file."},
+                    "description": format!("What the person calls the project, in two or three \
+                        words, {} characters at most, as Tally invoices; they can change it in its \
+                        file.", crate::title::WRITTEN)},
                 "model": {"type": "string", "minLength": 1,
                     "description": "The lead's PROVIDER/MODEL, as the person picked; else yours."},
                 "effort": {"type": "string", "minLength": 1, "description": "The lead's effort level."},
@@ -724,6 +725,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
+            let title = crate::title::checked(&text("title").unwrap_or_default())
+                .map_err(|e| ("invalid_arguments", e))?;
             // The daemon bounds how deep a line goes and refuses the
             // agent past it; asked first, by its own facts, so a start it
             // would refuse makes no folder and runs no setup.
@@ -835,6 +838,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                         true => format!("{short}.{}", n + 1),
                         false => short.clone(),
                     },
+                    title: Some(title.clone()),
                     brief: text("brief").unwrap_or_default(),
                     profile,
                     permissions: text("permissions"),
@@ -2897,6 +2901,48 @@ mod tests {
         assert_eq!(running(&json!({})), Duration::ZERO);
         // Every other wait is the call's whole time.
         assert!(left(&call(now + 600_000)) > Duration::from_secs(598));
+    }
+
+    #[test]
+    fn a_task_and_a_project_are_titled_in_30_characters_and_a_brief_is_no_title() {
+        let said = |tool: Value, field: &str| {
+            tool["parameters"]["properties"][field]["description"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let title = said(project(), "title");
+        assert!(
+            title.contains("in two or three words, 30 characters at most, as Tally invoices"),
+            "{title}"
+        );
+        assert!("Tally invoices".chars().count() <= crate::title::WRITTEN);
+        // A task's title is written by whoever starts it, apart from its
+        // brief, and held to 30 characters by the schema and by Sonny, which
+        // refuses an empty one too, naming why.
+        let task = said(start(), "title");
+        assert!(
+            task.contains("Verb first, as Round half cents to even"),
+            "{task}"
+        );
+        assert_eq!(
+            start()["parameters"]["properties"]["title"]["maxLength"],
+            30
+        );
+        assert!(
+            start()["parameters"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("title"))
+        );
+        let brief = said(start(), "brief");
+        assert!(
+            !brief.contains("title") && !brief.contains("first line"),
+            "{brief}"
+        );
+        assert!("Round half cents to even".chars().count() <= crate::title::WRITTEN);
     }
 
     #[test]

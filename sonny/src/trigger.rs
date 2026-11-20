@@ -1686,7 +1686,7 @@ pub struct Restored {
 }
 
 /// How much of a restored list one note carries: the daemon takes a
-/// message of at most 256 KiB, and a definition is at most 128 KiB.
+/// message of at most 1 MiB, and a definition is at most 128 KiB.
 const RESTORED_PART: usize = 128 * 1024;
 
 /// What the first lead of `project` opened since a restore is to set up

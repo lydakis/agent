@@ -1978,8 +1978,8 @@ class AutoApproverTests(ModelFixture):
         self.judge.answer = shell_danger
         # A 200 KiB script, as a monitor rewrites its own: written, then run.
         big = '# step\n' * (200 * 1024 // 7) + 'printf ok\n'
-        # Past the judge's input budget whole.
-        huge = 'x' * (300 * 1024) + '\nprintf ok\n'
+        # Past the judge's input budget whole, within what a write takes.
+        huge = 'x' * (1020 * 1024) + '\nprintf ok\n'
         self.model.call_script = [('write', {'path': 'run.sh', 'content': 'printf DANGER'}),
                                   ('shell', {'command': 'sh run.sh'}),
                                   ('write', {'path': 'big.sh', 'content': big}),
@@ -2015,7 +2015,7 @@ class AutoApproverTests(ModelFixture):
 
     def test_a_file_too_long_for_the_judge_goes_to_the_person(self):
         self.judge.answer = lambda round, id: .05
-        huge = 'x' * (300 * 1024) + '\nprintf ok\n'
+        huge = 'x' * (1020 * 1024) + '\nprintf ok\n'
         self.model.call_script = [('write', {'path': 'huge.sh', 'content': huge}),
                                   ('shell', {'command': 'sh huge.sh'})]
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')

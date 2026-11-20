@@ -81,6 +81,12 @@ impl Keys {
         self.key("↑↓", "pick")
     }
 
+    /// `ctrl+f find`, the same in every view of rows or text: declared
+    /// here once, so the title row and the `?` sheet both say it.
+    pub fn find(self) -> Self {
+        self.key(crate::find::KEY, "find")
+    }
+
     /// Another key and what it does.
     pub fn key(mut self, key: impl Into<String>, does: impl Into<String>) -> Self {
         self.pairs.push((key.into(), does.into()));
@@ -141,6 +147,8 @@ impl std::fmt::Display for Keys {
 enum Kind {
     /// `↑↓`, the same in every view.
     Pick,
+    /// `ctrl+f find`, the same in every view.
+    Find,
     /// The way back to the conversation: `ctrl+\`, `tab`.
     Back,
     /// A view's own letters.
@@ -158,6 +166,7 @@ fn kind_of(key: &str, does: &str) -> Kind {
         ("enter", _) => Kind::Enter,
         ("↑↓", _) => Kind::Pick,
         ("tab", "keys") => Kind::Back,
+        (crate::find::KEY, "find") => Kind::Find,
         (key, _) if key.starts_with("ctrl+\\") => Kind::Back,
         _ => Kind::Rest,
     }
@@ -165,7 +174,8 @@ fn kind_of(key: &str, does: &str) -> Kind {
 
 /// `said` joined in at most `room` columns. The last pair stays, as `esc`
 /// does wherever it is named. Before it, `↑↓ pick` goes first, since the
-/// arrows are the same in every view; then the way back; then the view's
+/// arrows are the same in every view; then `ctrl+f find`, the same in
+/// every view too; then the way back; then the view's
 /// letters, from the right, since a letter is the one key a person cannot
 /// guess; then `enter`.
 fn fitted(mut said: Vec<(String, String, Kind)>, room: usize) -> String {
@@ -173,6 +183,7 @@ fn fitted(mut said: Vec<(String, String, Kind)>, room: usize) -> String {
         let before = &said[..said.len().saturating_sub(1)];
         let last_of = |wanted: Kind| before.iter().rposition(|(_, _, kind)| *kind == wanted);
         let at = last_of(Kind::Pick)
+            .or_else(|| last_of(Kind::Find))
             .or_else(|| last_of(Kind::Back))
             .or_else(|| last_of(Kind::Rest))
             .or_else(|| last_of(Kind::Enter));
@@ -293,6 +304,22 @@ mod tests {
         // With no esc named, the last pair stays all the same.
         let agent = "ctrl+g main view · ctrl+t its tab · ctrl+\\ conversation";
         assert_eq!(fit(agent, 40), "ctrl+g main view · ctrl+\\ conversation");
+        // `ctrl+f find` gives way after the pick and before the way back
+        // and the view's letters, being the same in every view.
+        let found = Keys::new()
+            .pick()
+            .enter(Enter::Open)
+            .find()
+            .key("r", "run")
+            .esc(Esc::Close);
+        let whole = "↑↓ pick · enter open · ctrl+f find · r run · esc close";
+        assert_eq!(found.fit(80), whole);
+        assert_eq!(
+            found.fit(45),
+            "enter open · ctrl+f find · r run · esc close"
+        );
+        assert_eq!(found.fit(35), "enter open · r run · esc close");
+        assert_eq!(fit(whole, 35), "enter open · r run · esc close");
         // A line written out fits the same way.
         assert_eq!(fit(all, 30), "enter open · esc close");
         assert_eq!(

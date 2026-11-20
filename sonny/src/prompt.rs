@@ -89,6 +89,11 @@ impl Prompt {
         self.styled.take();
     }
 
+    /// Whether the cursor is before every word, nothing selected.
+    pub fn at_start(&self) -> bool {
+        self.at == 0 && self.selection().is_none()
+    }
+
     /// The selected bytes, when any are.
     pub fn selection(&self) -> Option<Range<usize>> {
         let anchor = self.anchor?;

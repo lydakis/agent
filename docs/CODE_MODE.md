@@ -941,7 +941,8 @@ calls failed at once after a cut. Read in source and reproduced in a test;
 the box's own logs were not available.
 
 Now a window or session adds only the companions the daemon keeps none of
-(`Companions::Add`, sonny/src/main.rs). `sonny upgrade` puts its own build
+(`Companions::Add`, sonny/src/main.rs), and, since 11-20, replaces those an
+older release of Sonny started. `sonny upgrade` puts its own build
 in their place (`Companions::Replace`), and so does a window that started
 the daemon itself (one that found none, or an older one it replaced),
 since its companions have only just started with it. After a hand-made

@@ -364,9 +364,9 @@ approval gate as a call that leaves the sandbox would; `memory` and
   so a hijacked release is usually yanked before an update can pick it up.
 - A tag push runs a workflow that holds no secrets and does nothing;
   the release and Homebrew workflows run from `main`'s own definitions on
-  its completion, verify the tag points to a commit on `main` and that
-  both manifests carry the tag's version, and refuse a tag that moved
-  during the build.
+  its completion, verify the tag points to a commit on `main`, write the
+  tag's version into the manifests (main's say 0.0.0) before testing and
+  building, and refuse a tag that moved during the build.
 - Release assets (the source archive, the formulas, the static Linux
   builds) carry a GitHub build attestation from the release workflow.
   Publishing to the Homebrew tap verifies it, so assets swapped on the

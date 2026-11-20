@@ -176,19 +176,19 @@ Claude Code's agents take `isolation` each time.
 
 A task and a project each have a title beside their name: a few words you
 know the work by, as `Round half cents to even` beside `halves`. The name
-stays the handle you address, link and click. Every agent's title is its
-first message's first line, cut at a word to 60 characters, as Codex names
-a thread from its first message: a task's is its brief's first line, which
-the lead writes as one, and one you start with `/new` takes yours. An agent
-started with none noted, such as a helper or a task started before tasks
-had titles, has its first line read once from its history, beside the
-window, and noted. A lead sets a project's with `new_project`'s `title`,
-which goes in `.agents/project.toml` as `title`, where you can change it; a
-folder that is a project already keeps its own, and one with none shows its
-name. A lead's title is its project's. Sonny keeps each agent's beside the
-store (`STORE.titles/NAME`) with the agent's id, so one given the name later
-takes none of it, and a noted title is never read again or replaced; the
-daemon keeps none.
+stays the handle you address, link and click. Whoever starts a task writes
+its title with `start_task`'s `title`: a sentence that starts with its verb,
+30 characters at most, what the pane's row holds beside a name; the brief
+stays the task's alone. A lead sets a project's with `new_project`'s
+`title`, two or three words, 30 characters at most, which goes in
+`.agents/project.toml` as `title`, where you can change it; a folder that
+is a project already keeps its own, and one with none shows its name. A
+lead's title is its project's. Any other agent, such as one made with
+`spawn_agent` or started with `/new`, has no title and shows its name; one
+noted before this keeps its own. Sonny draws a title as written and
+changes no letter. It keeps each task's beside the store
+(`STORE.titles/NAME`) with the agent's id, so one given the name later
+takes none of it; the daemon keeps none.
 Every row that lists an agent leads with its title: `/status`, `/switch`
 and the tasks a lead started.
 
@@ -2157,6 +2157,20 @@ beside included; while the pane has them the composer's `›` is muted,
 and a key the view does not name does nothing (`q` included), never
 typed into the composer.
 
+`ctrl+f` finds in a view of rows, as it does in Projects: `/status`,
+`/background` and `/commons`'s list of threads. What you type narrows the
+rows to those that say it, in any case unless you type a capital: a
+section with no match is not drawn, a fold is searched and stands open,
+and a row that holds a match (a task whose helper says it) stays, to keep
+it in its place. The pick goes to the first match, and `↑` `↓` and `enter`
+stay the view's. The find row is the view's last, a muted `find` and what
+you typed. `esc` drops the find and puts back the rows and the pick; the
+next `esc` closes the view. Each view's title names `ctrl+f find` with its
+keys. Find reads only what the view already read, nothing from the daemon
+as you type.
+
+![ctrl+f with a find typed in /status, /background and /commons: each narrowed to the rows that say it, the pick on the first, the find row last](../docs/sonny/find-views.png)
+
 Every view is laid out the same way, too. Its title row is the command
 that opens it (`mcp`, not "MCP servers") and the keys it takes. Under it
 the head says whose view it is, bold: the project (`shop`), `every
@@ -2379,25 +2393,35 @@ notes, one plan however often it changes; each `plan` call in the
 conversation is a row of how far it had got, and where the margin cannot
 show, the newest is the whole checklist.
 
-At rest the pane has two parts. On top, Sonny's: the project's agents,
-under the head `/status` has (the project's title and a count for each
-group with any). The lead is the first row whatever its state, its name
-and state word alone; then every task that needs you, failed or works, in
-that order, each its mark, its title and its name, a task's helpers
-counted under it (`└ 2 helpers, 1 working`), and a workflow as a row with
-its strip under the agent that runs it. The list is the project's, so it
-is the same in the lead's window and in each task's: from a task, the lead
-and the other tasks are one click away. The agent the window is on is in
-bold and plain, not blue. Idle and done tasks are not there: `/status`
-has them, and opens the whole list in the same place. Under a muted rule,
-the agent's: the margin, its plan and notes. Sonny draws the list from
-what `/status` reads, as it draws the footer's counts; it is no tool call
-and no note, so no agent writes it. With no task in the list it is not
-drawn, and the pane is the margin alone; the pane opens for it as it does
-for a plan. A click on a row, or `enter` with it picked, goes to its
-agent.
+At rest the pane has two parts. On top, Sonny's: the project's agents.
+The first row is the project, which is its lead: the lead's mark, the
+project's title and `lead`, a link; it is the way back from a task. No
+head and no counts stand over it: the footer counts the project's agents
+under the composer. The tasks hang two columns under it: every task that
+needs you, failed or works, in that order, each its mark, its title and
+its name, a link, the names in one column; a task's helpers counted under
+it (`└ 2 helpers, 1 working`), and a workflow as a row with its strip under
+the agent that runs it. Too long for its row, a title is cut at a word;
+the mark and the name stay. The list is the project's, so it is the same
+in the lead's window and in each task's: from a task, the lead and the
+other tasks are one click away. The agent the window is on has its whole
+row on the band your words sit on, from the pane's inset to its edge, its
+title and name in bold and the name plain, not blue; with `NO_COLOR` it
+is the bold alone. Idle and done tasks are not there: `/status` has them,
+and opens the whole list in the same place. Under a muted rule, the
+agent's: the margin, its plan and notes. Sonny draws the list from what
+`/status` reads, as it draws the footer's counts; it is no tool call and
+no note, so no agent writes it. With no task in the list it is not drawn,
+and the pane is the margin alone; the pane opens for it as it does for a
+plan. A click on a row, or `enter` with it picked, goes to its agent.
+While Projects is open, the pane draws the picked project's agents the
+same way, with no row on the band.
 
-![The project's agents above the margin at 150, 120, 60 and 44 columns, from the lead's window and from a task's](../docs/sonny/margin-agents.png)
+![The project's agents above the margin at 150, 120, 60 and 44 columns, from the lead's window, from a task's and with Projects open, in a dark theme](../docs/sonny/margin-agents.png)
+
+![The same in a light theme](../docs/sonny/margin-agents-light.png)
+
+![The same with NO_COLOR: the agent you are on is its bold alone](../docs/sonny/margin-agents-no-color.png)
 
 The notes are kept by agent in
 `~/.agent/sonny/margin/`, with the newest node of the agent's history they

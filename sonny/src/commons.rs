@@ -2038,6 +2038,9 @@ pub struct View {
     /// The golden tickets the week's invites held, each one agent's.
     golden: usize,
     notice: Option<String>,
+    /// `ctrl+f`: what is typed narrows the threads to those that say it,
+    /// and the thread picked when the find began, which `esc` puts back.
+    finding: Option<crate::find::Find<usize>>,
 }
 
 /// What a key did to the view.
@@ -2061,6 +2064,7 @@ impl View {
             known: Summaries::new(),
             golden: 0,
             notice: None,
+            finding: None,
         };
         view.reload();
         view
@@ -2115,9 +2119,84 @@ impl View {
         self.threads.get(self.selected)?["thread"].as_str()
     }
 
+    /// Whether the thread at `index` says what is typed to find, in its
+    /// title or who wrote in it, as its row does: every thread before
+    /// anything is typed.
+    fn shown(&self, index: usize) -> bool {
+        let Some(find) = self.finding.as_ref().filter(|find| find.typed()) else {
+            return true;
+        };
+        let Some(thread) = self.threads.get(index) else {
+            return false;
+        };
+        ["title", "started_by", "last_by"]
+            .iter()
+            .any(|key| find.says(thread[*key].as_str().unwrap_or_default()))
+    }
+
+    /// The thread shown next to the pick, after it or before it.
+    fn step(&self, down: bool) -> usize {
+        let mut at = self.selected;
+        loop {
+            at = match down {
+                true if at + 1 < self.threads.len() => at + 1,
+                false if at > 0 => at - 1,
+                _ => return self.selected,
+            };
+            if self.shown(at) {
+                return at;
+            }
+        }
+    }
+
+    /// The pick on the first thread that says what is typed.
+    fn found(&mut self) {
+        if let Some(at) = (0..self.threads.len()).find(|at| self.shown(*at)) {
+            self.selected = at;
+        }
+    }
+
+    /// Words pasted while finding, as if typed: whether a find took them.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(find) = self.finding.as_mut().filter(|_| self.open.is_none()) else {
+            return false;
+        };
+        find.paste(text);
+        self.found();
+        true
+    }
+
+    /// Whether a find is under way.
+    pub fn finding(&self) -> bool {
+        self.finding.is_some() && self.open.is_none()
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> Key {
         self.notice = None;
         let opened = self.open.is_some();
+        // `ctrl+f` in the list: what is typed narrows the threads, the pick
+        // on the first that says it; `esc` drops the find and puts the
+        // pick back. The arrows and `enter` stay the list's.
+        if !opened {
+            if let Some(find) = &mut self.finding {
+                match find.key(&key) {
+                    crate::find::Typed::Dropped => {
+                        self.selected = (self.finding.take().map(|find| find.before))
+                            .unwrap_or(self.selected)
+                            .min(self.threads.len().saturating_sub(1));
+                        return Key::Stay;
+                    }
+                    crate::find::Typed::Changed => {
+                        self.found();
+                        return Key::Stay;
+                    }
+                    crate::find::Typed::Other => {}
+                }
+            } else if crate::find::opens(&key) && !self.threads.is_empty() {
+                self.finding = Some(crate::find::Find::new(self.selected));
+                return Key::Stay;
+            }
+        }
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Key::Close;
@@ -2128,17 +2207,14 @@ impl View {
                 ) => {}
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left if opened => self.open = None,
             KeyCode::Esc => return Key::Close,
-            KeyCode::Up | KeyCode::Char('k') if !opened => {
-                self.selected = self.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') if !opened => {
-                self.selected = (self.selected + 1).min(self.threads.len().saturating_sub(1));
-            }
+            KeyCode::Up | KeyCode::Char('k') if !opened => self.selected = self.step(false),
+            KeyCode::Down | KeyCode::Char('j') if !opened => self.selected = self.step(true),
             KeyCode::Char('a') if !opened => {
                 self.this = !self.this;
                 self.reload();
             }
-            KeyCode::Enter | KeyCode::Right if !opened => {
+            // A find that keeps nothing picks nothing to open.
+            KeyCode::Enter | KeyCode::Right if !opened && self.shown(self.selected) => {
                 if let Some(name) = self.picked().map(str::to_owned) {
                     match thread(&self.dir, &name) {
                         Ok(read) => {
@@ -2234,9 +2310,15 @@ impl View {
             return (out, 0, Vec::new());
         }
         let mut at = 0;
+        // Each thread's row, by its place: one a find leaves out has none,
+        // past the last line, so no click lands on it.
         let mut starts = Vec::new();
         for (index, thread) in self.threads.iter().enumerate() {
             let picked = index == self.selected;
+            if !self.shown(index) {
+                starts.push(usize::MAX);
+                continue;
+            }
             out.push(Line::default());
             if picked {
                 at = out.len();
@@ -2283,6 +2365,16 @@ impl View {
                 Span::raw("  "),
                 Span::raw("  "),
             ));
+        }
+        // The find row, the view's last; and a find that keeps nothing says
+        // so.
+        if let Some(find) = &self.finding {
+            if find.typed() && !(0..self.threads.len()).any(|at| self.shown(at)) {
+                out.push(Line::default());
+                out.push(Line::from(format!("no thread matches {}", find.query)).dim());
+            }
+            out.push(Line::default());
+            out.push(crate::find::line(&find.query));
         }
         (out, at, starts)
     }
@@ -2340,10 +2432,16 @@ impl View {
         match (&self.open, self.threads.len()) {
             (Some(_), _) => Keys::new().key("↑↓", "scroll").esc(Esc::Back),
             (None, 0) => Keys::new().key("a", whose).esc(Esc::Close),
+            // `esc` drops the find first; the next one closes the view.
+            (None, _) if self.finding.is_some() => (Keys::new().pick().enter(Enter::Open))
+                .find()
+                .esc(Esc::Cancel),
             (None, 1) => (Keys::new().enter(Enter::Open))
+                .find()
                 .key("a", whose)
                 .esc(Esc::Close),
             (None, _) => (Keys::new().pick().enter(Enter::Open))
+                .find()
                 .key("a", whose)
                 .esc(Esc::Close),
         }
@@ -2386,6 +2484,89 @@ mod tests {
         let lines = news.lines.clone();
         assert!(news.mark_read());
         lines
+    }
+
+    #[test]
+    fn ctrl_f_narrows_the_threads_picks_the_first_match_and_esc_puts_them_back() {
+        let thread = |name: &str, title: &str, by: &str| {
+            json!({"thread": name, "title": title, "project": "calc", "started_by": by,
+                   "last_by": by, "posts": 1, "last_when": "2m ago"})
+        };
+        let mut view = View {
+            dir: home("find"),
+            project: "calc".into(),
+            this: false,
+            threads: vec![
+                thread("rounding", "How do you round half cents?", "halves"),
+                thread("ci-cache", "Caching the CI's cargo target", "builder"),
+                thread("readme", "Which README examples still run?", "readme"),
+            ],
+            invites: Value::Null,
+            selected: 2,
+            open: None,
+            open_stamp: None,
+            known: Summaries::new(),
+            golden: 0,
+            notice: None,
+            finding: None,
+        };
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let text = |view: &View| -> Vec<String> {
+            (view.card(80).0.iter())
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect()
+        };
+        let says = |view: &View, what: &str| text(view).iter().any(|line| line.contains(what));
+        // The hint names it with the view's keys.
+        assert_eq!(
+            view.keys(),
+            "↑↓ pick · enter open · ctrl+f find · a this project · esc close"
+        );
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(view.key(ctrl_f), Key::Stay);
+        assert!(view.finding());
+        assert_eq!(text(&view).last().unwrap(), "find");
+        // Typed, even `a` and `j`, it narrows; the pick to the first match.
+        assert_eq!(view.key(key(KeyCode::Char('c'))), Key::Stay);
+        assert!(says(&view, "round half cents") && says(&view, "README"));
+        assert_eq!(view.selected, 0);
+        assert_eq!(view.key(key(KeyCode::Char('a'))), Key::Stay);
+        assert!(!says(&view, "round half") && says(&view, "Caching the CI"));
+        assert!(!says(&view, "README"), "{:#?}", text(&view));
+        assert_eq!(view.selected, 1);
+        assert_eq!(text(&view).last().unwrap(), "find ca");
+        // Only the thread found has a row a click lands on: the ones left
+        // out have none, so no click on a row shown opens one hidden.
+        let (lines, _, starts) = view.card_rows(80);
+        assert!(starts[1] < lines.len(), "{starts:?}");
+        assert!(
+            starts[0] >= lines.len() && starts[2] >= lines.len(),
+            "{starts:?}"
+        );
+        // The arrows stay among the threads found.
+        view.key(key(KeyCode::Up));
+        assert_eq!(view.selected, 1);
+        // A thread found open: a paste there is no more to find.
+        view.open = Some(("ci-cache".into(), json!({})));
+        assert!(!view.finding() && !view.paste("zz"));
+        view.open = None;
+        // Pasted, as typed; nothing found says so, and nothing is picked
+        // to open.
+        assert!(view.paste("zz"));
+        assert!(says(&view, "no thread matches cazz"), "{:#?}", text(&view));
+        assert_eq!(view.key(key(KeyCode::Enter)), Key::Stay);
+        assert!(
+            view.open.is_none() && view.notice.is_none(),
+            "{:?}",
+            view.notice
+        );
+        // `esc` drops the find, the threads and the pick as they were; the
+        // next closes the view.
+        assert_eq!(view.key(key(KeyCode::Esc)), Key::Stay);
+        assert!(!view.finding() && view.selected == 2);
+        assert!(says(&view, "README") && says(&view, "round half"));
+        assert!(!text(&view).last().unwrap().contains("find"));
+        assert_eq!(view.key(key(KeyCode::Esc)), Key::Close);
     }
 
     #[test]
@@ -3396,7 +3577,7 @@ mod tests {
         assert!(at("New one") < at("Old one"), "{listed:?}");
         assert_eq!(
             view.keys(),
-            "↑↓ pick · enter open · a this project · esc close"
+            "↑↓ pick · enter open · ctrl+f find · a this project · esc close"
         );
         assert_eq!(view.footer(), None);
         view.key(KeyEvent::from(KeyCode::Down));
