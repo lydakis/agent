@@ -2708,13 +2708,37 @@ pub const CHECKPOINT_PAGES: std::os::raw::c_int = 1000;
 /// as [`Database::checkpoint_aside`] says: about the 16 MiB a log is cut
 /// back to.
 pub const CHECKPOINT_HELD: std::os::raw::c_int = 4 * CHECKPOINT_PAGES;
-/// A connection that only checkpoints the WAL, on a thread of its own, so
+/// The WAL pages after a commit past which the writer waits for the
+/// checkpointer before checkpointing itself: about 256 MiB, a bound on the
+/// disk the log takes. Only a disk whose syncs take a second or more
+/// while it takes writes at once lets a log grow that far: on one that is
+/// slow to write as well, the writes themselves wait.
+pub const CHECKPOINT_MOST: std::os::raw::c_int = 64 * CHECKPOINT_PAGES;
+/// Checkpoints of the WAL beside the writer, on a thread of their own, so
 /// a checkpoint's syncs hold no commit. PASSIVE, as SQLite's automatic
 /// checkpoint is: it copies back what no reader still needs and waits for
-/// no one; the writer goes on appending meanwhile.
-pub struct Checkpointer(Connection);
+/// no one; the writer goes on appending meanwhile. Each opens a connection
+/// for itself and closes it after, so an idle store holds none.
+pub struct Checkpointer {
+    path: std::path::PathBuf,
+    /// Held while a checkpoint runs, so the writer can wait one out.
+    running: Arc<std::sync::Mutex<()>>,
+}
 impl Checkpointer {
-    pub fn new(conn: Connection) -> Result<Self> {
+    pub fn new(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            running: Arc::default(),
+        }
+    }
+    /// What a checkpoint holds while it runs.
+    pub fn running(&self) -> Arc<std::sync::Mutex<()>> {
+        self.running.clone()
+    }
+    /// Checkpoint the WAL as far as its readers allow.
+    pub fn checkpoint(&self) -> Result<()> {
+        let _running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = Connection::open(&self.path)?;
         // Synced as the writer's own checkpoint was: the WAL before its
         // pages are copied back, the database after, flushing the drive
         // on macOS. It reads through no page cache of its own.
@@ -2722,12 +2746,7 @@ impl Checkpointer {
             "PRAGMA synchronous=NORMAL; PRAGMA checkpoint_fullfsync=ON;
             PRAGMA cache_size=-64; PRAGMA journal_size_limit={WAL_KEPT};"
         ))?;
-        Ok(Self(conn))
-    }
-    /// Checkpoint the WAL as far as its readers allow.
-    pub fn checkpoint(&self) -> Result<()> {
-        self.0
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
         Ok(())
     }
 }
@@ -3786,13 +3805,22 @@ impl Database {
     /// commits keep coming faster than it syncs. Past [`CHECKPOINT_HELD`]
     /// pages the writer checkpoints itself, as SQLite would have: nothing
     /// is appended meanwhile, so it copies back the whole log and the next
-    /// commit starts it over.
-    pub fn checkpoint_aside(&mut self, mut ask: impl FnMut() + Send + 'static) -> Result<()> {
+    /// commit starts it over. While the checkpointer runs that is busy and
+    /// the next commit tries again; past [`CHECKPOINT_MOST`] the writer
+    /// waits out the checkpoint `running` holds first, so the log stays
+    /// bounded however slow the disk.
+    pub fn checkpoint_aside(
+        &mut self,
+        running: Arc<std::sync::Mutex<()>>,
+        mut ask: impl FnMut() + Send + 'static,
+    ) -> Result<()> {
         self.conn
             .wal_hook(Some(move |wal: &mut rusqlite::hooks::Wal, pages| {
-                if pages >= CHECKPOINT_HELD {
-                    // Busy while the checkpointer runs; the next commit tries
-                    // again. The commit itself has been made either way.
+                if pages >= CHECKPOINT_MOST {
+                    let _running = running.lock().unwrap_or_else(|e| e.into_inner());
+                    // The commit has been made whatever this answers.
+                    let _ = wal.checkpoint();
+                } else if pages >= CHECKPOINT_HELD {
                     let _ = wal.checkpoint();
                 } else if pages >= CHECKPOINT_PAGES {
                     ask();

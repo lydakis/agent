@@ -31,17 +31,17 @@ pub use db::{
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 
-/// The WAL's checkpoints, off the writer: a thread with a connection of
-/// its own takes the writer's asks, one at a time, each counted as the
-/// `checkpoint` operation from when it was asked for. Asks made while one
-/// runs become the next. It ends once the writer's connection, which holds
-/// the asking end, closes.
+/// The WAL's checkpoints, off the writer: a thread takes the writer's
+/// asks, one at a time, each counted as the `checkpoint` operation from
+/// when it was asked for. Asks made while one runs become the next. It
+/// ends once the writer's connection, which holds the asking end, closes.
 fn checkpoints(
     path: &Path,
     db: &mut Database,
     counters: std::sync::Arc<Counters>,
 ) -> Result<std::thread::JoinHandle<()>> {
-    let checkpointer = db::Checkpointer::new(Connection::open(path)?)?;
+    let checkpointer = db::Checkpointer::new(path);
+    let running = checkpointer.running();
     let (ask, asked) = std::sync::mpsc::sync_channel::<std::time::Instant>(1);
     let thread = std::thread::Builder::new()
         .name("agent-storage-checkpoint".into())
@@ -52,7 +52,7 @@ fn checkpoints(
                 counters.record("checkpoint", queued, started, failed);
             }
         })?;
-    db.checkpoint_aside(move || {
+    db.checkpoint_aside(running, move || {
         let _ = ask.try_send(std::time::Instant::now());
     })?;
     Ok(thread)
