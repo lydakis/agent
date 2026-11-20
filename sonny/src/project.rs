@@ -1153,12 +1153,6 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
     if title.contains(['\n', '\r']) {
         return Err("project_invalid: a title is one line".into());
     }
-    if title.chars().count() > crate::title::WRITTEN {
-        return Err(format!(
-            "project_invalid: a title is a few words, {} characters at most",
-            crate::title::WRITTEN
-        ));
-    }
     let mut picks = agent_client::project::Picks {
         title: Some(title),
         model: text("model").or_else(|| std::env::var("AGENT_MODEL").ok()),
@@ -1329,12 +1323,10 @@ mod tests {
                 .unwrap_err()
                 .starts_with("project_invalid: ")
         );
-        // A project is made with what the person calls it, in a few words
-        // on one line.
+        // A project is made with what the person calls it, on one line.
         for bad in [
             json!({"folder": "/"}),
             json!({"folder": "/", "title": "Two\nlines"}),
-            json!({"folder": "/", "title": "Reconcile the invoices against the ledger"}),
         ] {
             assert!(
                 picked(bad.clone())

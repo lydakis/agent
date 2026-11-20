@@ -1166,15 +1166,13 @@ async fn read_projects(
             })
             .max()
             .unwrap_or(0);
-        // A project's lead its project's title; another lead of its folder
-        // its own, as any agent the person started with a message.
-        let title = match crate::title::is_project_lead(&lead.name) {
-            true => read.title.clone(),
-            false => (read.rows.iter())
-                .find(|row| row.bot == lead.name)
-                .map(|row| row.title.clone()),
-        }
-        .unwrap_or_default();
+        // A lead's own title, else its project's.
+        let title = (read.rows.iter())
+            .find(|row| row.bot == lead.name)
+            .map(|row| row.title.clone())
+            .filter(|title| !title.is_empty())
+            .or(read.title.clone())
+            .unwrap_or_default();
         let called = match lead.name.ends_with(".lead") {
             true => name.to_owned(),
             false => spoken(&lead.name),
@@ -1415,7 +1413,7 @@ async fn read_status_of(
         if prune {
             listed_here.insert(name);
         }
-        // Its title as noted, else, with none, its first message read once;
+        // Its title as noted, else, with none, its first line read once;
         // a project's lead takes its project's, never its first message.
         let mut title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
         let untitled = title.is_none()
@@ -3485,12 +3483,6 @@ fn main() -> std::process::ExitCode {
             agent_client::name_program("tool_host");
             tool_host::run(rest)
         }
-        // A task or a `/new` agent started runs this to have its title
-        // written, as Codex titles a thread.
-        Some((verb, rest)) if verb == title::VERB => {
-            agent_client::name_program("title");
-            title::cli(rest)
-        }
         Some((verb, rest)) if verb == "reviewer" => {
             agent_client::name_program("reviewer");
             reviewer::run(rest)
@@ -5397,8 +5389,6 @@ struct TasksRead {
     seen: Vec<(String, (i64, Seen))>,
     set_states: Vec<(String, String)>,
     pass: Option<TasksPass>,
-    /// Each agent's title as noted now: a model's once it wrote one.
-    titles: HashMap<String, String>,
 }
 
 /// What the tasks themselves were found doing.
@@ -5432,9 +5422,7 @@ impl TasksAsked {
             seen: Vec::new(),
             set_states: Vec::new(),
             pass: None,
-            titles: HashMap::new(),
         };
-        let noted = crate::title::Noted::read(&store);
         // What waits on the person, read as every surface reads it.
         let held = match bots.is_empty() && others.is_empty() {
             true => None,
@@ -5448,10 +5436,7 @@ impl TasksAsked {
         }
         for bot in others {
             let state = match task_turn_at(&client, &bot).await {
-                Ok((turn, _, id)) => {
-                    if let Some(title) = noted.of(&bot, id) {
-                        came.titles.insert(bot.clone(), title);
-                    }
+                Ok((turn, _)) => {
                     let state = started::state(&turn);
                     if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
                         let seen = match seen.get(&bot) {
@@ -5495,10 +5480,7 @@ impl TasksAsked {
             // Marked done, by itself or its lead, since its newest turn.
             let mut done = false;
             let state = match task_turn_at(&client, &bot).await {
-                Ok((turn, head, id)) => {
-                    if let Some(title) = noted.of(&bot, id) {
-                        came.titles.insert(bot.clone(), title);
-                    }
+                Ok((turn, head)) => {
                     let state = started::state(&turn);
                     // A running task may ask and go on working: read again
                     // now and then, once its history grew since.
@@ -5889,11 +5871,10 @@ async fn read_alerts(
 async fn task_turn_at(
     client: &Client,
     bot: &str,
-) -> Result<(Value, Option<i64>, Option<i64>), agent_client::Error> {
+) -> Result<(Value, Option<i64>), agent_client::Error> {
     let record = client.request("inspect", json!({"bot": bot})).await?;
     let turn = active_turn(client, bot, record["running_turn"].as_i64(), None).await?;
-    let id = record["bot_id"].as_i64();
-    Ok((with_error(client, turn).await, record["head"].as_i64(), id))
+    Ok((with_error(client, turn).await, record["head"].as_i64()))
 }
 
 /// What the footer's count of the agents found: the mark of where they
@@ -11201,34 +11182,11 @@ impl App {
                         task.state = state.clone();
                         changed = true;
                     }
-                    // Its brief shows until a model wrote its title.
-                    if let Some(title) = came.titles.get(&task.bot)
-                        && *title != task.title
-                    {
-                        task.title = title.clone();
-                        changed = true;
-                    }
                 }
                 if changed {
                     self.draw_started(at);
                 }
             }
-        }
-        // A task's `└ started` row takes its title as noted too.
-        let mut retitled = Vec::new();
-        for (at, set) in &mut self.set_rows {
-            for one in set.iter_mut().filter(|one| one.verb == started::STARTED) {
-                if let Some(title) = came.titles.get(&one.bot)
-                    && *title != one.title
-                {
-                    one.title = title.clone();
-                    retitled.push(*at);
-                }
-            }
-        }
-        retitled.dedup();
-        for at in retitled {
-            self.draw_set_row(at);
         }
         self.redraw_set_rows(&came.named);
     }
@@ -11272,10 +11230,7 @@ impl App {
     }
 
     /// [`App::task_turn`], with the newest node of `bot`'s history.
-    async fn task_turn_at(
-        &self,
-        bot: &str,
-    ) -> Result<(Value, Option<i64>, Option<i64>), agent_client::Error> {
+    async fn task_turn_at(&self, bot: &str) -> Result<(Value, Option<i64>), agent_client::Error> {
         task_turn_at(&self.client, bot).await
     }
 
@@ -20782,21 +20737,13 @@ impl App {
                             }
                             None => task::forget_profile(&self.store(), &lead.bot),
                         }
-                        // Its first message shows, noted by its id, until a
-                        // model wrote its title, as Codex titles a thread.
+                        // Its title is its first message's first line,
+                        // noted by its id.
                         let first = crate::title::of_message(&brief);
                         let asked = json!({"bot": lead.bot});
                         let noted = match self.client.request("inspect", asked).await {
                             Ok(record) => match record["bot_id"].as_i64() {
                                 Some(id) => {
-                                    let env = [
-                                        ("AGENT_SOCKET", &self.options.socket),
-                                        ("AGENT_STORE", &self.options.store),
-                                    ]
-                                    .map(|(key, path)| {
-                                        (key.to_owned(), path.display().to_string())
-                                    });
-                                    crate::title::spawn(&env, &lead.bot, id, &brief);
                                     crate::title::note(&self.store(), &lead.bot, id, &first)
                                         .map_err(|error| error.to_string())
                                 }
@@ -26928,10 +26875,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         counted(&mut app).await;
-        // The helper's first message on one line, noted once.
+        // The helper's first line, cut from its first message, noted once.
         assert_eq!(
             crate::title::noted(&store, "titled.helper", 2).as_deref(),
-            Some("Fix the flaky login test It fails one run in ten.")
+            Some("Fix the flaky login test")
         );
         assert_eq!(
             read_first(&firsts),
@@ -26942,13 +26889,13 @@ mod tests {
         // One whose newest page did not all come reads its first line.
         assert_eq!(
             crate::title::noted(&store, "titled.big", 5).as_deref(),
-            Some("Fix the flaky login test It fails one run in ten.")
+            Some("Fix the flaky login test")
         );
         // One whose newest page holds its whole history takes its first
         // line from that page, with no read of its own.
         assert_eq!(
             crate::title::noted(&store, "titled.short", 4).as_deref(),
-            Some("Count the coins Both jars.")
+            Some("Count the coins")
         );
         // Read again after it moved: its title is not.
         app.follower.as_ref().unwrap().moved("titled.helper");
@@ -26966,7 +26913,7 @@ mod tests {
         let mut titles = crate::title::Titles::read(&store);
         assert_eq!(
             titles.named("titled.helper", Some(2), None).as_deref(),
-            Some("Fix the flaky login test It fails one run in ten.")
+            Some("Fix the flaky login test")
         );
         assert!(reads.load(Ordering::SeqCst) > 0);
         // `/status` filling in reads none either, and the lead keeps its
@@ -33383,7 +33330,8 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let start = |app: &mut App, name: &str| {
-            let arguments = json!({"name": name, "brief": format!("Fix {name}")});
+            let arguments =
+                json!({"name": name, "brief": format!("Fix {name}\nNow, with a test.")});
             let output = format!("calc.{name}/1");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         };
