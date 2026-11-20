@@ -16,7 +16,7 @@ use crate::codec::Family;
 use crate::provider::{RUN_NAME, RUN_NAMESPACE};
 use crate::{Result, fail};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The longest call id written: Anthropic's bound, which Responses takes.
 const MAX_ID: usize = 64;
@@ -30,8 +30,10 @@ pub struct Translator {
     custom: HashSet<String>,
     /// Source calls that went as custom ones, whose results follow suit.
     custom_calls: HashSet<String>,
-    /// Source calls of the provider's own search, whose results go as text.
-    searches: HashSet<String>,
+    /// Source calls that went as text (the provider's own search, or
+    /// arguments the target can't hold), each with the heading its result
+    /// goes under, also as text.
+    words: HashMap<String, String>,
 }
 
 impl Translator {
@@ -41,7 +43,7 @@ impl Translator {
             to,
             custom,
             custom_calls: HashSet::new(),
-            searches: HashSet::new(),
+            words: HashMap::new(),
         }
     }
 
@@ -211,7 +213,7 @@ impl Translator {
             "function_call" | "custom_tool_call" => {
                 let source = item["call_id"].as_str().unwrap_or_default().to_owned();
                 if item["namespace"] == RUN_NAMESPACE && item["name"] == RUN_NAME {
-                    self.searches.insert(source);
+                    self.words.insert(source, "[web search results]".into());
                     let text = format!(
                         "[web search {}]",
                         item["arguments"].as_str().unwrap_or("{}")
@@ -226,7 +228,16 @@ impl Translator {
                         .map(serde_json::from_str::<Value>)
                     {
                         Some(Ok(input @ Value::Object(_))) => input,
-                        _ => return fail("invalid_tool_arguments"),
+                        // Arguments that aren't an object were answered as
+                        // a failed call; both go as words, which the target
+                        // takes whatever they hold.
+                        _ => {
+                            let name = item["name"].as_str().unwrap_or_default();
+                            let arguments = item["arguments"].as_str().unwrap_or_default();
+                            self.words.insert(source, format!("[{name} result]"));
+                            let text = format!("[{name} called with {arguments}]");
+                            return Ok(one("assistant", vec![json!({"type":"text","text":text})]));
+                        }
                     },
                 };
                 one(
@@ -252,7 +263,7 @@ impl Translator {
                     Value::String(text) => json!(text),
                     _ => json!(""),
                 };
-                if self.searches.contains(source) {
+                if let Some(heading) = self.words.get(source) {
                     let text = match &output {
                         Value::String(text) => text.clone(),
                         parts => (parts.as_array().into_iter().flatten())
@@ -262,7 +273,7 @@ impl Translator {
                     };
                     return Ok(one(
                         "user",
-                        vec![json!({"type":"text","text":format!("[web search results]\n{text}")})],
+                        vec![json!({"type":"text","text":format!("{heading}\n{text}")})],
                     ));
                 }
                 let id = self.id(source);
@@ -505,5 +516,30 @@ mod tests {
                 .contains("https://example.test")
         );
         assert_eq!(parts[2], json!({"type":"output_text","text":"Rust is"}));
+    }
+
+    #[test]
+    fn a_call_whose_arguments_were_not_an_object_goes_as_words_with_its_result() {
+        let mut t = Translator::new(Family::Responses, Family::Anthropic, HashSet::new());
+        for arguments in ["{\"path\":", "[1]"] {
+            let call = run(
+                &mut t,
+                json!({"type":"function_call","name":"read","call_id":"c1","arguments":arguments}),
+            );
+            assert_eq!(
+                call,
+                vec![json!({"role":"assistant","content":[
+                    {"type":"text","text":format!("[read called with {arguments}]")}]})]
+            );
+            let answer = run(
+                &mut t,
+                json!({"type":"function_call_output","call_id":"c1","output":"invalid_arguments"}),
+            );
+            assert_eq!(
+                answer,
+                vec![json!({"role":"user","content":[
+                    {"type":"text","text":"[read result]\ninvalid_arguments"}]})]
+            );
+        }
     }
 }

@@ -5049,13 +5049,23 @@ impl Database {
             }
         };
         let new_head = written.head.or(root).or(head);
+        // What its calls have read moves with the history: a translated node
+        // is read once its source was, so the next call counts only what
+        // follows as new. Back on the branch it left, what the other model
+        // first read was that branch's head; anything else read is older
+        // than what was written since.
+        let work_read = match (bot.work.read, &back) {
+            (Some(read), _) if written.last.contains_key(&read) => written.last[&read].or(root),
+            (Some(read), Some(back)) if read == back.node => Some(back.left),
+            (read, _) => read,
+        };
         let restore = |key: &str| state.get(key).cloned().unwrap_or(Value::Null);
         tx.prepare_cached(
             "UPDATE bots SET head=?1,provider=?2,family=?3,model=?4,reasoning=?5,context_start=?6,
                 compaction=?7,elision=?8,family_start=?9,cache_bot=?10,thinking_prefix=?11,
                 thinking_floor=?12,thinking_from=?13,thinking_to=?14,thinking_elided=?15,
-                compaction_model=?16,fallback=?17
-             WHERE id=?18",
+                compaction_model=?16,fallback=?17,work_read=?18
+             WHERE id=?19",
         )?
         .execute(params![
             new_head,
@@ -5075,6 +5085,7 @@ impl Database {
             restore("thinking_elided").as_i64().unwrap_or(0),
             restore("compaction_model").as_str(),
             restore("fallback").as_str(),
+            work_read,
             id
         ])?;
         // Its new head is a closed point a fork can start from.

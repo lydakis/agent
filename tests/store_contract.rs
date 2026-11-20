@@ -5,8 +5,8 @@ use agent_runtime::{
     store::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Joined, Lifted,
-        Limit, Planning, ProcessKind, QuoteRef, Retained, Settings, Strip, Trailer, TurnBudget,
-        TurnOptions, Wake,
+        Limit, Planning, ProcessKind, QuoteRef, Retained, Settings, Strip, Switch, Trailer,
+        TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome, ToolList},
 };
@@ -7944,6 +7944,51 @@ fn work_charges_what_a_request_sends_new_once_and_survives_a_restart() {
     .unwrap();
     assert_eq!(db.inspect("Later").unwrap().work.read, read);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn what_was_read_moves_with_the_history_to_the_other_family_and_back() {
+    let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    db.append(turn, vec![assistant("a")], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let left = db.inspect("Bob").unwrap();
+    assert_eq!(left.work.read, left.head);
+    let to = |family, provider, model| Switch {
+        provider,
+        model,
+        effort: None,
+        family,
+        custom: Default::default(),
+    };
+    let claude = to(Family::Anthropic, "anthropic", "synthetic-claude");
+    let back = to(Family::Responses, "openai", "synthetic-model");
+    // Everything read was translated: its copy is read, and the next call
+    // sends nothing new.
+    db.switch_family("Bob", None, &claude).unwrap().unwrap();
+    let moved = db.inspect("Bob").unwrap();
+    assert_ne!(moved.head, left.head);
+    assert_eq!(moved.work.read, moved.head);
+    // Straight back: the branch it left, read as it was.
+    db.switch_family("Bob", None, &back).unwrap().unwrap();
+    let home = db.inspect("Bob").unwrap();
+    assert_eq!((home.head, home.work.read), (left.head, left.head));
+    // What the other model read and added comes back read.
+    db.switch_family("Bob", None, &claude).unwrap().unwrap();
+    let turn = begun(&mut db, "Bob", "r2");
+    let reply =
+        serde_json::to_vec(&json!({"role":"assistant","content":[{"type":"text","text":"b"}]}))
+            .unwrap()
+            .into();
+    db.append(turn, vec![reply], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    db.switch_family("Bob", None, &back).unwrap().unwrap();
+    let home = db.inspect("Bob").unwrap();
+    assert!(home.head > left.head);
+    assert_eq!(home.work.read, home.head);
 }
 
 #[test]
