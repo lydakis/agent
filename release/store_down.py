@@ -76,6 +76,7 @@ def back_111(conn):
         "DROP TABLE switches;"
         "DROP TABLE translated;"
         "DROP TABLE translating;"
+        "DROP TABLE worded;"
         "DROP INDEX bots_family_start;"
         "ALTER TABLE bots DROP COLUMN family_start;"
     )

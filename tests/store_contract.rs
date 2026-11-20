@@ -8175,7 +8175,7 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
 }
 
 #[test]
-fn a_search_result_written_as_words_reads_through_its_handle_after_a_switch() {
+fn a_search_result_written_as_words_reads_through_its_handle_after_a_switch_and_a_fork() {
     let path =
         std::env::temp_dir().join(format!("agent-words-result-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -8239,6 +8239,19 @@ fn a_search_result_written_as_words_reads_through_its_handle_after_a_switch() {
     assert!(lines.contains("second line"), "{lines}");
     assert!(lines.contains("third line"), "{lines}");
     assert!(!lines.contains("first line"), "{lines}");
+    // A fork keeps reading it after the original is gone.
+    db.fork("Bob", "Cy", Fork::default()).unwrap();
+    db.delete_bot("Bob").unwrap();
+    let gone: i64 = read
+        .query_row("SELECT count(*) FROM nodes WHERE id=?", [output], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(gone, 0);
+    let lines = db
+        .result_lines("Cy", words, 2, 2, false, usize::MAX)
+        .unwrap();
+    assert!(lines.contains("second line"), "{lines}");
     drop(read);
     drop(db);
     let _ = std::fs::remove_file(&path);

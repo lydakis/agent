@@ -3838,6 +3838,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS switches_left ON switches(left) WHERE left IS NOT NULL;
             CREATE TABLE IF NOT EXISTS translated(node INTEGER PRIMARY KEY, source INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS translated_source ON translated(source);
+            CREATE TABLE IF NOT EXISTS worded(node INTEGER PRIMARY KEY, item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS translating(id INTEGER PRIMARY KEY, bot_id INTEGER UNIQUE, tip INTEGER);
             CREATE TABLE IF NOT EXISTS compactions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES compactions(node), cut INTEGER NOT NULL REFERENCES nodes(id),
@@ -17974,8 +17975,8 @@ impl Database {
                 return fail("result_not_found");
             }
         }
-        // A result a switch wrote as words reads as the result it was
-        // written from.
+        // A result a switch wrote as words reads as the result it kept
+        // beside them.
         let read = |sql: &str| -> Result<Option<Vec<u8>>> {
             Ok(self
                 .conn
@@ -17988,10 +17989,7 @@ impl Database {
         )?
         .ok_or(Error::new("result_not_found"))?;
         if super::context::tool_result(&item).is_none()
-            && let Some(source) = read(
-                "SELECT COALESCE(d.item,n.item) FROM translated t JOIN nodes n ON n.id=t.source
-                 LEFT JOIN declined d ON d.node=n.id WHERE t.node=?",
-            )?
+            && let Some(source) = read("SELECT item FROM worded WHERE node=?")?
         {
             item = source;
         }
@@ -22556,6 +22554,16 @@ impl Translation {
                     _ => Ok(None),
                 }
             };
+            // The result a node holds in full, which a copy written as words
+            // keeps beside it, so its handle reads it whatever becomes of
+            // the original.
+            let result = match declined.as_ref().unwrap_or(&item) {
+                full if super::context::tool_result(full).is_some() => Some(full.clone()),
+                _ => conn
+                    .prepare_cached("SELECT item FROM worded WHERE node=?")?
+                    .query_row([old], |r| r.get::<_, Vec<u8>>(0))
+                    .optional()?,
+            };
             let (stub, declined) = (one(&stub)?, one(&declined)?);
             for (index, new_item) in items.iter().enumerate() {
                 let lead = index == 0;
@@ -22606,6 +22614,13 @@ impl Translation {
                     if let Some(declined) = &declined {
                         conn.prepare_cached("INSERT INTO declined(node,item) VALUES (?,?)")?
                             .execute(params![new, declined])?;
+                    }
+                    if let Some(result) = &result
+                        && single
+                        && super::context::tool_result(new_item).is_none()
+                    {
+                        conn.prepare_cached("INSERT INTO worded(node,item) VALUES (?,?)")?
+                            .execute(params![new, result])?;
                     }
                     conn.prepare_cached(
                     "INSERT INTO openings(node,text,chars) SELECT ?1,text,chars FROM openings WHERE node=?2",
@@ -22665,6 +22680,7 @@ fn free_node(conn: &Connection, id: i64, name: &str) -> Result<Option<i64>> {
         "DELETE FROM senders WHERE node=?",
         "DELETE FROM translated WHERE node=?",
         "DELETE FROM translated WHERE source=?",
+        "DELETE FROM worded WHERE node=?",
         "DELETE FROM lineage WHERE node=?",
         "DELETE FROM nodes WHERE id=?",
     ] {
