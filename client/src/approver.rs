@@ -17,14 +17,28 @@ use std::borrow::Cow;
 /// calls being judged take none of it: they are shown whole.
 pub const STATE_TOKENS: usize = 32_000;
 pub const EARLIER_TOKENS: usize = 16_000;
-/// The judge's input budget, as Codex's is its reviewer model's input limit
-/// less a margin: the most the whole state may take as text. A judge's
-/// prompt is one daemon turn's, at most [`crate::PROMPT_BYTES`] (1 MiB, as
-/// Codex bounds a person's input), and the round's ids and keys take the
-/// rest. The calls being judged, and the files they run, are shown whole
-/// within it and the rest is fitted around them; a round they alone
-/// overflow goes to the person.
-pub const STATE_BYTES: usize = crate::PROMPT_BYTES - 16 * 1024;
+/// The smallest context window a judge model has, in tokens: what the
+/// daemon takes for a model it knows nothing more of, and Claude's before
+/// Claude 5 (`provider::context_window`).
+pub const JUDGE_WINDOW_TOKENS: usize = 200_000;
+/// The judge's input budget, as Codex's guardian takes its reviewer model's:
+/// the window's effective share (95%) less a margin of 256 tokens, counted
+/// at 4 bytes a token as Codex estimates text, less the judge's
+/// instructions; and within one daemon prompt, [`crate::PROMPT_BYTES`]
+/// (1 MiB, as Codex bounds a person's input), less room for the round's
+/// ids and keys. The most the whole state may take as text. The calls being
+/// judged, and the files they run, are shown whole within it and the rest
+/// is fitted around them; a round they alone overflow goes to the person.
+pub const STATE_BYTES: usize = {
+    let window = (JUDGE_WINDOW_TOKENS * 95 / 100 - 256) * 4 - JUDGE_INSTRUCTIONS.len();
+    let prompt = crate::PROMPT_BYTES - 16 * 1024;
+    if window < prompt { window } else { prompt }
+};
+// It fits the smallest window as Codex counts it, and one daemon prompt.
+const _: () = assert!(
+    (STATE_BYTES + JUDGE_INSTRUCTIONS.len()).div_ceil(4) <= JUDGE_WINDOW_TOKENS * 95 / 100 - 256
+        && STATE_BYTES + 16 * 1024 <= crate::PROMPT_BYTES
+);
 /// What the judge is shown of the agent's own history, as Codex's
 /// synchronous reviewer bounds it: each model message and each tool entry
 /// cut to its share, the newest kept within what messages and tool entries
