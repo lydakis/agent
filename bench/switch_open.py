@@ -80,7 +80,7 @@ def main():
             cpu = (cpu_seconds(window.pid), cpu_seconds(daemon.pid))
             at = time.monotonic()
             os.write(window.fd, b'/switch\r')
-            shown = window.wait('the list', lambda line: 'p1.lead' in line, 300)
+            shown = window.wait('the list', lambda line: 'p0.t10' in line, 300)
             settled = quiet([window.pid, daemon.pid])
             ops2, _, back2 = tap.counts()
             opens.append({
@@ -93,7 +93,7 @@ def main():
             })
             print('open', n + 1, opens[-1], settled, file=sys.stderr)
             os.write(window.fd, ESC)
-            window.wait('conversation', lambda line: 'p1.lead' not in line and 'Message' in line, 30)
+            window.wait('conversation', lambda line: 'Message' in line, 30)
             time.sleep(2)
         result['opens'] = opens
         Path(args.out).write_text(json.dumps(result, indent=1))
