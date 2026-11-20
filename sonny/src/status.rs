@@ -62,7 +62,16 @@ pub type Task = std::sync::Arc<serde_json::Value>;
 
 /// Where a task stands, as `/status` groups the tasks, in its order.
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub enum Group {
     /// Waiting on the person's approval or answer, or held on a cause

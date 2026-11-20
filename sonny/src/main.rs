@@ -1050,13 +1050,7 @@ impl App {
                     }
                 }
                 let (projects, whole) = read_projects(
-                    &client,
-                    &store,
-                    &listed,
-                    &bot,
-                    &asks,
-                    &approvals,
-                    &mut state,
+                    &client, &store, &listed, &bot, &asks, &approvals, &mut state,
                 )
                 .await?;
                 Some(ProjectsRead {
@@ -1178,9 +1172,8 @@ const EVERY_PROJECT: &str = "*.*";
 /// read as `/status` reads it: its counts, its most pressing state, its
 /// agents as the pane lists them, and when one last had a turn, which
 /// the listing says (`last.finished_ms`, or now while one runs); and
-/// whether every history it asked for was read. A project in `each` none
+/// whether every history it asked for was read. A project in `state` none
 /// of whose agents moved since is as it was read, and not read again.
-#[allow(clippy::too_many_arguments)]
 async fn read_projects(
     client: &Client,
     store: &std::path::Path,
@@ -1340,10 +1333,13 @@ async fn read_projects(
         };
         whole &= read.whole;
         let folder = lead.workspace.clone().unwrap_or_default();
-        let superlead = *state.superleads.entry(lead.name.clone()).or_insert_with(|| {
-            seat_profile(&kept, &lead.name, true, std::path::Path::new(&folder)).as_deref()
-                == Some("superlead")
-        });
+        let superlead = *state
+            .superleads
+            .entry(lead.name.clone())
+            .or_insert_with(|| {
+                seat_profile(&kept, &lead.name, true, std::path::Path::new(&folder)).as_deref()
+                    == Some("superlead")
+            });
         // When one of its agents last had a turn: now while one runs.
         let last = (theirs.iter())
             .filter_map(|bot| match bot.running_turn {
@@ -28915,7 +28911,9 @@ mod tests {
         assert_eq!(fresh.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
         assert!(!fresh.latest.contains_key("beta.two"));
         assert_eq!(
-            take_projects(&store, client.identity()).keys().collect::<Vec<_>>(),
+            take_projects(&store, client.identity())
+                .keys()
+                .collect::<Vec<_>>(),
             ["alpha.lead"]
         );
     }
