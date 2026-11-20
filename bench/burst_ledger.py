@@ -103,7 +103,9 @@ def in_repo(text, repo):
     """Whether an edit call's arguments touch the repository: a path in
     it, relative (the lead works at its root) or absolute under it, or no
     path to tell by. A lead's notes in its own state folder are not the
-    ask's code."""
+    ask's code. The audit trail cuts long arguments at 256 characters, so
+    a cut preview gives up what paths it still names; one that names none
+    is unknown, and unknown is not an edit."""
     try:
         args = json.loads(text)
     except ValueError:
@@ -116,6 +118,11 @@ def in_repo(text, repo):
         for value in args.values():
             if isinstance(value, str):
                 paths += re.findall(r'\*\*\* (?:Update|Add|Delete) File: (\S+)', value)
+    elif args is None:
+        paths += re.findall(r'"(?:file_)?path"\s*:\s*"((?:[^"\\]|\\.)+)"', text)
+        paths += re.findall(r'\*\*\* (?:Update|Add|Delete) File: ([^\s\\]+)', text)
+        if not paths:
+            return False
     if not paths:
         return True
     root = str(Path(repo).resolve())
@@ -137,11 +144,14 @@ class Recorder:
     """Every agent's turns, usage and ends as they come (`agent follow
     --all`), written to `path`, so evidence outlives a task deleted later."""
 
-    def __init__(self, agent, env, path, mode='w'):
-        # 'a' after a restart: the new daemon's stream follows the old one's.
+    def __init__(self, agent, env, path, mode='w', after=0):
+        # 'a' after a restart, from the last cursor the old stream gave:
+        # `follow --all` replays the store from its cursor, so without it
+        # the new daemon's stream would repeat what is already written.
         self.file = open(path, mode)
-        self.process = subprocess.Popen([str(agent), 'follow', '--all'], env=env, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True)
+        self.cursor = after
+        self.process = subprocess.Popen([str(agent), 'follow', '--all', '--after', str(after)], env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.thread = threading.Thread(target=self.read, daemon=True)
         self.thread.start()
 
@@ -151,6 +161,8 @@ class Recorder:
                 event = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(event.get('cursor'), int):
+                self.cursor = max(self.cursor, event['cursor'])
             if event.get('event') in KINDS:
                 self.file.write(json.dumps({'t': time.time(), **event}) + '\n')
                 self.file.flush()

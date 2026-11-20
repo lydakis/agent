@@ -583,7 +583,32 @@ class BurstLedgerTests(unittest.TestCase):
         self.assertTrue(inside(json.dumps({'input': '*** Begin Patch\n*** Add File: shop/clock.py\n'}), repo))
         self.assertFalse(inside(json.dumps({'path': '$SONNY_STATE/handoff.md', 'content': 'gitignore'}), repo))
         self.assertFalse(inside(json.dumps({'path': '/h/.agent/sonny/state/notes.md'}), repo))
-        self.assertTrue(inside('not json', repo))
+        # The trail cuts long arguments at 256 characters: a cut preview
+        # still tells by the paths it names, and one naming none is unknown.
+        cut = lambda args: json.dumps(args)[:256]
+        note = {'path': '/h/.agent/sonny/state/notes.md', 'content': 'gitignore ' * 40}
+        self.assertFalse(inside(cut(note), repo))
+        self.assertTrue(inside(cut({'path': 'shop/clock.py', 'content': 'x' * 400}), repo))
+        self.assertTrue(inside(cut({'input': '*** Begin Patch\n*** Update File: shop/clock.py\n' + 'x' * 400}), repo))
+        self.assertFalse(inside(cut({'content': 'x' * 400, 'path': 'shop/clock.py'}), repo))
+        self.assertFalse(inside('not json', repo))
+
+    def test_the_recorder_resumes_after_the_last_cursor_it_saw(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent, called, out = Path(tmp) / 'agent', Path(tmp) / 'called', Path(tmp) / 'events.jsonl'
+            agent.write_text(f'#!/bin/sh\necho "$@" >> {called}\n'
+                             'echo \'{"cursor": 7, "bot": "a", "event": "usage", "data": {}}\'\n'
+                             'echo \'{"cursor": 9, "bot": "a", "event": "text", "data": {}}\'\n')
+            agent.chmod(0o755)
+            first = self.ledger.Recorder(agent, os.environ.copy(), out)
+            first.process.wait(timeout=5)
+            first.close()
+            self.assertEqual(first.cursor, 9)
+            second = self.ledger.Recorder(agent, os.environ.copy(), out, mode='a', after=first.cursor)
+            second.process.wait(timeout=5)
+            second.close()
+            self.assertEqual(called.read_text().splitlines(), ['follow --all --after 0', 'follow --all --after 9'])
+            self.assertEqual(len(out.read_text().splitlines()), 2)
 
     def test_each_arm_takes_its_own_code_mode_and_settings(self):
         import argparse

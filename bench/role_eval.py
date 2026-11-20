@@ -964,8 +964,10 @@ def run(arm, n, bins, model, spec=None):
                 timeline[-1]['busy_at_restart'] = len(active(env, agent))
                 # No grace: running calls are cut, as a crash cuts them.
                 subprocess.run([str(agent), 'shutdown', '--grace', '0ms'], env=env, capture_output=True)
+                after = 0
                 if recorder:
                     recorder.close()
+                    after = recorder.cursor
                 for _ in range(30):
                     time.sleep(2)
                     if subprocess.run([str(agent), 'start', '--idle-exit', '0'], env=env,
@@ -975,7 +977,7 @@ def run(arm, n, bins, model, spec=None):
                     raise RuntimeError(f'step {step}: the daemon did not start again')
                 timeline[-1]['restarted'] = time.time()
                 if recorder:
-                    recorder = burst_ledger.Recorder(agent, env, out / 'events.jsonl', mode='a')
+                    recorder = burst_ledger.Recorder(agent, env, out / 'events.jsonl', mode='a', after=after)
             if not heard:
                 heard = until_subscribed(home)
                 release(step, s)
