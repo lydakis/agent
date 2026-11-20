@@ -245,7 +245,10 @@ pub fn own_session(command: &mut std::process::Command) {
 
 // No await occurs while this lock is held. Synchronous removal makes dropping
 // a request release its registration immediately, without a cleanup task.
-type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+/// Each reply goes to its request as its line, read there: the reader
+/// only routes it, and a request that wants a few of a reply's fields
+/// ([`Client::request_as`]) never builds the rest.
+type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<String>>>>;
 struct PendingRequest<'a> {
     pending: &'a Pending,
     id: u64,
@@ -583,10 +586,8 @@ impl Client {
                 match id {
                     Some(id) => {
                         let waiting = routed.lock().unwrap().remove(&id);
-                        if let Some(sender) = waiting
-                            && let Ok(message) = serde_json::from_str::<Value>(&line)
-                        {
-                            let _ = sender.send(message);
+                        if let Some(sender) = waiting {
+                            let _ = sender.send(line);
                         }
                     }
                     None => {
@@ -740,7 +741,43 @@ impl Client {
         let _ = self.in_flight.set(Semaphore::new(requests));
     }
 
-    pub async fn request(&self, op: &str, mut params: Value) -> Result<Value> {
+    pub async fn request(&self, op: &str, params: Value) -> Result<Value> {
+        let line = self.exchange(op, params).await?;
+        let message =
+            serde_json::from_str::<Value>(&line).map_err(|_| Error::new("daemon_disconnected"))?;
+        answer(message)
+    }
+
+    /// [`Client::request`], its result read as `T`: only the fields `T`
+    /// takes are built, so a listing whose rows hold more than a caller
+    /// reads costs only what it reads.
+    pub async fn request_as<T: serde::de::DeserializeOwned>(
+        &self,
+        op: &str,
+        params: Value,
+    ) -> Result<T> {
+        #[derive(serde::Deserialize)]
+        struct Answer<T> {
+            error: Option<serde::de::IgnoredAny>,
+            result: Option<T>,
+        }
+        let line = self.exchange(op, params).await?;
+        match serde_json::from_str::<Answer<T>>(&line) {
+            Ok(Answer {
+                error: None,
+                result: Some(result),
+            }) => Ok(result),
+            // An error, or a result `T` does not read: as `request` says it.
+            _ => {
+                let message = serde_json::from_str::<Value>(&line)
+                    .map_err(|_| Error::new("daemon_disconnected"))?;
+                Ok(serde_json::from_value(answer(message)?)?)
+            }
+        }
+    }
+
+    /// Send `op` with `params` and wait for its reply's line.
+    async fn exchange(&self, op: &str, mut params: Value) -> Result<String> {
         if !(params.is_object() || params.is_null()) {
             return Err(Error::with(
                 "invalid_request",
@@ -785,26 +822,30 @@ impl Client {
             writer.write_all(&line).await?;
             frame.complete = true;
         }
-        let message = receiver
+        receiver
             .await
-            .map_err(|_| Error::new("daemon_disconnected"))?;
-        let Some(code) = message.get("error").and_then(Value::as_str) else {
-            // Taken, not copied: a page of history runs to megabytes.
-            return Ok(match message {
-                Value::Object(mut reply) => reply.remove("result").unwrap_or(Value::Null),
-                _ => Value::Null,
-            });
-        };
-        let mut error = Error::new(code);
-        error.detail = message["detail"].as_str().map(str::to_owned);
-        if let Value::Object(mut facts) = message {
-            for key in ["id", "error", "detail"] {
-                facts.remove(key);
-            }
-            error.facts = (!facts.is_empty()).then(|| Box::new(facts));
-        }
-        Err(error)
+            .map_err(|_| Error::new("daemon_disconnected"))
     }
+}
+
+/// A reply's result, or the error it says.
+fn answer(message: Value) -> Result<Value> {
+    let Some(code) = message.get("error").and_then(Value::as_str) else {
+        // Taken, not copied: a page of history runs to megabytes.
+        return Ok(match message {
+            Value::Object(mut reply) => reply.remove("result").unwrap_or(Value::Null),
+            _ => Value::Null,
+        });
+    };
+    let mut error = Error::new(code);
+    error.detail = message["detail"].as_str().map(str::to_owned);
+    if let Value::Object(mut facts) = message {
+        for key in ["id", "error", "detail"] {
+            facts.remove(key);
+        }
+        error.facts = (!facts.is_empty()).then(|| Box::new(facts));
+    }
+    Err(error)
 }
 
 #[cfg(test)]
@@ -1089,7 +1130,8 @@ mod tests {
         reply
             .send(
                 json!({"id":id,"error":"bot_busy","detail":"turn 3 is running",
-                "running_turn":3,"fork_point":42}),
+                "running_turn":3,"fork_point":42})
+                .to_string(),
             )
             .unwrap();
         let error = request.await.unwrap().unwrap_err();
@@ -1101,6 +1143,42 @@ mod tests {
             error.facts.map(|facts| Value::Object(*facts)),
             Some(json!({"running_turn":3,"fork_point":42}))
         );
+        // Read as a type, a result gives only its fields, and an error is
+        // the same error.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Row {
+            name: String,
+        }
+        let mut answers = [
+            json!({"result":{"name":"Bob","head":7,"waiting_on":{"call":"x"}}}),
+            json!({"error":"bot_not_found","detail":"Bob"}),
+        ]
+        .into_iter();
+        for _ in 0..2 {
+            let request = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    client
+                        .request_as::<Row>("inspect", json!({"bot":"Bob"}))
+                        .await
+                }
+            });
+            let sent: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let id = sent["id"].as_u64().unwrap();
+            let reply = client.pending.lock().unwrap().remove(&id).unwrap();
+            let mut answer = answers.next().unwrap();
+            answer["id"] = json!(id);
+            reply.send(answer.to_string()).unwrap();
+            match request.await.unwrap() {
+                Ok(row) => assert_eq!(row, Row { name: "Bob".into() }),
+                Err(error) => assert_eq!(
+                    (error.code.as_str(), error.detail.as_deref()),
+                    ("bot_not_found", Some("Bob"))
+                ),
+            }
+        }
+        assert!(answers.next().is_none());
     }
 
     #[tokio::test]

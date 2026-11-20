@@ -10,6 +10,7 @@ pub mod sandbox;
 pub mod sse;
 pub mod store;
 pub mod tools;
+pub mod translate;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

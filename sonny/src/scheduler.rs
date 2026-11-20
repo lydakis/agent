@@ -1321,6 +1321,23 @@ fn run_own(me: &Path, args: &[&str]) -> Option<libc::pid_t> {
         .map(|child| child.id() as libc::pid_t)
 }
 
+/// `wait` run on a thread of its own, for a wait on another process (a
+/// lock it holds): a window that ends meanwhile goes without it, where a
+/// blocking task would hold the runtime's end until the other let go.
+/// What `wait` gives once nothing awaits it is dropped, a lock with it.
+pub(crate) async fn apart<T: Send + 'static>(
+    wait: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    let (sent, got) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("sonny-wait".into())
+        .spawn(move || {
+            let _ = sent.send(wait());
+        })
+        .ok()?;
+    got.await.ok().flatten()
+}
+
 /// A lock on `path`, a plain file made when it is not there: None while
 /// another process holds it.
 pub(crate) fn locked(path: &Path) -> Result<Option<std::fs::File>, String> {
@@ -1891,6 +1908,30 @@ fn civil_from_days(days: i64) -> (i32, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_ending_while_it_waits_apart_ends_at_once() {
+        // Another process holding the lock: the wait never ends by itself.
+        let (_hold, held) = std::sync::mpsc::channel::<()>();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.spawn(apart(move || held.recv().ok()));
+        runtime.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(50)).await });
+        let ending = std::time::Instant::now();
+        drop(runtime);
+        assert!(ending.elapsed() < std::time::Duration::from_secs(2));
+        // What it waited for, once given, goes to nothing awaiting it.
+        let (sent, got) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let waiting = runtime.spawn(apart(move || got.recv().ok()));
+        runtime.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(50)).await });
+        waiting.abort();
+        sent.send(7).unwrap();
+        assert!(runtime.block_on(waiting).is_err());
+    }
 
     fn clock(y: i32, mo: u8, d: u8, h: u8, mi: u8) -> i64 {
         trigger::epoch_of(trigger::Local {
