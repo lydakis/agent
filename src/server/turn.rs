@@ -6038,6 +6038,7 @@ impl Turn {
                             "last",
                             "workspace",
                             "created_by",
+                            "profile",
                             "closed_ms",
                         ] {
                             if !bot[field].is_null() {
@@ -6141,6 +6142,7 @@ impl Turn {
                         ("model", model.is_some()),
                         ("effort", effort.is_some()),
                         ("settings", settings.is_some()),
+                        ("profile", profile.is_some()),
                     ] {
                         if given {
                             asked.push(field.to_owned());
@@ -6319,7 +6321,8 @@ impl Turn {
     /// for the folder, in the profile's role); the role's tools or its own,
     /// search kept to a model that has it; its settings, in the role's
     /// sandbox unless the call names one (`sandbox_asked`), with why the
-    /// daemon will refuse a new agent in it when it is looser.
+    /// daemon will refuse a new agent in it when it is looser; and the
+    /// profile's name, which the agent keeps.
     #[allow(clippy::too_many_arguments)]
     async fn spawned(
         &self,
@@ -6378,6 +6381,8 @@ impl Turn {
                 .await?
             }
         };
+        // The profile it is composed from, kept on it by name.
+        let profile = role.as_ref().map(|role| role.name.clone());
         let own = format!(
             "{}/{}",
             me["provider"].as_str().unwrap_or_default(),
@@ -6443,7 +6448,7 @@ impl Turn {
             json!({"bot":name,"workspace":workspace,"model":model,"effort":effort,
             "instructions":instructions,"tools":tools,"settings":settings,
             "compaction_instructions":me["compaction_instructions"],
-            "compaction_model":compaction_model}),
+            "compaction_model":compaction_model,"profile":profile}),
             looser,
         ))
     }
@@ -9043,6 +9048,7 @@ mod tests {
                             declared: None,
                             request_id: None,
                             starts_line: false,
+                            profile: None,
                         },
                     )?;
                     let turn = db
@@ -9269,6 +9275,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 Ok(db
@@ -9413,6 +9420,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 let turn = (db.begin(
