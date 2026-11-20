@@ -1414,9 +1414,11 @@ async fn read_status_of(
         if prune {
             listed_here.insert(name);
         }
-        // Its title as noted, else, with none, its first line read once.
+        // Its title as noted, else, with none, its first line read once;
+        // a project's lead takes its project's, never its first message.
         let mut title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
         let untitled = title.is_none()
+            && !crate::title::is_project_lead(name)
             && bot.head.is_some()
             && (bot.bot_id).is_some_and(|id| !crate::title::asked(name, id));
         // An idle agent no event moved stands as the last count built it,
@@ -2927,10 +2929,11 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
 /// What a start of Sonny's companions may do to those the daemon keeps.
 #[derive(Clone, Copy, PartialEq)]
 enum Companions {
-    /// Add those it keeps none of: what a window and an editor's session
-    /// do as they start or the daemon comes back. A window of another
-    /// build or path never replaces what runs, as replacing one stops the
-    /// scripts it runs.
+    /// Add those it keeps none of, and replace those an older Sonny
+    /// started: what a window and an editor's session do as they start or
+    /// the daemon comes back. One of a newer Sonny, or another build of
+    /// this version, is never replaced, as replacing one stops the scripts
+    /// it runs.
     Add,
     /// Replace them with this Sonny's, as `sonny upgrade` does, and as a
     /// window does that started the daemon itself, whose companions have
@@ -2954,7 +2957,7 @@ async fn start_companions(client: &Client, start: Companions) -> Result<(), Stri
         (LOOKOUT, named::LOOKOUT, "lookout"),
         (TOOL_HOST, named::TOOL_HOST, tool_host::NAME),
     ] {
-        if start == Companions::Add && kept_companion(&listed, name).is_some() {
+        if kept_companion(&listed, name).is_some_and(|kept| !replaces(kept, start, VERSION)) {
             continue;
         }
         let program = named::named(&me, program);
@@ -2962,6 +2965,23 @@ async fn start_companions(client: &Client, start: Companions) -> Result<(), Stri
     }
     keep_reviewer(client, &listed, None, start).await
 }
+
+/// Whether a start of companions `start` by Sonny `version` replaces the
+/// companion `kept`: always on [`Companions::Replace`]; on
+/// [`Companions::Add`] only one an older release of Sonny started, by the
+/// version in its `SONNY_BUILD`. One that names no version Sonny can read
+/// is left running.
+fn replaces(kept: &Value, start: Companions, version: &str) -> bool {
+    let started_by = (kept["env"]["SONNY_BUILD"].as_str())
+        .and_then(|build| build.split(' ').next())
+        .and_then(update::parse_version);
+    start == Companions::Replace
+        || started_by
+            .is_some_and(|theirs| update::parse_version(version).is_some_and(|ours| theirs < ours))
+}
+
+/// This Sonny's release.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The companions the daemon keeps, as it lists them.
 async fn companions(client: &Client) -> Result<Value, String> {
@@ -2983,7 +3003,7 @@ async fn keep_reviewer(
     model: Option<&str>,
     start: Companions,
 ) -> Result<(), String> {
-    if start == Companions::Add && kept_companion(listed, REVIEWER).is_some() {
+    if kept_companion(listed, REVIEWER).is_some_and(|kept| !replaces(kept, start, VERSION)) {
         return Ok(());
     }
     let me = named::me().map_err(|e| e.to_string())?;
@@ -4117,8 +4137,8 @@ async fn run() -> Result<(), String> {
         if let Some(first) = &first {
             args.extend(["--send-file".into(), first.display().to_string()]);
         }
-        let draft = (app.carry_draft && !app.input.trim().is_empty())
-            .then(|| attach::draft(&app.input, &app.pictures))
+        let draft = (app.carry_draft && (!app.input.trim().is_empty() || !app.quotes.is_empty()))
+            .then(|| drafted(&app.input, &app.pictures, &app.quotes))
             .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
         if let Some(draft) = &draft {
             args.extend(["--draft-file".into(), draft.display().to_string()]);
@@ -4145,8 +4165,8 @@ async fn run() -> Result<(), String> {
         }
         // The words, and the pictures behind their placeholders: a picture
         // pasted from the clipboard has no file to come back from.
-        let draft = (!app.input.trim().is_empty())
-            .then(|| attach::draft(&app.input, &app.pictures))
+        let draft = (!app.input.trim().is_empty() || !app.quotes.is_empty())
+            .then(|| drafted(&app.input, &app.pictures, &app.quotes))
             .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
         if let Some(draft) = &draft {
             args.extend(["--draft-file".into(), draft.display().to_string()]);
@@ -6209,8 +6229,9 @@ struct App {
     /// What `/context` read, and the width its card was last laid at.
     context_read: Option<(context::Parts, Option<usize>)>,
     input: prompt::Prompt,
-    /// The prompts sent before, which Up and Down bring back.
-    recall: recall::Recall<Vec<Option<attach::Picture>>>,
+    /// The prompts sent before, which Up and Down bring back, with the
+    /// pictures and quotes each went with.
+    recall: recall::Recall<Attached>,
     /// Lines waiting to be written into the conversation, and what marks
     /// the rows of some, by their place among them.
     pending: Vec<Line<'static>>,
@@ -6440,6 +6461,9 @@ struct App {
     reacting: Option<(Vec<(i64, String)>, list::Picker)>,
     /// The list is `/reply`'s: the pick is quoted, not reacted to.
     quoting: bool,
+    /// The messages quoted over what is being written, in the order
+    /// picked: each one row over the composer, sent with the words.
+    quotes: Vec<Quote>,
     /// What Ctrl+F looks for on the full screen, while it does.
     finding: Option<String>,
     /// The reply `/react` picked, which the next emoji sent answers.
@@ -8589,6 +8613,7 @@ impl App {
             approval_left: None,
             replies: Vec::new(),
             quoting: false,
+            quotes: Vec::new(),
             reacting: None,
             finding: None,
             react_to: None,
@@ -8843,6 +8868,7 @@ impl App {
                 let (text, pictures) = attach::undraft(&draft);
                 self.input.set(&text);
                 self.pictures = pictures;
+                self.quotes = undrafted_quotes(&draft);
             }
             let _ = std::fs::remove_file(&file);
         }
@@ -8863,6 +8889,7 @@ impl App {
                         typed: first.clone(),
                         pictures: Vec::new(),
                         answering: None,
+                        quotes: Vec::new(),
                     };
                     self.send(first, None, (false, false), &[], then);
                 }
@@ -17142,6 +17169,7 @@ impl App {
             if switches(key)
                 || (key.code == KeyCode::Tab || right)
                     && self.input.is_empty()
+                    && self.quotes.is_empty()
                     && self.picker.is_none()
                     && self.agents.is_none()
                     && self.searching.is_none()
@@ -18089,7 +18117,7 @@ impl App {
                 self.kept.focused = Some(false);
                 match self.kept.showing {
                     // A message half typed keeps it, until sent or cleared.
-                    true if self.input.is_empty() => self.close_own(),
+                    true if self.blank() => self.close_own(),
                     true => {}
                     // Marked done by its lead while it rested here.
                     false => self.done_resting(true),
@@ -18466,20 +18494,20 @@ impl App {
                     KeyCode::Char('c') if ctrl => {
                         if self.input.is_empty() && self.making.is_some() {
                             self.making = None;
-                        } else if self.input.is_empty() {
+                        } else if self.blank() {
                             self.quit = true;
                         } else {
                             self.discard();
                         }
                     }
-                    KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
+                    KeyCode::Char('d') if ctrl && self.blank() => self.quit = true,
                     KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
                         if !ctrl
                             && !alt
                             && let Some(call) = self.waiting()
                             && self.paused.is_none()
-                            && self.input.is_empty()
+                            && self.blank()
                             && !self.new_brief() =>
                     {
                         // A call whose whole arguments could not be read
@@ -18495,7 +18523,7 @@ impl App {
                         if !ctrl
                             && !alt
                             && self.paused.is_none()
-                            && self.input.is_empty()
+                            && self.blank()
                             && !self.new_brief()
                             && let Some(prefix) = self.waiting().and_then(approvals::always) =>
                     {
@@ -18506,7 +18534,7 @@ impl App {
                     KeyCode::Char('y' | 'n' | 'a')
                         if !ctrl
                             && !alt
-                            && self.input.is_empty()
+                            && self.blank()
                             && self.waiting().is_none()
                             && self
                                 .approval_left
@@ -18535,7 +18563,7 @@ impl App {
                     // pane's list of the project's agents. A terminal that
                     // sends alt+← as alt+b is taken at its word.
                     KeyCode::Left | KeyCode::Right | KeyCode::Char('b') | KeyCode::Char('f')
-                        if self.input.is_empty()
+                        if self.blank()
                             && self.projects_here()
                             && (alt
                                 || ctrl && matches!(key.code, KeyCode::Left | KeyCode::Right)) =>
@@ -18557,7 +18585,7 @@ impl App {
                     // Codex and Claude Code.
                     KeyCode::Char('?')
                         if !alt
-                            && self.input.is_empty()
+                            && self.blank()
                             && self.asks.is_empty()
                             && self.waiting().is_none()
                             && self.react_to.is_none() =>
@@ -18565,6 +18593,11 @@ impl App {
                         self.shortcuts()
                     }
                     KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
+                    // At the start of the words, the newest quote over them
+                    // goes whole: it is one message, sent whole.
+                    KeyCode::Backspace if self.input.at_start() && !self.quotes.is_empty() => {
+                        self.quotes.pop();
+                    }
                     KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
                     KeyCode::Backspace => self.input.backspace(),
                     KeyCode::Delete if ctrl || alt => self.input.delete_word_forward(),
@@ -18573,7 +18606,7 @@ impl App {
                     KeyCode::Right if ctrl || alt => self.input.word_right(),
                     // With nothing typed, out to every project.
                     KeyCode::Left
-                        if self.input.is_empty()
+                        if self.blank()
                             && self.react_to.is_none()
                             && !self.new_brief()
                             && self.projects_here() =>
@@ -18586,9 +18619,7 @@ impl App {
                     KeyCode::End => self.input.end(),
                     // With nothing typed, the open questions are a list.
                     KeyCode::Up | KeyCode::Down
-                        if self.input.is_empty()
-                            && self.asking().is_some()
-                            && self.asks.len() > 1 =>
+                        if self.blank() && self.asking().is_some() && self.asks.len() > 1 =>
                     {
                         self.step_ask(key.code == KeyCode::Down)
                     }
@@ -18597,7 +18628,7 @@ impl App {
                     // and what was being written.
                     KeyCode::Up => {
                         if !self.input.up(self.prose())
-                            && let Some(text) = self.recall.older(&self.input, &mut self.pictures)
+                            && let Some(text) = self.recalled(recall::Recall::older)
                         {
                             self.input.set(&text);
                             // One of several rows starts at its top, so Up
@@ -18609,7 +18640,7 @@ impl App {
                     }
                     KeyCode::Down => {
                         if !self.input.down(self.prose())
-                            && let Some(text) = self.recall.newer(&self.input, &mut self.pictures)
+                            && let Some(text) = self.recalled(recall::Recall::newer)
                         {
                             self.input.set(&text);
                         }
@@ -18621,7 +18652,7 @@ impl App {
                     }
                     // Calls set aside come back to be answered.
                     KeyCode::Enter
-                        if self.input.is_empty()
+                        if self.blank()
                             && self.waiting().is_none()
                             && self.calls_waiting().1 > 0 =>
                     {
@@ -18632,9 +18663,7 @@ impl App {
                     // Drawn beside another conversation, Tab with nothing
                     // typed gives that one the keys back, while a turn
                     // runs too: there is nothing to queue.
-                    KeyCode::Tab if self.options.embedded && self.input.is_empty() => {
-                        embed::give_back()
-                    }
+                    KeyCode::Tab if self.options.embedded && self.blank() => embed::give_back(),
                     // Tab sends it to run once the running turn ends, as
                     // Codex queues; Enter steers.
                     KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
@@ -18676,13 +18705,13 @@ impl App {
                             // to do here, the conversation it is drawn
                             // beside has the keys again, and its next Esc
                             // closes this.
-                            match self.input.is_empty() {
+                            match self.blank() {
                                 true => embed::give_back(),
                                 false => self.discard(),
                             }
                         } else if self.options.side.is_some() {
                             // Back to the agent; the copy goes once idle.
-                            if self.input.is_empty() {
+                            if self.blank() {
                                 self.quit = true;
                             } else {
                                 self.discard();
@@ -18704,6 +18733,28 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// A step through the prompts sent before, from what the composer
+    /// holds: what it was sent with, pictures and quotes, swapped for
+    /// what the composer had.
+    fn recalled(
+        &mut self,
+        step: impl FnOnce(&mut recall::Recall<Attached>, &str, &mut Attached) -> Option<String>,
+    ) -> Option<String> {
+        let mut attached = (
+            std::mem::take(&mut self.pictures),
+            std::mem::take(&mut self.quotes),
+        );
+        let text = step(&mut self.recall, &self.input, &mut attached);
+        (self.pictures, self.quotes) = attached;
+        text
+    }
+
+    /// Whether nothing is being written: no words and no quotes over
+    /// them, so a key meant for the window is not taken from a reply.
+    fn blank(&self) -> bool {
+        self.input.is_empty() && self.quotes.is_empty()
     }
 
     /// Ctrl+R: the list of prompts sent before, over the composer.
@@ -18741,8 +18792,9 @@ impl App {
                             (search.found.get(search.pick)).map(|(at, _)| search.prompts[*at].0);
                         self.searching = None;
                         if let Some(back) = back
-                            && let Some(text) =
-                                self.recall.jump(back, &self.input, &mut self.pictures)
+                            && let Some(text) = self.recalled(|recall, current, attached| {
+                                recall.jump(back, current, attached)
+                            })
                         {
                             self.input.set(&text);
                         }
@@ -18798,7 +18850,8 @@ impl App {
     /// turn, or with `queue` runs after it.
     async fn submit_as(&mut self, queue: bool) {
         let prompt = self.input.trim().to_owned();
-        if prompt.is_empty() {
+        // A quote alone is a message, as it was typed into the words.
+        if prompt.is_empty() && self.quotes.is_empty() {
             return;
         }
         // With the pictures it shows, by their numbers.
@@ -18813,8 +18866,16 @@ impl App {
             true => attached,
             false => Vec::new(),
         };
-        let bytes = (attached.iter().flatten()).map(|p| p.data.len()).sum();
-        self.recall.sent(&prompt, attached, bytes);
+        // A command leaves the quotes for the message they go with.
+        let quotes = match prompt.starts_with('/') {
+            true => Vec::new(),
+            false => self.quotes.clone(),
+        };
+        let bytes = (attached.iter().flatten())
+            .map(|p| p.data.len())
+            .sum::<usize>()
+            + quotes.iter().map(|quote| quote.said.len()).sum::<usize>();
+        self.recall.sent(&prompt, (attached, quotes), bytes);
         // A command run, so the menu ranks it first next time.
         let word = prompt.split_whitespace().next().unwrap_or_default();
         if COMMANDS.iter().any(|(name, _)| *name == word) && !self.new_brief() {
@@ -18826,8 +18887,11 @@ impl App {
         {
             // Words only: neither a task's start nor the new window's first
             // send carries a picture, which the agent is shown once it runs.
+            // What it quotes goes before the words, as with any message;
+            // kept over the composer should the agent not be made.
             if self.placed(&prompt).is_empty() {
-                self.make_new(making, prompt).await;
+                let brief = noted(prompt, &self.quotes);
+                self.make_new(making, brief).await;
             } else {
                 making.failed =
                     Some("a new agent starts from words; send the picture once it runs".into());
@@ -19145,13 +19209,16 @@ impl App {
         if let Some(ask) = answering.clone().filter(|ask| ask.task.is_some()) {
             let pictures = self.placed(&prompt);
             let typed = (*self.input).to_owned();
-            let back = (typed, std::mem::take(&mut self.pictures));
+            let quotes = std::mem::take(&mut self.quotes);
+            let prompt = noted(prompt, &quotes);
+            let back = (typed, std::mem::take(&mut self.pictures), quotes);
             self.answer_task(&ask, &prompt, &pictures, Some(back));
             self.input.clear();
             self.notice = None;
             return;
         }
         if answering.is_none()
+            && self.quotes.is_empty()
             && let Some(emoji) = transcript::shortcodes(&prompt)
                 .or_else(|| transcript::reaction(&prompt).map(str::to_owned))
         {
@@ -19170,10 +19237,13 @@ impl App {
             messages.push(self.message(record, Some(SHELL), (join, queue), &[], Then::Held));
         }
         let pictures = self.placed(&prompt);
+        let quotes = std::mem::take(&mut self.quotes);
+        let prompt = noted(prompt, &quotes);
         let then = Then::Composed {
             typed: (*self.input).to_owned(),
             pictures: std::mem::take(&mut self.pictures),
             answering,
+            quotes: quotes.clone(),
         };
         let join = !messages.is_empty() && !queue;
         messages.push(self.message(prompt, None, (join, queue), &pictures, then));
@@ -19186,6 +19256,7 @@ impl App {
     fn discard(&mut self) {
         self.input.clear();
         self.pictures.clear();
+        self.quotes.clear();
     }
 
     /// The pictures whose placeholders are still in `prompt`, which go
@@ -19277,6 +19348,7 @@ impl App {
             typed: String::new(),
             pictures: Vec::new(),
             answering: None,
+            quotes: Vec::new(),
         };
         let message = self.message(prompt, None, (join, queue), &[], then);
         self.sending += 1;
@@ -19429,9 +19501,13 @@ impl App {
         }
         match then {
             Then::Composed {
-                typed, pictures, ..
+                typed,
+                pictures,
+                quotes,
+                ..
             } => {
                 self.give_back(&typed, pictures);
+                self.quotes_back(quotes);
             }
             Then::Zen(_, typed) => self.give_back(&typed, Vec::new()),
             Then::Ran(_) => {
@@ -19494,7 +19570,7 @@ impl App {
         ask: &asks::Ask,
         prompt: &str,
         pictures: &[attach::Picture],
-        back: Option<(String, Vec<Option<attach::Picture>>)>,
+        back: Option<(String, Vec<Option<attach::Picture>>, Vec<Quote>)>,
     ) {
         let Some(task) = ask.task.clone() else {
             self.notice = Some("that question is not a task's".into());
@@ -19517,8 +19593,9 @@ impl App {
             Ok(reply) => reply,
             Err(error) => {
                 self.notice = Some(error);
-                if let Some((typed, pictures)) = back {
+                if let Some((typed, pictures, quotes)) = back {
                     self.give_back(&typed, pictures);
+                    self.quotes_back(quotes);
                 }
                 return;
             }
@@ -20125,7 +20202,7 @@ impl App {
     /// before it was asked never answers it, as Codex keeps its draft
     /// apart from its questions. The one being answered keeps its focus.
     fn keep_draft(&mut self) {
-        if self.asking().is_none() && !self.input.trim().is_empty() {
+        if self.asking().is_none() && (!self.input.trim().is_empty() || !self.quotes.is_empty()) {
             self.chatting = true;
         }
         if self.focus.is_none() {
@@ -20140,13 +20217,18 @@ impl App {
     }
 
     /// The question in focus that sending `typed` answers: any words but
-    /// a command, a line for the shell, or nothing; and a line for the
+    /// a command, a line for the shell, or nothing (a quote alone is
+    /// words); and a line for the
     /// shell when the question is a step to run here ([`asks::runs_here`]),
     /// from its `!` on, as words are from their first letter.
     fn answers(&self, typed: &str) -> Option<&asks::Ask> {
         let typed = typed.trim_start();
         let ask = self.asking()?;
-        let words = !typed.trim().is_empty() && !typed.starts_with(['/', '!']);
+        // A quote alone is words, as it was typed into them.
+        let words = match typed.trim().is_empty() {
+            true => !self.quotes.is_empty(),
+            false => !typed.starts_with(['/', '!']),
+        };
         let runs = typed.starts_with('!') && asks::runs_here(ask);
         (words || runs).then_some(ask)
     }
@@ -20246,7 +20328,7 @@ impl App {
         self.kept.settled = Some(turn);
         match self.kept.done() {
             DoneWindow::Lead => {}
-            DoneWindow::Close if self.input.is_empty() => self.close_own(),
+            DoneWindow::Close if self.blank() => self.close_own(),
             DoneWindow::Close | DoneWindow::Stay => {
                 self.kept.showing = true;
                 self.commit(vec![done_line()]);
@@ -20587,7 +20669,7 @@ impl App {
             || self.react_to.is_some()
             || self.making.is_some()
             || self.searching.is_some();
-        let shows = self.input.is_empty()
+        let shows = self.blank()
             && self.running.is_none()
             && self.asks.is_empty()
             && self.calls_waiting().0 == 0
@@ -20831,6 +20913,7 @@ impl App {
         match made {
             Ok(bot) => {
                 self.input.clear();
+                self.quotes.clear();
                 self.switch_to = Some(bot);
                 self.quit = true;
             }
@@ -21661,10 +21744,12 @@ impl App {
         let room = (size.height as usize).saturating_sub(VIEWPORT as usize - 1);
         // What is typed to answer a question has the question over it,
         // as a reply in a chat has what it replies to.
-        let heading = self
-            .answering_over(width.min(measure()))
-            .filter(|_| room > 1);
-        let text_room = room - usize::from(heading.is_some());
+        let mut headings = self.quoting_over(width.min(measure()));
+        headings.extend(self.answering_over(width.min(measure())));
+        // The newest over the words, the room kept for one row of them.
+        let heading_room = room.saturating_sub(1);
+        headings.drain(..headings.len().saturating_sub(heading_room));
+        let text_room = room - headings.len();
         let (mut composer_rows, mut cursor_row) =
             window(composer_rows, cursor_row, text_room.max(1));
         // The first of the text's rows shown, for the mouse to find its spot.
@@ -21675,10 +21760,8 @@ impl App {
                 self.input.cursor(&layout).0 - cursor_row
             }),
         };
-        if let Some(heading) = &heading {
-            composer_rows.insert(0, heading.clone());
-            cursor_row += 1;
-        }
+        cursor_row += headings.len();
+        composer_rows.splice(0..0, headings.iter().cloned());
         let mut composer_at = None;
         let mut opens_at = Vec::new();
         let mut model_at = Vec::new();
@@ -22035,7 +22118,7 @@ impl App {
                 open.side = at;
                 let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
                 let drawn = (open.view.picked())
-                    .map(|project| status::agents_drawn(&project.agents, &self.bot, width))
+                    .map(|project| status::agents_drawn(&project.agents, None, width))
                     .unwrap_or_default();
                 for (row, (line, goes)) in drawn.into_iter().enumerate() {
                     let y = at.y + row as u16;
@@ -22530,7 +22613,7 @@ impl App {
                 .and_then(|(width, name)| {
                     let link = self.names.borrow_mut().link(name)?;
                     let x = composer.x + (width - name.width()) as u16;
-                    let y = composer.y + heading.is_some() as u16;
+                    let y = composer.y + headings.len() as u16;
                     Some((y, x..(x + name.width() as u16).min(composer.right()), link))
                 });
             // The task whose question its hint answers opens, as an
@@ -22560,14 +22643,12 @@ impl App {
                 }
                 opens_at.push((y, columns, link));
             }
-            // The mouse finds the text under the row over it.
-            let text = match heading {
-                Some(_) => Rect {
-                    y: composer.y + 1,
-                    height: composer.height.saturating_sub(1),
-                    ..composer
-                },
-                None => composer,
+            // The mouse finds the text under the rows over it.
+            let over = (headings.len() as u16).min(composer.height);
+            let text = Rect {
+                y: composer.y + over,
+                height: composer.height - over,
+                ..composer
             };
             composer_at = first_row.map(|first| (text, first, width.min(measure())));
             // Keys in the pane: no cursor where they do not go.
@@ -22732,12 +22813,15 @@ impl App {
                     "An emoji for that reply",
                     &hint::Keys::new().esc(hint::Esc::Cancel).text(),
                 ),
-                // Answered with its keys, until Esc sets it aside.
-                _ if self.waiting().is_some() => said(
+                // Answered with its keys, until Esc sets it aside, or a
+                // quote over the composer makes them words.
+                _ if self.waiting().is_some() && self.quotes.is_empty() => said(
                     "An approval waits",
                     &hint::Keys::new().esc(hint::Esc::WriteInstead).text(),
                 ),
-                _ if self.calls_waiting().1 > 0 => said("A message of your own", "enter approval"),
+                _ if self.calls_waiting().1 > 0 && self.quotes.is_empty() => {
+                    said("A message of your own", "enter approval")
+                }
                 _ if !self.asks.is_empty() => said("A message of your own", "esc answer"),
                 Some(_) => vec![Span::raw(format!("Steer {name}")).dim()],
                 None => vec![Span::raw(format!("Message {name}")).dim()],
@@ -22754,6 +22838,7 @@ impl App {
             // to every project, then the keys. Too long, `← projects` goes
             // first.
             if answering.is_none()
+                && self.quotes.is_empty()
                 && self.asks.is_empty()
                 && self.react_to.is_none()
                 && !self.new_brief()
@@ -23050,28 +23135,39 @@ impl App {
         Line::from(spans)
     }
 
-    /// A message quoted before what the person is writing, as a mail or a
-    /// GitHub reply quotes: `> ` before each of its lines, the first
-    /// [`QUOTE_LINES`] of them, a blank line, then the cursor. Quoted
-    /// after the quotes already there, so several read in the order
-    /// they were picked.
+    /// A message quoted over what the person is writing, after those
+    /// quoted already, so several read in the order they were picked: one
+    /// row over the composer, which one backspace at the start of the
+    /// words takes away whole. Sent, it goes before the words as it did
+    /// when it was typed into them ([`noted`]). One quoted already is not
+    /// quoted twice.
     fn quote(&mut self, said: &str) {
-        let lines: Vec<&str> = said.trim().lines().collect();
-        let mut quoted: Vec<String> = (lines.iter().take(QUOTE_LINES))
-            .map(|line| format!("> {line}").trim_end().to_owned())
-            .collect();
-        if lines.len() > QUOTE_LINES {
-            quoted.push("> …".into());
-        }
-        let typed = self.input.trim().to_owned();
-        let (before, typed) = transcript::opening_quote(&typed);
-        let before = match before.is_empty() {
-            true => String::new(),
-            false => format!("{before}\n\n"),
+        let quote = Quote {
+            said: said.trim().to_owned(),
         };
-        self.input
-            .set(&format!("{before}{}\n\n{typed}", quoted.join("\n")));
+        if !self.quotes.contains(&quote) {
+            self.quotes.push(quote);
+        }
         self.pane_keys = false;
+    }
+
+    /// Quotes that did not go, back over the composer: in front of any
+    /// quoted since, as they were picked first.
+    fn quotes_back(&mut self, mut quotes: Vec<Quote>) {
+        quotes.retain(|quote| !self.quotes.contains(quote));
+        self.quotes.splice(0..0, quotes);
+    }
+
+    /// The rows over the composer naming the messages quoted, each by
+    /// its first line, muted as the question an answer answers is.
+    fn quoting_over(&self, width: usize) -> Vec<Line<'static>> {
+        let room = width.saturating_sub("  quoting “”".width());
+        (self.quotes.iter())
+            .map(|quote| {
+                let first = quote.said.lines().next().unwrap_or_default().trim();
+                Line::from(format!("  quoting “{}”", transcript::cut(first, room))).dim()
+            })
+            .collect()
     }
 
     /// The profile the agent runs as, when it isn't its seat's own: a
@@ -24124,6 +24220,70 @@ struct Sent {
     then: Then,
 }
 
+/// What is being written, as a window keeps it for the one it becomes
+/// ([`attach::draft`]), with the messages it quotes under `quotes`.
+fn drafted(text: &str, pictures: &[Option<attach::Picture>], quotes: &[Quote]) -> String {
+    let draft = attach::draft(text, pictures);
+    if quotes.is_empty() {
+        return draft;
+    }
+    let mut draft: Value = serde_json::from_str(&draft).unwrap_or_default();
+    draft["quotes"] = json!(quotes);
+    draft.to_string()
+}
+
+/// The quotes [`drafted`] kept, none from a draft without them.
+fn undrafted_quotes(draft: &str) -> Vec<Quote> {
+    (serde_json::from_str::<Value>(draft).ok())
+        .and_then(|draft| serde_json::from_value(draft["quotes"].clone()).ok())
+        .unwrap_or_default()
+}
+
+/// What a prompt sent before went with: its pictures and its quotes.
+type Attached = (Vec<Option<attach::Picture>>, Vec<Quote>);
+
+/// A message quoted over what the person writes ([`App::quote`]).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Quote {
+    /// Its words, whose first line the row over the composer shows.
+    said: String,
+}
+
+/// `prompt` with `quotes` before the person's own words, as a mail or a
+/// GitHub reply quotes: `> ` before each of the first [`QUOTE_LINES`]
+/// lines of each, in the order picked. An answer keeps its question first.
+fn noted(prompt: String, quotes: &[Quote]) -> String {
+    if quotes.is_empty() {
+        return prompt;
+    }
+    let quoted: Vec<String> = (quotes.iter())
+        .map(|quote| {
+            let lines: Vec<&str> = quote.said.lines().collect();
+            let mut rows: Vec<String> = (lines.iter().take(QUOTE_LINES))
+                .map(|line| format!("> {line}").trim_end().to_owned())
+                .collect();
+            if lines.len() > QUOTE_LINES {
+                rows.push("> …".into());
+            }
+            rows.join("\n")
+        })
+        .collect();
+    let quoted = quoted.join("\n\n");
+    if prompt.is_empty() {
+        return quoted;
+    }
+    match asks::split(&prompt) {
+        Some((_, answer)) => {
+            let question = &prompt[..prompt.len() - answer.len()];
+            match answer.is_empty() {
+                true => format!("{question}{quoted}"),
+                false => format!("{question}{quoted}\n\n{answer}"),
+            }
+        }
+        None => format!("{quoted}\n\n{prompt}"),
+    }
+}
+
 /// What follows a message once the daemon took it ([`App::landed`]), or
 /// refused it ([`App::unsent`]).
 enum Then {
@@ -24134,6 +24294,7 @@ enum Then {
         typed: String,
         pictures: Vec<Option<attach::Picture>>,
         answering: Option<asks::Ask>,
+        quotes: Vec<Quote>,
     },
     /// The answer to a question, closed once it lands.
     Closes(asks::Ask),
@@ -24207,8 +24368,8 @@ struct Answering {
 struct TaskAnswering {
     ask: asks::Ask,
     prompt: String,
-    /// What the person typed, and its pictures, should it not go.
-    back: Option<(String, Vec<Option<attach::Picture>>)>,
+    /// What the person typed, its pictures and quotes, should it not go.
+    back: Option<(String, Vec<Option<attach::Picture>>, Vec<Quote>)>,
 }
 
 /// The picks a `configure` sent ([`App::configure`]): the bot's once the
@@ -29736,6 +29897,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_question_asked_under_a_quote_leaves_the_reply_the_persons_own() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        // A quote over the composer is a reply begun before any words.
+        app.quote("Merge it?");
+        app.asked("c0", Some(1), &json!({"question": "Bump it?"}));
+        assert!(app.asking().is_none());
+        assert!(app.answering_over(80).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_quote_alone_answers_the_question_in_focus() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(words_sent(asked).to_owned());
+            }
+            json!({"message": 2, "turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        app.asked("c0", Some(1), &json!({"question": "Bump it?"}));
+        app.quote("Keep the old one.");
+        // The row over the composer says it answers, as words would.
+        assert!(app.answering_over(80).is_some());
+        app.submit().await;
+        app.beside_done().await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["You asked (ask:1/c0): Bump it?\n\n> Keep the old one."]
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_command_goes_with_the_next_message() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -31814,22 +32009,170 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_quotes_the_message_before_what_is_being_written() {
-        let client = daemon_with(json!([])).await;
+    async fn a_reply_quotes_the_message_over_what_is_being_written() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_items") => match asked["nodes"][0].as_i64() {
+                Some(4) => json!({"items": [{"node": 4, "handle": "shop.lead/7",
+                    "item": {"role": "user", "content": "Merge it?"}}]}),
+                _ => json!({"items": [{"node": 9, "item": {"role": "assistant",
+                    "content": [{"type": "output_text", "text": "Merged it.\n\nThe tests pass."}]}}]}),
+            },
+            Some("submit") => {
+                seen.lock().unwrap().push(asked.clone());
+                json!({"message": 12, "turn": 12})
+            }
+            _ => json!({}),
+        })
+        .await;
         let mut app = app(client);
-        app.input.set("Yes, merge it");
-        let said: String = (1..=8).map(|n| format!("line {n}\n")).collect();
-        app.quote(&said);
-        let quoted = "> line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> …";
-        assert_eq!(&*app.input, format!("{quoted}\n\nYes, merge it"));
+        app.bot = "shop.lead".into();
+        app.input.set("Ship both");
+        app.press("reply/9").await;
+        app.beside_done().await;
+        app.press("reply/4").await;
+        app.beside_done().await;
+        // Picked again, it is quoted once.
+        app.press("reply/9").await;
+        app.beside_done().await;
+        // What is written stays as it was; each quote is a row over it, in
+        // the order picked, by its first line.
+        assert_eq!(&*app.input, "Ship both");
+        let over: Vec<String> = app.quoting_over(80).iter().map(Line::to_string).collect();
+        assert_eq!(over, ["  quoting “Merged it.”", "  quoting “Merge it?”"]);
+        // Sent, the quotes go before the words as they did typed into them.
+        app.submit().await;
+        app.beside_done().await;
+        let asked = sent.lock().unwrap()[0].clone();
+        assert_eq!(
+            asked["prompt"],
+            "> Merged it.\n>\n> The tests pass.\n\n> Merge it?\n\nShip both"
+        );
+        assert_eq!(asked["quotes"], Value::Null);
+        assert!(app.quotes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_emoji_under_a_quote_or_a_quote_alone_is_sent() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                seen.lock().unwrap().push(asked.clone());
+                json!({"message": 12, "turn": 12})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.quote("Fork me");
+        // A message with the quote, not a reaction.
+        app.input.set(":+1:");
+        app.submit().await;
+        app.beside_done().await;
+        let asked = sent.lock().unwrap()[0].clone();
+        assert_eq!(asked["prompt"], "> Fork me\n\n:+1:");
+        assert!(app.quotes.is_empty());
+        // A quote alone goes too, as it did typed into the words.
+        app.quote("Fork me");
+        app.submit().await;
+        app.beside_done().await;
+        assert_eq!(sent.lock().unwrap()[1]["prompt"], "> Fork me");
+        assert!(app.quotes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backspace_at_the_start_of_the_words_takes_a_quote_away_whole() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let backspace = || Event::Key(event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.quote("First.");
+        app.quote("Second.\nmore");
+        app.input.set("ok");
+        // Inside the words it deletes a letter, as ever.
+        app.key(backspace()).await;
+        assert_eq!((&*app.input, app.quotes.len()), ("o", 2));
+        app.key(backspace()).await;
+        assert_eq!((&*app.input, app.quotes.len()), ("", 2));
+        // With none before the cursor, the newest quote goes whole.
+        app.key(backspace()).await;
+        assert_eq!(app.quotes.len(), 1);
+        assert_eq!(app.quotes[0].said, "First.");
+        app.input.set("ok");
+        app.input.home();
+        app.key(backspace()).await;
+        assert_eq!((&*app.input, app.quotes.len()), ("ok", 0));
+        // Ctrl+C drops the quotes with the words, before it quits.
+        app.quote("Again.");
         app.input.clear();
-        app.quote("Merged it.\n\nThe tests pass.");
-        assert_eq!(&*app.input, "> Merged it.\n>\n> The tests pass.\n\n");
-        // Another quoted goes after it, in the order picked, before what
-        // is being written.
-        app.input.set("> Merged it.\n\nShip both");
-        app.quote("Tagged v2.");
-        assert_eq!(&*app.input, "> Merged it.\n\n> Tagged v2.\n\nShip both");
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert!(app.quotes.is_empty() && !app.quit);
+    }
+
+    #[test]
+    fn quotes_go_before_the_person_s_words_and_after_a_question() {
+        let quote = |said: &str| Quote { said: said.into() };
+        let said: String = (1..=8).map(|n| format!("line {n}\n")).collect();
+        let quotes = [quote(said.trim()), quote("✎ Plan\nShip it")];
+        assert_eq!(
+            noted("Yes".into(), &quotes),
+            "> line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> …\n\n\
+             > ✎ Plan\n> Ship it\n\nYes"
+        );
+        assert_eq!(noted("Yes".into(), &[]), "Yes");
+        assert_eq!(noted(String::new(), &quotes[1..]), "> ✎ Plan\n> Ship it");
+        assert_eq!(
+            noted("You asked (a1): Merge?\n\nYes".into(), &quotes[1..]),
+            "You asked (a1): Merge?\n\n> ✎ Plan\n> Ship it\n\nYes"
+        );
+        // A quote alone answers with itself.
+        assert_eq!(
+            noted("You asked (a1): Merge?\n\n".into(), &quotes[1..]),
+            "You asked (a1): Merge?\n\n> ✎ Plan\n> Ship it"
+        );
+    }
+
+    #[test]
+    fn a_draft_carried_to_another_window_keeps_its_quotes() {
+        let quotes = vec![
+            Quote {
+                said: "Fixed.".into(),
+            },
+            Quote {
+                said: "✎ Plan".into(),
+            },
+        ];
+        let kept = drafted("ship it", &[], &quotes);
+        assert_eq!(attach::undraft(&kept).0, "ship it");
+        assert_eq!(undrafted_quotes(&kept), quotes);
+        // One without quotes keeps the shape it had.
+        let plain = drafted("ship it", &[], &[]);
+        assert_eq!(plain, attach::draft("ship it", &[]));
+        assert!(undrafted_quotes(&plain).is_empty());
+    }
+
+    #[tokio::test]
+    async fn quotes_refused_with_their_message_come_back_in_front() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.quote("since");
+        let then = Then::Composed {
+            typed: "first".into(),
+            pictures: Vec::new(),
+            answering: None,
+            quotes: vec![Quote {
+                said: "picked".into(),
+            }],
+        };
+        app.unsent(String::new(), then, "refused".into());
+        let said: Vec<&str> = app.quotes.iter().map(|q| q.said.as_str()).collect();
+        assert_eq!(said, ["picked", "since"]);
     }
 
     #[tokio::test]
@@ -33923,13 +34266,42 @@ mod tests {
         assert_eq!(removed, [OLD_REVIEWER]);
     }
 
+    #[test]
+    fn a_window_replaces_only_companions_an_older_sonny_started() {
+        let kept = |build: Option<&str>| match build {
+            Some(build) => json!({"env": {"SONNY_BUILD": build}}),
+            None => json!({"env": {}}),
+        };
+        // An older release's: replaced, by its version, not its digits.
+        for older in ["0.10.1 1", "0.9.5 1", "0.0.0 1"] {
+            assert!(
+                replaces(&kept(Some(older)), Companions::Add, "0.10.2"),
+                "{older}"
+            );
+        }
+        // A newer release's, another build of this one, or one that names
+        // no version: left running.
+        for build in [Some("0.10.3 1"), Some("0.10.2 9"), Some("nightly"), None] {
+            assert!(
+                !replaces(&kept(build), Companions::Add, "0.10.2"),
+                "{build:?}"
+            );
+        }
+        // A start of this build's own replaces whatever is kept.
+        assert!(replaces(
+            &kept(Some("0.10.3 1")),
+            Companions::Replace,
+            "0.10.2"
+        ));
+    }
+
     #[tokio::test]
     async fn a_window_adds_only_the_companions_the_daemon_keeps_none_of() {
-        // Kept by another build: a window of this one leaves them running,
+        // Kept by a newer Sonny: a window of this one leaves them running,
         // as replacing the tool host stops every script it runs.
         let other = |name: &str| {
             json!({"name": name, "command": "/other/sonny", "args": [],
-                "env": {"SONNY_BUILD": "0.9.5 1", named::PROGRAM: "/other/sonny"}})
+                "env": {"SONNY_BUILD": "999.0.0 1", named::PROGRAM: "/other/sonny"}})
         };
         let (added, removed) = companions_kept_from(
             json!([other(LOOKOUT), other(TOOL_HOST), other(REVIEWER)]),
@@ -35228,6 +35600,49 @@ mod tests {
         assert!(
             texts.contains(&"– The request to run make deploy went away".to_owned()),
             "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_under_a_quote_types_y_n_and_a_rather_than_answering_a_call() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({})
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        app.quote("Merged it.");
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        for c in ['y', 'a', 'n'] {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+        app.beside_done().await;
+        assert_eq!(&*app.input, "yan");
+        assert!(app.waiting().is_some(), "the call still waits");
+        // Set aside, Enter under a quote alone sends it rather than
+        // bringing the call back.
+        app.input.set("");
+        app.key(key(KeyCode::Esc)).await;
+        assert!(app.waiting().is_none());
+        app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
+        assert!(app.waiting().is_none(), "the call stays aside");
+        assert!(app.quotes.is_empty(), "the quote went");
+        let asked = asked.lock().unwrap();
+        assert!(
+            !asked
+                .iter()
+                .any(|r| r.to_string().contains("allow") || r.to_string().contains("deny")),
+            "{asked:?}"
         );
     }
 
@@ -37585,8 +38000,9 @@ mod tests {
     #[tokio::test]
     async fn up_and_down_past_the_rows_walk_the_prompts_sent() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        app.recall.sent("/status", Vec::new(), 0);
-        app.recall.sent("first line\nsecond line", Vec::new(), 0);
+        app.recall.sent("/status", Attached::default(), 0);
+        app.recall
+            .sent("first line\nsecond line", Attached::default(), 0);
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         // A draft of two rows: Up moves through it before going back.
         app.input.set("draft\nmore");
@@ -37631,9 +38047,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recalled_prompt_comes_back_with_its_quotes() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("submit") => json!({"message": 12, "turn": 12}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        let file = std::env::temp_dir().join(format!("sonny-recall-quotes-{}", std::process::id()));
+        app.recall = recall::Recall::kept(&file, attach::MOST_BYTES);
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let quoted = Quote {
+            said: "Merged it.".into(),
+        };
+        app.quote(&quoted.said);
+        app.input.set("do that instead");
+        app.submit().await;
+        app.beside_done().await;
+        assert!(app.quotes.is_empty());
+        // A draft quoting something else waits while Up goes back.
+        app.quote("Other.");
+        app.input.set("draft");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "do that instead");
+        assert_eq!(app.quotes, [quoted]);
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "draft");
+        assert_eq!(app.quotes.len(), 1);
+        assert_eq!(app.quotes[0].said, "Other.");
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
     async fn up_in_a_prompt_taller_than_the_composer_reaches_its_top_lines() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        app.recall.sent("sent before", Vec::new(), 0);
+        app.recall.sent("sent before", Attached::default(), 0);
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let long: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
         app.input.set(&long.join("\n"));
@@ -37673,7 +38121,7 @@ mod tests {
     async fn ctrl_r_finds_a_prompt_sent_before_and_leaves_it_to_edit() {
         let mut app = app(daemon_answering(|_| json!({})).await);
         for prompt in ["fix the rounding", "tag 0.2\nand push", "fix the readme"] {
-            app.recall.sent(prompt, Vec::new(), 0);
+            app.recall.sent(prompt, Attached::default(), 0);
         }
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let ctrl = |c| {
@@ -37922,6 +38370,7 @@ mod tests {
             typed: "look [Image #1] and [Image #2]".into(),
             pictures: vec![Some(picture(1)), Some(picture(2))],
             answering: None,
+            quotes: Vec::new(),
         };
         app.unsent(String::new(), then, "refused".into());
         assert_eq!(
@@ -37938,6 +38387,7 @@ mod tests {
             typed: "then this".into(),
             pictures: Vec::new(),
             answering: None,
+            quotes: Vec::new(),
         };
         app.unsent(String::new(), then, "refused".into());
         assert_eq!(

@@ -2420,29 +2420,39 @@ notes, one plan however often it changes; each `plan` call in the
 conversation is a row of how far it had got, and where the margin cannot
 show, the newest is the whole checklist.
 
-At rest the pane has two parts. On top, Sonny's: the project's agents,
-under the head `/status` has (the project's title and a count for each
-group with any). The lead is the first row whatever its state, its name
-and state word alone; then every task that needs you, failed or works, in
-that order, each its mark, its title and its name, a task's helpers
-counted under it (`└ 2 helpers, 1 working`), and a workflow as a row with
-its strip under the agent that runs it. A task with several agents is one
-row, its most pressing agent's mark, its title and a muted `4 agents`,
-with those of its agents that need you, failed or work under it, two
-columns in, each its mark and its name, a link; `alt+←` and `alt+→` step
-through them as through any row. The list is the project's, so it
-is the same in the lead's window and in each task's: from a task, the lead
-and the other tasks are one click away. The agent the window is on is in
-bold and plain, not blue. Idle and done tasks are not there: `/status`
-has them, and opens the whole list in the same place. Under a muted rule,
-the agent's: the margin, its plan and notes. Sonny draws the list from
-what `/status` reads, as it draws the footer's counts; it is no tool call
-and no note, so no agent writes it. With no task in the list it is not
-drawn, and the pane is the margin alone; the pane opens for it as it does
-for a plan. A click on a row, or `enter` with it picked, goes to its
-agent.
+At rest the pane has two parts. On top, Sonny's: the project's agents.
+The first row is the project, which is its lead: the lead's mark, the
+project's title and `lead`, a link; it is the way back from a task. No
+head and no counts stand over it: the footer counts the project's agents
+under the composer. The tasks hang two columns under it: every task that
+needs you, failed or works, in that order, each its mark, its title and
+its name, a link, the names in one column; a task's helpers counted under
+it (`└ 2 helpers, 1 working`), and a workflow as a row with its strip under
+the agent that runs it. A task with several agents is one row, its most
+pressing agent's mark, its title and a muted `4 agents`, with those of
+its agents that need you, failed or work under it, two columns in, each
+its mark and its name, a link; `alt+←` and `alt+→` step through them as
+through any row. Too long for its row, a title is cut at a word;
+the mark and the name stay. The list is the project's, so it is the same
+in the lead's window and in each task's: from a task, the lead and the
+other tasks are one click away. The agent the window is on has its whole
+row on the band your words sit on, from the pane's inset to its edge, its
+title and name in bold and the name plain, not blue; with `NO_COLOR` it
+is the bold alone. Idle and done tasks are not there: `/status` has them,
+and opens the whole list in the same place. Under a muted rule, the
+agent's: the margin, its plan and notes. Sonny draws the list from what
+`/status` reads, as it draws the footer's counts; it is no tool call and
+no note, so no agent writes it. With no task in the list it is not drawn,
+and the pane is the margin alone; the pane opens for it as it does for a
+plan. A click on a row, or `enter` with it picked, goes to its agent.
+While Projects is open, the pane draws the picked project's agents the
+same way, with no row on the band.
 
-![The project's agents above the margin at 150, 120, 60 and 44 columns, from the lead's window and from a task's](../docs/sonny/margin-agents.png)
+![The project's agents above the margin at 150, 120, 60 and 44 columns, from the lead's window, from a task's and with Projects open, in a dark theme](../docs/sonny/margin-agents.png)
+
+![The same in a light theme](../docs/sonny/margin-agents-light.png)
+
+![The same with NO_COLOR: the agent you are on is its bold alone](../docs/sonny/margin-agents-no-color.png)
 
 The notes are kept by agent in
 `~/.agent/sonny/margin/`, with the newest node of the agent's history they

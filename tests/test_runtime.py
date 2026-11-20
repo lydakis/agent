@@ -41,6 +41,16 @@ def is_summary(request):
     return (isinstance(content, list) and bool(content) and items[-1].get('role') == 'user'
             and content[-1].get('text', '').startswith('[compaction request]'))
 
+def read_body(handler):
+    """The request's body, or None when the daemon stopped while sending
+    it, as one a test closes mid-upload does: no request arrived."""
+    length = int(handler.headers['Content-Length'])
+    body = handler.rfile.read(length)
+    if len(body) < length:
+        handler.close_connection = True
+        return None
+    return body
+
 class Model(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -68,7 +78,9 @@ class Model(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            body = self.rfile.read(int(self.headers['Content-Length']))
+            body = read_body(self)
+            if body is None:
+                return
             request = json.loads(body)
             self.server.requests.put(request)
             if hasattr(self.server, 'bodies'):
@@ -644,7 +656,10 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            body = read_body(self)
+            if body is None:
+                return
+            request = json.loads(body)
             self.server.requests.put(request)
             if hasattr(self.server, 'arrivals'):
                 self.server.arrivals.append((time.monotonic(), request))
@@ -1022,6 +1037,28 @@ class AnthropicRuntimeTests(unittest.TestCase):
                    for e in events if e['event'] == 'message' and e['turn'] in turns[:2]]
         self.assertEqual([[b['type'] for b in c] for c in replies], [['text'], ['thinking', 'text']])
         self.assertEqual([c[-1]['text'] for c in replies], [' \n', ' \n'])
+
+    def test_a_prompt_may_be_up_to_one_mib_as_in_codex(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        limit = 1024 * 1024
+        refused = client.request('submit', bot='Bob', request_id='over', prompt='x' * (limit + 1))
+        self.assertEqual(refused['error'], 'prompt_limit')
+        self.assertEqual(refused['detail'], f'prompt may be up to {limit} bytes')
+        # One of the whole limit goes to the model whole.
+        prompt = 'shell:sleep 1 #' + 'x' * (limit - 15)
+        self.assertEqual(len(prompt), limit)
+        turn = client.request('submit', bot='Bob', request_id='whole', prompt=prompt)['result']['message']
+        # And a steer as long joins the running turn whole, past what one
+        # batch of steers took before.
+        steer = 'y' * limit
+        steered = client.request('submit', bot='Bob', request_id='steer', prompt=steer, delivery='steer')
+        self.assertIn('result', steered)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
+        self.assertEqual(first['messages'][-1]['content'][0]['text'], prompt)
+        texts = [b.get('text') for m in second['messages'] for b in m['content'] if isinstance(b, dict)]
+        self.assertIn(steer, texts)
 
     def test_a_turns_reply_follows_the_schema_it_was_sent_with(self):
         client, model, path = self.start()
