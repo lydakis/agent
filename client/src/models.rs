@@ -30,6 +30,68 @@ impl Model {
     }
 }
 
+/// The Claude model a Bedrock id names: `anthropic.claude-…` and a
+/// geographic or global profile such as `us.anthropic.claude-…` or
+/// `global.anthropic.claude-…` name `claude-…`. Other ids are unchanged.
+pub fn claude_model(model: &str) -> &str {
+    if let Some(name) = model.strip_prefix("anthropic.") {
+        return name;
+    }
+    model
+        .split_once('.')
+        .filter(|(profile, _)| {
+            !profile.is_empty() && profile.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        })
+        .and_then(|(_, rest)| rest.strip_prefix("anthropic."))
+        .unwrap_or(model)
+}
+
+/// The context window, in tokens, of a model no setting or listing gives
+/// one: the window Anthropic publishes for a Claude model (1M from Claude
+/// 5 on, 200K before), else 200K, the smallest a current model has. The
+/// daemon's last resort (`provider::context_window`).
+pub fn unlisted_window(model: &str) -> u64 {
+    let claude = claude_model(model);
+    let before_5 = [
+        "claude-2",
+        "claude-3",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-haiku-4",
+    ];
+    match claude.starts_with("claude-") && !before_5.iter().any(|old| claude.starts_with(old)) {
+        true => 1_000_000,
+        false => 200_000,
+    }
+}
+
+/// The context window, in tokens, the daemon gives a bot running `path`,
+/// `PROVIDER/MODEL`, whose `context_windows` setting is `windows`: the
+/// most specific pattern there that `path` matches, else the window its
+/// provider lists in `listing` (a `provider_models` reply), else
+/// [`unlisted_window`]. The daemon's own order (`provider::context_window`).
+pub fn window(
+    windows: &std::collections::BTreeMap<String, u64>,
+    listing: &Value,
+    path: &str,
+) -> u64 {
+    let set = crate::config::ranked(windows.iter().map(|(k, v)| (k.clone(), *v)).collect());
+    if let Some((_, tokens)) = set
+        .iter()
+        .find(|(pattern, _)| crate::config::matches(pattern, path))
+    {
+        return *tokens;
+    }
+    let (provider, model) = path.split_once('/').unwrap_or(("", path));
+    let listed = listing["providers"][provider]["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["id"] == model)
+        .and_then(|entry| entry["context_tokens"].as_u64());
+    listed.unwrap_or_else(|| unlisted_window(model))
+}
+
 /// The person's list.
 pub fn path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent").join("models"))
@@ -479,8 +541,45 @@ fn sync_folder(path: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, render};
+    use super::{parse, render, window};
     use serde_json::json;
+
+    /// A model's window is the daemon's: the person's most specific
+    /// pattern, else its provider's listing, else Claude 5's 1M or 200K.
+    #[test]
+    fn a_models_window_is_the_persons_else_listed_else_the_default() {
+        let listing = json!({"providers": {"openai": {"models": [
+            {"id": "gpt-6-luna", "context_tokens": 272_000}, {"id": "gpt-6-sol"}]}}});
+        let none = std::collections::BTreeMap::new();
+        assert_eq!(window(&none, &listing, "openai/gpt-6-luna"), 272_000);
+        // Listed without a window, or not listed: the default.
+        assert_eq!(window(&none, &listing, "openai/gpt-6-sol"), 200_000);
+        assert_eq!(window(&none, &json!({}), "openai/gpt-6-luna"), 200_000);
+        assert_eq!(
+            window(&none, &json!({}), "anthropic/claude-opus-5-5"),
+            1_000_000
+        );
+        assert_eq!(
+            window(&none, &json!({}), "bedrock/us.anthropic.claude-opus-5-5"),
+            1_000_000
+        );
+        assert_eq!(
+            window(&none, &json!({}), "anthropic/claude-sonnet-4-5"),
+            200_000
+        );
+        let set = [
+            ("openai/*".to_owned(), 128_000),
+            ("openai/gpt-6-luna".to_owned(), 400_000),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(window(&set, &listing, "openai/gpt-6-luna"), 400_000);
+        assert_eq!(window(&set, &listing, "openai/gpt-6-sol"), 128_000);
+        assert_eq!(
+            window(&set, &listing, "anthropic/claude-opus-5-5"),
+            1_000_000
+        );
+    }
 
     #[test]
     fn discovery_requires_a_model_that_survives_rendering() {
