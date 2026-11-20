@@ -25,9 +25,9 @@ pub use db::{
     Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS, PROCESSES_PAGE, ParkedFallback,
     Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON, Replaced,
     Resumed, Room, SANDBOX, SETTINGS, Served, Settings, Shared, Spend, Started, Step, StepAsk,
-    StepOpened, Stepped, Strip, Switch, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, TurnBudget,
-    TurnOptions, UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share,
-    unserved,
+    StepOpened, Stepped, Strip, Switch, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, Translation,
+    TurnBudget, TurnOptions, UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob,
+    listed_command, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;

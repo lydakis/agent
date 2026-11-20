@@ -2040,6 +2040,37 @@ fn gate(
         ),
     }
 }
+/// A `configure` that switches a bot to the other model family, waiting
+/// while its history is translated a page at a time, each page its own
+/// store job, so the run loop and other bots go on between pages. Once it
+/// is all written the run loop takes the change again with it.
+struct SwitchDone {
+    bot: String,
+    bot_id: Option<i64>,
+    change: Configure,
+    /// Who asked; `None` for a change kept for a turn's end.
+    asker: Option<lane::Asker>,
+    translation: Result<agent_runtime::store::Translation>,
+}
+struct Switching {
+    /// Bots being translated: other changes to them wait.
+    bots: std::collections::HashSet<String>,
+    /// Translations done, for the `configure` that takes them.
+    prepared: HashMap<String, agent_runtime::store::Translation>,
+    done: tokio::sync::mpsc::UnboundedSender<SwitchDone>,
+    finished: tokio::sync::mpsc::UnboundedReceiver<SwitchDone>,
+}
+impl Default for Switching {
+    fn default() -> Self {
+        let (done, finished) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            bots: std::collections::HashSet::new(),
+            prepared: HashMap::new(),
+            done,
+            finished,
+        }
+    }
+}
 struct Service {
     store: Store,
     /// Each waiting step's `approve_step`, by approval, answered from the
@@ -2089,6 +2120,9 @@ struct Service {
     replays: JoinSet<()>,
     /// Retention tasks own outputs and must release them before stdout joins.
     retention: JoinSet<()>,
+    /// Switches between model families whose history is translated in
+    /// pieces, beside the run loop.
+    switching: Switching,
     /// Reads that decide nothing, answered beside the run loop.
     lane: lane::Lane,
     /// A turn may be ready to start: set whenever a slot opens or a turn
@@ -2947,6 +2981,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         tails: Default::default(),
         replays: JoinSet::new(),
         retention: JoinSet::new(),
+        switching: Switching::default(),
         lane,
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
@@ -3087,6 +3122,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                     service.chores.count("reload", chore);
                 }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
+                Some(done) = service.switching.finished.recv() => {
+                    let chore = std::time::Instant::now();
+                    service.switched(done).await?;
+                    service.chores.count("switched", chore);
+                }
                 // A paused daemon makes no calls: dropped, it comes to
                 // nothing, and the bot's next turn summarizes.
                 Some(tail) = service.tails.started.recv() => {
@@ -5151,6 +5191,19 @@ impl Service {
         bot_id: Option<i64>,
         change: Configure,
     ) -> Result<Value> {
+        self.configure_for(bot, bot_id, change, None).await
+    }
+
+    /// [`Service::configure`], for `asker`: a switch to the other model
+    /// family with history to translate answers `deferred`, and `asker` is
+    /// answered once it is done (see [`SwitchDone`]).
+    async fn configure_for(
+        &mut self,
+        bot: String,
+        bot_id: Option<i64>,
+        change: Configure,
+        asker: Option<lane::Asker>,
+    ) -> Result<Value> {
         // Said of this change alone, before one kept goes under it.
         if change.effort.is_some() && change.model.is_none() {
             return fail_with("invalid_effort", "effort goes with model");
@@ -5177,6 +5230,27 @@ impl Service {
                 }
             }
             false => change,
+        };
+        // A bot whose history is being translated takes no other change
+        // until it is done; the change that switches it takes what was
+        // translated.
+        let prepared = self.switching.prepared.remove(&bot);
+        if prepared.is_none() && self.switching.bots.contains(&bot) {
+            return fail_with("bot_busy", "its history is moving to another model family");
+        }
+        // A model of the other family, for an idle bot with history: the
+        // history is translated a page at a time beside the run loop first.
+        let change = match (&prepared, &change.model) {
+            (None, Some(reference)) if !rules_only => {
+                match self.switch_begin(&bot, bot_id, reference).await? {
+                    Some(translation) => {
+                        self.switch_pieces(bot, bot_id, change, asker, translation);
+                        return Err(Error::new("deferred"));
+                    }
+                    None => change,
+                }
+            }
+            _ => change,
         };
         // A digest is found and tools checked before the change is kept,
         // so what waits holds the tools themselves.
@@ -5315,21 +5389,7 @@ impl Service {
                     .ok_or(Error::with("provider_unavailable", provider.to_owned()))?;
                 let family = served.family();
                 if family != record.family()? {
-                    // Tools its new model is shown as custom tools: their
-                    // calls and results go as custom ones.
-                    let custom: std::collections::HashSet<String> = match served.grammars() {
-                        true => (record.offered().iter())
-                            .filter(|name| *name == "apply_patch")
-                            .cloned()
-                            .chain(
-                                (record.declared.iter())
-                                    .filter(|tool| tool.grammar.is_some())
-                                    .map(|tool| tool.name.clone()),
-                            )
-                            .collect(),
-                        false => Default::default(),
-                    };
-                    switch = Some((family, custom));
+                    switch = Some((family, custom_tools(served, record)));
                 }
                 turn::shaped(served, given.as_ref().unwrap_or(&record.settings))?;
                 if let Some(level) = &effort {
@@ -5414,6 +5474,7 @@ impl Service {
                                         family: *family,
                                         custom: custom.clone(),
                                     },
+                                    prepared,
                                 )?;
                                 if let Some(switched) = switched {
                                     changed.push("model".into());
@@ -5532,6 +5593,126 @@ impl Service {
         Ok(answer)
     }
 
+    /// Begin translating `bot`'s history for `reference`, a model of the
+    /// other family, if it is idle and has any: `None` otherwise, and the
+    /// change goes on as any other, refused or switching at once.
+    async fn switch_begin(
+        &mut self,
+        bot: &str,
+        bot_id: Option<i64>,
+        reference: &str,
+    ) -> Result<Option<agent_runtime::store::Translation>> {
+        let (provider, _) = split_model(reference)?;
+        let Some(served) = self.providers.get(provider) else {
+            return Ok(None);
+        };
+        let name = bot.to_owned();
+        let record = self
+            .store
+            .op("inspect", move |db| db.inspect(&name))
+            .await?;
+        let to = served.family();
+        if to == record.family()? || record.running_turn.is_some() || record.head.is_none() {
+            return Ok(None);
+        }
+        let custom = custom_tools(served, &record);
+        let name = bot.to_owned();
+        self.store
+            .op("switch_begin", move |db| {
+                db.switch_begin(&name, bot_id, to, &custom)
+            })
+            .await
+    }
+
+    /// Translate a switch's pages beside the run loop, each its own store
+    /// job, then hand the change back to the run loop ([`SwitchDone`]).
+    fn switch_pieces(
+        &mut self,
+        bot: String,
+        bot_id: Option<i64>,
+        change: Configure,
+        asker: Option<lane::Asker>,
+        translation: agent_runtime::store::Translation,
+    ) {
+        self.switching.bots.insert(bot.clone());
+        let (store, done) = (self.store.clone(), self.switching.done.clone());
+        self.retention.spawn(async move {
+            let mut translation = translation;
+            let translation = loop {
+                match store
+                    .op("switch_piece", move |db| {
+                        let done = db.switch_piece(&mut translation)?;
+                        Ok((translation, done))
+                    })
+                    .await
+                {
+                    Ok((written, true)) => break Ok(written),
+                    Ok((written, false)) => translation = written,
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = done.send(SwitchDone {
+                bot,
+                bot_id,
+                change,
+                asker,
+                translation,
+            });
+        });
+    }
+
+    /// A switch's history is all written, or its translation failed: the
+    /// change is taken with it, and its asker answered. A translation no
+    /// change took is let go, and the bot's turns go on.
+    async fn switched(&mut self, done: SwitchDone) -> Result<()> {
+        let SwitchDone {
+            bot,
+            bot_id,
+            change,
+            asker,
+            translation,
+        } = done;
+        let held = translation.as_ref().ok().map(|t| t.bot_id());
+        let result = match translation {
+            Ok(translation) => {
+                self.switching.prepared.insert(bot.clone(), translation);
+                match asker {
+                    Some(_) => self.configure_for(bot.clone(), bot_id, change, None).await,
+                    None => self.take_configure(&bot).await.map(|()| Value::Null),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        self.switching.prepared.remove(&bot);
+        self.switching.bots.remove(&bot);
+        let name = bot.clone();
+        let settled = self
+            .store
+            .op("switch_settle", move |db| {
+                let id = match held {
+                    Some(id) => id,
+                    None => db.identity(&name, bot_id)?,
+                };
+                db.switch_settle(id)
+            })
+            .await;
+        match settled {
+            Err(error) if error.code == "storage_error" => return Err(error),
+            _ => {}
+        }
+        self.ready_hint = true;
+        if let Some(asker) = asker {
+            self.retention.spawn(async move {
+                retention_reply(asker.session, &asker.output, asker.id, result).await;
+            });
+        } else if let Err(error) = result
+            && error.code == "storage_error"
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Take the `configure` kept for `bot` once no turn of it runs, as
     /// `configure` takes one; one still running keeps it. One that can no
     /// longer be taken (its model gone from the config, say) is let go,
@@ -5576,6 +5757,8 @@ impl Service {
             .await
         {
             Ok(_) => Ok(()),
+            // Its history is being translated: it is taken once it is.
+            Err(error) if error.code == "deferred" => Ok(()),
             Err(error) if error.code == "storage_error" => Err(error),
             Err(error) if error.code == "bot_not_found" => {
                 self.kept.remove(bot);
@@ -6317,7 +6500,12 @@ impl Service {
                     compaction_model,
                     profile,
                 };
-                self.configure(bot, bot_id, change).await
+                let asker = lane::Asker {
+                    session,
+                    output: output.clone(),
+                    id: id.clone(),
+                };
+                self.configure_for(bot, bot_id, change, Some(asker)).await
             }
             Command::Compact { bot, bot_id } => {
                 let name = bot.clone();
@@ -8120,6 +8308,26 @@ fn deliver(
 ///
 /// Match ordinary replies: the stdio owner (session zero) gets bounded
 /// backpressure; socket clients cannot hold up a reply task when they lag.
+/// Tools a model of `served` is shown as custom tools when a bot switches
+/// to it: their calls and results go as custom ones.
+fn custom_tools(
+    served: &Provider,
+    record: &agent_runtime::store::Bot,
+) -> std::collections::HashSet<String> {
+    match served.grammars() {
+        true => (record.offered().iter())
+            .filter(|name| *name == "apply_patch")
+            .cloned()
+            .chain(
+                (record.declared.iter())
+                    .filter(|tool| tool.grammar.is_some())
+                    .map(|tool| tool.name.clone()),
+            )
+            .collect(),
+        false => Default::default(),
+    }
+}
+
 async fn retention_reply(session: u64, output: &Output, id: Value, result: Result<Value>) -> bool {
     let sent = if session == 0 {
         matches!(
@@ -8696,6 +8904,7 @@ mod tests {
             tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            switching: Switching::default(),
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
@@ -8921,6 +9130,7 @@ mod tests {
             tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            switching: Switching::default(),
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
@@ -9242,6 +9452,7 @@ mod tests {
             tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            switching: Switching::default(),
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
@@ -9495,6 +9706,7 @@ mod tests {
             tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            switching: Switching::default(),
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),

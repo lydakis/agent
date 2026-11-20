@@ -7965,6 +7965,7 @@ fn ids_a_switched_agent_held_are_not_given_again_after_it_is_deleted() {
         "Bob",
         None,
         &to(Family::Anthropic, "anthropic", "synthetic-claude"),
+        None,
     )
     .unwrap()
     .unwrap();
@@ -7973,6 +7974,7 @@ fn ids_a_switched_agent_held_are_not_given_again_after_it_is_deleted() {
         "Bob",
         None,
         &to(Family::Responses, "openai", "synthetic-model"),
+        None,
     )
     .unwrap()
     .unwrap();
@@ -8011,6 +8013,7 @@ fn a_long_history_crosses_in_order_a_page_at_a_time() {
             family: Family::Anthropic,
             custom: Default::default(),
         },
+        None,
     )
     .unwrap()
     .unwrap();
@@ -8044,6 +8047,181 @@ fn a_long_history_crosses_in_order_a_page_at_a_time() {
 }
 
 #[test]
+fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
+    let path =
+        std::env::temp_dir().join(format!("agent-pieced-switch-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    let texts: Vec<String> = (0..1300).map(|n| format!("m{n}")).collect();
+    db.append(
+        turn,
+        texts.iter().map(|t| assistant(t)).collect(),
+        &[],
+        Some(&usage(100, 10, "m")),
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+    let read = Connection::open(&path).unwrap();
+    let nodes = || -> i64 {
+        read.query_row("SELECT count(*) FROM nodes", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = nodes();
+    let head = db.inspect("Bob").unwrap().head;
+    let custom = Default::default();
+    // Let go after a page: what it wrote goes, and the bot is as it was.
+    let mut pieces = db
+        .switch_begin("Bob", None, Family::Anthropic, &custom)
+        .unwrap()
+        .unwrap();
+    assert!(!db.switch_piece(&mut pieces).unwrap());
+    assert!(nodes() > before);
+    assert_eq!(
+        db.switch_begin("Bob", None, Family::Anthropic, &custom)
+            .err()
+            .unwrap()
+            .code,
+        "bot_busy"
+    );
+    assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
+    db.switch_settle(pieces.bot_id()).unwrap();
+    assert_eq!(nodes(), before);
+    assert_eq!(db.inspect("Bob").unwrap().head, head);
+    // Taken: a turn sent while it translates waits, then runs in the new
+    // family, on the history the pages wrote.
+    let mut pieces = db
+        .switch_begin("Bob", None, Family::Anthropic, &custom)
+        .unwrap()
+        .unwrap();
+    let waiting = begun(&mut db, "Bob", "r2");
+    assert_eq!(
+        db.start(waiting, allow_provider).unwrap_err().code,
+        "bot_busy"
+    );
+    let mut pages = 1;
+    while !db.switch_piece(&mut pieces).unwrap() {
+        pages += 1;
+    }
+    assert_eq!(pages, 3);
+    let written = nodes() - before;
+    let switched = db
+        .switch_family(
+            "Bob",
+            None,
+            &Switch {
+                provider: "anthropic",
+                model: "synthetic-claude",
+                effort: None,
+                family: Family::Anthropic,
+                custom: Default::default(),
+            },
+            Some(pieces),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(switched["translated"], json!(written));
+    assert_eq!(nodes() - before, written);
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(bob.family, "anthropic");
+    let crossed: Vec<String> = read
+        .prepare(
+            "WITH RECURSIVE chain(id,parent) AS (
+                SELECT id,parent FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent)
+             SELECT n.item FROM chain c JOIN nodes n ON n.id=c.id ORDER BY n.depth",
+        )
+        .unwrap()
+        .query_map([bob.head.unwrap()], |r| r.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|item| {
+            let item: Value = serde_json::from_slice(&item.unwrap()).unwrap();
+            item["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .filter(|text| text.starts_with('m'))
+        .collect();
+    assert_eq!(crossed, texts);
+    db.start(waiting, allow_provider).unwrap();
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_search_result_written_as_words_reads_through_its_handle_after_a_switch() {
+    let path =
+        std::env::temp_dir().join(format!("agent-words-result-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    let item = |value: Value| -> Bytes { serde_json::to_vec(&value).unwrap().into() };
+    db.append(
+        turn,
+        vec![
+            item(
+                json!({"type":"function_call","namespace":"web","name":"run",
+                "call_id":"s1","arguments":"{\"q\":\"rust\"}"}),
+            ),
+            item(json!({"type":"function_call_output","call_id":"s1",
+                "output":"first line\nsecond line\nthird line"})),
+            assistant("found"),
+        ],
+        &[],
+        Some(&usage(100, 10, "m")),
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+    let read = Connection::open(&path).unwrap();
+    let output: i64 = read
+        .query_row(
+            "SELECT id FROM nodes WHERE CAST(item AS TEXT) LIKE '%function_call_output%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.switch_family(
+        "Bob",
+        None,
+        &Switch {
+            provider: "anthropic",
+            model: "synthetic-claude",
+            effort: None,
+            family: Family::Anthropic,
+            custom: Default::default(),
+        },
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let words: i64 = read
+        .query_row(
+            "SELECT node FROM translated WHERE source=?",
+            [output],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let text: Vec<u8> = read
+        .query_row("SELECT item FROM nodes WHERE id=?", [words], |r| r.get(0))
+        .unwrap();
+    let text: Value = serde_json::from_slice(&text).unwrap();
+    assert_eq!(text["content"][0]["type"], "text", "{text}");
+    let lines = db
+        .result_lines("Bob", words, 2, 2, false, usize::MAX)
+        .unwrap();
+    assert!(lines.contains("second line"), "{lines}");
+    assert!(lines.contains("third line"), "{lines}");
+    assert!(!lines.contains("first line"), "{lines}");
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn what_was_read_moves_with_the_history_to_the_other_family_and_back() {
     let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
@@ -8064,16 +8242,20 @@ fn what_was_read_moves_with_the_history_to_the_other_family_and_back() {
     let back = to(Family::Responses, "openai", "synthetic-model");
     // Everything read was translated: its copy is read, and the next call
     // sends nothing new.
-    db.switch_family("Bob", None, &claude).unwrap().unwrap();
+    db.switch_family("Bob", None, &claude, None)
+        .unwrap()
+        .unwrap();
     let moved = db.inspect("Bob").unwrap();
     assert_ne!(moved.head, left.head);
     assert_eq!(moved.work.read, moved.head);
     // Straight back: the branch it left, read as it was.
-    db.switch_family("Bob", None, &back).unwrap().unwrap();
+    db.switch_family("Bob", None, &back, None).unwrap().unwrap();
     let home = db.inspect("Bob").unwrap();
     assert_eq!((home.head, home.work.read), (left.head, left.head));
     // What the other model read and added comes back read.
-    db.switch_family("Bob", None, &claude).unwrap().unwrap();
+    db.switch_family("Bob", None, &claude, None)
+        .unwrap()
+        .unwrap();
     let turn = begun(&mut db, "Bob", "r2");
     let reply =
         serde_json::to_vec(&json!({"role":"assistant","content":[{"type":"text","text":"b"}]}))
@@ -8082,7 +8264,7 @@ fn what_was_read_moves_with_the_history_to_the_other_family_and_back() {
     db.append(turn, vec![reply], &[], Some(&usage(100, 10, "m")))
         .unwrap();
     db.finish(turn, None).unwrap();
-    db.switch_family("Bob", None, &back).unwrap().unwrap();
+    db.switch_family("Bob", None, &back, None).unwrap().unwrap();
     let home = db.inspect("Bob").unwrap();
     assert!(home.head > left.head);
     assert_eq!(home.work.read, home.head);

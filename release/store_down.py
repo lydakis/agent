@@ -58,7 +58,8 @@ def back_111(conn):
     items, each prompt node holding its turn beside the original's. A turn
     keeps one node again: the one its agent's history reaches, else the
     newest. Each agent stays on the model and branch it has; the branches
-    it left stay as history no agent reaches."""
+    it left, and any a switch was still writing, stay as history no agent
+    reaches."""
     shared = conn.execute(
         "SELECT n.turn,b.head FROM nodes n LEFT JOIN turns t ON t.id=n.turn"
         " LEFT JOIN bots b ON b.name=t.bot"
@@ -74,6 +75,7 @@ def back_111(conn):
         "CREATE UNIQUE INDEX nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;"
         "DROP TABLE switches;"
         "DROP TABLE translated;"
+        "DROP TABLE translating;"
         "DROP INDEX bots_family_start;"
         "ALTER TABLE bots DROP COLUMN family_start;"
     )
