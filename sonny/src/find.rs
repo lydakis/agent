@@ -1,11 +1,13 @@
 //! `ctrl+f` in a view of rows (Rulebook, Keys and mouse, Find), as
-//! **Projects** first had it, made once and given to each view: what is
-//! typed keeps the rows that say it, in their title, their name or their
-//! words; a section with no match is not drawn; a fold is searched and
-//! stands open; a row that holds a match stays, to keep what hangs under
-//! it in its place. The pick goes to the first match, and `esc` drops the
-//! find and puts the rows and the pick back as they were. The find row is
-//! the view's last: a muted `find`, then what was typed.
+//! **Projects** first had it, made once and given to each view: the key,
+//! what is typed and what `esc` puts back, whether a row's words say what
+//! is typed, and the find row. Each view keeps the rows that say it and
+//! what they hang under in its own nesting (Projects' folders, `/status`'s
+//! makers, `/background`'s sections); a section with no match is not
+//! drawn; a fold is searched and stands open. The pick goes to the first
+//! match, and `esc` drops the find and puts the rows and the pick back as
+//! they were. The find row is the view's last: a muted `find`, then what
+//! was typed.
 //!
 //! Find reads what the view has already read: it asks the daemon nothing
 //! as you type.
@@ -100,69 +102,6 @@ pub fn says(query: &str, words: &str) -> bool {
     }
 }
 
-/// One row of a view as find reads it: how deep it hangs under the rows
-/// before it, whether it is a section's heading, and the words it says.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Row {
-    pub depth: usize,
-    /// A section's heading is never a match itself: it stays while a row
-    /// in it does.
-    pub section: bool,
-    pub words: String,
-}
-
-impl Row {
-    pub fn new(depth: usize, words: impl Into<String>) -> Self {
-        Self {
-            depth,
-            section: false,
-            words: words.into(),
-        }
-    }
-
-    pub fn section(depth: usize) -> Self {
-        Self {
-            depth,
-            section: true,
-            words: String::new(),
-        }
-    }
-}
-
-/// What a find keeps of `rows`: each row that says `query`, and each row
-/// or section a kept row hangs under, so the nesting stays. With nothing
-/// typed, every row.
-pub fn keep(rows: &[Row], query: &str) -> Vec<bool> {
-    if query.is_empty() {
-        return vec![true; rows.len()];
-    }
-    let matched: Vec<bool> = (rows.iter())
-        .map(|row| !row.section && says(query, &row.words))
-        .collect();
-    let mut kept = matched.clone();
-    for at in (0..rows.len()).filter(|at| matched[*at]) {
-        // Up through what it hangs under: the nearest row before it that
-        // stands less deep, and so on to the top.
-        let mut depth = rows[at].depth;
-        for above in (0..at).rev() {
-            if depth == 0 {
-                break;
-            }
-            if rows[above].depth < depth {
-                depth = rows[above].depth;
-                kept[above] = true;
-            }
-        }
-    }
-    kept
-}
-
-/// The first row that says `query` itself, not one kept only for what it
-/// holds: where the pick goes.
-pub fn first(rows: &[Row], query: &str) -> Option<usize> {
-    (rows.iter()).position(|row| !row.section && says(query, &row.words))
-}
-
 /// The find row, the view's last: a muted `find`, then what was typed.
 pub fn line(query: &str) -> Line<'static> {
     Line::from(vec![
@@ -176,45 +115,13 @@ pub fn line(query: &str) -> Line<'static> {
 mod tests {
     use super::*;
 
-    fn rows() -> Vec<Row> {
-        vec![
-            Row::section(0),
-            Row::new(1, "nightly Run the full test suite"),
-            Row::new(1, "pushcheck"),
-            Row::section(0),
-            Row::new(1, "inbox lead"),
-            Row::new(2, "mail down since 11:28"),
-            Row::new(2, "ci main: build 412 passed"),
-            Row::section(0),
-            Row::new(1, "python3 -m http.server 8000"),
-        ]
-    }
-
     #[test]
-    fn a_row_that_says_it_stays_with_what_it_hangs_under() {
-        let rows = rows();
-        let kept = |query| -> Vec<usize> {
-            (keep(&rows, query).into_iter().enumerate())
-                .filter(|(_, kept)| *kept)
-                .map(|(at, _)| at)
-                .collect()
-        };
-        // Nothing typed: every row.
-        assert_eq!(kept("").len(), rows.len());
-        // A match keeps its section; a section with none is not drawn.
-        assert_eq!(kept("nightly"), [0, 1]);
-        // A match under a row keeps that row too, and its section.
-        assert_eq!(kept("build"), [3, 4, 6]);
-        // In any case, unless a capital asks for it.
-        assert_eq!(kept("MAIL"), Vec::<usize>::new());
-        assert_eq!(kept("mail"), [3, 4, 5]);
-        assert_eq!(kept("Run"), [0, 1]);
-        // A section's own heading is never a match.
-        assert_eq!(kept("zzz"), Vec::<usize>::new());
-        // The pick goes to the first match, not a row kept for what it
-        // holds.
-        assert_eq!(first(&rows, "build"), Some(6));
-        assert_eq!(first(&rows, "zzz"), None);
+    fn words_say_it_in_any_case_unless_a_capital_asks_for_one() {
+        assert!(says("", "anything"));
+        assert!(says("mail", "Mail down since 11:28"));
+        assert!(!says("MAIL", "Mail down since 11:28"));
+        assert!(says("Run", "nightly Run the full test suite"));
+        assert!(!says("Run", "nightly run the full test suite"));
     }
 
     #[test]

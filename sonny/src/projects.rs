@@ -488,11 +488,7 @@ impl View {
         use crate::hint::{Enter, Esc, Keys};
         match self.finding {
             Some(_) => Keys::new().pick().enter(Enter::Open).esc(Esc::Cancel),
-            None => Keys::new()
-                .pick()
-                .enter(Enter::Open)
-                .find()
-                .esc(Esc::Close),
+            None => Keys::new().pick().enter(Enter::Open).find().esc(Esc::Close),
         }
     }
 

@@ -314,7 +314,10 @@ mod tests {
             .esc(Esc::Close);
         let whole = "↑↓ pick · enter open · ctrl+f find · r run · esc close";
         assert_eq!(found.fit(80), whole);
-        assert_eq!(found.fit(45), "enter open · ctrl+f find · r run · esc close");
+        assert_eq!(
+            found.fit(45),
+            "enter open · ctrl+f find · r run · esc close"
+        );
         assert_eq!(found.fit(35), "enter open · r run · esc close");
         assert_eq!(fit(whole, 35), "enter open · r run · esc close");
         // A line written out fits the same way.

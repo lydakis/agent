@@ -406,7 +406,7 @@ impl Counts {
 }
 
 /// `/status`'s groups in the page's order.
-const GROUPS: [Group; 5] = [
+pub const GROUPS: [Group; 5] = [
     Group::NeedsYou,
     Group::Failed,
     Group::Working,
