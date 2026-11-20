@@ -1598,6 +1598,156 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertNotIn('system', model.requests.get(timeout=1))
 
 
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class SwitchFamilyTests(unittest.TestCase):
+    """An agent moved to a model of the other family, and back."""
+
+    def start(self):
+        root = Path(__file__).resolve().parent.parent
+        temp = tempfile.TemporaryDirectory(dir=root / '.local')
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name)
+        servers = {}
+        for name, handler in (('openai', Model), ('anthropic', AnthropicModel)):
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            server.requests = queue.Queue()
+            server.daemon_threads = True
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            servers[name] = server
+        url = lambda server: f'http://127.0.0.1:{server.server_port}/v1'
+        env = {**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'}
+        client = Client(root / '.local/target/release/agent', path / 'state.sqlite', url(servers['openai']),
+                        'echo,shell', env=env,
+                        extra=('--provider', f"anthropic=anthropic,{url(servers['anthropic'])},ANTHROPIC_TEST_KEY"))
+        self.addCleanup(client.close)
+        return client, servers['openai'], servers['anthropic'], path
+
+    def run_turn(self, client, request_id, prompt):
+        turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt)['result']['message']
+        end = client.finished(turn)['data']
+        self.assertEqual(end['status'], 'completed', end)
+        return end
+
+    def test_an_agent_takes_its_history_to_the_other_family_and_back(self):
+        client, openai, anthropic, path = self.start()
+        # Each reply carries reasoning, which only its own provider reads.
+        openai.history_reasoning = {'type': 'reasoning', 'id': 'rs_1', 'encrypted_content': 'opaque',
+                                    'summary': []}
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        self.run_turn(client, '1', 'tool:first')
+        self.run_turn(client, '2', 'hello')
+        sent = [openai.requests.get(timeout=1) for _ in range(3)]
+        before = client.request('inspect', bot='Bob')['result']
+        # A summarizer or fallback must be of the family it goes to.
+        self.assertEqual(client.request('configure', bot='Bob', model='anthropic/synthetic-claude',
+                                        fallback='openai/synthetic-model')['error'], 'provider_family_mismatch')
+        moved = client.request('configure', bot='Bob', model='anthropic/synthetic-claude', effort='low')['result']
+        self.assertEqual(moved['changed'], ['model', 'family'])
+        record = client.request('inspect', bot='Bob')['result']
+        self.assertEqual((record['provider'], record['family'], record['model']),
+                         ('anthropic', 'anthropic', 'synthetic-claude'))
+        self.run_turn(client, '3', 'there')
+        # The new model reads the conversation in its own family's shape,
+        # without the other's reasoning: the call and its result paired.
+        messages = anthropic.requests.get(timeout=1)['messages']
+        self.assertEqual([(m['role'], {b['type'] for b in m['content']}) for m in messages], [
+            ('user', {'text'}), ('assistant', {'tool_use'}), ('user', {'tool_result'}),
+            ('assistant', {'text'}), ('user', {'text'}), ('assistant', {'text'}), ('user', {'text'})])
+        call, result = messages[1]['content'][0], messages[2]['content'][0]
+        self.assertEqual((call['id'], call['name'], call['input']), ('echo-1', 'echo', {'text': 'first'}))
+        self.assertEqual((result['tool_use_id'], result['content']), ('echo-1', 'first'))
+        self.assertEqual([messages[n]['content'][0]['text'] for n in (0, 3, 4, 5, 6)],
+                         ['tool:first', 'echo:first', 'hello', 'reply:hello', 'there'])
+        # Its turns are numbered on, and the history it left stays readable.
+        turns = client.request('turns', bot='Bob')['result']['turns']
+        self.assertEqual(len(turns), 3)
+        # Back again: the original items, reasoning and all, then what the
+        # other model added, in this family's shape.
+        client.request('configure', bot='Bob', model='openai/synthetic-model', effort='low')
+        self.run_turn(client, '4', 'again')
+        items = openai.requests.get(timeout=1)['input']
+        kept = sent[-1]['input']
+        self.assertEqual(items[:len(kept)], kept)
+        self.assertEqual(items[len(kept)]['type'], 'reasoning')
+        added = items[len(kept) + 2:]
+        self.assertEqual([(i.get('type'), i.get('role')) for i in added], [
+            (None, 'user'), ('message', 'assistant'), (None, 'user')])
+        self.assertEqual([i['content'][0]['text'] for i in added], ['there', 'reply:there', 'again'])
+        record = client.request('inspect', bot='Bob')['result']
+        self.assertEqual((record['family'], record['model']), ('responses', 'synthetic-model'))
+        self.assertEqual(record['bot_id'], before['bot_id'])
+        # A fork takes the family it is in; deleting the bot frees every
+        # branch it left.
+        fork = client.request('fork', source='Bob', bot='Copy', workspace=str(path))['result']
+        self.assertEqual(fork['family'], 'responses')
+        self.assert_all_freed(client, path, 'Copy', 'Bob')
+
+    def assert_all_freed(self, client, path, *bots):
+        for bot in bots:
+            freed = client.request('delete', bot=bot)
+            self.assertIn('result', freed, freed)
+        with closing(sqlite3.connect(path / 'state.sqlite')) as db:
+            self.assertEqual([db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+                              for table in ('nodes', 'lineage', 'switches', 'compactions')], [0, 0, 0, 0])
+
+    def test_thinking_stays_behind_and_calls_go_as_the_other_family_s(self):
+        client, openai, anthropic, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), model='anthropic/synthetic-claude',
+                       effort='low')
+        self.run_turn(client, '1', 'tool:first')
+        self.run_turn(client, '2', 'hello')
+        moved = client.request('configure', bot='Bob', model='openai/synthetic-model')['result']
+        self.assertEqual(moved['changed'], ['model', 'family'])
+        self.run_turn(client, '3', 'there')
+        items = openai.requests.get(timeout=1)['input']
+        self.assertEqual([(i.get('type'), i.get('role')) for i in items], [
+            (None, 'user'), ('function_call', None), ('function_call_output', None),
+            ('message', 'assistant'), (None, 'user'), ('message', 'assistant'), (None, 'user')])
+        self.assertEqual((items[1]['call_id'], items[1]['name'], json.loads(items[1]['arguments'])),
+                         ('toolu_1', 'echo', {'text': 'first'}))
+        self.assertEqual((items[2]['call_id'], items[2]['output']), ('toolu_1', 'first'))
+        self.assertEqual(items[5]['content'], [{'type': 'output_text', 'text': 'reply:hello'}])
+        self.assertNotIn('thinking', json.dumps(items))
+        self.assert_all_freed(client, path, 'Bob')
+
+    def test_a_summary_crosses_with_the_history_it_stands_for(self):
+        client, openai, anthropic, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        client.request('configure', bot='Bob', compaction_instructions='Summarize.')
+        self.run_turn(client, '1', 'tool:first')
+        self.run_turn(client, '2', 'hello')
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.run_turn(client, '3', 'third')
+        summary = client.request('inspect', bot='Bob')['result']['compaction']
+        self.assertIsNotNone(summary)
+        while not openai.requests.empty():
+            openai.requests.get()
+        client.request('configure', bot='Bob', model='anthropic/synthetic-claude', effort='low')
+        self.run_turn(client, '4', 'fourth')
+        messages = anthropic.requests.get(timeout=1)['messages']
+        # The summary leads, in the new family's shape, and what it stands
+        # for is not sent again.
+        self.assertIn('A short synthetic summary.', json.dumps(messages[0]))
+        self.assertNotIn('echo:first', json.dumps(messages))
+        self.assertFalse([b for m in messages for b in m['content'] if b['type'] in ('tool_use', 'tool_result')])
+        self.assertEqual(messages[-1]['content'][0]['text'], 'fourth')
+        # A summary made on this side keeps the next switch from going back
+        # onto the old branch: what it holds is translated again.
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.run_turn(client, '5', 'fifth')
+        while not anthropic.requests.empty():
+            anthropic.requests.get()
+        client.request('configure', bot='Bob', model='openai/synthetic-model', effort='low')
+        self.run_turn(client, '6', 'sixth')
+        items = openai.requests.get(timeout=1)['input']
+        self.assertNotIn('thinking', json.dumps(items))
+        self.assertEqual(items[-1]['content'][0]['text'], 'sixth')
+        self.assertNotIn('reply:fourth', json.dumps(items))
+        self.assert_all_freed(client, path, 'Bob')
+
+
 class ModelFixture(unittest.TestCase):
     handler = Model
 

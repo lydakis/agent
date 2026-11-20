@@ -1,6 +1,6 @@
-//! `/model`: the lead's model, effort and speed, picked from what its
-//! provider family lists. A bot changes model only within its family, since its
-//! history is in that family's shape.
+//! `/model`: the lead's model, effort and speed, picked from what every
+//! provider lists. A model of the other family takes the lead's history
+//! with it, written again in that family's shape.
 use serde_json::Value;
 
 pub struct Picker {
@@ -9,15 +9,17 @@ pub struct Picker {
     /// Typed to narrow the list.
     pub filter: String,
     pick: usize,
-    /// No effort first: the provider's default.
-    efforts: Vec<Option<String>>,
-    effort: usize,
+    /// Each provider's effort levels, no effort first: its default.
+    efforts: std::collections::HashMap<String, Vec<Option<String>>>,
+    /// The effort picked; the picked model's provider default when that
+    /// provider has no such level.
+    effort: Option<String>,
     /// The speed picked: `standard`, or a faster tier where the picked
     /// model serves it.
     pub speed: &'static str,
     /// Tab moved ← and → from effort to speed.
     pub on_speed: bool,
-    /// Why a provider of the family listed nothing.
+    /// Why a provider listed nothing.
     pub refused: Vec<String>,
 }
 
@@ -35,10 +37,10 @@ pub enum Click {
 }
 
 impl Picker {
-    /// The models of every binding in `current`'s family, from a
-    /// `provider_models` answer and `ready.providers`, less the ones the
-    /// person hides, the current one picked. A provider that would not
-    /// list still offers the current model.
+    /// The models of every binding, from a `provider_models` answer and
+    /// `ready.providers`, less the ones the person hides, the current one
+    /// picked. A provider that would not list still offers the current
+    /// model.
     pub fn new(
         listing: &Value,
         providers: &Value,
@@ -47,29 +49,21 @@ impl Picker {
         effort: Option<&str>,
     ) -> Self {
         let provider = current.split_once('/').map_or(current, |(p, _)| p);
-        // The listing says each provider's family and effort levels as the
-        // daemon binds it now, a provider added since this client connected
+        // The listing says each provider's effort levels as the daemon
+        // binds it now, a provider added since this client connected
         // included; `ready.providers` answers for a listing that does not.
         let listed = &listing["providers"];
-        let family_of = |name: &str| match &listed[name]["family"] {
-            Value::Null => &providers[name]["family"],
-            family => family,
-        };
-        let family = family_of(provider);
         let mut names: Vec<&String> = listed
             .as_object()
             .filter(|all| all.values().any(|entry| !entry["family"].is_null()))
             .or(providers.as_object())
-            .map(|all| {
-                all.keys()
-                    .filter(|name| !family.is_null() && family_of(name) == family)
-                    .collect()
-            })
+            .map(|all| all.keys().collect())
             .unwrap_or_default();
         // The lead's own provider first.
         names.sort_by_key(|name| (name.as_str() != provider, name.as_str()));
         let mut models: Vec<String> = Vec::new();
         let mut refused = Vec::new();
+        let mut efforts = std::collections::HashMap::new();
         for name in names {
             let answer = &listing["providers"][name];
             if let Some(error) = answer["error"].as_str() {
@@ -80,44 +74,58 @@ impl Picker {
                     models.push(format!("{name}/{id}"));
                 }
             }
+            let levels = match &answer["efforts"] {
+                Value::Null => &providers[name.as_str()]["efforts"],
+                levels => levels,
+            };
+            let levels = std::iter::once(None)
+                .chain(
+                    (levels.as_array().into_iter().flatten())
+                        .filter_map(Value::as_str)
+                        .map(|e| Some(e.to_owned())),
+                )
+                .collect::<Vec<_>>();
+            efforts.insert(name.clone(), levels);
         }
         models.retain(|m| m == current || !hidden.contains(m));
         if !models.iter().any(|m| m == current) {
             models.insert(0, current.to_owned());
         }
         let pick = models.iter().position(|m| m == current).unwrap_or(0);
-        let mut efforts = vec![None];
-        let levels = match &listed[provider]["efforts"] {
-            Value::Null => &providers[provider]["efforts"],
-            levels => levels,
-        };
-        efforts.extend(
-            levels
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(|e| Some(e.to_owned())),
-        );
+        // The lead's own effort, offered on its provider even unlisted.
+        let own = efforts
+            .entry(provider.to_owned())
+            .or_insert_with(|| vec![None]);
         if let Some(effort) = effort
-            && !efforts.iter().any(|e| e.as_deref() == Some(effort))
+            && !own.iter().any(|e| e.as_deref() == Some(effort))
         {
-            efforts.push(Some(effort.to_owned()));
+            own.push(Some(effort.to_owned()));
         }
-        let effort = efforts
-            .iter()
-            .position(|e| e.as_deref() == effort)
-            .unwrap_or(0);
         Picker {
             models,
             filter: String::new(),
             pick,
             efforts,
-            effort,
+            effort: effort.map(str::to_owned),
             speed: "standard",
             on_speed: false,
             refused,
         }
+    }
+
+    /// The effort levels of the picked model's provider, no effort first.
+    fn levels(&self) -> &[Option<String>] {
+        let shown = self.shown();
+        let provider = (shown.get(self.at()).copied())
+            .and_then(provider)
+            .unwrap_or_default();
+        self.efforts.get(provider).map_or(&[None], Vec::as_slice)
+    }
+
+    /// Where the effort picked is among the picked model's levels.
+    fn effort_at(&self) -> usize {
+        let levels = self.levels();
+        (levels.iter()).position(|e| *e == self.effort).unwrap_or(0)
     }
 
     /// The models the filter leaves, best first.
@@ -167,11 +175,14 @@ impl Picker {
     }
 
     pub fn less(&mut self) {
-        self.effort = self.effort.saturating_sub(1);
+        let at = self.effort_at().saturating_sub(1);
+        self.effort = self.levels()[at].clone();
     }
 
     pub fn more(&mut self) {
-        self.effort = (self.effort + 1).min(self.efforts.len() - 1);
+        let levels = self.levels();
+        let at = (self.effort_at() + 1).min(levels.len() - 1);
+        self.effort = levels[at].clone();
     }
 
     /// Steps the speed by `by` among `speeds`, those the picked model
@@ -207,7 +218,7 @@ impl Picker {
     }
 
     pub fn effort(&self) -> Option<&str> {
-        self.efforts[self.effort].as_deref()
+        self.levels()[self.effort_at()].as_deref()
     }
 
     /// The model and effort picked, when the filter leaves any model.
@@ -376,7 +387,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn the_family_is_offered_and_the_current_choice_picked() {
+    fn every_family_is_offered_and_the_current_choice_picked() {
         let providers = json!({
             "openai": {"family": "responses", "efforts": ["low", "medium", "high", "xhigh"]},
             "chatgpt": {"family": "responses", "efforts": ["low", "medium", "high", "xhigh"]},
@@ -396,13 +407,37 @@ mod tests {
         );
         assert_eq!(
             picker.shown(),
-            ["chatgpt/gpt-6-luna", "openai/gpt-6", "openai/gpt-6-luna"]
+            [
+                "chatgpt/gpt-6-luna",
+                "anthropic/claude-opus-5-5",
+                "openai/gpt-6",
+                "openai/gpt-6-luna"
+            ]
         );
         assert_eq!(
             picker.chosen(),
             Some(("chatgpt/gpt-6-luna".into(), Some("high".into())))
         );
+        // A model of the other family offers its own provider's levels: one
+        // it lacks goes as its default.
         picker.down();
+        assert_eq!(
+            picker.chosen(),
+            Some(("anthropic/claude-opus-5-5".into(), None))
+        );
+        picker.more();
+        picker.more();
+        assert_eq!(picker.effort(), Some("max"));
+        picker.less();
+        assert_eq!(picker.effort(), Some("low"));
+        // The level picked holds where the next model has it.
+        picker.down();
+        assert_eq!(
+            picker.chosen(),
+            Some(("openai/gpt-6".into(), Some("low".into())))
+        );
+        picker.more();
+        picker.more();
         picker.more();
         assert_eq!(
             picker.chosen(),
@@ -465,7 +500,10 @@ mod tests {
             "openai/gpt-6",
             None,
         );
-        assert_eq!(picker.shown(), ["openai/gpt-6", "second/gpt-6"]);
+        assert_eq!(
+            picker.shown(),
+            ["openai/gpt-6", "anthropic/claude-opus-5-5", "second/gpt-6"]
+        );
         // Its efforts come from the listing too.
         let listing = json!({"providers": {
             "second": {"family": "responses", "efforts": ["low", "high"],

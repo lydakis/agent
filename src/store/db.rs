@@ -3693,7 +3693,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 109;
+    pub const SCHEMA: i32 = 110;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3820,7 +3820,15 @@ impl Database {
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE TABLE IF NOT EXISTS lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
-            CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS switches(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id INTEGER NOT NULL, node INTEGER, root INTEGER, first INTEGER, left INTEGER,
+                back INTEGER NOT NULL, from_provider TEXT NOT NULL, from_family TEXT NOT NULL,
+                from_model TEXT NOT NULL, from_reasoning TEXT, to_provider TEXT NOT NULL,
+                to_family TEXT NOT NULL, to_model TEXT NOT NULL, to_reasoning TEXT,
+                compaction INTEGER, state TEXT NOT NULL, at_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS switches_bot ON switches(bot_id,id);
+            CREATE INDEX IF NOT EXISTS switches_left ON switches(left) WHERE left IS NOT NULL;
             CREATE TABLE IF NOT EXISTS compactions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES compactions(node), cut INTEGER NOT NULL REFERENCES nodes(id),
                 summary TEXT NOT NULL, prompts TEXT NOT NULL,
@@ -3877,7 +3885,8 @@ impl Database {
                 budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, waiting_on TEXT, last_turn INTEGER, last_status TEXT,
                 last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT,
-                configure_pending TEXT, refused_summary TEXT, closed_ms INTEGER);
+                configure_pending TEXT, refused_summary TEXT, closed_ms INTEGER,
+                family_start INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE TABLE IF NOT EXISTS bot_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
                 instructions TEXT NOT NULL, compaction_instructions TEXT);
@@ -3904,6 +3913,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
+            CREATE INDEX IF NOT EXISTS bots_family_start ON bots(family_start);
             CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
                 request_id TEXT NOT NULL, delivery TEXT NOT NULL, status TEXT NOT NULL,
                 turn INTEGER, node INTEGER REFERENCES nodes(id), text TEXT NOT NULL,
@@ -4842,6 +4852,293 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(changed == 1)
+    }
+    /// Point a bot at a model of the other family: its history from the
+    /// oldest node its next request can send, or a summary can read, is
+    /// written again in the new family's items on a branch beside the
+    /// original, and the bot moves onto it. Nothing is translated per call:
+    /// requests stream the new items as they stream any others. Reasoning
+    /// does not cross (see [`crate::translate`]). The original branch is
+    /// kept, so switching back to the family it was in before, with no
+    /// summary made since, goes back onto it: only what the other model
+    /// added is translated, and its provider's cache still holds the rest.
+    /// Its summarizer and fallback are of the old family, so they go, and
+    /// come back on the way back. The bot is idle: `configure` keeps a
+    /// change for a running turn's end. What it did, or `None` when the
+    /// model is of the bot's own family.
+    pub fn switch_family(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        switch: &Switch<'_>,
+    ) -> Result<Option<Value>> {
+        let id = self.identity(name, bot_id)?;
+        let bot = self.inspect(name)?;
+        let from = bot.family()?;
+        if from == switch.family {
+            return Ok(None);
+        }
+        if bot.running_turn.is_some() {
+            return fail("bot_busy");
+        }
+        // A bot that has sent no request since it was made or forked has
+        // no saved window start yet: find it as its next request would, so
+        // only what that request can send is translated.
+        if bot.head.is_some()
+            && let Err(error) = self.window(
+                name,
+                bot.settings.context_bytes() as i64,
+                bot.settings.context_items() as i64,
+            )
+            && error.code != "context_limit"
+        {
+            return Err(error);
+        }
+        let (context_start, family_start): (Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT context_start,family_start FROM bots WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // What the bot leaves on this branch, for the way back.
+        let left_state = json!({
+            "compaction": bot.compaction, "context_start": context_start,
+            "elision": bot.elision, "family_start": family_start,
+            "cache_bot": bot.cache_bot, "thinking_prefix": bot.thinking_prefix,
+            "thinking_floor": bot.thinking.below, "thinking_from": bot.thinking.from,
+            "thinking_to": bot.thinking.to, "thinking_elided": bot.thinking_elided,
+            "compaction_model": bot.compaction_model, "fallback": bot.fallback,
+        });
+        let back = self.switched_from(&bot, switch.family)?;
+        let mut translator =
+            crate::translate::Translator::new(from, switch.family, switch.custom.clone());
+        let tx = self.conn.savepoint()?;
+        // Turns past the queue keep the binding they ran at, as `set_model`
+        // records it.
+        tx.execute(
+            "UPDATE turns SET (bot_model,bot_reasoning)=(SELECT provider||'/'||model,reasoning FROM bots WHERE id=?1)
+              WHERE bot=?2 AND bot_model IS NULL",
+            params![id, name],
+        )?;
+        let head = bot.head;
+        let (root, written, state) = match (&back, head) {
+            (_, None) => (None, Translated::default(), Value::Null),
+            (Some(back), Some(head)) => {
+                // Only what the other model added since it took over.
+                let depth = node_depth(&tx, back.node)?;
+                let ids = lineage_from(&tx, head, depth + 1)?;
+                let written =
+                    translate_onto(&tx, &mut translator, switch.family, &ids, Some(back.left))?;
+                (Some(back.left), written, back.state.clone())
+            }
+            (None, Some(head)) => {
+                // From the oldest node a request or a summary reads: the
+                // window's start, the summary's cut, or the prompt it keeps
+                // whole; else the head's own turn.
+                let compaction = match bot.compaction {
+                    Some(version) => tx
+                        .prepare_cached("SELECT cut,pinned FROM compactions WHERE node=?")?
+                        .query_row([version], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+                        })
+                        .map(Some)?,
+                    None => None,
+                };
+                // Ids grow along a lineage: the least is the oldest.
+                let start = [
+                    context_start,
+                    compaction.map(|c| c.0),
+                    compaction.and_then(|c| c.1),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
+                let start = match start {
+                    Some(start) => start,
+                    None => (place(&tx, head)?.and_then(|p| p.start))
+                        .unwrap_or(ancestor(&tx, head, node_depth(&tx, head)?, 1)?.unwrap_or(head)),
+                };
+                let depth = node_depth(&tx, start)?;
+                let ids = lineage_from(&tx, head, depth)?;
+                let root = place(&tx, start)?.and_then(|p| p.parent);
+                let written = translate_onto(&tx, &mut translator, switch.family, &ids, root)?;
+                let state = json!({
+                    "context_start": context_start.map(|n| written.first_of(n)),
+                    "family_start": written.first_new,
+                    "compaction": match (bot.compaction, compaction) {
+                        (Some(version), Some((cut, pinned))) => {
+                            let at = written.head.ok_or(Error::new("storage_error"))?;
+                            let (summary, prompts, covered_from, covered_to): (String, String, i64, i64) = tx
+                                .prepare_cached(
+                                    "SELECT summary,prompts,covered_from,covered_to FROM compactions WHERE node=?",
+                                )?
+                                .query_row([version], |r| {
+                                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                                })?;
+                            tx.prepare_cached(
+                                "INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to,pinned)
+                                 VALUES (?,?,?,?,?,?,?,?)",
+                            )?
+                            .execute(params![
+                                at,
+                                version,
+                                written.first_of(cut),
+                                summary,
+                                prompts,
+                                covered_from,
+                                covered_to,
+                                pinned.map(|p| written.first_of(p))
+                            ])?;
+                            for pin in pins_of(&tx, version)? {
+                                tx.prepare_cached("INSERT INTO pins(compaction,node) VALUES (?,?)")?
+                                    .execute(params![at, written.first_of(pin)])?;
+                            }
+                            Some(at)
+                        }
+                        _ => None,
+                    },
+                    "elision": match bot.elision {
+                        Some(version) => {
+                            let through: i64 = tx
+                                .prepare_cached("SELECT through FROM elisions WHERE node=?")?
+                                .query_row([version], |r| r.get(0))?;
+                            // Stubs below the floor go on the new branch
+                            // from the floor's place there: the newest node
+                            // written for it, or the root when none was.
+                            let floor = match written.last.get(&through) {
+                                Some(floor) => floor.or(root),
+                                None => Some(through),
+                            };
+                            match floor {
+                                Some(floor) if floor != through => {
+                                    let at = written.head.ok_or(Error::new("storage_error"))?;
+                                    tx.prepare_cached(
+                                        "INSERT INTO elisions(node,previous,through,saved)
+                                         SELECT ?,?,id,total_elided FROM nodes WHERE id=?",
+                                    )?
+                                    .execute(params![at, version, floor])?;
+                                    Some(at)
+                                }
+                                Some(_) => Some(version),
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    },
+                });
+                (root, written, state)
+            }
+        };
+        let new_head = written.head.or(root).or(head);
+        let restore = |key: &str| state.get(key).cloned().unwrap_or(Value::Null);
+        tx.prepare_cached(
+            "UPDATE bots SET head=?1,provider=?2,family=?3,model=?4,reasoning=?5,context_start=?6,
+                compaction=?7,elision=?8,family_start=?9,cache_bot=?10,thinking_prefix=?11,
+                thinking_floor=?12,thinking_from=?13,thinking_to=?14,thinking_elided=?15,
+                compaction_model=?16,fallback=?17
+             WHERE id=?18",
+        )?
+        .execute(params![
+            new_head,
+            switch.provider,
+            switch.family.name(),
+            switch.model,
+            switch.effort,
+            restore("context_start").as_i64(),
+            restore("compaction").as_i64(),
+            restore("elision").as_i64(),
+            restore("family_start").as_i64(),
+            restore("cache_bot").as_i64(),
+            restore("thinking_prefix").as_i64(),
+            restore("thinking_floor").as_i64().unwrap_or(0),
+            restore("thinking_from").as_i64().unwrap_or(0),
+            restore("thinking_to").as_i64().unwrap_or(0),
+            restore("thinking_elided").as_i64().unwrap_or(0),
+            restore("compaction_model").as_str(),
+            restore("fallback").as_str(),
+            id
+        ])?;
+        // Its new head is a closed point a fork can start from.
+        if let Some(new_head) = new_head.filter(|h| Some(*h) != head) {
+            tx.prepare_cached("INSERT OR IGNORE INTO checkpoints VALUES (?,?)")?
+                .execute(params![name, new_head])?;
+        }
+        tx.prepare_cached(
+            "INSERT INTO switches(bot_id,node,root,first,left,back,from_provider,from_family,
+                from_model,from_reasoning,to_provider,to_family,to_model,to_reasoning,
+                compaction,state,at_ms)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )?
+        .execute(params![
+            id,
+            new_head,
+            root,
+            written.first_new,
+            head,
+            back.is_some(),
+            bot.provider,
+            from.name(),
+            bot.model,
+            bot.effort,
+            switch.provider,
+            switch.family.name(),
+            switch.model,
+            switch.effort,
+            restore("compaction").as_i64(),
+            left_state.to_string(),
+            epoch_ms()
+        ])?;
+        tx.commit()?;
+        // A summarizer or fallback of the family it left goes; the way back
+        // brings it back.
+        let changed: Vec<&str> = [
+            ("compaction_model", bot.compaction_model.as_deref()),
+            ("fallback", bot.fallback.as_deref()),
+        ]
+        .into_iter()
+        .filter(|(key, was)| restore(key).as_str() != *was)
+        .map(|(key, _)| key)
+        .collect();
+        Ok(Some(json!({
+            "from": from.name(), "to": switch.family.name(),
+            "back": back.is_some(), "translated": written.count, "changed": changed,
+        })))
+    }
+    /// The bot's last switch, when `to` is the family it came from and
+    /// going back can reuse the branch it left: the bot is still on the
+    /// branch that switch made, and no summary was made since.
+    fn switched_from(&self, bot: &Bot, to: Family) -> Result<Option<Switched>> {
+        let last = self
+            .conn
+            .prepare_cached(
+                "SELECT node,left,from_family,to_family,compaction,state FROM switches
+                 WHERE bot_id=? ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row([bot.bot_id], |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })
+            .optional()?;
+        let Some((Some(node), Some(left), from, onto, compaction, state)) = last else {
+            return Ok(None);
+        };
+        if from != to.name()
+            || onto != bot.family
+            || compaction != bot.compaction
+            || !self.in_lineage(bot.head, node)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(Switched {
+            node,
+            left,
+            state: serde_json::from_str(&state)?,
+        }))
     }
     /// Replace a bot's gates, those it took from its creator or its source
     /// included: whoever configures it decides, as the person overriding a
@@ -15391,6 +15688,22 @@ impl Database {
         if let Some(node) = checkpoint.filter(|_| !validated) {
             self.validate_fork_point(node)?;
         }
+        // A source switched to the other family has that family's items
+        // from `family_start` on: what is older is in the family it left.
+        let (family_start, family_root): (Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT b.family_start,l.parent FROM bots b LEFT JOIN lineage l ON l.node=b.family_start
+             WHERE b.name=?",
+            [source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if let (Some(first), Some(node)) = (family_start, checkpoint)
+            && node < first
+        {
+            return fail_with(
+                "fork_before_switch",
+                format!("{source} switched to {} after that point", parent.family),
+            );
+        }
         if parent.status == "deleting" {
             return fail_with("bot_not_found", format!("{source} is being deleted"));
         }
@@ -15500,27 +15813,46 @@ impl Database {
             tx.prepare_cached("INSERT INTO checkpoints VALUES (?,?)")?
                 .execute(params![name, node])?;
             // The newest compaction at or before the checkpoint, along the
-            // source's version chain; ids grow along a lineage.
+            // source's version chain; ids grow along a lineage. After a
+            // switch, one whose cut is not on the branch the bot's family
+            // starts on is of the other family's items: an older one, if
+            // any, applies.
             let mut version = parent.compaction;
-            while let Some(node_id) = version.filter(|v| *v > node) {
-                version = tx.query_row(
-                    "SELECT previous FROM compactions WHERE node=?",
+            while let Some(node_id) = version {
+                let (previous, cut): (Option<i64>, i64) = tx.query_row(
+                    "SELECT previous,cut FROM compactions WHERE node=?",
                     [node_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
+                if node_id <= node && family_start.is_none_or(|first| cut >= first) {
+                    break;
+                }
+                version = previous;
             }
+            // Its family's items start where its source's do, and a window
+            // with no start of its own starts no older.
             tx.execute(
-                "UPDATE bots SET compaction=?1,context_start=COALESCE(?3,(SELECT cut FROM compactions WHERE node=?1)) WHERE name=?2",
-                params![version, name, start],
+                "UPDATE bots SET compaction=?1,
+                    context_start=COALESCE(?3,(SELECT cut FROM compactions WHERE node=?1),?4),
+                    family_start=?4 WHERE name=?2",
+                params![version, name, start, family_start],
             )?;
-            // The elision floor the source had at the checkpoint.
+            // The elision floor the source had at the checkpoint: below the
+            // branch, or on it.
             let mut version = parent.elision;
-            while let Some(node_id) = version.filter(|v| *v > node) {
-                version = tx.query_row(
-                    "SELECT previous FROM elisions WHERE node=?",
+            while let Some(node_id) = version {
+                let (previous, through): (Option<i64>, i64) = tx.query_row(
+                    "SELECT previous,through FROM elisions WHERE node=?",
                     [node_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
+                let on_branch = family_start.is_none_or(|first| {
+                    through >= first || family_root.is_some_and(|root| through <= root)
+                });
+                if node_id <= node && on_branch {
+                    break;
+                }
+                version = previous;
             }
             tx.execute(
                 "UPDATE bots SET elision=? WHERE name=?",
@@ -15985,7 +16317,7 @@ impl Database {
             // any piece commits. RETURNING shares the existing indexed lookup
             // with the global watermark, without another query per piece.
             let pruned: i64 = tx.query_row(
-                "UPDATE bots SET status='deleting',context_start=NULL,compaction=NULL,elision=NULL,
+                "UPDATE bots SET status='deleting',context_start=NULL,compaction=NULL,elision=NULL,family_start=NULL,
                     pruned_cursor=MAX(pruned_cursor,
                         COALESCE((SELECT MAX(id) FROM events WHERE bot=?1),0))
                  WHERE name=?1 RETURNING pruned_cursor",
@@ -16044,42 +16376,61 @@ impl Database {
         // Walk back from the head, freeing nodes until one is still reached
         // by another bot: as a head, a saved context start, or a parent of
         // a surviving branch. A fork's own suffix is what it leaves behind.
+        // Then from each branch it left for the other family's, which
+        // ends where its history goes on, and again while either frees
+        // more: a summary on one branch may hold a node of the other.
         // Nodes are small rows; a piece of them is a multiple of the turn piece.
-        let mut node = bot.head;
+        let budget = piece * 32;
         let mut freed = 0;
-        while let Some(id) = node {
-            if freed == piece * 32 {
-                tx.execute("UPDATE bots SET head=? WHERE name=?", params![id, name])?;
-                out["nodes"] = json!(freed);
-                tx.commit()?;
-                return Ok(out);
+        loop {
+            let before = freed;
+            let mut node = tx.query_row("SELECT head FROM bots WHERE name=?", [name], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?;
+            while let Some(id) = node {
+                if freed == budget {
+                    out["nodes"] = json!(freed);
+                    tx.commit()?;
+                    return Ok(out);
+                }
+                if node_reached(&tx, id, name, bot.bot_id)? {
+                    break;
+                }
+                node = free_node(&tx, id, name)?;
+                freed += 1;
             }
-            let referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1 OR compaction=?1 OR elision=?1))
-                    OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)
-                    OR EXISTS(SELECT 1 FROM compactions WHERE previous=?1)
-                    OR EXISTS(SELECT 1 FROM elisions WHERE previous=?1)",
-                params![id, name],
-                |r| r.get(0),
-            )?;
-            if referenced {
+            let left: Vec<(i64, i64)> = tx
+                .prepare_cached(
+                    "SELECT id,left FROM switches WHERE bot_id=? AND left IS NOT NULL ORDER BY id",
+                )?
+                .query_map([bot.bot_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (switch, mut id) in left {
+                loop {
+                    let gone = !tx
+                        .prepare_cached("SELECT 1 FROM nodes WHERE id=?")?
+                        .exists([id])?;
+                    if gone || node_reached(&tx, id, name, bot.bot_id)? {
+                        break;
+                    }
+                    if freed == budget {
+                        out["nodes"] = json!(freed);
+                        tx.commit()?;
+                        return Ok(out);
+                    }
+                    let parent = free_node(&tx, id, name)?;
+                    freed += 1;
+                    tx.prepare_cached("UPDATE switches SET left=? WHERE id=?")?
+                        .execute(params![parent, switch])?;
+                    let Some(parent) = parent else { break };
+                    id = parent;
+                }
+            }
+            if freed == before {
                 break;
             }
-            let parent: Option<i64> =
-                tx.query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?;
-            tx.execute("UPDATE bots SET head=? WHERE name=?", params![parent, name])?;
-            tx.execute("DELETE FROM pins WHERE compaction=?", [id])?;
-            tx.execute("DELETE FROM compactions WHERE node=?", [id])?;
-            tx.execute("DELETE FROM elisions WHERE node=?", [id])?;
-            tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
-            tx.execute("DELETE FROM declined WHERE node=?", [id])?;
-            tx.execute("DELETE FROM openings WHERE node=?", [id])?;
-            tx.execute("DELETE FROM senders WHERE node=?", [id])?;
-            tx.execute("DELETE FROM lineage WHERE node=?", [id])?;
-            tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
-            freed += 1;
-            node = parent;
         }
+        tx.execute("DELETE FROM switches WHERE bot_id=?", [bot.bot_id])?;
         tx.execute("DELETE FROM events WHERE bot=?", [name])?;
         // The identity's name and creation key outlive it, so a resent
         // delete is told apart from a delete of some other identity, and a
@@ -20549,6 +20900,28 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         migrate_declared_field(conn, "lift", "yields")?;
     }
 
+    // Schema 110: a bot switched to the other family moves onto a branch of
+    // its history written again in that family's items, each new prompt with
+    // its turn beside the original's; the switch is kept, for the way back,
+    // and so is where the family's items start. No foreign key holds that
+    // node, so release/store_down.py can drop the column; a deletion keeps
+    // any node a bot's start names (`node_reached`).
+    if from < 110 {
+        // The column is added only when missing, as the steps before add
+        // theirs.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS nodes_turn;
+             CREATE INDEX nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;",
+        )?;
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='family_start')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            conn.execute("ALTER TABLE bots ADD COLUMN family_start INTEGER", [])?;
+        }
+    }
+
     Ok(())
 }
 
@@ -21564,6 +21937,225 @@ fn elision_shared(conn: &Connection, node: i64, name: &str) -> Result<bool> {
              OR EXISTS(SELECT 1 FROM elisions WHERE previous=?1)",
         )?
         .query_row(params![node, name], |r| r.get(0))?)
+}
+/// A model of the other family for `Database::switch_family`.
+pub struct Switch<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub effort: Option<&'a str>,
+    pub family: Family,
+    /// Tools the new model is shown as Responses custom tools.
+    pub custom: std::collections::HashSet<String>,
+}
+/// A switch the way back can reuse: the head it made, the head it left,
+/// and the bot's state there.
+struct Switched {
+    node: i64,
+    left: i64,
+    state: Value,
+}
+/// What `translate_onto` wrote, by the source node each came from.
+#[derive(Default)]
+struct Translated {
+    head: Option<i64>,
+    first_new: Option<i64>,
+    /// Each source node's first new node, or, for one that became none,
+    /// the next written after it.
+    first: HashMap<i64, i64>,
+    /// The newest new node once each source node was written; `None`
+    /// while none was, which is the branch's root.
+    last: HashMap<i64, Option<i64>>,
+    count: usize,
+}
+impl Translated {
+    fn first_of(&self, node: i64) -> Option<i64> {
+        self.first.get(&node).copied().or(self.head)
+    }
+}
+fn node_depth(conn: &Connection, node: i64) -> Result<i64> {
+    Ok(conn
+        .prepare_cached("SELECT depth FROM nodes WHERE id=?")?
+        .query_row([node], |r| r.get(0))?)
+}
+/// The lineage of `head` from `depth` down to it, oldest first.
+fn lineage_from(conn: &Connection, head: i64, depth: i64) -> Result<Vec<i64>> {
+    Ok(conn
+        .prepare_cached(
+            "WITH RECURSIVE chain(id,parent,depth) AS (
+                SELECT id,parent,depth FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent
+                WHERE c.depth>?2)
+             SELECT id FROM chain WHERE depth>=?2 ORDER BY depth",
+        )?
+        .query_map(params![head, depth], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+/// The messages a compaction keeps whole beside its prompt.
+fn pins_of(conn: &Connection, version: i64) -> Result<Vec<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT node FROM pins WHERE compaction=? ORDER BY node")?
+        .query_map([version], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+/// Write `ids`' items again in `translator`'s family, chained from
+/// `parent`: each with its turn, message, pictures, opening and sender,
+/// its stub naming the node it is now, and what a declined request left
+/// out of it. A prompt that becomes no item still keeps its turn.
+fn translate_onto(
+    conn: &Connection,
+    translator: &mut crate::translate::Translator,
+    to: Family,
+    ids: &[i64],
+    mut parent: Option<i64>,
+) -> Result<Translated> {
+    let mut out = Translated::default();
+    let mut waiting: Vec<i64> = Vec::new();
+    for &old in ids {
+        type Row = (
+            Vec<u8>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            i64,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
+        let (item, turn, message, extra, count, stub, declined): Row = conn
+            .prepare_cached(
+                "SELECT n.item,n.turn,n.message,n.pictured,n.pictures,s.item,d.item FROM nodes n
+                 LEFT JOIN stubs s ON s.node=n.id LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
+            )?
+            .query_row([old], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?;
+        let mut items = translator.item(&item)?;
+        if items.is_empty() && turn.is_some() {
+            items.push(to.user_item_from("(no text)", &[], &[])?);
+        }
+        waiting.push(old);
+        let single = items.len() == 1;
+        // The one item a node becomes, translated alone, else nothing.
+        let mut one = |source: &Option<Vec<u8>>| -> Result<Option<Vec<u8>>> {
+            match (source, single) {
+                (Some(source), true) => {
+                    let mut items = translator.item(source)?;
+                    Ok((items.len() == 1).then(|| items.remove(0)))
+                }
+                _ => Ok(None),
+            }
+        };
+        let (stub, declined) = (one(&stub)?, one(&declined)?);
+        for (index, new_item) in items.iter().enumerate() {
+            let lead = index == 0;
+            let next = next_node(conn)?;
+            let pictured = match lead && single {
+                true => Pictured { count, extra },
+                false => Pictured::default(),
+            };
+            // A result's stub names the node that holds it in full.
+            let stub = stub.as_ref().filter(|_| lead).map(|stub| {
+                let (was, now) = (format!("result/{old}\\\""), format!("result/{next}\\\""));
+                match std::str::from_utf8(stub) {
+                    Ok(text) => text.replacen(&was, &now, 1).into_bytes(),
+                    Err(_) => stub.clone(),
+                }
+            });
+            let weight = new_item.len() as i64 - pictured.extra;
+            let (stub, elided) = match stub {
+                Some(stub) if (stub.len() as i64) < weight => {
+                    let elided = weight - stub.len() as i64;
+                    (Some(stub), elided)
+                }
+                _ => (None, 0),
+            };
+            let new = insert_node(
+                conn,
+                parent,
+                new_item,
+                turn.filter(|_| lead),
+                message.filter(|_| lead),
+                elided,
+                pictured,
+            )?;
+            if new != next {
+                return fail("storage_error");
+            }
+            if let Some(stub) = stub {
+                conn.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
+                    .execute(params![new, stub])?;
+            }
+            if lead {
+                if let Some(declined) = &declined {
+                    conn.prepare_cached("INSERT INTO declined(node,item) VALUES (?,?)")?
+                        .execute(params![new, declined])?;
+                }
+                conn.prepare_cached(
+                    "INSERT INTO openings(node,text,chars) SELECT ?1,text,chars FROM openings WHERE node=?2",
+                )?
+                .execute(params![new, old])?;
+                conn.prepare_cached(
+                    "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes,attached)
+                     SELECT ?1,bot,bot_id,turn,origin,person,quotes,attached FROM senders WHERE node=?2",
+                )?
+                .execute(params![new, old])?;
+            }
+            for source in waiting.drain(..) {
+                out.first.insert(source, new);
+            }
+            out.first_new.get_or_insert(new);
+            out.head = Some(new);
+            out.count += 1;
+            parent = Some(new);
+        }
+        out.last.insert(old, out.head);
+    }
+    Ok(out)
+}
+/// Whether a node a deleted bot frees is still reached: by another bot,
+/// as its head, saved context start, summary or elision floor; as a parent;
+/// by a summary or floor made on it; or as the head another bot's switch
+/// left, which its way back goes on from.
+fn node_reached(conn: &Connection, id: i64, name: &str, bot_id: i64) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1 OR compaction=?1 OR elision=?1 OR family_start=?1))
+                OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)
+                OR EXISTS(SELECT 1 FROM compactions WHERE previous=?1)
+                OR EXISTS(SELECT 1 FROM elisions WHERE previous=?1)
+                OR EXISTS(SELECT 1 FROM switches WHERE left=?1 AND bot_id!=?3)",
+        )?
+        .query_row(params![id, name, bot_id], |r| r.get(0))?)
+}
+/// Free a node of a deleted bot and what is kept beside it; its parent.
+/// The bot's head follows it back.
+fn free_node(conn: &Connection, id: i64, name: &str) -> Result<Option<i64>> {
+    let parent: Option<i64> = conn
+        .prepare_cached("SELECT parent FROM nodes WHERE id=?")?
+        .query_row([id], |r| r.get(0))?;
+    conn.prepare_cached("UPDATE bots SET head=?1 WHERE name=?2 AND head=?3")?
+        .execute(params![parent, name, id])?;
+    for table in [
+        "DELETE FROM pins WHERE compaction=?",
+        "DELETE FROM compactions WHERE node=?",
+        "DELETE FROM elisions WHERE node=?",
+        "DELETE FROM stubs WHERE node=?",
+        "DELETE FROM declined WHERE node=?",
+        "DELETE FROM openings WHERE node=?",
+        "DELETE FROM senders WHERE node=?",
+        "DELETE FROM lineage WHERE node=?",
+        "DELETE FROM nodes WHERE id=?",
+    ] {
+        conn.prepare_cached(table)?.execute([id])?;
+    }
+    Ok(parent)
 }
 /// The id the next node insert takes, inside the caller's transaction.
 fn next_node(conn: &Connection) -> Result<i64> {

@@ -7,6 +7,8 @@ The daemon brings a store forward by itself when it starts, one schema at a
 time. Each of those steps has its way back here, newest first, so a release
 that knows only SCHEMA opens the store with nothing lost that it can hold:
 
+    110 -> 109  switches between model families go; each agent stays on
+                the model and history it has now (see back_110)
     109 -> 108  nothing: 0.10.2 (108) reads `yields`
     108 -> 107  the `namespace`, `speeds` and `context_windows` settings go
     107 -> 106  instructions back in each bot's row; `yields` is `lift` again
@@ -28,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import store_lift_yields  # noqa: E402
 
-NEWEST = 109
+NEWEST = 110
 OLDEST = 106
 
 
@@ -38,6 +40,41 @@ def run(conn, script):
     for statement in script.split(";"):
         if statement.strip():
             conn.execute(statement)
+
+
+def on_lineage(conn, head, node):
+    """Whether `node` is `head` or one of its ancestors."""
+    return conn.execute(
+        "WITH RECURSIVE up(id,parent) AS (SELECT id,parent FROM nodes WHERE id=?1"
+        " UNION ALL SELECT n.id,n.parent FROM nodes n JOIN up ON n.id=up.parent)"
+        " SELECT EXISTS(SELECT 1 FROM up WHERE id=?2)",
+        (head, node),
+    ).fetchone()[0] == 1
+
+
+def back_110(conn):
+    """A switched agent's history was written again in the other family's
+    items, each prompt node holding its turn beside the original's. A turn
+    keeps one node again: the one its agent's history reaches, else the
+    newest. Each agent stays on the model and branch it has; the branches
+    it left stay as history no agent reaches."""
+    shared = conn.execute(
+        "SELECT n.turn,b.head FROM nodes n LEFT JOIN turns t ON t.id=n.turn"
+        " LEFT JOIN bots b ON b.name=t.bot"
+        " WHERE n.turn IS NOT NULL GROUP BY n.turn HAVING count(*)>1"
+    ).fetchall()
+    for turn, head in shared:
+        nodes = [row[0] for row in conn.execute("SELECT id FROM nodes WHERE turn=? ORDER BY id DESC", (turn,))]
+        keep = next((node for node in nodes if head is not None and on_lineage(conn, head, node)), nodes[0])
+        conn.execute("UPDATE nodes SET turn=NULL WHERE turn=? AND id!=?", (turn, keep))
+    run(
+        conn,
+        "DROP INDEX nodes_turn;"
+        "CREATE UNIQUE INDEX nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;"
+        "DROP TABLE switches;"
+        "DROP INDEX bots_family_start;"
+        "ALTER TABLE bots DROP COLUMN family_start;"
+    )
 
 
 def back_109(conn):
@@ -75,7 +112,7 @@ def back_107(conn):
 
 
 # Each schema's way back to the one before it.
-BACK = {109: back_109, 108: back_108, 107: back_107}
+BACK = {110: back_110, 109: back_109, 108: back_108, 107: back_107}
 
 
 def down(store, to, dry=False):

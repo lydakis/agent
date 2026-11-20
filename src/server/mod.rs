@@ -5276,12 +5276,13 @@ impl Service {
             }
             _ => None,
         };
-        // Another model of the bot's family: its history is kept in
-        // that family's encoding. So must a summarizer or a fallback
-        // be, which are sent its items as they are.
+        // A model of the other family moves the bot's history into that
+        // family's encoding (`switch_family`). A summarizer or a fallback
+        // must be of the family the bot will be in, as they are sent its
+        // items as they are.
+        let mut switch = None;
         let model = match &record {
             Some(record) => {
-                let family = record.family()?;
                 let reference = model.as_deref();
                 let (provider, name) = match reference {
                     Some(reference) => split_model(reference)?,
@@ -5291,11 +5292,23 @@ impl Service {
                     .providers
                     .get(provider)
                     .ok_or(Error::with("provider_unavailable", provider.to_owned()))?;
-                if served.family() != family {
-                    return fail_with(
-                        "provider_family_mismatch",
-                        reference.unwrap_or(provider).to_owned(),
-                    );
+                let family = served.family();
+                if family != record.family()? {
+                    // Tools its new model is shown as custom tools: their
+                    // calls and results go as custom ones.
+                    let custom: std::collections::HashSet<String> = match served.grammars() {
+                        true => (record.offered().iter())
+                            .filter(|name| *name == "apply_patch")
+                            .cloned()
+                            .chain(
+                                (record.declared.iter())
+                                    .filter(|tool| tool.grammar.is_some())
+                                    .map(|tool| tool.name.clone()),
+                            )
+                            .collect(),
+                        false => Default::default(),
+                    };
+                    switch = Some((family, custom));
                 }
                 turn::shaped(served, given.as_ref().unwrap_or(&record.settings))?;
                 if let Some(level) = &effort {
@@ -5349,6 +5362,7 @@ impl Service {
                         false => db.inspect(&bot)?.running_turn,
                     };
                     let kept_tools = declare.clone();
+                    let trial = running.is_some();
                     let write = move |db: &mut agent_runtime::store::Database| {
                         let mut changed: Vec<String> = Vec::new();
                         // First: the changes that may be refused here.
@@ -5364,16 +5378,44 @@ impl Service {
                             changed.extend(set);
                             kin = of_kin;
                         }
-                        if let Some((provider, name)) = &model
-                            && db.set_model(
-                                &bot_name,
-                                Some(id),
-                                provider,
-                                name,
-                                effort.as_deref(),
-                            )?
-                        {
-                            changed.push("model".into());
+                        match (&model, &switch) {
+                            // Kept for the running turn's end, which takes
+                            // it as this does: checked above.
+                            (Some(_), Some(_)) if trial => changed.push("model".into()),
+                            (Some((provider, name)), Some((family, custom))) => {
+                                let switched = db.switch_family(
+                                    &bot_name,
+                                    Some(id),
+                                    &agent_runtime::store::Switch {
+                                        provider,
+                                        model: name,
+                                        effort: effort.as_deref(),
+                                        family: *family,
+                                        custom: custom.clone(),
+                                    },
+                                )?;
+                                if let Some(switched) = switched {
+                                    changed.push("model".into());
+                                    changed.push("family".into());
+                                    changed.extend(
+                                        (switched["changed"].as_array().into_iter().flatten())
+                                            .filter_map(Value::as_str)
+                                            .map(String::from),
+                                    );
+                                }
+                            }
+                            (Some((provider, name)), None) => {
+                                if db.set_model(
+                                    &bot_name,
+                                    Some(id),
+                                    provider,
+                                    name,
+                                    effort.as_deref(),
+                                )? {
+                                    changed.push("model".into());
+                                }
+                            }
+                            (None, _) => {}
                         }
                         if let Some(instructions) = instructions
                             && db.set_instructions(&bot_name, Some(id), &instructions)?
