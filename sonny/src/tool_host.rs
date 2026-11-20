@@ -104,15 +104,10 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
         if let Ok((client, mut events)) = Client::connect(&socket).await {
             gone = None;
             server.connected(&client);
-            // Once a host: a connection dropped and made again changes no
-            // bot's tools.
-            if started {
-                started = false;
-                let bots = crate::lookout::all_bots(&client).await;
-                tokio::spawn(refresh_tools(client.clone(), bots));
-            }
-            // For as long as this connection lasts.
-            let following = tokio::spawn(follow_config(client.clone()));
+            // For as long as this connection lasts. Every bot's tools only
+            // once a host: a connection dropped and made again changes none.
+            let following =
+                tokio::spawn(follow_config(client.clone(), std::mem::take(&mut started)));
             let follow = json!({"bot": "*", "after": cursor, "kinds": KINDS});
             match client.request("follow", follow).await {
                 Ok(_) => {
@@ -186,56 +181,75 @@ fn save(store: &Path, cursor: i64) {
     }
 }
 
-/// Bring every agent Sonny declared on up to this build's tools, as
-/// opening its window would, so one no one opens after an upgrade, such
-/// as a task out of sight, gets a tool added since. A busy one is tried
-/// again each minute, for an hour.
-async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
-    let mut left = bots;
-    for _ in 0..60 {
-        let mut busy = Vec::new();
-        for bot in left {
-            let Ok(mut record) = client
-                .request(
-                    "inspect",
-                    json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
-                )
-                .await
-            else {
-                continue;
-            };
-            record["name"] = bot["name"].clone();
-            record["bot_id"] = bot["bot_id"].clone();
-            let Some(fields) = crate::declared::refresh(&record) else {
-                // Said, not skipped in silence: the agent goes on without
-                // the tools added since.
-                let declared = record["declared"].as_array().cloned().unwrap_or_default();
-                let role = crate::declared::declared_role(&declared);
-                if let Some(why) = crate::declared::too_many(&record, role) {
-                    println!(
-                        "{}",
-                        json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": "tools_too_large", "why": why})
-                    );
-                }
-                continue;
-            };
-            match client.request("configure", Value::Object(fields)).await {
-                Ok(_) => println!(
-                    "{}",
-                    json!({"event": "tools_refreshed", "bot": bot["name"]})
-                ),
-                Err(error) if error.code == "bot_busy" => busy.push(bot),
-                Err(error) => println!(
-                    "{}",
-                    json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": error.code})
-                ),
-            }
+/// How long an agent found at work waits to be asked again for this
+/// build's tools, and how many times in all it is asked: each minute, for
+/// an hour.
+const REFRESH_AGAIN: Duration = Duration::from_secs(60);
+const REFRESH_ROUNDS: usize = 60;
+
+/// What the daemon says of `bot`, as listed; none when it says nothing.
+async fn inspect(client: &Client, bot: &Value) -> Option<Value> {
+    let mut record = client
+        .request(
+            "inspect",
+            json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
+        )
+        .await
+        .ok()?;
+    record["name"] = bot["name"].clone();
+    record["bot_id"] = bot["bot_id"].clone();
+    Some(record)
+}
+
+/// Bring the agent `record` describes, listed as `bot`, up to this build's
+/// tools when Sonny declared on it, as opening its window would, so one no
+/// one opens after an upgrade, such as a task out of sight, gets a tool
+/// added since. Whether it was at work, to ask again.
+async fn refresh(client: &Client, bot: &Value, record: &Value) -> bool {
+    let Some(fields) = crate::declared::refresh(record) else {
+        // Said, not skipped in silence: the agent goes on without the
+        // tools added since.
+        let declared = record["declared"].as_array().cloned().unwrap_or_default();
+        let role = crate::declared::declared_role(&declared);
+        if let Some(why) = crate::declared::too_many(record, role) {
+            println!(
+                "{}",
+                json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": "tools_too_large", "why": why})
+            );
         }
+        return false;
+    };
+    match client.request("configure", Value::Object(fields)).await {
+        Ok(_) => println!(
+            "{}",
+            json!({"event": "tools_refreshed", "bot": bot["name"]})
+        ),
+        Err(error) if error.code == "bot_busy" => return true,
+        Err(error) => println!(
+            "{}",
+            json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": error.code})
+        ),
+    }
+    false
+}
+
+/// Ask the agents found at work for this build's tools again each minute,
+/// for the rest of the hour.
+async fn refresh_again(client: Arc<Client>, mut busy: Vec<Value>) {
+    for _ in 1..REFRESH_ROUNDS {
         if busy.is_empty() {
             return;
         }
-        left = busy;
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(REFRESH_AGAIN).await;
+        let mut left = Vec::new();
+        for bot in busy {
+            if let Some(record) = inspect(&client, &bot).await
+                && refresh(&client, &bot, &record).await
+            {
+                left.push(bot);
+            }
+        }
+        busy = left;
     }
 }
 
@@ -251,7 +265,11 @@ const CONFIG_EVERY: Duration = Duration::from_secs(5);
 /// changes. The daemon takes the rules alone from an agent at work, for
 /// its next round; the rest it is asked again until it is idle, since
 /// `configure` otherwise waits for the turn to end.
-async fn follow_config(client: Arc<Client>) {
+///
+/// With `tools`, and whenever what `exec` reaches changes (code mode, or
+/// what linked machines lend), every agent is brought up to this build's
+/// tools too, on the same read of it: one `inspect` an agent for both.
+async fn follow_config(client: Arc<Client>, tools: bool) {
     let stamp = || {
         let found = agent_client::config::path().and_then(|path| std::fs::metadata(path).ok());
         found.map(|found| (found.len(), found.modified().ok()))
@@ -259,6 +277,7 @@ async fn follow_config(client: Arc<Client>) {
     let mut seen = None;
     let mut waiting: Vec<Value> = Vec::new();
     let mut live = std::collections::HashSet::new();
+    let mut tools = tools;
     // What the machines linked here lend, which their agents' tools say.
     let mut lent = crate::link::stamp();
     // Code mode, which says what `exec` reaches, read as the file changes.
@@ -267,40 +286,45 @@ async fn follow_config(client: Arc<Client>) {
         let now_lent = crate::link::stamp();
         if now_lent != lent {
             lent = now_lent;
-            let bots = crate::lookout::all_bots(&client).await;
-            tokio::spawn(refresh_tools(client.clone(), bots));
+            tools = true;
         }
         let rules = crate::rules::given();
         let now = (stamp(), rules.clone());
-        if seen.as_ref() != Some(&now) {
+        let changed = seen.as_ref() != Some(&now);
+        if changed {
             seen = Some(now);
             if crate::exec::code_mode() != coded {
                 coded = !coded;
-                let bots = crate::lookout::all_bots(&client).await;
-                tokio::spawn(refresh_tools(client.clone(), bots));
+                tools = true;
             }
+        }
+        if changed || tools {
             waiting = crate::lookout::all_bots(&client).await;
             live = (waiting.iter())
                 .filter_map(|bot| bot["bot_id"].as_i64())
                 .collect();
         }
         if !waiting.is_empty() {
-            match agent_client::config::load() {
-                Ok(config) => {
-                    let given = Given {
-                        config: &config,
-                        rules: rules.as_ref(),
-                        live: &live,
-                    };
-                    waiting = apply_config(&client, &given, waiting).await;
-                }
-                // Its next change is read again.
-                Err(error) => {
-                    println!("{}", json!({"event": "config_unread", "error": error}));
-                    waiting.clear();
-                }
+            let config = agent_client::config::load();
+            // Its next change is read again.
+            if let Err(error) = &config {
+                println!("{}", json!({"event": "config_unread", "error": error}));
+            }
+            let given = config.as_ref().ok().map(|config| Given {
+                config,
+                rules: rules.as_ref(),
+                live: &live,
+            });
+            let mut refreshing = tools.then(Vec::new);
+            waiting = match (&given, &refreshing) {
+                (None, None) => Vec::new(),
+                _ => apply_config(&client, given.as_ref(), waiting, refreshing.as_mut()).await,
+            };
+            if let Some(busy) = refreshing.filter(|busy| !busy.is_empty()) {
+                tokio::spawn(refresh_again(client.clone(), busy));
             }
         }
+        tools = false;
         tokio::time::sleep(CONFIG_EVERY).await;
     }
 }
@@ -314,57 +338,73 @@ struct Given<'a> {
     live: &'a std::collections::HashSet<i64>,
 }
 
-/// Configure each of `bots` that `given` would make otherwise; those at
-/// work, to ask again.
-async fn apply_config(client: &Client, given: &Given<'_>, bots: Vec<Value>) -> Vec<Value> {
+/// Read each of `bots` once, and configure each that `given` would make
+/// otherwise and, with `tools`, each this build's tools would; those at
+/// work, to ask again: the config's returned, the tools' put in `tools`.
+async fn apply_config(
+    client: &Client,
+    given: Option<&Given<'_>>,
+    bots: Vec<Value>,
+    mut tools: Option<&mut Vec<Value>>,
+) -> Vec<Value> {
     let mut busy = Vec::new();
     for bot in bots {
-        let Ok(mut record) = client
-            .request(
-                "inspect",
-                json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
-            )
-            .await
-        else {
+        let Some(record) = inspect(client, &bot).await else {
             continue;
         };
-        record["name"] = bot["name"].clone();
-        let Some(mut fields) = configured(&record, given) else {
-            continue;
-        };
-        fields.insert("bot".into(), bot["name"].clone());
-        fields.insert("bot_id".into(), bot["bot_id"].clone());
-        let rules = (fields.get("settings"))
-            .and_then(|settings| settings.get("rules"))
-            .cloned();
-        match client.request("configure", Value::Object(fields)).await {
-            Ok(answer) => println!(
-                "{}",
-                json!({"event": "config_applied", "bot": bot["name"], "changed": answer["changed"]})
-            ),
-            Err(error) if error.code == "bot_busy" => {
-                // The rules alone reach an agent at work, at its next
-                // round; the rest waits for it to be idle.
-                if let Some(rules) = rules {
-                    let alone = json!({"bot": bot["name"], "bot_id": bot["bot_id"],
-                        "settings": {"rules": rules}});
-                    if let Ok(answer) = client.request("configure", alone).await {
-                        println!(
-                            "{}",
-                            json!({"event": "config_applied", "bot": bot["name"],
-                                "changed": answer["changed"]})
-                        );
-                    }
-                }
-                busy.push(bot)
-            }
-            Err(error) => println!(
-                "{}",
-                json!({"event": "config_failed", "bot": bot["name"], "error": error.code})
-            ),
+        if let Some(tools) = tools.as_deref_mut()
+            && refresh(client, &bot, &record).await
+        {
+            tools.push(bot.clone());
+        }
+        if let Some(given) = given
+            && apply(client, given, &bot, &record).await
+        {
+            busy.push(bot);
         }
     }
     busy
+}
+
+/// Configure the agent `record` describes, listed as `bot`, to what
+/// `given` gives it, when that is not what it has; whether it was at work,
+/// to ask again.
+async fn apply(client: &Client, given: &Given<'_>, bot: &Value, record: &Value) -> bool {
+    let Some(mut fields) = configured(record, given) else {
+        return false;
+    };
+    fields.insert("bot".into(), bot["name"].clone());
+    fields.insert("bot_id".into(), bot["bot_id"].clone());
+    let rules = (fields.get("settings"))
+        .and_then(|settings| settings.get("rules"))
+        .cloned();
+    match client.request("configure", Value::Object(fields)).await {
+        Ok(answer) => println!(
+            "{}",
+            json!({"event": "config_applied", "bot": bot["name"], "changed": answer["changed"]})
+        ),
+        Err(error) if error.code == "bot_busy" => {
+            // The rules alone reach an agent at work, at its next round;
+            // the rest waits for it to be idle.
+            if let Some(rules) = rules {
+                let alone = json!({"bot": bot["name"], "bot_id": bot["bot_id"],
+                    "settings": {"rules": rules}});
+                if let Ok(answer) = client.request("configure", alone).await {
+                    println!(
+                        "{}",
+                        json!({"event": "config_applied", "bot": bot["name"],
+                            "changed": answer["changed"]})
+                    );
+                }
+            }
+            return true;
+        }
+        Err(error) => println!(
+            "{}",
+            json!({"event": "config_failed", "bot": bot["name"], "error": error.code})
+        ),
+    }
+    false
 }
 
 /// The `configure` fields that bring one of Sonny's agents, as `inspect`
