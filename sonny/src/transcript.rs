@@ -1350,23 +1350,20 @@ fn quote_rows(text: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>
     out
 }
 
-/// A message of the person's with the words it quotes, under its words
-/// on the same band, quieter than them and as short as a long paste.
+/// A message of the person's with the words it quotes over its words on
+/// the same band, as a reply's quote reads, quieter than them and as short
+/// as a long paste.
 pub fn with_quotes(
     mut prompt: Vec<Line<'static>>,
     quotes: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
     let band = crate::look::BAND;
-    let Some(end) = prompt.pop() else {
-        return prompt;
-    };
-    // A blank row of the band between its words and what they quote.
-    let quotes = quotes.strip_prefix('\n').unwrap_or(quotes);
-    for line in quote_rows(quotes, width, Some(PROMPT_LINES)) {
-        prompt.push(line.dim().bg(band));
-    }
-    prompt.push(end);
+    // Under the band's blank top row, straight over the words.
+    let at = 1.min(prompt.len());
+    let quotes = quote_rows(quotes.trim_start_matches('\n'), width, Some(PROMPT_LINES));
+    let rows: Vec<Line<'static>> = quotes.into_iter().map(|line| line.dim().bg(band)).collect();
+    prompt.splice(at..at, rows);
     prompt
 }
 

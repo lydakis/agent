@@ -11936,18 +11936,22 @@ impl App {
                 false => landed(said, &mut self.ran_here, prose, &folder),
             };
             if !lines.is_empty() {
+                // What the message quotes goes over its words, and its
+                // folds move down by as many rows.
+                let shown = lines.len();
                 let lines = match quotes.is_empty() {
                     true => lines,
                     false => transcript::with_quotes(lines, quotes, prose),
                 };
                 let count = lines.len();
+                let over = count - shown;
                 self.commit(lines);
                 for (fold, tag, button) in [
                     (folds.quoted, screen::Tag::Quoted(node), quoted_button(node)),
                     (folds.more, screen::Tag::More(node), more_button(node)),
                 ] {
                     if let Some(fold) = fold {
-                        let at = self.pending.len() - count + fold;
+                        let at = self.pending.len() - count + fold + over;
                         self.marks.push((at, screen::Mark::Tag(tag)));
                         self.marks.push((at, button));
                     }
@@ -32266,7 +32270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_person_s_message_shows_what_it_quotes_under_its_words() {
+    async fn the_person_s_message_shows_what_it_quotes_over_its_words() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
         app.width = 80;
@@ -32278,8 +32282,6 @@ mod tests {
             rows,
             [
                 "",
-                "› ship that",
-                "",
                 "  calc.fix replied:",
                 "  ▌ Fixed it.",
                 "  ▌ 1",
@@ -32288,6 +32290,7 @@ mod tests {
                 "  ▌ 4",
                 "  ▌ 5",
                 "  ▌ … +2 lines",
+                "› ship that",
                 "",
             ]
         );
