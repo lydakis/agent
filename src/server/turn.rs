@@ -306,14 +306,16 @@ async fn yields(yield_ms: Option<u64>) {
         None => std::future::pending().await,
     }
 }
+/// Each folder's holds and its read.
+type FolderReads = HashMap<String, (usize, Arc<FolderRead>)>;
 /// The folders a turn reads for an agent it makes, each read by one at a
 /// time ([`Turn::on_folder`]), with the path its reader waits on. A folder
-/// is held while a call waits on it or a read of it runs, and forgotten
-/// when the last hold ends.
-static FOLDER_READS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<FolderRead>>>> =
+/// is held while a call waits on it or a read of it runs, counted under
+/// the lock, and forgotten when the last hold ends.
+static FOLDER_READS: std::sync::LazyLock<std::sync::Mutex<FolderReads>> =
     std::sync::LazyLock::new(Default::default);
 
-fn folder_reads() -> std::sync::MutexGuard<'static, HashMap<String, Arc<FolderRead>>> {
+fn folder_reads() -> std::sync::MutexGuard<'static, FolderReads> {
     FOLDER_READS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -324,29 +326,26 @@ struct FolderHold {
 }
 impl FolderHold {
     fn new(folder: &str) -> Self {
-        let entry = folder_reads().entry(folder.to_owned()).or_default().clone();
+        let mut reads = folder_reads();
+        let (holds, entry) = reads.entry(folder.to_owned()).or_default();
+        *holds += 1;
         FolderHold {
             folder: folder.to_owned(),
-            entry,
+            entry: entry.clone(),
         }
     }
     fn again(&self) -> Self {
-        FolderHold {
-            folder: self.folder.clone(),
-            entry: self.entry.clone(),
-        }
+        FolderHold::new(&self.folder)
     }
 }
 impl Drop for FolderHold {
     fn drop(&mut self) {
         let mut reads = folder_reads();
-        // The map's and this one's are the last.
-        if Arc::strong_count(&self.entry) == 2
-            && reads
-                .get(&self.folder)
-                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
-        {
-            reads.remove(&self.folder);
+        if let Some((holds, _)) = reads.get_mut(&self.folder) {
+            *holds -= 1;
+            if *holds == 0 {
+                reads.remove(&self.folder);
+            }
         }
     }
 }
@@ -9828,5 +9827,18 @@ mod tests {
             .unwrap();
         assert!(!held());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_is_forgotten_when_its_last_hold_ends_at_once() {
+        // Holds that end together, as a cut call's and its read's can.
+        for round in 0..2000 {
+            let folder = format!("/held-together/{round}");
+            let first = FolderHold::new(&folder);
+            let second = first.again();
+            let ends = [first, second].map(|hold| std::thread::spawn(move || drop(hold)));
+            ends.into_iter().for_each(|end| end.join().unwrap());
+            assert!(!folder_reads().contains_key(&folder), "{folder}");
+        }
     }
 }
