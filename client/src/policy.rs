@@ -228,7 +228,10 @@ fn read_head(path: &Path, limit: usize) -> Result<Vec<u8>, Failure> {
             reason: "it is kept unreadable from agents".into(),
         });
     }
-    let mut bytes = Vec::new();
+    // Sized from the file's length, so the read takes one buffer rather
+    // than growing one read at a time.
+    let size = file.metadata().map_or(0, |meta| meta.len() as usize);
+    let mut bytes = Vec::with_capacity(size.min(limit) + 1);
     file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
@@ -1418,8 +1421,13 @@ fn append_memory(
         path: path.clone(),
         reason: e.utf8_error().to_string(),
     })?;
-    let index = crate::memory::filled_lines(&index, workspace);
-    push(text, path, "\n\n", &crate::memory::head(&index), reserve)
+    push(
+        text,
+        path,
+        "\n\n",
+        &crate::memory::head(&index, workspace),
+        reserve,
+    )
 }
 
 /// How much of a memory index composing reads.
@@ -2196,7 +2204,7 @@ mod tests {
         }
         std::fs::write(&user, &index).unwrap();
         let composed = instructions(&root, None, std::slice::from_ref(&user)).unwrap();
-        let head = crate::memory::head(&index);
+        let head = crate::memory::head(&index, &root);
         assert!(head.len() <= crate::memory::HEAD && head.contains("- fact-0000 ("));
         assert!(
             composed.text.ends_with(head.trim()),

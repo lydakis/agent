@@ -372,7 +372,7 @@ fn run_as_in(
             };
             let index = |dir: PathBuf| {
                 let text = std::fs::read_to_string(dir.join(INDEX)).unwrap_or_default();
-                json!({"dir": dir, "index": head(&filled_lines(&text, folder))})
+                json!({"dir": dir, "index": head(&text, folder)})
             };
             let mut shown = json!({"user": index(root.to_path_buf()), "project": null});
             if let Some(name) = project {
@@ -931,56 +931,84 @@ fn render_index(dir: &Path, facts: &[Fact]) -> String {
     text
 }
 
-/// What a new agent reads of an index: the whole index when it fits
-/// within [`HEAD`]; else every line still, in the index's order, each
-/// description shortened alike by the skills list's steps
+/// What a new agent starting in `folder` reads of an index, each live
+/// fact it shows filled from there ([`filled_lines`]): the whole index
+/// when it fits within [`HEAD`]; else every line still, in the index's
+/// order, each description shortened alike by the skills list's steps
 /// ([`crate::policy::SUMMARY_STEPS`]), the first that fits, a cut one
 /// ending in `…`, down to names alone; else names alone from the top, as
 /// many as fit, then how many facts it leaves out and how to find them.
-pub fn head(index: &str) -> String {
+pub fn head(index: &str, folder: &Path) -> String {
     if index.len() <= HEAD {
+        let filled = filled_lines(index, folder);
+        if filled.len() <= HEAD {
+            return filled;
+        }
+    }
+    head_of(index, Some(folder))
+}
+
+/// [`head`], each live fact filled from `folder` when there is one, and
+/// only the lines it may show: one pass reads lines until names alone, the
+/// shortest step, pass [`HEAD`], and the rest are only counted.
+fn head_of(index: &str, folder: Option<&Path>) -> String {
+    if index.len() <= HEAD && folder.is_none() {
         return index.to_owned();
     }
-    // What each step takes, in one pass that stops once names alone, the
-    // shortest, pass the head: then no step fits.
     let steps = crate::policy::SUMMARY_STEPS;
-    let mut sizes = [0; crate::policy::SUMMARY_STEPS.len()];
-    let mut lines = Vec::new();
-    for line in index.split_inclusive('\n').map(Line::of) {
-        for (size, chars) in sizes.iter_mut().zip(steps) {
-            *size += line.len(chars);
+    let mut sizes = [0; STEPS];
+    // Each line read, and where it ends in the index.
+    let mut lines = Vec::with_capacity(index.len().min(HEAD) / 32);
+    let mut read = 0;
+    let mut most = MOST;
+    // Where live facts fill from, when anything fills them.
+    let fill = folder.filter(|_| FILL.get().is_some());
+    while read < index.len() {
+        let end = find_byte(index.as_bytes(), read, b'\n').map_or(index.len(), |at| at + 1);
+        let line = &index[read..end];
+        read = end;
+        let mut line = Line::keeping(line, most);
+        if let Some(filled) = fill.and_then(|folder| filled(&line, folder)) {
+            line = Line::keeping(filled, most);
         }
-        lines.push(line);
-        if line_names(&sizes) > HEAD {
+        line.size(&mut sizes);
+        // A step past the head cannot fit: only those still sized count
+        // characters.
+        most = (steps.iter().zip(sizes))
+            .filter_map(|(&chars, size)| (size <= HEAD).then_some(chars))
+            .max()
+            .unwrap_or_default();
+        lines.push((line, read));
+        if sizes[STEPS - 1] > HEAD {
             break;
         }
     }
-    let size =
-        |chars| (steps.iter().zip(sizes)).find_map(|(&at, size)| (at == chars).then_some(size));
-    if let Some(chars) =
-        crate::policy::summary_step(HEAD, |chars| size(chars).unwrap_or(usize::MAX))
-    {
+    let step = |chars| steps.iter().position(|&at| at == chars).unwrap_or_default();
+    if let Some(chars) = crate::policy::summary_step(HEAD, |chars| sizes[step(chars)]) {
         let mut kept = String::with_capacity(HEAD);
-        for line in &lines {
+        for (line, _) in &lines {
             line.push(&mut kept, chars);
         }
         return kept;
     }
-    // Room for the closing line.
+    // Names from the top while they fit beside the closing line, the
+    // lines read being more than that; the rest only counted.
     let room = HEAD - 256;
     let mut kept = String::with_capacity(HEAD);
-    let mut left = 0;
-    for line in index.split_inclusive('\n') {
-        if left == 0 {
-            let line = Line::of(line);
-            if kept.len() + line.len(0) <= room {
-                line.push(&mut kept, 0);
-                continue;
-            }
+    let mut shown = 0;
+    for (line, end) in &lines {
+        if kept.len() + line.len(0) > room {
+            break;
         }
-        if line.starts_with("- ") {
-            left += 1;
-        }
+        line.push(&mut kept, 0);
+        shown = *end;
+    }
+    let bytes = index.as_bytes();
+    let mut left = usize::from(bytes[shown..].starts_with(b"- "));
+    let mut at = shown;
+    while let Some(end) = find_byte(bytes, at, b'\n') {
+        left += usize::from(bytes[end + 1..].starts_with(b"- "));
+        at = end + 1;
     }
     if left > 0 {
         kept.push_str(&format!(
@@ -990,70 +1018,254 @@ pub fn head(index: &str) -> String {
     kept
 }
 
-/// Of the bytes each step takes, those of names alone, the last step.
-fn line_names(sizes: &[usize]) -> usize {
-    sizes.last().copied().unwrap_or_default()
-}
-
 /// How many bytes an index's head takes with names alone, every fact
 /// listed: past [`HEAD`], the nightly cleanup folds facts by subject.
 fn names_only(index: &str) -> usize {
     (index.split_inclusive('\n'))
-        .map(|line| Line::of(line).len(0))
+        .map(|line| Line::keeping(line, 0).len(0))
         .sum()
 }
 
 /// One line of an index: a fact's `- NAME (TYPE, ...` and its
 /// description, or any other line as it is.
 struct Line<'a> {
-    whole: &'a str,
-    fact: Option<(&'a str, &'a str)>,
+    whole: std::borrow::Cow<'a, str>,
+    /// A fact's: where `): ` ends its markers, and where its description
+    /// ends, before the newline.
+    fact: Option<(usize, usize)>,
+    /// How many of the description's first bytes are known to be ASCII,
+    /// a byte a character.
+    ascii: usize,
+    /// Past those, where the character each step cuts at starts in the
+    /// description, by [`crate::policy::SUMMARY_STEPS`]: `None` when it
+    /// has no more characters than the step keeps.
+    starts: [Option<usize>; STEPS],
 }
 
+const STEPS: usize = crate::policy::SUMMARY_STEPS.len();
+
+/// Where the first `byte` in `bytes` from `from` is, read eight bytes
+/// at a time, sixteen while there is room, with none of `memchr`'s setup:
+/// the end of a line's markers is within its first hundred bytes or so.
+fn find_byte(bytes: &[u8], from: usize, byte: u8) -> Option<usize> {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    const HIGH: u64 = u64::from_le_bytes([0x80; 8]);
+    let pattern = ONES * byte as u64;
+    // Each byte that was `byte` is now zero: the lowest such sets the
+    // lowest high bit.
+    let zero = |word: &[u8]| {
+        let word = u64::from_le_bytes(word.try_into().unwrap_or_default()) ^ pattern;
+        word.wrapping_sub(ONES) & !word & HIGH
+    };
+    let mut at = from;
+    while let Some(words) = bytes.get(at..at + 16) {
+        let (low, high) = (zero(&words[..8]), zero(&words[8..]));
+        if low | high != 0 {
+            return Some(match low {
+                0 => at + 8 + high.trailing_zeros() as usize / 8,
+                _ => at + low.trailing_zeros() as usize / 8,
+            });
+        }
+        at += 16;
+    }
+    (bytes[at.min(bytes.len())..].iter())
+        .position(|&b| b == byte)
+        .map(|found| at + found)
+}
+
+/// Where, in `text`, the character each of
+/// [`crate::policy::SUMMARY_STEPS`] up to `most` cuts at starts, counting
+/// characters a word at a time: a byte starts one unless it continues one
+/// (`10xxxxxx`).
+fn char_starts(text: &[u8], most: usize) -> [Option<usize>; STEPS] {
+    const HIGH: u64 = u64::from_le_bytes([0x80; 8]);
+    let steps = crate::policy::SUMMARY_STEPS;
+    let starting = |b: u8| b & 0xC0 != 0x80;
+    let mut found = [None; STEPS];
+    // `n` characters start before `at`.
+    let (mut n, mut at) = (0, 0);
+    for step in (0..STEPS).rev() {
+        let chars = steps[step];
+        if chars == 0 || chars > most {
+            continue;
+        }
+        let starting_in = |word: &[u8]| {
+            let word = u64::from_le_bytes(word.try_into().unwrap_or_default());
+            8 - (word & HIGH & !(word << 1)).count_ones() as usize
+        };
+        // Sixteen bytes at a time while all may start characters before
+        // the one sought, then eight.
+        while n + 16 <= chars {
+            let Some(words) = text.get(at..at + 16) else {
+                break;
+            };
+            n += starting_in(&words[..8]) + starting_in(&words[8..]);
+            at += 16;
+        }
+        while let Some(word) = text.get(at..at + 8) {
+            let starting = starting_in(word);
+            if n + starting > chars {
+                break;
+            }
+            n += starting;
+            at += 8;
+        }
+        while at < text.len() && !(starting(text[at]) && n == chars) {
+            n += usize::from(starting(text[at]));
+            at += 1;
+        }
+        if at == text.len() {
+            break;
+        }
+        found[step] = Some(at);
+    }
+    found
+}
+
+/// The most characters a step keeps of a description.
+const MOST: usize = {
+    let (steps, mut most, mut at) = (crate::policy::SUMMARY_STEPS, 0, 0);
+    while at < steps.len() {
+        if steps[at] > most {
+            most = steps[at];
+        }
+        at += 1;
+    }
+    most
+};
+
 impl<'a> Line<'a> {
-    fn of(whole: &'a str) -> Self {
-        let fact = (whole.starts_with("- "))
-            .then(|| whole.trim_end_matches('\n').split_once("): "))
-            .flatten();
-        Self { whole, fact }
+    fn of(whole: impl Into<std::borrow::Cow<'a, str>>) -> Self {
+        Self::keeping(whole, MOST)
     }
 
-    /// The fact's part before its description and what `chars`
-    /// characters keep of the description: none when the line stays
-    /// whole, as one with no description or one short enough does.
-    fn cut(&self, chars: usize) -> Option<(&'a str, &'a str)> {
-        let (fact, description) = self.fact?;
-        if chars == 0 {
-            return Some((fact, ""));
+    /// The line, read to cut its description to at most `most`
+    /// characters.
+    fn keeping(whole: impl Into<std::borrow::Cow<'a, str>>, most: usize) -> Self {
+        let whole = whole.into();
+        let bytes = whole.as_bytes();
+        let mut fact = None;
+        let mut ascii = 0;
+        let mut starts = [None; STEPS];
+        if bytes.starts_with(b"- ") {
+            let mut from = 0;
+            while let Some(at) = find_byte(bytes, from, b')') {
+                if bytes[at..].starts_with(b"): ") {
+                    let start = at + "): ".len();
+                    let end = bytes.len() - usize::from(bytes[bytes.len() - 1] == b'\n');
+                    let end = end.max(start);
+                    let known = &bytes[start..end.min(start + most + 1)];
+                    ascii = if known.is_ascii() { known.len() } else { 0 };
+                    if ascii == 0 {
+                        starts = char_starts(&bytes[start..end], most);
+                    }
+                    fact = Some((at, end));
+                    break;
+                }
+                from = at + 1;
+            }
         }
-        let (at, _) = description.char_indices().nth(chars)?;
-        Some((fact, description[..at].trim_end()))
+        Self {
+            whole,
+            fact,
+            ascii,
+            starts,
+        }
+    }
+
+    /// The fact's part before `): `, and its description.
+    fn fact(&self) -> Option<(&str, &str)> {
+        let (at, end) = self.fact?;
+        Some((&self.whole[..at], &self.whole[at + "): ".len()..end]))
+    }
+
+    /// How many bytes of the description its first `chars` characters
+    /// take, white space at their end left out; none when it has no more
+    /// characters than that, and is kept whole.
+    fn cut(&self, description: &str, chars: usize) -> Option<usize> {
+        // No more bytes than `chars` is no more characters.
+        if description.len() <= chars {
+            return None;
+        }
+        let ascii = chars < self.ascii;
+        let at = match ascii {
+            true => chars,
+            false => {
+                let step = (crate::policy::SUMMARY_STEPS.iter()).position(|&at| at == chars);
+                match step {
+                    Some(step) => self.starts[step]?,
+                    None => description.char_indices().nth(chars)?.0,
+                }
+            }
+        };
+        Some(match ascii {
+            // ASCII white space, as `trim_end` finds it, a byte at a time.
+            true => {
+                let bytes = description.as_bytes();
+                let mut end = at;
+                while end > 0 && matches!(bytes[end - 1], b' ' | b'\t'..=b'\r') {
+                    end -= 1;
+                }
+                end
+            }
+            false => description[..at].trim_end().len(),
+        })
     }
 
     /// Write the line with its description cut to `chars` characters,
-    /// ending in `…` when cut, and left out at none.
+    /// ending in `…` when cut, and names alone at none.
     fn push(&self, out: &mut String, chars: usize) {
-        match self.cut(chars) {
-            None => out.push_str(self.whole),
-            Some((fact, _)) if chars == 0 => {
-                out.push_str(fact);
-                out.push_str(")\n");
-            }
-            Some((fact, kept)) => {
+        let Some((fact, description)) = self.fact() else {
+            return out.push_str(&self.whole);
+        };
+        if chars == 0 {
+            out.push_str(fact);
+            return out.push_str(")\n");
+        }
+        match self.cut(description, chars) {
+            None => out.push_str(&self.whole),
+            Some(end) => {
                 out.push_str(fact);
                 out.push_str("): ");
-                out.push_str(kept);
+                out.push_str(&description[..end]);
                 out.push_str("…\n");
             }
         }
     }
 
+    /// Add to each step's size in `sizes` the bytes [`Line::push`] writes
+    /// at it, for each step not yet past [`HEAD`].
+    fn size(&self, sizes: &mut [usize; STEPS]) {
+        let Some((fact, description)) = self.fact() else {
+            for size in sizes {
+                *size += self.whole.len();
+            }
+            return;
+        };
+        let steps = crate::policy::SUMMARY_STEPS;
+        for (size, chars) in sizes.iter_mut().zip(steps) {
+            if *size > HEAD {
+                continue;
+            }
+            *size += match (chars, self.cut(description, chars)) {
+                (0, _) => fact.len() + ")\n".len(),
+                (_, None) => self.whole.len(),
+                (_, Some(end)) => fact.len() + "): ".len() + end + "…\n".len(),
+            };
+        }
+    }
+
     /// How many bytes [`Line::push`] writes, without writing it.
     fn len(&self, chars: usize) -> usize {
-        match self.cut(chars) {
+        let Some((fact, description)) = self.fact() else {
+            return self.whole.len();
+        };
+        if chars == 0 {
+            return fact.len() + ")\n".len();
+        }
+        match self.cut(description, chars) {
             None => self.whole.len(),
-            Some((fact, _)) if chars == 0 => fact.len() + ")\n".len(),
-            Some((fact, kept)) => fact.len() + "): ".len() + kept.len() + "…\n".len(),
+            Some(end) => fact.len() + "): ".len() + end + "…\n".len(),
         }
     }
 }
@@ -1194,7 +1406,7 @@ fn in_head(index: &str, name: &str) -> bool {
     if index.len() <= HEAD {
         return true;
     }
-    let head = head(index);
+    let head = head_of(index, None);
     let line = format!("- {name} (");
     head.lines().any(|shown| shown.starts_with(&line))
 }
@@ -1257,35 +1469,39 @@ pub fn cut_filled(mut filled: String) -> String {
 /// agent starting there reads it: one line each, at most [`LIVE_LINE`]
 /// bytes. A description that does not fill stays as it is written.
 pub fn filled_lines(index: &str, folder: &Path) -> String {
-    let Some(fill) = FILL.get() else {
+    if FILL.get().is_none() {
         return index.to_owned();
-    };
+    }
     let mut out = String::with_capacity(index.len());
     for line in index.split_inclusive('\n') {
-        let live = (line.strip_prefix("- "))
-            .and_then(|rest| rest.split_once("): "))
-            .filter(|(meta, _)| meta.split(", ").any(|part| part == "live"));
-        let Some((meta, description)) = live else {
-            out.push_str(line);
-            continue;
-        };
-        match fill.fill(description.trim_end(), folder) {
-            Ok(filled) => {
-                let mut one: String = filled.split_whitespace().collect::<Vec<_>>().join(" ");
-                if one.len() > LIVE_LINE {
-                    let mut end = LIVE_LINE - 3;
-                    while !one.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    one.truncate(end);
-                    one.push_str("...");
-                }
-                out.push_str(&format!("- {meta}): {one}\n"));
-            }
-            Err(_) => out.push_str(line),
+        match filled(&Line::of(line), folder) {
+            Some(filled) => out.push_str(&filled),
+            None => out.push_str(line),
         }
     }
     out
+}
+
+/// A live fact's index line with its description filled from `folder`,
+/// one line of at most [`LIVE_LINE`] bytes; none for any other line, or
+/// one whose description does not fill.
+fn filled(line: &Line, folder: &Path) -> Option<String> {
+    let fill = FILL.get()?;
+    let (fact, description) = line.fact()?;
+    if !fact.split(',').any(|part| part == " live") {
+        return None;
+    }
+    let filled = fill.fill(description.trim_end(), folder).ok()?;
+    let mut one: String = filled.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.len() > LIVE_LINE {
+        let mut end = LIVE_LINE - 3;
+        while !one.is_char_boundary(end) {
+            end -= 1;
+        }
+        one.truncate(end);
+        one.push_str("...");
+    }
+    Some(format!("{fact}): {one}\n"))
 }
 
 fn remove(dir: &Path, name: &str, note: Note) -> Result<Value, String> {
@@ -2391,7 +2607,7 @@ mod tests {
         );
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
         assert!(index.len() > HEAD && index.contains(&format!("fact-{:03}", n - 1)));
-        let top = head(&index);
+        let top = head_of(&index, None);
         assert!(top.len() <= HEAD, "{}", top.len());
         let shown = top.lines().filter(|line| line.starts_with("- ")).count();
         assert!(
@@ -3746,10 +3962,17 @@ mod tests {
     fn at_step(index: &str, chars: usize) -> usize {
         let lines: Vec<Line> = index.split_inclusive('\n').map(Line::of).collect();
         let mut written = String::new();
+        let mut sized = 0;
         for line in &lines {
+            // Each cut where the `chars`th character starts.
+            if let Some((_, description)) = line.fact().filter(|_| chars > 0) {
+                let naive = (description.char_indices().nth(chars))
+                    .map(|(at, _)| description[..at].trim_end().len());
+                assert_eq!(line.cut(description, chars), naive, "{description}");
+            }
             line.push(&mut written, chars);
+            sized += line.len(chars);
         }
-        let sized: usize = lines.iter().map(|line| line.len(chars)).sum();
         assert_eq!(sized, written.len());
         sized
     }
@@ -3766,6 +3989,21 @@ mod tests {
     }
 
     #[test]
+    fn a_byte_is_found_where_a_plain_search_finds_it() {
+        let text = "ab)c\nd)): é—x\n".repeat(7);
+        let bytes = text.as_bytes();
+        for byte in [b')', b'\n', b'z', 0x80] {
+            for from in 0..=bytes.len() {
+                let plain = bytes[from..]
+                    .iter()
+                    .position(|&b| b == byte)
+                    .map(|at| from + at);
+                assert_eq!(find_byte(bytes, from, byte), plain, "{byte} from {from}");
+            }
+        }
+    }
+
+    #[test]
     fn every_fact_is_named_in_the_head_its_descriptions_shortened_alike_to_fit() {
         let dir = Path::new("/m");
         // The person's index on 11-19: 148 facts, lines of about 441 bytes,
@@ -3773,7 +4011,7 @@ mod tests {
         let facts = facts_of(148, 0, 441);
         let index = render_index(dir, &facts);
         assert!(index.len() > HEAD * 3, "{}", index.len());
-        let top = head(&index);
+        let top = head_of(&index, None);
         assert!(top.len() <= HEAD, "{}", top.len());
         // Every fact, in the index's order, a reference fact among them,
         // which sorts last.
@@ -3792,15 +4030,20 @@ mod tests {
         }
         assert!(at_step(&index, 80) > HEAD);
         assert_eq!(at_step(&index, 40), top.len());
+        // Characters past ASCII are cut on a character, as many as ASCII.
+        let wide = index.replace("way", "wäy — “so” 🙂");
         for chars in crate::policy::SUMMARY_STEPS {
             at_step(&index, chars);
+            at_step(&wide, chars);
         }
+        let wide_top = head_of(&wide, None);
+        assert!(wide_top.len() <= HEAD && named(&wide_top) == named(&index));
         // An index that fits is given whole, and a head changes only when
         // the index does, so a new agent's instructions stay cached.
         let small = render_index(dir, &facts[..20]);
         assert!(small.len() <= HEAD);
-        assert_eq!(head(&small), small);
-        assert_eq!(head(&index), top);
+        assert_eq!(head_of(&small, None), small);
+        assert_eq!(head_of(&index, None), top);
     }
 
     #[test]
@@ -3812,7 +4055,7 @@ mod tests {
         let index = render_index(dir, &facts);
         assert!(names_only(&index) > HEAD);
         assert_eq!(names_only(&index), at_step(&index, 0));
-        let top = head(&index);
+        let top = head_of(&index, None);
         assert!(top.len() <= HEAD, "{}", top.len());
         // The index's first facts, work first, by names alone.
         let all = named(&index);
