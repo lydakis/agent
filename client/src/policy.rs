@@ -287,7 +287,10 @@ fn read_head(path: &Path, limit: usize) -> Result<Vec<u8>, Failure> {
             reason: "it is kept unreadable from agents".into(),
         });
     }
-    let mut bytes = Vec::new();
+    // Sized from the file's length, so the read takes one buffer rather
+    // than growing one read at a time.
+    let size = file.metadata().map_or(0, |meta| meta.len() as usize);
+    let mut bytes = Vec::with_capacity(size.min(limit) + 1);
     file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
@@ -826,7 +829,16 @@ fn entry_row(entry: &Entry) -> String {
 
 /// How short each summary may become, in characters, before entries are
 /// left out: Codex trims its skill descriptions before it drops skills.
-const SUMMARY_STEPS: [usize; 4] = [160, 80, 40, 0];
+/// The skills list and each memory index's head shorten by these steps.
+pub(crate) const SUMMARY_STEPS: [usize; 4] = [160, 80, 40, 0];
+
+/// The first of [`SUMMARY_STEPS`] at which a list takes at most `room`
+/// bytes, `size` saying how many it takes when each summary keeps that many
+/// characters; none when not even bare names fit. Steps after the one
+/// that fits are never sized.
+pub(crate) fn summary_step(room: usize, mut size: impl FnMut(usize) -> usize) -> Option<usize> {
+    SUMMARY_STEPS.into_iter().find(|&chars| size(chars) <= room)
+}
 
 /// A list of `entries` within `room` bytes, with the entries it lists:
 /// whole when it fits; else each summary shortened, step by step; else
@@ -847,17 +859,19 @@ fn fit(kind: Kind, entries: Vec<Entry>, room: usize) -> (String, Vec<Entry>) {
         }
         block
     };
-    for chars in SUMMARY_STEPS {
-        let whole = block(&entries, chars);
-        if whole.len() <= room {
-            let kept = (entries.into_iter())
-                .map(|entry| Entry {
-                    summary: entry.summary.chars().take(chars).collect(),
-                    ..entry
-                })
-                .collect();
-            return (whole, kept);
-        }
+    // The step that fits is the last one rendered.
+    let mut whole = String::new();
+    if let Some(chars) = summary_step(room, |chars| {
+        whole = block(&entries, chars);
+        whole.len()
+    }) {
+        let kept = (entries.into_iter())
+            .map(|entry| Entry {
+                summary: entry.summary.chars().take(chars).collect(),
+                ..entry
+            })
+            .collect();
+        return (whole, kept);
     }
     let total = entries.len();
     let mut kept = entries;
@@ -1475,8 +1489,13 @@ fn append_memory(
         path: path.clone(),
         reason: e.utf8_error().to_string(),
     })?;
-    let index = crate::memory::filled_lines(&index, workspace);
-    push(text, path, "\n\n", &crate::memory::head(&index), reserve)
+    push(
+        text,
+        path,
+        "\n\n",
+        &crate::memory::head(&index, workspace),
+        reserve,
+    )
 }
 
 /// How much of a memory index composing reads.
@@ -2296,7 +2315,7 @@ mod tests {
         }
         std::fs::write(&user, &index).unwrap();
         let composed = instructions(&root, None, std::slice::from_ref(&user)).unwrap();
-        let head = crate::memory::head(&index);
+        let head = crate::memory::head(&index, &root);
         assert!(head.len() <= crate::memory::HEAD && head.contains("- fact-0000 ("));
         assert!(
             composed.text.ends_with(head.trim()),
