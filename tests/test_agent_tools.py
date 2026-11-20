@@ -9,7 +9,8 @@ import time
 import unittest
 
 from tests.test_runtime import ModelFixture
-from bench.runtime_client import node_item
+from bench.runtime_client import PROTECTING, Client, node_item
+from bench.targets import clean_env
 
 TOOLS = 'echo,wait,send_message,list_agents,pause_agents,spawn_agent,close_agent'
 
@@ -330,6 +331,66 @@ class AgentToolsTests(ModelFixture):
         again = node_item(client, 'shop.lead', node)['result']['output']
         self.assertIn('from differs from the request that sent message', again)
         self.assertEqual(client.request('inspect', bot='shop.once')['result']['settings']['sandbox'], 'read-only')
+
+    def test_a_turn_parked_across_a_restart_spawns_with_a_profile_once_it_resumes(self):
+        agents = self.path / '.agents' / 'agents'
+        agents.mkdir(parents=True)
+        (agents / 'helper.md').write_text('---\ndescription: a helper\n---\nHelp.\n')
+        # Parked on a wait, then the spawn once the wait ends.
+        def respond(request, user):
+            if not user.startswith('resume:'):
+                return None
+            done = sum(i.get('type') == 'function_call' for i in request['input'])
+            name = user.split(':')[1]
+            return ([('wait', {'handles': [f'shop.slow{name}/1'], 'timeout_ms': 60000})] if done == 0 else
+                    [('spawn_agent', {'name': f'helper{name}', 'message': 'q', 'profile': 'helper'})]
+                    if done == 1 else 'done')
+        self.model.respond = respond
+        # The daemon dies with the turn parked, or is stopped.
+        for name, kill in (('crash', True), ('stop', False)):
+            client = self.client(TOOLS)
+            client.request('create', bot=f'shop.slow{name}', workspace=str(self.path))
+            client.request('submit', bot=f'shop.slow{name}', request_id='slow', prompt='wait')
+            client.request('create', bot=f'shop.lead{name}', workspace=str(self.path),
+                           settings=grouped('shop.lead'))
+            turn = client.request('submit', bot=f'shop.lead{name}', request_id='go',
+                                  prompt=f'resume:{name}')['result']['message']
+            client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn, timeout=10)
+            client.close(kill=kill)
+            client = self.client(TOOLS)
+            self.assertEqual(client.finished(turn, timeout=15)['data']['status'], 'completed')
+            made = json.loads(self.output(client, f'shop.lead{name}', 'spawn_agent-1'))
+            self.assertEqual(made['name'], f'shop.helper{name}', made)
+            helper = client.request('inspect', bot=f'shop.helper{name}')['result']
+            self.assertIn('Help.', helper['instructions'])
+            client.close()
+
+    def test_a_file_that_would_wait_on_another_program_never_holds_a_spawn(self):
+        # A FIFO where composing reads (the person's memory index, a
+        # profile) would hold a read until something wrote to it: the call
+        # fails back at once, saying which file, and its audit row says so.
+        home = self.path / 'home'
+        (home / '.agents' / 'memory').mkdir(parents=True)
+        os.mkfifo(home / '.agents' / 'memory' / 'MEMORY.md')
+        (self.path / '.agents' / 'agents').mkdir(parents=True)
+        os.mkfifo(self.path / '.agents' / 'agents' / 'stuck.md')
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, TOOLS,
+                        extra=PROTECTING, env={**clean_env(), 'HOME': str(home)})
+        self.addCleanup(client.close)
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'told', 'message': 'q', 'agents': True}),
+                       ('spawn_agent', {'name': 'stuck', 'message': 'q', 'profile': 'stuck'}))
+        told = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
+        self.assertEqual(told['error'], 'instructions_unreadable', told)
+        self.assertIn('MEMORY.md: it is not a regular file', told['detail'])
+        stuck = json.loads(self.output(client, 'shop.lead', 'spawn_agent-2'))
+        self.assertEqual(stuck['error'], 'profile_not_found', stuck)
+        for name in ('shop.told', 'shop.stuck'):
+            self.assertEqual(client.request('inspect', bot=name)['error'], 'bot_not_found')
+        rows = client.request('audit', bot='shop.lead')['result']['rows']
+        self.assertEqual({row['call_id']: row['outcome'] for row in rows},
+                         {'spawn_agent-1': 'failed', 'spawn_agent-2': 'failed'})
 
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)

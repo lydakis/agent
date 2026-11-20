@@ -3017,7 +3017,13 @@ conversation (the `fork` request, with its `checkpoint`, `allow` and
 `expire_ms`), taking no instructions, profile, model, effort, tools,
 settings or compaction. One `request_id`, the call's own unless the model
 names one, keys both the making and the message, so a call made again
-makes and sends nothing new. The models the person lists in
+makes and sends nothing new. What it reads of the person's file system (the
+files composed for it, and its folder and writable folders by their real
+paths, as `create` resolves them) is read off the runtime thread and waited
+on with no time of its own: a file system that never answers (a mount whose
+server is gone) holds the call until a steer for the turn comes while it waits, which ends
+it as `folder_unanswered`, naming the file or folder still unanswered,
+with nothing made, or until the turn is interrupted. The models the person lists in
 `~/.agent/models`, with their notes, are named in its `model` parameter,
 read as the daemon starts. `close_agent` closes an agent the caller made:
 the `close` request marks it (`closed_ms` on its record, kept first,
