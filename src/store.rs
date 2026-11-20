@@ -34,8 +34,9 @@ type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 /// The WAL's checkpoints, off the writer, on the reader pool: once it is
 /// open, each of the writer's asks queues one checkpoint as a read, which
 /// the next free reader runs on its own connection, so no thread or
-/// connection is kept for them. Asks made while one waits are that one;
-/// once it starts, the next ask queues another. Each is counted as the
+/// connection is kept for them. One reader at a time runs them: asks
+/// made while one is queued are that one, and an ask while it runs has
+/// that reader run one more after it. Each is counted as the
 /// `checkpoint` operation from when it was asked for. With no room in the
 /// queue the ask is dropped, and the writer checkpoints itself as the log
 /// grows, as SQLite would have. The writer's own checkpoints are counted
@@ -46,11 +47,14 @@ fn checkpoints(
     pool: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<Pool>>>,
     counters: std::sync::Arc<Counters>,
 ) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
     let running = std::sync::Arc::<std::sync::Mutex<()>>::default();
     let held = running.clone();
     let (own_log, own_counters) = (counters.log.clone(), counters.clone());
-    let queued = std::sync::Arc::new(AtomicBool::new(false));
+    // None queued or running (0), one queued or running (1), and asked
+    // for again meanwhile (2): one reader at a time runs checkpoints, and
+    // an ask while it does is its next.
+    let state = std::sync::Arc::new(AtomicU8::new(0));
     db.checkpoint_aside(
         running,
         own_log,
@@ -58,29 +62,36 @@ fn checkpoints(
             let Some(pool) = pool.get() else {
                 return;
             };
-            if queued.swap(true, SeqCst) {
+            let was = state.fetch_update(SeqCst, SeqCst, |s| Some(if s == 0 { 1 } else { 2 }));
+            if was != Ok(0) {
                 return;
             }
             let Ok(place) = pool.room.clone().try_acquire_owned() else {
-                queued.store(false, SeqCst);
+                state.store(0, SeqCst);
                 return;
             };
-            let asked = std::time::Instant::now();
-            let (queued, counters, running) = (queued.clone(), counters.clone(), held.clone());
+            let mut asked = std::time::Instant::now();
+            let (state, counters, running) = (state.clone(), counters.clone(), held.clone());
             pool.push(
                 Box::new(move |db: &Database| {
-                    queued.store(false, SeqCst);
-                    let started = std::time::Instant::now();
-                    let found = {
-                        let _running = running.lock().unwrap_or_else(|e| e.into_inner());
-                        db.checkpoint()
-                    };
-                    if let Ok((frames, copied)) = found
-                        && frames >= 0
-                    {
-                        counters.log.note(frames, copied);
+                    loop {
+                        let started = std::time::Instant::now();
+                        let found = {
+                            let _running = running.lock().unwrap_or_else(|e| e.into_inner());
+                            db.checkpoint()
+                        };
+                        if let Ok((frames, copied)) = found
+                            && frames >= 0
+                        {
+                            counters.log.note(frames, copied);
+                        }
+                        counters.record("checkpoint", asked, started, found.is_err());
+                        if state.compare_exchange(1, 0, SeqCst, SeqCst).is_ok() {
+                            break;
+                        }
+                        state.store(1, SeqCst);
+                        asked = std::time::Instant::now();
                     }
-                    counters.record("checkpoint", asked, started, found.is_err());
                 }),
                 place,
             );
