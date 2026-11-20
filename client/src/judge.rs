@@ -296,7 +296,9 @@ impl Base {
     /// and `tools`, `LOOKING` ones run in a read-only sandbox: kept when it
     /// already is that judge, made anew when it is another or an older
     /// version of it, so a changed judge takes effect. A bot of that name
-    /// that is not a judge at all is refused, never deleted.
+    /// that is not a judge at all is refused, never deleted. `windows` is
+    /// its `context_windows` setting, the person's `[context_windows]` or
+    /// null, so its window is the one the person says its model has.
     pub async fn make(
         client: &Client,
         name: &str,
@@ -304,6 +306,7 @@ impl Base {
         effort: Option<&str>,
         instructions: &str,
         tools: &[&str],
+        windows: &Value,
     ) -> crate::Result<Self> {
         let judge = |bot: &Value| is_judge(bot, instructions);
         let same = |bot: &Value| {
@@ -319,7 +322,10 @@ impl Base {
         let mut made = json!({"bot": name, "workspace": "/", "model": model, "effort": effort,
             "instructions": instructions, "tools": tools});
         if !tools.is_empty() {
-            made["settings"] = json!({"sandbox": "read-only"});
+            made["settings"]["sandbox"] = json!("read-only");
+        }
+        if !windows.is_null() {
+            made["settings"]["context_windows"] = windows.clone();
         }
         let base = |bot: &Value| {
             Ok(Self {
@@ -339,13 +345,23 @@ impl Base {
             }
             Ok(bot) if same(&bot) => {
                 // A sandbox can go after the judge was made: asking for it
-                // again is refused where none runs now.
+                // again is refused where none runs now. The person's
+                // windows can change since: the judge takes them now.
+                let mut settings = Map::new();
                 if !tools.is_empty() {
+                    settings.insert("sandbox".into(), json!("read-only"));
+                }
+                // `inspect` gives an unset table as `{}`.
+                let had = match &bot["settings"]["context_windows"] {
+                    Value::Object(set) if set.is_empty() => &Value::Null,
+                    had => had,
+                };
+                if had != windows {
+                    settings.insert("context_windows".into(), windows.clone());
+                }
+                if !settings.is_empty() {
                     client
-                        .request(
-                            "configure",
-                            json!({"bot": name, "settings": {"sandbox": "read-only"}}),
-                        )
+                        .request("configure", json!({"bot": name, "settings": settings}))
                         .await?;
                 }
                 return base(&bot);

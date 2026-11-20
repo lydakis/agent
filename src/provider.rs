@@ -2129,21 +2129,7 @@ async fn create(prefix: &[u8], previous: Option<&str>, items: Items) -> Result<S
     String::from_utf8(text).map_err(|_| Error::new("invalid_item_encoding"))
 }
 
-/// The Claude model a Bedrock id names: `anthropic.claude-…` and a
-/// geographic or global profile such as `us.anthropic.claude-…` or
-/// `global.anthropic.claude-…` name `claude-…`. Other ids are unchanged.
-fn claude_model(model: &str) -> &str {
-    if let Some(name) = model.strip_prefix("anthropic.") {
-        return name;
-    }
-    model
-        .split_once('.')
-        .filter(|(profile, _)| {
-            !profile.is_empty() && profile.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
-        })
-        .and_then(|(_, rest)| rest.strip_prefix("anthropic."))
-        .unwrap_or(model)
-}
+pub(crate) use agent_client::models::claude_model;
 
 /// Values a person set by model path, `PROVIDER/MODEL` with `*` and `?`
 /// wildcards: the most specific pattern a path matches wins. An exact path
@@ -2385,18 +2371,7 @@ pub fn context_window(provider: &Provider, windows: &Windows, model: &str) -> u6
     if let Some(tokens) = provider.listed_window(model) {
         return tokens;
     }
-    let claude = claude_model(model);
-    let before_5 = [
-        "claude-2",
-        "claude-3",
-        "claude-opus-4",
-        "claude-sonnet-4",
-        "claude-haiku-4",
-    ];
-    match claude.starts_with("claude-") && !before_5.iter().any(|old| claude.starts_with(old)) {
-        true => 1_000_000,
-        false => 200_000,
-    }
+    agent_client::models::unlisted_window(model)
 }
 
 /// The model's full output limit. A lower cap fails any answer that runs
