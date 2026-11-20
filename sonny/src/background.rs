@@ -1249,7 +1249,7 @@ impl View {
 
     /// Words pasted while finding, as if typed: whether a find took them.
     pub fn paste(&mut self, text: &str) -> bool {
-        let Some(find) = &mut self.finding else {
+        let Some(find) = self.finding.as_mut().filter(|_| self.page.is_none()) else {
             return false;
         };
         find.paste(text);
@@ -1266,7 +1266,7 @@ impl View {
 
     /// Whether a find is under way.
     pub fn finding(&self) -> bool {
-        self.finding.is_some()
+        self.finding.is_some() && self.page.is_none()
     }
 
     /// The command picked, when the pick is past the items.
@@ -1568,6 +1568,14 @@ impl View {
             KeyCode::Char('l') if plain => KeyCode::Right,
             code => code,
         };
+        // A find that keeps nothing picks nothing to open, remove or run.
+        let picks = matches!(
+            code,
+            KeyCode::Enter | KeyCode::Right | KeyCode::Delete | KeyCode::Char('x' | 'r')
+        );
+        if picks && self.page.is_none() && !self.shown(self.selected) {
+            return Key::Stay;
+        }
         match code {
             KeyCode::Esc => return Key::Close,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3532,13 +3540,24 @@ mod tests {
         // The arrows stay among the rows found.
         view.key(key(KeyCode::Up), 0..0);
         assert_eq!(view.selected, 2);
-        // Pasted, as typed; nothing found says so.
+        // A row found opened as a page: a paste there is no more to find.
+        assert!(matches!(view.key(key(KeyCode::Enter), 0..0), Key::Stay));
+        assert!(view.page.is_some() && !view.finding());
+        assert!(!view.paste("zz"));
+        view.key(key(KeyCode::Left), 0..0);
+        assert!(view.page.is_none() && view.finding());
+        // Pasted, as typed; nothing found says so, and nothing is picked
+        // to open, remove or run.
         assert!(view.paste("zz"));
         assert!(
             says(&view, "nothing here matches mailzz"),
             "{:#?}",
             text(&view)
         );
+        for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Delete] {
+            assert!(matches!(view.key(key(code), 0..0), Key::Stay));
+        }
+        assert!(view.page.is_none() && view.confirm.is_none() && view.stopping.is_none());
         // `esc` drops the find, the rows and the pick as they were; the
         // next closes the view.
         assert!(matches!(view.key(key(KeyCode::Esc), 0..0), Key::Stay));

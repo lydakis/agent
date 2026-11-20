@@ -2014,7 +2014,7 @@ impl View {
 
     /// Words pasted while finding, as if typed: whether a find took them.
     pub fn paste(&mut self, text: &str) -> bool {
-        let Some(find) = &mut self.finding else {
+        let Some(find) = self.finding.as_mut().filter(|_| self.open.is_none()) else {
             return false;
         };
         find.paste(text);
@@ -2024,7 +2024,7 @@ impl View {
 
     /// Whether a find is under way.
     pub fn finding(&self) -> bool {
-        self.finding.is_some()
+        self.finding.is_some() && self.open.is_none()
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Key {
@@ -2069,7 +2069,8 @@ impl View {
                 self.this = !self.this;
                 self.reload();
             }
-            KeyCode::Enter | KeyCode::Right if !opened => {
+            // A find that keeps nothing picks nothing to open.
+            KeyCode::Enter | KeyCode::Right if !opened && self.shown(self.selected) => {
                 if let Some(name) = self.picked().map(str::to_owned) {
                     match thread(&self.dir, &name) {
                         Ok(read) => {
@@ -2401,9 +2402,20 @@ mod tests {
         // The arrows stay among the threads found.
         view.key(key(KeyCode::Up));
         assert_eq!(view.selected, 1);
-        // Pasted, as typed; nothing found says so.
+        // A thread found open: a paste there is no more to find.
+        view.open = Some(("ci-cache".into(), json!({})));
+        assert!(!view.finding() && !view.paste("zz"));
+        view.open = None;
+        // Pasted, as typed; nothing found says so, and nothing is picked
+        // to open.
         assert!(view.paste("zz"));
         assert!(says(&view, "no thread matches cazz"), "{:#?}", text(&view));
+        assert_eq!(view.key(key(KeyCode::Enter)), Key::Stay);
+        assert!(
+            view.open.is_none() && view.notice.is_none(),
+            "{:?}",
+            view.notice
+        );
         // `esc` drops the find, the threads and the pick as they were; the
         // next closes the view.
         assert_eq!(view.key(key(KeyCode::Esc)), Key::Stay);
