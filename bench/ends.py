@@ -341,6 +341,8 @@ def main():
     parser.add_argument('--shim', help='bench/held/slow_sync.c built: once its agents are made, '
                         'the daemon runs again with every sync taking --sync-ms, as on a busy disk')
     parser.add_argument('--sync-ms', type=int, default=300)
+    parser.add_argument('--durability', choices=('full', 'normal'),
+                        help="the daemon's --durability; its own default when not given")
     parser.add_argument('--dotted', action='store_true',
                         help="name each agent as its folder's project's, PROJECT.NAME, as Sonny names them")
     args = parser.parse_args()
@@ -378,7 +380,9 @@ def main():
                     if slow else {})
             process = subprocess.Popen(
                 [agent, 'serve', '--store', str(store), '--provider', f'openai=responses,{url}',
-                 '--socket', str(sock)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                 '--socket', str(sock),
+                 *(['--durability', args.durability] if args.durability else [])],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=open(work / 'daemon.err', 'a'), env={**env, **held}, start_new_session=True)
             return process, connect(sock, process)
 

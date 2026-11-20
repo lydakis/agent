@@ -651,7 +651,8 @@ name without `--max-` and with `_` for `-` (`processes`, `input_bytes`,
 `load`, ...), and its value a number or a formula of `cpus` and `memory`
 (bytes), as `"cpus * 64"` or `"max(memory / 16, 64 MiB)"`, with `+ - * /`,
 parentheses, `min` and `max`, and `KiB`, `MiB` and `GiB`; `stall_timeout`
-is a duration in whole seconds instead, as `"15m"`. A running daemon
+is a duration in whole seconds instead, as `"15m"`, and `durability` a
+word, `"full"` or `"normal"`. A running daemon
 keeps what it started with; the next start takes a change.
 
 | Flag | Bounds | Default |
@@ -667,6 +668,7 @@ keeps what it started with; the next start takes a change.
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count; a connection that sends no bytes at all, keepalives included, fails sooner, after 2 minutes. Whole seconds, `1s` to `24h`. `[daemon] stall_timeout` in `~/.agent/config.toml` sets it, as a duration such as `"15m"`. | `10m` |
 | `--max-depth` | How many generations below the bot that starts its line `create` and `fork` may make a bot (Codex's `agents.max_depth`). A bot made with no creator, or with `starts_line`, is at 0; one another bot creates is one below its creator; a fork its source makes stands where its source does, and one another bot makes is one below that bot. Each bot keeps its `depth`, so the check reads only its creator's row. Past the bound, `depth_limit`, with `depth` and `max_depth`, and nothing made; a resend of a keyed creation still answers with the bot it made. Zero is unbounded. Reported in `ready` as `limits.depth`, `null` for none (protocol 52). | none (the agent CLI passes `[daemon] depth`, 2 by default) |
+| `--durability` | How far each commit is on the disk when it is answered: `full` syncs it first, `normal` syncs at checkpoints, faster on a busy disk, and a crash of the machine or its power can lose the last commits ([Durable state and recovery](#durable-state-and-recovery)). `[daemon] durability` sets it. Reported in `ready` as `durability`. | `full` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
@@ -2327,6 +2329,25 @@ but does not make subsequent commits durable across an OS crash or power loss.
 Workspace writes have their own durability behavior and need not be lost
 together with the corresponding store records. Other platforms ignore both
 full-flush settings.
+
+That is the default, `--durability full`. `--durability normal` (`[daemon]
+durability = "normal"` in `~/.agent/config.toml`) trades it for speed on a
+busy disk: WAL with `synchronous=NORMAL`, as Codex keeps its state store,
+syncs the log only when it is checkpointed, so a commit is answered once
+the operating system has it. An answered commit still survives a crash of
+the daemon, and the store is never corrupted, but a crash of the machine
+or its power can lose the commits made since the last checkpoint, on any
+platform. `ready` names the one in force as `durability`: `sqlite_full` or
+`sqlite_wal_synchronous_normal`. On a fast disk the two are close. With
+424 agents over 8 s, full finishes 8,200 to 8,800 turns and normal 9,100
+to 9,200. An idle turn takes 47 to 48 ms under full and 44 ms under
+normal, and 100 windows over 10,000 agents run even. Where each sync
+takes 300 ms, normal keeps going. Full finishes 270 to 307 turns and
+normal 7,100 to 7,400. A script call takes 605 ms under full and 1.3 ms
+under normal. 100 windows start in 17 s under full and 2.8 s under
+normal. At 1 s per sync full stalls the screen, while normal finishes
+4,400 to 4,500 turns. The full figures are in
+[DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md).
 
 Checkpoints run beside the writer, not in a commit. SQLite's own automatic
 checkpoint runs on the connection that committed, right after the commit,

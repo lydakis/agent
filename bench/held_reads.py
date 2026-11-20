@@ -42,8 +42,8 @@ from bench.targets import clean_env  # noqa: E402
 import subprocess  # noqa: E402
 
 
-def daemon(binary, store, url, sock, env):
-    process = subprocess.Popen([str(binary), *serve_args(store, url), '--socket', str(sock)],
+def daemon(binary, store, url, sock, env, extra=()):
+    process = subprocess.Popen([str(binary), *serve_args(store, url, extra=extra), '--socket', str(sock)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True, env=env)
     deadline = time.monotonic() + 30
@@ -83,6 +83,8 @@ def main():
     parser.add_argument('--window', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--scripts', type=int, default=0)
     parser.add_argument('--out', required=True)
+    parser.add_argument('--durability', choices=('full', 'normal'),
+                        help="the daemon's --durability; its own default when not given")
     args = parser.parse_args()
     server, url = start()
     work = Path(tempfile.mkdtemp(prefix='held-', dir='/tmp'))
@@ -92,7 +94,8 @@ def main():
     process = None
     try:
         # Seeded on a fast disk.
-        process, control = daemon(args.binary, store, url, sock, clean_env())
+        flags = ('--durability', args.durability) if args.durability else ()
+        process, control = daemon(args.binary, store, url, sock, clean_env(), flags)
         for n in range(args.agents):
             gated = n < args.gated
             extra = {'tools': ['shell'], 'approve': ['shell'], 'approver': 'manual'} if gated else {}
@@ -108,7 +111,8 @@ def main():
         # Then held: every sync waits.
         env = {**clean_env(), 'LD_PRELOAD': str(Path(args.shim).resolve()),
                'SLOW_SYNC_MS': str(args.sync_ms)}
-        process, control = daemon(args.binary, store, url, sock, env)
+        process, control = daemon(args.binary, store, url, sock, env, flags)
+        durability = control.ready.get('durability')
         # Each gated bot asks once, and waits.
         for n in range(args.gated):
             control.request('submit', bot=f'b{n}', request_id=f'g{n}', prompt='shell:true')
@@ -231,7 +235,7 @@ def main():
             raise RuntimeError('no script finished')
         stats = control.request('stats')['result']
         storage = stats.get('store', stats.get('storage', {}))
-        result = {'agents': args.agents, 'busy': args.busy, 'sync_ms': args.sync_ms,
+        result = {'durability': durability, 'agents': args.agents, 'busy': args.busy, 'sync_ms': args.sync_ms,
                   'seconds': args.seconds, 'turns_finished': finished[0],
                   'scripts': args.scripts, 'scripts_finished': scripts[0],
                   **{op: summary(w) for op, w in waits.items()},

@@ -1570,6 +1570,9 @@ pub struct Configuration {
     /// The most generations below the bot that starts its line a `create`
     /// or `fork` may make a bot at; none by default.
     pub max_depth: Option<u64>,
+    /// How far each commit is on the disk when it is answered; `Full` by
+    /// default.
+    pub durability: agent_runtime::store::Durability,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -2576,7 +2579,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     let wait =
         owner_until.map(|until| until.saturating_duration_since(tokio::time::Instant::now()));
     let (owned, owning) = tokio::sync::oneshot::channel();
-    let opening = Store::open_owning(&config.store, limits.readers, wait, owned);
+    let opening = Store::open_owning(
+        &config.store,
+        limits.readers,
+        config.durability,
+        wait,
+        owned,
+    );
     tokio::pin!(opening);
     // The socket is taken the moment the store is this daemon's, before the
     // store's own opening, which an upgrade can make minutes long: a client
@@ -2776,7 +2785,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "fallbacks":config.fallbacks.json(),
-        "durability":"sqlite_full","partial_text_durable":false});
+        "durability":config.durability.label(),"partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
     let mut callers: HashMap<u64, i64> = HashMap::new();

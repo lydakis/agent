@@ -736,7 +736,7 @@ class SocketAndCliTests(ModelFixture):
                          'completed')
 
     def test_daemon_limits_match_on_startup_and_attach_and_bots_keep_their_settings(self):
-        flags = ['--idle-exit', '0', '--stall-timeout', '30s']
+        flags = ['--idle-exit', '0', '--stall-timeout', '30s', '--durability', 'normal']
         self.agent('run', *self.common, *flags, '--context-bytes', '1024', '--context-items', '2',
                    '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
@@ -756,6 +756,10 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
         refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '2m', check=False)
         self.assertIn('--stall-timeout: requested 2m but daemon has 30s', refused.stderr)
+        # Durability trades a machine crash's last commits for speed, as asked.
+        self.assertEqual(control.ready['durability'], 'sqlite_wal_synchronous_normal')
+        refused = self.agent('stats', '--store', str(self.store), '--durability', 'full', check=False)
+        self.assertIn('--durability: requested full but daemon has sqlite_wal_synchronous_normal', refused.stderr)
         # How a bot calls its model is chosen when it is made, not by the daemon.
         for flag, value in (('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
             refused = self.agent('stats', '--store', str(self.store), flag, value, check=False)
@@ -1084,6 +1088,7 @@ class SocketAndCliTests(ModelFixture):
             ready = json.loads(sock.makefile('r').readline())
         self.assertTrue({'processes', 'active', 'connecting', 'connections', 'idle_exit_seconds'} <= set(ready['limits']))
         self.assertEqual(ready['limits']['stall_timeout_seconds'], 600)
+        self.assertEqual(ready['durability'], 'sqlite_full')
         # How a bot calls its model is its own setting, not the daemon's.
         self.assertFalse({'output_tokens', 'cache_ttl'} & set(ready['limits']))
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))

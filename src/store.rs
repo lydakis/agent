@@ -20,13 +20,14 @@ pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, with
 pub use db::{
     Absorbed, AfterTurn, Answered, ApprovalPolicy, ArtifactLines, Binding, Blocked, Bot, CacheTtl,
     CallAnswer, Capture, CatchUp, Charge, Closing, CompactionPlan, CompactionView, CopiedCall,
-    Counts, DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, ENV_JSON, EVENT_PAGE_KINDS,
-    ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Identity, Joined, Kept, Lapsed,
-    Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS, PROCESSES_PAGE, ParkedFallback,
-    Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON, Replaced,
-    Resumed, Room, SANDBOX, SETTINGS, Served, Settings, Shared, Spend, Started, Step, StepAsk,
-    StepOpened, Stepped, Strip, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, TurnBudget, TurnOptions,
-    UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
+    Counts, DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, Durability, ENV_JSON,
+    EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Identity, Joined,
+    Kept, Lapsed, Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS, PROCESSES_PAGE,
+    ParkedFallback, Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON,
+    Replaced, Resumed, Room, SANDBOX, SETTINGS, Served, Settings, Shared, Spend, Started, Step,
+    StepAsk, StepOpened, Stepped, Strip, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, TurnBudget,
+    TurnOptions, UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share,
+    unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
@@ -765,7 +766,7 @@ impl Store {
         path: &Path,
         readers: usize,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE, None, None).await
+        Self::open_pooled(path, readers, READER_IDLE, Durability::Full, None, None).await
     }
     /// `open_with`, waiting up to `wait` for the process that owns the
     /// store to let it go rather than refusing at once: a daemon started
@@ -777,23 +778,34 @@ impl Store {
         readers: usize,
         wait: std::time::Duration,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE, Some(wait), None).await
+        Self::open_pooled(
+            path,
+            readers,
+            READER_IDLE,
+            Durability::Full,
+            Some(wait),
+            None,
+        )
+        .await
     }
     /// `open_with`, or `open_awaiting` with a `wait`, telling `owned` the
     /// moment the store is this process's, before its own opening (an
     /// upgrade perhaps) begins: a daemon answers on its socket from then.
+    /// Commits sync as `durability` asks.
     pub async fn open_owning(
         path: &Path,
         readers: usize,
+        durability: Durability,
         wait: Option<std::time::Duration>,
         owned: oneshot::Sender<()>,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE, wait, Some(owned)).await
+        Self::open_pooled(path, readers, READER_IDLE, durability, wait, Some(owned)).await
     }
     async fn open_pooled(
         path: &Path,
         readers: usize,
         idle: std::time::Duration,
+        durability: Durability,
         wait: Option<std::time::Duration>,
         owned: Option<oneshot::Sender<()>>,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
@@ -883,6 +895,7 @@ impl Store {
                     }
                     owner_only(&path)?;
                     let mut db = Database::initialize(Connection::open(&path)?)?;
+                    db.durability(durability)?;
                     checkpoints(&mut db, worker_pool, worker_counters.clone())?;
                     Ok((db, lock, path))
                 })();
@@ -1904,6 +1917,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_sync_as_the_durability_asks_full_by_default() {
+        let store = scratch_store("durability-full").await;
+        let synchronous = store.call(|db| Ok(db.pragma("synchronous"))).await.unwrap();
+        assert_eq!(synchronous, 2);
+        for (durability, expected) in [(Durability::Full, 2), (Durability::Normal, 1)] {
+            let path = scratch_path(&format!("durability-{durability:?}"));
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            let (owned, _owning) = oneshot::channel();
+            let (store, _publications) = Store::open_owning(&path, 1, durability, None, owned)
+                .await
+                .unwrap();
+            let synchronous = store.call(|db| Ok(db.pragma("synchronous"))).await.unwrap();
+            assert_eq!(synchronous, expected, "{durability:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_long_log_is_checkpointed_beside_the_writer_and_starts_over() {
         let store = scratch_store("checkpoint").await;
         store
@@ -2023,9 +2053,10 @@ mod tests {
         let path = scratch_path("readers");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let idle = std::time::Duration::from_millis(500);
-        let (store, _publications) = Store::open_pooled(&path, 4, idle, None, None)
-            .await
-            .unwrap();
+        let (store, _publications) =
+            Store::open_pooled(&path, 4, idle, Durability::Full, None, None)
+                .await
+                .unwrap();
         let open = |store: &Store| store.stats()["readers"]["open"].as_u64().unwrap();
         // A quiet store holds one reader, with the whole cache budget.
         assert_eq!(open(&store), 1);
@@ -2101,9 +2132,10 @@ mod tests {
         let path = scratch_path("reader-shares");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let idle = std::time::Duration::from_millis(500);
-        let (store, _publications) = Store::open_pooled(&path, 4, idle, None, None)
-            .await
-            .unwrap();
+        let (store, _publications) =
+            Store::open_pooled(&path, 4, idle, Durability::Full, None, None)
+                .await
+                .unwrap();
         let held = |store: &Store| store.stats()["readers"]["cache_kib"].as_u64().unwrap();
         let budget = READER_CACHE_KIB as u64;
         store.read("warm", |_| Ok(())).await.unwrap();
