@@ -113,6 +113,24 @@ class StoreLiftYields(unittest.TestCase):
         self.assertEqual(report["lists"] + report["bots"] + report["configures"], 0)
         self.assertEqual(self.rows(), after)
 
+    def test_every_byte_but_the_key_stays_as_the_daemon_wrote_it(self):
+        # serde_json writes 1e-7 where Python would write 1e-07, and keeps
+        # an escape Python would not make.
+        text = (
+            '[{"name":"exec","description":"a \\u00e9 \\"q\\"","parameters":'
+            '{"type":"number","minimum":1e-7,"maximum":1.0E10,"lift":true},'
+            '"answered_by":"sonny","lift":true,"kind":"browser"},{"name":"b","lift":false}]'
+        )
+        up = script.renamed_text(text, "lift", "yields")
+        self.assertEqual(
+            up,
+            text.replace('"answered_by":"sonny","lift"', '"answered_by":"sonny","yields"')
+            .replace('{"name":"b","lift"', '{"name":"b","yields"'),
+        )
+        self.assertEqual(script.renamed_text(up, "yields", "lift"), text)
+        self.assertIsNone(script.renamed_text(up, "lift", "yields"))
+        self.assertIsNone(script.renamed_text("[]", "lift", "yields"))
+
     def test_dry_run_writes_nothing(self):
         before = self.rows()
         report = self.run_script("up", "--dry-run")

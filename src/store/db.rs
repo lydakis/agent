@@ -20610,10 +20610,8 @@ impl Database {
 /// Each step's way back, from schema `from` to `to`, newest first: the
 /// store as a release at `to` wrote it, so that release opens it.
 fn migrate_back(conn: &Connection, from: i32, to: i32) -> Result<()> {
-    // 109 -> 108: `yields` is `lift` again.
-    if from >= 109 && to < 109 {
-        rename_declared(conn, "yields", "lift")?;
-    }
+    // 109 -> 108: nothing to undo. 0.10.2, at 108, reads `yields`; 109
+    // only makes sure no list still says `lift`.
     // 108 -> 107: no `namespace` setting; a bot's group is its name up to
     // its first dot again. The speed and context window tables bots took
     // as settings with it (#1208) go too: older releases take them as
@@ -20629,8 +20627,11 @@ fn migrate_back(conn: &Connection, from: i32, to: i32) -> Result<()> {
              WHERE json_type(configure_pending,'$.settings') IS NOT NULL;",
         )?;
     }
-    // 107 -> 106: each bot's instructions back in its row.
+    // 107 -> 106: each bot's instructions back in its row, and `yields`
+    // is `lift` again, as 0.10.1 names it (#1203 renamed it with no step
+    // of its own).
     if from >= 107 && to < 107 {
+        rename_declared(conn, "yields", "lift")?;
         conn.execute_batch(
             "ALTER TABLE bots ADD COLUMN instructions TEXT NOT NULL DEFAULT '';
              ALTER TABLE bots ADD COLUMN compaction_instructions TEXT;
@@ -20643,7 +20644,8 @@ fn migrate_back(conn: &Connection, from: i32, to: i32) -> Result<()> {
     Ok(())
 }
 
-/// 108 <-> 109: every declared tool's `old` field named `new`, in place.
+/// Every declared tool's `old` field named `new`, in place: `lift` to
+/// `yields` going to 109, back going to 106.
 /// A list is kept once under the digest of its bytes, so a list that
 /// changes moves to its new digest, and the bots holding it, the records
 /// of creations that declared it and kept `configure`s naming it follow.

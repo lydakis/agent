@@ -62,6 +62,14 @@ pub fn migrate(path: &Path, to: Option<i32>) -> Result<(i32, i32)> {
     if lock.try_lock().is_err() {
         return crate::fail("store_already_owned");
     }
+    // As a daemon's open: a hard link is another path, so another lock,
+    // to the same store.
+    {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(&path)?.nlink() != 1 {
+            return crate::fail("store_hard_links_unsupported");
+        }
+    }
     let conn = Connection::open(&path)?;
     let from: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     match to {

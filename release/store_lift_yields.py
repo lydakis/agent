@@ -30,10 +30,8 @@ RENAMES = {"up": ("lift", "yields"), "down": ("yields", "lift")}
 
 
 def renamed(tools, old, new):
-    """`tools` with each tool's `old` key named `new`, in the same place.
-
-    The key keeps its position, which is the field's place in the daemon's
-    `Declared`, so the JSON is the bytes the daemon itself writes."""
+    """`tools`, a parsed list, with each tool's `old` key named `new`, in the
+    same place. For a kept `configure`, which no digest names."""
     changed = False
     out = []
     for tool in tools:
@@ -44,6 +42,69 @@ def renamed(tools, old, new):
             changed = True
         out.append(tool)
     return out, changed
+
+
+DECODER = json.JSONDecoder()
+SPACE = " \t\n\r"
+
+
+def renamed_text(text, old, new):
+    """The JSON array of objects `text` with each object's `old` key named
+    `new` where it stands, every other byte as it was (numbers included, as
+    the daemon wrote them), or None when no object has the key."""
+    out, at, changed = [], 0, False
+
+    def skip(i):
+        while i < len(text) and text[i] in SPACE:
+            i += 1
+        return i
+
+    def expect(i, char):
+        i = skip(i)
+        if text[i] != char:
+            raise SystemExit(f"not a declared list: {char!r} expected at {i}")
+        return i + 1
+
+    i = expect(0, "[")
+    i = skip(i)
+    if text[i] == "]":
+        return None
+    while True:
+        i = expect(i, "{")
+        keys = set()
+        i = skip(i)
+        if text[i] != "}":
+            while True:
+                i = expect(i, '"')
+                key, end = json.decoder.scanstring(text, i)
+                if key in keys:
+                    raise SystemExit(f"a tool repeats {key!r}")
+                keys.add(key)
+                if key == old:
+                    if new in keys:
+                        raise SystemExit(f"a tool has both {old!r} and {new!r}")
+                    out.append(text[at : i - 1])
+                    out.append(json.dumps(new, ensure_ascii=False))
+                    at, changed = end, True
+                i = expect(end, ":")
+                _, i = DECODER.raw_decode(text, skip(i))
+                i = skip(i)
+                if text[i] == ",":
+                    i += 1
+                    continue
+                i = expect(i, "}") - 1
+                break
+        i += 1
+        i = skip(i)
+        if text[i] == ",":
+            i += 1
+            continue
+        expect(i, "]")
+        break
+    if not changed:
+        return None
+    out.append(text[at:])
+    return "".join(out)
 
 
 def dumps(value):
@@ -65,10 +126,9 @@ def migrate(conn, old, new):
         raise SystemExit("not an agent store at schema 101 or later (no bots or tool_lists)")
     moved = {}
     for digest, text in conn.execute("SELECT digest,tools FROM tool_lists").fetchall():
-        tools, changed = renamed(json.loads(text), old, new)
-        if not changed:
+        json_text = renamed_text(text, old, new)
+        if json_text is None:
             continue
-        json_text = dumps(tools)
         moved[digest] = (digest_of(json_text), json_text)
     for digest, (fresh, json_text) in moved.items():
         conn.execute(

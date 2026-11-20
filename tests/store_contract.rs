@@ -23640,7 +23640,7 @@ fn schema_109_names_a_lifted_tool_yields() {
 }
 
 /// Each step from 0.10.1's schema has a way back: `agent migrate --schema
-/// 106` leaves a store 0.10.1 reads (instructions in each bot's row, no
+/// 108` leaves a store 0.10.2 reads, and `--schema 106` one 0.10.1 reads (instructions in each bot's row, no
 /// setting it does not know, `lift`), and a start of this release brings
 /// it forward again to the same bots, byte for byte where it keeps bytes.
 #[test]
@@ -23683,9 +23683,27 @@ fn a_store_goes_back_to_0_10_1_and_forward_again() {
         let refused = agent_runtime::store::migrate(&path, Some(to)).unwrap_err();
         assert_eq!(refused.code, "store_schema_unsupported", "{to}");
     }
+    // A hard link is another lock on the same store: refused, as a start is.
+    let alias = dir.join("alias.sqlite");
+    std::fs::hard_link(&path, &alias).unwrap();
+    let refused = agent_runtime::store::migrate(&alias, Some(106)).unwrap_err();
+    assert_eq!(refused.code, "store_hard_links_unsupported");
+    std::fs::remove_file(&alias).unwrap();
+    // 0.10.2, at 108, reads `yields`: its way back keeps it.
+    assert_eq!(
+        agent_runtime::store::migrate(&path, Some(108)).unwrap(),
+        (Database::SCHEMA, 108)
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT COUNT(*) FROM tool_lists WHERE tools LIKE '%\"yields\":true%'"
+        ),
+        1
+    );
     assert_eq!(
         agent_runtime::store::migrate(&path, Some(106)).unwrap(),
-        (Database::SCHEMA, 106)
+        (108, 106)
     );
     assert_eq!(count(&path, "PRAGMA user_version"), 106);
     assert!(
