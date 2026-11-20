@@ -24,13 +24,13 @@ use std::sync::OnceLock;
 /// The most of one post.
 const POST_BYTES: usize = 16 * 1024;
 /// The most posts a thread holds; a longer conversation starts a new one.
-const POSTS: usize = 256;
+pub(crate) const POSTS: usize = 256;
 /// The most of one read's posts, so a read fits a served tool's answer:
 /// the rest come with `from`.
 const READ_BYTES: usize = 40 * 1024;
 /// The most of one listing's threads, newest first: the rest come with
 /// `from`.
-const LIST_BYTES: usize = crate::served::PAGE_BYTES;
+pub(crate) const LIST_BYTES: usize = crate::served::PAGE_BYTES;
 const READS: &str = ".reads";
 /// The invites of the last week, and how many threads ever sent any:
 /// `{"sent": [{"thread", "at", "bot", "golden", "answered"}], "count",
@@ -250,9 +250,11 @@ pub fn call(
     )
 }
 
-/// What a post holds that a filter matches: all Sonny wrote of it.
-const FIELDS: [&str; 8] = [
-    "by", "by_id", "at", "model", "project", "sonny", "external", "title",
+/// What a post holds that a filter matches: all Sonny wrote of it, and
+/// of an item on a board, where it stands (`crate::board::item`).
+const FIELDS: [&str; 15] = [
+    "by", "by_id", "at", "model", "project", "sonny", "external", "title", "board", "do", "needs",
+    "labels", "for", "state", "holder",
 ];
 
 /// A call's `filter`, an event pattern as the follows tool takes one,
@@ -266,16 +268,23 @@ fn filter(arguments: &Value) -> Result<Option<&Value>, String> {
     {
         return Err("commons_invalid: a filter narrows the listing or a search".into());
     }
-    crate::lookout::pattern::check(filter).map_err(|e| format!("commons_invalid: {e}"))?;
+    check_filter(filter, "commons_invalid")?;
+    Ok(Some(filter))
+}
+
+/// `filter` held to what one may say and to the fields a post has, its
+/// refusal coded `code`.
+pub(crate) fn check_filter(filter: &Value, code: &str) -> Result<(), String> {
+    crate::lookout::pattern::check(filter).map_err(|e| format!("{code}: {e}"))?;
     let missing = crate::lookout::pattern::missing(filter, &|field| FIELDS.contains(&field));
     if !missing.is_empty() {
         return Err(format!(
-            "commons_invalid: no post has {}; a post has {}",
+            "{code}: no post has {}; a post has {}",
             missing.join(", "),
             FIELDS.join(", ")
         ));
     }
-    Ok(Some(filter))
+    Ok(())
 }
 
 /// `post` as a filter sees it: its fields but its text.
@@ -288,7 +297,7 @@ fn matched(filter: Option<&Value>, post: &Value) -> bool {
     crate::lookout::pattern::matches(filter, &Value::Object(fields))
 }
 
-fn valid_name(name: &str) -> Result<(), String> {
+pub(crate) fn valid_name(name: &str) -> Result<(), String> {
     let fine = (1..=64).contains(&name.len())
         && (name.bytes()).all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     match fine {
@@ -303,7 +312,7 @@ fn valid_name(name: &str) -> Result<(), String> {
 /// from reaching a later agent that took a removed poster's name; the
 /// model it was written with is kept as the daemon named it, and the
 /// project as Sonny named the author in it.
-fn entry(
+pub(crate) fn entry(
     author: &str,
     author_id: Option<i64>,
     model: Option<&str>,
@@ -360,7 +369,7 @@ fn when(epoch: i64) -> String {
 
 /// The folder's lock, held from a thread's first read to its last write,
 /// so two replies at once both land.
-fn lock(dir: &Path) -> Result<std::fs::File, String> {
+pub(crate) fn lock(dir: &Path) -> Result<std::fs::File, String> {
     let failed = |e: std::io::Error| format!("commons_failed: {}: {e}", dir.display());
     std::fs::create_dir_all(dir).map_err(failed)?;
     let file = std::fs::OpenOptions::new()
@@ -374,7 +383,7 @@ fn lock(dir: &Path) -> Result<std::fs::File, String> {
 }
 
 /// A thread's posts, opening post first.
-fn posts(path: &Path) -> Result<Vec<Value>, String> {
+pub(crate) fn posts(path: &Path) -> Result<Vec<Value>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => format!(
             "commons_not_found: no thread {}",
@@ -414,6 +423,17 @@ fn start(dir: &Path, name: &str, title: &str, post: &Value, reader: &str) -> Res
         );
     }
     let _lock = lock(dir)?;
+    start_locked(dir, name, title, post, reader)
+}
+
+/// `start`, under the lock the caller holds, its name and title checked.
+pub(crate) fn start_locked(
+    dir: &Path,
+    name: &str,
+    title: &str,
+    post: &Value,
+    reader: &str,
+) -> Result<Value, String> {
     let path = dir.join(format!("{name}.jsonl"));
     if path.exists() {
         return Err(format!(
@@ -825,9 +845,21 @@ fn invite_submit(bot: &str, thread: &str, note: String, golden: bool) -> Value {
 fn add(dir: &Path, name: &str, post: &Value, reader: &str) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = lock(dir)?;
+    add_locked(dir, name, post, reader, true)
+}
+
+/// `add`, under the lock the caller holds, its name checked; `capped`,
+/// refused once the thread holds [`POSTS`].
+pub(crate) fn add_locked(
+    dir: &Path,
+    name: &str,
+    post: &Value,
+    reader: &str,
+    capped: bool,
+) -> Result<Value, String> {
     let path = dir.join(format!("{name}.jsonl"));
     let earlier = posts(&path)?;
-    if earlier.len() >= POSTS {
+    if capped && earlier.len() >= POSTS {
         return Err(format!(
             "commons_full: {name} holds {POSTS} posts; start a new thread that names it"
         ));
@@ -977,10 +1009,20 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
                     shown[key] = post[key].clone();
                 }
             }
+            // What a board's post did, as the item's history.
+            for key in ["do", "board", "needs", "labels", "for", "took_from"] {
+                if !post[key].is_null() {
+                    shown[key] = post[key].clone();
+                }
+            }
             shown
         })
         .collect();
-    Ok(json!({"thread": name, "title": title, "posts": shown}))
+    let mut shown = json!({"thread": name, "title": title, "posts": shown});
+    if let Some(item) = crate::board::item(&posts) {
+        shown["item"] = item;
+    }
+    Ok(shown)
 }
 
 /// An agent's read of a thread from its post `from`, as many posts as
@@ -1058,22 +1100,35 @@ fn count_reads(dir: &Path, names: &[&str]) {
 
 /// Each thread's summary as last read, by name, with the file's size and
 /// time it was read at: a listing reads again only a thread that changed.
-type Summaries = HashMap<String, (crate::kept::Stamp, Value)>;
+pub(crate) type Summaries = HashMap<String, (crate::kept::Stamp, Value)>;
 
 /// Where a summary keeps its first post's fields, for a filter.
 const OPENING: &str = "opening";
 
 /// A thread's line in a listing, from its first and last posts and its
-/// count of lines, decoding no post between them.
-fn summary(name: &str, path: &Path) -> Option<Value> {
+/// count of lines, decoding no post between them but a board's actions:
+/// an item's, under `item`, as [`crate::board::item`] reads its posts.
+pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
     let text = std::fs::read(path).ok()?;
     let mut lines =
         (text.split(|b| *b == b'\n')).filter(|line| !line.iter().all(u8::is_ascii_whitespace));
     let first: Value = serde_json::from_slice(lines.next()?).ok()?;
     let (mut count, mut last) = (1, None);
+    // Only a line holding `"do":` can be an action: in a post's text the
+    // quotes are escaped, so no text passes for one.
+    let marked = |line: &[u8]| line.windows(5).any(|w| w == br#""do":"#);
+    let mut actions = Vec::new();
+    if first["do"].is_string() {
+        actions.push(first.clone());
+    }
     for line in lines {
         count += 1;
         last = Some(line);
+        if marked(line)
+            && let Ok(post) = serde_json::from_slice::<Value>(line)
+        {
+            actions.push(post);
+        }
     }
     let last: Value = match last {
         Some(line) => serde_json::from_slice(line).ok()?,
@@ -1091,6 +1146,9 @@ fn summary(name: &str, path: &Path) -> Option<Value> {
     if first["project"].is_string() {
         summary["project"] = first["project"].clone();
     }
+    if let Some(item) = crate::board::item(&actions) {
+        summary["item"] = item;
+    }
     // Its first post but its text, which a filter on the listing matches
     // and the listing leaves out.
     let mut opening = first;
@@ -1103,7 +1161,7 @@ fn summary(name: &str, path: &Path) -> Option<Value> {
 /// `next` where the rest start; `known` keeps what each read found, and
 /// `sent` is the week's invites, read once by the caller. With `filter`,
 /// only the threads whose first post it matches.
-fn list(
+pub(crate) fn list(
     dir: &Path,
     from: usize,
     bytes: usize,
@@ -1118,7 +1176,7 @@ fn list(
         entries => entries.map_err(|e| format!("commons_failed: {}: {e}", dir.display()))?,
     };
     let counts = reads(dir);
-    let mut threads = Vec::new();
+    let mut all = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = (path.file_name().and_then(|n| n.to_str()))
@@ -1131,7 +1189,7 @@ fn list(
         else {
             continue;
         };
-        let mut thread = match known.get(name) {
+        let thread = match known.get(name) {
             Some((at, thread)) if *at == stamp => thread.clone(),
             // A thread that will not read is left for read to name.
             _ => match summary(name, &path) {
@@ -1142,11 +1200,34 @@ fn list(
                 None => continue,
             },
         };
-        let opening = (thread.as_object_mut()).and_then(|t| t.remove(OPENING));
-        if !matched(filter, opening.as_ref().unwrap_or(&Value::Null)) {
+        all.push((name.to_owned(), thread));
+    }
+    // An item waits while one of its needs is not done, which only the
+    // other items say.
+    let done: std::collections::HashSet<String> = (all.iter())
+        .filter(|(_, thread)| thread["item"]["state"] == "done")
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut threads = Vec::new();
+    for (name, mut thread) in all {
+        if crate::board::waiting(&thread["item"], &|need| done.contains(need)) {
+            thread["item"]["state"] = json!("waiting");
+        }
+        let mut opening = (thread.as_object_mut())
+            .and_then(|t| t.remove(OPENING))
+            .unwrap_or(Value::Null);
+        // A filter sees where an item stands as its first post's own: what
+        // the item has since cleared is gone from it too.
+        if let (Some(fields), Some(item)) = (opening.as_object_mut(), thread["item"].as_object()) {
+            for key in crate::board::CHANGING {
+                fields.remove(key);
+            }
+            fields.extend(item.iter().map(|(key, value)| (key.clone(), value.clone())));
+        }
+        if !matched(filter, &opening) {
             continue;
         }
-        thread["reads"] = counts.get(name).map_or(json!(0), |r| r["count"].clone());
+        thread["reads"] = counts.get(&name).map_or(json!(0), |r| r["count"].clone());
         threads.push(thread);
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t["at"].as_i64().unwrap_or(0)));
@@ -1158,6 +1239,22 @@ fn list(
     let mut listed = json!({"dir": dir, "invites": budget(sent, agents(dir))});
     crate::served::paged(&mut listed, "threads", threads, from, bytes);
     Ok(listed)
+}
+
+/// Every thread's summary, by name, in no order: what a board's action
+/// reads of the others, under the lock the caller holds.
+pub(crate) fn summaries(dir: &Path) -> Vec<(String, Value)> {
+    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    (entries.filter_map(|entry| {
+        let path = entry.path();
+        let name = (path.file_name().and_then(|n| n.to_str()))
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .filter(|n| valid_name(n).is_ok())?
+            .to_owned();
+        let thread = summary(&name, &path)?;
+        Some((name, thread))
+    }))
+    .collect()
 }
 
 /// The most of a post's text a search shows: the rest is read.
@@ -1240,12 +1337,40 @@ fn search(
         let title = first["title"].as_str().unwrap_or_default();
         let every = holds(title);
         let mut whole = true;
+        // An item's posts each show where it stands, as the listing's
+        // first post does, waiting while a need is not done.
+        let mut item = crate::board::item(&posts);
+        if let Some(item) = &mut item {
+            let done = |need: &str| {
+                (crate::commons::posts(&dir.join(format!("{need}.jsonl"))).ok())
+                    .and_then(|posts| crate::board::item(&posts))
+                    .is_some_and(|it| it["state"] == "done")
+            };
+            if crate::board::waiting(item, &done) {
+                item["state"] = json!("waiting");
+            }
+        }
+        let seen = |post: &Value| match (&item, post) {
+            (Some(Value::Object(item)), Value::Object(fields)) => {
+                // The post's own fields stand, by being who wrote it, but
+                // for what the item has changed since, which is the item's.
+                let mut fields = fields.clone();
+                for key in crate::board::CHANGING {
+                    fields.remove(key);
+                }
+                for (key, value) in item {
+                    fields.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+                matched(filter, &Value::Object(fields))
+            }
+            _ => matched(filter, post),
+        };
         // A thread's matches fit a page on their own: past that, how many
         // more there are and the post to read from.
         let (mut matches, mut held, mut more) = (Vec::new(), 0, None);
         let hits = (posts.iter().enumerate())
             .filter(|(_, post)| every || holds(post["text"].as_str().unwrap_or_default()))
-            .filter(|(_, post)| matched(filter, post));
+            .filter(|(_, post)| seen(post));
         for (n, post) in hits {
             if let Some((count, _)) = &mut more {
                 *count += 1;
@@ -1286,6 +1411,9 @@ fn search(
         let mut thread = json!({"thread": name, "title": title, "started_by": first["by"],
             "posts": posts.len(), "last_by": last["by"], "last_when": when(at),
             "matches": matches});
+        if let Some(item) = &item {
+            thread["item"] = item.clone();
+        }
         if let Some((count, from)) = more {
             thread["more_matches"] = json!(count);
             thread["read_from"] = json!(from);
@@ -1681,15 +1809,35 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             .first()
             .and_then(|p| p["title"].as_str())
             .unwrap_or_default();
+        // An item's board, which a follow of the board hears it by.
+        let board = (posts.iter().any(|post| post["do"].is_string()))
+            .then(|| crate::board::item(&posts))
+            .flatten()
+            .and_then(|item| item["board"].as_str().map(str::to_owned));
         for (n, post) in posts.iter().enumerate().skip(had).filter(|_| !first) {
             let text = post["text"].as_str().unwrap_or_default();
-            let text = match n {
-                0 => format!("new thread {thread}, \"{title}\": {text}"),
-                _ => format!("reply in {thread}, \"{title}\": {text}"),
+            let text = match (n, post["do"].as_str()) {
+                (0, Some(_)) => format!(
+                    "new item {thread} on {}, \"{title}\": {text}",
+                    board.as_deref().unwrap_or_default()
+                ),
+                (0, None) => format!("new thread {thread}, \"{title}\": {text}"),
+                (_, Some(done)) => format!("{done} in {thread}, \"{title}\": {text}"),
+                (_, None) => format!("reply in {thread}, \"{title}\": {text}"),
             };
             let mut line = json!({"id": format!("{thread}/{n}"), "topic": thread, "text": text});
             if let Some(by) = post["by"].as_str() {
                 line["from"] = json!(by);
+            }
+            // Where a board's follow hears it, what it did, and the items
+            // it opened, which a worker's follow is steered by.
+            if let Some(board) = &board {
+                line["board"] = json!(board);
+            }
+            for key in ["do", "opened"] {
+                if !post[key].is_null() {
+                    line[key] = post[key].clone();
+                }
             }
             lines.push(line.to_string());
         }
@@ -1872,31 +2020,99 @@ fn author_project(
         .map_or_else(|| crate::served::project_of(by), str::to_owned)
 }
 
-/// `/commons` in the pane: the threads, newest first, and one opened to
-/// its posts, read from the folder with no model or daemon call. The
-/// person's reading here is not counted as an agent's.
+/// `/commons` in the pane: the boards agents pull work from, the threads
+/// newest first, a board opened to its items by state, and a thread or an
+/// item opened to its posts, read from the folder with no model or daemon
+/// call. The person's reading here is not counted as an agent's.
 pub struct View {
     dir: PathBuf,
-    /// The window's project, which `a` narrows the threads to.
+    /// The window's project, whose boards come first and which `a`
+    /// narrows the list to.
     project: String,
-    /// `a`: only the threads started in `project`. Every project's open.
+    /// `a`: only this project's boards and threads. Every project's open.
     this: bool,
+    /// `m`: every item listed among the threads too.
+    more: bool,
+    /// Every thread as the listing last read it, items too, newest first.
     threads: Vec<Value>,
+    /// The items among them, each where it stands.
+    items: Vec<crate::board_view::Item>,
+    /// Each item's place in `items`, by its thread.
+    item_at: HashMap<String, usize>,
+    boards: Vec<crate::board_view::Board>,
     /// What the week's invites came to, as the listing says.
     invites: Value,
-    selected: usize,
-    /// The thread opened, by name, and its posts as last read.
-    open: Option<(String, Value)>,
-    /// The opened thread's file size and time when its posts were read.
-    open_stamp: Option<crate::kept::Stamp>,
+    /// The list's pick, by what it is, so a read that moves rows keeps it.
+    pick: Option<Pick>,
+    /// Whether the finished boards' fold is open.
+    fold_open: bool,
+    /// `ctrl+f` (`crate::find`): what is typed narrows the list, and the
+    /// pick as it was before, which `esc` puts back.
+    finding: Option<crate::find::Find<Option<Pick>>>,
+    /// The pages opened over the list, the last on top.
+    pages: Vec<Page>,
     /// What the listing last read of each thread.
     known: Summaries,
     /// The golden tickets the week's invites held, each one agent's.
     golden: usize,
+    /// The agents this window's project lists now: a holder that is not
+    /// among them is closed.
+    present: crate::board_view::Present,
     notice: Option<String>,
-    /// `ctrl+f`: what is typed narrows the threads to those that say it,
-    /// and the thread picked when the find began, which `esc` puts back.
-    finding: Option<crate::find::Find<usize>>,
+    /// Whether boards are on (`crate::board::on`): off, the list is as it
+    /// was before boards, an item's thread a thread like any.
+    boards_on: bool,
+}
+
+/// A row the pick lands on, by what it is.
+#[derive(Clone, Debug, PartialEq)]
+enum Pick {
+    Board(String),
+    /// The finished boards' fold.
+    Fold,
+    /// A thread or an item, by its thread.
+    Thread(String),
+    /// A folding section's heading on a board's page.
+    Heading(crate::board_view::State),
+}
+
+/// A row of the list or of a board's page, as drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Row {
+    /// A board, by its place in `boards`.
+    Board(usize),
+    /// The finished boards' fold, and how many it holds.
+    Fold(usize),
+    /// An item hung under its board while finding, by its place in `items`.
+    Hung(usize),
+    /// A thread or an item among the threads, by its place in `threads`.
+    Thread(usize),
+    /// A section's heading on a board's page.
+    Heading(crate::board_view::State),
+    /// An item on a board's page, by its place in `items`.
+    Item(usize),
+}
+
+/// A page over the list: a board, or a thread.
+enum Page {
+    Board {
+        name: String,
+        pick: Option<Pick>,
+        /// The folding sections opened.
+        open: Vec<crate::board_view::State>,
+        finding: Option<crate::find::Find<Option<Pick>>>,
+    },
+    Thread {
+        name: String,
+        /// Its posts as last read, or why they could not be.
+        posts: Result<Vec<Value>, String>,
+        /// Its file's size and time when they were read.
+        stamp: Option<crate::kept::Stamp>,
+        /// The link picked, by its place among those drawn.
+        link: Option<usize>,
+        /// Where each link was last drawn, and what it opens.
+        links: Vec<(usize, usize, usize, crate::board_view::Target)>,
+    },
 }
 
 /// What a key did to the view.
@@ -1904,6 +2120,25 @@ pub struct View {
 pub enum Key {
     Stay,
     Close,
+    /// Scroll a thread one row, up (true) or down: no link is left that way.
+    Scroll(bool),
+    /// Follow an address outside the view: an agent a page names.
+    Open(String),
+}
+
+/// The view's link to its clicks: a button's address is this, then the
+/// link's place on the page.
+pub const BUTTON: &str = "commons/";
+
+/// The card as the pane draws it: its lines, the row the pick is on, the
+/// row each pick starts on by its place, each agent's name drawn as a
+/// link, and each of a page's own links by its place.
+pub struct Card {
+    pub lines: Vec<Line<'static>>,
+    pub at: usize,
+    pub starts: Vec<usize>,
+    pub agents: Vec<crate::board_view::Named>,
+    pub links: Vec<(usize, usize, usize, usize)>,
 }
 
 impl View {
@@ -1912,33 +2147,41 @@ impl View {
             dir: dir(home),
             project,
             this: false,
+            more: false,
             threads: Vec::new(),
+            items: Vec::new(),
+            item_at: HashMap::new(),
+            boards: Vec::new(),
             invites: Value::Null,
-            selected: 0,
-            open: None,
-            open_stamp: None,
+            pick: None,
+            fold_open: false,
+            finding: None,
+            pages: Vec::new(),
             known: Summaries::new(),
             golden: 0,
+            present: crate::board_view::Present::default(),
             notice: None,
-            finding: None,
+            boards_on: crate::board::on(),
         };
         view.reload();
         view
     }
 
-    /// Read it all again, the pick kept on the same thread where it still is.
+    /// The agents this window's project lists now, as its count knows
+    /// them: a holder of this project not among them is closed.
+    pub fn set_present(&mut self, present: crate::board_view::Present) {
+        self.present = present;
+    }
+
+    /// Read it all again: each thread only once it changed, the pick kept
+    /// on what it was on.
     pub fn reload(&mut self) {
-        let picked = self.picked().map(str::to_owned);
         // The invites file is read once for the budget and the golden
         // tickets both.
         let sent = sent(&self.dir);
         match list(&self.dir, 0, usize::MAX, &mut self.known, &sent, None) {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
-                if self.this {
-                    let project = self.project.as_str();
-                    self.threads.retain(|thread| thread["project"] == project);
-                }
                 self.invites = listed["invites"].clone();
                 self.golden = (sent.iter())
                     .filter(|invite| !invite["bot"].is_null() && invite["golden"] == true)
@@ -1946,75 +2189,626 @@ impl View {
             }
             Err(error) => self.notice = Some(error),
         }
-        self.selected = picked
-            .and_then(|name| {
-                self.threads
-                    .iter()
-                    .position(|t| t["thread"] == name.as_str())
+        // Each item as its listing line says, its last post's time from
+        // what the listing kept of it; none with boards off.
+        self.items = (self.threads.iter())
+            .filter(|_| self.boards_on)
+            .filter_map(|thread| {
+                let name = thread["thread"].as_str()?;
+                let at =
+                    (self.known.get(name)).map_or(0, |(_, kept)| kept["at"].as_i64().unwrap_or(0));
+                crate::board_view::item_of(thread, at)
             })
-            .unwrap_or(self.selected)
-            .min(self.threads.len().saturating_sub(1));
-        if let Some((name, _)) = &self.open {
+            .collect();
+        self.item_at = (self.items.iter().enumerate())
+            .map(|(at, item)| (item.thread.clone(), at))
+            .collect();
+        self.boards = crate::board_view::boards(&self.items, &self.project);
+        self.settle();
+        for page in &mut self.pages {
+            let Page::Thread {
+                name, posts, stamp, ..
+            } = page
+            else {
+                continue;
+            };
             // Read again only once it changed.
-            let stamp = crate::kept::stamp(&self.dir.join(format!("{name}.jsonl")));
-            if stamp.is_some() && stamp == self.open_stamp {
-                return;
+            let path = self.dir.join(format!("{name}.jsonl"));
+            let now = crate::kept::stamp(&path);
+            if now.is_some() && now == *stamp {
+                continue;
             }
-            self.open_stamp = stamp;
-            match thread(&self.dir, name) {
-                Ok(read) => self.open = Some((name.clone(), read)),
-                Err(error) => {
-                    self.notice = Some(error);
-                    self.open = None;
+            *stamp = now;
+            *posts = self::posts(&path);
+        }
+    }
+
+    /// Whether a page is open over the list.
+    pub fn on_page(&self) -> bool {
+        !self.pages.is_empty()
+    }
+
+    /// Whether a thread or an item is open, whose rows scroll.
+    pub fn reading(&self) -> bool {
+        matches!(self.pages.last(), Some(Page::Thread { .. }))
+    }
+
+    /// How many pages are open over the list.
+    pub fn depth(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Whether `←` has nowhere to go back to in the view.
+    pub fn left_ends(&self) -> bool {
+        self.pages.is_empty() && self.finding.is_none()
+    }
+
+    fn now() -> i64 {
+        now()
+    }
+
+    /// The threads the list holds in its scope, items aside unless `m`.
+    fn in_scope(&self, thread: &Value) -> bool {
+        !self.this || thread["project"] == self.project.as_str()
+    }
+
+    fn board_in_scope(&self, board: &crate::board_view::Board) -> bool {
+        !self.this || crate::board_view::project_of(&board.name) == self.project
+    }
+
+    fn is_item(&self, thread: &Value) -> bool {
+        (thread["thread"].as_str()).is_some_and(|name| self.item_at.contains_key(name))
+    }
+
+    /// The boards in scope and not finished, then the finished ones.
+    fn boards_split(&self) -> (Vec<usize>, Vec<usize>) {
+        let now = Self::now();
+        let (mut open, mut finished) = (Vec::new(), Vec::new());
+        for (at, board) in self.boards.iter().enumerate() {
+            if !self.board_in_scope(board) {
+                continue;
+            }
+            match board.finished(now) {
+                true => finished.push(at),
+                false => open.push(at),
+            }
+        }
+        (open, finished)
+    }
+
+    /// The list's rows in order: the boards, the fold, then the threads.
+    /// While finding, the boards that match or hold an item that does,
+    /// with those items hung under them, then the threads that match,
+    /// an item hung under its board not again among them.
+    fn rows(&self) -> Vec<Row> {
+        let (open, finished) = self.boards_split();
+        let query = (self.finding.as_ref())
+            .filter(|find| find.typed())
+            .map(|find| find.query.clone());
+        let mut rows = Vec::new();
+        let mut hung_threads = std::collections::HashSet::new();
+        match &query {
+            Some(query) => {
+                for at in open.iter().chain(&finished) {
+                    let board = &self.boards[*at];
+                    let hung: Vec<usize> = (board.items.iter().copied())
+                        .filter(|item| crate::board_view::found_in_list(&self.items[*item], query))
+                        .collect();
+                    if hung.is_empty() && !crate::find::says(query, &board.name) {
+                        continue;
+                    }
+                    rows.push(Row::Board(*at));
+                    hung_threads.extend(hung.iter().map(|item| self.items[*item].thread.as_str()));
+                    rows.extend(hung.into_iter().map(Row::Hung));
+                }
+            }
+            None => {
+                rows.extend(open.iter().map(|at| Row::Board(*at)));
+                if !finished.is_empty() {
+                    rows.push(Row::Fold(finished.len()));
+                    if self.fold_open {
+                        rows.extend(finished.iter().map(|at| Row::Board(*at)));
+                    }
+                }
+            }
+        }
+        for (at, thread) in self.threads.iter().enumerate() {
+            if !self.in_scope(thread) || (self.is_item(thread) && !self.more) {
+                continue;
+            }
+            if hung_threads.contains(thread["thread"].as_str().unwrap_or_default()) {
+                continue;
+            }
+            // A thread says it in its title or who wrote in it, as its row
+            // does.
+            if let Some(query) = &query
+                && !["title", "started_by", "last_by"]
+                    .iter()
+                    .any(|key| crate::find::says(query, thread[*key].as_str().unwrap_or_default()))
+            {
+                continue;
+            }
+            rows.push(Row::Thread(at));
+        }
+        rows
+    }
+
+    fn pick_of(&self, row: Row) -> Pick {
+        match row {
+            Row::Board(at) => Pick::Board(self.boards[at].name.clone()),
+            Row::Fold(_) => Pick::Fold,
+            Row::Hung(at) | Row::Item(at) => Pick::Thread(self.items[at].thread.clone()),
+            Row::Thread(at) => Pick::Thread(
+                self.threads[at]["thread"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            Row::Heading(state) => Pick::Heading(state),
+        }
+    }
+
+    /// Where `pick` is among `rows`.
+    fn find_pick(&self, rows: &[Row], pick: &Pick) -> Option<usize> {
+        rows.iter().position(|row| self.pick_of(*row) == *pick)
+    }
+
+    /// The pick on a row the list still shows: where it was, else the
+    /// first. In a project its boards come first, so the pick starts on
+    /// one.
+    fn settle(&mut self) {
+        let rows = self.rows();
+        let kept = (self.pick.as_ref()).and_then(|pick| self.find_pick(&rows, pick));
+        if kept.is_none() {
+            self.pick = rows.first().map(|row| self.pick_of(*row));
+        }
+        for at in 0..self.pages.len() {
+            if let Page::Board { name, pick, .. } = &self.pages[at] {
+                let rows = Self::pickable(&self.board_rows(name, at));
+                let kept = (pick.as_ref()).and_then(|pick| self.find_pick(&rows, pick));
+                if kept.is_none() {
+                    let first = rows.first().map(|row| self.pick_of(*row));
+                    if let Page::Board { pick, .. } = &mut self.pages[at] {
+                        *pick = first;
+                    }
                 }
             }
         }
     }
 
-    fn picked(&self) -> Option<&str> {
-        self.threads.get(self.selected)?["thread"].as_str()
-    }
-
-    /// Whether the thread at `index` says what is typed to find, in its
-    /// title or who wrote in it, as its row does: every thread before
-    /// anything is typed.
-    fn shown(&self, index: usize) -> bool {
-        let Some(find) = self.finding.as_ref().filter(|find| find.typed()) else {
-            return true;
+    /// The board `name`'s page rows: one section a state, in the page's
+    /// order, Done and Canceled folded unless opened; while finding, the
+    /// items that match, every section open.
+    fn board_rows(&self, name: &str, page: usize) -> Vec<Row> {
+        let Some(board) = self.boards.iter().find(|board| board.name == name) else {
+            return Vec::new();
         };
-        let Some(thread) = self.threads.get(index) else {
-            return false;
+        let (open, finding) = match self.pages.get(page) {
+            Some(Page::Board { open, finding, .. }) => (
+                open.clone(),
+                (finding.as_ref())
+                    .filter(|find| find.typed())
+                    .map(|find| find.query.clone()),
+            ),
+            _ => (Vec::new(), None),
         };
-        ["title", "started_by", "last_by"]
-            .iter()
-            .any(|key| find.says(thread[*key].as_str().unwrap_or_default()))
-    }
-
-    /// The thread shown next to the pick, after it or before it.
-    fn step(&self, down: bool) -> usize {
-        let mut at = self.selected;
-        loop {
-            at = match down {
-                true if at + 1 < self.threads.len() => at + 1,
-                false if at > 0 => at - 1,
-                _ => return self.selected,
-            };
-            if self.shown(at) {
-                return at;
+        let mut rows = Vec::new();
+        for state in crate::board_view::State::ALL {
+            let mut items: Vec<usize> = (board.items.iter().copied())
+                .filter(|item| self.items[*item].state == state)
+                .filter(|item| {
+                    (finding.as_deref())
+                        .is_none_or(|q| crate::board_view::found_on_page(&self.items[*item], q))
+                })
+                .collect();
+            if items.is_empty() {
+                continue;
             }
+            // Newest first within a state, as the threads are; written
+            // in the same second, by name, whatever order the folder lists.
+            items.sort_by(|a, b| {
+                let (a, b) = (&self.items[*a], &self.items[*b]);
+                (b.at.cmp(&a.at)).then_with(|| a.thread.cmp(&b.thread))
+            });
+            rows.push(Row::Heading(state));
+            if !state.folds() || open.contains(&state) || finding.is_some() {
+                rows.extend(items.into_iter().map(Row::Item));
+            }
+        }
+        rows
+    }
+
+    /// Of `rows`, those the pick may land on: on a board's page, the
+    /// items and the headings that fold.
+    fn pickable(rows: &[Row]) -> Vec<Row> {
+        (rows.iter().copied())
+            .filter(|row| !matches!(row, Row::Heading(state) if !state.folds()))
+            .collect()
+    }
+
+    pub fn key(&mut self, key: KeyEvent, in_view: std::ops::Range<usize>) -> Key {
+        self.notice = None;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let code = match key.code {
+            KeyCode::Char('k') if !self.is_finding() => KeyCode::Up,
+            KeyCode::Char('j') if !self.is_finding() => KeyCode::Down,
+            KeyCode::Char('h') if !self.is_finding() => KeyCode::Left,
+            KeyCode::Char('l') if !self.is_finding() => KeyCode::Right,
+            code => code,
+        };
+        if code == KeyCode::Char('c') && ctrl {
+            return Key::Close;
+        }
+        // Finding: what is typed narrows the rows; the arrows still pick.
+        if let Some(find) = self.find_mut() {
+            match find.key(&key) {
+                crate::find::Typed::Dropped => {
+                    self.drop_find();
+                    return Key::Stay;
+                }
+                crate::find::Typed::Changed => {
+                    self.found();
+                    return Key::Stay;
+                }
+                crate::find::Typed::Other => {}
+            }
+        }
+        match code {
+            _ if crate::find::opens(&key) && !self.reading() => {
+                let find = crate::find::Find::new(self.current_pick());
+                match self.pages.last_mut() {
+                    Some(Page::Board { finding, .. }) => *finding = Some(find),
+                    _ => self.finding = Some(find),
+                }
+            }
+            // A letter with Ctrl or Alt is another shortcut.
+            KeyCode::Char(_)
+                if key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) => {}
+            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace if self.on_page() => {
+                self.pages.pop();
+                self.settle();
+            }
+            KeyCode::Esc => return Key::Close,
+            _ if self.reading() => return self.thread_key(code, in_view),
+            KeyCode::Up | KeyCode::Down => self.step(code == KeyCode::Down),
+            KeyCode::Enter | KeyCode::Right => self.go_in(code == KeyCode::Enter),
+            KeyCode::Char('a') if !self.on_page() => {
+                self.this = !self.this;
+                self.settle();
+            }
+            KeyCode::Char('m') if !self.on_page() && !self.items.is_empty() => {
+                self.more = !self.more;
+                self.settle();
+            }
+            _ => {}
+        }
+        Key::Stay
+    }
+
+    /// Whether a find is open on the list or the board in view.
+    pub fn finding(&self) -> bool {
+        self.is_finding()
+    }
+
+    /// A key with every row in view, as a test presses it.
+    #[cfg(test)]
+    pub fn press(&mut self, key: KeyEvent) -> Key {
+        self.key(key, 0..usize::MAX)
+    }
+
+    /// The view as `[sonny] boards = false` has it, as a test reads it.
+    #[cfg(test)]
+    pub fn without_boards(mut self) -> Self {
+        self.boards_on = false;
+        self.reload();
+        self
+    }
+
+    fn is_finding(&self) -> bool {
+        match self.pages.last() {
+            Some(Page::Board { finding, .. }) => finding.is_some(),
+            Some(Page::Thread { .. }) => false,
+            None => self.finding.is_some(),
         }
     }
 
-    /// The pick on the first thread that says what is typed.
+    fn find_mut(&mut self) -> Option<&mut crate::find::Find<Option<Pick>>> {
+        match self.pages.last_mut() {
+            Some(Page::Board { finding, .. }) => finding.as_mut(),
+            Some(Page::Thread { .. }) => None,
+            None => self.finding.as_mut(),
+        }
+    }
+
+    /// `esc` while finding: the rows and the pick as they were.
+    fn drop_find(&mut self) {
+        match self.pages.last_mut() {
+            Some(Page::Board { finding, pick, .. }) => {
+                if let Some(find) = finding.take() {
+                    *pick = find.before;
+                }
+            }
+            Some(Page::Thread { .. }) => {}
+            None => {
+                if let Some(find) = self.finding.take() {
+                    self.pick = find.before;
+                }
+            }
+        }
+        self.settle();
+    }
+
+    /// The rows of the page on top, the list's when none is.
+    fn current_rows(&self) -> Vec<Row> {
+        match self.pages.last() {
+            Some(Page::Board { name, .. }) => self.board_rows(name, self.pages.len() - 1),
+            Some(Page::Thread { .. }) => Vec::new(),
+            None => self.rows(),
+        }
+    }
+
+    fn current_pick(&self) -> Option<Pick> {
+        match self.pages.last() {
+            Some(Page::Board { pick, .. }) => pick.clone(),
+            Some(Page::Thread { .. }) => None,
+            None => self.pick.clone(),
+        }
+    }
+
+    fn set_pick(&mut self, to: Option<Pick>) {
+        match self.pages.last_mut() {
+            Some(Page::Board { pick, .. }) => *pick = to,
+            Some(Page::Thread { .. }) => {}
+            None => self.pick = to,
+        }
+    }
+
+    /// After what is found changed: the pick goes to the first row that
+    /// matches, not to a board kept only because it holds a match.
     fn found(&mut self) {
-        if let Some(at) = (0..self.threads.len()).find(|at| self.shown(*at)) {
-            self.selected = at;
+        let rows = Self::pickable(&self.current_rows());
+        let query = match self.pages.last() {
+            Some(Page::Board { finding, .. }) => finding.as_ref().map(|find| find.query.clone()),
+            _ => self.finding.as_ref().map(|find| find.query.clone()),
+        }
+        .unwrap_or_default();
+        let matches = |row: &Row| match row {
+            Row::Board(at) => crate::find::says(&query, &self.boards[*at].name),
+            Row::Hung(_) | Row::Thread(_) | Row::Item(_) => true,
+            Row::Fold(_) | Row::Heading(_) => false,
+        };
+        // The pick to the first match, as every find has it.
+        let first = rows.iter().find(|row| matches(row)).or(rows.first());
+        let first = first.map(|row| self.pick_of(*row));
+        self.set_pick(first);
+    }
+
+    /// `↑` or `↓` on the list or a board's page.
+    fn step(&mut self, down: bool) {
+        let rows = Self::pickable(&self.current_rows());
+        if rows.is_empty() {
+            return;
+        }
+        let at = (self.current_pick()).and_then(|pick| self.find_pick(&rows, &pick));
+        let next = match (at, down) {
+            (Some(at), true) => (at + 1).min(rows.len() - 1),
+            (Some(at), false) => at.saturating_sub(1),
+            (None, _) => 0,
+        };
+        let next = self.pick_of(rows[next]);
+        self.set_pick(Some(next));
+    }
+
+    /// `enter` or `→` on the pick: a board opens as its page, a thread or
+    /// an item as its thread, a fold in its place; `enter` on an open fold
+    /// shuts it.
+    fn go_in(&mut self, enter: bool) {
+        let rows = Self::pickable(&self.current_rows());
+        let Some(row) = (self.current_pick())
+            .and_then(|pick| self.find_pick(&rows, &pick))
+            .map(|at| rows[at])
+        else {
+            return;
+        };
+        match row {
+            Row::Board(at) => {
+                let name = self.boards[at].name.clone();
+                self.open_board(name);
+            }
+            Row::Fold(_) => {
+                if !self.fold_open {
+                    self.fold_open = true;
+                } else if enter {
+                    self.fold_open = false;
+                }
+            }
+            Row::Heading(state) => {
+                if let Some(Page::Board { open, .. }) = self.pages.last_mut() {
+                    match open.iter().position(|s| *s == state) {
+                        Some(at) if enter => {
+                            open.remove(at);
+                        }
+                        Some(_) => {}
+                        None => open.push(state),
+                    }
+                }
+            }
+            Row::Hung(at) | Row::Item(at) => {
+                let name = self.items[at].thread.clone();
+                self.open_thread_page(name);
+            }
+            Row::Thread(at) => {
+                let name = self.threads[at]["thread"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                self.open_thread_page(name);
+            }
+        }
+        self.settle();
+    }
+
+    fn open_board(&mut self, name: String) {
+        self.pages.push(Page::Board {
+            name,
+            pick: None,
+            open: Vec::new(),
+            finding: None,
+        });
+        self.settle();
+    }
+
+    fn open_thread_page(&mut self, name: String) {
+        let path = self.dir.join(format!("{name}.jsonl"));
+        let posts = valid_name(&name).and_then(|_| self::posts(&path));
+        self.pages.push(Page::Thread {
+            name,
+            posts,
+            stamp: crate::kept::stamp(&path),
+            link: None,
+            links: Vec::new(),
+        });
+    }
+
+    /// A key on a thread's page: the arrows pick among its links in view,
+    /// and scroll where none is left that way; `→` or `enter` follows the
+    /// picked link.
+    fn thread_key(&mut self, code: KeyCode, in_view: std::ops::Range<usize>) -> Key {
+        match code {
+            KeyCode::Up | KeyCode::Down => self.step_link(code == KeyCode::Down, in_view, None),
+            KeyCode::Right | KeyCode::Enter => {
+                let Some(Page::Thread { link, links, .. }) = self.pages.last() else {
+                    return Key::Stay;
+                };
+                // A link scrolled out of view is not followed.
+                let target = (link.and_then(|at| links.get(at)))
+                    .filter(|l| in_view.contains(&l.0))
+                    .map(|l| l.3.clone());
+                self.follow(target)
+            }
+            _ => Key::Stay,
+        }
+    }
+
+    /// An arrow on a thread's page, with `posts` the screen it is drawn
+    /// on: see [`View::step_link`].
+    pub fn arrow(&mut self, down: bool, posts: &mut crate::screen::Screen) -> Key {
+        let in_view = posts.in_view();
+        self.step_link(down, in_view, Some(posts))
+    }
+
+    /// The pick moved down or up a thread's page. Its head's links and
+    /// the links its posts hold (`posts`, the screen's own) are one run,
+    /// the head's above: the pick goes to the next link that way in view,
+    /// whichever holds it, so one link is picked at a time and `enter`
+    /// follows that one; where none is left that way, the view scrolls.
+    fn step_link(
+        &mut self,
+        down: bool,
+        in_view: std::ops::Range<usize>,
+        mut posts: Option<&mut crate::screen::Screen>,
+    ) -> Key {
+        let Some(Page::Thread { link, links, .. }) = self.pages.last_mut() else {
+            return Key::Stay;
+        };
+        let shown: Vec<usize> = (0..links.len())
+            .filter(|&at| in_view.contains(&links[at].0))
+            .collect();
+        let in_posts = posts.as_ref().is_some_and(|s| s.picked_link().is_some());
+        if in_posts && let Some(screen) = posts.as_deref_mut() {
+            if screen.pick_link(down, false) {
+                return Key::Stay;
+            }
+            // Up past a post's first link: the head's last.
+            if !down && let Some(&at) = shown.last() {
+                screen.unpick_link();
+                *link = Some(at);
+                return Key::Stay;
+            }
+            return Key::Scroll(!down);
+        }
+        let mut post =
+            |down: bool| (posts.as_deref_mut()).is_some_and(|s| s.pick_link(down, false));
+        let next = match (*link, down) {
+            (Some(at), true) => shown.iter().copied().find(|&s| s > at),
+            (Some(at), false) => shown.iter().copied().rev().find(|&s| s < at),
+            (None, true) => shown.first().copied(),
+            // Nothing picked, up: the lowest link in view, a post's first.
+            (None, false) if post(false) => return Key::Stay,
+            (None, false) => shown.last().copied(),
+        };
+        match next {
+            Some(at) => *link = Some(at),
+            // Down past the head's last link: a post's first.
+            None if down && post(true) => *link = None,
+            None => return Key::Scroll(!down),
+        }
+        Key::Stay
+    }
+
+    /// Open what a link targets: a board as its page, an item as its
+    /// thread, an agent outside the view.
+    fn follow(&mut self, target: Option<crate::board_view::Target>) -> Key {
+        match target {
+            Some(crate::board_view::Target::Board(name)) => self.open_board(name),
+            Some(crate::board_view::Target::Thread(name)) => self.open_thread_page(name),
+            Some(crate::board_view::Target::Agent(bot)) => {
+                return Key::Open(format!("{}{bot}", crate::links::AGENT));
+            }
+            None => {}
+        }
+        Key::Stay
+    }
+
+    /// A click on one of the page's links, `what` past [`BUTTON`]: the
+    /// address to follow when it leaves the view.
+    pub fn click(&mut self, what: &str) -> Option<String> {
+        let at: usize = what.strip_prefix("link/")?.parse().ok()?;
+        let Some(Page::Thread { link, links, .. }) = self.pages.last_mut() else {
+            return None;
+        };
+        let target = links.get(at).map(|l| l.3.clone())?;
+        *link = Some(at);
+        match self.follow(Some(target)) {
+            Key::Open(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Back a page, as `←` there and the title's `‹` go. Whether there
+    /// was one to leave.
+    pub fn back(&mut self) -> bool {
+        let left = self.pages.pop().is_some();
+        self.settle();
+        left
+    }
+
+    /// The thread `name` opened, as a link elsewhere names it, and picked
+    /// in the list it goes back to.
+    pub fn open_thread(&mut self, name: &str) {
+        self.pages.clear();
+        self.pick = Some(Pick::Thread(name.to_owned()));
+        self.open_thread_page(name.to_owned());
+    }
+
+    /// The row at `at` among those the pick lands on, picked, as a click
+    /// picks it.
+    pub fn pick_at(&mut self, at: usize) {
+        if self.reading() {
+            return;
+        }
+        let rows = Self::pickable(&self.current_rows());
+        if let Some(row) = rows.get(at) {
+            let pick = self.pick_of(*row);
+            self.set_pick(Some(pick));
         }
     }
 
     /// Words pasted while finding, as if typed: whether a find took them.
     pub fn paste(&mut self, text: &str) -> bool {
-        let Some(find) = self.finding.as_mut().filter(|_| self.open.is_none()) else {
+        let Some(find) = self.find_mut() else {
             return false;
         };
         find.paste(text);
@@ -2022,115 +2816,37 @@ impl View {
         true
     }
 
-    /// Whether a find is under way.
-    pub fn finding(&self) -> bool {
-        self.finding.is_some() && self.open.is_none()
-    }
-
-    pub fn key(&mut self, key: KeyEvent) -> Key {
-        self.notice = None;
-        let opened = self.open.is_some();
-        // `ctrl+f` in the list: what is typed narrows the threads, the pick
-        // on the first that says it; `esc` drops the find and puts the
-        // pick back. The arrows and `enter` stay the list's.
-        if !opened {
-            if let Some(find) = &mut self.finding {
-                match find.key(&key) {
-                    crate::find::Typed::Dropped => {
-                        self.selected = (self.finding.take().map(|find| find.before))
-                            .unwrap_or(self.selected)
-                            .min(self.threads.len().saturating_sub(1));
-                        return Key::Stay;
-                    }
-                    crate::find::Typed::Changed => {
-                        self.found();
-                        return Key::Stay;
-                    }
-                    crate::find::Typed::Other => {}
-                }
-            } else if crate::find::opens(&key) && !self.threads.is_empty() {
-                self.finding = Some(crate::find::Find::new(self.selected));
-                return Key::Stay;
-            }
-        }
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Key::Close;
-            }
-            KeyCode::Char(_)
-                if key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) => {}
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left if opened => self.open = None,
-            KeyCode::Esc => return Key::Close,
-            KeyCode::Up | KeyCode::Char('k') if !opened => self.selected = self.step(false),
-            KeyCode::Down | KeyCode::Char('j') if !opened => self.selected = self.step(true),
-            KeyCode::Char('a') if !opened => {
-                self.this = !self.this;
-                self.reload();
-            }
-            // A find that keeps nothing picks nothing to open.
-            KeyCode::Enter | KeyCode::Right if !opened && self.shown(self.selected) => {
-                if let Some(name) = self.picked().map(str::to_owned) {
-                    match thread(&self.dir, &name) {
-                        Ok(read) => {
-                            self.open = Some((name, read));
-                            self.open_stamp = None;
-                        }
-                        Err(error) => self.notice = Some(error),
-                    }
-                }
-            }
-            _ => {}
-        }
-        Key::Stay
-    }
-
-    /// The thread `name` opened, as a link elsewhere names it, and picked
-    /// in the list it goes back to.
-    pub fn open_thread(&mut self, name: &str) {
-        if let Some(at) = (self.threads.iter()).position(|t| t["thread"] == name) {
-            self.selected = at;
-        }
-        match thread(&self.dir, name) {
-            Ok(read) => {
-                self.open = Some((name.to_owned(), read));
-                self.open_stamp = None;
-            }
-            Err(error) => self.notice = Some(error),
-        }
-    }
-
-    /// Whether a thread is open, whose rows scroll with the arrows.
-    pub fn reading(&self) -> bool {
-        self.open.is_some()
-    }
-
     /// The card, and the row the picked thread starts on.
     #[cfg(test)]
-    pub fn card(&self, width: usize) -> (Vec<Line<'static>>, usize) {
-        let (out, at, _) = self.card_rows(width);
-        (out, at)
+    pub fn card(&mut self, width: usize) -> (Vec<Line<'static>>, usize) {
+        let card = self.card_rows(width);
+        (card.lines, card.at)
     }
 
-    /// [`View::card`], and the row each thread listed starts on, by its
-    /// place in the list; none while a thread is open.
-    pub fn card_rows(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
-        match &self.open {
-            Some((_, read)) => (self.thread_lines(read, width), 0, Vec::new()),
-            None => self.list_lines(width),
+    /// The card `width` wide, as [`Card`] says.
+    pub fn card_rows(&mut self, width: usize) -> Card {
+        let mut card = match self.pages.last() {
+            Some(Page::Thread { .. }) => self.thread_card(width),
+            Some(Page::Board { name, .. }) => {
+                let name = name.clone();
+                self.board_card(&name, width)
+            }
+            None => self.list_card(width),
+        };
+        // The find row, the view's last.
+        let query = match self.pages.last() {
+            Some(Page::Board { finding, .. }) => finding.as_ref(),
+            Some(Page::Thread { .. }) => None,
+            None => self.finding.as_ref(),
+        };
+        if let Some(find) = query {
+            card.lines.push(Line::default());
+            card.lines.push(crate::find::line(&find.query));
         }
+        card
     }
 
-    /// The thread at `at` picked, as a click picks it.
-    pub fn pick_at(&mut self, at: usize) {
-        if self.open.is_none() && at < self.threads.len() {
-            self.selected = at;
-        }
-    }
-
-    fn list_lines(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
-        let count = self.threads.len();
+    fn head(&self, boards: usize, threads: usize) -> Line<'static> {
         // Numbers, read as numbers: a listing short of one says 0, never null.
         let invites = |key: &str| self.invites[key].as_u64().unwrap_or(0);
         // Whose it is, every project's agents sharing here, then what it holds.
@@ -2138,123 +2854,397 @@ impl View {
             true => self.project.clone(),
             false => "every project".to_owned(),
         };
-        let mut out = vec![Line::from(vec![
-            Span::raw(whose).bold(),
-            Span::raw(format!(
-                " · {count} thread{} · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
-                if count == 1 { "" } else { "s" },
-                invites("today"),
-                invites("a_day"),
-                invites("reach"),
-                invites("answered"),
-                invites("this_week"),
-                self.golden,
-                if self.golden == 1 { "" } else { "s" },
-            ))
-            .dim(),
-        ])];
-        if self.threads.is_empty() {
-            out.push(Line::default());
-            out.push(Line::from(match self.this {
-                true => "No thread started in this project yet.",
-                false => "No thread yet.",
-            }));
-            out.push(
-                Line::from("Agents start one with their commons tool when they have something to share or ask.")
-                    .dim(),
-            );
-            return (out, 0, Vec::new());
-        }
-        let mut at = 0;
-        // Each thread's row, by its place: one a find leaves out has none,
-        // past the last line, so no click lands on it.
-        let mut starts = Vec::new();
-        for (index, thread) in self.threads.iter().enumerate() {
-            let picked = index == self.selected;
-            if !self.shown(index) {
-                starts.push(usize::MAX);
-                continue;
-            }
-            out.push(Line::default());
-            if picked {
-                at = out.len();
-            }
-            starts.push(out.len());
-            let text = |key: &str| thread[key].as_str().unwrap_or_default().to_owned();
-            // A picked title is reversed on every row it wraps to, each a
-            // cell past its last word, which the wrap leaves room for so
-            // the band never spills onto a row of its own.
-            let title = Span::raw(text("title")).bold();
-            let mut rows = crate::transcript::wrap(
-                Line::from(vec![Span::raw("  "), title]),
-                width.saturating_sub(1),
-                Span::raw(""),
-                Span::raw("  "),
-            );
-            if picked {
-                for row in &mut rows {
-                    // The space a wrap leaves after its last word, which
-                    // the band's own cell stands for.
-                    if let Some(last) = row.spans.last_mut() {
-                        let kept = last.content.trim_end().len();
-                        last.content.to_mut().truncate(kept);
-                    }
-                    crate::list::pick(row);
-                }
-            }
-            out.extend(rows);
-            let posts = thread["posts"].as_u64().unwrap_or(0);
-            let mut facts = vec![
-                format!("{posts} post{}", if posts == 1 { "" } else { "s" }),
-                format!("by {}", text("started_by")),
-            ];
-            if posts > 1 {
-                facts.push(format!("last {}", text("last_by")));
-            }
-            facts.push(text("last_when"));
-            if let Some(reads) = thread["reads"].as_u64().filter(|n| *n > 0) {
-                facts.push(format!("read {reads}×"));
-            }
-            out.extend(crate::transcript::wrap(
-                Line::from(facts.join(" · ")).dim(),
-                width,
-                Span::raw("  "),
-                Span::raw("  "),
+        let mut facts = String::new();
+        if boards > 0 {
+            facts.push_str(&format!(
+                " · {}",
+                crate::board_view::counted(boards, "board")
             ));
         }
-        // The find row, the view's last; and a find that keeps nothing says
-        // so.
-        if let Some(find) = &self.finding {
-            if find.typed() && !(0..self.threads.len()).any(|at| self.shown(at)) {
-                out.push(Line::default());
-                out.push(Line::from(format!("no thread matches {}", find.query)).dim());
-            }
-            out.push(Line::default());
-            out.push(crate::find::line(&find.query));
-        }
-        (out, at, starts)
+        facts.push_str(&format!(
+            " · {threads} thread{} · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
+            if threads == 1 { "" } else { "s" },
+            invites("today"),
+            invites("a_day"),
+            invites("reach"),
+            invites("answered"),
+            invites("this_week"),
+            self.golden,
+            if self.golden == 1 { "" } else { "s" },
+        ));
+        Line::from(vec![Span::raw(whose).bold(), Span::raw(facts).dim()])
     }
 
-    fn thread_lines(&self, read: &Value, width: usize) -> Vec<Line<'static>> {
+    fn list_card(&self, width: usize) -> Card {
+        let rows = self.rows();
+        let now = Self::now();
+        let (open, _) = self.boards_split();
+        let threads = (self.threads.iter())
+            .filter(|thread| self.in_scope(thread) && !self.is_item(thread))
+            .count();
+        let items = (self.threads.iter())
+            .filter(|thread| self.in_scope(thread) && self.is_item(thread))
+            .count();
+        let mut out = vec![self.head(open.len(), threads)];
+        let mut card = Card {
+            lines: Vec::new(),
+            at: 0,
+            starts: Vec::new(),
+            agents: Vec::new(),
+            links: Vec::new(),
+        };
+        let any_board = self.boards.iter().any(|board| self.board_in_scope(board));
+        if rows.is_empty() {
+            out.push(Line::default());
+            match &self.finding {
+                Some(find) if find.typed() => {
+                    out.push(Line::from(format!("nothing here matches {}", find.query)).dim());
+                }
+                _ if any_board => {}
+                _ => {
+                    out.push(Line::from(match self.this {
+                        true => "No thread started in this project yet.",
+                        false => "No thread yet.",
+                    }));
+                    out.push(
+                        Line::from("Agents start one with their commons tool when they have something to share or ask.")
+                            .dim(),
+                    );
+                }
+            }
+            card.lines = out;
+            return card;
+        }
+        let picked = (self.pick.as_ref()).and_then(|pick| self.find_pick(&rows, pick));
+        let column = (rows.iter())
+            .filter_map(|row| match row {
+                Row::Board(at) => Some(crate::title::width(&self.boards[*at].name)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let board_rows = rows
+            .iter()
+            .filter(|row| !matches!(row, Row::Thread(_)))
+            .count();
+        let thread_rows = rows.len() - board_rows;
+        for (index, row) in rows.iter().enumerate() {
+            let pick = picked == Some(index);
+            // Each section's heading, before its first row, when there
+            // are boards: with none the list is the threads alone, as
+            // it always was.
+            if any_board && index == 0 && board_rows > 0 {
+                out.push(Line::default());
+                out.push(Line::from(vec![
+                    Span::raw("Boards").bold(),
+                    Span::raw(format!(" · {}", open.len())).dim(),
+                ]));
+            }
+            if any_board && index == board_rows && thread_rows > 0 {
+                out.push(Line::default());
+                let mut heading = vec![
+                    Span::raw("Threads").bold(),
+                    Span::raw(format!(" · {threads}")).dim(),
+                ];
+                if self.more {
+                    heading.push(
+                        Span::raw(format!(" · {}", crate::board_view::counted(items, "item")))
+                            .dim(),
+                    );
+                }
+                out.push(Line::from(heading));
+            }
+            match row {
+                Row::Board(at) => {
+                    if pick {
+                        card.at = out.len();
+                    }
+                    card.starts.push(out.len());
+                    let mut line =
+                        crate::board_view::board_row(&self.boards[*at], column, width, now);
+                    if pick {
+                        crate::list::pick(&mut line);
+                    }
+                    out.push(line);
+                }
+                Row::Fold(n) => {
+                    if pick {
+                        card.at = out.len();
+                    }
+                    card.starts.push(out.len());
+                    let mark = if self.fold_open { "▾" } else { "▸" };
+                    let mut line = Line::from(vec![
+                        Span::raw(" "),
+                        Span::raw(format!(
+                            "{mark} {}",
+                            crate::board_view::counted(*n, "finished board")
+                        ))
+                        .dim(),
+                    ]);
+                    if pick {
+                        crate::list::pick(&mut line);
+                    }
+                    out.push(line);
+                }
+                Row::Hung(at) => {
+                    if pick {
+                        card.at = out.len();
+                    }
+                    card.starts.push(out.len());
+                    let item = &self.items[*at];
+                    let mut spans = vec![Span::raw("   "), item.state.sign(), Span::raw(" ")];
+                    let room = width.saturating_sub(5);
+                    spans.push(Span::raw(crate::title::cut(&item.title, room)));
+                    let mut line = Line::from(spans);
+                    if pick {
+                        crate::list::pick(&mut line);
+                    }
+                    out.push(line);
+                }
+                Row::Thread(at) => {
+                    out.push(Line::default());
+                    if pick {
+                        card.at = out.len();
+                    }
+                    card.starts.push(out.len());
+                    self.thread_row(&self.threads[*at], pick, width, &mut out);
+                }
+                Row::Heading(_) | Row::Item(_) => {}
+            }
+        }
+        card.lines = out;
+        card
+    }
+
+    /// A thread's two rows in the list: its title, bold, and under it
+    /// what it holds. An item has its state's mark in the two columns a
+    /// thread leaves empty, and its row under starts with its board and
+    /// its state.
+    fn thread_row(&self, thread: &Value, picked: bool, width: usize, out: &mut Vec<Line<'static>>) {
+        let text = |key: &str| thread[key].as_str().unwrap_or_default().to_owned();
+        let item = (thread["thread"].as_str())
+            .and_then(|name| self.item_at.get(name))
+            .map(|at| &self.items[*at]);
+        let lead = match item {
+            Some(item) => Line::from(vec![item.state.sign(), Span::raw(" ")]),
+            None => Line::from("  "),
+        };
+        // A picked title is reversed on every row it wraps to, each a
+        // cell past its last word, which the wrap leaves room for so
+        // the band never spills onto a row of its own.
+        let title = Span::raw(text("title")).bold();
+        let mut rows = crate::transcript::wrap_lines(
+            Line::from(vec![title]),
+            width.saturating_sub(1),
+            lead,
+            Line::from("  "),
+        );
+        if picked {
+            for row in &mut rows {
+                // The space a wrap leaves after its last word, which
+                // the band's own cell stands for.
+                if let Some(last) = row.spans.last_mut() {
+                    let kept = last.content.trim_end().len();
+                    last.content.to_mut().truncate(kept);
+                }
+                crate::list::pick(row);
+            }
+        }
+        out.extend(rows);
+        let posts = thread["posts"].as_u64().unwrap_or(0);
+        let mut facts = Vec::new();
+        if let Some(item) = item {
+            facts.push(crate::board_view::state_words(
+                item,
+                &self.project,
+                &self.present,
+            ));
+        }
+        facts.push(format!("{posts} post{}", if posts == 1 { "" } else { "s" }));
+        facts.push(format!("by {}", text("started_by")));
+        if posts > 1 {
+            facts.push(format!("last {}", text("last_by")));
+        }
+        facts.push(text("last_when"));
+        if let Some(reads) = thread["reads"].as_u64().filter(|n| *n > 0) {
+            facts.push(format!("read {reads}×"));
+        }
+        let mut spans = Vec::new();
+        if let Some(item) = item {
+            // The board's name in `ink`, then the rest muted.
+            spans.push(Span::raw(item.board.clone()));
+            spans.push(Span::raw(" · ").dim());
+        }
+        spans.push(Span::raw(facts.join(" · ")).dim());
+        out.extend(crate::transcript::wrap(
+            Line::from(spans),
+            width,
+            Span::raw("  "),
+            Span::raw("  "),
+        ));
+    }
+
+    fn board_card(&self, name: &str, width: usize) -> Card {
+        let page = self.pages.len() - 1;
+        let mut card = Card {
+            lines: Vec::new(),
+            at: 0,
+            starts: Vec::new(),
+            agents: Vec::new(),
+            links: Vec::new(),
+        };
+        let Some(board) = self.boards.iter().find(|board| board.name == name) else {
+            card.lines = vec![
+                Line::from(name.to_owned()).bold(),
+                Line::default(),
+                Line::from("No item is on this board now.").dim(),
+            ];
+            return card;
+        };
+        let now = Self::now();
+        let mut out = crate::board_view::page_head(board);
+        let rows = self.board_rows(name, page);
+        let pickable = Self::pickable(&rows);
+        let picked = (self.current_pick())
+            .and_then(|pick| self.find_pick(&pickable, &pick))
+            .map(|at| pickable[at]);
+        let others: HashMap<&str, &crate::board_view::Item> = (self.items.iter())
+            .map(|item| (item.thread.as_str(), item))
+            .collect();
+        if rows.is_empty()
+            && let Some(Page::Board {
+                finding: Some(find),
+                ..
+            }) = self.pages.last()
+        {
+            out.push(Line::default());
+            out.push(Line::from(format!("no item matches {}", find.query)).dim());
+        }
+        for row in &rows {
+            match row {
+                Row::Heading(state) => {
+                    out.push(Line::default());
+                    let open = match self.pages.last() {
+                        Some(Page::Board { open, finding, .. }) => {
+                            open.contains(state) || finding.is_some()
+                        }
+                        _ => false,
+                    };
+                    let n = (board.items.iter())
+                        .filter(|item| self.items[**item].state == *state)
+                        .count();
+                    if state.folds() {
+                        if picked == Some(*row) {
+                            card.at = out.len();
+                        }
+                        card.starts.push(out.len());
+                    }
+                    let mut line = crate::board_view::section_heading(*state, n, open);
+                    if picked == Some(*row) {
+                        crate::list::pick(&mut line);
+                    }
+                    out.push(line);
+                }
+                Row::Item(at) => {
+                    let item = &self.items[*at];
+                    if picked == Some(*row) {
+                        card.at = out.len();
+                    }
+                    card.starts.push(out.len());
+                    let (mut line, named) =
+                        crate::board_view::page_row(item, width, now, &self.project, &self.present);
+                    if let Some((from, to, bot)) = named {
+                        card.agents.push((out.len(), from, to, bot));
+                    }
+                    if picked == Some(*row) {
+                        crate::list::pick(&mut line);
+                    }
+                    out.push(line);
+                    if let Some(detail) = crate::board_view::page_detail(item, &others, width) {
+                        out.push(detail);
+                    }
+                }
+                _ => {}
+            }
+        }
+        card.lines = out;
+        card
+    }
+
+    fn thread_card(&mut self, width: usize) -> Card {
+        let mut card = Card {
+            lines: Vec::new(),
+            at: 0,
+            starts: Vec::new(),
+            agents: Vec::new(),
+            links: Vec::new(),
+        };
+        let Some(Page::Thread {
+            name, posts, link, ..
+        }) = self.pages.last()
+        else {
+            return card;
+        };
+        let posts = match posts {
+            Ok(posts) => posts,
+            Err(error) => {
+                card.lines = vec![Line::from(format!("✗ could not read {name}: {error}")).dim()];
+                return card;
+            }
+        };
+        let picked_link = *link;
+        let title = (posts.first())
+            .and_then(|post| post["title"].as_str())
+            .unwrap_or_default();
         let mut out = crate::transcript::wrap(
-            Line::from(read["title"].as_str().unwrap_or_default().to_owned()).bold(),
+            Line::from(title.to_owned()).bold(),
             width,
             Span::raw(""),
             Span::raw(""),
         );
-        out.push(Line::from(read["thread"].as_str().unwrap_or_default().to_owned()).dim());
-        for post in read["posts"].as_array().into_iter().flatten() {
+        out.push(Line::from(name.clone()).dim());
+        let item = self.item_at.get(name.as_str()).map(|at| &self.items[*at]);
+        let mut links = Vec::new();
+        if let Some(item) = item {
+            let (rows, found) =
+                crate::board_view::item_head(item, &self.project, &self.present, width);
+            let first = out.len();
+            for (row, from, to, target) in found {
+                links.push((first + row, from, to, target));
+            }
+            out.extend(rows);
+        }
+        for post in posts {
             out.push(Line::default());
+            let by = post["by"].as_str().unwrap_or_default();
+            let when = when(post["at"].as_i64().unwrap_or(0));
+            // What an agent did to the item: who, what, when, one muted
+            // row; a closing one has its text under it, as any post.
+            if let Some(did) = crate::board_view::action_words(post, &self.project) {
+                out.push(Line::from(format!("{by} · {did} · {when}")).dim());
+                let closes = matches!(post["do"].as_str(), Some("done" | "fail" | "cancel"));
+                let text = post["text"].as_str().unwrap_or_default();
+                if closes && !text.trim().is_empty() {
+                    let mut markdown = crate::transcript::Markdown::default();
+                    out.extend(crate::transcript::markdown(
+                        &mut markdown,
+                        text,
+                        width,
+                        (Line::from("  "), Line::from("  ")),
+                    ));
+                }
+                continue;
+            }
             let mut head = vec![
                 // Its writer by name: one of this daemon's agents takes the
                 // agents' hue and opens, as wherever an agent is named.
-                Span::raw(post["by"].as_str().unwrap_or_default().to_owned()).bold(),
+                Span::raw(by.to_owned()).bold(),
             ];
             // The model it was written with, as people say it.
             if let Some(model) = post["model"].as_str() {
                 head.push(Span::raw(format!(" · {}", crate::models::label(model))).dim());
             }
-            head.push(Span::raw(format!(" · {}", post["when"].as_str().unwrap_or_default())).dim());
+            head.push(Span::raw(format!(" · {when}")).dim());
             if post["external"] == true {
                 // Nothing to act on: muted, as the rest of the line.
                 head.push(Span::raw(" · external").dim());
@@ -2268,10 +3258,23 @@ impl View {
                 (Line::from("  "), Line::from("  ")),
             ));
         }
-        out
+        // The picked link reversed; each a button by its place.
+        for (at, (row, from, to, _)) in links.iter().enumerate() {
+            card.links.push((*row, *from, *to, at));
+            if picked_link == Some(at)
+                && let Some(line) = out.get_mut(*row)
+            {
+                reverse_columns(line, *from, *to);
+            }
+        }
+        if let Some(Page::Thread { links: kept, .. }) = self.pages.last_mut() {
+            *kept = links;
+        }
+        card.lines = out;
+        card
     }
 
-    /// The line under the card: what went wrong, or the keys.
+    /// The line under the card: what went wrong.
     pub fn footer(&self) -> Option<Line<'static>> {
         self.notice
             .as_ref()
@@ -2285,24 +3288,64 @@ impl View {
             true => "every project",
             false => "this project",
         };
-        match (&self.open, self.threads.len()) {
-            (Some(_), _) => Keys::new().key("↑↓", "scroll").esc(Esc::Back),
-            (None, 0) => Keys::new().key("a", whose).esc(Esc::Close),
-            // `esc` drops the find first; the next one closes the view.
-            (None, _) if self.finding.is_some() => (Keys::new().pick().enter(Enter::Open))
+        let finding = self.is_finding();
+        match self.pages.last() {
+            Some(Page::Thread { links, .. }) if !links.is_empty() => {
+                Keys::new().pick().esc(Esc::Back)
+            }
+            Some(Page::Thread { .. }) => Keys::new().key("↑↓", "scroll").esc(Esc::Back),
+            // `esc` drops the find first; the next one leaves the page.
+            _ if finding => (Keys::new().pick().enter(Enter::Open))
                 .find()
                 .esc(Esc::Cancel),
-            (None, 1) => (Keys::new().enter(Enter::Open))
+            Some(Page::Board { .. }) => (Keys::new().pick().enter(Enter::Open))
                 .find()
-                .key("a", whose)
-                .esc(Esc::Close),
-            (None, _) => (Keys::new().pick().enter(Enter::Open))
-                .find()
-                .key("a", whose)
-                .esc(Esc::Close),
+                .esc(Esc::Back),
+            None => {
+                let rows = Self::pickable(&self.rows()).len();
+                let mut keys = match rows {
+                    0 => Keys::new(),
+                    1 => Keys::new().enter(Enter::Open),
+                    _ => Keys::new().pick().enter(Enter::Open),
+                };
+                keys = keys.find().key("a", whose);
+                if !self.items.is_empty() {
+                    keys = keys.key("m", if self.more { "threads only" } else { "items" });
+                }
+                keys.esc(Esc::Close)
+            }
         }
         .text()
     }
+}
+
+/// `line` reversed from column `from` to `to`, as a picked link is.
+fn reverse_columns(line: &mut Line<'static>, from: usize, to: usize) {
+    use unicode_width::UnicodeWidthStr;
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for span in std::mem::take(&mut line.spans) {
+        let width = span.content.width();
+        let (start, end) = (at, at + width);
+        at = end;
+        if end <= from || start >= to || !span.content.is_ascii() {
+            spans.push(span);
+            continue;
+        }
+        let text = span.content.to_string();
+        let (a, b) = (from.saturating_sub(start), to.min(end) - start);
+        if a > 0 {
+            spans.push(Span::styled(text[..a].to_owned(), span.style));
+        }
+        spans.push(Span::styled(
+            text[a..b].to_owned(),
+            span.style.add_modifier(ratatui::style::Modifier::REVERSED),
+        ));
+        if b < text.len() {
+            spans.push(Span::styled(text[b..].to_owned(), span.style));
+        }
+    }
+    line.spans = spans;
 }
 
 #[cfg(test)]
@@ -2344,85 +3387,79 @@ mod tests {
 
     #[test]
     fn ctrl_f_narrows_the_threads_picks_the_first_match_and_esc_puts_them_back() {
-        let thread = |name: &str, title: &str, by: &str| {
-            json!({"thread": name, "title": title, "project": "calc", "started_by": by,
-                   "last_by": by, "posts": 1, "last_when": "2m ago"})
-        };
-        let mut view = View {
-            dir: home("find"),
-            project: "calc".into(),
-            this: false,
-            threads: vec![
-                thread("rounding", "How do you round half cents?", "halves"),
-                thread("ci-cache", "Caching the CI's cargo target", "builder"),
-                thread("readme", "Which README examples still run?", "readme"),
-            ],
-            invites: Value::Null,
-            selected: 2,
-            open: None,
-            open_stamp: None,
-            known: Summaries::new(),
-            golden: 0,
-            notice: None,
-            finding: None,
-        };
+        let home = &home("find");
+        for (by, name, title) in [
+            ("calc.halves", "rounding", "How do you round half cents?"),
+            ("calc.builder", "ci-cache", "Caching the CI's cargo target"),
+            ("calc.readme", "readme", "Which README examples still run?"),
+        ] {
+            caught_up(
+                home,
+                by,
+                None,
+                None,
+                &json!({"post": {"name": name, "title": title, "text": "?"}}),
+            )
+            .unwrap();
+        }
+        let mut view = View::open(home, "calc".into());
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        let text = |view: &View| -> Vec<String> {
+        let text = |view: &mut View| -> Vec<String> {
             (view.card(80).0.iter())
                 .map(|line| line.to_string().trim_end().to_owned())
                 .collect()
         };
-        let says = |view: &View, what: &str| text(view).iter().any(|line| line.contains(what));
+        let picked = |view: &mut View| {
+            let (lines, at) = view.card(80);
+            lines[at].to_string()
+        };
+        let says = |view: &mut View, what: &str| text(view).iter().any(|line| line.contains(what));
         // The hint names it with the view's keys.
         assert_eq!(
             view.keys(),
             "↑↓ pick · enter open · ctrl+f find · a this project · esc close"
         );
+        while !picked(&mut view).contains("README") {
+            view.press(key(KeyCode::Down));
+        }
         let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
-        assert_eq!(view.key(ctrl_f), Key::Stay);
+        assert_eq!(view.press(ctrl_f), Key::Stay);
         assert!(view.finding());
-        assert_eq!(text(&view).last().unwrap(), "find");
-        // Typed, even `a` and `j`, it narrows; the pick to the first match.
-        assert_eq!(view.key(key(KeyCode::Char('c'))), Key::Stay);
-        assert!(says(&view, "round half cents") && says(&view, "README"));
-        assert_eq!(view.selected, 0);
-        assert_eq!(view.key(key(KeyCode::Char('a'))), Key::Stay);
-        assert!(!says(&view, "round half") && says(&view, "Caching the CI"));
-        assert!(!says(&view, "README"), "{:#?}", text(&view));
-        assert_eq!(view.selected, 1);
-        assert_eq!(text(&view).last().unwrap(), "find ca");
-        // Only the thread found has a row a click lands on: the ones left
-        // out have none, so no click on a row shown opens one hidden.
-        let (lines, _, starts) = view.card_rows(80);
-        assert!(starts[1] < lines.len(), "{starts:?}");
-        assert!(
-            starts[0] >= lines.len() && starts[2] >= lines.len(),
-            "{starts:?}"
-        );
+        assert_eq!(text(&mut view).last().unwrap(), "find");
+        // Typed, it narrows; the pick to the first match.
+        assert_eq!(view.press(key(KeyCode::Char('c'))), Key::Stay);
+        assert!(says(&mut view, "round half cents") && says(&mut view, "README"));
+        // Who wrote counts too: `calc.` is in every one's, `cac` only in
+        // a title.
+        view.press(key(KeyCode::Char('a')));
+        assert!(says(&mut view, "round half") && says(&mut view, "README"));
+        assert_eq!(view.press(key(KeyCode::Char('c'))), Key::Stay);
+        assert!(!says(&mut view, "round half") && says(&mut view, "Caching the CI"));
+        assert!(!says(&mut view, "README"), "{:#?}", text(&mut view));
+        assert!(picked(&mut view).contains("Caching the CI"));
+        assert_eq!(text(&mut view).last().unwrap(), "find cac");
         // The arrows stay among the threads found.
-        view.key(key(KeyCode::Up));
-        assert_eq!(view.selected, 1);
-        // A thread found open: a paste there is no more to find.
-        view.open = Some(("ci-cache".into(), json!({})));
-        assert!(!view.finding() && !view.paste("zz"));
-        view.open = None;
+        view.press(key(KeyCode::Up));
+        assert!(picked(&mut view).contains("Caching the CI"));
         // Pasted, as typed; nothing found says so, and nothing is picked
         // to open.
         assert!(view.paste("zz"));
-        assert!(says(&view, "no thread matches cazz"), "{:#?}", text(&view));
-        assert_eq!(view.key(key(KeyCode::Enter)), Key::Stay);
         assert!(
-            view.open.is_none() && view.notice.is_none(),
-            "{:?}",
-            view.notice
+            says(&mut view, "nothing here matches caczz"),
+            "{:#?}",
+            text(&mut view)
         );
+        assert_eq!(view.press(key(KeyCode::Enter)), Key::Stay);
+        assert!(!view.reading());
         // `esc` drops the find, the threads and the pick as they were; the
         // next closes the view.
-        assert_eq!(view.key(key(KeyCode::Esc)), Key::Stay);
-        assert!(!view.finding() && view.selected == 2);
-        assert!(says(&view, "README") && says(&view, "round half"));
-        assert!(!text(&view).last().unwrap().contains("find"));
-        assert_eq!(view.key(key(KeyCode::Esc)), Key::Close);
+        assert_eq!(view.press(key(KeyCode::Esc)), Key::Stay);
+        assert!(!view.finding() && !view.paste("zz"));
+        assert!(picked(&mut view).contains("README"));
+        assert!(says(&mut view, "README") && says(&mut view, "round half"));
+        assert!(!text(&mut view).last().unwrap().contains("find"));
+        assert_eq!(view.press(key(KeyCode::Esc)), Key::Close);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -3245,7 +4282,7 @@ mod tests {
         )
         .unwrap();
         let mut view = View::open(home, "a".into());
-        view.key(KeyEvent::from(KeyCode::Enter));
+        view.press(KeyEvent::from(KeyCode::Enter));
         assert!(view.reading());
         assert_eq!(
             caught_up(home, "a.x", None, None, &json!({})).unwrap()["threads"][0]["reads"],
@@ -3436,8 +4473,8 @@ mod tests {
             "↑↓ pick · enter open · ctrl+f find · a this project · esc close"
         );
         assert_eq!(view.footer(), None);
-        view.key(KeyEvent::from(KeyCode::Down));
-        view.key(KeyEvent::from(KeyCode::Enter));
+        view.press(KeyEvent::from(KeyCode::Down));
+        view.press(KeyEvent::from(KeyCode::Enter));
         let read = text(view.card(60).0);
         assert_eq!(read[0], "Old one");
         // Who wrote it, with the model it wrote with as people say it.
@@ -3447,9 +4484,9 @@ mod tests {
         );
         assert!(read.iter().any(|l| l.contains("first")), "{read:?}");
         // Esc goes back to the threads, and from there closes.
-        assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Stay);
+        assert_eq!(view.press(KeyEvent::from(KeyCode::Esc)), Key::Stay);
         assert!(!view.reading());
-        assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
+        assert_eq!(view.press(KeyEvent::from(KeyCode::Esc)), Key::Close);
     }
 
     #[test]
@@ -3464,7 +4501,7 @@ mod tests {
             &json!({"post": {"name": "long", "title": title, "text": "first"}}),
         )
         .unwrap();
-        let view = View::open(home, "a".into());
+        let mut view = View::open(home, "a".into());
         for width in 30..=80 {
             let (lines, at) = view.card(width);
             for line in &lines[at..] {
@@ -3514,7 +4551,7 @@ mod tests {
             json!({"thread": "u", "at": now(), "golden": true, "reach": 3}),
         ];
         assert!(keep(&dir, &sent, 2));
-        let view = View::open(home, "a".into());
+        let mut view = View::open(home, "a".into());
         let head: String = (view.card(200).0[0].spans.iter())
             .map(|span| span.content.as_ref())
             .collect();
@@ -3887,26 +4924,29 @@ mod tests {
         post("shop.lead", "shop", "ours");
         post("calc.lead", "calc", "theirs");
         let mut view = View::open(home, "shop".into());
-        let head = |view: &View| line_text(&view.card(80).0[0]);
+        let head = |view: &mut View| line_text(&view.card(80).0[0]);
+        let listed =
+            |view: &mut View| -> Vec<String> { view.card(80).0.iter().map(line_text).collect() };
         // Every project's, as it opens.
-        assert_eq!(view.threads.len(), 2);
-        assert!(head(&view).starts_with("every project · 2 threads"));
+        assert!(listed(&mut view).iter().any(|l| l.contains("theirs")));
+        assert!(head(&mut view).starts_with("every project · 2 threads"));
         assert!(view.keys().contains("a this project"), "{}", view.keys());
-        view.key(KeyEvent::from(KeyCode::Char('a')));
-        assert_eq!(view.threads.len(), 1);
-        assert_eq!(view.threads[0]["thread"], "ours");
-        assert!(head(&view).starts_with("shop · 1 thread "));
+        view.press(KeyEvent::from(KeyCode::Char('a')));
+        let shown = listed(&mut view);
+        assert!(shown.iter().any(|l| l.contains("ours")), "{shown:?}");
+        assert!(!shown.iter().any(|l| l.contains("theirs")), "{shown:?}");
+        assert!(head(&mut view).starts_with("shop · 1 thread "));
         assert!(view.keys().contains("a every project"), "{}", view.keys());
         // None started here: says so.
         let mut none = View::open(home, "web".into());
-        none.key(KeyEvent::from(KeyCode::Char('a')));
+        none.press(KeyEvent::from(KeyCode::Char('a')));
         let lines: Vec<String> = none.card(80).0.iter().map(line_text).collect();
         assert!(
             lines.contains(&"No thread started in this project yet.".to_owned()),
             "{lines:?}"
         );
-        view.key(KeyEvent::from(KeyCode::Char('a')));
-        assert_eq!(view.threads.len(), 2);
+        view.press(KeyEvent::from(KeyCode::Char('a')));
+        assert!(listed(&mut view).iter().any(|l| l.contains("theirs")));
         let _ = std::fs::remove_dir_all(home);
     }
 

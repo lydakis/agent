@@ -59,6 +59,8 @@ def main():
                         help='then, with the page open, this many tasks of other projects run turns back to back')
     parser.add_argument('--seconds', type=float, default=20)
     parser.add_argument('--seed')
+    parser.add_argument('--other-build', action='store_true',
+                        help='the new window opens as after an upgrade: what was kept was read by another build')
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
     agent, sonny = (str(Path(p).resolve()) for p in (args.agent, args.sonny))
@@ -162,6 +164,13 @@ def main():
         # Another window, as `/switch` or `enter` on a project makes one (a
         # new process): its first open.
         window.close()
+        if args.other_build:
+            kept = Path(str(store) + '.status-reads')
+            for file in kept.glob('*.json'):
+                written = json.loads(file.read_text())
+                if 'build' in written:
+                    written['build'] = '0.0.0 another build ' + written['build'].split(' ')[-1]
+                    file.write_text(json.dumps(written))
         window = Screen([sonny, '--store', str(store), '--socket', str(sock), '--agent', 'p1.lead',
                          '--no-sound', '--no-layout'], env, str(folders[min(1, args.projects - 1)]),
                         columns=150, rows=40)
@@ -170,10 +179,12 @@ def main():
         time.sleep(3)
         quiet([window.pid, daemon.pid])
         cpu = (cpu_seconds(window.pid), cpu_seconds(daemon.pid))
+        began = time.monotonic()
         os.write(window.fd, LEFT)
         first = f'Proj {0:03}'
         result['next_window_shown_s'] = window.wait('projects', lambda line: first in line, 300)
         quiet([window.pid, daemon.pid])
+        result['next_window_settled_s'] = round(time.monotonic() - began, 2)
         result['next_window_cpu_s'] = round(cpu_seconds(window.pid) - cpu[0], 3)
         result['next_window_daemon_cpu_s'] = round(cpu_seconds(daemon.pid) - cpu[1], 3)
         if args.busy:

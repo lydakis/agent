@@ -409,6 +409,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
+| Whether agents have boards, work in the commons they take | `[sonny] boards` (true, the default, or false; off, agents go without the board tool and skill, and `start_task` takes no `board` or `agents`; off with the commons too) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most rows a margin note draws | `[sonny] margin_note_lines` (40 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
@@ -1161,7 +1162,21 @@ has something on it, or is off the screen, no time shows.
   The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
   a helper that needs you or failed listed in its group too; a click on that
   line, or → on the picked task, opens them, and ← folds them. `x` stops a
-  picked workflow. As threads in a claude.ai project are
+  picked workflow.
+  A task with several agents (named `errors.1`, `errors.2` and so on, in
+  the order they started) is one row: the mark of its most pressing agent,
+  its title, and a muted `4 agents` where one agent's name would be, in the
+  group of that mark. Under it, two columns in, one row an agent in the
+  order of their names: its mark, its name, a link, and its time; its
+  state word only where the mark does not say it, and what one that needs
+  you asks on its own `└` row. Enter on the task's row goes to its most
+  pressing agent; `←` folds its agents to `▸ 4 agents, 2 working`, and `→`
+  opens them; they start open. `←` on one of its agents folds the task.
+  The head and the footer still count each agent. A task with one agent
+  is one row, as any.
+
+  ![A task with four agents in /status, at 150, 120, 60 and 44 columns](../docs/sonny/status-task-agents.png)
+ As threads in a claude.ai project are
   resolved, a task marks itself done with the `mark_done` tool once
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
@@ -1342,8 +1357,37 @@ has something on it, or is off the screen, no time shows.
   and the model they ran, as people say it (`Opus 5.5`, `GPT 6.1 Sol`), with
   no provider, region or vendor prefix. Esc goes back, then closes. Your
   reading there is not counted as an agent's.
+  Boards, work in the commons that agents take, sit over the threads in a
+  **Boards** section: a row a board, its most pressing state's mark, its
+  name whole, a count for each state it has any of (`2 claimed · 1 open ·
+  2 waiting · 1 done`), and the age of its last post. This window's
+  project's boards come first, then the rest by name; a row never moves
+  when its state changes. Boards with every item done or canceled and no
+  post in seven days fold into one last row, `▸ 3 finished boards`.
+  An item is not a row among the threads until `m`, which lists every
+  item there too: its state's mark before its title, and under it its
+  board and where it stands (`shop/typed-errors · claimed by api-1`).
+  Enter or `→` on a board opens its page: a head that counts its items in
+  words, one section a state (Done and Canceled folded), each item its
+  mark, title, labels, holder (a link) and age, and a `└` row under it
+  for the items it waits on, a failure's reason or a done item's result.
+  An item opens as its thread, with a row under its name that says where
+  it stands and one muted row for each claim, release, done, label and
+  the rest. `←` goes back a page, the pick on what you left. `ctrl+f`
+  finds by typing: in the list it reads boards, items and threads; on a
+  board's page, titles, holders and labels. A holder whose agent the
+  window's last count no longer lists reads `closed`, from what Sonny
+  already knows, with no read of its own. Sonny reads a thread's file
+  again only once it changed, and makes no model or daemon call to draw
+  any of it. With `[sonny] boards = false` there are none of these: every
+  thread is a thread, as before boards, and in `/status` and the pane a
+  task's agents are each their own row.
 
   ![/commons in the pane](../docs/sonny/commons.png)
+
+  ![/commons with boards over the threads, at 150, 120, 60 and 44 columns](../docs/sonny/commons-boards.png)
+
+  ![A board's page: a section a state, a failure's reason under its item](../docs/sonny/commons-board-page.png)
 - `/memory` shows, in the pane beside the conversation, what agents saved to
   memory: Work under way, newest first, with how long since each was saved;
   This project's facts; and Everywhere, the facts kept in every project,
@@ -2401,7 +2445,11 @@ under the composer. The tasks hang two columns under it: every task that
 needs you, failed or works, in that order, each its mark, its title and
 its name, a link, the names in one column; a task's helpers counted under
 it (`└ 2 helpers, 1 working`), and a workflow as a row with its strip under
-the agent that runs it. Too long for its row, a title is cut at a word;
+the agent that runs it. A task with several agents is one row, its most
+pressing agent's mark, its title and a muted `4 agents`, with those of
+its agents that need you, failed or work under it, two columns in, each
+its mark and its name, a link; `alt+←` and `alt+→` step through them as
+through any row. Too long for its row, a title is cut at a word;
 the mark and the name stay. The list is the project's, so it is the same
 in the lead's window and in each task's: from a task, the lead and the
 other tasks are one click away. The agent the window is on has its whole

@@ -148,10 +148,9 @@ const DESCRIPTION: &str = "Keep state beside the conversation, in the margin the
          Every note has an exit: remove it in the turn its condition ends, such as a review done, \
          a draft sent or a check passed. Posting the same id again replaces that note in place. \
          Where a note ages, such as a pull request's state, say when it was last checked, in the \
-         person's time zone. Give markdown, or file (a path in your own folder, shown as it \
-         stands; for a file in a task's copy, put its content in markdown, since that copy goes \
-         away with the task), or from (a task's note as \"task/id\", as the lookout names it, \
-         shown as the task keeps it). Ask a question where the person answers, never in a note: \
+         person's time zone. Give markdown, file (a path in your own folder, shown as it stands; \
+         for a file in a task's copy, put its content in markdown, since that copy goes away with \
+         the task) or from (a task's note, as the lookout names it, shown as the task keeps it). Ask a question where the person answers, never in a note: \
          a note may point to it, with opens naming the agent that asked, and never repeats its \
          text.";
 
@@ -172,13 +171,13 @@ pub fn tool() -> Value {
                 "markdown": {"type": "string", "maxLength": NOTE_BYTES,
                     "description": "The note, as Markdown."},
                 "live": {"type": "boolean",
-                    "description": format!("true: markdown has Jinja blanks Sonny keeps filled. {}", crate::template::BLANKS)},
+                    "description": "true: markdown has Jinja blanks Sonny keeps filled, as the live tool's markdown."},
                 "file": {"type": "string", "minLength": 1,
                     "description": "Or a file to show, absolute or from your folder."},
                 "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",
                     "description": "Or a task's note to show, as \"task/id\"."},
                 "opens": {"type": "string", "pattern": "^[A-Za-z0-9._-]{0,128}$",
-                    "description": "An agent the note is about, by its name, such as a task whose question waits on the person: the note gets a button that opens it beside the conversation. Empty takes the button away."},
+                    "description": "An agent the note is about, by name, such as a task whose question waits on the person: the note gets a button opening it beside the conversation. Empty removes the button."},
                 "remove": {"type": "boolean", "description": "true takes the note away."}
             },
             "required": ["id"],
@@ -2229,6 +2228,8 @@ mod tests {
             lead: name == "lead",
             helpers: Vec::new(),
             run: None,
+            of: 0,
+            agents: Vec::new(),
         };
         let agents = |listed: Vec<Listed>| Agents {
             project: "Tally invoices".into(),

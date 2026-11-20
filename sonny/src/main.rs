@@ -16,6 +16,8 @@ mod attach;
 mod audit;
 mod background;
 mod banner;
+mod board;
+mod board_view;
 mod boot;
 mod browser;
 mod budget;
@@ -572,6 +574,10 @@ struct StatusView<'a> {
     /// The calls waiting on the person, read once for many projects'
     /// reads (**Projects**); else each read lists them.
     held: Option<&'a [needs::Held]>,
+    /// The agents with a question open, as the store's one follow of every
+    /// project keeps them ([`elsewhere`]), in place of what their histories
+    /// say (**Projects**, which reads none).
+    waiting: Option<&'a std::collections::HashSet<String>>,
 }
 
 /// What a window's reads of its agents' histories (its count, its card,
@@ -651,11 +657,15 @@ struct ProjectsOpen {
     listed: Option<Vec<standing::Agent>>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
     read_at: Option<Instant>,
-    /// What was read, for the next read: the read under way holds it.
+    /// What was counted, for the next read: the read under way holds it.
     state: ProjectsState,
-    /// Whether the last read read every history it asked for: one that
-    /// did not is read again after [`STATUS_AGAIN`], though nothing moved.
+    /// Whether the last read read all it asked for: one that did not is
+    /// read again after [`STATUS_AGAIN`], though nothing moved.
     whole: bool,
+    /// The agents with a question open, as the store's follow of every
+    /// project said at the last read: once it says otherwise, every
+    /// project is counted again.
+    waiting: std::collections::HashSet<String>,
     /// Where the page and the pane beside it were drawn, for the mouse.
     page: Rect,
     side: Rect,
@@ -704,39 +714,29 @@ impl Drop for ProjectsOpen {
     }
 }
 
-/// What **Projects** read, for its next read, as an informer's cache
-/// keeps what it listed: each project as read, and of each agent its
-/// history and question as read.
+/// What **Projects** counted, for its next read, as an informer's cache
+/// keeps what it listed: each project as counted.
 #[derive(Default)]
 struct ProjectsState {
-    /// What was read of each agent's history and question, as `/status`
-    /// keeps it.
-    latest: HashMap<String, (Value, Latest)>,
-    seen: HashMap<String, (i64, Seen)>,
-    /// Each project as last read, by its lead: one none of whose agents
-    /// moved is not read again.
+    /// Each project as last counted, by its lead: one none of whose
+    /// agents moved is not counted again.
     each: HashMap<String, ProjectRead>,
-    /// The leads whose files of reads kept beside the store were taken.
-    taken: std::collections::HashSet<String>,
     /// Whether the projects some window kept beside the store were taken.
     took_kept: bool,
-    /// The leads whose agents' histories were read since they were last
-    /// kept beside the store: kept once the project is quiet.
-    unkept: std::collections::HashSet<String>,
     /// What the last read keeps beside the store, being written.
     writing: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// What **Projects** read, kept by the window once the page closes: the
+/// What **Projects** counted, kept by the window once the page closes: the
 /// page opens again on the projects it showed, and its first read, from a
-/// new snapshot, reads only the projects whose agents moved since, and of
-/// those only the histories that moved. A read under way as the page
-/// closed is let finish, here.
+/// new snapshot, counts again only the projects whose agents moved since.
+/// A read under way as the page closed is let finish, here.
 #[derive(Default)]
 struct ProjectsKept {
     projects: Vec<projects::Project>,
     state: ProjectsState,
     whole: bool,
+    waiting: std::collections::HashSet<String>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
     /// The drain of the connection that read reads on, until it ends.
     lent: Option<tokio::task::JoinHandle<()>>,
@@ -767,17 +767,7 @@ impl ProjectsKept {
         self.projects = read.projects;
         self.state = read.state;
         self.whole = read.whole;
-        self.trim();
-    }
-
-    /// Closed, it keeps each project as read and not each agent's history:
-    /// what was read of those is kept beside the store, and taken again
-    /// for the projects that moved, so a closed page holds little.
-    fn trim(&mut self) {
-        let state = &mut self.state;
-        (state.latest, state.seen) = (HashMap::new(), HashMap::new());
-        state.taken = Default::default();
-        state.unkept = Default::default();
+        self.waiting = read.waiting;
     }
 }
 
@@ -821,20 +811,21 @@ impl App {
                 }
                 *kept
             }
-            // What this window read of its own project's agents is read,
-            // and the projects as any window last read them show at once.
+            // The projects as any window last counted them show at once,
+            // those another build counted too: this one counts each again.
             None => {
                 let store = self.store();
-                let each = take_projects(&store, self.client.identity());
+                let (mut each, this_build) = take_projects(&store, self.client.identity());
                 let shown: Vec<projects::Project> =
                     (each.values()).map(|read| read.project.clone()).collect();
                 if !shown.is_empty() {
                     view.set(shown, now_ms());
                 }
+                if !this_build {
+                    each.clear();
+                }
                 ProjectsKept {
                     state: ProjectsState {
-                        latest: self.status_read.clone(),
-                        seen: self.asks_seen.clone(),
                         each,
                         took_kept: true,
                         ..Default::default()
@@ -855,6 +846,7 @@ impl App {
             read_at: None,
             state: kept.state,
             whole: kept.whole,
+            waiting: kept.waiting,
             page: Rect::default(),
             side: Rect::default(),
             connected_at: Instant::now(),
@@ -876,10 +868,10 @@ impl App {
             projects: open.view.take_projects(),
             state: std::mem::take(&mut open.state),
             whole: open.whole,
+            waiting: std::mem::take(&mut open.waiting),
             job,
             lent,
         };
-        kept.trim();
         kept.landed();
         self.projects_kept = Some(Box::new(kept));
     }
@@ -937,8 +929,8 @@ impl App {
     /// projects' as **Projects** lists them, from the one after this
     /// project's around ([`elsewhere::round`]).
     fn next_needing(&mut self) {
-        let mut local: Vec<String> = (self.margin.agents().listed.iter())
-            .filter(|agent| agent.run.is_none() && agent.group == status::Group::NeedsYou)
+        let mut local: Vec<String> = (self.margin.agents().steps())
+            .filter(|agent| agent.group == status::Group::NeedsYou)
             .map(|agent| agent.bot.clone())
             .collect();
         if let Some(fleet) = &self.fleet {
@@ -993,6 +985,14 @@ impl App {
         let Some(open) = &mut self.projects else {
             return;
         };
+        // The agents with a question open, as the store's one follow of
+        // every project keeps them: no history is read here.
+        let waiting: std::collections::HashSet<String> = match &self.other_projects {
+            Some((shared, _)) => (shared.waiting.borrow().agents.iter())
+                .map(|(_, _, bot)| bot.clone())
+                .collect(),
+            None => Default::default(),
+        };
         // Its connection went, as when the daemon did: a new one, followed
         // from a new snapshot, at most every few seconds.
         if (open.drain.as_ref()).is_none_or(|drain| drain.is_finished())
@@ -1024,6 +1024,7 @@ impl App {
                     open.listed = Some(read.listed);
                     open.state = read.state;
                     open.whole = read.whole;
+                    open.waiting = read.waiting;
                 }
                 // What moved is unknown: start over from a new snapshot.
                 _ => {
@@ -1054,7 +1055,13 @@ impl App {
         };
         let running = listed.iter().any(|bot| bot.running_turn.is_some());
         let moved = changes.moved;
-        if !whole && moved.is_empty() && !running && open.view.read && open.whole {
+        if !whole
+            && moved.is_empty()
+            && !running
+            && open.view.read
+            && open.whole
+            && waiting == open.waiting
+        {
             open.listed = Some(listed);
             return;
         }
@@ -1082,7 +1089,7 @@ impl App {
                     }
                 }
                 let (projects, whole) = read_projects(
-                    &client, &store, &listed, &bot, &asks, &approvals, &mut state,
+                    &client, &store, &listed, &bot, &asks, &approvals, &waiting, &mut state,
                 )
                 .await?;
                 Some(ProjectsRead {
@@ -1090,6 +1097,7 @@ impl App {
                     listed,
                     state,
                     whole,
+                    waiting,
                 })
             }
             .await;
@@ -1192,8 +1200,10 @@ struct ProjectsRead {
     projects: Vec<projects::Project>,
     listed: Vec<standing::Agent>,
     state: ProjectsState,
-    /// Whether every history it asked for was read.
+    /// Whether every read it asked for was read.
     whole: bool,
+    /// The agents with a question open it counted with.
+    waiting: std::collections::HashSet<String>,
 }
 
 /// The pattern that names every project's agents: a project's are
@@ -1201,11 +1211,15 @@ struct ProjectsRead {
 const EVERY_PROJECT: &str = "*.*";
 
 /// Every project in `listed` (every agent [`EVERY_PROJECT`] names), each
-/// read as `/status` reads it: its counts, its most pressing state, its
-/// agents as the pane lists them, and when one last had a turn, which
-/// the listing says (`last.finished_ms`, or now while one runs); and
-/// whether every history it asked for was read. A project in `state` none
-/// of whose agents moved since is as it was read, and not read again.
+/// counted as `/status` counts it, from the listing alone: no history is
+/// read. Its counts, its most pressing state and its agents as the pane
+/// lists them say what the listing does, the calls held for the person,
+/// and `waiting`: the agents with a question open, as the store's one
+/// follow of every project keeps them ([`elsewhere`]). When one last had a
+/// turn is the listing's (`last.finished_ms`, or now while one runs). Also
+/// whether every read it asked for was read. A project in `state` none of
+/// whose agents moved since is as it was counted, and not counted again.
+#[allow(clippy::too_many_arguments)]
 async fn read_projects(
     client: &Client,
     store: &std::path::Path,
@@ -1213,6 +1227,7 @@ async fn read_projects(
     bot: &str,
     asks: &[asks::Ask],
     approvals: &[Value],
+    waiting: &std::collections::HashSet<String>,
     state: &mut ProjectsState,
 ) -> Option<(Vec<projects::Project>, bool)> {
     let now = std::time::SystemTime::now()
@@ -1223,12 +1238,14 @@ async fn read_projects(
     let held = needs::listing(client, None).await.ok();
     let kept = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_path_buf());
     let identity = client.identity();
-    // The projects some window read last, on the page's first read here:
-    // each one that moved since is read again, as one read here would be.
+    // The projects some window counted last, on the page's first read
+    // here: each one that moved since is counted again.
     if !state.took_kept {
         state.took_kept = true;
-        for (lead, read) in take_projects(&kept, identity) {
-            state.each.entry(lead).or_insert(read);
+        if let (each, true) = take_projects(&kept, identity) {
+            for (lead, read) in each {
+                state.each.entry(lead).or_insert(read);
+            }
         }
     }
     let leads: Vec<&standing::Agent> = (listed.iter())
@@ -1240,18 +1257,16 @@ async fn read_projects(
         })
         .collect();
     let mut found = Vec::with_capacity(leads.len());
-    let mut whole = true;
+    let mut whole = held.is_some();
     let turns = HashMap::new();
     let mut titles = crate::title::Titles::read(&kept);
     // The done marks kept beside the store, which move no listing.
     let marked = resolved::marked(store);
     let mut was = std::mem::take(&mut state.each);
-    // Whether a project was read to another mark than it was kept with.
+    // Whether a project was counted to another mark than it was kept with.
     let mut moved = false;
-    // What each project read of its agents' histories, to keep.
-    let mut to_keep = Vec::new();
     // Each agent under the lead it answers to, so a folder with two leads
-    // counts each agent in one row: read once for every project.
+    // counts each agent in one row: counted once for every project.
     let makers: HashMap<&str, &str> = (listed.iter())
         .map(|agent| (agent.name.as_str(), agent.maker()))
         .collect();
@@ -1267,22 +1282,26 @@ async fn read_projects(
             continue;
         };
         let theirs: Vec<standing::Agent> = under.remove(&lead.name).unwrap_or_default();
-        // What it is read from: its agents as listed, their calls waiting
-        // on the person, their done marks and its file's title. One none of
-        // which moved is
-        // as it was read, but while one of its agents runs, which moves
-        // with no event, or where it holds the window's own agent, whose
-        // row reads the window's own questions.
+        // What it is counted from: its agents as listed, their calls
+        // waiting on the person, their questions open, their done marks
+        // and its file's title. One none of which moved is as it was
+        // counted, but while one of its agents runs, which moves with no
+        // event, or where it holds the window's own agent, whose row
+        // reads the window's own questions.
         let held_here: Vec<needs::Held> = (held.iter().flatten())
             .filter(|call| theirs.iter().any(|bot| bot.name == call.bot))
             .cloned()
+            .collect();
+        let asking: Vec<&str> = (theirs.iter())
+            .filter(|bot| waiting.contains(&bot.name))
+            .map(|bot| bot.name.as_str())
             .collect();
         let titled = titles.named(&lead.name, lead.bot_id, lead.workspace.as_deref());
         let marks: Vec<(&str, Option<i64>)> = (theirs.iter())
             .filter(|bot| marked.contains(&bot.name))
             .map(|bot| (bot.name.as_str(), resolved::read(store, &bot.name)))
             .collect();
-        let mark = project_mark(&theirs, &held_here, &marks, titled.as_deref());
+        let mark = project_mark(&theirs, &held_here, &asking, &marks, titled.as_deref());
         let keeps = !theirs
             .iter()
             .any(|agent| agent.running_turn.is_some() || agent.name == bot);
@@ -1299,28 +1318,6 @@ async fn read_projects(
                 state.each.insert(lead.name.clone(), read);
             }
         }
-        // What a window kept of its agents' histories, where this holds none.
-        if state.taken.insert(lead.name.clone())
-            && theirs
-                .iter()
-                .any(|bot| !state.latest.contains_key(&bot.name))
-        {
-            take_reads(
-                &kept,
-                &lead.name,
-                identity,
-                &mut state.latest,
-                &mut state.seen,
-            );
-        }
-        // Each read keeps only its own agents' reads: the project's are
-        // lent to it and taken back.
-        let mut read_here: HashMap<String, (Value, Latest)> = (theirs.iter())
-            .filter_map(|bot| state.latest.remove_entry(&bot.name))
-            .collect();
-        let mut seen_here: HashMap<String, (i64, Seen)> = (theirs.iter())
-            .filter_map(|bot| state.seen.remove_entry(&bot.name))
-            .collect();
         let scope = background::Scope {
             project: name.to_owned(),
             lead: lead.name.clone(),
@@ -1334,9 +1331,10 @@ async fn read_projects(
             places: Default::default(),
             aside: &|_| false,
             details: false,
-            fill: false,
+            fill: true,
             readers: None,
             held: held.as_deref(),
+            waiting: Some(waiting),
         };
         let read = read_status_of(
             client,
@@ -1344,32 +1342,13 @@ async fn read_projects(
             scope,
             &theirs,
             &turns,
-            &mut read_here,
-            &mut seen_here,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
             view,
             None,
         )
-        .await;
-        // What it read of histories, kept for the lead's window and the
-        // next page in any window, as `/status` keeps its own: once the
-        // project is quiet, not at each read while one of its agents runs.
-        // A quiet project's reads are let go here, as it is not read again
-        // until it moves: then taken again from beside the store.
-        if read.as_ref().is_ok_and(|read| read.fresh) {
-            state.unkept.insert(lead.name.clone());
-        }
-        if keeps && read.as_ref().is_ok_and(|read| read.whole) {
-            state.taken.remove(&lead.name);
-            if state.unkept.remove(&lead.name) {
-                to_keep.push((lead.name.clone(), read_here, seen_here));
-            }
-        } else {
-            state.latest.extend(read_here);
-            state.seen.extend(seen_here);
-        }
-        let Ok(read) = read else {
-            return None;
-        };
+        .await
+        .ok()?;
         whole &= read.whole;
         let folder = lead.workspace.clone().unwrap_or_default();
         let superlead = seat_profile(lead.profile.as_deref(), true, std::path::Path::new(&folder))
@@ -1414,37 +1393,26 @@ async fn read_projects(
                 .insert(lead.name.clone(), ProjectRead { mark, project });
         }
     }
-    // What was read of agents no longer listed is let go.
-    if state.latest.len() > listed.len() || state.seen.len() > listed.len() {
-        let names: std::collections::HashSet<&str> =
-            listed.iter().map(|bot| bot.name.as_str()).collect();
-        state.latest.retain(|name, _| names.contains(name.as_str()));
-        state.seen.retain(|name, _| names.contains(name.as_str()));
-    }
-    // The projects as read, for the next page in any window, once one
+    // The projects as counted, for the next page in any window, once one
     // moved or went, written beside the page, which shows them at once.
-    let each = (moved || !was.is_empty()).then(|| state.each.clone());
-    if each.is_some() || !to_keep.is_empty() {
+    if moved || !was.is_empty() {
+        let each = state.each.clone();
         let identity = identity.map(str::to_owned);
         state.writing = Some(tokio::task::spawn_blocking(move || {
-            for (lead, latest, seen) in to_keep {
-                keep_for(&kept, &lead, "", identity.as_deref(), &latest, &seen);
-            }
-            if let Some(each) = each {
-                keep_projects(&kept, identity.as_deref(), &each);
-            }
+            keep_projects(&kept, identity.as_deref(), &each);
         }));
     }
     Some((found, whole))
 }
 
-/// The mark of what a project is read from ([`ProjectRead`]): every field
-/// of its agents as listed, their calls waiting on the person, the done
-/// marks kept for them beside the store (an outer lead marking one moves
-/// no listing), and its file's title.
+/// The mark of what a project is counted from ([`ProjectRead`]): every
+/// field of its agents as listed, their calls waiting on the person, those
+/// with a question open, the done marks kept for them beside the store (an
+/// outer lead marking one moves no listing), and its file's title.
 fn project_mark(
     agents: &[standing::Agent],
     held: &[needs::Held],
+    asking: &[&str],
     marks: &[(&str, Option<i64>)],
     title: Option<&str>,
 ) -> u64 {
@@ -1474,6 +1442,7 @@ fn project_mark(
         (model, provider, workspace, profile).hash(&mut mark);
     }
     held.hash(&mut mark);
+    asking.hash(&mut mark);
     marks.hash(&mut mark);
     title.hash(&mut mark);
     mark.finish()
@@ -1486,19 +1455,24 @@ fn projects_file(store: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The projects as **Projects** last read them in any window, by lead,
-/// as this build reads them ([`reads_build`]) from the daemon `identity`
-/// names.
-fn take_projects(store: &std::path::Path, identity: Option<&str>) -> HashMap<String, ProjectRead> {
+/// from the daemon's store `identity` names, and whether this build read
+/// them ([`reads_build`]): another build's are shown, not reused, as it
+/// may read a project otherwise.
+fn take_projects(
+    store: &std::path::Path,
+    identity: Option<&str>,
+) -> (HashMap<String, ProjectRead>, bool) {
     #[derive(serde::Deserialize)]
     struct Kept {
         build: String,
+        store: String,
         each: HashMap<String, ProjectRead>,
     }
     std::fs::read(projects_file(store))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-        .filter(|kept| kept.build == reads_build(identity))
-        .map(|kept| kept.each)
+        .filter(|kept| kept.store == identity.unwrap_or(""))
+        .map(|kept| (kept.each, kept.build == reads_build(identity)))
         .unwrap_or_default()
 }
 
@@ -1512,10 +1486,12 @@ fn keep_projects(
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
+        store: &'a str,
         each: HashMap<&'a String, &'a ProjectRead>,
     }
     let kept = Kept {
         build: reads_build(identity),
+        store: identity.unwrap_or(""),
         each: (each.iter())
             .filter(|(_, read)| {
                 (read.project.agents.listed.iter()).all(|agent| agent.run.is_none())
@@ -1567,8 +1543,7 @@ async fn read_status(
 ) -> Result<StatusRead, String> {
     let listed = standing::list(client, &scope.glob)
         .await
-        .map_err(|_| "could not list the agents".to_owned())?
-        .0;
+        .map_err(|_| "could not list the agents".to_owned())?;
     read_status_of(
         client,
         options_store,
@@ -1880,6 +1855,11 @@ async fn read_status_of(
         let itself = seen.itself && ran_status == Some("completed");
         let resolved = itself || resolved::holds(resolved::read(&store, name), turn, running);
         let open = seen.ask.clone();
+        // Whether the store's follow of every project has its question
+        // open, where it is asked: it says so in place of its history.
+        let asking = (view.waiting)
+            .filter(|_| name != view.bot)
+            .map(|waiting| waiting.contains(name));
         // This window's own agent waits on what it shows open here too,
         // its transcript read only so far back.
         let ask = match name == view.bot {
@@ -1887,7 +1867,7 @@ async fn read_status_of(
                 .find(|ask| ask.task.is_none())
                 .cloned()
                 .or(open),
-            false => open,
+            false => open.filter(|_| asking != Some(false)),
         };
         // Unlisted, this window's own calls still say what they wait on.
         if name == view.bot && held.is_err() {
@@ -1903,7 +1883,7 @@ async fn read_status_of(
         if let Some(ask) = &ask {
             step = format!("asks: {}", first_line(&ask.question));
         }
-        let state = match needs.waits(name) {
+        let state = match needs.waits(name) || asking == Some(true) {
             true => "needs you".to_owned(),
             false => state,
         };
@@ -2066,7 +2046,7 @@ async fn fill_status(
     let listing = async {
         match listed {
             Some(listed) => Some(listed),
-            None => (standing::list(client, &scope.glob).await.ok()).map(|listed| listed.0),
+            None => standing::list(client, &scope.glob).await.ok(),
         }
     };
     let (alerts, listed) = tokio::join!(read_alerts(client, logs, temp_due), listing);
@@ -2168,7 +2148,7 @@ async fn fill_status(
         }
         drop(agents);
         if screen.is_none() {
-            let Ok((again, _)) = standing::list(client, &scope.glob).await else {
+            let Ok(again) = standing::list(client, &scope.glob).await else {
                 return (alerts, None);
             };
             listed = again;
@@ -3905,6 +3885,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             fill: false,
             readers: None,
             held: None,
+            waiting: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
@@ -13195,6 +13176,7 @@ impl App {
                 fill: false,
                 readers: Some(&readers),
                 held: held.as_deref(),
+                waiting: None,
             };
             let Ok(read) = read_status_of(
                 &client,
@@ -15533,7 +15515,14 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            commons: Some(commons::View::open(&home, project)),
+            commons: Some({
+                let mut view = commons::View::open(&home, project.clone());
+                view.set_present(board_view::Present {
+                    project: project.clone(),
+                    bots: self.kept_rows.bots.clone(),
+                });
+                view
+            }),
             memory: None,
             sky: None,
             picked: None,
@@ -15659,6 +15648,12 @@ impl App {
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.commons
         {
+            // What the window's count already knows of its project's
+            // agents: a holder it no longer lists is closed.
+            view.set_present(board_view::Present {
+                project: watch.project.clone(),
+                bots: self.kept_rows.bots.clone(),
+            });
             view.reload();
             watch.read = Instant::now();
             return;
@@ -15742,6 +15737,7 @@ impl App {
                 fill: fill.is_some(),
                 readers: Some(&readers),
                 held: None,
+                waiting: None,
             };
             let Some(fill) = fill else {
                 let alerts = read_alerts(&client, &logs, temp_due).await;
@@ -16043,6 +16039,7 @@ impl App {
             fill: false,
             readers: Some(&self.readers),
             held: None,
+            waiting: None,
         };
         let read = read_status(
             &self.client,
@@ -16108,6 +16105,7 @@ impl App {
                         fill: false,
                         readers: Some(&readers),
                         held: None,
+                        waiting: None,
                     };
                     let turns = HashMap::new();
                     let read =
@@ -16899,7 +16897,7 @@ impl App {
         // `l` too.
         let view_finding = self.pane_keys && self.view_finding();
         // `h` `j` `k` `l` are the arrows in every pane but a program's,
-        // unlisted.
+        // unlisted; typed into a find, they are letters.
         let arrow;
         let key = match (self.pane_keys && !program && self.finding.is_none() && !view_finding)
             .then(|| vim_arrow(key))
@@ -17061,7 +17059,9 @@ impl App {
                 match (key.code, picked) {
                     // Enter goes to the picked agent; on a heading it
                     // does the heading's one thing, opening or folding.
-                    (KeyCode::Enter, Some(Picked::Agent(bot))) => self.open_picked(&bot),
+                    (KeyCode::Enter, Some(Picked::Agent(bot) | Picked::Task(_, bot))) => {
+                        self.open_picked(&bot)
+                    }
                     // `→` goes into a workflow's row, as `enter` does.
                     (KeyCode::Right, Some(Picked::Agent(bot)))
                         if workflow::view::split(&bot).1.is_some() =>
@@ -17200,51 +17200,64 @@ impl App {
                 }
                 return true;
             }
-            // `/commons` takes its own keys: picking a thread, reading it.
+            // `/commons` takes its own keys: picking a board, a thread or
+            // an item, its pages, finding.
             if self.pane_keys
                 && pane.is_card()
                 && let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut())
             {
                 let reading = view.reading();
+                let depth = view.depth();
                 match key.code {
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
                         pane.screen.unselect();
                         self.copied(&text);
                     }
-                    // A thread read is a page: ↑↓ pick its links, as Lynx
-                    // does, and scroll where none is left that way.
-                    KeyCode::Up if reading && !pane.screen.pick_link(false, pane.is_margin()) => {
-                        pane.screen.scroll(1)
-                    }
-                    KeyCode::Down if reading && !pane.screen.pick_link(true, pane.is_margin()) => {
-                        pane.screen.scroll(-1)
-                    }
-                    KeyCode::Up | KeyCode::Down if reading => {}
-                    KeyCode::Enter | KeyCode::Right
-                        if reading && let Some(url) = pane.screen.picked_link() =>
-                    {
-                        let url = url.to_owned();
-                        self.follow(&url);
-                    }
                     KeyCode::PageUp => pane.screen.page(true),
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Char(' ') if reading => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
-                    // The list of threads: nothing to close.
-                    KeyCode::Left if key.modifiers.is_empty() && !reading => self.left_ends(),
-                    _ => {
-                        if view.key(*key) == commons::Key::Close {
-                            self.close_pane(true);
-                        } else if view.reading() != reading {
-                            // A thread opened or left starts at its top.
+                    // The list, with nothing to close: the keys go back.
+                    KeyCode::Left if key.modifiers.is_empty() && view.left_ends() => {
+                        self.left_ends()
+                    }
+                    // A thread's page: its head's links and its posts' are
+                    // one run of picks, as Lynx moves among a page's links.
+                    KeyCode::Up | KeyCode::Down | KeyCode::Char('k' | 'j')
+                        if reading
+                            && !(key.modifiers)
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
+                        if let commons::Key::Scroll(up) = view.arrow(down, &mut pane.screen) {
+                            pane.screen.scroll(if up { 1 } else { -1 });
+                        }
+                    }
+                    _ => match view.key(*key, pane.screen.in_view()) {
+                        commons::Key::Close => self.close_pane(true),
+                        commons::Key::Scroll(up) => pane.screen.scroll(if up { 1 } else { -1 }),
+                        commons::Key::Open(url) => self.follow(&url),
+                        commons::Key::Stay if view.depth() != depth => {
+                            // A page opened or left starts at its top, or
+                            // at the pick it was left on.
                             pane.screen.hold(usize::MAX);
                             if let Some(watch) = &mut self.watch {
                                 watch.picked = None;
                             }
                         }
-                    }
+                        commons::Key::Stay => {
+                            // A post's own link picked from the keys opens.
+                            if reading
+                                && matches!(key.code, KeyCode::Enter | KeyCode::Right)
+                                && let Some(url) = pane.screen.picked_link()
+                            {
+                                let url = url.to_owned();
+                                self.follow(&url);
+                            }
+                        }
+                    },
                 }
                 return true;
             }
@@ -17564,9 +17577,29 @@ impl App {
                     self.left_ends();
                 }
             }
+            // A task's agents start open: its fold is in `helpers` when
+            // shut.
+            Picked::Task(task, _) => {
+                if watch.helpers.contains(&task) == open {
+                    watch.helpers_of(&task, Some(!open));
+                } else if !open {
+                    self.left_ends();
+                }
+            }
             Picked::Agent(bot) if open => watch.helpers_of(&bot, Some(true)),
             Picked::Agent(bot) if watch.helpers.contains(&bot) => {
                 watch.helpers_of(&bot, Some(false))
+            }
+            // `←` on one of a task's agents folds the task, the pick on it.
+            Picked::Agent(bot)
+                if let Some(at) = status::task_of(&bot).and_then(|(task, _)| {
+                    (card_picks(watch, width).iter())
+                        .position(|p| matches!(p, Picked::Task(t, _) if t == task))
+                }) =>
+            {
+                let task = status::task_of(&bot).map(|(task, _)| task.to_owned());
+                watch.helpers_of(&task.unwrap_or_default(), Some(true));
+                watch.pick = Some(at);
             }
             Picked::Agent(bot) => {
                 let group = (watch.rows.iter())
@@ -17601,8 +17634,7 @@ impl App {
     /// agents, around its ends, as a multiplexer's previous and next tab.
     /// From an agent the list does not show, either goes to the lead.
     fn step_agent(&mut self, down: bool) {
-        let listed: Vec<&str> = (self.margin.agents().listed.iter())
-            .filter(|agent| agent.run.is_none())
+        let listed: Vec<&str> = (self.margin.agents().steps())
             .map(|agent| agent.bot.as_str())
             .collect();
         let Some(to) = stepped(&listed, &self.bot, down) else {
@@ -17841,6 +17873,23 @@ impl App {
                 }
                 self.pane_keys = true;
             }
+            // A link on a page of `/commons`.
+            "commons" => {
+                if let Some(watch) = self.watch.as_mut()
+                    && let Some(view) = watch.commons.as_mut()
+                {
+                    let depth = view.depth();
+                    let leaves = view.click(id);
+                    // A page opened from a link starts at its top.
+                    if view.depth() != depth {
+                        watch.picked = None;
+                    }
+                    self.pane_keys = true;
+                    if let Some(url) = leaves {
+                        self.follow(&url);
+                    }
+                }
+            }
             // A row or a link in `/memory`.
             "memory" => {
                 if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
@@ -17860,6 +17909,21 @@ impl App {
                         watch.pick = Some(at);
                     }
                     watch.toggle(group_of(id));
+                }
+            }
+            // A task's row in `/status`, picked: its most pressing agent.
+            "agents" => {
+                let width = self.width.max(40);
+                if let Some(watch) = &mut self.watch
+                    && let Some(picked) =
+                        Picked::from_link(&format!("{}agents/{id}", screen::BUTTON))
+                {
+                    if let Some(at) = card_picks(watch, width).iter().position(|p| *p == picked) {
+                        watch.pick = Some(at);
+                    }
+                    if let Picked::Task(_, bot) = picked {
+                        self.open_picked(&bot);
+                    }
                 }
             }
             // A task's helpers in `/status`: shown under it, or folded.
@@ -18066,6 +18130,7 @@ impl App {
             && let Some(watch) = &mut self.watch
             && (watch.run.take().is_some()
                 || watch.memory.as_mut().is_some_and(memory::View::back)
+                || watch.commons.as_mut().is_some_and(commons::View::back)
                 || watch
                     .background
                     .as_mut()
@@ -21182,6 +21247,7 @@ impl App {
             env,
             made_by: Some(self.bot.clone()),
             providers: Value::Null,
+            board: None,
         };
         let (here, project, starter) = (dir.to_owned(), project.to_owned(), self.bot.clone());
         tokio::task::spawn_blocking(move || {
@@ -21430,7 +21496,7 @@ impl App {
             .then(|| watch.pick.and_then(|at| picks.get(at).cloned()))
             .flatten()
             .and_then(|picked| match picked {
-                Picked::Agent(bot) => Some(bot),
+                Picked::Agent(bot) | Picked::Task(_, bot) => Some(bot),
                 Picked::Group(_) => None,
             })
             .filter(|bot| *bot != self.bot)
@@ -22097,19 +22163,39 @@ impl App {
                         }
                     }
                 }
-            } else if let Some(view) = &watch.commons {
-                let (card, at, starts) = view.card_rows(width);
-                let lines: Vec<Line<'static>> = card
-                    .into_iter()
+            } else if let Some(view) = &mut watch.commons {
+                // A page open: the title's ‹ goes back from it.
+                pane.page = view.on_page();
+                let card = view.card_rows(width);
+                let lines: Vec<Line<'static>> = (card.lines.into_iter())
                     .map(|line| {
                         let mut spans = vec![Span::raw(" ")];
                         spans.extend(line.spans);
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                let marks = row_marks(&lines, &starts);
+                let mut marks = row_marks(&lines, &card.starts);
+                marks.extend(agent_marks(
+                    (card.agents.into_iter())
+                        .map(|(row, from, to, bot)| (row, from as u16, to as u16, bot))
+                        .collect(),
+                ));
+                let mut links: Vec<(usize, screen::Buttons)> = Vec::new();
+                for (row, from, to, at) in card.links {
+                    let button = (
+                        from as u16 + 1,
+                        to as u16 + 1,
+                        format!("{}{}link/{at}", screen::BUTTON, commons::BUTTON),
+                    );
+                    match links.last_mut() {
+                        Some((last, buttons)) if *last == row => buttons.push(button),
+                        _ => links.push((row, vec![button])),
+                    }
+                }
+                marks.extend((links.into_iter()).map(|(row, b)| (row, screen::Mark::Buttons(b))));
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
+                let at = card.at;
                 if view.reading() {
                     // A thread just opened starts at its top, after the
                     // card's swap kept the list's scroll.
@@ -23721,6 +23807,10 @@ fn status_first_match(watch: &Watch, width: usize) -> Option<usize> {
         Picked::Agent(bot) => {
             (watch.rows.iter()).any(|row| row.bot == *bot && status::says(row, query))
         }
+        // A task with several agents says it where one of its agents does.
+        Picked::Task(task, _) => (watch.rows.iter()).any(|row| {
+            status::task_of(&row.bot).is_some_and(|(of, _)| of == task) && status::says(row, query)
+        }),
         Picked::Group(_) => false,
     })
 }
@@ -23764,7 +23854,16 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
     let found = watch.query().map(|query| status::found(&watch.rows, query));
     let (rows, open, shown_helpers) = match &found {
         Some((kept, opened)) => {
-            let mut helpers = watch.helpers.clone();
+            // A task's agents folded with `←` stand open too; folded
+            // again when the find ends, as `watch.helpers` keeps them.
+            let mut helpers: Vec<String> = (watch.helpers.iter())
+                .filter(|fold| {
+                    !(kept.iter()).any(|row| {
+                        status::task_of(&row.bot).is_some_and(|(task, _)| task == fold.as_str())
+                    })
+                })
+                .cloned()
+                .collect();
             helpers.extend(
                 opened
                     .iter()
@@ -23794,16 +23893,17 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
         named,
         folds,
         helpers,
+        tasks,
     } = match watch.more {
         true => {
             let picked = (watch.pick)
                 .and_then(|at| {
-                    picks_in_order(&quiet.named, &quiet.folds)
+                    picks_in_order(&quiet.named, &quiet.folds, &quiet.tasks)
                         .into_iter()
                         .nth(at)
                 })
                 .and_then(|(_, picked)| match picked {
-                    Picked::Agent(bot) => Some(bot),
+                    Picked::Agent(bot) | Picked::Task(_, bot) => Some(bot),
                     Picked::Group(_) => None,
                 });
             card(status::Details::Picked(picked.as_deref()))
@@ -23842,10 +23942,11 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
     let below = |at: usize| at + if at >= 1 { added } else { 0 };
     // The rows the keys pick first, in the order they are drawn: each
     // agent, and each heading that opens and folds its group.
-    let folding = !folds.is_empty() || !helpers.is_empty();
-    let mut marks: Vec<(usize, screen::Mark)> = (picks_in_order(&named, &folds).into_iter())
-        .map(|(at, picked)| (below(at), screen::Mark::Link(picked.link())))
-        .collect();
+    let folding = !folds.is_empty() || !helpers.is_empty() || !tasks.is_empty();
+    let mut marks: Vec<(usize, screen::Mark)> = (picks_in_order(&named, &folds, &tasks)
+        .into_iter())
+    .map(|(at, picked)| (below(at), screen::Mark::Link(picked.link())))
+    .collect();
     marks.extend(opening);
     marks.extend(helpers.into_iter().map(|(at, bot)| {
         let link = format!("{}helpers/{bot}", screen::BUTTON);
@@ -23941,12 +24042,13 @@ fn row_marks(lines: &[Line<'static>], starts: &[usize]) -> Vec<(usize, screen::M
     marks
 }
 
-/// A row `/status`'s keys pick: an agent, or the heading of a group that
-/// folds.
+/// A row `/status`'s keys pick: an agent, the heading of a group that
+/// folds, or a task with several agents, with its most pressing one.
 #[derive(Clone, Debug, PartialEq)]
 enum Picked {
     Agent(String),
     Group(status::Group),
+    Task(String, String),
 }
 
 impl Picked {
@@ -23955,6 +24057,7 @@ impl Picked {
         match self {
             Picked::Agent(bot) => format!("{}task/{bot}", screen::BUTTON),
             Picked::Group(group) => format!("{}group/{}", screen::BUTTON, group_id(*group)),
+            Picked::Task(task, bot) => format!("{}agents/{task}/{bot}", screen::BUTTON),
         }
     }
 
@@ -23964,21 +24067,29 @@ impl Picked {
         if let Some(bot) = button.strip_prefix("task/") {
             return Some(Picked::Agent(bot.to_owned()));
         }
+        if let Some((task, bot)) = button
+            .strip_prefix("agents/")
+            .and_then(|t| t.split_once('/'))
+        {
+            return Some(Picked::Task(task.to_owned(), bot.to_owned()));
+        }
         button
             .strip_prefix("group/")
             .map(|id| Picked::Group(group_of(id)))
     }
 }
 
-/// The agents and the folding groups' headings of a card, by the row
-/// each is drawn on, in that order.
+/// The agents, the folding groups' headings and the tasks with several
+/// agents of a card, by the row each is drawn on, in that order.
 fn picks_in_order(
     named: &[(usize, String)],
     folds: &[(usize, status::Group)],
+    tasks: &[(usize, String, String)],
 ) -> Vec<(usize, Picked)> {
     let mut picks: Vec<(usize, Picked)> = (named.iter())
         .map(|(at, bot)| (*at, Picked::Agent(bot.clone())))
         .chain(folds.iter().map(|(at, group)| (*at, Picked::Group(*group))))
+        .chain((tasks.iter()).map(|(at, task, bot)| (*at, Picked::Task(task.clone(), bot.clone()))))
         .collect();
     picks.sort_by_key(|(at, _)| *at);
     picks
@@ -25737,6 +25848,16 @@ mod tests {
     }
 
     /// Sonny on bot `b`, on `client`.
+    /// The window's first snapshot in, once its follow hears that it is
+    /// live, as the daemon tells it.
+    async fn snapshot_in(app: &mut App) {
+        let follower = app.follower.as_mut().unwrap();
+        follower.heard(&json!({"event": "follow_live", "bot": follower.pattern}));
+        while !follower.snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn app(client: Arc<Client>) -> App {
         let options = Options {
             store: PathBuf::new(),
@@ -26645,6 +26766,7 @@ mod tests {
             fill: false,
             readers: None,
             held: None,
+            waiting: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let read = read_status(
@@ -27371,9 +27493,7 @@ mod tests {
         app.bot = "titled.lead".into();
         app.options.store = store.clone();
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         app.counted_at = None;
         app.count_agents().await;
         if let Some(job) = &app.counting {
@@ -27434,9 +27554,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         app.options.store = dir.join("state.sqlite");
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         app.counted_at = None;
         app.count_agents().await;
         while !app.counting.as_ref().unwrap().is_finished() {
@@ -27501,9 +27619,7 @@ mod tests {
         app.bot = "shop.fix".into();
         app.options.store = store;
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         app.count_agents().await;
         while !app.counting.as_ref().unwrap().is_finished() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -27586,9 +27702,7 @@ mod tests {
         };
         // The follow starts, and its snapshot is what the footer counts.
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         counted(&mut app).await;
         let counts = |needs_you, working, idle| status::Counts {
             needs_you,
@@ -27697,9 +27811,7 @@ mod tests {
             app.count_agents().await;
         };
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         counted(&mut app).await;
         let names = |app: &App| -> Vec<String> {
             (app.listed.iter().flatten())
@@ -27777,9 +27889,7 @@ mod tests {
             app.count_agents().await;
         };
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         counted(&mut app).await;
         let needs = |app: &App| app.counts.as_ref().map(|counts| counts.needs_you);
         assert_eq!(needs(&app), Some(0));
@@ -27820,9 +27930,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         app.options.store = dir.join("state.sqlite");
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         app.count_agents().await;
         let _ = app.counting.take().unwrap().await;
         let first = asked.load(std::sync::atomic::Ordering::SeqCst);
@@ -28998,11 +29106,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projects_read_again_only_the_projects_that_moved() {
+    async fn projects_count_from_the_listing_and_again_only_the_projects_that_moved() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let answer = |asked: Arc<std::sync::Mutex<Vec<String>>>| {
             move |request: &Value| {
-                if request["op"] == "history_nodes" {
+                if request["op"] == "history_nodes" || request["op"] == "history_items" {
                     let bot = request["bot"].as_str().unwrap_or("").to_owned();
                     asked.lock().unwrap().push(bot);
                 }
@@ -29019,6 +29127,11 @@ mod tests {
             head: Some(1),
             created_by: maker.map(str::to_owned),
             workspace: Some(home.to_string_lossy().into_owned()),
+            last: Some(standing::Ended {
+                turn: 1,
+                status: "completed".into(),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mut listed = vec![
@@ -29027,70 +29140,89 @@ mod tests {
             agent("beta.lead", 3, None),
             agent("beta.two", 4, Some("beta.lead")),
         ];
+        // Each read: the projects found, and those counted again (their
+        // mark moved), and no history read.
         async fn page(
             client: &Client,
             store: &std::path::Path,
             asked: &std::sync::Mutex<Vec<String>>,
             listed: &[standing::Agent],
+            waiting: &[&str],
             state: &mut ProjectsState,
-        ) -> (Vec<String>, Vec<String>) {
-            asked.lock().unwrap().clear();
-            let (found, whole) = read_projects(client, store, listed, "x.lead", &[], &[], state)
-                .await
-                .unwrap();
+        ) -> Vec<String> {
+            let waiting = waiting.iter().map(|bot| bot.to_string()).collect();
+            let (found, whole) =
+                read_projects(client, store, listed, "x.lead", &[], &[], &waiting, state)
+                    .await
+                    .unwrap();
             assert!(whole);
+            assert!(asked.lock().unwrap().is_empty(), "a history was read");
             if let Some(writing) = state.writing.take() {
                 writing.await.unwrap();
             }
-            let mut read = asked.lock().unwrap().clone();
-            read.sort();
-            read.dedup();
-            (found.into_iter().map(|p| p.lead).collect(), read)
+            found.into_iter().map(|p| p.lead).collect()
         }
+        let needs = |state: &ProjectsState, lead: &str| {
+            state.each[lead].project.counts.of(status::Group::NeedsYou)
+        };
         let mut state = ProjectsState::default();
         let leads = ["alpha.lead", "beta.lead"];
-        // The first read reads every history.
-        let (found, read) = page(&client, &store, &asked, &listed, &mut state).await;
+        let found = page(&client, &store, &asked, &listed, &[], &mut state).await;
         assert_eq!(found, leads);
-        assert_eq!(read, ["alpha.lead", "alpha.one", "beta.lead", "beta.two"]);
-        // Nothing moved: no project is read again, and both are listed.
-        let (found, read) = page(&client, &store, &asked, &listed, &mut state).await;
-        assert_eq!(found, leads);
-        assert!(read.is_empty(), "{read:?}");
-        // One task moved: its project alone is read, and of it only the
-        // history that moved.
+        assert_eq!(needs(&state, "alpha.lead"), 0);
+        let marks = |state: &ProjectsState| leads.map(|lead| state.each[lead].mark);
+        let before = marks(&state);
+        // Nothing moved: no project is counted again.
+        page(&client, &store, &asked, &listed, &[], &mut state).await;
+        assert_eq!(marks(&state), before);
+        // A task asks the person, as the store's follow says: its project
+        // alone is counted again, and counts it.
+        page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
+        assert_eq!(needs(&state, "alpha.lead"), 1);
+        assert_ne!(marks(&state)[0], before[0]);
+        assert_eq!(marks(&state)[1], before[1]);
+        // A task moved: its project alone is counted again.
+        let before = marks(&state);
         listed[3].head = Some(2);
-        let (found, read) = page(&client, &store, &asked, &listed, &mut state).await;
-        assert_eq!(found, leads);
-        assert_eq!(read, ["beta.two"]);
+        page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
+        assert_eq!(marks(&state)[0], before[0]);
+        assert_ne!(marks(&state)[1], before[1]);
         // An outer lead marks a quiet project's lead done, which moves no
-        // listing: that project is read again, and counts it done.
+        // listing: that project is counted again, and counts it done.
         let done = state.each["beta.lead"].project.counts.done;
         resolved::keep(&store, "beta.lead", 1, "call-1").unwrap();
-        page(&client, &store, &asked, &listed, &mut state).await;
+        page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
         assert_eq!(state.each["beta.lead"].project.counts.done, done + 1);
         assert_eq!(state.each["alpha.lead"].project.counts.done, 0);
-        // Another window (a new process: nothing in memory) reads only
-        // what moved since this one kept its read beside the store.
-        listed[1].head = Some(2);
-        let other = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = daemon_answering(answer(other.clone())).await;
+        // Another window (a new process: nothing in memory) takes what
+        // this one kept beside the store.
         let mut fresh = ProjectsState::default();
-        let (found, read) = page(&client, &store, &other, &listed, &mut fresh).await;
+        let found = page(&client, &store, &asked, &listed, &["alpha.one"], &mut fresh).await;
         assert_eq!(found, leads);
-        assert_eq!(read, ["alpha.one"]);
-        // A project gone is let go, with what was read of its agents.
+        assert_eq!(marks(&fresh), marks(&state));
+        // A project gone is let go, from memory and from the kept file.
         listed.truncate(2);
-        let (found, _) = page(&client, &store, &other, &listed, &mut fresh).await;
+        let found = page(&client, &store, &asked, &listed, &["alpha.one"], &mut fresh).await;
         assert_eq!(found, ["alpha.lead"]);
         assert_eq!(fresh.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
-        assert!(!fresh.latest.contains_key("beta.two"));
-        assert_eq!(
-            take_projects(&store, client.identity())
-                .keys()
-                .collect::<Vec<_>>(),
-            ["alpha.lead"]
-        );
+        let (kept, this_build) = take_projects(&store, client.identity());
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        assert!(this_build);
+        // Another build's projects show, but are not reused; another
+        // store's are not taken.
+        let file = projects_file(&store);
+        let mut written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        written["build"] = json!("0.0.0 older");
+        std::fs::write(&file, written.to_string()).unwrap();
+        let (kept, this_build) = take_projects(&store, client.identity());
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        assert!(!this_build);
+        let mut other = ProjectsState::default();
+        page(&client, &store, &asked, &listed, &[], &mut other).await;
+        assert_eq!(other.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        written["store"] = json!("another store");
+        std::fs::write(&file, written.to_string()).unwrap();
+        assert!(take_projects(&store, client.identity()).0.is_empty());
     }
 
     #[tokio::test]
@@ -29105,6 +29237,7 @@ mod tests {
                     listed: Vec::new(),
                     state: ProjectsState::default(),
                     whole: true,
+                    waiting: Default::default(),
                 })
             })),
             lent: Some(tokio::spawn(std::future::pending())),
@@ -38305,6 +38438,252 @@ mod tests {
             status_keys(app.watch.as_ref().unwrap(), true),
             "↑↓ pick · enter open · →← fold · ctrl+f find · m more · esc close"
         );
+    }
+
+    #[test]
+    fn a_find_in_status_picks_a_task_s_row_where_its_agents_say_it() {
+        let row = |n: u32, title: &str, group| status::Row {
+            name: format!("errors.{n}"),
+            bot: format!("calc.errors.{n}"),
+            title: title.into(),
+            state: "working".into(),
+            running: true,
+            group,
+            ..Default::default()
+        };
+        let mut find = find::Find::new((None, Vec::new(), Vec::new()));
+        find.query = "typed".into();
+        let watch = Watch {
+            project: "calc".into(),
+            rows: vec![
+                row(1, "Move shop to typed errors", status::Group::Working),
+                row(2, "Move shop to typed errors", status::Group::Working),
+            ],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: Some(find),
+        };
+        let at = status_first_match(&watch, 80).expect("a match");
+        assert_eq!(
+            card_picks(&watch, 80)[at],
+            Picked::Task("calc.errors".into(), "calc.errors.1".into())
+        );
+    }
+
+    #[test]
+    fn a_find_in_status_opens_a_folded_task_and_esc_folds_it_again() {
+        let row = |n: u32| status::Row {
+            name: format!("errors.{n}"),
+            bot: format!("calc.errors.{n}"),
+            title: "Move shop to typed errors".into(),
+            state: "working".into(),
+            running: true,
+            group: status::Group::Working,
+            ..Default::default()
+        };
+        let mut watch = Watch {
+            project: "calc".into(),
+            rows: vec![row(1), row(2)],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            // The task folded with `←`.
+            helpers: vec!["calc.errors".into()],
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        };
+        let agent = Picked::Agent("calc.errors.2".into());
+        assert!(!card_picks(&watch, 80).contains(&agent));
+        let mut find = find::Find::new((None, Vec::new(), Vec::new()));
+        // Both agents say it: the task stays, two agents under it.
+        find.query = "errors.".into();
+        watch.finding = Some(find);
+        // A fold is searched and stands open while finding.
+        assert!(card_picks(&watch, 80).contains(&agent));
+        watch.finding = None;
+        assert!(!card_picks(&watch, 80).contains(&agent));
+        assert_eq!(watch.helpers, ["calc.errors"]);
+    }
+
+    #[tokio::test]
+    async fn h_j_k_l_typed_into_the_commons_find_are_letters() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let home = std::env::temp_dir().join(format!("sonny-commons-find-{}", std::process::id()));
+        app.open_pane(pane::Pane::card("commons", STATUS_KEYS));
+        app.pane_keys = true;
+        app.watch = Some(Watch {
+            project: "shop".into(),
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: Some(commons::View::open(&home, "shop".into())),
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        });
+        let key = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        app.key(key(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        for c in "shjkl".chars() {
+            app.key(key(KeyCode::Char(c), KeyModifiers::NONE)).await;
+        }
+        let view = (app.watch.as_mut())
+            .and_then(|w| w.commons.as_mut())
+            .unwrap();
+        let (lines, _) = view.card(80);
+        let last: String = (lines.last().unwrap().spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(last, "find shjkl");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_link_clicked_on_an_item_s_page_opens_the_next_page_at_its_top() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let home = board_view::tests::commons("click-depth");
+        let mut view = commons::View::open(&home, "shop".into());
+        view.open_thread("api");
+        // Its links are laid as the pane draws it.
+        view.card(80);
+        let depth = view.depth();
+        app.open_pane(pane::Pane::card("commons", STATUS_KEYS));
+        app.watch = Some(Watch {
+            project: "shop".into(),
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: Some(view),
+            memory: None,
+            sky: None,
+            // Reading a thread: the page as it was scrolled.
+            picked: Some(usize::MAX),
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        });
+        // The head's first link, its board.
+        app.act("commons/link/0");
+        let watch = app.watch.as_ref().unwrap();
+        assert_eq!(watch.commons.as_ref().unwrap().depth(), depth + 1);
+        assert_eq!(watch.picked, None);
+    }
+
+    #[tokio::test]
+    async fn status_folds_a_task_s_agents_and_enter_goes_to_its_most_pressing() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let row = |n: u32, state: &str, group| status::Row {
+            name: format!("errors.{n}"),
+            bot: format!("calc.errors.{n}"),
+            title: "Move shop to typed errors".into(),
+            state: state.into(),
+            running: group == status::Group::Working,
+            group,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![
+                row(1, "working", status::Group::Working),
+                row(2, "needs you", status::Group::NeedsYou),
+            ],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: Some(0),
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);
+        let picked = |app: &App| picks(app)[app.watch.as_ref().unwrap().pick.unwrap()].clone();
+        let task = Picked::Task("calc.errors".into(), "calc.errors.2".into());
+        let agent = |n: u32| Picked::Agent(format!("calc.errors.{n}"));
+        // They start open, in the order of their names.
+        assert_eq!(picks(&app), [task.clone(), agent(1), agent(2)]);
+        // ← on the task's row folds them; → opens them.
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picks(&app), std::slice::from_ref(&task));
+        let lines = watch_card(app.watch.as_ref().unwrap(), 80).0;
+        let row: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            row.trim_end(),
+            "  ? Move shop to typed errors  ▸ 2 agents, 1 needs you, 1 working"
+        );
+        app.key(key(KeyCode::Right)).await;
+        assert_eq!(picks(&app).len(), 3);
+        // ← on one of its agents folds the task, the pick on its row.
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(picked(&app), agent(1));
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picks(&app), std::slice::from_ref(&task));
+        assert_eq!(picked(&app), task);
+        // `enter` on it goes to the agent whose mark it shows: here, this
+        // window's own, so the view closes.
+        app.bot = "calc.errors.2".into();
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.pane.is_none() || !app.pane.as_ref().unwrap().is_card());
     }
 
     #[tokio::test]
