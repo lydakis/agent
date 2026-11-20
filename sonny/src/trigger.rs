@@ -3558,12 +3558,26 @@ pub fn index(row: &Value) -> Value {
         }
         line["last"] = json!(said);
     }
-    let problem = [&row["problem"], &last["turn_error"]]
-        .into_iter()
-        .chain((last["outcome"] == "failed").then_some(&last["detail"]))
-        .find_map(|said| said.as_str().filter(|said| !said.is_empty()));
+    // An `if` that fails keeps the last run as it was, and stops the
+    // next: that is its problem first.
+    let checked = &row["checked"];
+    let check = (checked["gate"] == "failed").then(|| {
+        (checked["detail"].as_str())
+            .filter(|detail| !detail.is_empty())
+            .map_or_else(
+                || "its if could not check".to_owned(),
+                |detail| format!("its if failed: {detail}"),
+            )
+    });
+    let problem = check.or_else(|| {
+        [&row["problem"], &last["turn_error"]]
+            .into_iter()
+            .chain((last["outcome"] == "failed").then_some(&last["detail"]))
+            .find_map(|said| said.as_str().filter(|said| !said.is_empty()))
+            .map(str::to_owned)
+    });
     if let Some(problem) = problem {
-        line["problem"] = json!(crate::lookout::sources::cut(problem, PROBLEM_CHARS));
+        line["problem"] = json!(crate::lookout::sources::cut(&problem, PROBLEM_CHARS));
     }
     for key in ["missed", "ended", "shadow"] {
         if row[key] == true {
@@ -8022,6 +8036,12 @@ pub(crate) mod tests {
             "{line}"
         );
         assert_eq!(line["problem"], "login expired");
+        // An if that fails keeps the last run, and is the problem.
+        let mut broken = rows[2].clone();
+        broken["checked"] = json!({"gate": "failed", "detail": "gh: not logged in"});
+        let line = index(&broken);
+        assert!(line["last"].as_str().unwrap().ends_with(" sent"), "{line}");
+        assert_eq!(line["problem"], "its if failed: gh: not logged in");
         // Read gives it whole, its message too.
         let whole = own(&w.places, "watch-03", &caller).unwrap();
         assert!(

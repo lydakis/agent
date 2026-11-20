@@ -1277,9 +1277,13 @@ pub fn read_one(
     let sub = (subs.iter().find(|sub| sub.name == name))
         .ok_or_else(|| format!("no follow {name:?}: a call with nothing lists yours"))?;
     let (counts, now) = (counts(store, subscriber), super::epoch_ms() as u64);
-    let mut said = status(store, sub, sources);
-    said["follow"] = whole(sub, &counts, owner, now);
-    said["lookout"] = taken(store, subscriber);
+    let (follow, lookout) = (whole(sub, &counts, owner, now), taken(store, subscriber));
+    // What the follow and the lookout's word take is left out of what its
+    // sources' words may fill.
+    let reserve = follow.to_string().len() + lookout.to_string().len();
+    let mut said = status(store, sub, sources, reserve);
+    said["follow"] = follow;
+    said["lookout"] = lookout;
     Ok(said)
 }
 
@@ -1303,8 +1307,14 @@ pub fn source(
     };
     let (shape, examples) =
         super::sources::listed(store, &[super::sources::named(name).0.to_owned()], &subs);
-    let mut said = status(store, &reading, sources);
     let mut source = shape.into_iter().next().unwrap_or_default();
+    // What its shape and the examples' warning take is left out of what
+    // its topics may fill.
+    let reserve = source.to_string().len()
+        + examples
+            .then_some(super::sources::EXAMPLES.len())
+            .unwrap_or(0);
+    let mut said = status(store, &reading, sources, reserve);
     if let Some(now) = said.as_object_mut().and_then(|said| said.remove("now")) {
         let now = now
             .as_array()
@@ -1350,8 +1360,9 @@ fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
 /// it ([`super::sources::status`]): the newest event of each topic it
 /// hears, newest first, as data, and that the source is down while it
 /// is. The tasks source and the commons keep none here, so they are said
-/// to be unread; a source there is not now is left out.
-fn status(store: &Path, sub: &Sub, sources: &[String]) -> Value {
+/// to be unread; a source there is not now is left out. The answer fits
+/// what a tool's answer shows with `reserve` bytes more beside it.
+fn status(store: &Path, sub: &Sub, sources: &[String], reserve: usize) -> Value {
     let named: Vec<&str> = (sub.sources.iter())
         .map(|name| super::sources::named(name).0)
         .filter(|source| sources.iter().any(|there| there == source))
@@ -1363,7 +1374,7 @@ fn status(store: &Path, sub: &Sub, sources: &[String]) -> Value {
     let mut listed = Vec::new();
     // The whole answer fits what a tool's answer shows, its words besides
     // the topics (`outside`, `more`, `unread`) counted first.
-    let (mut bytes, mut more) = (READ_WORDS, 0);
+    let (mut bytes, mut more) = (READ_WORDS + reserve, 0);
     for (n, source) in named.iter().enumerate() {
         if named[..n].contains(source) {
             continue;
@@ -2093,6 +2104,33 @@ mod tests {
             all["more"],
             format!("{} topics more than one answer holds", 300 - shown)
         );
+        // Its shape counts against what its topics may fill: long topic
+        // names and many fields still leave the answer whole.
+        let shapes = super::super::beside(&store, ".sources").join(".shapes");
+        std::fs::create_dir_all(&shapes).unwrap();
+        let fields: serde_json::Map<String, Value> = (0..64)
+            .map(|n| {
+                (
+                    format!("field_{n:02}_{}", "f".repeat(40)),
+                    json!({"kinds": ["string"]}),
+                )
+            })
+            .collect();
+        let topics: Vec<String> = (0..32)
+            .map(|n| format!("{n}-{}", "t".repeat(280)))
+            .collect();
+        std::fs::write(
+            shapes.join("prs.json"),
+            json!({"events": 300, "fields": fields, "topics": topics, "recent": []}).to_string(),
+        )
+        .unwrap();
+        let shaped = source(&store, "shop.lead", None, "prs", &names).unwrap();
+        assert!(
+            shaped.to_string().len() <= crate::served::OUTPUT_BYTES,
+            "{}",
+            shaped.to_string().len()
+        );
+        assert!(shaped["source"]["now"].as_array().unwrap().len() < shown);
         // A source with nothing kept reads empty, and says nothing is outside.
         let names = ["ci".to_owned()];
         let empty = source(&store, "shop.lead", None, "ci", &names).unwrap();
@@ -2128,13 +2166,13 @@ mod tests {
             ]
             .map(|(what, asked)| (what, parse(&asked).unwrap()));
             for (what, asked) in &asks {
-                let _ = status(&store, asked, &names);
+                let _ = status(&store, asked, &names, 0);
                 let start = std::time::Instant::now();
                 for _ in 0..20 {
-                    let _ = status(&store, asked, &names);
+                    let _ = status(&store, asked, &names, 0);
                 }
                 let one = start.elapsed() / 20;
-                let size = status(&store, asked, &names).to_string().len();
+                let size = status(&store, asked, &names, 0).to_string().len();
                 println!(
                     "agents {agents:>5} {what:>6}: one read {one:>9.2?}, answer {} KiB",
                     size / 1024
@@ -2165,7 +2203,7 @@ mod tests {
                                         json!({"name": "r", "sources": [format!("prs:{agent}")]});
                                     let asked = parse(&asked).unwrap();
                                     let at = std::time::Instant::now();
-                                    let _ = status(store, &asked, names);
+                                    let _ = status(store, &asked, names, 0);
                                     at.elapsed()
                                 })
                                 .collect::<Vec<_>>()
