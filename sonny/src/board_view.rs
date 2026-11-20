@@ -497,17 +497,14 @@ pub fn section_heading(state: State, n: usize, open: bool) -> Line<'static> {
 }
 
 /// Whether an item answers a find on a board's page: its title, its
-/// holder or a label holds what was typed, case aside.
+/// holder or a label says what was typed (`crate::find::says`).
 pub fn found_on_page(item: &Item, query: &str) -> bool {
     let labels: Vec<String> = (item.labels.iter())
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
-    crate::projects::finds(
-        query,
-        [item.title.as_str(), item.holder.as_deref().unwrap_or("")]
-            .into_iter()
-            .chain(labels.iter().map(String::as_str)),
-    )
+    ([item.title.as_str(), item.holder.as_deref().unwrap_or("")].into_iter())
+        .chain(labels.iter().map(String::as_str))
+        .any(|words| crate::find::says(query, words))
 }
 
 /// What one action post did to its item, in words: `claimed`,
@@ -636,12 +633,11 @@ pub enum Target {
 }
 
 /// Whether an item is listed by a find in the list: its title, its board
-/// or its holder holds what was typed, case aside.
+/// or its holder says what was typed (`crate::find::says`).
 pub fn found_in_list(item: &Item, query: &str) -> bool {
-    crate::projects::finds(
-        query,
-        [item.title.as_str(), item.holder.as_deref().unwrap_or("")],
-    )
+    [item.title.as_str(), item.holder.as_deref().unwrap_or("")]
+        .into_iter()
+        .any(|words| crate::find::says(query, words))
 }
 
 #[cfg(test)]
@@ -1347,7 +1343,10 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("Provider")), "{lines:#?}");
         // The pick goes to the first match, not the board that holds it.
         assert!(picked(&mut view, 80).contains("Remove the old error enum"));
-        assert_eq!(view.keys(), "↑↓ pick · enter open · esc cancel");
+        assert_eq!(
+            view.keys(),
+            "↑↓ pick · enter open · ctrl+f find · esc cancel"
+        );
         // A board by its name; a thread by its title.
         for _ in 0..4 {
             press(&mut view, KeyCode::Backspace);

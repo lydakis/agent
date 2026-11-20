@@ -2042,9 +2042,9 @@ pub struct View {
     pick: Option<Pick>,
     /// Whether the finished boards' fold is open.
     fold_open: bool,
-    /// What `ctrl+f` narrows the list to, while finding, and the pick as
-    /// it was before, which `esc` puts back.
-    finding: Option<(String, Option<Pick>)>,
+    /// `ctrl+f` (`crate::find`): what is typed narrows the list, and the
+    /// pick as it was before, which `esc` puts back.
+    finding: Option<crate::find::Find<Option<Pick>>>,
     /// The pages opened over the list, the last on top.
     pages: Vec<Page>,
     /// What the listing last read of each thread.
@@ -2093,7 +2093,7 @@ enum Page {
         pick: Option<Pick>,
         /// The folding sections opened.
         open: Vec<crate::board_view::State>,
-        finding: Option<(String, Option<Pick>)>,
+        finding: Option<crate::find::Find<Option<Pick>>>,
     },
     Thread {
         name: String,
@@ -2273,8 +2273,8 @@ impl View {
     fn rows(&self) -> Vec<Row> {
         let (open, finished) = self.boards_split();
         let query = (self.finding.as_ref())
-            .map(|(query, _)| query.to_lowercase())
-            .filter(|query| !query.is_empty());
+            .filter(|find| find.typed())
+            .map(|find| find.query.clone());
         let mut rows = Vec::new();
         match &query {
             Some(query) => {
@@ -2283,7 +2283,7 @@ impl View {
                     let hung: Vec<usize> = (board.items.iter().copied())
                         .filter(|item| crate::board_view::found_in_list(&self.items[*item], query))
                         .collect();
-                    if hung.is_empty() && !crate::projects::finds(query, [board.name.as_str()]) {
+                    if hung.is_empty() && !crate::find::says(query, &board.name) {
                         continue;
                     }
                     rows.push(Row::Board(*at));
@@ -2304,11 +2304,14 @@ impl View {
             if !self.in_scope(thread) || (self.is_item(thread) && !self.more) {
                 continue;
             }
-            if let Some(query) = &query {
-                let title = thread["title"].as_str().unwrap_or_default().to_lowercase();
-                if !title.contains(query.as_str()) {
-                    continue;
-                }
+            // A thread says it in its title or who wrote in it, as its row
+            // does.
+            if let Some(query) = &query
+                && !["title", "started_by", "last_by"]
+                    .iter()
+                    .any(|key| crate::find::says(query, thread[*key].as_str().unwrap_or_default()))
+            {
+                continue;
             }
             rows.push(Row::Thread(at));
         }
@@ -2369,8 +2372,8 @@ impl View {
             Some(Page::Board { open, finding, .. }) => (
                 open.clone(),
                 (finding.as_ref())
-                    .map(|(query, _)| query.clone())
-                    .filter(|q| !q.is_empty()),
+                    .filter(|find| find.typed())
+                    .map(|find| find.query.clone()),
             ),
             _ => (Vec::new(), None),
         };
@@ -2422,36 +2425,25 @@ impl View {
             return Key::Close;
         }
         // Finding: what is typed narrows the rows; the arrows still pick.
-        if self.is_finding() {
-            let plain = !(key.modifiers).intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-            match code {
-                KeyCode::Esc => {
+        if let Some(find) = self.find_mut() {
+            match find.key(&key) {
+                crate::find::Typed::Dropped => {
                     self.drop_find();
                     return Key::Stay;
                 }
-                KeyCode::Backspace => {
-                    if let Some(query) = self.query_mut() {
-                        query.pop();
-                    }
+                crate::find::Typed::Changed => {
                     self.found();
                     return Key::Stay;
                 }
-                KeyCode::Char(c) if plain => {
-                    if let Some(query) = self.query_mut() {
-                        query.push(c);
-                    }
-                    self.found();
-                    return Key::Stay;
-                }
-                _ => {}
+                crate::find::Typed::Other => {}
             }
         }
         match code {
-            KeyCode::Char('f') if ctrl && !self.reading() => {
-                let pick = self.current_pick();
+            _ if crate::find::opens(&key) && !self.reading() => {
+                let find = crate::find::Find::new(self.current_pick());
                 match self.pages.last_mut() {
-                    Some(Page::Board { finding, .. }) => *finding = Some((String::new(), pick)),
-                    _ => self.finding = Some((String::new(), pick)),
+                    Some(Page::Board { finding, .. }) => *finding = Some(find),
+                    _ => self.finding = Some(find),
                 }
             }
             // A letter with Ctrl or Alt is another shortcut.
@@ -2499,11 +2491,11 @@ impl View {
         }
     }
 
-    fn query_mut(&mut self) -> Option<&mut String> {
+    fn find_mut(&mut self) -> Option<&mut crate::find::Find<Option<Pick>>> {
         match self.pages.last_mut() {
-            Some(Page::Board { finding, .. }) => finding.as_mut().map(|(q, _)| q),
+            Some(Page::Board { finding, .. }) => finding.as_mut(),
             Some(Page::Thread { .. }) => None,
-            None => self.finding.as_mut().map(|(q, _)| q),
+            None => self.finding.as_mut(),
         }
     }
 
@@ -2511,14 +2503,14 @@ impl View {
     fn drop_find(&mut self) {
         match self.pages.last_mut() {
             Some(Page::Board { finding, pick, .. }) => {
-                if let Some((_, was)) = finding.take() {
-                    *pick = was;
+                if let Some(find) = finding.take() {
+                    *pick = find.before;
                 }
             }
             Some(Page::Thread { .. }) => {}
             None => {
-                if let Some((_, was)) = self.finding.take() {
-                    self.pick = was;
+                if let Some(find) = self.finding.take() {
+                    self.pick = find.before;
                 }
             }
         }
@@ -2550,25 +2542,21 @@ impl View {
         }
     }
 
-    /// After what is found changed: the pick stays on a row that matches,
-    /// else goes to the first that does, not to a board kept only because
-    /// it holds a match.
+    /// After what is found changed: the pick goes to the first row that
+    /// matches, not to a board kept only because it holds a match.
     fn found(&mut self) {
         let rows = Self::pickable(&self.current_rows());
         let query = match self.pages.last() {
-            Some(Page::Board { finding, .. }) => finding.as_ref().map(|(q, _)| q.to_lowercase()),
-            _ => self.finding.as_ref().map(|(q, _)| q.to_lowercase()),
+            Some(Page::Board { finding, .. }) => finding.as_ref().map(|find| find.query.clone()),
+            _ => self.finding.as_ref().map(|find| find.query.clone()),
         }
         .unwrap_or_default();
         let matches = |row: &Row| match row {
-            Row::Board(at) => crate::projects::finds(&query, [self.boards[*at].name.as_str()]),
+            Row::Board(at) => crate::find::says(&query, &self.boards[*at].name),
             Row::Hung(_) | Row::Thread(_) | Row::Item(_) => true,
             Row::Fold(_) | Row::Heading(_) => false,
         };
-        let picked = (self.current_pick()).and_then(|pick| self.find_pick(&rows, &pick));
-        if query.is_empty() || picked.is_some_and(|at| matches(&rows[at])) {
-            return self.settle();
-        }
+        // The pick to the first match, as every find has it.
         let first = rows.iter().find(|row| matches(row)).or(rows.first());
         let first = first.map(|row| self.pick_of(*row));
         self.set_pick(first);
@@ -2792,12 +2780,14 @@ impl View {
         }
     }
 
-    /// Words pasted while finding, as if typed.
-    pub fn paste(&mut self, text: &str) {
-        if let Some(query) = self.query_mut() {
-            query.extend(text.chars().filter(|c| !c.is_control()));
-            self.found();
-        }
+    /// Words pasted while finding, as if typed: whether a find took them.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(find) = self.find_mut() else {
+            return false;
+        };
+        find.paste(text);
+        self.found();
+        true
     }
 
     /// The card, and the row the picked thread starts on.
@@ -2823,12 +2813,9 @@ impl View {
             Some(Page::Thread { .. }) => None,
             None => self.finding.as_ref(),
         };
-        if let Some((query, _)) = query {
+        if let Some(find) = query {
             card.lines.push(Line::default());
-            card.lines.push(Line::from(vec![
-                Span::raw("find ").dim(),
-                Span::raw(query.clone()),
-            ]));
+            card.lines.push(crate::find::line(&find.query));
         }
         card
     }
@@ -2884,8 +2871,8 @@ impl View {
         if rows.is_empty() {
             out.push(Line::default());
             match &self.finding {
-                Some((query, _)) if !query.is_empty() => {
-                    out.push(Line::from(format!("Nothing matches {query}.")).dim());
+                Some(find) if find.typed() => {
+                    out.push(Line::from(format!("nothing here matches {}", find.query)).dim());
                 }
                 _ if any_board => {}
                 _ => {
@@ -3100,12 +3087,12 @@ impl View {
             .collect();
         if rows.is_empty()
             && let Some(Page::Board {
-                finding: Some((query, _)),
+                finding: Some(find),
                 ..
             }) = self.pages.last()
         {
             out.push(Line::default());
-            out.push(Line::from(format!("Nothing matches {query}.")).dim());
+            out.push(Line::from(format!("no item matches {}", find.query)).dim());
         }
         for row in &rows {
             match row {
@@ -3281,9 +3268,12 @@ impl View {
                 Keys::new().pick().esc(Esc::Back)
             }
             Some(Page::Thread { .. }) => Keys::new().key("↑↓", "scroll").esc(Esc::Back),
-            _ if finding => Keys::new().pick().enter(Enter::Open).esc(Esc::Cancel),
+            // `esc` drops the find first; the next one leaves the page.
+            _ if finding => (Keys::new().pick().enter(Enter::Open))
+                .find()
+                .esc(Esc::Cancel),
             Some(Page::Board { .. }) => (Keys::new().pick().enter(Enter::Open))
-                .key("ctrl+f", "find")
+                .find()
                 .esc(Esc::Back),
             None => {
                 let rows = Self::pickable(&self.rows()).len();
@@ -3292,11 +3282,11 @@ impl View {
                     1 => Keys::new().enter(Enter::Open),
                     _ => Keys::new().pick().enter(Enter::Open),
                 };
-                keys = keys.key("a", whose);
+                keys = keys.find().key("a", whose);
                 if !self.items.is_empty() {
                     keys = keys.key("m", if self.more { "threads only" } else { "items" });
                 }
-                keys.key("ctrl+f", "find").esc(Esc::Close)
+                keys.esc(Esc::Close)
             }
         }
         .text()
@@ -3367,6 +3357,83 @@ mod tests {
         let lines = news.lines.clone();
         assert!(news.mark_read());
         lines
+    }
+
+    #[test]
+    fn ctrl_f_narrows_the_threads_picks_the_first_match_and_esc_puts_them_back() {
+        let home = &home("find");
+        for (by, name, title) in [
+            ("calc.halves", "rounding", "How do you round half cents?"),
+            ("calc.builder", "ci-cache", "Caching the CI's cargo target"),
+            ("calc.readme", "readme", "Which README examples still run?"),
+        ] {
+            caught_up(
+                home,
+                by,
+                None,
+                None,
+                &json!({"post": {"name": name, "title": title, "text": "?"}}),
+            )
+            .unwrap();
+        }
+        let mut view = View::open(home, "calc".into());
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let text = |view: &mut View| -> Vec<String> {
+            (view.card(80).0.iter())
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect()
+        };
+        let picked = |view: &mut View| {
+            let (lines, at) = view.card(80);
+            lines[at].to_string()
+        };
+        let says = |view: &mut View, what: &str| text(view).iter().any(|line| line.contains(what));
+        // The hint names it with the view's keys.
+        assert_eq!(
+            view.keys(),
+            "↑↓ pick · enter open · ctrl+f find · a this project · esc close"
+        );
+        while !picked(&mut view).contains("README") {
+            view.press(key(KeyCode::Down));
+        }
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(view.press(ctrl_f), Key::Stay);
+        assert!(view.finding());
+        assert_eq!(text(&mut view).last().unwrap(), "find");
+        // Typed, it narrows; the pick to the first match.
+        assert_eq!(view.press(key(KeyCode::Char('c'))), Key::Stay);
+        assert!(says(&mut view, "round half cents") && says(&mut view, "README"));
+        // Who wrote counts too: `calc.` is in every one's, `cac` only in
+        // a title.
+        view.press(key(KeyCode::Char('a')));
+        assert!(says(&mut view, "round half") && says(&mut view, "README"));
+        assert_eq!(view.press(key(KeyCode::Char('c'))), Key::Stay);
+        assert!(!says(&mut view, "round half") && says(&mut view, "Caching the CI"));
+        assert!(!says(&mut view, "README"), "{:#?}", text(&mut view));
+        assert!(picked(&mut view).contains("Caching the CI"));
+        assert_eq!(text(&mut view).last().unwrap(), "find cac");
+        // The arrows stay among the threads found.
+        view.press(key(KeyCode::Up));
+        assert!(picked(&mut view).contains("Caching the CI"));
+        // Pasted, as typed; nothing found says so, and nothing is picked
+        // to open.
+        assert!(view.paste("zz"));
+        assert!(
+            says(&mut view, "nothing here matches caczz"),
+            "{:#?}",
+            text(&mut view)
+        );
+        assert_eq!(view.press(key(KeyCode::Enter)), Key::Stay);
+        assert!(!view.reading());
+        // `esc` drops the find, the threads and the pick as they were; the
+        // next closes the view.
+        assert_eq!(view.press(key(KeyCode::Esc)), Key::Stay);
+        assert!(!view.finding() && !view.paste("zz"));
+        assert!(picked(&mut view).contains("README"));
+        assert!(says(&mut view, "README") && says(&mut view, "round half"));
+        assert!(!text(&mut view).last().unwrap().contains("find"));
+        assert_eq!(view.press(key(KeyCode::Esc)), Key::Close);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -4377,7 +4444,7 @@ mod tests {
         assert!(at("New one") < at("Old one"), "{listed:?}");
         assert_eq!(
             view.keys(),
-            "↑↓ pick · enter open · a this project · ctrl+f find · esc close"
+            "↑↓ pick · enter open · ctrl+f find · a this project · esc close"
         );
         assert_eq!(view.footer(), None);
         view.press(KeyEvent::from(KeyCode::Down));
