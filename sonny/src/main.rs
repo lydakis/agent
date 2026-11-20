@@ -18794,8 +18794,11 @@ impl App {
         {
             // Words only: neither a task's start nor the new window's first
             // send carries a picture, which the agent is shown once it runs.
+            // What it quotes goes before the words, as with any message;
+            // kept over the composer should the agent not be made.
             if self.placed(&prompt).is_empty() {
-                self.make_new(making, prompt).await;
+                let brief = noted(prompt, &self.quotes);
+                self.make_new(making, brief).await;
             } else {
                 making.failed =
                     Some("a new agent starts from words; send the picture once it runs".into());
@@ -20825,6 +20828,7 @@ impl App {
         match made {
             Ok(bot) => {
                 self.input.clear();
+                self.quotes.clear();
                 self.switch_to = Some(bot);
                 self.quit = true;
             }
