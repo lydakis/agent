@@ -30,6 +30,11 @@ class StoreDownTest(unittest.TestCase):
             "UPDATE bots SET settings=json_set(coalesce(settings,'{}'),'$.namespace','fixture')"
             " WHERE name='Helper'"
         )
+        conn.execute(
+            "UPDATE bots SET creation=json_object('request',json_object('op','create','settings',"
+            "json_object('namespace','fixture','speeds',json_object('openai/*',json_array('fast')),"
+            "'sandbox','read-only'))) WHERE name='Helper'"
+        )
         conn.commit()
         conn.close()
 
@@ -55,6 +60,9 @@ class StoreDownTest(unittest.TestCase):
         self.assertEqual(self.read("SELECT DISTINCT instructions FROM bots"), [("Test agent.",)])
         self.assertEqual(self.read("SELECT count(*) FROM bots WHERE json_type(settings,'$.namespace') IS NOT NULL"),
                          [(0,)])
+        # A keyed creation's record keeps only what 0.10.1 could have sent.
+        self.assertEqual(self.read("SELECT json_extract(creation,'$.request.settings') FROM bots"
+                                   " WHERE name='Helper'"), [('{"sandbox":"read-only"}',)])
         lists = self.read("SELECT tools FROM tool_lists")
         self.assertTrue(lists and all('"yields"' not in tools for (tools,) in lists))
         self.assertTrue(any('"lift":true' in tools for (tools,) in lists))

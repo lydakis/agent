@@ -55,6 +55,11 @@ def back_108(conn):
         "UPDATE bots SET configure_pending=json_remove(configure_pending,"
         "    '$.settings.namespace','$.settings.speeds','$.settings.context_windows')"
         " WHERE json_type(configure_pending,'$.settings') IS NOT NULL;"
+        # A keyed creation's record, so a resend from the older release,
+        # which cannot carry them, still matches it.
+        "UPDATE bots SET creation=json_remove(creation,'$.request.settings.namespace',"
+        "    '$.request.settings.speeds','$.request.settings.context_windows')"
+        " WHERE json_type(creation,'$.request.settings') IS NOT NULL;"
     )
 
 
