@@ -236,6 +236,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::lookout::subs::COMMONS_OUTLIVE_CLOSE,
         retire: "0.12.0",
     },
+    // The profile Sonny noted beside the store for each task and lead it
+    // started goes onto the agent, which the daemon keeps now (0.10.3).
+    Migration {
+        id: crate::task::PROFILES_ON_AGENTS,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -293,6 +299,20 @@ pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) 
             tokio::task::spawn_blocking(move || crate::commons::projects(&home, &records));
         }
     });
+}
+
+/// The profiles Sonny noted beside `store` for the agents it started go
+/// onto them, awaited before a lead's instructions are composed again from
+/// its profile: a whole listing, until it is done once.
+pub async fn profiles_on_agents(client: &agent_client::Client, store: &Path) {
+    let record = beside(store);
+    if done(&record, crate::task::PROFILES_ON_AGENTS) {
+        return;
+    }
+    let (bots, whole) = crate::lookout::listed(client).await;
+    if whole && crate::task::profiles_onto_agents(client, &bots, store).await {
+        once(&record, crate::task::PROFILES_ON_AGENTS, || true);
+    }
 }
 
 /// The record beside `store` of what was done once for it.

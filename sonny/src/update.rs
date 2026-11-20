@@ -10,7 +10,8 @@
 //! Then the new Sonny does the rest, run in place of the old one: the
 //! daemon running now is replaced by the new build's (`agent start
 //! --replace`: the old one stops at once, its running turns park and
-//! continue on the new one), the companions start on the new build, and
+//! continue on the new one), the companions are checked on the new build
+//! and replaced where they are not ([`check_companions`]), and
 //! what names Sonny's program (the scripts in `~/.agent`, automations, the
 //! scheduler's job) is written again by the path that outlives a release,
 //! and Sonny's own agent-browser and agent-desktop are brought to the
@@ -106,11 +107,12 @@ fn tarball_name(version: &str, arch: &str) -> String {
 
 /// Whether `latest` is a newer release than `current`, as Codex compares
 /// them: plain `MAJOR.MINOR.PATCH` only, so a prerelease is never offered.
+/// A build from main is 0.0.0, older than any release.
 fn is_newer(latest: &str, current: &str) -> Option<bool> {
     Some(parse_version(latest)? > parse_version(current)?)
 }
 
-fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.trim().split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -521,7 +523,7 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
     // Sonny's own files migrated before the daemon and its companions
     // start on this build.
     crate::upgrade::at_start(store);
-    let replaced = runtime.block_on(switch_daemon(store, socket, installed))?;
+    let (replaced, failing) = runtime.block_on(switch_daemon(store, socket, installed))?;
     // Sonny's own agent-browser and agent-desktop at the versions this
     // build's tools list, before the skills they serve are written again.
     let say = |line: &str| println!("{line}");
@@ -562,14 +564,31 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
         Last::AsBuilt => println!("Sonny is on version {VERSION}, as built"),
         _ => println!("Sonny is up to date ({VERSION})"),
     }
-    Ok(())
+    still_failing(&failing)
+}
+
+/// The upgrade's outcome once its companions are checked: an error, so
+/// it exits non-zero, while any is still failing.
+fn still_failing(failing: &[&str]) -> Result<(), String> {
+    match failing {
+        [] => Ok(()),
+        [one] => Err(format!("{one} is still failing on {VERSION}")),
+        _ => Err(format!(
+            "{} are still failing on {VERSION}",
+            failing.join(", ")
+        )),
+    }
 }
 
 /// The daemon on `socket` made this build's: replaced when it runs
 /// another release, or always when `installed` (a build was just
-/// installed), its companions then started on this one. Whether it was
-/// replaced.
-async fn switch_daemon(store: &Path, socket: &Path, installed: bool) -> Result<bool, String> {
+/// installed), its companions then checked on this one. Whether it was
+/// replaced, and the companions still failing.
+async fn switch_daemon(
+    store: &Path,
+    socket: &Path,
+    installed: bool,
+) -> Result<(bool, Vec<&'static str>), String> {
     let agent = crate::agent_bin_or_missing()?;
     let own = agent_version(&agent);
     let running = match agent_client::Client::connect(socket).await {
@@ -590,11 +609,11 @@ async fn switch_daemon(store: &Path, socket: &Path, installed: bool) -> Result<b
     };
     let Some(version) = running else {
         println!("Daemon: not running; the next window starts {own}");
-        return Ok(false);
+        return Ok((false, Vec::new()));
     };
     let replace = installed || version.as_deref() != Some(own.as_str());
     if replace {
-        crate::start_daemon_replacing(store, socket).map_err(|e| e.to_string())?;
+        crate::start_daemon_replacing(store, socket).map_err(|e| format!("{e}; {UNCHECKED}"))?;
         println!(
             "Daemon: {} stopped and {own} started; its running turns continue on {own}",
             version.as_deref().unwrap_or("the older daemon")
@@ -604,11 +623,264 @@ async fn switch_daemon(store: &Path, socket: &Path, installed: bool) -> Result<b
     }
     let (client, _events) = agent_client::Client::connect(socket)
         .await
-        .map_err(|e| e.to_string())?;
-    crate::start_companions(&client, crate::Companions::Replace).await?;
+        .map_err(|e| format!("{e}; {UNCHECKED}"))?;
+    let checked = check_companions(&client, store, &Watch::UPGRADE).await;
     client.close().await;
-    println!("Companions: the lookout and tool host run Sonny {VERSION}");
-    Ok(replace)
+    let checked = checked.map_err(|e| format!("{e}; {UNCHECKED}"))?;
+    for (name, found) in &checked {
+        println!("{}", said(name, found));
+    }
+    let failing = (checked.iter())
+        .filter(|(_, found)| matches!(found, Checked::Failing(_)))
+        .map(|(name, _)| *name)
+        .collect();
+    Ok((replace, failing))
+}
+
+/// Why an upgrade left its companions unchecked: the daemon did not come
+/// up on this build, and they come back as they were kept when it does.
+const UNCHECKED: &str = "its companions were not checked; once the daemon runs, `sonny upgrade` puts them on this build";
+
+/// What became of one of Sonny's companions at an upgrade.
+#[derive(Debug, PartialEq)]
+enum Checked {
+    /// This build's, running.
+    Ok,
+    /// Put on this build in place of what it was.
+    Replaced(String),
+    /// None was kept; this build's was started.
+    Started,
+    /// Not running on this build, with the daemon's word on why.
+    Failing(String),
+}
+
+/// How [`check_companions`] watches the companions run.
+struct Watch {
+    /// How long a run lasts with no restart to count as running: the
+    /// daemon starts one that exited again after a second, then two, so
+    /// one that exits as it starts has restarted by then.
+    settled: std::time::Duration,
+    /// How long it waits for them all: one replaced waits for the run
+    /// before it to stop, up to the daemon's 5 s grace, then settles.
+    until: std::time::Duration,
+    /// How often it asks the daemon.
+    every: std::time::Duration,
+}
+
+impl Watch {
+    const UPGRADE: Watch = Watch {
+        settled: std::time::Duration::from_secs(5),
+        until: std::time::Duration::from_secs(15),
+        every: std::time::Duration::from_millis(200),
+    };
+}
+
+/// One line for what became of companion `name`.
+fn said(name: &str, found: &Checked) -> String {
+    match found {
+        Checked::Ok => format!("Companion {name}: ok"),
+        Checked::Replaced(was) => format!("Companion {name}: replaced (was {was})"),
+        Checked::Started => format!("Companion {name}: started (none was kept)"),
+        Checked::Failing(why) => format!("Companion {name}: still failing ({why})"),
+    }
+}
+
+/// Every companion of Sonny's the daemon keeps on this build and running:
+/// the lookout and the tool host, and the reviewer when one is kept. One
+/// of another build, run by a name that led to another program, or not
+/// running is replaced with this build's, and each is watched until it
+/// has run [`Watch::settled`] with no restart, or [`Watch::until`] is up.
+/// A daemon started after an upgrade by anything but this Sonny (the
+/// `agent` CLI, a window that only joined it) brings back the companions
+/// it kept, by names that still lead to the program they named then.
+async fn check_companions(
+    client: &agent_client::Client,
+    store: &Path,
+    watch: &Watch,
+) -> Result<Vec<(&'static str, Checked)>, String> {
+    let me = crate::named::me().map_err(|e| e.to_string())?;
+    let build = crate::lookout::identity();
+    let before = crate::companions(client).await?;
+    let reviewer = [crate::REVIEWER, crate::OLD_REVIEWER]
+        .iter()
+        .any(|name| crate::kept_companion(&before, name).is_some());
+    let mut names = vec![
+        (crate::LOOKOUT, crate::named::LOOKOUT),
+        (crate::TOOL_HOST, crate::named::TOOL_HOST),
+    ];
+    if reviewer {
+        names.push((crate::REVIEWER, crate::named::REVIEWER));
+    }
+    // Why each needs replacing, read before anything is linked again.
+    let now = now_ms();
+    let was: Vec<Option<String>> = (names.iter())
+        .map(
+            |(name, program)| match crate::kept_companion(&before, name) {
+                None if *name == crate::REVIEWER => {
+                    crate::kept_companion(&before, crate::OLD_REVIEWER)
+                        .map(|_| "kept by its name before 0.9.1".to_owned())
+                }
+                None => None,
+                Some(kept) => off_build(kept, &me, program, &build).or_else(|| unwell(kept, now)),
+            },
+        )
+        .collect();
+    // Each put on this build: one whose spec changes starts again.
+    crate::start_companions(client, crate::Companions::Replace).await?;
+    let after = crate::companions(client).await?;
+    for ((name, _), was) in names.iter().zip(&was) {
+        let spec = |listed: &serde_json::Value| {
+            crate::kept_companion(listed, name)
+                .map(|c| [&c["command"], &c["args"], &c["env"], &c["cwd"]].map(Clone::clone))
+        };
+        // The same spec as before keeps the run it has, from the program it
+        // started from: stopped and started again.
+        if was.is_some()
+            && let Some(kept) = crate::kept_companion(&after, name)
+            && spec(&before) == spec(&after)
+        {
+            restart(client, kept).await?;
+        }
+    }
+    // Read again: a run restarted above is listed by its replacement only
+    // from now on.
+    let mut listed = crate::companions(client).await?;
+    let mut settled = vec![false; names.len()];
+    let deadline = tokio::time::Instant::now() + watch.until;
+    loop {
+        let now = now_ms();
+        for ((name, program), settled) in names.iter().zip(settled.iter_mut()) {
+            *settled = crate::kept_companion(&listed, name).is_some_and(|kept| {
+                off_build(kept, &me, program, &build).is_none()
+                    && kept["running"] == true
+                    && (kept["started_ms"].as_u64()).is_some_and(|at| {
+                        now.saturating_sub(at) >= watch.settled.as_millis() as u64
+                    })
+            });
+        }
+        if settled.iter().all(|s| *s) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(watch.every).await;
+        listed = crate::companions(client).await?;
+    }
+    let logs = format!("{}.companions", store.display());
+    Ok((names.iter().zip(was).zip(settled))
+        .map(|(((name, program), was), settled)| {
+            let found = match (settled, was) {
+                (true, None) if crate::kept_companion(&before, name).is_none() => Checked::Started,
+                (true, None) => Checked::Ok,
+                (true, Some(was)) => Checked::Replaced(was),
+                (false, _) => Checked::Failing(failing(
+                    crate::kept_companion(&listed, name),
+                    &me,
+                    program,
+                    &build,
+                    &format!("{}/{name}.log", crate::tilde(&logs)),
+                )),
+            };
+            (*name, found)
+        })
+        .collect())
+}
+
+/// How companion `kept` is not this build's, run by program `me`'s name
+/// `program`: none when it is.
+fn off_build(kept: &serde_json::Value, me: &Path, program: &str, build: &str) -> Option<String> {
+    let theirs = kept["env"]["SONNY_BUILD"].as_str();
+    if theirs != Some(build) {
+        let version = |build: &str| build.split(' ').next().unwrap_or_default().to_owned();
+        return Some(match theirs.map(version) {
+            None => "a build that does not name itself".to_owned(),
+            Some(theirs) if theirs == VERSION => format!("another build of {VERSION}"),
+            Some(theirs) => theirs,
+        });
+    }
+    let command = Path::new(kept["command"].as_str().unwrap_or_default());
+    let named = crate::named::path(program);
+    if command == named && !crate::named::current(me, program) {
+        return Some(format!("an older program by its name, {}", tilde(&named)));
+    }
+    if command != named && !crate::named::runs(command, me) {
+        return Some(tilde(command));
+    }
+    None
+}
+
+/// How companion `kept` is not running well as of `now`: down, or
+/// restarted and up for less than a healthy run, as `/status` alerts.
+fn unwell(kept: &serde_json::Value, now: u64) -> Option<String> {
+    let restarts = kept["restarts"].as_u64().unwrap_or(0);
+    let up = (kept["started_ms"].as_u64()).map(|at| now.saturating_sub(at));
+    let how = || crate::status::companion_exit(&kept["last_exit"]);
+    match kept["running"] == true {
+        false if kept["last_exit"].is_null() => Some("not running".to_owned()),
+        false => Some(format!("not running: {}", how())),
+        true if restarts > 0 && up.is_none_or(|up| up < crate::status::HEALTHY_MS) => Some(
+            format!("restarting: {}, {}", how(), restarts_said(restarts)),
+        ),
+        true => None,
+    }
+}
+
+/// Why companion `kept`, watched, is still not running on this build.
+fn failing(
+    kept: Option<&serde_json::Value>,
+    me: &Path,
+    program: &str,
+    build: &str,
+    log: &str,
+) -> String {
+    let Some(kept) = kept else {
+        return "the daemon keeps none".to_owned();
+    };
+    if let Some(theirs) = off_build(kept, me, program, build) {
+        return format!("still on {theirs}");
+    }
+    let restarts = kept["restarts"].as_u64().unwrap_or(0);
+    let how = match kept["last_exit"].is_null() {
+        true => "not started yet".to_owned(),
+        false => crate::status::companion_exit(&kept["last_exit"]),
+    };
+    let detail = (kept["last_exit"]["detail"].as_str()).map_or(String::new(), |d| format!(": {d}"));
+    match restarts {
+        0 => format!("{how}{detail}; its log: {log}"),
+        _ => format!("{how}{detail}, {}; its log: {log}", restarts_said(restarts)),
+    }
+}
+
+fn restarts_said(restarts: u64) -> String {
+    match restarts {
+        1 => "1 restart".to_owned(),
+        n => format!("{n} restarts"),
+    }
+}
+
+/// Stop companion `kept` and start it again as it is kept.
+async fn restart(client: &agent_client::Client, kept: &serde_json::Value) -> Result<(), String> {
+    let name = kept["name"].as_str().unwrap_or_default();
+    let mut add = serde_json::json!({"name": name, "command": kept["command"],
+        "args": kept["args"], "env": kept["env"]});
+    if !kept["cwd"].is_null() {
+        add["cwd"] = kept["cwd"].clone();
+    }
+    for asked in [
+        serde_json::json!({"remove": name}),
+        serde_json::json!({"add": add}),
+    ] {
+        (client.request("companions", asked).await).map_err(|e| format!("{name}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn tilde(path: &Path) -> String {
+    crate::tilde(&path.to_string_lossy())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// The release `agent --version` names, else this Sonny's.
@@ -795,6 +1067,9 @@ mod tests {
         // A prerelease is never offered, as Codex never offers one.
         assert_eq!(is_newer("0.10.0-rc.1", "0.9.4"), None);
         assert_eq!(is_newer("0.9.5", "0.9.5-rc.1"), None);
+        // A build from main says 0.0.0: every release is newer than it.
+        assert_eq!(is_newer("0.0.1", "0.0.0"), Some(true));
+        assert_eq!(is_newer("0.10.2", "0.0.0"), Some(true));
     }
 
     #[test]
@@ -835,5 +1110,230 @@ mod tests {
         std::fs::write(&old, "reinstalled").unwrap();
         assert!(identity(&old).is_some() && identity(&old) != before);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in daemon keeping companions as the daemon does: one added
+    /// with a new spec starts again, `run` saying how each run goes; the
+    /// same spec again changes nothing. The removes it was asked for.
+    async fn daemon_keeping(
+        kept: Vec<serde_json::Value>,
+        run: fn(&str) -> serde_json::Value,
+    ) -> (
+        std::sync::Arc<agent_client::Client>,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use serde_json::json;
+        let kept = std::sync::Arc::new(std::sync::Mutex::new(kept));
+        let removed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (state, gone) = (kept.clone(), removed.clone());
+        let spec = |c: &serde_json::Value| {
+            [&c["command"], &c["args"], &c["env"], &c["cwd"]].map(Clone::clone)
+        };
+        let client = crate::tests::daemon_answering(move |asked| {
+            let mut kept = state.lock().unwrap();
+            if let Some(name) = asked["remove"].as_str() {
+                gone.lock().unwrap().push(name.to_owned());
+                kept.retain(|c| c["name"] != name);
+                return json!({"name": name, "removed": true});
+            }
+            if let Some(add) = asked["add"].as_object() {
+                let mut add = serde_json::Value::Object(add.clone());
+                if add.get("cwd").is_none() {
+                    add["cwd"] = serde_json::Value::Null;
+                }
+                let name = add["name"].as_str().unwrap().to_owned();
+                if kept
+                    .iter()
+                    .any(|c| c["name"] == *name && spec(c) == spec(&add))
+                {
+                    return json!({"changed": false});
+                }
+                kept.retain(|c| c["name"] != *name);
+                let mut shown = run(&name);
+                for key in ["name", "command", "args", "env", "cwd"] {
+                    shown[key] = add[key].clone();
+                }
+                kept.push(shown);
+                return json!({"changed": true});
+            }
+            json!({"companions": *kept})
+        })
+        .await;
+        (client, kept, removed)
+    }
+
+    /// A run that started just now and keeps running.
+    fn runs(_: &str) -> serde_json::Value {
+        serde_json::json!({"running": true, "pid": 42, "started_ms": now_ms(),
+            "restarts": 0, "last_exit": null})
+    }
+
+    /// The tool host exits each time it starts; the rest run.
+    fn tool_host_exits(name: &str) -> serde_json::Value {
+        match name == crate::TOOL_HOST {
+            true => serde_json::json!({"running": false, "pid": null, "started_ms": now_ms(),
+                "restarts": 3, "last_exit": {"code": 1, "signal": null}}),
+            false => runs(name),
+        }
+    }
+
+    /// Companion `name` as this build keeps it, up for an hour.
+    fn this_build(name: &str, program: &str, verb: &str) -> serde_json::Value {
+        let me = crate::named::me().unwrap();
+        let mut env = serde_json::json!({"SONNY_BUILD": crate::lookout::identity(),
+            crate::named::PROGRAM: me});
+        if name == crate::REVIEWER {
+            env["AGENT_MODEL"] = serde_json::json!("openai/gpt-6");
+        }
+        serde_json::json!({"name": name, "command": crate::named::named(&me, program),
+            "args": [verb], "env": env, "cwd": null, "running": true, "pid": 7,
+            "started_ms": now_ms() - 3_600_000, "restarts": 0, "last_exit": null})
+    }
+
+    fn all_this_build() -> Vec<serde_json::Value> {
+        vec![
+            this_build(crate::LOOKOUT, crate::named::LOOKOUT, "lookout"),
+            this_build(
+                crate::TOOL_HOST,
+                crate::named::TOOL_HOST,
+                crate::tool_host::NAME,
+            ),
+            this_build(crate::REVIEWER, crate::named::REVIEWER, "reviewer"),
+        ]
+    }
+
+    const QUICK: Watch = Watch {
+        settled: std::time::Duration::from_millis(100),
+        until: std::time::Duration::from_secs(3),
+        every: std::time::Duration::from_millis(20),
+    };
+
+    #[tokio::test]
+    async fn companions_of_another_build_are_replaced_and_said_so() {
+        let older = |c: serde_json::Value| {
+            let mut c = c;
+            c["env"]["SONNY_BUILD"] = serde_json::json!("0.10.1 1");
+            c
+        };
+        let (client, kept, removed) =
+            daemon_keeping(all_this_build().into_iter().map(older).collect(), runs).await;
+        let checked = check_companions(&client, Path::new("/s/state.sqlite"), &QUICK)
+            .await
+            .unwrap();
+        let was = || Checked::Replaced("0.10.1".to_owned());
+        assert_eq!(
+            checked,
+            [
+                (crate::LOOKOUT, was()),
+                (crate::TOOL_HOST, was()),
+                (crate::REVIEWER, was())
+            ]
+        );
+        assert_eq!(
+            said(crate::LOOKOUT, &was()),
+            "Companion sonny-lookout: replaced (was 0.10.1)"
+        );
+        // Each on this build, the reviewer with the model it had.
+        for c in kept.lock().unwrap().iter() {
+            assert_eq!(
+                c["env"]["SONNY_BUILD"],
+                serde_json::json!(crate::lookout::identity())
+            );
+        }
+        assert_eq!(
+            kept.lock().unwrap()[2]["env"]["AGENT_MODEL"],
+            "openai/gpt-6"
+        );
+        assert!(removed.lock().unwrap().is_empty());
+        assert_eq!(still_failing(&[]), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_companion_that_keeps_exiting_is_failing_and_the_upgrade_exits_non_zero() {
+        // On this build, but exiting each time it starts.
+        let mut crashing = all_this_build();
+        crashing[1] = tool_host_exits(crate::TOOL_HOST);
+        for key in ["name", "command", "args", "env", "cwd"] {
+            crashing[1][key] = all_this_build()[1][key].clone();
+        }
+        let (client, _, removed) = daemon_keeping(crashing, tool_host_exits).await;
+        let checked = check_companions(&client, Path::new("/s/state.sqlite"), &QUICK)
+            .await
+            .unwrap();
+        assert_eq!(checked[0], (crate::LOOKOUT, Checked::Ok));
+        assert_eq!(checked[2], (crate::REVIEWER, Checked::Ok));
+        let Checked::Failing(why) = &checked[1].1 else {
+            panic!("{checked:?}");
+        };
+        assert_eq!(
+            why,
+            "exits 1, 3 restarts; its log: /s/state.sqlite.companions/sonny-tool-host.log"
+        );
+        // Replaced once with this build: stopped and started again.
+        assert_eq!(*removed.lock().unwrap(), [crate::TOOL_HOST]);
+        assert_eq!(
+            still_failing(&[crate::TOOL_HOST]),
+            Err(format!("sonny-tool-host is still failing on {VERSION}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_companion_is_watched_by_its_new_run() {
+        // This build's, running for 10 s after two restarts: restarted, and
+        // the new run, which exits, is what is watched.
+        let mut restarting = all_this_build();
+        restarting[1]["restarts"] = serde_json::json!(2);
+        restarting[1]["started_ms"] = serde_json::json!(now_ms() - 10_000);
+        let (client, _, removed) = daemon_keeping(restarting, tool_host_exits).await;
+        let checked = check_companions(&client, Path::new("/s/state.sqlite"), &QUICK)
+            .await
+            .unwrap();
+        assert_eq!(*removed.lock().unwrap(), [crate::TOOL_HOST]);
+        assert!(
+            matches!(&checked[1].1, Checked::Failing(why) if why.starts_with("exits 1, 3 restarts")),
+            "{checked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn companions_all_current_are_ok_and_nothing_restarts() {
+        let (client, kept, removed) = daemon_keeping(all_this_build(), runs).await;
+        let started = std::time::Instant::now();
+        let checked = check_companions(&client, Path::new("/s/state.sqlite"), &Watch::UPGRADE)
+            .await
+            .unwrap();
+        assert_eq!(
+            checked,
+            [
+                (crate::LOOKOUT, Checked::Ok),
+                (crate::TOOL_HOST, Checked::Ok),
+                (crate::REVIEWER, Checked::Ok)
+            ]
+        );
+        assert_eq!(
+            said(crate::LOOKOUT, &Checked::Ok),
+            "Companion sonny-lookout: ok"
+        );
+        // Up long enough already: no wait, and the same runs.
+        assert!(started.elapsed() < Watch::UPGRADE.settled);
+        assert!(removed.lock().unwrap().is_empty());
+        assert!(kept.lock().unwrap().iter().all(|c| c["pid"] == 7));
+    }
+
+    #[tokio::test]
+    async fn a_missing_companion_is_started_and_no_reviewer_is_made() {
+        let (client, kept, _) = daemon_keeping(Vec::new(), runs).await;
+        let checked = check_companions(&client, Path::new("/s/state.sqlite"), &QUICK)
+            .await
+            .unwrap();
+        assert_eq!(
+            checked,
+            [
+                (crate::LOOKOUT, Checked::Started),
+                (crate::TOOL_HOST, Checked::Started)
+            ]
+        );
+        assert_eq!(kept.lock().unwrap().len(), 2);
     }
 }

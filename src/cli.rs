@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --replaces --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --replaces --agents --profile --profile-name --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs --namespace",
         startup: true,
     },
@@ -368,7 +368,11 @@ fn print_flags(flags: &str) {
             ),
             "--profile" => (
                 "ROLE",
-                "Compose instructions (as --agents) in the role .agents/agents/ROLE.md, with its model and tools",
+                "Compose instructions (as --agents) in the role .agents/agents/ROLE.md, with its model and tools; the bot keeps ROLE as its profile",
+            ),
+            "--profile-name" => (
+                "ROLE",
+                "The profile a new bot's instructions were composed from by its client, kept on the bot as --profile keeps ROLE; nothing is read",
             ),
             "--effort" => (
                 "LEVEL",
@@ -927,6 +931,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         ("--agents", "--instructions-file"),
         ("--profile", "--instructions"),
         ("--profile", "--instructions-file"),
+        ("--profile", "--profile-name"),
     ] {
         if has(a) && has(b) {
             return fail_with("usage", format!("{a} conflicts with {b}"));
@@ -979,7 +984,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             return fail_with("usage", "run --fork needs --bot to name the copy");
         }
         // A fork keeps all its source chose but a budget of its own.
-        if let Some(flag) = ["--agents", "--profile"]
+        if let Some(flag) = ["--agents", "--profile", "--profile-name"]
             .into_iter()
             .chain(c.settings.split_whitespace())
             .find(|f| *f != "--budget-tokens" && has(f))
@@ -1003,6 +1008,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--instructions-file",
             "--agents",
             "--profile",
+            "--profile-name",
             "--budget-tokens",
             "--fallback",
             "--sandbox",

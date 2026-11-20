@@ -63,6 +63,12 @@ pub fn current(program: &Path, name: &str) -> bool {
     std::fs::canonicalize(program).is_ok_and(|program| same(&dir().join(name), &program))
 }
 
+/// Whether `command` runs `program` as it is now: its name (a link or
+/// the copy it links), or the program itself.
+pub fn runs(command: &Path, program: &Path) -> bool {
+    std::fs::canonicalize(program).is_ok_and(|program| same(command, &program))
+}
+
 /// Where the name `name` is, made or not.
 pub fn path(name: &str) -> PathBuf {
     dir().join(name)

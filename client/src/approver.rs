@@ -12,12 +12,18 @@
 use serde_json::{Map, Value, json};
 use std::borrow::Cow;
 
-/// The judge's state limit, and the share of it earlier prompts may take.
+/// What the words the turn answers to and the calls it already ran may take
+/// together, and the share of what is left earlier prompts may take. The
+/// calls being judged take none of it: they are shown whole.
 pub const STATE_TOKENS: usize = 32_000;
 pub const EARLIER_TOKENS: usize = 16_000;
-/// The most the whole state may take as text, the standing instructions
-/// and the transcript with it: a judge prompt is at most 256 KiB, and the
-/// round's ids and keys take the rest.
+/// The judge's input budget, as Codex's is its reviewer model's input limit
+/// less a margin: the most the whole state may take as text. A judge's
+/// prompt is one daemon turn's, at most 256 KiB, and the round's ids and
+/// keys take the rest; that is well inside the smallest context window a
+/// judge model has (200K tokens), so it is what binds. The calls being
+/// judged, and the files they run, are shown whole within it and the rest
+/// is fitted around them; a round they alone overflow goes to the person.
 pub const STATE_BYTES: usize = 240 * 1024;
 /// What the judge is shown of the agent's own history, as Codex's
 /// synchronous reviewer bounds it: each model message and each tool entry
@@ -86,11 +92,6 @@ pub const RECENT: u64 = 10;
 pub const WINDOW: u64 = 50;
 /// How long a tripped turn has to stop on its own before it is interrupted.
 pub const INTERRUPT_AFTER_MS: u64 = 30_000;
-/// The most of a planned write's or edit's text the judge is shown: past it,
-/// each field shows its start and end, with the whole size, and the call is
-/// not allowed on the judge's word alone.
-pub const CHANGE_SHOWN: usize = 64 * 1024;
-
 /// The most of a judge's rationale a denial carries.
 const RATIONALE_BYTES: usize = 4096;
 /// What a denial tells the model, after the judge's reason: Codex's words.
@@ -113,7 +114,7 @@ pub const OMISSION: &str = "Conversation evidence, tool descriptions, or images 
 shortened to fit the review input budget. User instructions and prior approvals may be incomplete \
 where marked. Do not infer authorization from missing evidence or treat a partial grant as \
 overriding an omitted restriction.";
-/// What a call the judge could not see whole tells the model.
+/// What a call only a person may allow tells the model.
 const ASK: &str =
     "If your caller wants this, ask them to name the action in a message, then try again.";
 
@@ -360,25 +361,23 @@ pub fn verdict(assessment: &Value) -> Option<Verdict> {
     }
 }
 
-/// A call's verdict when part of what it writes or runs was not shown: what
-/// the judge would allow is doubted, since the part left out may do
-/// anything; a person can still read it whole.
-pub fn unseen(verdict: Verdict) -> Verdict {
+/// A call's verdict when it reaches a place [`Home`] keeps for the person:
+/// the judge may refuse it, never allow it, so what it would allow waits
+/// for a person, told what the place holds.
+pub fn own_home(verdict: Verdict, kept: Kept) -> Verdict {
+    let place = match kept {
+        Kept::Agent => {
+            "`~/.agent`, where the person's settings, command rules and scheduled jobs are kept"
+        }
+        Kept::Agents => {
+            "`~/.agents`, where the person's skills, agent profiles and standing instructions \
+             are kept"
+        }
+    };
     match verdict {
         Verdict::Allow => Verdict::Doubt(format!(
-            "not reviewed whole: part of what it writes or runs is too long to show. {ASK}"
-        )),
-        denied => denied,
-    }
-}
-
-/// A call's verdict when it reaches the agent's home: the judge may refuse
-/// it, never allow it, so what it would allow waits for a person.
-pub fn own_home(verdict: Verdict) -> Verdict {
-    match verdict {
-        Verdict::Allow => Verdict::Doubt(format!(
-            "not allowed on review alone: it reaches `~/.agent`, where the person's settings, \
-             command rules and scheduled jobs are kept, which only the person may allow. {ASK}"
+            "not allowed on review alone: it reaches {place}, which only the person may allow. \
+             {ASK}"
         )),
         denied => denied,
     }
@@ -446,18 +445,47 @@ pub fn names_daemon_start(text: &str) -> bool {
     })
 }
 
-/// The agent's home, `~/.agent`, as a planned call may name it. What is
-/// kept there runs outside every sandbox or says how each one is made (the
-/// settings, the command rules, the scheduler's jobs), so the judge's word
-/// alone never lets a call reach it, as Claude Code's `--restricted` keeps
-/// the classifier from its own paths; the person may. The folders in it the
-/// agent was given, such as a task's worktree, are its own.
+/// What a place [`Home`] keeps for the person holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// `~/.agent`: the settings, command rules and scheduler's jobs.
+    Agent,
+    /// In `~/.agents`: the skills, agent profiles and standing
+    /// instructions every agent reads.
+    Agents,
+}
+
+/// The places only the person may let a call reach, each as a path word
+/// names it: the agent's home, `~/.agent`, and in `~/.agents` the skills,
+/// the agent profiles and the standing instructions. A skill, a profile
+/// or AGENTS.md is read as the person's own by every agent; the rest runs
+/// outside every sandbox or says how each one is made.
+pub const KEPT: [(&str, Kept); 4] = [
+    (".agent", Kept::Agent),
+    (".agents/skills", Kept::Agents),
+    (".agents/agents", Kept::Agents),
+    (".agents/AGENTS.md", Kept::Agents),
+];
+
+/// The folder in the home that holds kept places but is not one: a command
+/// that names it itself, as a copy's destination or a `cd`, can reach what
+/// it holds, so it is kept as they are.
+pub const HOLDER: (&str, Kept) = (".agents", Kept::Agents);
+
+/// The places [`KEPT`] names, as a planned call may name them: the judge's
+/// word alone never lets a call reach one, as Claude Code's `--restricted`
+/// keeps the classifier from its own paths, and Codex keeps `.agents`
+/// read-only in a writable workspace; the person may. The folders in them
+/// the agent was given, such as a task's worktree, are its own.
 #[derive(Debug, Clone, Default)]
 pub struct Home {
     /// `$HOME`, which `~` and `$HOME` in a command stand for.
     pub home: std::path::PathBuf,
-    /// `~/.agent`, as `$HOME` spells it and by its real path.
-    pub agent: Vec<std::path::PathBuf>,
+    /// Each place in [`KEPT`], as `$HOME` spells it and by its real path,
+    /// with what it holds.
+    pub kept: Vec<(std::path::PathBuf, Kept)>,
+    /// [`HOLDER`], as `$HOME` spells it and by its real path.
+    pub holders: Vec<std::path::PathBuf>,
     /// The folders the agent may write, its own and the writable ones.
     pub given: Vec<std::path::PathBuf>,
     /// Folders in the home that hold agents' work folders, such as Sonny's
@@ -469,16 +497,20 @@ pub struct Home {
 }
 
 impl Home {
-    fn under_agent(&self, path: &std::path::Path) -> bool {
-        self.agent.iter().any(|agent| path.starts_with(agent))
+    /// The kept place holding `path`, if one does.
+    fn kept_at(&self, path: &std::path::Path) -> Option<Kept> {
+        (self.kept.iter())
+            .find(|(place, _)| path.starts_with(place))
+            .map(|(_, kept)| *kept)
     }
 
-    /// Whether a given folder holds `path`: in the agent's home, only one
-    /// given there by name, since a folder holding the home (a lead in
-    /// `$HOME`) leaves it read-only, as its sandbox does.
+    /// Whether a given folder holds `path`: in a kept place, only one given
+    /// there by name, since a folder holding the place (a lead in `$HOME`)
+    /// leaves it read-only, as its sandbox does.
     fn given_holds(&self, path: &std::path::Path) -> bool {
         self.given.iter().any(|given| {
-            path.starts_with(given) && (!self.under_agent(path) || self.under_agent(given))
+            path.starts_with(given)
+                && (self.kept_at(path).is_none() || self.kept_at(given).is_some())
         }) || self.in_work(path)
     }
 
@@ -493,36 +525,57 @@ impl Home {
         })
     }
 
-    /// Whether a file a write, edit or patch changes, by its absolute
-    /// path, is in the agent's home outside the folders it was given there.
-    pub fn reaches(&self, path: &std::path::Path) -> bool {
+    /// The kept place a file a write, edit or patch changes is in, by its
+    /// absolute path, outside the folders the agent was given there.
+    pub fn reaches(&self, path: &std::path::Path) -> Option<Kept> {
         let path = lexical(path);
-        self.under_agent(&path) && !self.given_holds(&path)
+        self.kept_at(&path).filter(|_| !self.given_holds(&path))
     }
 
-    /// Whether a command's text names a `.agent` folder outside the folders
-    /// the agent was given: every path word holding `.agent` as a whole
-    /// part, or the home by one of its absolute spellings (its real path
-    /// need not hold the name), with `~`, `$HOME` and `${HOME}` read as the
-    /// home and a relative one read from `folder`. Read by its words alone, so a
+    /// The kept place a command's text names outside the folders the agent
+    /// was given: a path word holding one of [`KEPT`] as a whole part, or a
+    /// place by one of its absolute spellings (its real path need not hold
+    /// the name), with `~`, `$HOME` and `${HOME}` read as the home and a
+    /// relative one read from `folder`. Read by its words alone, so a
     /// command that spells the name another way is left to the judge.
-    pub fn named_by(&self, text: &str, folder: Option<&std::path::Path>) -> bool {
+    pub fn named_by(&self, text: &str, folder: Option<&std::path::Path>) -> Option<Kept> {
         let part =
             |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
         let ends = |c: char| c.is_whitespace() || "'\"`;|&()<>=:,".contains(c);
-        // `.agent` anywhere, and the home by each of its absolute spellings,
-        // its real one too, which need not hold the name.
-        let spelled: Vec<String> = (self.agent.iter())
-            .map(|agent| agent.to_string_lossy().into_owned())
+        // Each place's name anywhere, and each place by its absolute
+        // spellings, its real one too, which need not hold the name.
+        let spelled: Vec<(String, Kept)> = (self.kept.iter())
+            .map(|(place, kept)| (place.to_string_lossy().into_owned(), *kept))
             .collect();
-        let needles = std::iter::once(".agent").chain(spelled.iter().map(String::as_str));
-        let at: Vec<(usize, usize)> = needles
-            .flat_map(|needle| text.match_indices(needle).map(|(at, n)| (at, n.len())))
-            .filter(|&(at, len)| {
-                !part(text[..at].chars().next_back()) && !part(text[at + len..].chars().next())
+        // The holder too, named as itself: a word that goes no further.
+        let holders: Vec<String> = (self.holders.iter())
+            .map(|holder| holder.to_string_lossy().into_owned())
+            .collect();
+        let needles = (KEPT.iter().map(|(name, kept)| (*name, *kept, false)))
+            .chain(
+                spelled
+                    .iter()
+                    .map(|(place, kept)| (place.as_str(), *kept, false)),
+            )
+            .chain(std::iter::once((HOLDER.0, HOLDER.1, true)))
+            .chain(
+                holders
+                    .iter()
+                    .map(|holder| (holder.as_str(), HOLDER.1, true)),
+            );
+        let at: Vec<(usize, usize, Kept, bool)> = needles
+            .flat_map(|(needle, kept, whole)| {
+                (text.match_indices(needle)).map(move |(at, n)| (at, n.len(), kept, whole))
+            })
+            .filter(|&(at, len, _, whole)| {
+                let rest = &text[at + len..];
+                let rest = &rest[..rest.find(ends).unwrap_or(rest.len())];
+                !part(text[..at].chars().next_back())
+                    && !part(rest.chars().next())
+                    && (!whole || rest.is_empty() || rest == "/")
             })
             .collect();
-        at.into_iter().any(|(at, _)| {
+        at.into_iter().find_map(|(at, _, kept, whole)| {
             let start = text[..at]
                 .char_indices()
                 .rev()
@@ -539,9 +592,14 @@ impl Home {
             let path = match (path.is_absolute(), folder) {
                 (true, _) => lexical(path),
                 (false, Some(folder)) => lexical(&folder.join(path)),
-                (false, None) => return true,
+                (false, None) => return Some(kept),
             };
-            !self.given_holds(&path)
+            // The holder is the person's unless it was given by name.
+            if whole {
+                let holder = self.holders.contains(&path);
+                return (holder && !self.given.contains(&path)).then_some(kept);
+            }
+            (!self.given_holds(&path)).then_some(kept)
         })
     }
 }
@@ -809,11 +867,9 @@ pub struct Planned {
     /// Files this turn wrote that the call names, whole, with their paths:
     /// what it would run.
     pub files: Vec<(String, String)>,
-    /// Part of what it writes or runs was too long to show: the judge cannot
-    /// have seen what the left-out part does.
-    pub unseen: bool,
-    /// It reaches the agent's home ([`Home`]): only a person may allow it.
-    pub own_home: bool,
+    /// The kept place it reaches ([`Home`]), if any: only a person may
+    /// allow it.
+    pub own_home: Option<Kept>,
     /// Outside its sandbox, it may start a daemon
     /// ([`names_daemon_start`]): only a person may allow it.
     pub starts_daemon: bool,
@@ -901,7 +957,8 @@ pub struct Covers {
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
     Built(Value),
-    /// The calls being judged do not fit, even with no words.
+    /// The calls being judged, with the files they run, do not fit the
+    /// judge's input budget even with nothing else.
     TooLong,
 }
 
@@ -966,49 +1023,19 @@ pub fn clip(text: &str, limit: usize) -> Cow<'_, str> {
     ))
 }
 
-/// A planned write's or edit's arguments as the judge is shown them, and
-/// whether they were cut: whole within `CHANGE_SHOWN`, else each text field
-/// redacted, then clipped, and `bytes` the whole text, so a cut cannot leave
-/// a secret's value without what names it. Its path is always whole.
-pub fn shown_change(arguments: &Value, redactor: &Redactor) -> (Value, bool) {
-    let Value::Object(fields) = arguments else {
-        return (arguments.clone(), false);
-    };
-    let text = |(name, value): (&String, &Value)| match (name.as_str(), value) {
-        ("path", _) => 0,
-        (_, Value::String(text)) => text.len(),
-        _ => 0,
-    };
-    let bytes: usize = fields.iter().map(text).sum();
-    if bytes <= CHANGE_SHOWN {
-        return (arguments.clone(), false);
-    }
-    let mut shown: Map<String, Value> = fields
-        .iter()
-        .map(|(name, value)| match (name.as_str(), value) {
-            ("path", _) => (name.clone(), value.clone()),
-            (_, Value::String(text)) => {
-                let text = redactor.redact(text);
-                (name.clone(), json!(clip(&text, CHANGE_SHOWN / 2)))
-            }
-            _ => (name.clone(), value.clone()),
-        })
-        .collect();
-    shown.insert("bytes".into(), json!(bytes));
-    (Value::Object(shown), true)
-}
-
 fn size(value: &Value) -> usize {
     tokens(serde_json::to_string(value).map_or(0, |text| text.len()))
 }
 
-/// Build the state within the judge's limit, as Codex's reviewer keeps
-/// the newest: the note and the calls being judged always; the words the
-/// turn answers to, newest first, as far as they fit; the calls already
-/// allowed, newest first, as far as they fit; then earlier prompts, newest
-/// first, within their share; whatever is left out marked, never read as
-/// consent withheld. The asks, the standing instructions and the
-/// transcript come last, bounded on their own, each ask whole or left out.
+/// Build the state within the judge's input budget, as Codex's reviewer
+/// keeps the whole planned action and fits the rest around it: the note
+/// and the calls being judged, with the files they run, always whole, or
+/// the round does not fit at all. Then, newest first and each within its
+/// own bound and what the budget has left: the words the turn answers to,
+/// the calls already allowed, earlier prompts, the person's own words, the
+/// asks (each whole or left out whole), the standing instructions (whole
+/// or left out), and the transcript. Whatever is left out is marked, and
+/// never read as consent withheld.
 pub fn build(intent: &Intent, redactor: &Redactor) -> State {
     let mut state = Map::new();
     if let Some(note) = &intent.note {
@@ -1041,21 +1068,36 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
             })
             .collect(),
     );
-    // Room for the request's own keys, whatever it holds, and for the note
-    // that tells the judge what was left out.
-    let mut used = size(&Value::Object(state.clone()))
-        + size(&json!({"request":[],"request_cut":true,"context_omission":OMISSION}));
-    if used > STATE_TOKENS {
+    // Room for every other key, whatever it holds, and for the note that
+    // tells the judge what was left out: what is left is the budget's.
+    let keys = json!({"request":[],"request_cut":true,"already_allowed":[],
+        "already_allowed_cut":true,"earlier_prompts":[],"persons_words":[],
+        "persons_words_cut":true,"decisions":[],"decisions_cut":true,
+        "standing_instructions":[],"transcript":[],"transcript_cut":true,
+        "context_omission":OMISSION});
+    let fixed = Value::Object(state.clone()).to_string().len() + keys.to_string().len();
+    let Some(left) = STATE_BYTES.checked_sub(fixed) else {
         return State::TooLong;
-    }
+    };
+    let left = std::cell::Cell::new(left);
+    // An entry's text and the comma after it, when the budget has room.
+    let take = |entry: &Value| {
+        let bytes = entry.to_string().len() + 1;
+        let fits = bytes <= left.get();
+        if fits {
+            left.set(left.get() - bytes);
+        }
+        fits
+    };
     // The newest words first, so whatever is left out is older than all
     // that is shown; the newest is cut to fit when it alone does not.
+    let mut used = 0;
     let mut request = Vec::new();
     let mut cut = intent.request_cut;
     for said in intent.request.iter().rev() {
         let entry = words(said, redactor);
         let cost = size(&entry) + 1;
-        if used + cost <= STATE_TOKENS {
+        if used + cost <= STATE_TOKENS && take(&entry) {
             used += cost;
             request.push(entry);
             continue;
@@ -1063,12 +1105,12 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
         cut = true;
         if request.is_empty() {
             let text = redactor.redact(&said.text);
-            let mut limit = (STATE_TOKENS - used) * 3;
+            let mut limit = ((STATE_TOKENS - used) * 3).min(left.get());
             loop {
                 let mut entry = entry.clone();
                 entry["text"] = json!(clip(&text, limit.saturating_sub(256)));
                 let cost = size(&entry) + 1;
-                if used + cost <= STATE_TOKENS {
+                if used + cost <= STATE_TOKENS && take(&entry) {
                     used += cost;
                     request.push(entry);
                     break;
@@ -1089,14 +1131,13 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
     }
     // The newest calls first, so whatever is left out is older than all
     // that is shown.
-    used += size(&json!({"already_allowed":[],"already_allowed_cut":true}));
     let mut allowed = Vec::new();
     let mut allowed_cut = intent.allowed_cut;
     for call in intent.allowed.iter().rev() {
         let entry = json!({"tool":call.tool,"arguments":redactor.redact_value(&call.arguments),
             "status":call.status});
         let cost = size(&entry) + 1;
-        if used + cost > STATE_TOKENS {
+        if used + cost > STATE_TOKENS || !take(&entry) {
             allowed_cut = true;
             break;
         }
@@ -1114,7 +1155,7 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
     for prompt in &intent.earlier {
         let entry = words(prompt, redactor);
         let cost = size(&entry);
-        if spent + cost > room {
+        if spent + cost > room || !take(&entry) {
             break;
         }
         spent += cost;
@@ -1141,7 +1182,7 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
             entry["agent"] = json!(agent);
         }
         let cost = size(&entry) + 1;
-        if spent + cost > PERSONS_TOKENS {
+        if spent + cost > PERSONS_TOKENS || !take(&entry) {
             cut = true;
             break;
         }
@@ -1159,52 +1200,55 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
     if !intent.decisions.is_empty() {
         let shown: Vec<Value> = (intent.decisions.iter().take(DECISIONS))
             .map(|decision| self::decision(decision, redactor))
-            .filter(|decision| size(decision) <= DECISION_TOKENS)
+            .filter(|decision| size(decision) <= DECISION_TOKENS && take(decision))
             .collect();
         if shown.len() < intent.decisions.len() {
             state.insert("decisions_cut".into(), json!(true));
         }
         state.insert("decisions".into(), Value::Array(shown));
     }
-    // Bounded on their own, as Codex bounds them, outside the limit above:
-    // the files as the bot was given them, and its history newest kept.
-    if !intent.instructions.is_empty() {
-        state.insert(
-            "standing_instructions".into(),
-            intent
-                .instructions
-                .iter()
-                .map(|(path, text)| {
-                    json!({"path":redactor.redact(path),"text":redactor.redact(text)})
-                })
-                .collect(),
-        );
-    }
-    state.insert(
-        "transcript".into(),
-        intent
-            .transcript
-            .entries
-            .iter()
-            .map(|entry| {
-                let by = match entry.said {
-                    Said::Model => "model",
-                    Said::Call => "call",
-                    Said::Output => "output",
-                };
-                let mut shown = json!({"by":by,"text":entry.text});
-                if let Some(call) = &entry.call {
-                    shown["call_id"] = json!(call);
-                }
-                shown
-            })
-            .collect(),
-    );
-    if intent.transcript.cut {
-        state.insert("transcript_cut".into(), json!(true));
-    }
     // Whatever was left out or shortened, the judge is told how to read
     // what remains, as Codex tells its reviewer.
+    let mut omitted = false;
+    // The files as the bot was given them, whole or left out, when they
+    // then authorize nothing.
+    if !intent.instructions.is_empty() {
+        let instructions: Value = intent
+            .instructions
+            .iter()
+            .map(|(path, text)| json!({"path":redactor.redact(path),"text":redactor.redact(text)}))
+            .collect();
+        match take(&instructions) {
+            true => {
+                state.insert("standing_instructions".into(), instructions);
+            }
+            false => omitted = true,
+        }
+    }
+    // Its history, bounded as Codex bounds it, the newest kept.
+    let mut transcript: Vec<Value> = Vec::new();
+    let mut transcript_cut = intent.transcript.cut;
+    for entry in intent.transcript.entries.iter().rev() {
+        let by = match entry.said {
+            Said::Model => "model",
+            Said::Call => "call",
+            Said::Output => "output",
+        };
+        let mut shown = json!({"by":by,"text":entry.text});
+        if let Some(call) = &entry.call {
+            shown["call_id"] = json!(call);
+        }
+        if !take(&shown) {
+            transcript_cut = true;
+            break;
+        }
+        transcript.push(shown);
+    }
+    transcript.reverse();
+    state.insert("transcript".into(), Value::Array(transcript));
+    if transcript_cut {
+        state.insert("transcript_cut".into(), json!(true));
+    }
     const CUT: [&str; 5] = [
         "request_cut",
         "already_allowed_cut",
@@ -1212,38 +1256,8 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
         "decisions_cut",
         "persons_words_cut",
     ];
-    let omission = |state: &mut Map<String, Value>| {
+    if omitted || CUT.iter().any(|key| state.contains_key(*key)) {
         state.insert("context_omission".into(), json!(OMISSION));
-    };
-    if CUT.iter().any(|key| state.contains_key(*key)) {
-        omission(&mut state);
-    }
-    // The whole state must also fit one judge prompt: past it the oldest
-    // transcript entries go first, then the standing instructions, which
-    // then authorize nothing, with room kept for the note above. What is
-    // left fits, as its limit says.
-    let room = match state.contains_key("context_omission") {
-        true => 0,
-        false => OMISSION.len() + 64,
-    };
-    let mut over = Value::Object(state.clone())
-        .to_string()
-        .len()
-        .saturating_sub(STATE_BYTES - room);
-    if over > 0 {
-        omission(&mut state);
-    }
-    if over > 0
-        && let Some(Value::Array(entries)) = state.get_mut("transcript")
-        && !entries.is_empty()
-    {
-        while over > 0 && !entries.is_empty() {
-            over = over.saturating_sub(entries.remove(0).to_string().len() + 1);
-        }
-        state.insert("transcript_cut".into(), json!(true));
-    }
-    if over > 0 {
-        state.remove("standing_instructions");
     }
     State::Built(Value::Object(state))
 }
@@ -1752,13 +1766,6 @@ mod tests {
             too_long("the call is too long to show"),
             Verdict::Doubt(_)
         ));
-        assert!(
-            matches!(unseen(Verdict::Allow), Verdict::Doubt(r) if r.starts_with("not reviewed whole"))
-        );
-        assert!(matches!(
-            unseen(Verdict::Deny("no".into())),
-            Verdict::Deny(_)
-        ));
     }
 
     #[test]
@@ -2033,8 +2040,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"git push"}),
                 files: Vec::new(),
-                unseen: false,
-                own_home: false,
+                own_home: None,
                 starts_daemon: false,
             }],
             transcript: transcript.finish(),
@@ -2083,8 +2089,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"gh release edit v1 --draft=false"}),
                 files: Vec::new(),
-                unseen: false,
-                own_home: false,
+                own_home: None,
                 starts_daemon: false,
             }],
             decisions,
@@ -2155,8 +2160,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"ls"}),
                 files: Vec::new(),
-                unseen: false,
-                own_home: false,
+                own_home: None,
                 starts_daemon: false,
             }],
             request: vec![Words {
@@ -2174,10 +2178,49 @@ mod tests {
         };
         assert!(model_prompt(&state, &["c1"]).len() <= 256 * 1024);
         assert!(state.to_string().len() <= STATE_BYTES);
-        assert_eq!(state["transcript_cut"], true);
-        assert!(state["transcript"].as_array().unwrap().len() < 3);
         // The judge is told, in Codex's words, how to read what remains.
         assert_eq!(state["context_omission"], OMISSION);
+        // A 200 KiB script the call runs and a 200 KiB write are each shown
+        // whole, and the rest fitted around them, the newest kept.
+        let script = "echo step\n".repeat(200 * 1024 / 10);
+        for planned in [
+            Planned {
+                arguments: json!({"command":"sh monitor.sh","sandbox_permissions":"require_escalated"}),
+                files: vec![("monitor.sh".into(), script.clone())],
+                ..intent.planned[0].clone()
+            },
+            Planned {
+                tool: "write".into(),
+                arguments: json!({"path":"monitor.sh","content":script}),
+                ..intent.planned[0].clone()
+            },
+        ] {
+            let mut whole = intent.clone();
+            whole.planned = vec![planned.clone()];
+            let State::Built(state) = build(&whole, &Redactor::default()) else {
+                panic!()
+            };
+            assert!(model_prompt(&state, &["c1"]).len() <= 256 * 1024);
+            assert_eq!(state["planned_calls"][0]["arguments"], planned.arguments);
+            if let Some((path, content)) = planned.files.first() {
+                assert_eq!(
+                    state["planned_calls"][0]["files_it_names"],
+                    json!([{"path":path,"content":content}])
+                );
+            }
+            assert!(state.get("standing_instructions").is_none());
+            assert_eq!(state["transcript_cut"], true);
+            assert_eq!(state["context_omission"], OMISSION);
+            // The words the turn answers to keep their place: the newest,
+            // cut to fit.
+            assert_eq!(state["request_cut"], true);
+            assert_eq!(state["request"].as_array().unwrap().len(), 1);
+        }
+        // A round the calls alone overflow can't be judged: it goes to the
+        // person.
+        let mut over = intent.clone();
+        over.planned[0].files = vec![("big.sh".into(), "x".repeat(STATE_BYTES))];
+        assert_eq!(build(&over, &Redactor::default()), State::TooLong);
     }
 
     #[test]
@@ -2226,8 +2269,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"sh deploy.sh"}),
                 files: vec![("deploy.sh".into(), "make deploy".into())],
-                unseen: false,
-                own_home: false,
+                own_home: None,
                 starts_daemon: false,
             }],
             allowed: vec![Allowed {
@@ -2312,7 +2354,7 @@ mod tests {
         };
         let text = newest["text"].as_str().unwrap();
         assert!(text.starts_with('n') && text.ends_with('n') && text.contains("bytes not shown]"));
-        assert!(size(&state) <= STATE_TOKENS);
+        assert!(size(&state["request"]) + size(&state["already_allowed"]) <= STATE_TOKENS);
         intent.request = vec![
             person(&"o".repeat(STATE_TOKENS * 4)),
             person("deploy the site"),
@@ -2360,57 +2402,39 @@ mod tests {
         assert_eq!(state["request"][0]["refused_calls"], shown);
         assert!(state["request"][1].get("refused_calls").is_none());
         assert_eq!(state["earlier_prompts"][0]["refused_calls"], shown);
-        // Calls being judged that do not fit are not judged.
+        // Calls being judged are shown whole past every share, within the
+        // judge's input budget; past it they are not judged.
         intent.planned[0].arguments = json!({"command":"y".repeat(STATE_TOKENS * 3)});
+        let State::Built(state) = build(&intent, &redactor) else {
+            panic!()
+        };
+        assert_eq!(
+            state["planned_calls"][0]["arguments"],
+            intent.planned[0].arguments
+        );
+        intent.planned[0].arguments = json!({"command":"y".repeat(STATE_BYTES)});
         assert_eq!(build(&intent, &redactor), State::TooLong);
     }
 
     #[test]
-    fn a_long_write_or_text_is_shown_by_its_start_and_end() {
+    fn a_long_text_is_shown_by_its_start_and_end() {
         assert_eq!(clip("short", 10), "short");
         assert_eq!(clip("aaaabbbbcccc", 8), "aaaa\n[4 bytes not shown]\ncccc");
         // Never inside a character.
         assert_eq!(clip("ééé", 4), "é\n[2 bytes not shown]\né");
         assert_eq!(clip("ééé", 3), "\n[6 bytes not shown]\n");
-        let small = json!({"path":"src/lib.rs","content":"fn main() {}"});
-        let redactor = Redactor::from_env([]);
-        assert_eq!(shown_change(&small, &redactor), (small, false));
-        let content = "x".repeat(CHANGE_SHOWN * 4);
-        let (shown, cut) = shown_change(&json!({"path":"src/lib.rs","content":content}), &redactor);
-        assert!(cut);
-        assert_eq!(shown["path"], "src/lib.rs");
-        assert_eq!(shown["bytes"], CHANGE_SHOWN * 4);
-        assert!(shown["content"].as_str().unwrap().len() < CHANGE_SHOWN);
-        let (edit, _) = shown_change(
-            &json!({"path":"a.rs","old_string":"y".repeat(CHANGE_SHOWN),"new_string":"z".repeat(CHANGE_SHOWN)}),
-            &redactor,
-        );
-        assert_eq!(edit["bytes"], CHANGE_SHOWN * 2);
-        assert!(
-            edit["new_string"]
-                .as_str()
-                .unwrap()
-                .contains("bytes not shown")
-        );
-        // Redacted before it is cut: a value whose name falls in the part
-        // left out is still found.
-        let secret = ["Zq8vT2nW", "5xK9pL3r", "B7mY4cH6", "jD1fG0sA"].concat();
-        let tail = "b".repeat(CHANGE_SHOWN / 2 - secret.len() - 1);
-        let content = format!("{}password={secret}\n{tail}", "a".repeat(CHANGE_SHOWN));
-        let (shown, _) = shown_change(&json!({"path":"a.env","content":content}), &redactor);
-        assert!(
-            !shown.to_string().contains(&secret),
-            "{}",
-            &shown["content"].as_str().unwrap()[CHANGE_SHOWN / 2..]
-        );
     }
 
     fn home() -> Home {
         Home {
             home: "/Users/me".into(),
-            agent: vec!["/Users/me/.agent".into()],
+            kept: (KEPT.iter())
+                .map(|(name, kept)| (format!("/Users/me/{name}").into(), *kept))
+                .collect(),
+            holders: vec!["/Users/me/.agents".into()],
             given: vec![
                 "/Users/me".into(),
+                "/Users/me/code/shop".into(),
                 "/Users/me/.agent/worktrees/shop-fix".into(),
                 "/Users/me/.agent/sonny/zen".into(),
             ],
@@ -2421,10 +2445,13 @@ mod tests {
     #[test]
     fn a_call_reaching_the_agent_s_home_is_never_allowed_on_the_judge_s_word() {
         assert!(
-            matches!(own_home(Verdict::Allow), Verdict::Doubt(r) if r.contains("only the person may allow"))
+            matches!(own_home(Verdict::Allow, Kept::Agent), Verdict::Doubt(r) if r.contains("only the person may allow"))
         );
+        // Told what the place holds.
+        assert!(matches!(own_home(Verdict::Allow, Kept::Agents),
+            Verdict::Doubt(r) if r.contains("it reaches `~/.agents`, where the person's skills, agent profiles and standing instructions are kept")));
         assert_eq!(
-            own_home(Verdict::Deny("no".into())),
+            own_home(Verdict::Deny("no".into()), Kept::Agents),
             Verdict::Deny("no".into())
         );
         // The policy no longer calls the scheduler's jobs ordinary work.
@@ -2536,7 +2563,7 @@ mod tests {
     #[test]
     fn a_file_in_the_agent_s_home_is_reached_but_in_the_folders_given_there() {
         let home = home();
-        let reaches = |path: &str| home.reaches(std::path::Path::new(path));
+        let reaches = |path: &str| home.reaches(std::path::Path::new(path)).is_some();
         assert!(reaches("/Users/me/.agent/automations/jobs/x.json"));
         assert!(reaches("/Users/me/.agent/config.toml"));
         assert!(reaches("/Users/me/.agent"));
@@ -2549,7 +2576,18 @@ mod tests {
         assert!(!reaches("/Users/me/.agent/worktrees/shop-fix/src/main.rs"));
         assert!(!reaches("/Users/me/.agent/sonny/zen/focus"));
         assert!(!reaches("/Users/me/notes.md"));
-        assert!(!reaches("/Users/me/.agents/skills/x/SKILL.md"));
+        // The person's skills, agent profiles and standing instructions.
+        assert_eq!(
+            home.reaches(std::path::Path::new("/Users/me/.agents/skills/x/SKILL.md")),
+            Some(Kept::Agents)
+        );
+        assert!(reaches("/Users/me/.agents/agents/r.md"));
+        assert!(reaches("/Users/me/.agents/AGENTS.md"));
+        assert!(reaches("/Users/me/.agents/skills"));
+        assert!(!reaches("/Users/me/.agents/notes.md"));
+        assert!(!reaches("/Users/me/.agents/AGENTS.md.bak"));
+        // A skill in a folder the agent was given is its work.
+        assert!(!reaches("/Users/me/code/shop/.agents/skills/x/SKILL.md"));
         // Beside its worktree, among the agents' work: the judge's to weigh.
         assert!(!reaches("/Users/me/.agent/worktrees/shop-fix-notes.md"));
         assert!(!reaches("/Users/me/.agent/worktrees/shop-pay/README.md"));
@@ -2564,7 +2602,7 @@ mod tests {
     fn a_command_names_the_agent_s_home_however_it_spells_the_home() {
         let home = home();
         let folder = Some(std::path::Path::new("/Users/me/code/shop"));
-        let named = |text: &str| home.named_by(text, folder);
+        let named = |text: &str| home.named_by(text, folder).is_some();
         for text in [
             "echo x > ~/.agent/automations/jobs/x.json",
             "cp job.json $HOME/.agent/automations/jobs/",
@@ -2584,14 +2622,34 @@ mod tests {
             "rm -rf ~/.agent/worktrees",
             "rm ~/.agent/worktrees/.folders/shop-fix",
             "cp x ~/.agent/worktrees/shop-fix/../../rules/default.rules",
+            // The person's skills, agent profiles and standing instructions.
+            "cp -r ./skill ~/.agents/skills/x",
+            "rm -rf $HOME/.agents/skills/publish",
+            "cat r.md > /Users/me/.agents/agents/r.md",
+            "echo rule >> ${HOME}/.agents/AGENTS.md",
+            // Their folder, named as itself: a copy into it, or a `cd`.
+            "cp AGENTS.md ~/.agents/",
+            "cp -r skills $HOME/.agents",
+            "mv agents /Users/me/.agents/ && ls",
+            "cd ~/.agents; cp ../r.md agents/",
         ] {
             assert!(named(text), "{text}");
         }
+        assert_eq!(
+            home.named_by("cp -r ./skill ~/.agents/skills/x", folder),
+            Some(Kept::Agents)
+        );
+        assert_eq!(home.named_by("rm -rf ~/.agent", folder), Some(Kept::Agent));
         for text in [
             "cargo test",
             "git -C ~/.agent/worktrees/shop-fix push origin HEAD",
-            "ls ~/.agents/skills",
             "cat ./.agent/notes.md",
+            // Its own folder's skills are its work.
+            "cp -r skill .agents/skills/x",
+            "echo x > ~/.agents/notes.md",
+            "cp x ~/.agents/notes/",
+            "cp x .agents/",
+            "echo my.agents",
             "grep -r agent .",
             "echo my.agent.name",
             "rm -rf ~/.agent/sonny/zen/old",
@@ -2602,6 +2660,11 @@ mod tests {
             assert!(!named(text), "{text}");
         }
         // With no folder, a relative one could be anywhere.
-        assert!(home.named_by("cat .agent/x", None));
+        assert!(home.named_by("cat .agent/x", None).is_some());
+        assert!(home.named_by("cp x .agents/", None).is_some());
+        assert_eq!(
+            home.named_by("cp AGENTS.md ~/.agents/", folder),
+            Some(Kept::Agents)
+        );
     }
 }
