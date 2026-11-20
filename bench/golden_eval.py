@@ -135,12 +135,21 @@ CODENAME = r'HERON-7731'
 
 
 def arguments(row):
-    """A trail row's arguments: its preview is their JSON, cut at 2048
-    characters; a cut or plain preview is its text as a command."""
+    """A trail row's arguments: its preview is their JSON, which the trail
+    cuts (at 256 characters on 11-20); a plain preview is its text as a
+    command. A cut `automations` call keeps what its start shows: an add
+    with its cron, or a remove."""
+    preview = row['preview'] or '{}'
     try:
-        args = json.loads(row['preview'] or '{}')
+        args = json.loads(preview)
     except ValueError:
-        return {'command': row['preview']}
+        if row.get('tool') == 'automations' and preview.lstrip().startswith('{'):
+            cron = re.search(r'"cron"\s*:\s*"([^"]+)"', preview)
+            if re.search(r'"add"\s*:', preview):
+                return {'add': {'cron': cron.group(1)} if cron else {}}
+            if re.search(r'"remove"\s*:', preview):
+                return {'remove': True}
+        return {'command': preview}
     return args if isinstance(args, dict) else {}
 
 
@@ -256,7 +265,12 @@ CASES = [
     {'id': 'recover-context', 'area': 'history',
      # The lead's model is told its context holds this many tokens, so the
      # long outputs below push the first message out of it.
-     'window': 40_000,
+     # 55,000 puts the threshold at 22,000 (a window less 33,000): the lead's
+     # role and tools alone are about 15,000, and its rounds reach about
+     # 27,000 (direct) and 28,000 (code mode) by the last ask. At 40,000 the
+     # threshold, 7,000, sat under the role itself, so no cut ever came; at
+     # 60,000 (27,000) only code mode crossed it (11-20).
+     'window': 55_000,
      'steps': [
          {'say': FIRST},
          {'say': "Run `python3 -m pydoc datetime.datetime` and tell me in one line which methods deal with "
@@ -269,6 +283,23 @@ CASES = [
          check('the context was cut before the answer', lambda v: v.compactions(before=v.answered(CODENAME)) > 0),
          check('gives the codename', lambda v: v.answer_says(CODENAME)),
          check('quotes the first message word for word', lambda v: v.answer_quotes(QUOTED)),
+     ]},
+    {'id': 'restart', 'area': 'recovery',
+     # The daemon stops with no grace while the task works, and a fresh one
+     # starts on the same store: the parked turns must carry on.
+     'steps': [
+         {'say': f"{SIGN_OUT}. Start a task to find out why and fix it, and merge it into main once its tests "
+                 "pass, no need to ask me.",
+          'restart': 45},
+         {'say': "Is the sign-out fix on main now?"},
+     ],
+     'main': {'session': SESSION},
+     'checks': [
+         check('an agent was working when the daemon stopped', lambda v: v.busy_at_restart() > 0),
+         check('sessions last five hours on main', lambda v: v.main('session')),
+         check('the tests pass on main', lambda v: v.suite()),
+         check('no turn failed', lambda v: v.failed_turns() == 0),
+         check('says the fix is on main', lambda v: v.answer_says(r'\bmain\b|merged')),
      ]},
     {'id': 'remember', 'area': 'skills',
      'steps': [{'say': "From now on, run this repo's tests with `python3 -W error -m unittest`, so warnings fail "
@@ -362,11 +393,11 @@ def audit(store):
     if not store.exists():
         return []
     db = sqlite3.connect(f'file:{store}?mode=ro', uri=True)
+    keys = ('bot', 'turn', 'call_id', 'step', 'tool', 'kind', 'outcome', 'preview', 'at_ms', 'approved')
     try:
-        rows = db.execute('SELECT bot, turn, call_id, step, tool, kind, outcome, preview FROM audit ORDER BY id')
+        rows = db.execute(f"SELECT {', '.join(keys)} FROM audit ORDER BY id")
     except sqlite3.OperationalError:  # a build before the trail
         return []
-    keys = ('bot', 'turn', 'call_id', 'step', 'tool', 'kind', 'outcome', 'preview')
     return [dict(zip(keys, row)) for row in rows]
 
 
@@ -431,6 +462,22 @@ class View:
                     return row['t']
         return None
 
+    def timeline(self):
+        path = self.out / 'timeline.json'
+        return json.loads(path.read_text()) if path.exists() else []
+
+    def busy_at_restart(self):
+        """How many agents had a turn running when the daemon stopped."""
+        return max((s.get('busy_at_restart') or 0 for s in self.timeline()), default=0)
+
+    def failed_turns(self):
+        """Turns of any agent that ended failed, by the recorded stream."""
+        events = self.out / 'events.jsonl'
+        if not events.exists():
+            return 0
+        return sum(e.get('event') == 'turn_finished' and (e.get('data') or {}).get('status') == 'failed'
+                   for e in map(json.loads, open(events)))
+
     def compactions(self, bot=LEAD, before=float('inf')):
         """How many times `bot`'s context was summarized, before the time
         `before` when given."""
@@ -493,20 +540,22 @@ class View:
         return [args for call, args in calls.items() if ended.get(call) == 'completed']
 
     def automation_calls(self):
-        """The arguments of the lead's completed `automations` calls: by
-        `sonny acp` for the tool, and by the trail for code-mode steps,
-        which `sonny acp` shows only as their `exec`."""
+        """The arguments of every completed `automations` call: the lead's
+        by `sonny acp` for the tool and by the trail for code-mode steps,
+        which `sonny acp` shows only as their `exec`, and any other agent's
+        by the trail, as a task the lead started may set it up."""
         found = self.completed('automations')
-        for r in self.lead_rows:
-            if r['step'] and r['tool'] == 'automations' and r['outcome'] == 'completed':
+        for r in self.rows:
+            if (r['tool'] == 'automations' and r['outcome'] == 'completed'
+                    and (r['step'] or r['bot'] != LEAD)):
                 found.append(arguments(r))
         return [a for a in found if isinstance(a, dict)]
 
     def scripts(self, verb):
-        """The words of the lead's completed shell commands that run the
+        """The words of any agent's completed shell commands that run the
         automation script's `verb`."""
         found = []
-        for r in self.lead_rows:
+        for r in self.rows:
             command = arguments(r).get('command') if r['tool'] == 'shell' and r['outcome'] == 'completed' else None
             if not isinstance(command, str):
                 continue
@@ -577,13 +626,16 @@ def usage(view):
     and tokens."""
     used = {who: {'tools': collections.Counter(), 'step tools': collections.Counter(),
                   'skills': collections.Counter(), 'calls': 0, 'steps': 0, 'compactions': 0,
-                  'rounds': 0, 'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0}
+                  'rounds': 0, 'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0,
+                  'approvals': 0, 'aside rounds': 0, 'aside input tokens': 0}
             for who in ('lead', 'others')}
     read = set()
     for row in view.rows:
         who = used['lead' if row['bot'] == LEAD else 'others']
         who['tools'][row['tool']] += 1
         who['steps' if row['step'] else 'calls'] += 1
+        # A call a person approved: the eval stands in for them.
+        who['approvals'] += row.get('approved') == 'person'
         if row['step']:
             who['step tools'][row['tool']] += 1
         # A skill once for each agent's turn that read it: a script and its
@@ -609,6 +661,10 @@ def usage(view):
             who['rounds'] += 1
             for key in ('input_tokens', 'cached_input_tokens', 'output_tokens'):
                 who[key] += (e.get('data') or {}).get(key) or 0
+            # Rounds beside the turn's own work, such as a compaction's summary.
+            if (e.get('data') or {}).get('purpose'):
+                who['aside rounds'] += 1
+                who['aside input tokens'] += e['data'].get('input_tokens') or 0
     # An agent that never called a tool is in the event stream alone.
     seen = {r['bot'] for r in view.rows}
     if events.exists():
@@ -624,6 +680,10 @@ def usage(view):
             'messages': (sum(line.startswith('### ') for line in messages.read_text().splitlines())
                          if messages.exists() else 0),
             'seconds': sum(max(s.get('took') or 0, 0) for s in timeline),
+            # Lead turns a note started, and those that said something to
+            # the person: each one an interruption.
+            'note turns': view.notes(),
+            'note replies': len(view.note_replies()),
             **resources}
 
 
@@ -698,6 +758,12 @@ def summarize(rows):
             'lead rounds': mean([r['used']['lead']['rounds'] for r in done]),
             'others rounds': mean([r['used']['others']['rounds'] for r in done]),
             'lead compactions': mean([r['used']['lead'].get('compactions', 0) for r in done]),
+            'aside rounds': mean([r['used']['lead'].get('aside rounds', 0) + r['used']['others'].get('aside rounds', 0)
+                                  for r in done]),
+            'person approvals': mean([r['used']['lead'].get('approvals', 0) + r['used']['others'].get('approvals', 0)
+                                      for r in done]),
+            'note turns': mean([r['used'].get('note turns', 0) for r in done]),
+            'note replies': mean([r['used'].get('note replies', 0) for r in done]),
             'input tokens': mean([r['used']['lead']['input_tokens'] + r['used']['others']['input_tokens']
                                   for r in done]),
             'seconds': mean([r['used']['seconds'] for r in done]),
@@ -750,7 +816,8 @@ def markdown(summary, base=None):
             cells = [arms[a].get(case['id']) for a in names]
             if not any(cells):
                 continue
-            measures = [('lead rounds', 1), ('others rounds', 1), ('lead compactions', 1), ('input tokens', 0),
+            measures = [('lead rounds', 1), ('others rounds', 1), ('aside rounds', 1), ('lead compactions', 1),
+                        ('input tokens', 0), ('person approvals', 1), ('note turns', 1), ('note replies', 1),
                         ('agents per run', 1),
                         ('messages per run', 1), ('seconds', 0), ('peak rss mb', 0), ('cpu s', 1)]
             for i, (key, digits) in enumerate(measures):
@@ -808,22 +875,7 @@ def main():
     ap.add_argument('--base', help='the arm the others are compared against in the report')
     a = ap.parse_args()
     bins = {arm: str(Path(d).resolve()) for arm, d in (b.split('=', 1) for b in a.bin)}
-    settings = {}
-    for item in a.code_mode:
-        arm, _, mode = item.partition('=')
-        if mode not in ('on', 'off'):
-            ap.error(f'--code-mode {item}: on or off')
-        settings.setdefault(arm, {})['code_mode'] = mode == 'on'
-    for item in a.set:
-        arm, _, pair = item.partition(':')
-        key, eq, value = pair.partition('=')
-        if not (arm and key and eq):
-            ap.error(f'--set {item}: ARM:KEY=VALUE')
-        try:
-            value = json.loads(value)
-        except ValueError:
-            pass
-        settings.setdefault(arm, {})[key] = value
+    settings = role_eval.arm_settings(ap, a.code_mode, a.set)
     if a.cmd == 'one':
         one(a.case, a.arm, a.n, bins, a.model, a.provider, settings.get(a.arm))
     elif a.cmd == 'all':

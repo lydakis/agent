@@ -387,6 +387,10 @@ DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
 # More `[sonny]` settings for a run's config, such as `code_mode`, so two
 # arms of one build can differ in a setting alone.
 SETTINGS = {}
+# Each arm's own `[sonny]` settings over SETTINGS (`--code-mode`, `--set`),
+# so two arms of one build compare a setting, such as direct tools against
+# code mode.
+ARM_SETTINGS = {}
 # More of a run's config after the rest, such as a `[context_windows]` table
 # that makes a lead's context fill sooner.
 CONFIG = ''
@@ -420,7 +424,7 @@ def sh(args, **kw):
     return subprocess.run(args, check=True, capture_output=True, text=True, **kw)
 
 
-def setup(root, bin_dir, model, spec=None):
+def setup(root, bin_dir, model, spec=None, settings=None):
     if root.exists():
         shutil.rmtree(root)
     home, repo = root / 'h', root / 'shop'
@@ -444,7 +448,7 @@ def setup(root, bin_dir, model, spec=None):
     # build refuses the other's, so an arm of one still compares.
     reviewer = 'reviewer' if b'[reviewer]' in (own / 'sonny').read_bytes() else 'judge'
     # The run's own settings, each once, an arm's over the defaults.
-    sonny = {'task_effort': 'high', 'suggest': False, 'default_permissions': 'eval', **SETTINGS}
+    sonny = {'task_effort': 'high', 'suggest': False, 'default_permissions': 'eval', **SETTINGS, **(settings or {})}
     (home / '.agent/config.toml').write_text(f'''model = "{model}"
 provider = "{spec or provider}"
 
@@ -831,11 +835,12 @@ def until_subscribed(home, cap=10 * 60):
     return False
 
 
-def allow_waiting(env, agent, home):
+def allow_waiting(env, agent, home, log=None):
     """Answer every call a task waits on the person for: allowed when its
     effects stay in the run, denied otherwise. Only the lead's session runs
     through `sonny acp`, which answers the lead's own; a task's would
-    otherwise park and stall the day."""
+    otherwise park and stall the day. Each answer is written to `log`: a
+    call that waited on a person."""
     out = subprocess.run([str(agent), 'approvals'], env=env, capture_output=True, text=True).stdout
     try:
         calls = json.loads(out or '[]')
@@ -847,19 +852,23 @@ def allow_waiting(env, agent, home):
             continue
         tag = ['--tag', 'manual'] if 'manual' in gates else []
         choice = 'allow' if determinable(home, call) else 'deny'
+        if log:
+            with open(log, 'a') as f:
+                f.write(json.dumps({'t': time.time(), 'bot': call['bot'], 'tool': call.get('tool'),
+                                    'choice': choice}) + '\n')
         subprocess.run([str(agent), 'answer', '--bot', call['bot'], '--turn', str(call['turn']),
                         '--call', call['call_id'], '--request', str(call['request']), *tag, choice],
                        env=env, capture_output=True)
 
 
-def settle(env, agent, acp, quiet=60, cap=40 * 60):
+def settle(env, agent, acp, quiet=60, cap=40 * 60, log=None):
     """Wait until no agent has a turn running and `sonny acp` has said
     nothing for `quiet` seconds: the lookout's notes have landed and been
     answered."""
     start = time.monotonic()
     calm = None
     while time.monotonic() - start < cap:
-        allow_waiting(env, agent, acp.home)
+        allow_waiting(env, agent, acp.home, log)
         busy = active(env, agent)
         idle = not busy and time.monotonic() - acp.last > 10
         if idle:
@@ -876,7 +885,7 @@ def run(arm, n, bins, model, spec=None):
     # Apart per model, so runs of two models at once never share a root.
     # The day too, so a small day never clears a full day's run.
     root = ROOT / f'{zlib.crc32((model + DAY_NAME).encode()):08x}-{arm}{n}'
-    home, repo, env, bin_dir = setup(root, Path(bins[arm]), model, spec)
+    home, repo, env, bin_dir = setup(root, Path(bins[arm]), model, spec, ARM_SETTINGS.get(arm))
     agent, sonny = bin_dir / 'agent', bin_dir / 'sonny'
     out = RUNS / f'{arm}{n}'
     if out.exists():
@@ -885,6 +894,8 @@ def run(arm, n, bins, model, spec=None):
     # The build, so `blind` can hide it from the scorer.
     (out / 'bin.txt').write_text(bins[arm])
     log = out / 'acp.jsonl'
+    # Every task's call that waited on a person, as the eval answered it.
+    waited = out / 'approvals.jsonl'
     started = time.time()
     sh([str(agent), 'start', '--idle-exit', '0'], env=env)
     acp = None
@@ -904,7 +915,7 @@ def run(arm, n, bins, model, spec=None):
         (root / 'step').write_text(str(step))
 
     try:
-        acp = Acp(sonny, env, repo, log, home, lambda: allow_waiting(env, agent, home))
+        acp = Acp(sonny, env, repo, log, home, lambda: allow_waiting(env, agent, home, waited))
         acp.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 'role-eval'}})
         session = acp.ask('session/new', {'cwd': str(repo), 'mcpServers': []})['result']['sessionId']
         # A prompt sent mid-burst, still out: its step and request.
@@ -945,6 +956,28 @@ def run(arm, n, bins, model, spec=None):
                         acp.collect(out_prompt[1])
                         heard_back()
                     answered(step, acp.ask('session/prompt', prompt))
+            if s.get('restart') is not None:
+                # The daemon stops mid-work and a fresh one starts on the
+                # same store, as a crash, an upgrade or a reboot leaves it:
+                # parked turns continue, and `sonny acp` follows again.
+                time.sleep(s['restart'])
+                timeline[-1]['busy_at_restart'] = len(active(env, agent))
+                # No grace: running calls are cut, as a crash cuts them.
+                subprocess.run([str(agent), 'shutdown', '--grace', '0ms'], env=env, capture_output=True)
+                after = 0
+                if recorder:
+                    recorder.close()
+                    after = recorder.cursor
+                for _ in range(30):
+                    time.sleep(2)
+                    if subprocess.run([str(agent), 'start', '--idle-exit', '0'], env=env,
+                                      capture_output=True).returncode == 0:
+                        break
+                else:
+                    raise RuntimeError(f'step {step}: the daemon did not start again')
+                timeline[-1]['restarted'] = time.time()
+                if recorder:
+                    recorder = burst_ledger.Recorder(agent, env, out / 'events.jsonl', mode='a', after=after)
             if not heard:
                 heard = until_subscribed(home)
                 release(step, s)
@@ -952,13 +985,13 @@ def run(arm, n, bins, model, spec=None):
             if s.get('gap'):
                 # A burst's wave: the next comes on the clock, busy or not.
                 while time.time() - timeline[-1]['t'] < s['gap']:
-                    allow_waiting(env, agent, home)
+                    allow_waiting(env, agent, home, waited)
                     heard_back()
                     time.sleep(5)
                 continue
             if s.get('events'):
                 time.sleep(30)  # the sources run every 15 s
-            timeline[-1]['settled'] = settle(env, agent, acp)
+            timeline[-1]['settled'] = settle(env, agent, acp, log=waited)
             # Less the minute of quiet, how long the step kept agents busy.
             timeline[-1]['took'] = round(time.time() - timeline[-1]['t'] - 60)
             # So is a turn the lookout started, which fails in an update.
@@ -1241,6 +1274,28 @@ def blind():
     print('\n'.join(sorted(key)))
 
 
+def arm_settings(ap, code_mode, sets):
+    """Each arm's `[sonny]` settings from `--code-mode ARM=on|off` and
+    `--set ARM:KEY=VALUE`, VALUE read as JSON where it parses."""
+    settings = {}
+    for item in code_mode:
+        arm, _, mode = item.partition('=')
+        if mode not in ('on', 'off'):
+            ap.error(f'--code-mode {item}: on or off')
+        settings.setdefault(arm, {})['code_mode'] = mode == 'on'
+    for item in sets:
+        arm, _, pair = item.partition(':')
+        key, eq, value = pair.partition('=')
+        if not (arm and key and eq):
+            ap.error(f'--set {item}: ARM:KEY=VALUE')
+        try:
+            value = json.loads(value)
+        except ValueError:
+            pass
+        settings.setdefault(arm, {})[key] = value
+    return settings
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cmd', choices=['run', 'all', 'blind', 'transcript', 'ledger'])
@@ -1252,7 +1307,11 @@ def main():
     ap.add_argument('--day', choices=sorted(DAYS), default='full', help='the scripted day to run')
     ap.add_argument('--model', default=MODEL, help='provider/model every agent of a run uses')
     ap.add_argument('--provider', help='the daemon\'s provider spec, as AGENT_PROVIDER takes it (default: the model\'s provider)')
+    ap.add_argument('--code-mode', action='append', default=[], help='ARM=on|off: [sonny] code_mode for that arm')
+    ap.add_argument('--set', action='append', default=[],
+                    help='ARM:KEY=VALUE: a [sonny] setting for that arm, VALUE read as JSON where it parses')
     a = ap.parse_args()
+    ARM_SETTINGS.update(arm_settings(ap, a.code_mode, a.set))
     # Each model's runs, transcripts and blind copies sit apart.
     global OUT, RUNS, DAY, DAY_NAME
     DAY, DAY_NAME = DAYS[a.day], ('' if a.day == 'full' else a.day)
@@ -1279,7 +1338,8 @@ def main():
         blind()
     elif a.cmd == 'ledger':
         # A finished burst run's ledger again, while its root is still there.
-        for arm, n in ([(a.arm, a.n)] if a.runs == 0 else [(arm, n) for n in range(1, a.runs + 1) for arm in 'AB']):
+        arms = sorted(bins) or ['A', 'B']
+        for arm, n in ([(a.arm, a.n)] if a.runs == 0 else [(arm, n) for n in range(1, a.runs + 1) for arm in arms]):
             out, root = RUNS / f'{arm}{n}', ROOT / f'{zlib.crc32((a.model + DAY_NAME).encode()):08x}-{arm}{n}'
             if not (out / 'acp.jsonl').exists() or not (root / 'shop').exists():
                 continue
