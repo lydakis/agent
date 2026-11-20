@@ -180,6 +180,19 @@ fn file(store: &Path, task: &str) -> PathBuf {
     PathBuf::from(dir).join(format!("{task}.json"))
 }
 
+/// The tasks with a mark kept beside `store`, by name: one look at the
+/// folder, no mark read.
+pub fn marked(store: &Path) -> HashSet<String> {
+    let folder = file(store, "x");
+    let entries = folder.parent().and_then(|dir| std::fs::read_dir(dir).ok());
+    (entries.into_iter().flatten().flatten())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            Some(name.strip_suffix(".json")?.to_owned())
+        })
+        .collect()
+}
+
 /// The newest turn of `task` its resolving covered, if it was resolved.
 pub fn read(store: &Path, task: &str) -> Option<i64> {
     kept(store, task)?["turn"].as_i64()

@@ -61,7 +61,18 @@ pub struct Row {
 pub type Task = std::sync::Arc<serde_json::Value>;
 
 /// Where a task stands, as `/status` groups the tasks, in its order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum Group {
     /// Waiting on the person's approval or answer, or held on a cause
     /// they can fix.
@@ -448,7 +459,7 @@ fn listing<R: std::borrow::Borrow<Row>>(rows: &[R]) -> Listing<'_> {
 
 /// How many agents each of `/status`'s groups lists, as its head and its
 /// headings count them: the footer shows these same counts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Counts {
     pub needs_you: usize,
     pub failed: usize,
@@ -713,7 +724,7 @@ fn helpers_fold<'a, 'b>(
 /// One of the project's agents as the pane lists it above the margin: the
 /// lead, a task that needs the person, failed or works, or a workflow
 /// that runs.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Listed {
     pub bot: String,
     pub name: String,
@@ -724,6 +735,8 @@ pub struct Listed {
     pub lead: bool,
     /// Its helpers' groups: each agent whose line of makers leads to it.
     pub helpers: Vec<Group>,
+    /// Read live, never kept ([`crate::projects::Project`]).
+    #[serde(skip)]
     pub run: Option<Box<crate::workflow::view::Live>>,
     /// A task with several agents: how many it has, and those that need
     /// the person, failed or work, in the order of their names. Its row
@@ -738,7 +751,7 @@ pub struct Listed {
 /// that needs the person, failed or works, in the order of the groups,
 /// each workflow under the agent that runs it. Its counts are the
 /// footer's, which the pane does not draw.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Agents {
     pub project: String,
     pub counts: Counts,
