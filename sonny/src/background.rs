@@ -1253,6 +1253,14 @@ impl View {
             return false;
         };
         find.paste(text);
+        // A removal or stop asked for is dropped, as any other key drops
+        // it: the paste may move the pick.
+        if self.confirm.take().is_some() {
+            self.notice = Some("not removed".into());
+        }
+        if self.stopping.take().is_some() {
+            self.notice = Some("not stopped".into());
+        }
         self.found();
         true
     }
@@ -3566,6 +3574,15 @@ mod tests {
         assert!(!view.paste("zz"));
         view.key(key(KeyCode::Left), 0..0);
         assert!(view.page.is_none() && view.finding());
+        // A removal asked for, then a paste: the paste moves the find, so
+        // the question is dropped, as any other key drops it.
+        assert!(matches!(view.key(key(KeyCode::Delete), 0..0), Key::Stay));
+        assert!(view.confirm.is_some());
+        assert!(view.paste("zz"));
+        assert!(view.confirm.is_none() && view.notice.as_deref() == Some("not removed"));
+        for _ in 0..2 {
+            view.key(key(KeyCode::Backspace), 0..0);
+        }
         // Pasted, as typed; nothing found says so, and nothing is picked
         // to open, remove or run.
         assert!(view.paste("zz"));

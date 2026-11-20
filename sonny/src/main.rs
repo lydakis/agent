@@ -6099,7 +6099,7 @@ struct Watch {
     drawn: std::cell::RefCell<Option<(CardFrom, Card)>>,
     /// `ctrl+f` in `/status`: what is typed narrows its rows; `esc` puts
     /// back the pick and the helpers shown as they were.
-    finding: Option<find::Find<(Option<usize>, Vec<String>)>>,
+    finding: Option<find::Find<(Option<usize>, Vec<String>, Vec<status::Group>)>>,
 }
 
 /// `/status`'s card: its lines, whether a group folds, and the marks the
@@ -16827,7 +16827,7 @@ impl App {
                 Some(find) => match find.key(key) {
                     find::Typed::Dropped => {
                         if let Some(find) = watch.finding.take() {
-                            (watch.pick, watch.helpers) = find.before;
+                            (watch.pick, watch.helpers, watch.open) = find.before;
                         }
                         watch.picked = None;
                         return true;
@@ -16840,7 +16840,11 @@ impl App {
                     find::Typed::Other => {}
                 },
                 None if find::opens(key) => {
-                    watch.finding = Some(find::Find::new((watch.pick, watch.helpers.clone())));
+                    watch.finding = Some(find::Find::new((
+                        watch.pick,
+                        watch.helpers.clone(),
+                        watch.open.clone(),
+                    )));
                     return true;
                 }
                 None => {}
@@ -37794,7 +37798,7 @@ mod tests {
             ],
             read: Instant::now(),
             alerts: Vec::new(),
-            open: Vec::new(),
+            open: vec![status::Group::Idle],
             background: None,
             usage: None,
             audit: None,
@@ -37849,6 +37853,17 @@ mod tests {
         assert_eq!(card(&app).last().unwrap(), " find sums");
         // The pick on the first match.
         assert_eq!(picked(&app), Some(Picked::Agent("calc.old".into())));
+        // A fold opened or shut while finding is put back with the rest.
+        let watch = app.watch.as_mut().unwrap();
+        let done = (card_picks(watch, 80).iter())
+            .position(|picked| *picked == Picked::Group(status::Group::Done));
+        watch.pick = done;
+        app.key(key(KeyCode::Enter)).await;
+        let watch = app.watch.as_ref().unwrap();
+        assert_eq!(
+            watch.finding.as_ref().map(|find| find.query.as_str()),
+            Some("sums")
+        );
         // A helper that says it keeps its task, its helpers shown.
         for _ in 0.."sums".len() {
             app.key(key(KeyCode::Backspace)).await;
@@ -37873,6 +37888,7 @@ mod tests {
         app.key(key(KeyCode::Esc)).await;
         let watch = app.watch.as_ref().unwrap();
         assert!(watch.finding.is_none() && watch.helpers.is_empty());
+        assert_eq!(watch.open, vec![status::Group::Idle]);
         assert_eq!(watch.pick, Some(1));
         assert!(says(&app, "Round half") && says(&app, "Check the README"));
         assert!(!says(&app, "Fix the sums"), "the done fold shut again");
