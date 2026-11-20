@@ -753,7 +753,7 @@ async fn judge(
                 .map(|call| {
                     let verdict = policy::verdict(&answers[&call.id])?;
                     Some(match (call.own_home, call.starts_daemon) {
-                        (true, _) => policy::own_home(verdict),
+                        (Some(kept), _) => policy::own_home(verdict, kept),
                         (_, true) => policy::starts_daemon(verdict),
                         _ => verdict,
                     })
@@ -834,30 +834,52 @@ fn own_home(given: &[String]) -> Option<policy::Home> {
 }
 
 fn own_home_in(home: PathBuf, given: &[String]) -> policy::Home {
-    let agent = home.join(".agent");
-    let real = agent_client::files::real(&agent).filter(|real| *real != agent);
+    // Each kept place as `$HOME` spells it, and its real path where that
+    // differs.
+    let places: Vec<(PathBuf, Option<PathBuf>, policy::Kept)> = (policy::KEPT.iter())
+        .map(|(name, kept)| {
+            let place = home.join(name);
+            let real = agent_client::files::real(&place).filter(|real| *real != place);
+            (place, real, *kept)
+        })
+        .collect();
     let mut folders = Vec::new();
     for folder in given {
         let folder = PathBuf::from(folder);
         let resolved = agent_client::files::real(&folder).unwrap_or_else(|| folder.clone());
-        // A folder in the home's real place, as the home's own name spells it.
-        if let Some(real) = &real
-            && let Ok(rest) = resolved.strip_prefix(real)
-        {
-            folders.push(agent.join(rest));
+        // A folder in a place's real path, as the place's own name spells it.
+        for (place, real, _) in &places {
+            if let Some(real) = real
+                && let Ok(rest) = resolved.strip_prefix(real)
+            {
+                folders.push(place.join(rest));
+            }
         }
         folders.push(resolved);
         folders.push(folder);
     }
     folders.sort();
     folders.dedup();
-    // Where tasks' worktrees are made, as each of its spellings names it.
-    let work = (std::iter::once(&agent).chain(&real))
+    // Where tasks' worktrees are made, as each of the home's spellings
+    // names it.
+    let work = (places.iter())
+        .filter(|(_, _, kept)| *kept == policy::Kept::Agent)
+        .flat_map(|(place, real, _)| std::iter::once(place).chain(real))
         .map(|agent| agent.join("worktrees"))
         .collect();
+    let holder = home.join(policy::HOLDER.0);
+    let holders = (agent_client::files::real(&holder).filter(|real| *real != holder))
+        .into_iter()
+        .chain(std::iter::once(holder))
+        .collect();
     policy::Home {
+        holders,
         home,
-        agent: std::iter::once(agent).chain(real).collect(),
+        kept: (places.into_iter())
+            .flat_map(|(place, real, kept)| {
+                std::iter::once((place, kept)).chain(real.map(|real| (real, kept)))
+            })
+            .collect(),
         given: folders,
         work,
     }
@@ -875,7 +897,7 @@ fn reaches_home(
     changed: &[String],
     folder: Option<&Path>,
     confined: bool,
-) -> bool {
+) -> Option<policy::Kept> {
     let absolute = |path: &str| -> Option<PathBuf> {
         let path = match path {
             "~" | "$HOME" | "${HOME}" => home.home.clone(),
@@ -893,24 +915,27 @@ fn reaches_home(
         }
     };
     match tool {
-        "write" | "edit" | "apply_patch" => changed.iter().any(|path| {
+        "write" | "edit" | "apply_patch" => changed.iter().find_map(|path| {
             // An unknown folder is as near as it could be.
             let Some(path) = absolute(path) else {
-                return true;
+                return Some(policy::Kept::Agent);
             };
             home.reaches(&path)
-                || agent_client::files::real(&path).is_none_or(|real| home.reaches(&real))
+                .or_else(|| match agent_client::files::real(&path) {
+                    Some(real) => home.reaches(&real),
+                    None => Some(policy::Kept::Agent),
+                })
         }),
         "shell" => {
             if confined && arguments["sandbox_permissions"] != "require_escalated" {
-                return false;
+                return None;
             }
             let workdir = arguments["workdir"].as_str().and_then(absolute);
             let mut text = String::new();
             strings(arguments, &mut text);
             home.named_by(&text, workdir.as_deref().or(folder))
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -1158,7 +1183,7 @@ async fn intent(
             tool,
             arguments,
             files: Vec::new(),
-            own_home: false,
+            own_home: None,
             starts_daemon: false,
         });
     }
@@ -1378,7 +1403,7 @@ async fn intent(
             .collect();
         let flags = tokio::task::spawn_blocking(move || {
             let Some(home) = own_home(&given) else {
-                return vec![false; calls.len()];
+                return vec![None; calls.len()];
             };
             (calls.iter().zip(changed_by_call))
                 .map(|((tool, arguments), changed)| {
@@ -1391,7 +1416,7 @@ async fn intent(
                         confined,
                     )
                 })
-                .collect::<Vec<bool>>()
+                .collect::<Vec<Option<policy::Kept>>>()
         })
         .await
         .map_err(|_| Unjudged::Failed)?;
@@ -1833,16 +1858,17 @@ mod tests {
         let agent = root.join(".agent");
         let worktree = agent.join("worktrees/shop-fix");
         std::fs::create_dir_all(&worktree).unwrap();
-        let home = policy::Home {
-            home: root.clone(),
-            agent: vec![agent.clone()],
-            given: vec![root.join("code"), worktree.clone()],
-            work: vec![agent.join("worktrees")],
-        };
+        let home = own_home_in(
+            root.clone(),
+            &[
+                root.join("code").to_str().unwrap().to_owned(),
+                worktree.to_str().unwrap().to_owned(),
+            ],
+        );
         let folder = root.join("code");
         let reaches = |tool: &str, arguments: Value, confined: bool| {
             let changed = changed_paths(tool, &arguments);
-            reaches_home(&home, tool, &arguments, &changed, Some(&folder), confined)
+            reaches_home(&home, tool, &arguments, &changed, Some(&folder), confined).is_some()
         };
         let job = "~/.agent/automations/jobs/x.json";
         // In its sandbox a command can't write there: nothing to hold.
@@ -1918,6 +1944,72 @@ mod tests {
             json!({"add": {"message": job}}),
             true
         ));
+        // The person's skills, agent profiles and standing instructions,
+        // by a command run out of the sandbox, a write or an edit.
+        let kept = |tool: &str, arguments: Value| {
+            let changed = changed_paths(tool, &arguments);
+            reaches_home(&home, tool, &arguments, &changed, Some(&folder), true)
+        };
+        assert_eq!(
+            kept(
+                "shell",
+                json!({"command": "cp -r ./skill ~/.agents/skills/x",
+                    "sandbox_permissions": "require_escalated"})
+            ),
+            Some(policy::Kept::Agents)
+        );
+        assert_eq!(
+            kept(
+                "write",
+                json!({"path": "$HOME/.agents/agents/r.md", "content": "x"})
+            ),
+            Some(policy::Kept::Agents)
+        );
+        assert_eq!(
+            kept(
+                "edit",
+                json!({"path": "~/.agents/AGENTS.md", "old_string": "a", "new_string": "b"})
+            ),
+            Some(policy::Kept::Agents)
+        );
+        assert_eq!(
+            kept(
+                "write",
+                json!({"path": root.join(".agents/skills/x/SKILL.md"), "content": "x"})
+            ),
+            Some(policy::Kept::Agents)
+        );
+        // Read in the sandbox, it reaches nothing; a skill in its own
+        // worktree is its work.
+        assert!(!reaches(
+            "shell",
+            json!({"command": "ls ~/.agents/skills"}),
+            true
+        ));
+        assert!(!reaches(
+            "write",
+            json!({"path": worktree.join(".agents/skills/x/SKILL.md"), "content": "x"}),
+            true
+        ));
+        assert!(!reaches(
+            "shell",
+            json!({"command": "cp -r skill .agents/skills/x",
+                "workdir": worktree.to_str().unwrap(),
+                "sandbox_permissions": "require_escalated"}),
+            true
+        ));
+        // A skills folder kept elsewhere through a link, by its real path.
+        let skills = root.join("dotfiles/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
+        std::os::unix::fs::symlink(&skills, root.join(".agents/skills")).unwrap();
+        let linked = own_home_in(root.clone(), &[]);
+        let arguments = json!({"path": skills.join("x/SKILL.md"), "content": "x"});
+        let changed = changed_paths("write", &arguments);
+        assert_eq!(
+            reaches_home(&linked, "write", &arguments, &changed, Some(&folder), true),
+            Some(policy::Kept::Agents)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1967,7 +2059,7 @@ mod tests {
         let folder = root.join("code");
         let reaches = |tool: &str, arguments: Value| {
             let changed = changed_paths(tool, &arguments);
-            reaches_home(&home, tool, &arguments, &changed, Some(&folder), true)
+            reaches_home(&home, tool, &arguments, &changed, Some(&folder), true).is_some()
         };
         let escalated =
             |command: &str| json!({"command": command, "sandbox_permissions": "require_escalated"});
