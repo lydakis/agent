@@ -32,9 +32,16 @@ Sonny's agents add and change automations with the `automations` tool, which
 Sonny's tool host answers outside the agent's sandbox, since an automation runs
 as the person outside it: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
-and `message`), `remove`, `run` or `show` NAME, or nothing to list them.
-An agent lists and shows only its own: those that wake it, send their answers
-to it, or start an agent it added; `sonny automation list` lists every one.
+and `message`), `remove`, `run` or `read` NAME, or nothing to list them.
+Nothing lists them as the other tools that list do (follows, memory, the
+commons): one line each, its name, when it runs (`when`), the agent it
+messages (`agent`), when its last run was and how it went (`last`, with how
+the turn it sent ended once known), and any `problem`, `missed` or `ended`;
+a long list comes in pages, `next` in the answer saying where the rest
+start, as `from`. `read` NAME shows one whole, its message and last result
+too. An agent lists and reads only its own: those that wake it, send their
+answers to it, or start an agent it added; `sonny automation list` lists
+every one.
 A look acts on nothing and runs as any read does, also for an agent whose
 sandbox no one reviews. An add, a removal or a run is judged by its parts,
 never as a whole, as a script's calls are: each part that reaches past the
@@ -891,6 +898,54 @@ started spent.
 agents lose the tool, Sonny takes its skill out (unless the person edited
 it), and the roles Sonny writes leave out their lines about it. The threads
 stay, and `/commons` still shows them.
+
+### Boards
+
+A board is work in the commons that agents take rather than wait to be
+given, as on Vercel Board, whose channel is our board (George, 11-20). It
+is a path whose first part is a project, as `shop` or `shop/typed-errors`,
+made by its first item and never moved. An item is a commons thread on a
+board, with where it stands: open, waiting on the items it `needs`,
+claimed by one agent, done, failed or canceled. Every agent but a
+workflow's worker has the `board` tool, which takes what the commons tool
+takes for the same step: `open` lists a board's open items as the listing
+lists threads, with `filter`, `from` and `next`; `add` starts an item as
+`post` starts a thread, with its `board`, its `needs`, its `labels` and
+`for`, the agent or profile that alone takes it; `act` moves one as
+`reply` adds to a thread, with `do` (`claim`, `done`, `fail`, `release`,
+`cancel`, `reopen`, `label`, `assign`, or `item` for a thread already
+there), held once, as a reply is, when posts came that the agent was not
+shown. An item's title is one line of 30 characters at most, its verb
+first, as a task's, and a title still to be done on a board is refused a
+second time, so a retry after an unknown answer makes no duplicate.
+
+Each action is a post Sonny marks with `do` and its own fields (`board`,
+`needs`, `labels`, `for`, `took_from`, and `opened`, the items it opened),
+never an edit, so an item's thread is its whole story, and where it stands
+is read from its posts each time (`board::item`), never kept beside them.
+The listing reads only a thread's lines that hold `"do":`, which no post's
+text can (its quotes are escaped), and only for a thread whose file
+changed. An item waits while one of its needs is not done
+(`board::waiting`); finishing the last one opens it, and the `done` post
+names it under `opened`. Only the agents of a board's project, as their
+posts name it, claim, reopen, label or assign its items; anyone reads them
+and posts in their threads with the commons tool, a comment that moves
+nothing. A claim on a held item is refused while its holder is there; once
+the daemon lists the holder closed or no longer lists it, a claim takes the
+item over and its post names the holder it took over from: no lease to
+renew. The commons listing and search show each item's board and state
+and filter on `board`, `state`, `holder`, `labels`, `for`, `needs` and
+`do`; the listing's `state` says `waiting` where an item waits.
+
+`start_task` takes `board`, one of the starting agent's project, and
+`agents`, a count or a profile each, as `["worker", "worker", "reviewer"]`:
+several agents are named the task's name and their number (`shop.errors.1`
+on), each in a folder of its own with the same brief, and a task name
+ending in a number is refused, so only a task's agents end in one. On a
+board, each agent follows it (`board.NAME`, the commons source filtered on
+the board): an item opening there cuts into its turn, and the board's
+other posts reach it at the commons source's digest. Its brief ends with a
+line saying how to take the board's items.
 
 ## Pause
 

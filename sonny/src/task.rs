@@ -80,6 +80,9 @@ pub struct Start {
     /// The daemon's providers, as its `ready` names them, from which the
     /// tools a task gets by default are known: null when none were read.
     pub providers: Value,
+    /// The board the task works from, which it follows and its brief
+    /// names.
+    pub board: Option<String>,
 }
 
 /// Start the task `start` asks for in `project`, whose lead's folder is
@@ -462,6 +465,13 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     if let Some(namespace) = crate::project::namespace(name) {
         flags.extend(["--namespace".to_owned(), namespace.to_owned()]);
     }
+    // The profile it runs as, kept on it: the one asked for, else what the
+    // project tells every task.
+    if let Some(profile) =
+        (start.profile.clone()).or_else(|| crate::project::task_profile(&info).ok())
+    {
+        flags.extend(["--profile-name".to_owned(), profile]);
+    }
     // A path in the lead's folder would have the task write there instead
     // of in its copy, where nothing keeps it apart from the lead's work.
     let mut brief = vec![start.brief.clone()];
@@ -473,7 +483,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         Some((from, to)) => in_copy(&brief, from, to),
         None => (brief, 0),
     };
-    let brief = brief.join(" ");
+    let mut brief = brief.join(" ");
+    if let Some(board) = &start.board {
+        brief.push_str(&board_line(board));
+    }
     // The commons threads that share the brief's words, named under it.
     let brief = match (crate::commons::pointer_on(), std::env::var_os("HOME")) {
         (true, Some(home)) => crate::commons::pointed(Path::new(&home), &brief),
@@ -514,9 +527,6 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             return failed(&place, false, format!("running {}: {e}", agent.display()));
         }
     };
-    // The profile it runs as, which nothing the daemon keeps names: the
-    // one asked for, else what the project tells every task. Only said
-    // where it is shown, so a failed write starts the task all the same.
     let store = started_on(start);
     // Which daemon's task its folder in `~/.agent/worktrees` is, so no
     // other daemon's lead takes it over or counts it gone.
@@ -543,19 +553,18 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         }
         _ => Vec::new(),
     };
-    let profile = (start.profile.clone()).or_else(|| crate::project::task_profile(&info).ok());
     if let Some(store) = &store {
         // Noted by the id it started with, which no agent given its name
         // later has.
         let started: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
         if let Some(id) = started["bot_id"].as_i64() {
             let _ = crate::title::note(store, name, id, &crate::title::of_message(&start.brief));
-        }
-        match profile {
-            Some(profile) => {
-                let _ = note_profile(store, name, &profile);
+            // The board's posts reach it as the commons' do, its items
+            // opening as they come.
+            if let Some(board) = &start.board {
+                let follow = crate::lookout::subs::Sub::board(board, Some(id));
+                let _ = crate::lookout::subs::ensure(store, name, follow);
             }
-            None => forget_profile(store, name),
         }
     }
     let mut said = vec![format!(
@@ -581,32 +590,79 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     Ok(said.join("\n"))
 }
 
-/// Where Sonny keeps the profile each task was started as: beside the
-/// store, as the marks of resolved tasks are, one file per task.
-fn profile_file(store: &Path, task: &str) -> PathBuf {
+/// The upgrade that moves the profile Sonny noted for each task and lead
+/// it started, in a file beside the store, onto the agent, which the
+/// daemon keeps now (0.10.3).
+pub const PROFILES_ON_AGENTS: &str = "profiles-on-agents";
+
+/// [`PROFILES_ON_AGENTS`] for the daemon of `store`, whose agents `bots`
+/// lists: each note in the folder `STORE.profiles` named for an agent with
+/// no profile of its own goes onto it with `configure`, and the folder goes
+/// once every note is taken or its agent is gone. Whether it is done.
+pub async fn profiles_onto_agents(
+    client: &agent_client::Client,
+    bots: &[Value],
+    store: &Path,
+) -> bool {
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
     let mut dir = store.into_os_string();
     dir.push(".profiles");
-    PathBuf::from(dir).join(task)
-}
-
-/// Forget the profile noted for `task`: one made since under its name runs
-/// as its project says, not as the agent it replaces did.
-pub fn forget_profile(store: &Path, task: &str) {
-    let _ = std::fs::remove_file(profile_file(store, task));
-}
-
-pub fn note_profile(store: &Path, task: &str, profile: &str) -> std::io::Result<()> {
-    let file = profile_file(store, task);
-    std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/")))?;
-    std::fs::write(file, format!("{profile}\n"))
-}
-
-/// The profile the task `task` of the daemon of `store` was started as,
-/// when Sonny started it.
-pub fn noted_profile(store: &Path, task: &str) -> Option<String> {
-    let text = std::fs::read_to_string(profile_file(store, task)).ok()?;
-    Some(text.trim().to_owned()).filter(|profile| !profile.is_empty())
+    let dir = PathBuf::from(dir);
+    let read = dir.clone();
+    // A note that cannot be read leaves the move undone, the folder kept
+    // for the next start: none is dropped unread.
+    let Ok(Ok(notes)) =
+        tokio::task::spawn_blocking(move || -> std::io::Result<Vec<(String, String)>> {
+            let entries = match std::fs::read_dir(&read) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                entries => entries?,
+            };
+            let mut notes = Vec::new();
+            for entry in entries {
+                let entry = entry?;
+                // Notes are named for agents; no agent's name is anything else.
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                let text = std::fs::read_to_string(entry.path())?;
+                notes.push((name, text.trim().to_owned()));
+            }
+            Ok(notes)
+        })
+        .await
+    else {
+        return false;
+    };
+    let by_name: std::collections::HashMap<&str, &Value> = (bots.iter())
+        .filter_map(|bot| Some((bot["name"].as_str()?, bot)))
+        .collect();
+    let mut all = true;
+    for (name, profile) in notes {
+        let Some(bot) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        if profile.is_empty() || !bot["profile"].is_null() {
+            continue;
+        }
+        let asked = json!({"bot": name, "bot_id": bot["bot_id"], "profile": profile});
+        match client.request("configure", asked).await {
+            Ok(_) => {}
+            Err(error) if error.code == "bot_not_found" => {}
+            // Said nowhere: a window's screen is up. Tried again at the
+            // next start.
+            Err(_) => all = false,
+        }
+    }
+    if all {
+        let gone = tokio::task::spawn_blocking(move || {
+            std::fs::remove_dir_all(&dir).map_or_else(
+                |error| error.kind() == std::io::ErrorKind::NotFound,
+                |()| true,
+            )
+        });
+        all = gone.await.unwrap_or(false);
+    }
+    all
 }
 
 /// Whether two paths name one folder, links followed.
@@ -689,8 +745,8 @@ fn given(mut child: std::process::Child, input: String) -> std::io::Result<std::
     output
 }
 
-/// The store of the daemon a task is started on, beside which its profile
-/// is noted: the one `start.env` names over Sonny's own.
+/// The store of the daemon a task is started on, beside which its title
+/// and folder are noted: the one `start.env` names over Sonny's own.
 fn started_on(start: &Start) -> Option<PathBuf> {
     crate::daemon_paths(env_of(start, "AGENT_STORE").map(PathBuf::from), None)
         .ok()
@@ -1243,34 +1299,56 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The line a task working from `board` finds under its brief.
+pub fn board_line(board: &str) -> String {
+    format!(
+        "\n\nYou work from the board {board}: board with open \"{board}\" lists its open items. \
+         Take one with act claim, close it with act done and what you made, then take the next; \
+         you hear of items opening there. The commons skill's Boards section says more."
+    )
+}
+
+/// The daemon's records of agents named `name`, or None when it can't be
+/// read.
+fn listed(name: &str) -> Option<Vec<Value>> {
+    let agent = crate::agent_bin()?;
+    let output = Command::new(agent)
+        .args(["ls", "--name", name])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(Value::Array(bots)) => Some(bots),
+        _ => None,
+    }
+}
+
 /// Whether the agent `name`, which the daemon knew as `id` when given,
 /// is closed or no longer there, as the daemon lists it: a board's item
 /// it holds is then another's to take over. False when the daemon can't
 /// be read, so no claim is taken from an agent still working.
 pub fn gone(name: &str, id: Option<i64>) -> bool {
-    let Some(agent) = crate::agent_bin() else {
-        return false;
-    };
-    let Ok(output) = Command::new(agent)
-        .args(["ls", "--name", name])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    match serde_json::from_slice::<Value>(&output.stdout) {
-        Ok(Value::Array(bots)) => gone_from(&bots, name, id),
-        _ => false,
-    }
+    listed(name).is_some_and(|bots| gone_from(&bots, name, id))
+}
+
+/// The profile the agent `name` runs as, on its record.
+pub fn profile(name: &str, id: Option<i64>) -> Option<String> {
+    let bots = listed(name)?;
+    let bot = find(&bots, name, id)?;
+    bot["profile"].as_str().map(str::to_owned)
+}
+
+/// The record of `name`, the one known as `id` when given.
+fn find<'a>(bots: &'a [Value], name: &str, id: Option<i64>) -> Option<&'a Value> {
+    (bots.iter()).find(|bot| {
+        bot["name"] == name && id.is_none_or(|id| bot["bot_id"].as_i64().is_none_or(|i| i == id))
+    })
 }
 
 /// [`gone`], from the daemon's listing `bots`.
 fn gone_from(bots: &[Value], name: &str, id: Option<i64>) -> bool {
-    let theirs = (bots.iter()).find(|bot| {
-        bot["name"] == name && id.is_none_or(|id| bot["id"].as_i64().is_none_or(|i| i == id))
-    });
-    theirs.is_none_or(|bot| !bot["closed_ms"].is_null())
+    find(bots, name, id).is_none_or(|bot| !bot["closed_ms"].is_null())
 }
 
 /// Whether the daemon `env` names, or this shell's, lists `name`: so when
@@ -2518,6 +2596,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_holder_is_gone_once_closed_or_no_longer_listed() {
+        let open = json!({"name": "shop.w1", "bot_id": 7, "status": "idle"});
+        let closed = json!({"name": "shop.w1", "bot_id": 7, "closed_ms": 1});
+        assert!(!gone_from(std::slice::from_ref(&open), "shop.w1", Some(7)));
+        assert!(gone_from(&[closed], "shop.w1", Some(7)));
+        assert!(gone_from(&[], "shop.w1", Some(7)));
+        // Another agent given its name since is not the holder.
+        assert!(gone_from(std::slice::from_ref(&open), "shop.w1", Some(8)));
+        assert!(!gone_from(&[open], "shop.w1", None));
+    }
+
+    #[test]
+    fn a_task_on_a_board_is_told_how_to_take_its_items() {
+        let line = board_line("shop/errors");
+        assert!(line.contains(r#"board with open "shop/errors""#));
+        assert!(line.contains("act claim"));
+    }
+
+    #[test]
     fn a_tighter_row_gates_the_task_as_sonny_gates_the_row() {
         use agent_client::config::WebSearch;
         let row = crate::approvals::find("ask").unwrap();
@@ -3089,7 +3186,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_s_profile_is_noted_beside_the_store_it_was_started_on() {
+    fn a_task_is_started_on_the_store_its_window_names() {
         let dir = std::env::temp_dir().join(format!("sonny-task-store-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
@@ -3108,6 +3205,7 @@ mod tests {
             env: vec![("AGENT_STORE".into(), store.to_string_lossy().into_owned())],
             made_by: None,
             providers: Value::Null,
+            board: None,
         };
         // The store a window's `--store` names, not the one Sonny's own
         // environment would find.
@@ -3115,16 +3213,6 @@ mod tests {
             started_on(&start),
             Some(agent_client::socket::canonical_store(&store).unwrap())
         );
-        // One made later under the same name in its project's role keeps
-        // nothing of the note the one before it had.
-        note_profile(&store, "shop.fix", "reviewer").unwrap();
-        assert_eq!(
-            noted_profile(&store, "shop.fix").as_deref(),
-            Some("reviewer")
-        );
-        forget_profile(&store, "shop.fix");
-        assert_eq!(noted_profile(&store, "shop.fix"), None);
-        forget_profile(&store, "shop.fix");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

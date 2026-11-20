@@ -1301,7 +1301,7 @@ has something on it, or is off the screen, no time shows.
   the memory cleanup's, show in every window. The footer's red `✗`
   counts them with the failed agents until you look here, and
   `/status` says how many under its heading, a click there opening
-  `/background`. An agent sees the same in its `automations` tool, whose rows
+  `/background`. An agent sees the same in its `automations` tool, whose lines
   say how the turn their last run sent ended. Automations and follows are
   what the agents' `automations` and `follows` tools make.
 

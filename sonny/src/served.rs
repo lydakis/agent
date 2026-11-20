@@ -53,6 +53,41 @@ pub const GATED: [&str; 8] = [
 /// daemon's bound on an answer.
 pub(crate) const OUTPUT_BYTES: usize = 60 * 1024;
 
+/// What the tools that list (follows, automations, memory, the commons)
+/// say of a call with nothing, in the same words in each: one rule.
+const LISTS: &str = "Nothing lists them, a line each; read NAME shows one.";
+
+/// The most of one page of a list a tool's answer holds.
+pub(crate) const PAGE_BYTES: usize = 40 * 1024;
+
+/// A page of a list, as every tool that lists answers one: its `items`
+/// from the `from`th, as many as `bytes` holds and at least one, under
+/// `key`, with `next` where the rest start and `of` how many there are
+/// while any are left.
+pub(crate) fn paged(answer: &mut Value, key: &str, items: Vec<Value>, from: usize, bytes: usize) {
+    let of = items.len();
+    let (mut shown, mut size) = (Vec::new(), 0);
+    for item in items.into_iter().skip(from) {
+        size += item.to_string().len() + 1;
+        if !shown.is_empty() && size > bytes {
+            break;
+        }
+        shown.push(item);
+    }
+    let next = from + shown.len();
+    answer[key] = Value::Array(shown);
+    if next < of {
+        answer["next"] = json!(next);
+        answer["of"] = json!(of);
+    }
+}
+
+/// The `from` a tool that pages takes: where its page starts, in the
+/// same words in each.
+fn from_arg() -> Value {
+    json!({"type": "integer", "minimum": 0, "description": "An answer's next."})
+}
+
 /// How often waiting calls are listed with no call started to say so: a
 /// start missed while the daemon restarted is answered by then.
 const SWEEP: Duration = Duration::from_secs(30);
@@ -140,23 +175,19 @@ pub fn tools(role: Role) -> Vec<Value> {
 fn start() -> Value {
     json!({
         "name": START,
-        "description": "Start a new task. A lead starts tasks for the person's work; any other agent starts one \
-            only for help inside its own brief, such as a review, research or a watch on something, and asks its \
-            lead for a task for separate work. Unless this project's tasks all work in one folder, Sonny makes the \
-            task a git worktree of its lead's repository on the branch agent/NAME, from the last commit (a task's \
-            own helper, from the last commit on that task's branch), so uncommitted changes are not in it; outside git, the task works in this folder itself, shared with you and \
-            its other tasks. With own_folder, it gets an empty folder of its own instead, where it makes what it \
-            changes, such as a checkout made with this folder's tooling, as the brief says how, and reads this \
-            folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
-            memory, as the profile named, and the brief as its first message. Paths in this folder that the brief \
-            names are turned into the task's own. The result is the task's turn handle; its work comes back on \
-            its branch, here already as it commits.",
+        "description": "Start a new task. A lead starts tasks for the person's work; another agent only for \
+            help inside its own brief (a review, research, a watch), asking its lead for separate work. Unless \
+            this project's tasks share one folder, the task gets a git worktree of its lead's repository on \
+            branch agent/NAME from the last commit (a task's helper: from its task's branch), so uncommitted \
+            changes are not in it; outside git, it shares this folder. It starts with this folder's rules, skills \
+            and memory, as the profile named, the brief its first message, paths in this folder it names turned \
+            into its own. The result is its turn handle; its work comes back on its branch as it commits.",
         "parameters": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "minLength": 1, "maxLength": 100,
-                    "description": "A short name for the task, valid as a git branch name, that no agent of \
-                        this project has yet; Sonny puts your project's name and a dot before it."},
+                    "description": "A short name, valid as a git branch, that no agent of this project has \
+                        yet; Sonny puts your project's name and a dot before it."},
                 "brief": {"type": "string", "minLength": 1,
                     "description": "Everything the task needs, since it never sees your conversation. \
                         Its first line is the title the person knows the task by, so write it as one: \
@@ -165,29 +196,29 @@ fn start() -> Value {
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
                 "permissions": {"type": "string", "minLength": 1,
-                    "description": "One of the person's /permissions modes to hold the task tighter \
-                        than you, such as one that refuses what would need approval; one looser \
-                        than yours is refused. Without one, it works as you do."},
+                    "description": "One of the person's /permissions modes holding the task tighter than \
+                        you; a looser one is refused. Without one, it works as you do."},
                 "folder": {"type": "string", "minLength": 1,
-                    "description": "A folder inside this one to start the task at instead of here, \
-                        relative or absolute, in a git repository, such as one this folder holds: the task \
-                        then gets a worktree of that repository and works at that folder in it."},
+                    "description": "A folder inside this one, in a git repository, to start at instead: \
+                        the task gets a worktree of that repository and works there."},
                 "own_folder": {"type": "boolean",
-                    "description": "An empty folder of the task's own instead of a worktree or this folder: \
-                        for work that makes its own copy of what it changes, such as a checkout of another \
-                        branch made with this folder's tooling, or that must not touch this folder."},
+                    "description": "An empty folder of its own instead, for work that makes its own copy \
+                        of what it changes as the brief says, or must not touch this folder; it reads this one in place."},
                 "setup": {"type": "boolean",
-                    "description": "Run the folder's .agents/setup in the copy first: true for a task \
-                        that will change files, false for one that only reads."},
+                    "description": "Run this folder's .agents/setup in its folder first: true for a task \
+                        that will change files."},
                 "model": {"type": "string", "minLength": 1,
                     "description": format!("PROVIDER/MODEL, when the work suits another model than yours; \
                         without one, the project's task_model, else yours.{}", noted_models())},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
+                "agents": {"type": ["integer", "array"], "minimum": 1, "items": {"type": "string"},
+                    "description": "For several agents: a count, or a profile each. They are NAME.1 on."},
+                "board": {"type": "string", "minLength": 1,
+                    "description": "A board of this project whose items its agents take."},
                 "reason": {"type": "string", "minLength": 1,
-                    "description": "Why this is work none of your tasks still there should take, when you \
-                        have any: a task given more work keeps what it learned. Without it, a start while \
-                        you have tasks is refused with the list of them."}
+                    "description": "Why none of your tasks still there should take this work, since a task \
+                        given more keeps what it learned; without it, a start while you have tasks is refused, listing them."}
             },
             "required": ["name", "brief"],
             "additionalProperties": false
@@ -196,6 +227,28 @@ fn start() -> Value {
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
     })
+}
+
+/// The profiles a start's agents are made as, one an agent: `agents` as
+/// a count of agents made as `profile`, or a list of profiles.
+fn agents_of(agents: &Value, profile: Option<String>) -> Result<Vec<Option<String>>, String> {
+    let refused = || "agents is a count of 1 or more, or a list of profiles".to_owned();
+    match agents {
+        Value::Null => Ok(vec![profile]),
+        Value::Number(count) => match count.as_u64() {
+            Some(count) if count >= 1 => Ok(vec![profile; count as usize]),
+            _ => Err(refused()),
+        },
+        Value::Array(list) if !list.is_empty() => (list.iter())
+            .map(|p| {
+                (p.as_str().map(str::trim))
+                    .filter(|p| !p.is_empty())
+                    .map(|p| Some(p.to_owned()))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(refused),
+        _ => Err(refused()),
+    }
 }
 
 /// The most of the person's model notes the start tool carries.
@@ -228,13 +281,12 @@ fn remove() -> Value {
     json!({
         "name": REMOVE,
         "description": "Clean up a task once the person says it is done: mark it done, as mark_done does, \
-            and remove the folder Sonny made it; for a task no longer there, the folder it left, which a start lists. \
-            Its agent and history stay, and a message to it reopens it, without that folder. A worktree is removed, \
-            and its branch kept while it has commits not merged here; a folder of its own is deleted with all it \
-            holds, only with discard, since Sonny cannot check what the task made there: ask the task first whether \
-            its work is pushed. It refuses, before changing anything, while the task is working or its worktree has \
-            uncommitted changes, and says what. With discard, that work is dropped: only when the person says to \
-            drop it.",
+            and remove the folder Sonny made it, or for a task no longer there the folder it left, which a start \
+            lists. Its agent and history stay; a message to it reopens it without that folder. A worktree is \
+            removed, its branch kept while it has commits not merged here; a folder of its own is deleted with all \
+            it holds only with discard, since Sonny cannot check what the task made there: ask the task first \
+            whether its work is pushed. It refuses, changing nothing, while the task works or its worktree has \
+            uncommitted changes, and says what. Discard drops that work: only when the person says so.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -289,19 +341,17 @@ fn project() -> Value {
 fn follows() -> Value {
     json!({
         "name": FOLLOWS,
-        "description": "Your follows in the person's lookout, which tells you what happens in what you \
-            follow, in a message sent by lookout that joins your running turn or starts one: each event a \
-            line [source · topic · from · time], then its text. A follow watches the tasks of an agent (every agent it or \
-            its tasks made) or agents by name, through the tasks source, each agent its topic: messages others \
-            write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
-            notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside, each \
-            by name, or one topic of a source as NAME:TOPIC, and Sonny's own: the commons, each thread a topic \
-            (posting in a thread follows it as commons.THREAD, removing that leaves it), memory, each fact \
-            saved or removed, and links, each linked machine that comes or goes. \
-            Add steer yourself for what you own; a filter or a digest only when the person asks: \
-            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name, \
-            as {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
-            it lists them all, the sources there are and their events' recent fields.",
+        "description": format!("Your follows in the person's lookout, which tells you what happens in them in a \
+            message joining your turn or starting one: each event a line \
+            [source · topic · from · time], then its text. A follow watches an agent's tasks (every agent it or \
+            its tasks made) or agents by name, each its topic: messages others write in them, questions to the \
+            person, calls awaiting their approval, margin notes, each turn's end with its reply. It also hears \
+            sources by name, or NAME:TOPIC, the person's and Sonny's own: the commons, each thread a topic \
+            (posting in one follows it as commons.THREAD), memory, each fact saved or removed, and links, each \
+            linked machine coming or going. Add steer for what you own; a filter or a digest only when the \
+            person asks: what a filter leaves out you never hear, a digest makes you late. Add or remove one by \
+            name, as {{\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}}. \
+            {LISTS} It names the sources too; source NAME or NAME:TOPIC shows one."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -317,23 +367,18 @@ fn follows() -> Value {
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
-                            "description": "Only the events this matches are heard, its sources' and its agents' \
-                                alike. A task's event has type (wrote, turn.ended, question, approval, \
-                                margin), bot, maker, from, turn, text, status (completed, failed, \
-                                stopped, interrupted), done, asked_by (you, the person, an agent's name, \
-                                automation), options, command, call, id and removed (a margin note's). \
-                                An event pattern as \
-                                AWS EventBridge writes one. Each field maps to a list of values, \
-                                any of which will do, or to a pattern for an object field; every field \
-                                must match, and a field that is a list matches when any item does. A value is a \
-                                string, number, boolean or null, or one of EventBridge's matchers: prefix, \
-                                suffix, wildcard, equals-ignore-case, anything-but, numeric or exists; \
-                                $or takes any of several patterns. \
-                                As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
+                            "description": "Only events this matches are heard, from sources and agents alike. \
+                                A task's event has type (wrote, turn.ended, question, approval, margin), bot, \
+                                maker, from, turn, text, status (completed, failed, stopped, interrupted), done, \
+                                asked_by (you, the person, an agent, automation), options, command, call, id and \
+                                removed. An AWS EventBridge event pattern: each field a list of values, any \
+                                matching, or a pattern for an object field; all must match, a list field when \
+                                any item does. Values are literals or the matchers prefix, suffix, \
+                                wildcard, equals-ignore-case, anything-but, numeric, exists; $or takes several. As {\"paths\": [{\"prefix\": \"src/\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
-                            "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
-                                its sources' own digest. What steers never waits: the person's words in a task, a question \
-                                to them, an approval only they can give, and what steer matches."},
+                            "description": "Tell what it hears at most once this long, as 15m, over its sources' \
+                                digest. What steers never waits: the person's words, questions and approvals for \
+                                them, and what steer matches."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, goes at once, \
                                 past any digest, as the person's words do. As \
@@ -344,9 +389,11 @@ fn follows() -> Value {
                     "required": ["name"],
                     "additionalProperties": false
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "remove": {"type": "string", "minLength": 1},
                 "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."},
-                "read": {"type": "boolean", "description": "What add hears now; adds nothing."}
+                "read": {"type": "string"},
+                "source": {"type": "string"},
+                "from": from_arg()
             },
             "additionalProperties": false
         },
@@ -361,14 +408,12 @@ fn automations() -> Value {
         // part of an add, a removal or a run, under the tool it amounts
         // to, and none for a look.
         "steps": true,
-        "description": "Your automations, which wake an agent later, repeatedly, or when something \
-            happens, even with Sonny closed. Each run gives the agent the message in its own conversation, \
-            after a line saying when and why it ran; a run waits for the agent's work, one run of an automation \
-            at a time. Add one, or remove, run or show one by name; with none, the result lists yours (those \
-            that wake you, answer to you or start an agent you added) with any problems. Adding the same one \
-            again changes nothing; a different one under a name in use is refused with the field that differs \
-            unless replace is set. Write the message as what to check and when to stop, and to remove its \
-            automation once the work is done.",
+        "description": format!("Your automations, which wake an agent later, repeatedly, or when something \
+            happens, even with Sonny closed. Each run gives the agent the message in its own conversation after \
+            a line saying when and why, one run at a time. Add one, or remove or run one by name. {LISTS} It \
+            holds yours. The same one again changes nothing; a different one under a name in use is refused \
+            with the field that differs unless replace is set. Write the message as what to check, when to \
+            stop, and to remove its automation once done."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -399,25 +444,22 @@ fn automations() -> Value {
                             },
                             "required": ["name", "model"],
                             "additionalProperties": false,
-                            "description": "An agent the first run starts, in your folder as a task is started, \
-                                and later runs message."
+                            "description": "An agent the first run starts in your folder as a task, which later \
+                                runs message."
                         },
                         "reply_to": {"type": "string", "minLength": 1,
                             "description": "Who gets the turn's answer when it ends."},
                         "if": {"type": "string", "minLength": 1,
-                            "description": "A shell command run in your folder first; it runs only when that \
-                                exits 0, so a check that finds nothing costs no turn."},
+                            "description": "A shell command run in your folder first; it runs only if that exits \
+                                0, so a check finding nothing costs no turn."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
                         "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
-                            "description": "A cap on the tokens of each turn a run starts, counting every request's \
-                                input with the agent's history, so a cap below that history ends every run on \
-                                its first reply. Set one only when the person asks for a spending limit."},
+                            "description": "Caps each run's turn tokens, every request's input and history counted, \
+                                so one below the history ends each run at its first reply. Only when the person asks."},
                         "shadow": {"type": "boolean",
-                            "description": "A dry run, as when moving a job from elsewhere onto an automation: \
-                                each run goes to a read-only copy of the agent, where anything past \
-                                reading is refused rather than asked about, and its answer comes to you \
-                                (or reply_to) as a report of what it would have done. Replace it without \
+                            "description": "A dry run: each run goes to a read-only copy of the agent, its answer \
+                                a report to you (or reply_to) of what it would have done. Replace it without \
                                 shadow once the reports match the job."},
                         "live": {"type": "boolean",
                             "description": "The message is a template like a live memory fact's, filled as each run starts."},
@@ -429,10 +471,11 @@ fn automations() -> Value {
                     "additionalProperties": false,
                     "description": "With none of every, in, at, cron, file and commit, only run runs it."
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "remove": {"type": "string", "minLength": 1},
                 "run": {"type": "string", "minLength": 1,
                     "description": "The name of one to run now; the result says what the run did."},
-                "show": {"type": "string", "minLength": 1, "description": "The name of one to show."}
+                "read": {"type": "string"},
+                "from": from_arg()
             },
             "additionalProperties": false
         },
@@ -461,27 +504,27 @@ fn memory() -> Value {
                 "text": {"type": "string", "minLength": 1,
                     "description": "The fact, then Why: and, where it helps, How to apply:."},
                 "external": {"type": "boolean",
-                    "description": "True keeps the mark of a fact read from outside content, when merging or rewriting one whose index line says external. A save in a turn that read a web page, a search or an MCP server is marked without it."},
+                    "description": "True keeps the external mark when merging or rewriting a fact whose index line has it; a save in a turn that read a web page, a search or an MCP server is marked anyway."},
                 "confirmed": {"type": "integer", "minimum": 0,
-                    "description": "How many times the person confirmed what a feedback fact says; left out, the fact keeps the count it had."},
+                    "description": "Times the person confirmed a feedback fact; left out, it keeps its count."},
                 "pushed_back": {"type": "integer", "minimum": 0,
-                    "description": "How many times the person pushed back on it; left out, the fact keeps the count it had."},
+                    "description": "Times the person pushed back on it; left out, it keeps its count."},
                 "live": {"type": "boolean"}
             },
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
         },
         "read": {"type": "string", "minLength": 1,
-            "description": "The name of a fact to open: its whole file. The read is recorded, so the nightly cleanup can check facts no agent has read in 30 days."},
+            "description": "A fact's name: its whole file. Reads are recorded, so the nightly cleanup can check facts unread in 30 days."},
         "search": {"type": "string", "minLength": 1,
-            "description": "Words to find in facts, case aside: those holding every word, best first, with their index line and the lines that hold them. Searches the person's facts and this project's, or the scope given."},
+            "description": "Words, case aside: facts holding every word, best first, with their index line and the lines holding them, in the person's and this project's facts or the scope given."},
         "remove": {"type": "string", "minLength": 1, "description": "The name of a fact to remove."},
         "index": {"type": "boolean", "description": "Rewrite the index from the facts."},
         "check": {"type": "boolean",
             "description": "Report files that are not valid facts and an index out of date."},
         "changed": {"type": "boolean", "description": "For the nightly cleanup only."},
         "said": {"type": "boolean",
-            "description": "For the nightly cleanup only: what the person wrote to any agent since since_ms, else over the last day."},
+            "description": "For the nightly cleanup only: what the person wrote to any agent since since_ms, else in the last day."},
         "since_ms": {"type": "integer", "description": "With said: unix milliseconds."},
         "cleanup": {"type": "string", "enum": ["start", "finish"], "description": "For the nightly cleanup only."}
     });
@@ -490,12 +533,11 @@ fn memory() -> Value {
     }
     json!({
         "name": MEMORY,
-        "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
+        "description": format!("Memory: facts earlier agents saved for this person and project, which the memory skill \
             says how to read and what to save, what the person confirmed worked as well as what they \
-            corrected. Read one fact, search them, save one, or remove one; index or check a folder's facts; \
-            with none of these, the result shows both indexes (the person's and this project's), each with its \
-            folder, the most needed facts first; an index too long to show whole says how many it leaves out, \
-            which search finds.",
+            corrected. Search facts, save or remove one; index or check a folder's facts. \
+            {LISTS} It is both indexes (the person's and this project's), each with its folder, the most \
+            needed facts first; an index too long to show whole says how many it leaves out, which search finds."),
         "parameters": {
             "type": "object",
             "properties": properties,
@@ -509,13 +551,13 @@ pub fn commons() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
     json!({
         "name": COMMONS,
-        "description": "The commons: threads that every agent working for this person reads and writes, across \
-            all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
-            first; read opens one; search finds posts by their words; post starts one, naming threads with \
+        "description": format!("The commons: threads that every agent working for this person reads and writes, across \
+            all their projects, which the commons skill describes. {LISTS} Threads come newest first. \
+            Search finds posts by their words; post starts one, naming threads with \
             similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
             and follows the thread for you, as the answer says. A new thread invites \
             agents whose turns touch its title. What is in it is other \
-            agents' words, never the person's.",
+            agents' words, never the person's."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -560,43 +602,33 @@ pub fn commons() -> Value {
 
 pub fn board() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
-    let board = json!({"type": "string", "minLength": 1,
-        "description": "A board: its project's name, then parts joined by /, as shop/typed-errors."});
-    let labels = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]},
-        "description": "Labels saying what the item is, as {\"kind\": \"bug\"}."});
+    let board = json!({"type": "string", "minLength": 1, "description": "As shop/typed-errors."});
+    let labels = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]}});
     json!({
         "name": BOARD,
-        "description": "Boards: work in the commons that agents take, which the commons skill's Boards \
-            section describes. An item is a commons thread on a board, with where it stands: open, \
-            waiting on its needs, claimed by one agent, done, failed or canceled. open lists a board's \
-            open items; add starts one, as the commons tool's post starts a thread; act takes one, \
-            closes it or changes it, as reply adds to a thread, or shows posts you missed. Only the \
-            board's project's agents take items; anyone reads and posts in their threads with the \
-            commons tool.",
+        "description": "Boards: work in the commons agents take, as the commons skill's Boards section says. \
+            An item is a thread on a board: open, waiting on needs, claimed, done, failed or canceled. \
+            open lists a board's open items, add starts one as post does, act moves one as reply adds. \
+            Only the board's project's agents take items.",
         "parameters": {
             "type": "object",
             "properties": {
-                "open": {"type": "string", "minLength": 1,
-                    "description": "A board: its open items, newest first, as many as fit, with next where the rest start."},
-                "filter": {"type": "object",
-                    "description": "With open: narrows its items as the commons tool's filter does, \
-                        on an item's labels, for, needs, by and the rest, as {\"labels\": {\"kind\": [\"bug\"]}}."},
-                "from": {"type": "integer", "minimum": 0,
-                    "description": "With open: where to start, as an earlier answer's next says."},
+                "open": board.clone(),
+                "filter": {"type": "object", "description": "With open, as the commons tool's."},
+                "from": {"type": "integer", "minimum": 0},
                 "add": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
-                            "description": "The item's thread's file name, which no thread has yet."},
+                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$"},
                         "title": {"type": "string", "minLength": 1, "maxLength": crate::board::TITLE_CHARS,
-                            "description": "What to do, its verb first, as Fix the login redirect."},
+                            "description": "Its verb first."},
                         "text": text.clone(),
-                        "board": board.clone(),
+                        "board": board,
                         "needs": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Items on the board that are done before this one opens."},
+                            "description": "Items done before it opens."},
                         "labels": labels.clone(),
                         "for": {"type": "string", "minLength": 1,
-                            "description": "The agent, or the profile, that alone may take it."}
+                            "description": "The agent or profile that alone takes it."}
                     },
                     "required": ["name", "title", "text", "board"],
                     "additionalProperties": false
@@ -605,16 +637,11 @@ pub fn board() -> Value {
                     "type": "object",
                     "properties": {
                         "thread": {"type": "string", "minLength": 1},
-                        "do": {"type": "string", "enum": &crate::board::ACTIONS[1..],
-                            "description": "claim takes an open item, or one whose holder was closed; \
-                                done, fail or release closes or gives back the one you hold; cancel one you \
-                                added that nobody holds; reopen a failed one; label or assign changes one; \
-                                item puts a thread already there on a board."},
+                        "do": {"type": "string", "enum": &crate::board::ACTIONS[1..]},
                         "text": text,
-                        "board": {"type": "string", "minLength": 1, "description": "With item: the board."},
+                        "board": {"type": "string", "minLength": 1},
                         "labels": labels,
-                        "for": {"type": "string",
-                            "description": "With assign: the agent or profile that alone may take it; empty for anyone."}
+                        "for": {"type": "string"}
                     },
                     "required": ["thread", "do", "text"],
                     "additionalProperties": false
@@ -760,25 +787,74 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 },
                 false => Value::Null,
             };
-            let start = crate::task::Start {
-                name: text("name").unwrap_or_default(),
-                brief: text("brief").unwrap_or_default(),
-                profile: text("profile"),
-                permissions: text("permissions"),
-                setup: arguments["setup"] == true,
-                model: text("model"),
-                effort: text("effort"),
-                own_folder: arguments["own_folder"] == true,
-                here: false,
-                folder: text("folder"),
-                // A task's own helper builds on its work.
-                builds_on: (!line.lead).then(|| caller.clone()),
-                env: Vec::new(),
-                made_by: None,
-                providers,
-            };
-            let started = crate::task::start(&line.folder, &line.project, &caller, &start)
-                .map_err(|e| ("task_not_started", e))?;
+            // The agents it starts with, each made as its profile: one, as
+            // profile names, unless agents says more.
+            let profiles = agents_of(&arguments["agents"], text("profile"))
+                .map_err(|e| ("invalid_arguments", e))?;
+            // A board its agents take items from: their own project's.
+            let board = text("board");
+            if let Some(board) = &board {
+                crate::board::valid_board(board).map_err(|e| ("invalid_arguments", e))?;
+                if crate::board::project_of(board) != line.project {
+                    return Err((
+                        "invalid_arguments",
+                        format!(
+                            "{board} is not a board of {}: a task works from its own project's, \
+                             whose items its agents take",
+                            line.project
+                        ),
+                    ));
+                }
+            }
+            let short = text("name").unwrap_or_default();
+            // A last part all digits names one of a task's several agents.
+            if (short.rsplit('.').next())
+                .is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
+            {
+                return Err((
+                    "task_not_started",
+                    format!(
+                        "{short:?} ends in a number, as one of a task's several agents is \
+                         named; give the task another name"
+                    ),
+                ));
+            }
+            let several = profiles.len() > 1;
+            let mut said: Vec<String> = Vec::new();
+            for (n, profile) in profiles.into_iter().enumerate() {
+                let start = crate::task::Start {
+                    // Several are the task's name and their number from 1.
+                    name: match several {
+                        true => format!("{short}.{}", n + 1),
+                        false => short.clone(),
+                    },
+                    brief: text("brief").unwrap_or_default(),
+                    profile,
+                    permissions: text("permissions"),
+                    setup: arguments["setup"] == true,
+                    model: text("model"),
+                    effort: text("effort"),
+                    own_folder: arguments["own_folder"] == true,
+                    here: false,
+                    folder: text("folder"),
+                    // A task's own helper builds on its work.
+                    builds_on: (!line.lead).then(|| caller.clone()),
+                    env: Vec::new(),
+                    made_by: None,
+                    providers: providers.clone(),
+                    board: board.clone(),
+                };
+                match crate::task::start(&line.folder, &line.project, &caller, &start) {
+                    Ok(started) => said.push(started),
+                    Err(e) if said.is_empty() => return Err(("task_not_started", e)),
+                    // Those started work on; the rest is said, not undone.
+                    Err(e) => {
+                        said.push(format!("{} did not start: {e}", start.name));
+                        break;
+                    }
+                }
+            }
+            let started = said.join("\n\n");
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
@@ -842,45 +918,57 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
-            if arguments["read"] == true {
-                let (Some(add), None) = (arguments.get("add"), arguments.get("remove")) else {
-                    return Err(("follow_refused", "read reads an add alone".into()));
-                };
-                return crate::lookout::subs::read_now(
-                    &store,
-                    &caller,
-                    add,
-                    &crate::lookout::sources::names(),
-                )
-                .map(|read| read.to_string())
-                .map_err(|e| ("follow_refused", e));
+            let sources = crate::lookout::sources::names();
+            let alone = |key: &str| {
+                let others = ["add", "remove", "test", "read", "source"]
+                    .iter()
+                    .any(|other| {
+                        *other != key && arguments.get(*other).is_some_and(|v| !v.is_null())
+                    });
+                match others {
+                    true => Err(("follow_refused", format!("{key} takes a name alone"))),
+                    false => Ok(()),
+                }
+            };
+            if let Some(name) = arguments.get("read").filter(|read| !read.is_null()) {
+                alone("read")?;
+                let name = (name.as_str())
+                    .ok_or(("follow_refused", "read takes a follow's name".to_owned()))?;
+                return crate::lookout::subs::read_one(&store, &caller, caller_id, name, &sources)
+                    .map(|read| read.to_string())
+                    .map_err(|e| ("follow_refused", e));
+            }
+            if let Some(name) = arguments.get("source").filter(|source| !source.is_null()) {
+                alone("source")?;
+                let name = (name.as_str())
+                    .ok_or(("follow_refused", "source takes a source's name".to_owned()))?;
+                return crate::lookout::subs::source(&store, &caller, caller_id, name, &sources)
+                    .map(|mut read| {
+                        crate::lookout::sources::say_wants(&mut read);
+                        read.to_string()
+                    })
+                    .map_err(|e| ("follow_refused", e));
             }
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {
                     return Err(("follow_refused", "test tries an add".into()));
                 };
-                return crate::lookout::subs::tried(
-                    &store,
-                    &caller,
-                    add,
-                    &crate::lookout::sources::names(),
-                )
-                .map(|tried| tried.to_string())
-                .map_err(|e| ("follow_refused", e));
+                return crate::lookout::subs::tried(&store, &caller, add, &sources)
+                    .map(|tried| tried.to_string())
+                    .map_err(|e| ("follow_refused", e));
             }
-            crate::lookout::subs::change(
-                &store,
-                &caller,
-                caller_id,
-                arguments.get("add"),
-                arguments["remove"].as_str(),
-                &crate::lookout::sources::names(),
-            )
-            .map(|mut listed| {
-                crate::lookout::sources::say_wants(&mut listed);
-                listed.to_string()
-            })
-            .map_err(|e| ("follow_refused", e))
+            let (add, remove) = (arguments.get("add"), arguments["remove"].as_str());
+            let said = match add.is_some() || remove.is_some() {
+                true => {
+                    crate::lookout::subs::change(&store, &caller, caller_id, add, remove, &sources)
+                }
+                false => {
+                    let from = arguments["from"].as_u64().unwrap_or(0) as usize;
+                    crate::lookout::subs::listing(&store, &caller, caller_id, &sources, from)
+                }
+            };
+            said.map(|said| said.to_string())
+                .map_err(|e| ("follow_refused", e))
         }
         name if name == crate::resolved::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
@@ -1031,9 +1119,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // named in, as its posts say, and the profile it was made as.
             let project = writes.then(|| Line::of(&caller, &here).project);
             let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
-            let profile = (store.as_deref())
-                .filter(|_| arguments["act"]["do"] == "claim")
-                .and_then(|store| crate::task::noted_profile(store, &caller));
+            let profile = (arguments["act"]["do"] == "claim")
+                .then(|| crate::task::profile(&caller, caller_id))
+                .flatten();
             let board_caller = crate::board::Caller {
                 name: &caller,
                 id: caller_id,
@@ -1110,6 +1198,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 store: client.as_ref().and_then(|c| c.store()).map(str::to_owned),
             };
             // A trigger's add runs on a runtime of its own.
+            let from = arguments["from"].as_u64().unwrap_or(0) as usize;
             let arguments = arguments.clone();
             let mut said =
                 tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
@@ -1149,6 +1238,11 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     crate::trigger::forget_done(&places, store, &ended);
                 }
                 client.close().await;
+            }
+            // A listing shows each one's line, as many as fit now that
+            // they say how their turns ended; read shows one whole.
+            if said["automations"].is_array() {
+                crate::trigger::indexed(&mut said, from);
             }
             Ok(said.to_string())
         }
@@ -3987,6 +4081,21 @@ mod tests {
         ];
         for item in &own {
             assert!(!outside(item), "{item}");
+        }
+    }
+
+    #[test]
+    fn a_start_makes_one_agent_or_as_many_as_agents_says() {
+        let worker = Some("worker".to_owned());
+        assert_eq!(
+            agents_of(&Value::Null, worker.clone()).unwrap(),
+            std::slice::from_ref(&worker)
+        );
+        assert_eq!(agents_of(&json!(3), None).unwrap(), [None, None, None]);
+        let named = agents_of(&json!(["worker", "reviewer"]), None).unwrap();
+        assert_eq!(named, [worker, Some("reviewer".to_owned())]);
+        for bad in [json!(0), json!([]), json!([""]), json!("two")] {
+            assert!(agents_of(&bad, None).is_err(), "{bad}");
         }
     }
 
