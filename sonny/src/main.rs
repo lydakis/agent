@@ -1567,8 +1567,7 @@ async fn read_status(
 ) -> Result<StatusRead, String> {
     let listed = standing::list(client, &scope.glob)
         .await
-        .map_err(|_| "could not list the agents".to_owned())?
-        .0;
+        .map_err(|_| "could not list the agents".to_owned())?;
     read_status_of(
         client,
         options_store,
@@ -2066,7 +2065,7 @@ async fn fill_status(
     let listing = async {
         match listed {
             Some(listed) => Some(listed),
-            None => (standing::list(client, &scope.glob).await.ok()).map(|listed| listed.0),
+            None => standing::list(client, &scope.glob).await.ok(),
         }
     };
     let (alerts, listed) = tokio::join!(read_alerts(client, logs, temp_due), listing);
@@ -2168,7 +2167,7 @@ async fn fill_status(
         }
         drop(agents);
         if screen.is_none() {
-            let Ok((again, _)) = standing::list(client, &scope.glob).await else {
+            let Ok(again) = standing::list(client, &scope.glob).await else {
                 return (alerts, None);
             };
             listed = again;
@@ -25737,6 +25736,16 @@ mod tests {
     }
 
     /// Sonny on bot `b`, on `client`.
+    /// The window's first snapshot in, once its follow hears that it is
+    /// live, as the daemon tells it.
+    async fn snapshot_in(app: &mut App) {
+        let follower = app.follower.as_mut().unwrap();
+        follower.heard(&json!({"event": "follow_live", "bot": follower.pattern}));
+        while !follower.snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn app(client: Arc<Client>) -> App {
         let options = Options {
             store: PathBuf::new(),
@@ -27371,9 +27380,7 @@ mod tests {
         app.bot = "titled.lead".into();
         app.options.store = store.clone();
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         app.counted_at = None;
         app.count_agents().await;
         if let Some(job) = &app.counting {
@@ -27434,9 +27441,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         app.options.store = dir.join("state.sqlite");
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         app.counted_at = None;
         app.count_agents().await;
         while !app.counting.as_ref().unwrap().is_finished() {
@@ -27501,9 +27506,7 @@ mod tests {
         app.bot = "shop.fix".into();
         app.options.store = store;
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         app.count_agents().await;
         while !app.counting.as_ref().unwrap().is_finished() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -27586,9 +27589,7 @@ mod tests {
         };
         // The follow starts, and its snapshot is what the footer counts.
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         counted(&mut app).await;
         let counts = |needs_you, working, idle| status::Counts {
             needs_you,
@@ -27697,9 +27698,7 @@ mod tests {
             app.count_agents().await;
         };
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         counted(&mut app).await;
         let names = |app: &App| -> Vec<String> {
             (app.listed.iter().flatten())
@@ -27777,9 +27776,7 @@ mod tests {
             app.count_agents().await;
         };
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         counted(&mut app).await;
         let needs = |app: &App| app.counts.as_ref().map(|counts| counts.needs_you);
         assert_eq!(needs(&app), Some(0));
@@ -27820,9 +27817,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         app.options.store = dir.join("state.sqlite");
         app.count_agents().await;
-        while !app.follower.as_ref().unwrap().snapshot_waits() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        snapshot_in(&mut app).await;
         app.count_agents().await;
         let _ = app.counting.take().unwrap().await;
         let first = asked.load(std::sync::atomic::Ordering::SeqCst);

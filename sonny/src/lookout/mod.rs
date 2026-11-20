@@ -1474,6 +1474,11 @@ impl Service {
         let (Some(bot), Some(turn)) = (event["bot"].as_str(), number(event)) else {
             return Vec::new();
         };
+        // A workflow's worker tells no one how its turn went: its run tells
+        // its caller once, at its end, a failed worker among its counts.
+        if crate::workflow::is_worker(bot) {
+            return Vec::new();
+        }
         let data = &event["data"];
         match event["event"].as_str() {
             // A steer's event comes on the turn it joins: its message
@@ -3953,6 +3958,25 @@ mod tests {
             let told = service.bounced(&finished, true);
             assert_eq!(told.len(), usize::from(bounces));
         }
+    }
+
+    #[tokio::test]
+    async fn a_workflow_workers_failed_turn_reaches_its_caller_only_through_the_run() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        // The run's host submits each worker's prompt from its caller.
+        let from = json!({"from": {"bot": "calc.lead", "turn": 7, "bot_id": 1}});
+        let failed = json!({"status": "failed", "error": "provider_http_400"});
+        let worker = "calc.wf-18097bfc-8dc30c0d0fb6";
+        let queued = ev(worker, 8, "queued", from.clone());
+        service.bounced(&queued, true);
+        service.track(&queued, false, Some(40));
+        let told = service.bounced(&ev(worker, 8, "turn_finished", failed.clone()), true);
+        assert!(told.is_empty());
+        assert!(service.senders.is_empty() && service.in_flight.is_empty());
+        // Any other agent's message still goes back to its sender.
+        service.bounced(&ev("calc.fix", 4, "accepted", from), true);
+        let told = service.bounced(&ev("calc.fix", 4, "turn_finished", failed), true);
+        assert_eq!(told.len(), 1);
     }
 
     #[tokio::test]
