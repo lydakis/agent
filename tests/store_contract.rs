@@ -18649,8 +18649,15 @@ fn calls_are_timed_by_the_model_that_answered_and_the_daemon_by_turn() {
 
 /// A store at `path` with Bob's turn, timed when `model_ms` is not 0, that
 /// ran a command and a read together, started 1 and 0.5 s before they ended,
-/// 2 s into the turn.
-fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, request: &str) -> i64 {
+/// 2 s into the turn. Returns the turn and the wall-clock milliseconds from
+/// just before the calls start to just after both end: the most real time the
+/// store can add to the second the command was moved back.
+fn clocked_turn(
+    path: &std::path::Path,
+    db: &mut Database,
+    model_ms: u64,
+    request: &str,
+) -> (i64, i64) {
     let turn = db
         .begin(
             "Bob",
@@ -18668,6 +18675,7 @@ fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, reques
     let read = read_call(&read_id);
     db.append(turn, vec![item], &[shell.clone(), read.clone()], None)
         .unwrap();
+    let calls = std::time::Instant::now();
     db.tool_start(turn, &shell, false, false).unwrap();
     db.tool_start(turn, &read, false, false).unwrap();
     let conn = Connection::open(path).unwrap();
@@ -18688,6 +18696,7 @@ fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, reques
     .unwrap();
     db.tool_finish(turn, &shell_id, &result("ok")).unwrap();
     db.tool_finish(turn, &read_id, &result("ok")).unwrap();
+    let calls_ms = i64::try_from(calls.elapsed().as_millis()).unwrap() + 1;
     let usage = Usage {
         input_tokens: 100,
         output_tokens: 40,
@@ -18698,7 +18707,7 @@ fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, reques
     db.append(turn, vec![assistant("done")], &[], Some(&usage))
         .unwrap();
     db.finish(turn, None).unwrap();
-    turn
+    (turn, calls_ms)
 }
 
 #[test]
@@ -18716,7 +18725,7 @@ fn each_turn_counts_its_calls_and_their_time_once() {
         },
     )
     .unwrap();
-    clocked_turn(&path, &mut db, 2_000, "1");
+    let (_, calls_ms) = clocked_turn(&path, &mut db, 2_000, "1");
     // A turn with no timed call is left out of the time.
     clocked_turn(&path, &mut db, 0, "2");
     let usage = db
@@ -18730,9 +18739,14 @@ fn each_turn_counts_its_calls_and_their_time_once() {
         })
         .unwrap();
     let time = &usage["time"];
-    // The two calls ran together: 1 s, not 1.5.
+    // The two calls ran together: 1 s plus the real time they took, not
+    // 1.5 s plus that time twice. The real time is measured, so a slow runner
+    // can't fail it.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
-    assert!((1_000..1_400).contains(&tool_ms), "{time}");
+    assert!(
+        (1_000..=1_000 + calls_ms).contains(&tool_ms),
+        "{time} calls_ms={calls_ms}"
+    );
     assert_eq!(
         [
             &time["turns"],
@@ -18872,9 +18886,9 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
         )
         .unwrap();
         clocked_turn(&path, &mut db, 0, "1");
-        let timed = clocked_turn(&path, &mut db, 2_000, "2");
-        let lifted = clocked_turn(&path, &mut db, 2_000, "3");
-        let pruned = clocked_turn(&path, &mut db, 2_000, "4");
+        let (timed, _) = clocked_turn(&path, &mut db, 2_000, "2");
+        let (lifted, _) = clocked_turn(&path, &mut db, 2_000, "3");
+        let (pruned, _) = clocked_turn(&path, &mut db, 2_000, "4");
         // The third turn's read went to the background, as a lifted call
         // does: its row ended with its process, not in its turn. Its
         // command ran as a terminal does, with a process of its own that
