@@ -2169,6 +2169,8 @@ next `esc` closes the view. Each view's title names `ctrl+f find` with its
 keys. Find reads only what the view already read, nothing from the daemon
 as you type.
 
+![ctrl+f with a find typed in /status, /background and /commons: each narrowed to the rows that say it, the pick on the first, the find row last](../docs/sonny/find-views.png)
+
 Every view is laid out the same way, too. Its title row is the command
 that opens it (`mcp`, not "MCP servers") and the keys it takes. Under it
 the head says whose view it is, bold: the project (`shop`), `every

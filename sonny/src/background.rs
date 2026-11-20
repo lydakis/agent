@@ -3497,7 +3497,7 @@ mod tests {
         let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         assert!(matches!(view.key(ctrl_f, 0..0), Key::Stay));
         assert!(view.finding());
-        assert_eq!(text(&view).last().unwrap(), " find");
+        assert_eq!(text(&view).last().unwrap(), "find");
         assert!(view.keys().ends_with("esc cancel"), "{}", view.keys());
         // Typed, even a letter the list keeps for itself, it narrows: the
         // rows that say it stay, a section with none is not drawn, and the
@@ -3512,7 +3512,7 @@ mod tests {
         );
         assert!(!says(&view, "Failed") && !says(&view, "pushcheck"));
         assert_eq!(view.selected, 2);
-        assert_eq!(text(&view).last().unwrap(), " find mail");
+        assert_eq!(text(&view).last().unwrap(), "find mail");
         // The arrows stay among the rows found.
         view.key(key(KeyCode::Up), 0..0);
         assert_eq!(view.selected, 2);

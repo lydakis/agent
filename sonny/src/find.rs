@@ -104,11 +104,7 @@ pub fn says(query: &str, words: &str) -> bool {
 
 /// The find row, the view's last: a muted `find`, then what was typed.
 pub fn line(query: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(" "),
-        Span::raw("find ").dim(),
-        Span::raw(query.to_owned()),
-    ])
+    Line::from(vec![Span::raw("find ").dim(), Span::raw(query.to_owned())])
 }
 
 #[cfg(test)]
@@ -158,9 +154,9 @@ mod tests {
     fn the_find_row_is_a_muted_find_then_what_was_typed() {
         let line = line("main");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, " find main");
+        assert_eq!(text, "find main");
         assert!(
-            line.spans[1]
+            line.spans[0]
                 .style
                 .add_modifier
                 .contains(ratatui::style::Modifier::DIM)

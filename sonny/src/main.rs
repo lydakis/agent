@@ -23603,7 +23603,12 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
         (below(at), screen::Mark::Link(link))
     }));
     marks.extend(named_agents);
-    let mut lines: Vec<Line<'static>> = card
+    // The find row, the view's last.
+    if let Some(find) = &watch.finding {
+        card.push(Line::default());
+        card.push(find::line(&find.query));
+    }
+    let lines = card
         .into_iter()
         .map(|line| {
             let mut spans = vec![Span::raw(" ")];
@@ -23611,11 +23616,6 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
             Line::from(spans).style(line.style)
         })
         .collect();
-    // The find row, the view's last.
-    if let Some(find) = &watch.finding {
-        lines.push(Line::default());
-        lines.push(find::line(&find.query));
-    }
     (lines, folding, marks)
 }
 

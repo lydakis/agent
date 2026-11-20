@@ -2392,7 +2392,7 @@ mod tests {
         let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         assert_eq!(view.key(ctrl_f), Key::Stay);
         assert!(view.finding());
-        assert_eq!(text(&view).last().unwrap(), " find");
+        assert_eq!(text(&view).last().unwrap(), "find");
         // Typed, even `a` and `j`, it narrows; the pick to the first match.
         assert_eq!(view.key(key(KeyCode::Char('c'))), Key::Stay);
         assert!(says(&view, "round half cents") && says(&view, "README"));
@@ -2401,7 +2401,7 @@ mod tests {
         assert!(!says(&view, "round half") && says(&view, "Caching the CI"));
         assert!(!says(&view, "README"), "{:#?}", text(&view));
         assert_eq!(view.selected, 1);
-        assert_eq!(text(&view).last().unwrap(), " find ca");
+        assert_eq!(text(&view).last().unwrap(), "find ca");
         // The arrows stay among the threads found.
         view.key(key(KeyCode::Up));
         assert_eq!(view.selected, 1);
