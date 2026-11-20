@@ -1,13 +1,15 @@
 //! Where a window's project agents stand, kept current by the daemon's
-//! events instead of listed again every few seconds. A window takes one
-//! snapshot, every agent its project's pattern names with the events'
-//! cursor the listing was read at, and follows the project from that
-//! cursor for the events that move an agent's state alone (a turn starting,
-//! waiting, resuming, held or ending, a call held for approval, an agent
-//! made or deleted), so it never receives every tool event of every agent
-//! to keep a count. Kubernetes' list then watch from the list's
-//! resourceVersion, and Codex's app server pushing a thread's status
-//! instead of clients listing threads again, are the same shape.
+//! events instead of listed again every few seconds. A window follows its
+//! project from now for the events that move an agent's state alone (a
+//! turn starting, waiting, resuming, held or ending, a call held for
+//! approval, an agent made or deleted), and once the follow is live takes
+//! one snapshot, every agent its project's pattern names, so it never
+//! receives every tool event of every agent to keep a count. Live first,
+//! then the listing: an event the daemon keeps for no replay (an agent
+//! `deleted`) still reaches a follow that is live, so nothing that moves
+//! while the listing is read falls between the two. What moved meanwhile
+//! is read again by name. Codex's app server pushing a thread's status
+//! instead of clients listing threads again is the same shape.
 //!
 //! The follow shares the window's connection: the daemon names the pattern
 //! on each event it brings (`following`), so its events never mix with the
@@ -104,20 +106,16 @@ pub fn kept(row: Value) -> Option<Agent> {
     serde_json::from_value(row).ok()
 }
 
-/// Every agent `pattern` names but those closed, every page, with the
-/// events' cursor read before the first page: following from it misses no
-/// change.
-pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<Agent>, i64)> {
+/// Every agent `pattern` names but those closed, every page.
+pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<Vec<Agent>> {
     let mut listed = Vec::new();
     let mut after: Option<String> = None;
-    let mut cursor = None;
     loop {
         let mut ask = json!({"name": pattern, "limit": 256, "open": true});
         if let Some(after) = &after {
             ask["after"] = json!(after);
         }
         let page = client.request("bots", ask).await?;
-        cursor = cursor.or(page["cursor"].as_i64());
         listed.extend(
             (page["bots"].as_array().into_iter().flatten())
                 .cloned()
@@ -125,10 +123,9 @@ pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<A
         );
         match page["next_after"].as_str() {
             Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
-            _ => break,
+            _ => return Ok(listed),
         }
     }
-    Ok((listed, cursor.unwrap_or(0)))
 }
 
 /// The rows of `names`, read by name, 256 a request: the agents that
@@ -167,11 +164,20 @@ pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Agen
 /// What the follow heard since the window last took it.
 #[derive(Default)]
 pub struct Changes {
-    /// A fresh snapshot, every agent the pattern names: taken at the start
-    /// and after the follow said `pruned`.
+    /// A fresh snapshot, every agent the pattern names: taken at the start,
+    /// once the follow is live.
     pub snapshot: Option<Vec<Agent>>,
     /// The agents an event moved since.
     pub moved: BTreeSet<String>,
+}
+
+/// What the follow keeps for the window, and whether a snapshot is still
+/// to come: what moved meanwhile waits for it, so the window reads no
+/// move before the listing it lands in.
+#[derive(Default)]
+struct Kept {
+    changes: Changes,
+    listing: bool,
 }
 
 /// Whether `pattern` names bots by a GLOB pattern, not one bot by name.
@@ -183,8 +189,10 @@ fn is_glob(pattern: &str) -> bool {
 pub struct Follower {
     pub pattern: String,
     client: Arc<Client>,
-    changes: Arc<Mutex<Changes>>,
+    kept: Arc<Mutex<Kept>>,
     woken: Arc<Notify>,
+    /// Told when the follow reaches the present (`follow_live`).
+    live: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -193,18 +201,23 @@ impl Follower {
     /// connection, waking `woken` when something arrives that the window
     /// has not taken.
     pub fn start(client: Arc<Client>, pattern: String, woken: Arc<Notify>) -> Self {
-        let changes = Arc::new(Mutex::new(Changes::default()));
+        let kept = Arc::new(Mutex::new(Kept {
+            listing: true,
+            ..Kept::default()
+        }));
+        let live = Arc::new(Notify::new());
         let task = tokio::spawn(snapshot(
             client.clone(),
             pattern.clone(),
-            changes.clone(),
-            woken.clone(),
+            (kept.clone(), woken.clone()),
+            Some(live.clone()),
         ));
         Self {
             pattern,
             client,
-            changes,
+            kept,
             woken,
+            live,
             task,
         }
     }
@@ -228,23 +241,34 @@ impl Follower {
             return false;
         }
         match event["event"].as_str() {
-            // A gap retention made: the snapshot is the truth.
+            // The follow is live: the snapshot is read from here.
+            Some("follow_live") if is_glob(pattern) => self.live.notify_one(),
+            // A gap retention made. One while the snapshot is still to
+            // come is no matter: it is read once the follow is live, and is
+            // the truth. One after it: a fresh snapshot, not a catch up
+            // event by event.
             Some("pruned") => {
-                self.task.abort();
-                self.task = tokio::spawn(snapshot(
-                    self.client.clone(),
-                    self.pattern.clone(),
-                    self.changes.clone(),
-                    self.woken.clone(),
-                ));
+                let mut kept = self.kept.lock().unwrap();
+                if !kept.listing {
+                    kept.listing = true;
+                    drop(kept);
+                    self.task.abort();
+                    self.task = tokio::spawn(snapshot(
+                        self.client.clone(),
+                        self.pattern.clone(),
+                        (self.kept.clone(), self.woken.clone()),
+                        None,
+                    ));
+                }
             }
             Some(kind) if KINDS.contains(&kind) => {
                 if let Some(bot) = event["bot"].as_str() {
                     let first = {
-                        let mut changes = self.changes.lock().unwrap();
+                        let mut kept = self.kept.lock().unwrap();
+                        let changes = &mut kept.changes;
                         let first = changes.moved.is_empty() && changes.snapshot.is_none();
                         changes.moved.insert(bot.to_owned());
-                        first
+                        first && !kept.listing
                     };
                     if first {
                         self.woken.notify_one();
@@ -256,21 +280,28 @@ impl Follower {
         brought || (named && is_glob(pattern))
     }
 
-    /// What arrived since the last take.
+    /// What arrived since the last take: nothing while the snapshot is
+    /// still to come.
     pub fn take(&self) -> Changes {
-        std::mem::take(&mut *self.changes.lock().unwrap())
+        let mut kept = self.kept.lock().unwrap();
+        match kept.listing {
+            true => Changes::default(),
+            false => std::mem::take(&mut kept.changes),
+        }
     }
 
     /// As though an event had moved `bot`.
     #[cfg(test)]
     pub fn moved(&self, bot: &str) {
-        self.changes.lock().unwrap().moved.insert(bot.to_owned());
+        let mut kept = self.kept.lock().unwrap();
+        kept.changes.moved.insert(bot.to_owned());
     }
 
     /// Whether the snapshot is in and not yet taken.
     #[cfg(test)]
     pub fn snapshot_waits(&self) -> bool {
-        self.changes.lock().unwrap().snapshot.is_some()
+        let kept = self.kept.lock().unwrap();
+        !kept.listing && kept.changes.snapshot.is_some()
     }
 }
 
@@ -310,33 +341,50 @@ impl Drop for Follower {
     }
 }
 
-/// The snapshot, then the follow from its cursor; tried again, a little
-/// later each time, until both are in. What moved meanwhile stays to be
-/// read again. A pattern that is one agent's name is not followed again:
-/// the window's own follow brings its events, and a second follow of the
+/// The follow from now, once it is `live`, then the snapshot; tried
+/// again, a little later each time, until both are in. What moved
+/// meanwhile stays to be read again. A follow already live (`live` none)
+/// is not asked again, nor is a pattern that is one agent's name: the
+/// window's own follow brings its events, and a second follow of the
 /// same name on the connection would take its place.
 async fn snapshot(
     client: Arc<Client>,
     pattern: String,
-    changes: Arc<Mutex<Changes>>,
-    woken: Arc<Notify>,
+    (kept, woken): (Arc<Mutex<Kept>>, Arc<Notify>),
+    mut live: Option<Arc<Notify>>,
 ) {
+    if !is_glob(&pattern) {
+        live = None;
+    }
     let mut pause = Duration::from_millis(250);
     loop {
-        if let Ok((listed, cursor)) = list(&client, &pattern).await {
-            changes.lock().unwrap().snapshot = Some(listed);
-            woken.notify_one();
-            if !is_glob(&pattern) {
-                return;
-            }
-            let asked = json!({"bot": pattern, "after": cursor, "kinds": KINDS});
+        if let Some(told) = &live {
+            let asked = json!({"bot": pattern, "since_ms": epoch_ms(), "kinds": KINDS});
             if client.request("follow", asked).await.is_ok() {
-                return;
+                told.notified().await;
+                live = None;
             }
+        }
+        if live.is_none()
+            && let Ok(listed) = list(&client, &pattern).await
+        {
+            let mut held = kept.lock().unwrap();
+            held.changes.snapshot = Some(listed);
+            held.listing = false;
+            drop(held);
+            woken.notify_one();
+            return;
         }
         tokio::time::sleep(pause).await;
         pause = (pause * 2).min(Duration::from_secs(30));
     }
+}
+
+/// Now, in Unix ms, as the daemon writes an event's time.
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64)
 }
 
 #[cfg(test)]
@@ -423,24 +471,37 @@ mod tests {
         }
     }
 
+    /// The follow `follows` was asked for, once it is.
+    async fn nth_follow(follows: &Mutex<Vec<Value>>, nth: usize) -> Value {
+        loop {
+            if let Some(asked) = follows.lock().unwrap().get(nth) {
+                return asked.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     async fn a_follow_on_the_windows_connection_names_what_it_moved_and_snapshots_again_after_a_gap()
      {
         let (client, follows, listings) = listing_daemon().await;
         let woken = Arc::new(Notify::new());
         let mut follower = Follower::start(client, "shop.*".into(), woken.clone());
-        // The snapshot, then the follow from the cursor it was listed at.
+        // The follow from now first, and no listing until it is live.
+        let asked = nth_follow(&follows, 0).await;
+        let since = asked["since_ms"].as_i64().unwrap();
+        assert!(since > 0 && since <= epoch_ms());
+        assert_eq!(
+            asked,
+            json!({"id": asked["id"], "op": "follow", "bot": "shop.*", "since_ms": since,
+                "kinds": KINDS})
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(listings.lock().unwrap().is_empty());
+        assert!(follower.heard(&json!({"event": "follow_live", "bot": "shop.*"})));
         let first = next_snapshot(&follower, &woken).await;
         assert_eq!(first, vec![agent("shop.0", 1)]);
         let snapshot = listings.lock().unwrap()[0].clone();
-        while follows.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-        let asked = follows.lock().unwrap()[0].clone();
-        assert_eq!(
-            asked,
-            json!({"id": asked["id"], "op": "follow", "bot": "shop.*", "after": 40, "kinds": KINDS})
-        );
         // The snapshot leaves closed agents out, as the follow hears them
         // close.
         assert_eq!(
@@ -456,20 +517,47 @@ mod tests {
         assert!(!follower.heard(&own));
         let quiet = json!({"event": "text_delta", "bot": "shop.fix", "following": "shop.*"});
         assert!(follower.heard(&quiet));
-        assert!(follower.heard(&json!({"event": "follow_live", "bot": "shop.*"})));
         assert_eq!(
             follower.take().moved,
             BTreeSet::from(["shop.fix".to_owned()])
         );
-        // A gap: a fresh snapshot, not a catch up event by event, and the
-        // follow again from its cursor.
+        // A gap: a fresh snapshot, not a catch up event by event, from the
+        // follow that is live already.
         assert!(follower.heard(&json!({"event": "pruned", "bot": "shop.*", "before": 9})));
         let again = next_snapshot(&follower, &woken).await;
         assert_eq!(again, vec![agent("shop.1", 1)]);
-        while follows.lock().unwrap().len() < 2 {
-            tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(follows.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_agent_deleted_while_the_snapshot_is_read_is_read_again_after_it() {
+        let (client, follows, _) = listing_daemon().await;
+        let woken = Arc::new(Notify::new());
+        let mut follower = Follower::start(client, "shop.*".into(), woken.clone());
+        nth_follow(&follows, 0).await;
+        // A gap in the follow's short replay is no matter: the listing, read
+        // once it is live, is the truth.
+        assert!(follower.heard(&json!({"event": "pruned", "bot": "shop.*", "before": 9})));
+        // Deleted before the listing is in: the daemon keeps no `deleted`
+        // to replay, so only a follow that is live hears it. It waits for
+        // the snapshot, not read ahead of it.
+        let deleted = json!({"event": "deleted", "bot": "shop.0", "following": "shop.*"});
+        assert!(follower.heard(&deleted));
+        assert!(follower.take().moved.is_empty());
+        assert!(follower.heard(&json!({"event": "follow_live", "bot": "shop.*"})));
+        loop {
+            let changes = follower.take();
+            if let Some(snapshot) = changes.snapshot {
+                assert_eq!(snapshot, vec![agent("shop.0", 1)]);
+                // Read again by name with the snapshot: gone, it leaves.
+                assert_eq!(changes.moved, BTreeSet::from(["shop.0".to_owned()]));
+                break;
+            }
+            assert!(changes.moved.is_empty());
+            woken.notified().await;
         }
-        assert_eq!(follows.lock().unwrap()[1]["after"], 41);
+        assert_eq!(follows.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -26,8 +26,14 @@
 //! between. The daemon has no unfollow: once none of those does any more,
 //! a new connection follows every agent on from the last event, with
 //! nothing read again.
+//!
+//! The daemon replays each follow on a task of its own, so while one still
+//! replays (every one at the start, and the wide one on a new connection),
+//! an agent's call can end before the older approval that held it comes.
+//! The events are applied in the order of their cursors ([`Lanes`]), so
+//! what needs the person comes out as the daemon's history says.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -706,7 +712,8 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
     // [`NARROW`]'s, so each event of a [`WIDE`] kind is its, in order, while
     // an agent's own follow may run ahead of it.
     let mut wide_from = json!({"since_ms": now});
-    let Some((mut client, mut events)) = follow_wide(socket, wide_from.clone()).await else {
+    let Some((mut client, mut events, mut lanes)) = follow_wide(socket, wide_from.clone()).await
+    else {
         return;
     };
     let Some(seeded) = seed(&client, store).await else {
@@ -732,7 +739,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             continue;
         }
         let asked = json!({"bot": bot, "since_ms": now, "kinds": NARROW});
-        if client.request("follow", asked).await.is_err() {
+        if !lanes.follow(&client, asked).await {
             return;
         }
         narrow.insert(bot, waited);
@@ -745,8 +752,14 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
     // and needs no one until a message opens it again.
     tell_waiting(&needs, &order, tell);
     loop {
-        let Some(event) = events.recv().await else {
-            return;
+        // The next event in the order of the cursors, once every follow
+        // that still replays has passed it.
+        let Some(event) = lanes.next() else {
+            let Some(event) = events.recv().await else {
+                return;
+            };
+            lanes.heard(event);
+            continue;
         };
         let cursor = event["cursor"].clone();
         if (event["event"].as_str()).is_some_and(|kind| WIDE.contains(&kind)) {
@@ -811,7 +824,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         if !narrow.contains_key(&bot) && (ours && (waits_from(&event) || forked) || done.is_some())
         {
             let asked = json!({"bot": bot, "after": cursor, "kinds": NARROW});
-            if client.request("follow", asked).await.is_err() {
+            if !lanes.follow(&client, asked).await {
                 return;
             }
             narrow.insert(bot.clone(), false);
@@ -873,13 +886,14 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         // None followed narrowly waits, runs, marks any more or is to be
         // read at its turn's end: their events are no longer wanted, and
         // the daemon has no unfollow. A new connection follows every agent
-        // on from where its follow had reached, with nothing read again.
-        if done_with(&narrow, &needs, &marked) {
+        // on from where its follow had reached, with nothing read again,
+        // once every event heard is applied.
+        if lanes.is_empty() && done_with(&narrow, &needs, &marked) {
             drop((client, events));
             let Some(again) = follow_wide(socket, wide_from.clone()).await else {
                 return;
             };
-            (client, events) = again;
+            (client, events, lanes) = again;
             narrow.clear();
         }
     }
@@ -904,14 +918,101 @@ fn done_with(
 async fn follow_wide(
     socket: &std::path::Path,
     from: Value,
-) -> Option<(Arc<Client>, agent_client::Events)> {
+) -> Option<(Arc<Client>, agent_client::Events, Lanes)> {
     let (client, events) = Client::connect(socket).await.ok()?;
     let mut asked = json!({"bot": "*.*", "kinds": WIDE});
     if let (Some(asked), Some(from)) = (asked.as_object_mut(), from.as_object()) {
         asked.extend(from.clone());
     }
-    client.request("follow", asked).await.ok()?;
-    Some((client, events))
+    let mut lanes = Lanes::default();
+    lanes
+        .follow(&client, asked)
+        .await
+        .then_some((client, events, lanes))
+}
+
+/// The events of every follow on one connection, given back in the order
+/// of their cursors. The daemon replays each follow on a task of its own
+/// until it sends `follow_live`, so while any replays, one follow's events
+/// can come ahead of another's older ones: an agent's call ending and its
+/// turn's end, on its own follow, before the approval that held the call,
+/// on the follow of every agent. Each follow replays in order, so an event
+/// is given once every follow still replaying has passed its cursor. Once
+/// every follow is live, the daemon publishes in order and each event is
+/// given as it comes.
+#[derive(Default)]
+struct Lanes {
+    /// Each follow still replaying, by what it follows (an agent's name or
+    /// `*.*`), with the newest cursor it gave.
+    replaying: HashMap<String, i64>,
+    /// The events heard and not yet given, by cursor.
+    held: BTreeMap<i64, Vec<Value>>,
+    /// Those given as they came: with no cursor, or heard once every
+    /// follow was live with nothing held.
+    loose: VecDeque<Value>,
+}
+
+impl Lanes {
+    /// Follow as `asked`, replaying from the cursor the daemon answers.
+    async fn follow(&mut self, client: &Client, asked: Value) -> bool {
+        let Some(of) = asked["bot"].as_str().map(str::to_owned) else {
+            return false;
+        };
+        let from = asked["after"].as_i64().unwrap_or(0);
+        let Ok(answer) = client.request("follow", asked).await else {
+            return false;
+        };
+        self.replaying
+            .insert(of, answer["after"].as_i64().unwrap_or(from));
+        true
+    }
+
+    /// An event as it came: kept to be given in order. A follow's
+    /// `follow_live` says it replays no more.
+    fn heard(&mut self, event: Value) {
+        let of = (event["following"].as_str()).or(event["bot"].as_str());
+        if event["event"] == "follow_live" {
+            if let Some(of) = of {
+                self.replaying.remove(of);
+            }
+            return;
+        }
+        // Every follow live and nothing held: as it comes, in the order
+        // the daemon published it.
+        let cursor = event["cursor"].as_i64();
+        let Some(cursor) = cursor.filter(|_| !self.replaying.is_empty() || !self.held.is_empty())
+        else {
+            self.loose.push_back(event);
+            return;
+        };
+        if let Some(reached) = of.and_then(|of| self.replaying.get_mut(of)) {
+            *reached = (*reached).max(cursor);
+        }
+        self.held.entry(cursor).or_default().push(event);
+    }
+
+    /// The next event to apply: the oldest held, once no follow still
+    /// replaying can give an older one.
+    fn next(&mut self) -> Option<Value> {
+        if let Some(event) = self.loose.pop_front() {
+            return Some(event);
+        }
+        let passed = self.replaying.values().copied().min().unwrap_or(i64::MAX);
+        let mut oldest = self.held.first_entry()?;
+        if *oldest.key() > passed {
+            return None;
+        }
+        let event = oldest.get_mut().remove(0);
+        if oldest.get().is_empty() {
+            oldest.remove();
+        }
+        Some(event)
+    }
+
+    /// Whether every event heard was given.
+    fn is_empty(&self) -> bool {
+        self.held.is_empty() && self.loose.is_empty()
+    }
 }
 
 /// Where things stood when the follow began.
@@ -936,7 +1037,7 @@ struct Seeded {
 async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     let mut needs = needs::Needs::default();
     let held = needs::listing(client, None).await.ok()?;
-    let (listed, _) = standing::list(client, "*.*").await.ok()?;
+    let listed = standing::list(client, "*.*").await.ok()?;
     let order = in_order(store, &listed);
     let named_as_sides: HashSet<String> = (listed.iter())
         .filter(|bot| {
@@ -1502,8 +1603,18 @@ mod tests {
                                 let _ = asked.send((at, request.clone()));
                                 let out = json!({"id": request["id"], "result": result});
                                 write.write_all(format!("{out}\n").as_bytes()).await.unwrap();
+                                // Nothing to replay: each follow is live at once.
+                                if request["op"] == "follow" {
+                                    let live = json!({"event": "follow_live",
+                                        "bot": request["bot"], "cursor": 0});
+                                    write.write_all(format!("{live}\n").as_bytes()).await.unwrap();
+                                }
                             }
-                            Some(event) = gone.recv() => {
+                            Some(mut event) = gone.recv() => {
+                                // The follow of every agent's, naming it.
+                                if (event["event"].as_str()).is_some_and(|kind| WIDE.contains(&kind)) {
+                                    event["following"] = json!("*.*");
+                                }
                                 write.write_all(format!("{event}\n").as_bytes()).await.unwrap();
                             }
                         }
@@ -1631,6 +1742,162 @@ mod tests {
         assert_eq!(bots, ["site.fix"]);
         drop(second);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Applied in the order they came, an agent's call ending and its
+    /// turn's end, on its own follow, run ahead of the older approval
+    /// that held the call, still on its way on the follow of every agent
+    /// as it replays: the agent would need the person until the follow
+    /// starts again (#1222). Applied in the order of their cursors, it
+    /// needs no one, and those that wait still do.
+    #[tokio::test]
+    async fn an_approval_replayed_after_its_own_end_does_not_wait() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("elsewhere-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (asked, mut requests) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let wide = |event: Value| {
+            let mut event = event;
+            event["following"] = json!("*.*");
+            event
+        };
+        let of = |bot: &str, kind: &str, call: &str, cursor: i64| {
+            let data = match kind {
+                "approval_requested" => {
+                    json!({"calls": [{"call_id": call, "gates": ["manual"], "name": "shell"}]})
+                }
+                _ => json!({"call_id": call}),
+            };
+            json!({"cursor": cursor, "bot": bot, "turn": 1, "event": kind, "data": data})
+        };
+        let live =
+            |of: &str, cursor: i64| json!({"event": "follow_live", "bot": of, "cursor": cursor});
+        // Its approval, when the follow of every agent replays.
+        let first = vec![
+            live("site.wait", 6),
+            wide(of("site.fix", "approval_requested", "c1", 7)),
+        ];
+        // Its own follow, at once to the present; then the follow of every
+        // agent goes on with the older approval, and one more.
+        let then = vec![
+            of("site.fix", "tool_completed", "c1", 8),
+            of("site.fix", "tool_completed", "c2", 10),
+            of("site.fix", "turn_finished", "", 11),
+            live("site.fix", 11),
+            wide(of("site.fix", "approval_requested", "c2", 9)),
+            wide(of("site.next", "approval_requested", "c3", 12)),
+            live("*.*", 12),
+        ];
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+            write
+                .write_all(format!("{ready}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut lines = BufReader::new(read).lines();
+            let (mut first, mut then) = (Some(first), Some(then));
+            while let Ok(Some(line)) = lines.next_line().await {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["op"].as_str() {
+                    Some("bots") if request["active"] == true => json!({"bots": []}),
+                    Some("bots") => json!({"bots": [
+                        {"name": "site.fix", "bot_id": 3},
+                        {"name": "site.lead", "bot_id": 2},
+                        {"name": "site.next", "bot_id": 4},
+                        {"name": "site.wait", "bot_id": 5},
+                        {"name": "tally.lead", "bot_id": 1}], "cursor": 1}),
+                    // Held when the follow starts.
+                    Some("approvals") => json!({"approvals": [
+                        {"bot": "site.wait", "turn": 1, "call_id": "c9", "gates": ["manual"]}]}),
+                    Some("follow") => json!({"following": request["bot"],
+                        "after": request["after"].as_i64().unwrap_or(6)}),
+                    _ => json!({}),
+                };
+                let out = json!({"id": request["id"], "result": result});
+                write
+                    .write_all(format!("{out}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let events = match (request["op"].as_str(), request["bot"].as_str()) {
+                    (Some("follow"), Some("site.wait")) => first.take(),
+                    (Some("follow"), Some("site.fix")) => then.take(),
+                    _ => None,
+                };
+                for event in events.into_iter().flatten() {
+                    write
+                        .write_all(format!("{event}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                let _ = asked.send(request);
+            }
+        });
+        let store = dir.join("state.sqlite");
+        let open = Elsewhere::start(socket, store, "tally".into(), Arc::new(Notify::new()));
+        let mut waiting = open.waiting.clone();
+        let wait = std::time::Duration::from_secs(5);
+        tokio::time::timeout(
+            wait,
+            waiting.wait_for(|shared| shared.agents.iter().any(|(_, _, bot)| bot == "site.next")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let bots: Vec<String> = (waiting.borrow().agents.iter())
+            .map(|(_, _, bot)| bot.clone())
+            .collect();
+        assert_eq!(bots, ["site.next", "site.wait"]);
+        // Its own follow, from the approval that held it.
+        let mut follows = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            if request["op"] == "follow" {
+                follows.push((request["bot"].clone(), request["after"].clone()));
+            }
+        }
+        assert!(follows.contains(&(json!("site.fix"), json!(7))));
+        drop(open);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Events from follows that replay at once come out in the order of
+    /// their cursors, none before every follow still replaying passed it;
+    /// a follow's `follow_live` lets the rest go.
+    #[test]
+    fn events_come_out_in_cursor_order_while_a_follow_replays() {
+        let mut lanes = Lanes::default();
+        lanes.replaying.insert("*.*".into(), 6);
+        lanes.replaying.insert("site.fix".into(), 7);
+        let event = |cursor: i64, following: Option<&str>| {
+            let mut event = json!({"cursor": cursor, "bot": "site.fix", "event": "e"});
+            if let Some(following) = following {
+                event["following"] = json!(following);
+            }
+            event
+        };
+        let given = |lanes: &mut Lanes| {
+            std::iter::from_fn(|| lanes.next())
+                .map(|event| event["cursor"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        lanes.heard(event(8, None));
+        lanes.heard(event(10, None));
+        lanes.heard(json!({"event": "follow_live", "bot": "site.fix", "cursor": 10}));
+        // The follow of every agent has passed none of them.
+        assert!(given(&mut lanes).is_empty());
+        lanes.heard(event(9, Some("*.*")));
+        assert_eq!(given(&mut lanes), [8, 9]);
+        assert!(!lanes.is_empty());
+        lanes.heard(json!({"event": "follow_live", "bot": "*.*", "cursor": 10}));
+        assert_eq!(given(&mut lanes), [10]);
+        // Every follow live: each as it comes.
+        lanes.heard(event(11, Some("*.*")));
+        assert_eq!(given(&mut lanes), [11]);
+        assert!(lanes.is_empty());
     }
 
     /// A question the person's words went past is read again at its

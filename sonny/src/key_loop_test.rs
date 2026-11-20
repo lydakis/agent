@@ -198,14 +198,14 @@ async fn held_daemon(
                         _ => json!({}),
                     };
                     let answer = json!({"id": asked["id"], "result": result});
-                    let follow = asked["op"] == "follow";
+                    let follow = (asked["op"] == "follow").then(|| asked["bot"].clone());
                     let write = write.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(held).await;
                         let mut write = write.lock().await;
                         let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
-                        if follow {
-                            let live = json!({"event": "follow_live"});
+                        if let Some(bot) = follow {
+                            let live = json!({"event": "follow_live", "bot": bot});
                             let _ = write.write_all(format!("{live}\n").as_bytes()).await;
                         }
                     });
@@ -241,6 +241,15 @@ fn window(client: Arc<Client>, socket: PathBuf) -> App {
 
 fn key(code: KeyCode) -> Event {
     Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// `key` sent to the window, timed as it goes: the window may take it and
+/// draw it before the sender runs again, so a time read after the send can
+/// fall after the frame that showed it.
+fn press(keys: &tokio::sync::mpsc::UnboundedSender<Event>, key: Event) -> Instant {
+    let at = Instant::now();
+    keys.send(key).unwrap();
+    at
 }
 
 /// The time from each key to the first frame that shows what it typed.
@@ -320,13 +329,11 @@ async fn typing_and_scrolling_never_wait_on_a_daemon_that_holds_every_answer() {
         };
         for (at, c) in "the tallies look right".chars().enumerate() {
             typed.push(c);
-            keys.send(key(KeyCode::Char(c))).unwrap();
-            sent.push((Instant::now(), typed.clone()));
+            sent.push((press(&keys, key(KeyCode::Char(c))), typed.clone()));
             tokio::time::sleep(Duration::from_millis(40)).await;
             if at % 5 == 4 {
                 typed.pop();
-                keys.send(key(KeyCode::Backspace)).unwrap();
-                sent.push((Instant::now(), typed.clone()));
+                sent.push((press(&keys, key(KeyCode::Backspace)), typed.clone()));
                 tokio::time::sleep(Duration::from_millis(40)).await;
                 keys.send(notch(event::MouseEventKind::ScrollUp)).unwrap();
                 keys.send(notch(event::MouseEventKind::ScrollDown)).unwrap();
@@ -335,15 +342,13 @@ async fn typing_and_scrolling_never_wait_on_a_daemon_that_holds_every_answer() {
         }
         // Sent: the composer empties at once, and the message shows
         // where it will land while the daemon holds its answer.
-        keys.send(key(KeyCode::Enter)).unwrap();
-        let entered = Instant::now();
+        let entered = press(&keys, key(KeyCode::Enter));
         sent.push((entered, String::new()));
         tokio::time::sleep(Duration::from_millis(200)).await;
         let mut more = String::new();
         for c in "and more".chars() {
             more.push(c);
-            keys.send(key(KeyCode::Char(c))).unwrap();
-            sent.push((Instant::now(), more.clone()));
+            sent.push((press(&keys, key(KeyCode::Char(c))), more.clone()));
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         // The reads come back: the transcript catches up.
@@ -474,18 +479,16 @@ async fn stream_behind_a_held_read(
         {
             for c in "tallies".chars() {
                 typed.push(c);
-                keys.send(key(KeyCode::Char(c))).unwrap();
-                sent.push((Instant::now(), typed.clone()));
+                sent.push((press(&keys, key(KeyCode::Char(c))), typed.clone()));
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
             // Cleared, so the words stay on one row.
             typed.clear();
-            keys.send(Event::Key(event::KeyEvent::new(
+            let cleared = Event::Key(event::KeyEvent::new(
                 KeyCode::Char('u'),
                 KeyModifiers::CONTROL,
-            )))
-            .unwrap();
-            sent.push((Instant::now(), typed.clone()));
+            ));
+            sent.push((press(&keys, cleared), typed.clone()));
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         // Everything heard, or caught up from history, the window quits.
@@ -672,8 +675,7 @@ async fn typing_never_waits_on_a_page_the_browser_is_slow_to_draw() {
         let mut typed = String::new();
         for c in "the page looks right".chars() {
             typed.push(c);
-            keys.send(key(KeyCode::Char(c))).unwrap();
-            sent.push((Instant::now(), typed.clone()));
+            sent.push((press(&keys, key(KeyCode::Char(c))), typed.clone()));
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         // Drawn by now: it takes the row that stood for it.
