@@ -3808,8 +3808,9 @@ impl Database {
     /// commits keep coming faster than it syncs. Past [`CHECKPOINT_HELD`]
     /// pages the writer checkpoints itself, as SQLite would have: nothing
     /// is appended meanwhile, so it copies back the whole log and the next
-    /// commit starts it over. While the checkpointer runs that is busy and
-    /// the next commit tries again; past [`CHECKPOINT_MOST`] the writer
+    /// commit starts it over. While the checkpointer runs that is busy, so
+    /// it asks the checkpointer to run again and the next commit tries
+    /// again; past [`CHECKPOINT_MOST`] the writer
     /// waits out the checkpoint `running` holds first, so the log stays
     /// bounded however slow the disk.
     pub fn checkpoint_aside(
@@ -3829,7 +3830,12 @@ impl Database {
                     // The commit has been made whatever this answers.
                     let _ = wal.checkpoint();
                 } else if pages >= CHECKPOINT_HELD {
-                    let _ = wal.checkpoint();
+                    // Busy while the checkpointer runs: ask it to go on
+                    // once it is done, so on a disk slower than the commits
+                    // it keeps checkpointing and the writer seldom syncs.
+                    if wal.checkpoint().is_err() {
+                        ask();
+                    }
                 } else if pages >= asked + CHECKPOINT_PAGES {
                     asked = pages;
                     ask();
