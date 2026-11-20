@@ -839,7 +839,7 @@ pub fn background_alert(n: usize) -> Option<Alert> {
 
 /// How long a companion's run must last to count as healthy, as the
 /// daemon counts it before its restart backoff starts over.
-const HEALTHY_MS: u64 = 60_000;
+pub const HEALTHY_MS: u64 = 60_000;
 
 /// The companions the daemon keeps (`companions`' list) that keep
 /// restarting, as of `now_ms`: one that restarted and is down now,
@@ -856,18 +856,7 @@ pub fn companion_alerts(companions: &serde_json::Value, now_ms: u64, logs: &str)
         .map(|c| {
             let name = c["name"].as_str().unwrap_or("a companion");
             let restarts = c["restarts"].as_u64().unwrap_or(0);
-            let exit = &c["last_exit"];
-            let how = match (
-                exit["error"].as_str(),
-                exit["code"].as_i64(),
-                exit["signal"].as_i64(),
-            ) {
-                (Some("spawn_failed"), ..) => "could not start".to_owned(),
-                (Some(_), ..) => "lost track of it".to_owned(),
-                (None, Some(code), _) => format!("exits {code}"),
-                (None, None, Some(signal)) => format!("killed by signal {signal}"),
-                (None, None, None) => "exits".to_owned(),
-            };
+            let how = companion_exit(&c["last_exit"]);
             Alert {
                 said: format!(
                     "{name} keeps restarting · {how} · {restarts} restart{}",
@@ -878,6 +867,21 @@ pub fn companion_alerts(companions: &serde_json::Value, now_ms: u64, logs: &str)
             }
         })
         .collect()
+}
+
+/// How a companion's last run ended, as the daemon lists it (`last_exit`).
+pub fn companion_exit(exit: &serde_json::Value) -> String {
+    match (
+        exit["error"].as_str(),
+        exit["code"].as_i64(),
+        exit["signal"].as_i64(),
+    ) {
+        (Some("spawn_failed"), ..) => "could not start".to_owned(),
+        (Some(_), ..) => "lost track of it".to_owned(),
+        (None, Some(code), _) => format!("exits {code}"),
+        (None, None, Some(signal)) => format!("killed by signal {signal}"),
+        (None, None, None) => "exits".to_owned(),
+    }
 }
 
 /// Under what share of its space or of its inodes left a temporary folder
