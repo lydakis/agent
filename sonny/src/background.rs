@@ -1860,7 +1860,9 @@ impl View {
     /// [`View::card_rows`] as of `now_ms`, which the commands' ages count
     /// to.
     fn card_at(&self, width: usize, now_ms: i64) -> (Vec<Line<'static>>, usize, Vec<usize>, Links) {
-        let mut starts = vec![0; self.rows()];
+        // A row a find leaves out has none, past the last line, so no
+        // click lands on it.
+        let mut starts = vec![usize::MAX; self.rows()];
         let mut links = Links::new();
         let mut out = vec![Line::from(self.scope.project.clone()).bold()];
         if !self.lookout.is_empty() {
@@ -3513,6 +3515,20 @@ mod tests {
         assert!(!says(&view, "Failed") && !says(&view, "pushcheck"));
         assert_eq!(view.selected, 2);
         assert_eq!(text(&view).last().unwrap(), "find mail");
+        // Only a row found has a place a click lands on: one left out has
+        // none, so no click on a row shown, or on the head, opens it.
+        let (lines, _, starts, _) = view.card_linked(80);
+        for (index, start) in starts.iter().enumerate() {
+            assert_eq!(
+                *start < lines.len(),
+                view.shown(index),
+                "{index} {starts:?}"
+            );
+        }
+        assert!(
+            starts.iter().any(|start| *start >= lines.len()),
+            "{starts:?}"
+        );
         // The arrows stay among the rows found.
         view.key(key(KeyCode::Up), 0..0);
         assert_eq!(view.selected, 2);

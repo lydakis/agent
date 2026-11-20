@@ -2165,13 +2165,13 @@ impl View {
             return (out, 0, Vec::new());
         }
         let mut at = 0;
-        // Each thread's row, by its place: one a find leaves out keeps the
-        // row of the one shown before it, a click on it picking that.
+        // Each thread's row, by its place: one a find leaves out has none,
+        // past the last line, so no click lands on it.
         let mut starts = Vec::new();
         for (index, thread) in self.threads.iter().enumerate() {
             let picked = index == self.selected;
             if !self.shown(index) {
-                starts.push(starts.last().copied().unwrap_or(0));
+                starts.push(usize::MAX);
                 continue;
             }
             out.push(Line::default());
@@ -2390,6 +2390,14 @@ mod tests {
         assert!(!says(&view, "README"), "{:#?}", text(&view));
         assert_eq!(view.selected, 1);
         assert_eq!(text(&view).last().unwrap(), "find ca");
+        // Only the thread found has a row a click lands on: the ones left
+        // out have none, so no click on a row shown opens one hidden.
+        let (lines, _, starts) = view.card_rows(80);
+        assert!(starts[1] < lines.len(), "{starts:?}");
+        assert!(
+            starts[0] >= lines.len() && starts[2] >= lines.len(),
+            "{starts:?}"
+        );
         // The arrows stay among the threads found.
         view.key(key(KeyCode::Up));
         assert_eq!(view.selected, 1);
