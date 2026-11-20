@@ -176,23 +176,19 @@ Claude Code's agents take `isolation` each time.
 
 A task and a project each have a title beside their name: a few words you
 know the work by, as `Round half cents to even` beside `halves`. The name
-stays the handle you address, link and click. Every agent's title is its
-first message's first line, cut at a word to 60 characters, as Codex names
-a thread from its first message: a task's is its brief's first line, which
-the lead writes as one, and one you start with `/new` takes yours. An agent
-started with none noted, such as a helper or a task started before tasks
-had titles, has its first line read once from its history, beside the
-window, and noted. A lead sets a project's with `new_project`'s `title`,
-which goes in `.agents/project.toml` as `title`, where you can change it; a
-folder that is a project already keeps its own, and one with none shows its
-name. A lead's title is its project's. A title written for you is a
-sentence of 30 characters at most, what the pane's row holds beside a
-name: `new_project` asks the lead for two or three words. Sonny draws a
-title as it was written and changes no letter; the 60 it keeps is for a
-first line no one wrote as one. Sonny keeps each agent's beside the
-store (`STORE.titles/NAME`) with the agent's id, so one given the name later
-takes none of it, and a noted title is never read again or replaced; the
-daemon keeps none.
+stays the handle you address, link and click. Whoever starts a task writes
+its title with `start_task`'s `title`: a sentence that starts with its verb,
+30 characters at most, what the pane's row holds beside a name; the brief
+stays the task's alone. A lead sets a project's with `new_project`'s
+`title`, two or three words, 30 characters at most, which goes in
+`.agents/project.toml` as `title`, where you can change it; a folder that
+is a project already keeps its own, and one with none shows its name. A
+lead's title is its project's. Any other agent, such as one made with
+`spawn_agent` or started with `/new`, has no title and shows its name; one
+noted before this keeps its own. Sonny draws a title as written and
+changes no letter. It keeps each task's beside the store
+(`STORE.titles/NAME`) with the agent's id, so one given the name later
+takes none of it; the daemon keeps none.
 Every row that lists an agent leads with its title: `/status`, `/switch`
 and the tasks a lead started.
 
