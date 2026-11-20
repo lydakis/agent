@@ -7540,11 +7540,21 @@ impl Service {
                         format!("a prompt may quote up to {MAX_QUOTES} messages"),
                     );
                 }
-                if let Some(quote) = quotes.iter().find(|quote| quote.message < 1) {
-                    return Err(
-                        Error::with("invalid_quote", "a quoted message is 1 or more")
-                            .facts(json!({"bot":quote.bot,"message":quote.message})),
-                    );
+                // A message by its number, or the agent's words by their
+                // item, each 1 or more; only a message has a reply.
+                if let Some(quote) = quotes
+                    .iter()
+                    .find(|quote| match (quote.message, quote.item) {
+                        (Some(message), None) => message < 1,
+                        (None, Some(item)) => item < 1 || quote.reply,
+                        _ => true,
+                    })
+                {
+                    return Err(Error::with(
+                        "invalid_quote",
+                        "a quote names a message or an item, 1 or more; only a message has a reply",
+                    )
+                    .facts(json!({"bot":quote.bot,"message":quote.message,"item":quote.item})));
                 }
 
                 if prompt.len() > 256 * 1024 {

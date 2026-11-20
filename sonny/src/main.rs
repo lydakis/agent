@@ -6437,6 +6437,9 @@ struct App {
     reacting: Option<(Vec<(i64, String)>, list::Picker)>,
     /// The list is `/reply`'s: the pick is quoted, not reacted to.
     quoting: bool,
+    /// The messages quoted over what is being written, in the order
+    /// picked: each one row over the composer, sent with the words.
+    quotes: Vec<Quote>,
     /// What Ctrl+F looks for on the full screen, while it does.
     finding: Option<String>,
     /// The reply `/react` picked, which the next emoji sent answers.
@@ -8591,6 +8594,7 @@ impl App {
             approval_left: None,
             replies: Vec::new(),
             quoting: false,
+            quotes: Vec::new(),
             reacting: None,
             finding: None,
             react_to: None,
@@ -8864,6 +8868,7 @@ impl App {
                         typed: first.clone(),
                         pictures: Vec::new(),
                         answering: None,
+                        quotes: Vec::new(),
                     };
                     self.send(first, None, (false, false), &[], then);
                 }
@@ -9484,7 +9489,7 @@ impl App {
                     (self.screen).put_under_with(screen::Tag::End(node), tag, row, buttons);
                 }
                 Wrote::Reacted(_, _, None) => {}
-                Wrote::Quoted(said) => self.quote(&said),
+                Wrote::Quoted(said, named) => self.quote(&said, Some(named)),
                 // Taken away once the agent will hear of it; kept to close
                 // again when it could not be told.
                 Wrote::NoteClosed(id, None) => {
@@ -17593,7 +17598,7 @@ impl App {
         match verb {
             // A margin note answered, quoted the same way.
             "reply-note" => match self.margin.quoted(id) {
-                Some(said) => self.quote(&said),
+                Some(said) => self.quote(&said, None),
                 None => self.notice = Some("that note is no longer in the margin".into()),
             },
             // A message answered: quoted where the person writes.
@@ -17605,9 +17610,13 @@ impl App {
                     self.client.clone(),
                     json!({"bot": self.bot, "nodes": [node]}),
                 );
+                let bot = self.bot.clone();
                 self.write(async move {
                     match client.request("history_items", asked).await {
-                        Ok(read) => Wrote::Quoted(text(&read["items"][0]["item"])),
+                        Ok(read) => {
+                            let read = &read["items"][0];
+                            Wrote::Quoted(text(&read["item"]), quoted(read, &bot, node))
+                        }
                         Err(error) => Wrote::Said(Some(error.to_string())),
                     }
                 });
@@ -18391,7 +18400,7 @@ impl App {
                     KeyCode::Char('c') if ctrl => {
                         if self.input.is_empty() && self.making.is_some() {
                             self.making = None;
-                        } else if self.input.is_empty() {
+                        } else if self.input.is_empty() && self.quotes.is_empty() {
                             self.quit = true;
                         } else {
                             self.discard();
@@ -18490,6 +18499,11 @@ impl App {
                         self.shortcuts()
                     }
                     KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
+                    // At the start of the words, the newest quote over them
+                    // goes whole: it is one message, sent whole.
+                    KeyCode::Backspace if self.input.at_start() && !self.quotes.is_empty() => {
+                        self.quotes.pop();
+                    }
                     KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
                     KeyCode::Backspace => self.input.backspace(),
                     KeyCode::Delete if ctrl || alt => self.input.delete_word_forward(),
@@ -19095,13 +19109,21 @@ impl App {
             messages.push(self.message(record, Some(SHELL), (join, queue), &[], Then::Held));
         }
         let pictures = self.placed(&prompt);
+        let quotes = std::mem::take(&mut self.quotes);
+        let prompt = noted(prompt, &quotes);
         let then = Then::Composed {
             typed: (*self.input).to_owned(),
             pictures: std::mem::take(&mut self.pictures),
             answering,
+            quotes: quotes.clone(),
         };
         let join = !messages.is_empty() && !queue;
-        messages.push(self.message(prompt, None, (join, queue), &pictures, then));
+        let mut message = self.message(prompt, None, (join, queue), &pictures, then);
+        let named: Vec<&Value> = quotes.iter().filter_map(|q| q.named.as_ref()).collect();
+        if !named.is_empty() {
+            message.submitted["quotes"] = json!(named);
+        }
+        messages.push(message);
         self.input.clear();
         self.notice = None;
         self.send_all(messages);
@@ -19111,6 +19133,7 @@ impl App {
     fn discard(&mut self) {
         self.input.clear();
         self.pictures.clear();
+        self.quotes.clear();
     }
 
     /// The pictures whose placeholders are still in `prompt`, which go
@@ -19202,6 +19225,7 @@ impl App {
             typed: String::new(),
             pictures: Vec::new(),
             answering: None,
+            quotes: Vec::new(),
         };
         let message = self.message(prompt, None, (join, queue), &[], then);
         self.sending += 1;
@@ -19354,9 +19378,15 @@ impl App {
         }
         match then {
             Then::Composed {
-                typed, pictures, ..
+                typed,
+                pictures,
+                mut quotes,
+                ..
             } => {
                 self.give_back(&typed, pictures);
+                // In front of any quoted since, as they were picked first.
+                quotes.retain(|quote| !self.quotes.contains(quote));
+                self.quotes.splice(0..0, quotes);
             }
             Then::Zen(_, typed) => self.give_back(&typed, Vec::new()),
             Then::Ran(_) => {
@@ -21598,10 +21628,12 @@ impl App {
         let room = (size.height as usize).saturating_sub(VIEWPORT as usize - 1);
         // What is typed to answer a question has the question over it,
         // as a reply in a chat has what it replies to.
-        let heading = self
-            .answering_over(width.min(measure()))
-            .filter(|_| room > 1);
-        let text_room = room - usize::from(heading.is_some());
+        let mut headings = self.quoting_over(width.min(measure()));
+        headings.extend(self.answering_over(width.min(measure())));
+        // The newest over the words, the room kept for one row of them.
+        let heading_room = room.saturating_sub(1);
+        headings.drain(..headings.len().saturating_sub(heading_room));
+        let text_room = room - headings.len();
         let (mut composer_rows, mut cursor_row) =
             window(composer_rows, cursor_row, text_room.max(1));
         // The first of the text's rows shown, for the mouse to find its spot.
@@ -21612,10 +21644,8 @@ impl App {
                 self.input.cursor(&layout).0 - cursor_row
             }),
         };
-        if let Some(heading) = &heading {
-            composer_rows.insert(0, heading.clone());
-            cursor_row += 1;
-        }
+        cursor_row += headings.len();
+        composer_rows.splice(0..0, headings.iter().cloned());
         let mut composer_at = None;
         let mut opens_at = Vec::new();
         let mut model_at = Vec::new();
@@ -22447,7 +22477,7 @@ impl App {
                 .and_then(|(width, name)| {
                     let link = self.names.borrow_mut().link(name)?;
                     let x = composer.x + (width - name.width()) as u16;
-                    let y = composer.y + heading.is_some() as u16;
+                    let y = composer.y + headings.len() as u16;
                     Some((y, x..(x + name.width() as u16).min(composer.right()), link))
                 });
             // The task whose question its hint answers opens, as an
@@ -22477,14 +22507,12 @@ impl App {
                 }
                 opens_at.push((y, columns, link));
             }
-            // The mouse finds the text under the row over it.
-            let text = match heading {
-                Some(_) => Rect {
-                    y: composer.y + 1,
-                    height: composer.height.saturating_sub(1),
-                    ..composer
-                },
-                None => composer,
+            // The mouse finds the text under the rows over it.
+            let over = (headings.len() as u16).min(composer.height);
+            let text = Rect {
+                y: composer.y + over,
+                height: composer.height - over,
+                ..composer
             };
             composer_at = first_row.map(|first| (text, first, width.min(measure())));
             // Keys in the pane: no cursor where they do not go.
@@ -22967,28 +22995,33 @@ impl App {
         Line::from(spans)
     }
 
-    /// A message quoted before what the person is writing, as a mail or a
-    /// GitHub reply quotes: `> ` before each of its lines, the first
-    /// [`QUOTE_LINES`] of them, a blank line, then the cursor. Quoted
-    /// after the quotes already there, so several read in the order
-    /// they were picked.
-    fn quote(&mut self, said: &str) {
-        let lines: Vec<&str> = said.trim().lines().collect();
-        let mut quoted: Vec<String> = (lines.iter().take(QUOTE_LINES))
-            .map(|line| format!("> {line}").trim_end().to_owned())
-            .collect();
-        if lines.len() > QUOTE_LINES {
-            quoted.push("> …".into());
-        }
-        let typed = self.input.trim().to_owned();
-        let (before, typed) = transcript::opening_quote(&typed);
-        let before = match before.is_empty() {
-            true => String::new(),
-            false => format!("{before}\n\n"),
+    /// A message quoted over what the person is writing, after those
+    /// quoted already, so several read in the order they were picked: one
+    /// row over the composer, which one backspace at the start of the
+    /// words takes away whole. The daemon copies the words of one it
+    /// `named` after the person's; a margin note, which nothing names,
+    /// goes as its words. One quoted already is not quoted twice.
+    fn quote(&mut self, said: &str, named: Option<Value>) {
+        let quote = Quote {
+            said: said.trim().to_owned(),
+            named,
         };
-        self.input
-            .set(&format!("{before}{}\n\n{typed}", quoted.join("\n")));
+        if !self.quotes.contains(&quote) {
+            self.quotes.push(quote);
+        }
         self.pane_keys = false;
+    }
+
+    /// The rows over the composer naming the messages quoted, each by
+    /// its first line, muted as the question an answer answers is.
+    fn quoting_over(&self, width: usize) -> Vec<Line<'static>> {
+        let room = width.saturating_sub("  quoting “”".width());
+        (self.quotes.iter())
+            .map(|quote| {
+                let first = quote.said.lines().next().unwrap_or_default().trim();
+                Line::from(format!("  quoting “{}”", transcript::cut(first, room))).dim()
+            })
+            .collect()
     }
 
     /// The profile the agent runs as, when it isn't its seat's own: a
@@ -24029,6 +24062,61 @@ struct Sent {
     then: Then,
 }
 
+/// A message quoted over what the person writes ([`App::quote`]).
+#[derive(Clone, Debug, PartialEq)]
+struct Quote {
+    /// Its words, whose first line the row over the composer shows.
+    said: String,
+    /// What `submit`'s `quotes` takes for it: `{bot, message}` for a
+    /// message with a number, `{bot, item}` for the agent's own words;
+    /// none for a margin note, which goes as its words ([`noted`]).
+    named: Option<Value>,
+}
+
+/// What names the message at `node` of `bot`'s history to the daemon, as
+/// `history_items` read it: its number, by its handle, where it has one,
+/// else its item.
+fn quoted(read: &Value, bot: &str, node: i64) -> Value {
+    let numbered = (read["handle"].as_str())
+        .and_then(|handle| handle.rsplit_once('/'))
+        .and_then(|(bot, message)| Some((bot, message.parse::<i64>().ok()?)));
+    match numbered {
+        Some((bot, message)) => json!({"bot": bot, "message": message}),
+        None => json!({"bot": bot, "item": node}),
+    }
+}
+
+/// `prompt` with the margin notes among `quotes` before the person's own
+/// words, quoted as Markdown quotes, the first [`QUOTE_LINES`] of each:
+/// a note has no number for the daemon to copy it by. An answer keeps its
+/// question first.
+fn noted(prompt: String, quotes: &[Quote]) -> String {
+    let notes: Vec<String> = (quotes.iter())
+        .filter(|quote| quote.named.is_none())
+        .map(|quote| {
+            let lines: Vec<&str> = quote.said.lines().collect();
+            let mut quoted: Vec<String> = (lines.iter().take(QUOTE_LINES))
+                .map(|line| format!("> {line}").trim_end().to_owned())
+                .collect();
+            if lines.len() > QUOTE_LINES {
+                quoted.push("> …".into());
+            }
+            quoted.join("\n")
+        })
+        .collect();
+    if notes.is_empty() {
+        return prompt;
+    }
+    let notes = notes.join("\n\n");
+    match asks::split(&prompt) {
+        Some((_, answer)) => {
+            let question = &prompt[..prompt.len() - answer.len()];
+            format!("{question}{notes}\n\n{answer}")
+        }
+        None => format!("{notes}\n\n{prompt}"),
+    }
+}
+
 /// What follows a message once the daemon took it ([`App::landed`]), or
 /// refused it ([`App::unsent`]).
 enum Then {
@@ -24039,6 +24127,7 @@ enum Then {
         typed: String,
         pictures: Vec<Option<attach::Picture>>,
         answering: Option<asks::Ask>,
+        quotes: Vec<Quote>,
     },
     /// The answer to a question, closed once it lands.
     Closes(asks::Ask),
@@ -24085,8 +24174,9 @@ enum Wrote {
     /// An answer to a call that waits on the person, what the daemon said
     /// of it, and the calls of this bot's round still waiting.
     Answered(Box<Answering>, agent_client::Result<Value>, Option<Value>),
-    /// A message read to quote where the person writes.
-    Quoted(String),
+    /// A message read to quote where the person writes: its words, and
+    /// what names it to the daemon.
+    Quoted(String, Value),
     /// A margin note the agent was told was taken away, and why the
     /// daemon refused to tell it.
     NoteClosed(String, Option<String>),
@@ -31633,22 +31723,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_quotes_the_message_before_what_is_being_written() {
-        let client = daemon_with(json!([])).await;
+    async fn a_reply_quotes_the_message_by_reference_over_what_is_being_written() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_items") => match asked["nodes"][0].as_i64() {
+                // The person's own message, which has a number.
+                Some(4) => json!({"items": [{"node": 4, "handle": "shop.lead/7",
+                    "item": {"role": "user", "content": "Merge it?"}}]}),
+                // The agent's words, which have none.
+                _ => json!({"items": [{"node": 9, "item": {"role": "assistant",
+                    "content": [{"type": "output_text", "text": "Merged it.\n\nThe tests pass."}]}}]}),
+            },
+            Some("submit") => {
+                seen.lock().unwrap().push(asked.clone());
+                json!({"message": 12, "turn": 12})
+            }
+            _ => json!({}),
+        })
+        .await;
         let mut app = app(client);
-        app.input.set("Yes, merge it");
-        let said: String = (1..=8).map(|n| format!("line {n}\n")).collect();
-        app.quote(&said);
-        let quoted = "> line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> …";
-        assert_eq!(&*app.input, format!("{quoted}\n\nYes, merge it"));
+        app.bot = "shop.lead".into();
+        app.input.set("Ship both");
+        app.press("reply/9").await;
+        app.beside_done().await;
+        app.press("reply/4").await;
+        app.beside_done().await;
+        // Picked again, it is quoted once.
+        app.press("reply/9").await;
+        app.beside_done().await;
+        // What is written stays as it was; each quote is a row over it, in
+        // the order picked, by its first line.
+        assert_eq!(&*app.input, "Ship both");
+        let over: Vec<String> = app.quoting_over(80).iter().map(Line::to_string).collect();
+        assert_eq!(over, ["  quoting “Merged it.”", "  quoting “Merge it?”"]);
+        // Sent, the daemon copies the words it names after the person's.
+        app.submit().await;
+        app.beside_done().await;
+        let asked = sent.lock().unwrap()[0].clone();
+        assert_eq!(asked["prompt"], "Ship both");
+        assert_eq!(
+            asked["quotes"],
+            json!([{"bot": "shop.lead", "item": 9}, {"bot": "shop.lead", "message": 7}])
+        );
+        assert!(app.quotes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backspace_at_the_start_of_the_words_takes_a_quote_away_whole() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let backspace = || Event::Key(event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let named = |n: i64| Some(json!({"bot": "shop.lead", "item": n}));
+        app.quote("First.", named(1));
+        app.quote("Second.\nmore", named(2));
+        app.input.set("ok");
+        // Inside the words it deletes a letter, as ever.
+        app.key(backspace()).await;
+        assert_eq!((&*app.input, app.quotes.len()), ("o", 2));
+        app.key(backspace()).await;
+        assert_eq!((&*app.input, app.quotes.len()), ("", 2));
+        // With none before the cursor, the newest quote goes whole.
+        app.key(backspace()).await;
+        assert_eq!(app.quotes.len(), 1);
+        assert_eq!(app.quotes[0].said, "First.");
+        app.input.set("ok");
+        app.input.home();
+        app.key(backspace()).await;
+        assert_eq!((&*app.input, app.quotes.len()), ("ok", 0));
+        // Ctrl+C drops the quotes with the words, before it quits.
+        app.quote("Again.", named(3));
         app.input.clear();
-        app.quote("Merged it.\n\nThe tests pass.");
-        assert_eq!(&*app.input, "> Merged it.\n>\n> The tests pass.\n\n");
-        // Another quoted goes after it, in the order picked, before what
-        // is being written.
-        app.input.set("> Merged it.\n\nShip both");
-        app.quote("Tagged v2.");
-        assert_eq!(&*app.input, "> Merged it.\n\n> Tagged v2.\n\nShip both");
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert!(app.quotes.is_empty() && !app.quit);
+    }
+
+    #[test]
+    fn a_margin_note_goes_as_its_words_before_the_person_s_and_after_a_question() {
+        let note = |said: &str| Quote {
+            said: said.into(),
+            named: None,
+        };
+        let message = Quote {
+            said: "Fixed.".into(),
+            named: Some(json!({"bot": "shop.lead", "item": 3})),
+        };
+        let said: String = (1..=8).map(|n| format!("line {n}\n")).collect();
+        let quotes = [note(said.trim()), message, note("✎ Plan\nShip it")];
+        assert_eq!(
+            noted("Yes".into(), &quotes),
+            "> line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> …\n\n\
+             > ✎ Plan\n> Ship it\n\nYes"
+        );
+        assert_eq!(noted("Yes".into(), &quotes[1..2]), "Yes");
+        assert_eq!(
+            noted("You asked (a1): Merge?\n\nYes".into(), &quotes[2..]),
+            "You asked (a1): Merge?\n\n> ✎ Plan\n> Ship it\n\nYes"
+        );
+    }
+
+    #[tokio::test]
+    async fn quotes_refused_with_their_message_come_back_in_front() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let quote = |said: &str| Quote {
+            said: said.into(),
+            named: Some(json!({"bot": "shop.lead", "item": said.len()})),
+        };
+        app.quote("since", quote("since").named);
+        let then = Then::Composed {
+            typed: "first".into(),
+            pictures: Vec::new(),
+            answering: None,
+            quotes: vec![quote("picked")],
+        };
+        app.unsent(String::new(), then, "refused".into());
+        let said: Vec<&str> = app.quotes.iter().map(|q| q.said.as_str()).collect();
+        assert_eq!(said, ["picked", "since"]);
     }
 
     #[tokio::test]
@@ -37673,6 +37868,7 @@ mod tests {
             typed: "look [Image #1] and [Image #2]".into(),
             pictures: vec![Some(picture(1)), Some(picture(2))],
             answering: None,
+            quotes: Vec::new(),
         };
         app.unsent(String::new(), then, "refused".into());
         assert_eq!(
@@ -37689,6 +37885,7 @@ mod tests {
             typed: "then this".into(),
             pictures: Vec::new(),
             answering: None,
+            quotes: Vec::new(),
         };
         app.unsent(String::new(), then, "refused".into());
         assert_eq!(
