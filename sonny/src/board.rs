@@ -1142,6 +1142,26 @@ mod tests {
         };
         assert_eq!(listed(json!({"for": ["reviewer"]})), 0);
         assert_eq!(listed(json!({"for": [{"exists": false}]})), 1);
+        // A search sees where it stands now too, never what a post once said.
+        let coder =
+            json!({"act": {"thread": "store", "do": "assign", "text": "y", "for": "coder"}});
+        lead(coder).unwrap();
+        let found = |who: &str| {
+            let filter = json!({"for": [who]});
+            let found = commons::call(
+                &home,
+                "x.y",
+                None,
+                "x.y",
+                None,
+                Some("x"),
+                &json!({"search": "", "filter": filter}),
+            )
+            .unwrap();
+            found["threads"].as_array().map_or(0, Vec::len)
+        };
+        assert_eq!(found("reviewer"), 0);
+        assert_eq!(found("coder"), 1);
     }
 
     #[test]
