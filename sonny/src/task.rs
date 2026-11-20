@@ -80,6 +80,9 @@ pub struct Start {
     /// The daemon's providers, as its `ready` names them, from which the
     /// tools a task gets by default are known: null when none were read.
     pub providers: Value,
+    /// The board the task works from, which it follows and its brief
+    /// names.
+    pub board: Option<String>,
 }
 
 /// Start the task `start` asks for in `project`, whose lead's folder is
@@ -473,7 +476,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         Some((from, to)) => in_copy(&brief, from, to),
         None => (brief, 0),
     };
-    let brief = brief.join(" ");
+    let mut brief = brief.join(" ");
+    if let Some(board) = &start.board {
+        brief.push_str(&board_line(board));
+    }
     // The commons threads that share the brief's words, named under it.
     let brief = match (crate::commons::pointer_on(), std::env::var_os("HOME")) {
         (true, Some(home)) => crate::commons::pointed(Path::new(&home), &brief),
@@ -550,6 +556,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         let started: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
         if let Some(id) = started["bot_id"].as_i64() {
             let _ = crate::title::note(store, name, id, &crate::title::of_message(&start.brief));
+            // The board's posts reach it as the commons' do, its items
+            // opening as they come.
+            if let Some(board) = &start.board {
+                let follow = crate::lookout::subs::Sub::board(board, Some(id));
+                let _ = crate::lookout::subs::ensure(store, name, follow);
+            }
         }
         match profile {
             Some(profile) => {
@@ -1241,6 +1253,15 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
             Some((name.to_owned(), status.to_owned()))
         })
         .collect()
+}
+
+/// The line a task working from `board` finds under its brief.
+pub fn board_line(board: &str) -> String {
+    format!(
+        "\n\nYou work from the board {board}: board with open \"{board}\" lists its open items. \
+         Take one with act claim, close it with act done and what you made, then take the next; \
+         you hear of items opening there. The commons skill's Boards section says more."
+    )
 }
 
 /// Whether the agent `name`, which the daemon knew as `id` when given,
@@ -2518,6 +2539,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_holder_is_gone_once_closed_or_no_longer_listed() {
+        let open = json!({"name": "shop.w1", "id": 7, "status": "idle"});
+        let closed = json!({"name": "shop.w1", "id": 7, "closed_ms": 1});
+        assert!(!gone_from(std::slice::from_ref(&open), "shop.w1", Some(7)));
+        assert!(gone_from(&[closed], "shop.w1", Some(7)));
+        assert!(gone_from(&[], "shop.w1", Some(7)));
+        // Another agent given its name since is not the holder.
+        assert!(gone_from(std::slice::from_ref(&open), "shop.w1", Some(8)));
+        assert!(!gone_from(&[open], "shop.w1", None));
+    }
+
+    #[test]
+    fn a_task_on_a_board_is_told_how_to_take_its_items() {
+        let line = board_line("shop/errors");
+        assert!(line.contains(r#"board with open "shop/errors""#));
+        assert!(line.contains("act claim"));
+    }
+
+    #[test]
     fn a_tighter_row_gates_the_task_as_sonny_gates_the_row() {
         use agent_client::config::WebSearch;
         let row = crate::approvals::find("ask").unwrap();
@@ -3108,6 +3148,7 @@ mod tests {
             env: vec![("AGENT_STORE".into(), store.to_string_lossy().into_owned())],
             made_by: None,
             providers: Value::Null,
+            board: None,
         };
         // The store a window's `--store` names, not the one Sonny's own
         // environment would find.

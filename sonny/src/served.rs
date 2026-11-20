@@ -140,17 +140,13 @@ pub fn tools(role: Role) -> Vec<Value> {
 fn start() -> Value {
     json!({
         "name": START,
-        "description": "Start a new task. A lead starts tasks for the person's work; any other agent starts one \
-            only for help inside its own brief, such as a review, research or a watch on something, and asks its \
-            lead for a task for separate work. Unless this project's tasks all work in one folder, Sonny makes the \
-            task a git worktree of its lead's repository on the branch agent/NAME, from the last commit (a task's \
-            own helper, from the last commit on that task's branch), so uncommitted changes are not in it; outside git, the task works in this folder itself, shared with you and \
-            its other tasks. With own_folder, it gets an empty folder of its own instead, where it makes what it \
-            changes, such as a checkout made with this folder's tooling, as the brief says how, and reads this \
-            folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
-            memory, as the profile named, and the brief as its first message. Paths in this folder that the brief \
-            names are turned into the task's own. The result is the task's turn handle; its work comes back on \
-            its branch, here already as it commits.",
+        "description": "Start a new task. A lead starts tasks for the person's work; another agent only for \
+            help inside its own brief (a review, research, a watch), asking its lead for separate work. Unless \
+            this project's tasks share one folder, the task gets a git worktree of its lead's repository on \
+            branch agent/NAME from the last commit (a task's helper: from its task's branch), so uncommitted \
+            changes are not in it; outside git, it shares this folder. It starts with this folder's rules, skills \
+            and memory, as the profile named, the brief its first message, paths in this folder it names turned \
+            into its own. The result is its turn handle; its work comes back on its branch as it commits.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -165,29 +161,29 @@ fn start() -> Value {
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
                 "permissions": {"type": "string", "minLength": 1,
-                    "description": "One of the person's /permissions modes to hold the task tighter \
-                        than you, such as one that refuses what would need approval; one looser \
-                        than yours is refused. Without one, it works as you do."},
+                    "description": "One of the person's /permissions modes holding the task tighter than \
+                        you; a looser one is refused. Without one, it works as you do."},
                 "folder": {"type": "string", "minLength": 1,
-                    "description": "A folder inside this one to start the task at instead of here, \
-                        relative or absolute, in a git repository, such as one this folder holds: the task \
-                        then gets a worktree of that repository and works at that folder in it."},
+                    "description": "A folder inside this one, in a git repository, to start at instead: \
+                        the task gets a worktree of that repository and works there."},
                 "own_folder": {"type": "boolean",
-                    "description": "An empty folder of the task's own instead of a worktree or this folder: \
-                        for work that makes its own copy of what it changes, such as a checkout of another \
-                        branch made with this folder's tooling, or that must not touch this folder."},
+                    "description": "An empty folder of its own instead, for work that makes its own copy \
+                        of what it changes as the brief says, or must not touch this folder; it reads this one in place."},
                 "setup": {"type": "boolean",
-                    "description": "Run the folder's .agents/setup in the copy first: true for a task \
-                        that will change files, false for one that only reads."},
+                    "description": "Run this folder's .agents/setup in its folder first: true for a task \
+                        that will change files."},
                 "model": {"type": "string", "minLength": 1,
                     "description": format!("PROVIDER/MODEL, when the work suits another model than yours; \
                         without one, the project's task_model, else yours.{}", noted_models())},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
+                "agents": {"type": ["integer", "array"], "minimum": 1, "items": {"type": "string"},
+                    "description": "For several agents: a count, or a profile each. They are NAME.1 on."},
+                "board": {"type": "string", "minLength": 1,
+                    "description": "A board of this project whose items its agents take."},
                 "reason": {"type": "string", "minLength": 1,
-                    "description": "Why this is work none of your tasks still there should take, when you \
-                        have any: a task given more work keeps what it learned. Without it, a start while \
-                        you have tasks is refused with the list of them."}
+                    "description": "Why none of your tasks still there should take this work, since a task \
+                        given more keeps what it learned; without it, a start while you have tasks is refused, listing them."}
             },
             "required": ["name", "brief"],
             "additionalProperties": false
@@ -196,6 +192,28 @@ fn start() -> Value {
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
     })
+}
+
+/// The profiles a start's agents are made as, one an agent: `agents` as
+/// a count of agents made as `profile`, or a list of profiles.
+fn agents_of(agents: &Value, profile: Option<String>) -> Result<Vec<Option<String>>, String> {
+    let refused = || "agents is a count of 1 or more, or a list of profiles".to_owned();
+    match agents {
+        Value::Null => Ok(vec![profile]),
+        Value::Number(count) => match count.as_u64() {
+            Some(count) if count >= 1 => Ok(vec![profile; count as usize]),
+            _ => Err(refused()),
+        },
+        Value::Array(list) if !list.is_empty() => (list.iter())
+            .map(|p| {
+                (p.as_str().map(str::trim))
+                    .filter(|p| !p.is_empty())
+                    .map(|p| Some(p.to_owned()))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(refused),
+        _ => Err(refused()),
+    }
 }
 
 /// The most of the person's model notes the start tool carries.
@@ -290,18 +308,16 @@ fn follows() -> Value {
     json!({
         "name": FOLLOWS,
         "description": "Your follows in the person's lookout, which tells you what happens in what you \
-            follow, in a message sent by lookout that joins your running turn or starts one: each event a \
-            line [source · topic · from · time], then its text. A follow watches the tasks of an agent (every agent it or \
-            its tasks made) or agents by name, through the tasks source, each agent its topic: messages others \
-            write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
-            notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside, each \
-            by name, or one topic of a source as NAME:TOPIC, and Sonny's own: the commons, each thread a topic \
-            (posting in a thread follows it as commons.THREAD, removing that leaves it), memory, each fact \
-            saved or removed, and links, each linked machine that comes or goes. \
-            Add steer yourself for what you own; a filter or a digest only when the person asks: \
-            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name, \
-            as {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
-            it lists them all, the sources there are and their events' recent fields.",
+            follow in a message from lookout that joins your turn or starts one: each event a line \
+            [source · topic · from · time], then its text. A follow watches an agent's tasks (every agent it or \
+            its tasks made) or agents by name, each its topic: messages others write in them, questions to the \
+            person, calls awaiting their approval, margin notes, each turn's end with its reply. It also hears \
+            sources by name, or NAME:TOPIC, the person's and Sonny's own: the commons, each thread a topic \
+            (posting in one follows it as commons.THREAD), memory, each fact saved or removed, and links, each \
+            linked machine coming or going. Add steer for what you own; a filter or a digest only when the \
+            person asks: what a filter leaves out you never hear, a digest makes you late. Add or remove one by \
+            name, as {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with \
+            neither, it lists them, the sources there are and their events' recent fields.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -317,23 +333,19 @@ fn follows() -> Value {
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
-                            "description": "Only the events this matches are heard, its sources' and its agents' \
-                                alike. A task's event has type (wrote, turn.ended, question, approval, \
-                                margin), bot, maker, from, turn, text, status (completed, failed, \
-                                stopped, interrupted), done, asked_by (you, the person, an agent's name, \
-                                automation), options, command, call, id and removed (a margin note's). \
-                                An event pattern as \
-                                AWS EventBridge writes one. Each field maps to a list of values, \
-                                any of which will do, or to a pattern for an object field; every field \
-                                must match, and a field that is a list matches when any item does. A value is a \
-                                string, number, boolean or null, or one of EventBridge's matchers: prefix, \
-                                suffix, wildcard, equals-ignore-case, anything-but, numeric or exists; \
-                                $or takes any of several patterns. \
-                                As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
+                            "description": "Only events this matches are heard, its sources' and agents' alike. \
+                                A task's event has type (wrote, turn.ended, question, approval, margin), bot, \
+                                maker, from, turn, text, status (completed, failed, stopped, interrupted), done, \
+                                asked_by (you, the person, an agent, automation), options, command, call, id and \
+                                removed. An AWS EventBridge event pattern: each field maps to a list of values, \
+                                any of which match, or a pattern for an object field; all must match, a list \
+                                field when any item does. Values are strings, numbers, booleans, null or the \
+                                matchers prefix, suffix, wildcard, equals-ignore-case, anything-but, numeric, \
+                                exists; $or takes several patterns. As {\"paths\": [{\"prefix\": \"src/\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
-                            "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
-                                its sources' own digest. What steers never waits: the person's words in a task, a question \
-                                to them, an approval only they can give, and what steer matches."},
+                            "description": "Tell what it hears at most once this long, as 15m, in place of its \
+                                sources' digest. What steers never waits: the person's words, questions and approvals \
+                                for them, and what steer matches."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, goes at once, \
                                 past any digest, as the person's words do. As \
@@ -362,13 +374,11 @@ fn automations() -> Value {
         // to, and none for a look.
         "steps": true,
         "description": "Your automations, which wake an agent later, repeatedly, or when something \
-            happens, even with Sonny closed. Each run gives the agent the message in its own conversation, \
-            after a line saying when and why it ran; a run waits for the agent's work, one run of an automation \
-            at a time. Add one, or remove, run or show one by name; with none, the result lists yours (those \
-            that wake you, answer to you or start an agent you added) with any problems. Adding the same one \
-            again changes nothing; a different one under a name in use is refused with the field that differs \
-            unless replace is set. Write the message as what to check and when to stop, and to remove its \
-            automation once the work is done.",
+            happens, even with Sonny closed. Each run gives the agent the message in its own conversation after \
+            a line saying when and why, one run at a time. Add one, or remove, run or show one by name; with \
+            none, it lists yours with any problems. The same one again changes nothing; a different one under a \
+            name in use is refused with the field that differs unless replace is set. Write the message as what \
+            to check, when to stop, and to remove its automation once done.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -410,15 +420,12 @@ fn automations() -> Value {
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
                         "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
-                            "description": "A cap on the tokens of each turn a run starts, counting every request's \
-                                input with the agent's history, so a cap below that history ends every run on \
-                                its first reply. Set one only when the person asks for a spending limit."},
+                            "description": "Caps each run's turn tokens, every request's input and history counted, \
+                                so one below the history ends each run at its first reply. Only when the person asks."},
                         "shadow": {"type": "boolean",
-                            "description": "A dry run, as when moving a job from elsewhere onto an automation: \
-                                each run goes to a read-only copy of the agent, where anything past \
-                                reading is refused rather than asked about, and its answer comes to you \
-                                (or reply_to) as a report of what it would have done. Replace it without \
-                                shadow once the reports match the job."},
+                            "description": "A dry run: each run goes to a read-only copy of the agent, anything \
+                                past reading refused, its answer a report to you (or reply_to) of what it would \
+                                have done. Replace it without shadow once the reports match the job."},
                         "live": {"type": "boolean",
                             "description": "The message is a template like a live memory fact's, filled as each run starts."},
                         "replace": {"type": "boolean",
@@ -560,43 +567,33 @@ pub fn commons() -> Value {
 
 pub fn board() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
-    let board = json!({"type": "string", "minLength": 1,
-        "description": "A board: its project's name, then parts joined by /, as shop/typed-errors."});
-    let labels = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]},
-        "description": "Labels saying what the item is, as {\"kind\": \"bug\"}."});
+    let board = json!({"type": "string", "minLength": 1, "description": "As shop/typed-errors."});
+    let labels = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]}});
     json!({
         "name": BOARD,
-        "description": "Boards: work in the commons that agents take, which the commons skill's Boards \
-            section describes. An item is a commons thread on a board, with where it stands: open, \
-            waiting on its needs, claimed by one agent, done, failed or canceled. open lists a board's \
-            open items; add starts one, as the commons tool's post starts a thread; act takes one, \
-            closes it or changes it, as reply adds to a thread, or shows posts you missed. Only the \
-            board's project's agents take items; anyone reads and posts in their threads with the \
-            commons tool.",
+        "description": "Boards: work in the commons agents take, as the commons skill's Boards section says. \
+            An item is a thread on a board: open, waiting on needs, claimed, done, failed or canceled. \
+            open lists a board's open items, add starts one as post does, act moves one as reply adds. \
+            Only the board's project's agents take items.",
         "parameters": {
             "type": "object",
             "properties": {
-                "open": {"type": "string", "minLength": 1,
-                    "description": "A board: its open items, newest first, as many as fit, with next where the rest start."},
-                "filter": {"type": "object",
-                    "description": "With open: narrows its items as the commons tool's filter does, \
-                        on an item's labels, for, needs, by and the rest, as {\"labels\": {\"kind\": [\"bug\"]}}."},
-                "from": {"type": "integer", "minimum": 0,
-                    "description": "With open: where to start, as an earlier answer's next says."},
+                "open": board.clone(),
+                "filter": {"type": "object", "description": "With open, as the commons tool's."},
+                "from": {"type": "integer", "minimum": 0},
                 "add": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
-                            "description": "The item's thread's file name, which no thread has yet."},
+                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$"},
                         "title": {"type": "string", "minLength": 1, "maxLength": crate::board::TITLE_CHARS,
-                            "description": "What to do, its verb first, as Fix the login redirect."},
+                            "description": "Its verb first."},
                         "text": text.clone(),
-                        "board": board.clone(),
+                        "board": board,
                         "needs": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Items on the board that are done before this one opens."},
+                            "description": "Items done before it opens."},
                         "labels": labels.clone(),
                         "for": {"type": "string", "minLength": 1,
-                            "description": "The agent, or the profile, that alone may take it."}
+                            "description": "The agent or profile that alone takes it."}
                     },
                     "required": ["name", "title", "text", "board"],
                     "additionalProperties": false
@@ -605,16 +602,11 @@ pub fn board() -> Value {
                     "type": "object",
                     "properties": {
                         "thread": {"type": "string", "minLength": 1},
-                        "do": {"type": "string", "enum": &crate::board::ACTIONS[1..],
-                            "description": "claim takes an open item, or one whose holder was closed; \
-                                done, fail or release closes or gives back the one you hold; cancel one you \
-                                added that nobody holds; reopen a failed one; label or assign changes one; \
-                                item puts a thread already there on a board."},
+                        "do": {"type": "string", "enum": &crate::board::ACTIONS[1..]},
                         "text": text,
-                        "board": {"type": "string", "minLength": 1, "description": "With item: the board."},
+                        "board": {"type": "string", "minLength": 1},
                         "labels": labels,
-                        "for": {"type": "string",
-                            "description": "With assign: the agent or profile that alone may take it; empty for anyone."}
+                        "for": {"type": "string"}
                     },
                     "required": ["thread", "do", "text"],
                     "additionalProperties": false
@@ -760,25 +752,74 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 },
                 false => Value::Null,
             };
-            let start = crate::task::Start {
-                name: text("name").unwrap_or_default(),
-                brief: text("brief").unwrap_or_default(),
-                profile: text("profile"),
-                permissions: text("permissions"),
-                setup: arguments["setup"] == true,
-                model: text("model"),
-                effort: text("effort"),
-                own_folder: arguments["own_folder"] == true,
-                here: false,
-                folder: text("folder"),
-                // A task's own helper builds on its work.
-                builds_on: (!line.lead).then(|| caller.clone()),
-                env: Vec::new(),
-                made_by: None,
-                providers,
-            };
-            let started = crate::task::start(&line.folder, &line.project, &caller, &start)
-                .map_err(|e| ("task_not_started", e))?;
+            // The agents it starts with, each made as its profile: one, as
+            // profile names, unless agents says more.
+            let profiles = agents_of(&arguments["agents"], text("profile"))
+                .map_err(|e| ("invalid_arguments", e))?;
+            // A board its agents take items from: their own project's.
+            let board = text("board");
+            if let Some(board) = &board {
+                crate::board::valid_board(board).map_err(|e| ("invalid_arguments", e))?;
+                if crate::board::project_of(board) != line.project {
+                    return Err((
+                        "invalid_arguments",
+                        format!(
+                            "{board} is not a board of {}: a task works from its own project's, \
+                             whose items its agents take",
+                            line.project
+                        ),
+                    ));
+                }
+            }
+            let short = text("name").unwrap_or_default();
+            // A last part all digits names one of a task's several agents.
+            if (short.rsplit('.').next())
+                .is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
+            {
+                return Err((
+                    "task_not_started",
+                    format!(
+                        "{short:?} ends in a number, as one of a task's several agents is \
+                         named; give the task another name"
+                    ),
+                ));
+            }
+            let several = profiles.len() > 1;
+            let mut said: Vec<String> = Vec::new();
+            for (n, profile) in profiles.into_iter().enumerate() {
+                let start = crate::task::Start {
+                    // Several are the task's name and their number from 1.
+                    name: match several {
+                        true => format!("{short}.{}", n + 1),
+                        false => short.clone(),
+                    },
+                    brief: text("brief").unwrap_or_default(),
+                    profile,
+                    permissions: text("permissions"),
+                    setup: arguments["setup"] == true,
+                    model: text("model"),
+                    effort: text("effort"),
+                    own_folder: arguments["own_folder"] == true,
+                    here: false,
+                    folder: text("folder"),
+                    // A task's own helper builds on its work.
+                    builds_on: (!line.lead).then(|| caller.clone()),
+                    env: Vec::new(),
+                    made_by: None,
+                    providers: providers.clone(),
+                    board: board.clone(),
+                };
+                match crate::task::start(&line.folder, &line.project, &caller, &start) {
+                    Ok(started) => said.push(started),
+                    Err(e) if said.is_empty() => return Err(("task_not_started", e)),
+                    // Those started work on; the rest is said, not undone.
+                    Err(e) => {
+                        said.push(format!("{} did not start: {e}", start.name));
+                        break;
+                    }
+                }
+            }
+            let started = said.join("\n\n");
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
@@ -3987,6 +4028,21 @@ mod tests {
         ];
         for item in &own {
             assert!(!outside(item), "{item}");
+        }
+    }
+
+    #[test]
+    fn a_start_makes_one_agent_or_as_many_as_agents_says() {
+        let worker = Some("worker".to_owned());
+        assert_eq!(
+            agents_of(&Value::Null, worker.clone()).unwrap(),
+            [worker.clone()]
+        );
+        assert_eq!(agents_of(&json!(3), None).unwrap(), [None, None, None]);
+        let named = agents_of(&json!(["worker", "reviewer"]), None).unwrap();
+        assert_eq!(named, [worker, Some("reviewer".to_owned())]);
+        for bad in [json!(0), json!([]), json!([""]), json!("two")] {
+            assert!(agents_of(&bad, None).is_err(), "{bad}");
         }
     }
 

@@ -94,6 +94,27 @@ impl Sub {
         }
     }
 
+    /// What a task's agent working from a board follows: the commons'
+    /// posts on its items, at the commons source's digest, and an item
+    /// opening there as it comes, cutting into a busy turn, so a worker
+    /// that finished one hears of the next.
+    pub fn board(board: &str, owner: Option<i64>) -> Sub {
+        Sub {
+            name: format!("board.{}", board.replace('/', ".")),
+            tasks_of: Vec::new(),
+            agents: Vec::new(),
+            sources: vec![COMMONS_SOURCE.to_owned()],
+            filter: Some(serde_json::json!({"board": [board]})),
+            digest: None,
+            steer: Some(serde_json::json!({"opened": [{"exists": true}]})),
+            owner,
+            until: None,
+            runs: None,
+            made: None,
+            outlives_close: true,
+        }
+    }
+
     /// Which subscription it is, for its counts: all it says, and the
     /// subscriber bot it is for.
     pub fn identity(&self, subscriber: Option<i64>) -> String {
