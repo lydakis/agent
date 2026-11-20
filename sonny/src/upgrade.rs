@@ -236,6 +236,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::lookout::subs::COMMONS_OUTLIVE_CLOSE,
         retire: "0.12.0",
     },
+    // The profile Sonny noted beside the store for each task and lead it
+    // started goes onto the agent, which the daemon keeps now (0.10.3).
+    Migration {
+        id: crate::task::PROFILES_ON_AGENTS,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -265,7 +271,8 @@ pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) 
     let nested = !done(&record, crate::approvals::NESTED_GONE);
     let migrated = home.as_ref().map(|home| home.join(".agent/sonny/migrated"));
     let projects = (migrated.as_ref()).is_some_and(|it| !done(it, crate::commons::PROJECTS));
-    if !nested && !projects {
+    let profiles = !done(&record, crate::task::PROFILES_ON_AGENTS);
+    if !nested && !projects && !profiles {
         return;
     }
     let store = store.to_path_buf();
@@ -273,6 +280,10 @@ pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) 
         let (bots, whole) = crate::lookout::listed(&client).await;
         if !whole {
             return;
+        }
+        // The profiles noted for the agents Sonny started go onto them.
+        if profiles && crate::task::profiles_onto_agents(&client, &bots, &store).await {
+            once(&record, crate::task::PROFILES_ON_AGENTS, || true);
         }
         // What Sonny's walk of the repositories inside agents' folders
         // gave them leaves their sandboxes.

@@ -2543,7 +2543,7 @@ async fn setup_lead(
     if let Ok((taken, left)) = project::review(
         Path::new(&workspace),
         record["instructions"].as_str().unwrap_or_default(),
-        project::chosen(&agent.options.store, &lead.bot).as_deref(),
+        record["profile"].as_str(),
     ) {
         left_out = left;
         if let Some(text) = taken {

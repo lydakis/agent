@@ -7,6 +7,7 @@ The daemon brings a store forward by itself when it starts, one schema at a
 time. Each of those steps has its way back here, newest first, so a release
 that knows only SCHEMA opens the store with nothing lost that it can hold:
 
+    110 -> 109  no `profile` on each bot
     109 -> 108  nothing: 0.10.2 (108) reads `yields`
     108 -> 107  the `namespace`, `speeds` and `context_windows` settings go
     107 -> 106  instructions back in each bot's row; `yields` is `lift` again
@@ -28,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import store_lift_yields  # noqa: E402
 
-NEWEST = 109
+NEWEST = 110
 OLDEST = 106
 
 
@@ -38,6 +39,10 @@ def run(conn, script):
     for statement in script.split(";"):
         if statement.strip():
             conn.execute(statement)
+
+
+def back_110(conn):
+    run(conn, "ALTER TABLE bots DROP COLUMN profile")
 
 
 def back_109(conn):
@@ -75,7 +80,7 @@ def back_107(conn):
 
 
 # Each schema's way back to the one before it.
-BACK = {109: back_109, 108: back_108, 107: back_107}
+BACK = {110: back_110, 109: back_109, 108: back_108, 107: back_107}
 
 
 def down(store, to, dry=False):

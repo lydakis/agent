@@ -59,6 +59,7 @@ fn binding() -> Binding<'static> {
         declared: None,
         request_id: None,
         starts_line: false,
+        profile: None,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -11799,6 +11800,7 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
         settings: settings.clone(),
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     {
@@ -11845,6 +11847,7 @@ fn schema_98_hidden_senders_become_an_empty_trailer() {
         settings: settings.clone(),
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     {
@@ -12009,6 +12012,7 @@ fn schema_100_declared_tools_move_to_lists_by_digest() {
                 Binding {
                     request_id: Some("once"),
                     starts_line: false,
+                    profile: None,
                     ..binding()
                 },
             )
@@ -12043,6 +12047,7 @@ fn schema_100_declared_tools_move_to_lists_by_digest() {
                 declared: Some(&list),
                 request_id: Some("once"),
                 starts_line: false,
+                profile: None,
                 ..binding()
             },
         )
@@ -17284,6 +17289,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
     let keyed = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     let (bob, event) = db.create("Bob", Some("/synthetic"), keyed()).unwrap();
@@ -17318,6 +17324,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
                 Binding {
                     request_id,
                     starts_line: false,
+                    profile: None,
                     ..binding()
                 },
             )
@@ -17370,6 +17377,7 @@ fn a_resent_keyed_fork_gets_its_fork_wherever_the_source_moved() {
     let made = Binding {
         request_id: Some("branch"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     db.create("Made", Some("/synthetic"), made).unwrap();
@@ -17406,6 +17414,7 @@ fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
     let keyed = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     let (kay, _) = db.create("Kay", Some("/synthetic"), keyed()).unwrap();
@@ -17435,6 +17444,7 @@ fn schema_43_bots_were_made_without_a_key() {
     let keyed = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     assert_eq!(
@@ -17594,6 +17604,7 @@ fn a_keyed_creation_resends_after_its_instructions_change() {
     let made = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     let (bot, _) = db.create("Bob", None, made()).unwrap();
@@ -17618,6 +17629,7 @@ fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
     let made = || Binding {
         request_id: Some("once"),
         starts_line: false,
+        profile: None,
         ..binding()
     };
     {
@@ -23561,6 +23573,7 @@ fn schema_109_names_a_lifted_tool_yields() {
                     declared: Some(declared),
                     request_id: Some("once"),
                     starts_line: false,
+                    profile: None,
                     ..binding()
                 },
             )
@@ -23629,6 +23642,7 @@ fn schema_109_names_a_lifted_tool_yields() {
                 declared: Some(&list),
                 request_id: Some("once"),
                 starts_line: false,
+                profile: None,
                 ..binding()
             },
         )
@@ -24304,4 +24318,105 @@ fn a_held_step_of_a_lifted_call_ends_with_its_turn() {
         let calls = db.tool_calls("sonny", 0, 10).unwrap();
         assert_eq!(calls["calls"][0]["call_id"], "c1", "{calls}");
     }
+}
+
+/// Schema 110: the profile a bot was composed from, as its client named
+/// it, is kept on the bot when it is made, shown by `inspect`, its
+/// `created` event and `bots` pages, and kept by a fork; a keyed resend
+/// naming another is another request. `configure` names another, or none.
+#[test]
+fn a_bot_keeps_the_profile_it_was_made_in() {
+    let mut db = db();
+    let (made, event) = db
+        .create(
+            "shop.fix",
+            Some("/synthetic"),
+            Binding {
+                profile: Some("reviewer"),
+                request_id: Some("fix"),
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!(made.profile.as_deref(), Some("reviewer"));
+    assert_eq!(event.unwrap()["data"]["profile"], json!("reviewer"));
+    db.create("shop.plain", Some("/synthetic"), binding())
+        .unwrap();
+    let record = serde_json::to_value(db.inspect("shop.plain").unwrap()).unwrap();
+    assert!(record.get("profile").is_none(), "{record}");
+    let (_, forked) = db
+        .fork("shop.fix", "shop.fix-copy", Fork::default())
+        .unwrap();
+    assert_eq!(forked.unwrap()["data"]["profile"], json!("reviewer"));
+    let page = db
+        .list(None, 256, Some("shop.*"), false, None, false, None)
+        .unwrap();
+    let listed = |name: &str| {
+        (page["bots"].as_array().unwrap().iter())
+            .find(|bot| bot["name"] == name)
+            .unwrap()
+            .get("profile")
+            .cloned()
+    };
+    assert_eq!(listed("shop.fix"), Some(json!("reviewer")));
+    assert_eq!(listed("shop.fix-copy"), Some(json!("reviewer")));
+    assert_eq!(listed("shop.plain"), None);
+    // The same request again gets the bot it made; another profile is
+    // another request.
+    let mut again = |profile| {
+        db.create(
+            "shop.fix",
+            Some("/synthetic"),
+            Binding {
+                profile,
+                request_id: Some("fix"),
+                ..binding()
+            },
+        )
+    };
+    assert_eq!(again(Some("reviewer")).unwrap().1, None);
+    let refused = again(Some("task")).unwrap_err();
+    assert_eq!(refused.code, "idempotency_conflict");
+    assert_eq!(refused.facts.unwrap()["field"], json!("profile"));
+    // Named again, or let go.
+    assert!(db.set_profile("shop.plain", None, Some("task")).unwrap());
+    assert!(!db.set_profile("shop.plain", None, Some("task")).unwrap());
+    assert_eq!(
+        db.inspect("shop.plain").unwrap().profile.as_deref(),
+        Some("task")
+    );
+    assert!(db.set_profile("shop.fix", None, None).unwrap());
+    assert_eq!(db.inspect("shop.fix").unwrap().profile, None);
+}
+
+/// Schema 110: a store from before it takes the profile column at start,
+/// the bots made before it with none. release/store_down.py takes it back.
+#[test]
+fn a_store_from_109_takes_profiles_with_none_on_its_bots() {
+    let dir = std::env::temp_dir().join(format!("agent-schema110-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.sqlite");
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("shop.fix", Some("/synthetic"), binding()).unwrap();
+    }
+    // The store as 109 wrote it: what store_down.py's step leaves.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE bots DROP COLUMN profile; PRAGMA user_version=109;")
+        .unwrap();
+    let has_column = || {
+        count(
+            &path,
+            "SELECT COUNT(*) FROM pragma_table_info('bots') WHERE name='profile'",
+        )
+    };
+    assert_eq!(has_column(), 0);
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(count(&path, "PRAGMA user_version"), i64::from(Database::SCHEMA));
+    assert_eq!(has_column(), 1);
+    assert_eq!(db.inspect("shop.fix").unwrap().profile, None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

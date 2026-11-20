@@ -1354,6 +1354,7 @@ mod tests {
                             declared: None,
                             request_id: None,
                             starts_line: false,
+                            profile: None,
                         },
                     )?;
                 }
@@ -1528,6 +1529,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 db.connection().execute("DELETE FROM events", [])?;
@@ -1744,6 +1746,7 @@ mod tests {
                         declared: None,
                         request_id: None,
                         starts_line: false,
+                        profile: None,
                     },
                 )?;
                 let options = TurnOptions {
