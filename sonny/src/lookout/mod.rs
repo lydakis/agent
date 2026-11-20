@@ -2201,13 +2201,16 @@ pub(crate) async fn listed(client: &Client) -> (Vec<Value>, bool) {
     let mut bots = Vec::new();
     let mut after = Value::Null;
     loop {
-        let Ok(page) = client
+        let Ok(mut page) = client
             .request("bots", json!({"limit": 256, "after": after}))
             .await
         else {
             return (bots, false);
         };
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        // Taken, not copied: every agent's whole row.
+        if let Value::Array(page) = page["bots"].take() {
+            bots.extend(page);
+        }
         match &page["next_after"] {
             Value::Null => return (bots, true),
             next => after = next.clone(),

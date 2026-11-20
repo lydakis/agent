@@ -26254,38 +26254,56 @@ mod tests {
         }
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
-        let client = daemon_answering(move |ask| {
-            seen.lock().unwrap().push(ask.clone());
-            json!({"bot": ask["bot"], "changed": ["profile"]})
-        })
-        .await;
         // One that has a profile of its own keeps it; one gone has none
         // to take.
         let bots = [
             json!({"name": "shop.fix", "bot_id": 2}),
             json!({"name": "shop.kept", "bot_id": 3, "profile": "lead"}),
         ];
+        let client = daemon_answering(move |ask| {
+            seen.lock().unwrap().push(ask.clone());
+            match ask["op"].as_str() {
+                Some("bots") => {
+                    let named = (bots.iter())
+                        .filter(|bot| (ask["names"].as_array().unwrap()).contains(&bot["name"]));
+                    json!({"bots": named.collect::<Vec<_>>(), "next_after": null})
+                }
+                _ => json!({"bot": ask["bot"], "changed": ["profile"]}),
+            }
+        })
+        .await;
         // A note that cannot be read leaves every note where it is, for
         // the next start.
         std::fs::create_dir(notes.join("shop.unread")).unwrap();
-        assert!(!task::profiles_onto_agents(&client, &bots, &store).await);
+        assert!(!task::profiles_onto_agents(&client, &store).await);
         assert!(notes.join("shop.fix").exists());
         assert!(asked.lock().unwrap().is_empty());
         std::fs::remove_dir(notes.join("shop.unread")).unwrap();
-        assert!(task::profiles_onto_agents(&client, &bots, &store).await);
-        let asked: Vec<Value> = (asked.lock().unwrap().iter())
+        assert!(task::profiles_onto_agents(&client, &store).await);
+        let said: Vec<Value> = (asked.lock().unwrap().iter())
             .map(|ask| {
-                json!({"op": ask["op"], "bot": ask["bot"], "bot_id": ask["bot_id"],
-                "profile": ask["profile"]})
+                let mut names: Vec<&str> = (ask["names"].as_array().into_iter().flatten())
+                    .filter_map(Value::as_str)
+                    .collect();
+                names.sort_unstable();
+                json!({"op": ask["op"], "names": names, "bot": ask["bot"],
+                "bot_id": ask["bot_id"], "profile": ask["profile"]})
             })
             .collect();
+        // Only the agents noted are read, by name.
         assert_eq!(
-            asked,
-            [json!({"op": "configure", "bot": "shop.fix", "bot_id": 2, "profile": "reviewer"})]
+            said,
+            [
+                json!({"op": "bots", "names": ["shop.fix", "shop.gone", "shop.kept"],
+                    "bot": null, "bot_id": null, "profile": null}),
+                json!({"op": "configure", "names": [], "bot": "shop.fix", "bot_id": 2,
+                    "profile": "reviewer"})
+            ]
         );
         assert!(!notes.exists());
-        // Nothing left: done again at once.
-        assert!(task::profiles_onto_agents(&client, &bots, &store).await);
+        // Nothing left: done again at once, with nothing read.
+        assert!(task::profiles_onto_agents(&client, &store).await);
+        assert_eq!(asked.lock().unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -26317,6 +26335,11 @@ mod tests {
         assert!(!notes.exists());
         // Done once: no listing again.
         upgrade::profiles_on_agents(&client, &store).await;
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        // A store with no notes is done with nothing read.
+        let other = dir.join("other.sqlite");
+        upgrade::profiles_on_agents(&client, &other).await;
+        upgrade::profiles_on_agents(&client, &other).await;
         assert_eq!(asked.lock().unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }

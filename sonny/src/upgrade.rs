@@ -370,16 +370,39 @@ fn lock(record: &Path) -> std::path::PathBuf {
 
 /// The profiles Sonny noted beside `store` for the agents it started go
 /// onto them, awaited before a lead's instructions are composed again from
-/// its profile: a whole listing, until it is done once.
+/// its profile, until it is done once: in one window of the store at a
+/// time, the others waiting for it to end and finding it done.
 pub async fn profiles_on_agents(client: &agent_client::Client, store: &Path) {
+    let id = crate::task::PROFILES_ON_AGENTS;
     let record = beside(store);
-    if done(&record, crate::task::PROFILES_ON_AGENTS) {
+    if done(&record, id) {
         return;
     }
-    let (bots, whole) = crate::lookout::listed(client).await;
-    if whole && crate::task::profiles_onto_agents(client, &bots, store).await {
-        once(&record, crate::task::PROFILES_ON_AGENTS, || true);
+    let mut path = record.as_os_str().to_owned();
+    path.push(format!(".{id}.lock"));
+    let _held = tokio::task::spawn_blocking(move || waited(Path::new(&path)))
+        .await
+        .ok()
+        .flatten();
+    if !done(&record, id) && crate::task::profiles_onto_agents(client, store).await {
+        once(&record, id, || true);
     }
+}
+
+/// A lock on `path`, a plain file made when it is not there, once no other
+/// process holds it: none where it cannot be had, and the caller goes on
+/// without it.
+fn waited(path: &Path) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .ok()?;
+    // SAFETY: flock on a descriptor `file` owns and keeps open; closing it
+    // lets go, as the process ending does.
+    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(file)
 }
 
 /// The record beside `store` of what was done once for it.
@@ -542,6 +565,31 @@ mod tests {
         ));
         assert!(migrate_from_listing(client, &store, home).is_none());
         assert_eq!(listed.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_window_waits_for_another_moving_the_profiles_and_finds_them_moved() {
+        let dir = std::env::temp_dir().join(format!("sonny-profiles-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let client = crate::tests::daemon_answering(|_| json!({})).await;
+        let id = crate::task::PROFILES_ON_AGENTS;
+        let mut path = beside(&store).into_os_string();
+        path.push(format!(".{id}.lock"));
+        let held = waited(Path::new(&path)).unwrap();
+        let waiting = tokio::spawn({
+            let store = store.clone();
+            async move { profiles_on_agents(&client, &store).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        // The other window recorded it done, then let go.
+        once(&beside(&store), id, || true);
+        drop(held);
+        waiting.await.unwrap();
+        assert!(done(&beside(&store), id));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
