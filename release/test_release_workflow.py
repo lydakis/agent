@@ -70,6 +70,26 @@ class LinuxBuildTest(unittest.TestCase):
         self.assertNotIn("secrets.APP", workflow)
 
 
+class StampTest(unittest.TestCase):
+    def test_each_job_stamps_the_tags_version_before_it_tests_or_builds(self):
+        workflow = (WORKFLOWS / "release.yml").read_text()
+        package = workflow[workflow.index("\n  package:\n"):workflow.index("\n  linux:\n")]
+        linux = workflow[workflow.index("\n  linux:\n"):]
+        stamp = 'run: python3 release/stamp_version.py "${RELEASE_TAG#v}"'
+        for job, first in [(package, "cargo test"), (linux, "cargo build")]:
+            self.assertEqual(job.count(stamp), 1)
+            self.assertLess(job.index(stamp), job.index(first))
+        # These tests check main's 0.0.0, so they run on the tree unstamped.
+        self.assertLess(package.index("python3 -m unittest discover -s release"),
+                        package.index(stamp))
+        # The source archive is the stamped tree, so Homebrew's build from
+        # it, without git, says the tag's version.
+        self.assertIn('git archive --format=tar.gz --prefix="agent-${version}/" \\\n'
+                      '            -o "dist/agent-${version}.tar.gz" "$tree"', package)
+        resolve = workflow[:workflow.index("\n  package:\n")]
+        self.assertNotIn("Cargo.toml", resolve)
+
+
 class SourceFormulaTest(unittest.TestCase):
     def test_the_release_carries_its_source_and_both_formulas(self):
         release = (WORKFLOWS / "release.yml").read_text()
@@ -107,9 +127,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.git("tag", "v2.0.0")
         self.git("switch", "main")
 
-    def commit(self, version, sonny_version=None):
-        for manifest, value in [("Cargo.toml", version),
-                                ("sonny/Cargo.toml", sonny_version or version)]:
+    def commit(self, version):
+        for manifest, value in [("Cargo.toml", version), ("sonny/Cargo.toml", version)]:
             path = self.root / manifest
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f'[package]\nname = "x"\nversion = "{value}"\n\n[dependencies]\n')
@@ -169,16 +188,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 self.assertEqual(self.output.read_text(),
                                  f"tag={tag}\ncommit={commit}\n")
 
-    def test_both_manifests_must_carry_the_tags_version(self):
-        self.git("tag", "v1.2.0", self.main)
-        result = self.gate("v1.2.0")
-        self.assertIn("Cargo.toml has version 1.1.0, not 1.2.0", result.stderr)
-        self.commit("1.3.0", sonny_version="1.2.0")
-        self.git("tag", "v1.3.0")
+    def test_a_tag_on_main_needs_no_version_in_its_manifests(self):
+        # Main says 0.0.0; the build stamps the tag's version (StampTest).
+        self.commit("0.0.0")
+        self.git("tag", "v1.2.0")
         self.git("update-ref", "refs/remotes/origin/main", "HEAD")
-        result = self.gate("v1.3.0")
-        self.assertIn("sonny/Cargo.toml has version 1.2.0, not 1.3.0", result.stderr)
-        self.assertFalse(self.output.exists())
+        result = self.gate("v1.2.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(),
+                         f"tag=v1.2.0\ncommit={self.git('rev-parse', 'HEAD')}\n")
 
     def test_unmerged_or_missing_tag_cannot_publish_a_commit(self):
         for tag in ["v2.0.0", "v9.9.9"]:

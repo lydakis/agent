@@ -2,9 +2,10 @@
 //! name, which stays the handle. Every agent's is its first message's first
 //! line, as Codex names a thread from its first message: a task's brief or
 //! a `/new` agent's message noted as it starts, any other (a helper, a task
-//! started before titles) read once from its history and noted. A lead with
-//! none of its own takes its project's, which the project file keeps where
-//! the person can change it. The daemon keeps none: Sonny notes each beside
+//! started before titles) read once from its history and noted. A
+//! project's lead has none of its own: it takes its project's, which the
+//! project file keeps where the person can change it, else none, so the
+//! project's name shows. The daemon keeps none: Sonny notes each beside
 //! the store, as it notes the profile a task was started as.
 use std::path::{Path, PathBuf};
 
@@ -283,8 +284,15 @@ pub fn of_project(info: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Agents' titles, for a listing of many: each noted one, else, for a
-/// lead, its project's, each project file read once.
+/// Whether `bot` is a project's lead, `tally.lead`, whose title is its
+/// project's: not another lead of its folder, which the person started
+/// with a message as any agent.
+pub fn is_project_lead(bot: &str) -> bool {
+    bot.ends_with(".lead") && crate::project::is_lead(bot)
+}
+
+/// Agents' titles, for a listing of many: a project's lead its project's,
+/// each project file read once; any other agent its noted one.
 pub struct Titles {
     noted: Noted,
     projects: std::collections::HashMap<String, Option<String>>,
@@ -311,13 +319,10 @@ impl Titles {
         id: Option<i64>,
         workspace: Option<&str>,
     ) -> Option<String> {
-        if let Some(title) = self.noted.of(name, id) {
-            return Some(title);
+        match is_project_lead(name) {
+            true => self.project(workspace.unwrap_or("")),
+            false => self.noted.of(name, id),
         }
-        if !crate::project::is_lead(name) {
-            return None;
-        }
-        self.project(workspace.unwrap_or(""))
     }
 
     /// The title of the project in `folder`, as its file gives it.
@@ -449,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_noted_title_wins_and_a_lead_takes_its_project_s() {
+    fn a_project_s_lead_takes_its_project_s_title_and_any_other_agent_its_own() {
         let root = std::env::temp_dir().join(format!("sonny-title-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (store, dir) = (root.join("state.sqlite"), root.join("tally"));
@@ -461,6 +466,19 @@ mod tests {
         .unwrap();
         let bot = |name: &str, id: i64| serde_json::json!({"name": name, "bot_id": id, "workspace": dir.to_str().unwrap()});
         let titles = |bot: &serde_json::Value| Titles::read(&store).of(bot);
+        assert_eq!(
+            titles(&bot("tally.lead", 1)).as_deref(),
+            Some("Tally invoices")
+        );
+        // Never its first message, noted before a project's lead took
+        // its project's alone.
+        note(
+            &store,
+            "tally.lead",
+            1,
+            "hey can you look at why the invoices are off",
+        )
+        .unwrap();
         assert_eq!(
             titles(&bot("tally.lead", 1)).as_deref(),
             Some("Tally invoices")
@@ -480,7 +498,8 @@ mod tests {
             titles(&bot("tally.lead.notes", 3)).as_deref(),
             Some("Draft the release notes")
         );
-        // A project file with none: the lead has none.
+        // A project file with none: the lead has none, so its name shows,
+        // and not the first message noted.
         std::fs::write(dir.join(agent_client::project::FILE), "name = \"tally\"\n").unwrap();
         assert_eq!(titles(&bot("tally.lead", 1)), None);
         let _ = std::fs::remove_dir_all(&root);
