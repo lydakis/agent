@@ -1136,7 +1136,11 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
             Some(match (arguments["add"]["name"].as_str(), field("remove")) {
                 (Some(added), _) => said("Followed", added),
                 (None, Some(removed)) => said("Unfollowed", removed),
-                (None, None) => said("Listed follows", ""),
+                (None, None) => match (field("read"), field("source")) {
+                    (Some(read), _) => said("Read the follow", read),
+                    (None, Some(source)) => said("Read the source", source),
+                    (None, None) => said("Listed follows", ""),
+                },
             })
         }
         crate::served::MEMORY => Some(
@@ -1173,7 +1177,8 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 arguments["add"].is_object(),
                 field("remove"),
                 field("run").or(field("fire")),
-                field("show"),
+                // `show`, as read was named before 11-20, in history.
+                field("read").or(field("show")),
             ) {
                 (true, ..) => {
                     // As the automation script's add says it.

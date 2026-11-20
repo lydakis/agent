@@ -714,21 +714,18 @@ pub const WANTS: &str = "A source with wants fetches only the values of that fie
     follows' filters name, as {\"id\": [\"CR-12\"]}, or a topic as NAME:TOPIC when it \
     wants topic; while one follow names none, it fetches everything.";
 
-/// Mark each source a `follows` answer lists that has `wants`, and
-/// say once what that means.
-pub fn say_wants(listed: &mut Value) {
-    let wants: HashMap<String, String> = (configured().unwrap_or_default().into_iter())
-        .filter_map(|source| Some((source.name, source.wants?)))
-        .collect();
-    let mut any = false;
-    for source in listed["sources"].as_array_mut().into_iter().flatten() {
-        if let Some(field) = source["name"].as_str().and_then(|name| wants.get(name)) {
-            source["wants"] = json!(field);
-            any = true;
-        }
-    }
-    if any {
-        listed["wants"] = json!(WANTS);
+/// Mark the source a `follows` answer shows whole when it has `wants`,
+/// and say what that means.
+pub fn say_wants(said: &mut Value) {
+    let Some(name) = said["source"]["name"].as_str() else {
+        return;
+    };
+    let wants = (configured().unwrap_or_default().into_iter())
+        .find(|source| source.name == name)
+        .and_then(|source| source.wants);
+    if let Some(field) = wants {
+        said["source"]["wants"] = json!(field);
+        said["wants"] = json!(WANTS);
     }
 }
 
@@ -2045,6 +2042,21 @@ pub fn listed(store: &Path, names: &[String], subs: &[super::subs::Sub]) -> (Vec
         })
         .collect();
     (listed, examples)
+}
+
+/// These sources by name, each with how many events its shape counts,
+/// as a `follows` listing names them: `source` shows one whole.
+pub fn counted(store: &Path, names: &[String]) -> Vec<Value> {
+    let dir = super::beside(store, ".sources");
+    (names.iter())
+        .map(|name| {
+            let events = std::fs::read_to_string(shape_file(&dir, name))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .map_or(json!(0), |shape| shape["events"].clone());
+            json!({"name": name, "events": events})
+        })
+        .collect()
 }
 
 /// Whether one of `subs` hears an event a shape of `source` kept: its
