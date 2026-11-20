@@ -5837,7 +5837,7 @@ struct Fill {
 }
 
 /// How often `/status` reads its rows again while open.
-const STATUS_AGAIN: Duration = Duration::from_secs(2);
+pub(crate) const STATUS_AGAIN: Duration = Duration::from_secs(2);
 
 /// How soon the follow of the other projects starts again once it
 /// stopped, as when the daemon went and came back.

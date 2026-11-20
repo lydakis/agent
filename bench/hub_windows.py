@@ -90,6 +90,7 @@ def main():
     result = {'agent': agent, 'sonny': sonny, 'windows': args.windows, 'busy': args.busy}
     stop = threading.Event()
     turns = [0]
+    failed = []
     try:
         began = time.monotonic()
         for n in range(args.windows):
@@ -129,6 +130,12 @@ def main():
                     found = need(connection.request('wait', handles=[handle], timeout_ms=60_000), 'wait')
                     if not found['results'][handle].get('pending'):
                         break
+                # A turn that failed did no model work: the measure stops.
+                status = found['results'][handle].get('status')
+                if status != 'completed':
+                    failed.append(f'{bot}: {status}')
+                    stop.set()
+                    break
                 turns[0] += 1
             connection.close()
 
@@ -169,6 +176,7 @@ def main():
             first.wait('conversation', lambda line: 'Message' in line, 30)
             time.sleep(.5)
         result['open_s'] = {'p50': quantile(shown, .5), 'p99': quantile(shown, .99), 'max': max(shown)}
+        result['open_each_s'] = [round(s, 3) for s in shown]
         print('opens', result['open_s'], file=sys.stderr)
         os.write(first.fd, LEFT)
         first.wait('projects', lambda line: 'Proj 001' in line, 300)
@@ -182,6 +190,8 @@ def main():
         result['rss_mib'] = {'first': round(rss[0], 1), 'others_mean': round(sum(rss[1:]) / max(1, len(rss) - 1), 1),
                              'total': round(sum(rss), 1)}
         stop.set()
+        if failed:
+            raise RuntimeError(f'busy turns failed, so nothing was measured: {failed[:3]}')
         Path(args.out).write_text(json.dumps(result, indent=1))
         print(json.dumps(result, indent=1))
     finally:

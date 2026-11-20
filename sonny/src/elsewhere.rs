@@ -80,7 +80,7 @@ pub struct Elsewhere {
     /// Every agent's row, while the window asks for them and once the
     /// first are in.
     rows: Arc<std::sync::Mutex<Option<Rows>>>,
-    want: watch::Sender<bool>,
+    want: watch::Sender<Wish>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -204,7 +204,7 @@ impl Elsewhere {
         let mut seen = waiting.clone();
         let outside = project.clone();
         let rows = Arc::new(std::sync::Mutex::new(None));
-        let (want, wanted) = watch::channel(false);
+        let (want, wanted) = watch::channel(Wish::default());
         let here = Here {
             rows: rows.clone(),
             wanted,
@@ -239,9 +239,14 @@ impl Elsewhere {
     /// go): while asked, the window is woken each time one moves.
     pub fn want_rows(&self, yes: bool) {
         self.want.send_if_modified(|was| {
-            let moved = *was != yes;
-            *was = yes;
-            moved
+            if was.yes == yes {
+                return false;
+            }
+            // Each ask its own, so one that follows a let-go before the
+            // hub saw it still gets every row again.
+            was.ask += u64::from(yes);
+            was.yes = yes;
+            true
         });
         if !yes && let Ok(mut rows) = self.rows.lock() {
             *rows = None;
@@ -283,16 +288,23 @@ fn beside(store: &Path) -> (PathBuf, PathBuf) {
 }
 
 /// What a window keeps of every agent's row, and whether it asks for them.
+/// Whether the window asks for every agent's row, and its ask's number.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Wish {
+    yes: bool,
+    ask: u64,
+}
+
 struct Here {
     rows: Arc<std::sync::Mutex<Option<Rows>>>,
-    wanted: watch::Receiver<bool>,
+    wanted: watch::Receiver<Wish>,
     woken: Arc<Notify>,
 }
 
 impl Here {
     /// A change of every agent's row, kept where the window asks for them.
     fn take(&self, moved: &Moved) {
-        if !*self.wanted.borrow() {
+        if !self.wanted.borrow().yes {
             return;
         }
         if let Ok(mut rows) = self.rows.lock() {
@@ -460,8 +472,14 @@ async fn follow_rows(socket: &Path, book: &Book) {
         // Ended however this does, dropped with the window's hub included.
         let drain = Ended(drain);
         let followed = async {
+            let mut read_at: Option<std::time::Instant> = None;
             loop {
                 woken.notified().await;
+                // No oftener than `/status` reads its own: what moves
+                // meanwhile is read together.
+                if let Some(at) = read_at {
+                    tokio::time::sleep(crate::STATUS_AGAIN.saturating_sub(at.elapsed())).await;
+                }
                 let changes = (follower.lock())
                     .map(|follower| follower.take())
                     .unwrap_or_default();
@@ -475,6 +493,7 @@ async fn follow_rows(socket: &Path, book: &Book) {
                 // Moved since the listing, or since the last of these.
                 if !changes.moved.is_empty() {
                     let names: Vec<String> = changes.moved.into_iter().collect();
+                    read_at = Some(std::time::Instant::now());
                     let Ok(set) = standing::rows(&client, &names).await else {
                         return;
                     };
@@ -509,9 +528,9 @@ async fn follow_rows(socket: &Path, book: &Book) {
 async fn rows_here(book: &Book, here: &Here) {
     let mut wanted = here.wanted.clone();
     loop {
-        if wanted.wait_for(|yes| *yes).await.is_err() {
+        let Ok(ask) = wanted.wait_for(|wish| wish.yes).await.map(|wish| wish.ask) else {
             return std::future::pending().await;
-        }
+        };
         let (asking, kept, mut moved) = book.ask();
         if let Some(kept) = &kept {
             here.take(kept);
@@ -535,7 +554,7 @@ async fn rows_here(book: &Book, here: &Here) {
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
-                _ = wanted.wait_for(|yes| !*yes) => break,
+                _ = wanted.wait_for(|wish| !wish.yes || wish.ask != ask) => break,
             }
         }
         drop(asking);
@@ -620,6 +639,7 @@ async fn hear(stream: UnixStream, tell: &watch::Sender<Shared>, here: &Here) {
     let mut lines = BufReader::new(read).lines();
     let mut wanted = here.wanted.clone();
     wanted.mark_changed();
+    let mut asked = Wish::default();
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -640,11 +660,17 @@ async fn hear(stream: UnixStream, tell: &watch::Sender<Shared>, here: &Here) {
                 if changed.is_err() {
                     return;
                 }
-                let asked = Asked { rows: *wanted.borrow_and_update() };
-                let asked = serde_json::to_string(&asked).unwrap_or_default();
-                if write.write_all(format!("{asked}\n").as_bytes()).await.is_err() {
-                    return;
+                let wish = *wanted.borrow_and_update();
+                // Let go and asked again before this was seen: let go here
+                // too, so every row comes again.
+                let again = (asked.yes && wish.yes && asked.ask != wish.ask).then_some(false);
+                for rows in again.into_iter().chain([wish.yes]) {
+                    let line = serde_json::to_string(&Asked { rows }).unwrap_or_default();
+                    if write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                        return;
+                    }
                 }
+                asked = wish;
             }
         }
     }
@@ -1405,6 +1431,19 @@ mod tests {
         assert_eq!(*follows.lock().unwrap(), 2);
         // Listed anew, never at a version already read.
         assert!(second.rows(|rows| rows.unwrap().version) > read);
+        // Let go and asked again at once, before the hub sees either: every
+        // row comes again, to a window that hears and to the one that
+        // follows.
+        first.want_rows(true);
+        until("the rows kept again", || head(&first, "site.lead") == Some(9)).await;
+        for open in [&second, &first] {
+            open.want_rows(false);
+            open.want_rows(true);
+        }
+        until("every row after a quick reopen", || {
+            head(&second, "site.lead") == Some(9) && head(&first, "site.lead") == Some(9)
+        })
+        .await;
     }
 
     /// An approval held in another project is told the window as the
