@@ -94,33 +94,20 @@ impl Sub {
         }
     }
 
-    /// What a task's agent working from a board follows: the commons'
-    /// posts on its items, at the commons source's digest, and an item
-    /// opening there as it comes, cutting into a busy turn, so a worker
-    /// that finished one hears of the next.
-    pub fn board(board: &str, owner: Option<i64>) -> Sub {
-        // A long board's name is cut, and ends in a digest of the whole,
-        // so it stays within NAME_MAX and two boards never share it.
-        let mut name = format!("board.{}", board.replace('/', "."));
+    /// `name` as a subscription may hold it: one too long is cut, and
+    /// ends in a digest of the whole, so it stays within [`NAME_MAX`] and
+    /// two names never become one.
+    pub fn bounded(mut name: String) -> String {
         if name.len() > NAME_MAX {
             let digest = super::digest(&name);
-            name.truncate(NAME_MAX - digest.len() - 1);
+            let mut cut = NAME_MAX - digest.len() - 1;
+            while !name.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            name.truncate(cut);
             name = format!("{name}.{digest}");
         }
-        Sub {
-            name,
-            tasks_of: Vec::new(),
-            agents: Vec::new(),
-            sources: vec![COMMONS_SOURCE.to_owned()],
-            filter: Some(serde_json::json!({"board": [board]})),
-            digest: None,
-            steer: Some(serde_json::json!({"opened": [{"exists": true}]})),
-            owner,
-            until: None,
-            runs: None,
-            made: None,
-            outlives_close: true,
-        }
+        name
     }
 
     /// Which subscription it is, for its counts: all it says, and the
@@ -1811,17 +1798,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_board_follow_reads_back_whatever_the_board_s_length() {
-        let short = Sub::board("shop/errors", Some(7));
-        assert_eq!(short.name, "board.shop.errors");
-        let long = format!("shop/{}/{}", "a".repeat(64), "b".repeat(64));
-        let other = format!("shop/{}/{}", "a".repeat(64), "c".repeat(64));
-        let (one, two) = (Sub::board(&long, Some(7)), Sub::board(&other, Some(7)));
-        assert!(one.name.len() <= NAME_MAX && two.name.len() <= NAME_MAX);
-        assert_ne!(one.name, two.name);
-        let back = Sub::from_json(&one.to_json()).expect("reads back");
-        assert_eq!(back.name, one.name);
-        assert_eq!(back.filter, Some(serde_json::json!({"board": [long]})));
+    fn a_long_name_is_bounded_and_stays_apart() {
+        assert_eq!(
+            Sub::bounded("board.shop.errors".into()),
+            "board.shop.errors"
+        );
+        let (one, two) = (
+            Sub::bounded(format!("board.shop.{}.{}", "a".repeat(64), "b".repeat(64))),
+            Sub::bounded(format!("board.shop.{}.{}", "a".repeat(64), "c".repeat(64))),
+        );
+        assert!(one.len() <= NAME_MAX && two.len() <= NAME_MAX);
+        assert_ne!(one, two);
+        assert!(named_plainly(&one));
     }
 
     #[test]

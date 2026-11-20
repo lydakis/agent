@@ -9,6 +9,7 @@
 //! what the commons tool takes for the same step, plus the board's own:
 //! `add` as `post`, `act` as `reply`, `open` as the listing.
 use crate::commons;
+use crate::lookout::subs::Sub;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -32,7 +33,8 @@ pub fn project_of(board: &str) -> &str {
     board.split('/').next().unwrap_or(board)
 }
 
-/// A board is segments of a-z 0-9 - . _, each 1-64 of them, joined by /.
+/// A board is its project's name, then segments of a-z 0-9 - . _, each
+/// 1-64 of them, joined by /.
 pub fn valid_board(board: &str) -> Result<(), String> {
     let segment = |s: &str| {
         (1..=64).contains(&s.len())
@@ -41,12 +43,35 @@ pub fn valid_board(board: &str) -> Result<(), String> {
                 b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.' || b == b'_'
             })
     };
-    match !board.is_empty() && board.split('/').all(segment) {
+    let mut segments = board.split('/');
+    let project = segments.next().unwrap_or_default();
+    match agent_client::project::valid_name(project) && segments.all(segment) {
         true => Ok(()),
         false => Err(format!(
             "board_invalid: a board is its project's name, then /-separated parts of a-z 0-9 - . _, \
              as shop/typed-errors; not {board:?}"
         )),
+    }
+}
+
+/// What a task's agent working from `board` follows: the commons' posts
+/// on its items, at the commons source's digest, and an item opening there
+/// as it comes, cutting into a busy turn, so a worker that finished one
+/// hears of the next.
+pub fn follow(board: &str, owner: Option<i64>) -> Sub {
+    Sub {
+        name: Sub::bounded(format!("board.{}", board.replace('/', "."))),
+        tasks_of: Vec::new(),
+        agents: Vec::new(),
+        sources: vec![agent_client::config::COMMONS_SOURCE.to_owned()],
+        filter: Some(json!({"board": [board]})),
+        digest: None,
+        steer: Some(json!({"opened": [{"exists": true}]})),
+        owner,
+        until: None,
+        runs: None,
+        made: None,
+        outlives_close: true,
     }
 }
 
@@ -529,7 +554,13 @@ fn act(
             }
         }
     }
-    let mut said = commons::add_locked(dir, thread, &post, caller.reader)?;
+    // A full thread still takes what moves its item, so talk in it never
+    // leaves the item stuck where it stands.
+    let moves = matches!(
+        action,
+        "claim" | "done" | "fail" | "release" | "cancel" | "reopen"
+    );
+    let mut said = commons::add_locked(dir, thread, &post, caller.reader, !moves)?;
     if said["posted"] != false {
         let mut after = posts;
         after.push(post);
@@ -1004,7 +1035,17 @@ mod tests {
     fn a_board_is_a_projects_path() {
         assert!(valid_board("shop").is_ok());
         assert!(valid_board("shop.web/typed-errors").is_ok());
-        for bad in ["", "Shop", "shop//x", "shop/", "../x", "shop/x y"] {
+        // The project's name as the project has it, capitals and all.
+        assert!(valid_board("MyApp/work").is_ok());
+        for bad in [
+            "",
+            "shop/Errors",
+            "shop//x",
+            "shop/",
+            "../x",
+            "shop./x",
+            "shop/x y",
+        ] {
             assert!(valid_board(bad).is_err(), "{bad}");
         }
         assert_eq!(project_of("shop.web/typed-errors"), "shop.web");
@@ -1039,6 +1080,36 @@ mod tests {
         let by = commons(json!({"search": "", "filter": {"by": ["shop.lead"], "do": ["claim"]}}))
             .unwrap();
         assert_eq!(by["threads"][0]["item"]["state"], "claimed");
+    }
+
+    #[test]
+    fn a_board_follow_reads_back_whatever_the_board_s_length() {
+        assert_eq!(follow("shop/errors", Some(7)).name, "board.shop.errors");
+        let long = format!("shop/{}/{}", "a".repeat(64), "b".repeat(64));
+        let one = follow(&long, Some(7));
+        let back = Sub::from_json(&one.to_json()).expect("reads back");
+        assert_eq!(back.name, one.name);
+        assert_eq!(back.filter, Some(json!({"board": [long]})));
+    }
+
+    #[test]
+    fn a_full_thread_still_takes_what_moves_its_item() {
+        let home = home("full");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(add("store", "Type the store errors", json!({}))).unwrap();
+        lead(act("store", "claim")).unwrap();
+        let talk = json!({"by": "x.y", "at": 1, "text": "more"}).to_string() + "\n";
+        let path = commons::dir(&home).join("store.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, talk.repeat(commons::POSTS).as_bytes()).unwrap();
+        let label = json!({"act": {"thread": "store", "do": "label", "text": "y", "labels": {"area": "db"}}});
+        let refused = lead(label).unwrap_err();
+        assert!(refused.starts_with("commons_full"), "{refused}");
+        let done = lead(act("store", "done")).unwrap();
+        assert_eq!(done["item"]["state"], "done");
     }
 
     #[test]

@@ -794,6 +794,13 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // A board its agents take items from: their own project's.
             let board = text("board");
             if let Some(board) = &board {
+                if !crate::commons::on() {
+                    return Err((
+                        "invalid_arguments",
+                        "the commons is off, and its boards with it: start without board"
+                            .to_owned(),
+                    ));
+                }
                 crate::board::valid_board(board).map_err(|e| ("invalid_arguments", e))?;
                 if crate::board::project_of(board) != line.project {
                     return Err((

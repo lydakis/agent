@@ -562,7 +562,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             // The board's posts reach it as the commons' do, its items
             // opening as they come.
             if let Some(board) = &start.board {
-                let follow = crate::lookout::subs::Sub::board(board, Some(id));
+                let follow = crate::board::follow(board, Some(id));
                 let _ = crate::lookout::subs::ensure(store, name, follow);
             }
         }

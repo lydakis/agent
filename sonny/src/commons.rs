@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 /// The most of one post.
 const POST_BYTES: usize = 16 * 1024;
 /// The most posts a thread holds; a longer conversation starts a new one.
-const POSTS: usize = 256;
+pub(crate) const POSTS: usize = 256;
 /// The most of one read's posts, so a read fits a served tool's answer:
 /// the rest come with `from`.
 const READ_BYTES: usize = 40 * 1024;
@@ -845,19 +845,21 @@ fn invite_submit(bot: &str, thread: &str, note: String, golden: bool) -> Value {
 fn add(dir: &Path, name: &str, post: &Value, reader: &str) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = lock(dir)?;
-    add_locked(dir, name, post, reader)
+    add_locked(dir, name, post, reader, true)
 }
 
-/// `add`, under the lock the caller holds, its name checked.
+/// `add`, under the lock the caller holds, its name checked; `capped`,
+/// refused once the thread holds [`POSTS`].
 pub(crate) fn add_locked(
     dir: &Path,
     name: &str,
     post: &Value,
     reader: &str,
+    capped: bool,
 ) -> Result<Value, String> {
     let path = dir.join(format!("{name}.jsonl"));
     let earlier = posts(&path)?;
-    if earlier.len() >= POSTS {
+    if capped && earlier.len() >= POSTS {
         return Err(format!(
             "commons_full: {name} holds {POSTS} posts; start a new thread that names it"
         ));
