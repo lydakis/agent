@@ -42,7 +42,7 @@ use agent_client::Client;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, broadcast, watch};
 
 use crate::needs::{self, Seen};
 use crate::standing;
@@ -76,13 +76,87 @@ pub const NARROW: [&str; 5] = [
 ];
 
 /// Every project's agents that need the person, followed while the window
-/// is open: by this window, or heard from the one that follows.
+/// is open: by this window, or heard from the one that follows. And, while
+/// the window asks for them ([`Elsewhere::want_rows`]), every agent's row.
 pub struct Elsewhere {
     /// What needs the person in every project.
     pub waiting: watch::Receiver<Shared>,
     /// The window's project, whose own it leaves out.
     pub project: String,
+    /// Every agent's row, while the window asks for them and once the
+    /// first are in.
+    rows: Arc<std::sync::Mutex<Option<Rows>>>,
+    want: watch::Sender<Wish>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Every open agent of the store, by name, as the window that follows
+/// keeps it from the daemon's events ([`standing::Follower`] of every
+/// agent): one listing and one follow for every window, held only while a
+/// window asks for them.
+#[derive(Clone, Debug, Default)]
+pub struct Rows {
+    /// Moves on with each change, so a reader knows whether anything did;
+    /// never back, and from a different start in each window that follows,
+    /// so rows listed again after a pause or by another window never pass
+    /// for ones already read.
+    pub version: u64,
+    /// Whether every row is in: a listing was told since the follow began.
+    pub whole: bool,
+    /// Shared with the change that told each and the reads counted from
+    /// them: a row is copied once, as it comes.
+    pub agents: BTreeMap<String, Arc<standing::Agent>>,
+}
+
+/// A change of [`Rows`], as told to the windows: every row (`all`), or
+/// the rows set and the agents gone (closed or deleted) since.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Moved {
+    version: u64,
+    all: bool,
+    set: Vec<Arc<standing::Agent>>,
+    gone: Vec<String>,
+}
+
+impl Rows {
+    fn take(&mut self, moved: &Moved) {
+        if moved.all {
+            self.agents.clear();
+            self.whole = true;
+        }
+        for name in &moved.gone {
+            self.agents.remove(name);
+        }
+        for agent in &moved.set {
+            self.agents.insert(agent.name.clone(), agent.clone());
+        }
+        self.version = moved.version;
+    }
+
+    fn all(&self) -> Moved {
+        Moved {
+            version: self.version,
+            all: true,
+            set: self.agents.values().cloned().collect(),
+            gone: Vec::new(),
+        }
+    }
+}
+
+/// One line the window that follows tells a window that connected.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Line {
+    Waiting(Shared),
+    Rows(Moved),
+}
+
+/// One line a window asks the one that follows: every agent's row, or no
+/// more of them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Asked {
+    rows: bool,
 }
 
 /// What the window that follows tells the others: every project's agents
@@ -137,6 +211,13 @@ impl Elsewhere {
         let (tell, waiting) = watch::channel(Shared::default());
         let mut seen = waiting.clone();
         let outside = project.clone();
+        let rows = Arc::new(std::sync::Mutex::new(None));
+        let (want, wanted) = watch::channel(Wish::default());
+        let here = Here {
+            rows: rows.clone(),
+            wanted,
+            woken: woken.clone(),
+        };
         let task = tokio::spawn(async move {
             let wake = async {
                 let mut was = Waiting::default();
@@ -149,14 +230,43 @@ impl Elsewhere {
                 }
             };
             tokio::select! {
-                () = share(&socket, &store, &tell) => {}
+                () = share(&socket, &store, &tell, here) => {}
                 () = wake => {}
             }
         });
         Elsewhere {
             waiting,
             project,
+            rows,
+            want,
             task,
+        }
+    }
+
+    /// Ask for every agent's row, or no more of them (what was held is let
+    /// go): while asked, the window is woken each time one moves.
+    pub fn want_rows(&self, yes: bool) {
+        self.want.send_if_modified(|was| {
+            if was.yes == yes {
+                return false;
+            }
+            // Each ask its own, so one that follows a let-go before the
+            // hub saw it still gets every row again.
+            was.ask += u64::from(yes);
+            was.yes = yes;
+            true
+        });
+        if !yes && let Ok(mut rows) = self.rows.lock() {
+            *rows = None;
+        }
+    }
+
+    /// Every agent's row, as last told: none until the first are in, or
+    /// while not asked for.
+    pub fn rows<T>(&self, read: impl FnOnce(Option<&Rows>) -> T) -> T {
+        match self.rows.lock() {
+            Ok(rows) => read(rows.as_ref()),
+            Err(_) => read(None),
         }
     }
 
@@ -169,7 +279,9 @@ impl Elsewhere {
 /// The lock the window that follows holds, and the socket it tells the
 /// others on: beside `store`, or, where that path is too long for a Unix
 /// socket, the short one the client finds for a daemon's
-/// ([`agent_client::socket::default_socket`]).
+/// ([`agent_client::socket::default_socket`]). Named for what is told on
+/// it ([`Line`]): a Sonny that tells otherwise follows under another name,
+/// so windows of two builds each hear their own.
 fn beside(store: &Path) -> (PathBuf, PathBuf) {
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
     let at = |end: &str| {
@@ -177,27 +289,64 @@ fn beside(store: &Path) -> (PathBuf, PathBuf) {
         path.push(end);
         PathBuf::from(path)
     };
-    let lock = at(".elsewhere.lock");
-    let told = agent_client::socket::default_socket(&at(".elsewhere"))
-        .unwrap_or_else(|_| at(".elsewhere.sock"));
+    let lock = at(".hub.lock");
+    let told =
+        agent_client::socket::default_socket(&at(".hub")).unwrap_or_else(|_| at(".hub.sock"));
     (lock, told)
+}
+
+/// What a window keeps of every agent's row, and whether it asks for them.
+/// Whether the window asks for every agent's row, and its ask's number.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Wish {
+    yes: bool,
+    ask: u64,
+}
+
+struct Here {
+    rows: Arc<std::sync::Mutex<Option<Rows>>>,
+    wanted: watch::Receiver<Wish>,
+    woken: Arc<Notify>,
+}
+
+impl Here {
+    /// A change of every agent's row, kept where the window asks for them.
+    fn take(&self, moved: &Moved) {
+        if !self.wanted.borrow().yes {
+            return;
+        }
+        if let Ok(mut rows) = self.rows.lock() {
+            match (&mut *rows, moved.all) {
+                (Some(rows), _) => rows.take(moved),
+                (None, true) => {
+                    *rows = Some(Rows::default()).map(|mut rows| {
+                        rows.take(moved);
+                        rows
+                    })
+                }
+                // A change before every row: the first all is to come.
+                (None, false) => return,
+            }
+        }
+        self.woken.notify_one();
+    }
 }
 
 /// Follow, where no window of the store does; else hear the one that does,
 /// and follow once it is gone. Ends when the daemon goes.
-async fn share(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
+async fn share(socket: &Path, store: &Path, tell: &watch::Sender<Shared>, here: Here) {
     let (lock, told) = beside(store);
     let mut missed = 0;
     loop {
         if let Ok(Some(held)) = crate::scheduler::locked(&lock) {
-            lead(socket, store, &told, tell).await;
+            lead(socket, store, &told, tell, &here).await;
             drop(held);
             return;
         }
         match UnixStream::connect(&told).await {
             Ok(stream) => {
                 missed = 0;
-                hear(stream, tell).await;
+                hear(stream, tell, &here).await;
             }
             // The window that took the lock is still making its socket.
             Err(_) => {
@@ -217,61 +366,321 @@ impl Drop for Told {
     }
 }
 
+/// Every agent's row as the window that follows keeps it, for the windows
+/// that ask: followed only while one does.
+struct Book {
+    rows: std::sync::Mutex<Rows>,
+    moved: broadcast::Sender<Arc<Moved>>,
+    /// How many windows ask for them.
+    asking: watch::Sender<usize>,
+}
+
+impl Book {
+    fn new() -> Self {
+        // Where this window's versions start: the time, so another window
+        // following after it starts elsewhere.
+        let start = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+            .map_or(1, |since| since.as_micros() as u64);
+        Book {
+            rows: std::sync::Mutex::new(Rows {
+                version: start,
+                ..Default::default()
+            }),
+            moved: broadcast::channel(64).0,
+            asking: watch::channel(0).0,
+        }
+    }
+
+    /// A window asks for every agent's row: they are followed from now,
+    /// and what is kept already comes first. Let go with the [`Asking`].
+    fn ask(&self) -> (Asking<'_>, Option<Moved>, broadcast::Receiver<Arc<Moved>>) {
+        self.asking.send_modify(|asking| *asking += 1);
+        let moved = self.moved.subscribe();
+        let kept = (self.rows.lock().ok())
+            .filter(|rows| rows.whole)
+            .map(|rows| rows.all());
+        (Asking(self), kept, moved)
+    }
+
+    /// A change, kept and told.
+    fn tell(&self, moved: Moved) {
+        let Ok(mut rows) = self.rows.lock() else {
+            return;
+        };
+        let moved = Moved {
+            version: rows.version + 1,
+            ..moved
+        };
+        rows.take(&moved);
+        let _ = self.moved.send(Arc::new(moved));
+    }
+}
+
+/// A task ended when dropped.
+struct Ended(tokio::task::JoinHandle<()>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A window asking for every agent's row, until dropped.
+struct Asking<'a>(&'a Book);
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        self.0.asking.send_modify(|asking| *asking -= 1);
+    }
+}
+
 /// Follow every project, and tell each window that connects what needs
-/// the person, at once and each time it changes.
-async fn lead(socket: &Path, store: &Path, told: &Path, tell: &watch::Sender<Shared>) {
+/// the person, at once and each time it changes; and every agent's row to
+/// each window that asks, followed while any does.
+async fn lead(socket: &Path, store: &Path, told: &Path, tell: &watch::Sender<Shared>, here: &Here) {
     let _ = std::fs::remove_file(told);
     let listener = UnixListener::bind(told).ok();
     let _told = listener.as_ref().map(|_| Told(told.to_owned()));
+    let book = Arc::new(Book::new());
     let mut hearing = tokio::task::JoinSet::new();
     let following = follow(socket, store, tell);
     tokio::pin!(following);
+    let rows = follow_rows(socket, &book);
+    tokio::pin!(rows);
+    let mine = rows_here(&book, here);
+    tokio::pin!(mine);
     loop {
         tokio::select! {
             () = &mut following => return,
+            () = &mut rows => return,
+            () = &mut mine => return,
             Ok((stream, _)) = async { listener.as_ref().unwrap().accept().await }, if listener.is_some() => {
-                hearing.spawn(tell_on(stream, tell.subscribe()));
+                hearing.spawn(tell_on(stream, tell.subscribe(), book.clone()));
             }
             Some(_) = hearing.join_next(), if !hearing.is_empty() => {}
         }
     }
 }
 
-/// What needs the person, to a window that connected: now, and again each
-/// time it changes, one line each.
-async fn tell_on(stream: UnixStream, mut shared: watch::Receiver<Shared>) {
-    let (mut read, mut write) = stream.into_split();
-    shared.mark_changed();
-    let mut gone = [0u8; 1];
+/// Every agent's row, followed on a connection of its own while any window
+/// asks for them ([`Book::asking`]), and let go once none does; ends when
+/// the daemon goes.
+async fn follow_rows(socket: &Path, book: &Book) {
+    let mut asking = book.asking.subscribe();
     loop {
-        let line = serde_json::to_string(&*shared.borrow_and_update()).unwrap_or_default();
-        if write
-            .write_all(format!("{line}\n").as_bytes())
-            .await
-            .is_err()
-        {
+        if asking.wait_for(|asking| *asking > 0).await.is_err() {
             return;
         }
+        let woken = Arc::new(Notify::new());
+        let Some((client, follower, drain)) =
+            standing::follow_apart(socket, crate::EVERY_PROJECT, &woken).await
+        else {
+            return;
+        };
+        // Ended however this does, dropped with the window's hub included.
+        let drain = Ended(drain);
+        let followed = async {
+            let mut read_at: Option<std::time::Instant> = None;
+            loop {
+                woken.notified().await;
+                // No oftener than `/status` reads its own: what moves
+                // meanwhile is read together.
+                if let Some(at) = read_at {
+                    tokio::time::sleep(crate::STATUS_AGAIN.saturating_sub(at.elapsed())).await;
+                }
+                let changes = (follower.lock())
+                    .map(|follower| follower.take())
+                    .unwrap_or_default();
+                if let Some(snapshot) = changes.snapshot {
+                    book.tell(Moved {
+                        all: true,
+                        set: snapshot.into_iter().map(Arc::new).collect(),
+                        ..Default::default()
+                    });
+                }
+                // Moved since the listing, or since the last of these.
+                if !changes.moved.is_empty() {
+                    let names: Vec<String> = changes.moved.into_iter().collect();
+                    read_at = Some(std::time::Instant::now());
+                    let Ok(set) = standing::rows(&client, &names).await else {
+                        return;
+                    };
+                    let gone = (names.into_iter())
+                        .filter(|name| !set.iter().any(|row| row.name == *name))
+                        .collect();
+                    book.tell(Moved {
+                        set: set.into_iter().map(Arc::new).collect(),
+                        gone,
+                        ..Default::default()
+                    });
+                }
+                if drain.0.is_finished() {
+                    return;
+                }
+            }
+        };
         tokio::select! {
-            changed = shared.changed() => if changed.is_err() { return },
-            // The window closed.
-            _ = tokio::io::AsyncReadExt::read(&mut read, &mut gone) => return,
+            () = followed => return,
+            _ = asking.wait_for(|asking| *asking == 0) => {}
+        }
+        // None asks: the follow is let go, and what it kept.
+        drop(drain);
+        if let Ok(mut rows) = book.rows.lock() {
+            rows.agents.clear();
+            rows.whole = false;
         }
     }
 }
 
-/// What the window that follows tells, until it goes.
-async fn hear(stream: UnixStream, tell: &watch::Sender<Shared>) {
-    let mut lines = BufReader::new(stream).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(mut shared) = serde_json::from_str::<Shared>(&line) else {
-            continue;
+/// The window that follows asking for every agent's row itself.
+async fn rows_here(book: &Book, here: &Here) {
+    let mut wanted = here.wanted.clone();
+    loop {
+        let Ok(ask) = wanted.wait_for(|wish| wish.yes).await.map(|wish| wish.ask) else {
+            return std::future::pending().await;
         };
-        tell.send_if_modified(|was| {
-            let moved = *was != shared;
-            *was = std::mem::take(&mut shared);
-            moved
-        });
+        let (asking, kept, mut moved) = book.ask();
+        if let Some(kept) = &kept {
+            here.take(kept);
+        }
+        let mut at = kept.map_or(0, |kept| kept.version);
+        loop {
+            tokio::select! {
+                got = moved.recv() => match got {
+                    Ok(moved) if moved.version > at => {
+                        at = moved.version;
+                        here.take(&moved);
+                    }
+                    Ok(_) => {}
+                    // Too far behind: every row again.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let all = book.rows.lock().ok().filter(|rows| rows.whole).map(|rows| rows.all());
+                        if let Some(all) = all {
+                            at = all.version;
+                            here.take(&all);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                _ = wanted.wait_for(|wish| !wish.yes || wish.ask != ask) => break,
+            }
+        }
+        drop(asking);
+    }
+}
+
+/// A line to a window that connected.
+async fn write_line(write: &mut tokio::net::unix::OwnedWriteHalf, line: &Line) -> bool {
+    let line = serde_json::to_string(line).unwrap_or_default();
+    write
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .is_ok()
+}
+
+/// What needs the person, to a window that connected: now, and again each
+/// time it changes, one line each; and every agent's row while it asks.
+async fn tell_on(stream: UnixStream, mut shared: watch::Receiver<Shared>, book: Arc<Book>) {
+    let (read, mut write) = stream.into_split();
+    let mut asks = BufReader::new(read).lines();
+    let mut rows: Option<(Asking<'_>, broadcast::Receiver<Arc<Moved>>, u64)> = None;
+    let mut told = false;
+    loop {
+        if !told {
+            told = true;
+            let line = Line::Waiting(shared.borrow_and_update().clone());
+            if !write_line(&mut write, &line).await {
+                return;
+            }
+        }
+        tokio::select! {
+            changed = shared.changed() => match changed {
+                Ok(()) => told = false,
+                Err(_) => return,
+            },
+            asked = asks.next_line() => {
+                // The window closed.
+                let Ok(Some(asked)) = asked else { return };
+                let Ok(Asked { rows: yes }) = serde_json::from_str(&asked) else { continue };
+                match (yes, rows.is_some()) {
+                    (true, false) => {
+                        let (asking, kept, moved) = book.ask();
+                        let at = kept.as_ref().map_or(0, |kept| kept.version);
+                        if let Some(kept) = kept
+                            && !write_line(&mut write, &Line::Rows(kept)).await
+                        {
+                            return;
+                        }
+                        rows = Some((asking, moved, at));
+                    }
+                    (false, true) => rows = None,
+                    _ => {}
+                }
+            }
+            got = async { rows.as_mut().unwrap().1.recv().await }, if rows.is_some() => {
+                let Some((_, _, at)) = &mut rows else { continue };
+                let line = match got {
+                    Ok(moved) if moved.version > *at => (*moved).clone(),
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let all = book.rows.lock().ok().filter(|rows| rows.whole).map(|rows| rows.all());
+                        match all {
+                            Some(all) => all,
+                            None => continue,
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                *at = line.version;
+                if !write_line(&mut write, &Line::Rows(line)).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// What the window that follows tells, until it goes; and the window's
+/// asks for every agent's row, told to it.
+async fn hear(stream: UnixStream, tell: &watch::Sender<Shared>, here: &Here) {
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let mut wanted = here.wanted.clone();
+    wanted.mark_changed();
+    let mut asked = Wish::default();
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Ok(Some(line)) = line else { return };
+                match serde_json::from_str::<Line>(&line) {
+                    Ok(Line::Waiting(mut shared)) => {
+                        tell.send_if_modified(|was| {
+                            let moved = *was != shared;
+                            *was = std::mem::take(&mut shared);
+                            moved
+                        });
+                    }
+                    Ok(Line::Rows(moved)) => here.take(&moved),
+                    Err(_) => {}
+                }
+            }
+            changed = wanted.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let wish = *wanted.borrow_and_update();
+                // Let go and asked again before this was seen: let go here
+                // too, so every row comes again.
+                let again = (asked.yes && wish.yes && asked.ask != wish.ask).then_some(false);
+                for rows in again.into_iter().chain([wish.yes]) {
+                    let line = serde_json::to_string(&Asked { rows }).unwrap_or_default();
+                    if write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+                asked = wish;
+            }
+        }
     }
 }
 
@@ -918,22 +1327,13 @@ mod tests {
     fn the_shared_socket_fits_beside_a_long_store() {
         let short = std::env::temp_dir().join("s/state.sqlite");
         let (lock, told) = beside(&short);
-        assert!(
-            lock.to_string_lossy()
-                .ends_with("state.sqlite.elsewhere.lock")
-        );
-        assert!(
-            told.to_string_lossy()
-                .ends_with("state.sqlite.elsewhere.sock")
-        );
+        assert!(lock.to_string_lossy().ends_with("state.sqlite.hub.lock"));
+        assert!(told.to_string_lossy().ends_with("state.sqlite.hub.sock"));
         let long = std::env::temp_dir()
             .join("a".repeat(120))
             .join("state.sqlite");
         let (lock, told) = beside(&long);
-        assert!(
-            lock.to_string_lossy()
-                .ends_with("state.sqlite.elsewhere.lock")
-        );
+        assert!(lock.to_string_lossy().ends_with("state.sqlite.hub.lock"));
         assert!(
             std::os::unix::net::SocketAddr::from_pathname(&told).is_ok(),
             "{told:?}"
@@ -956,6 +1356,208 @@ mod tests {
         );
         let other = json!({"event": "tool_started", "data": {"name": "shell"}});
         assert_eq!(marks(&other, "shop.lead", &projects), None);
+    }
+
+    /// Every agent's row is followed only while a window asks for them: a
+    /// window that hears the one that follows gets every row, then only
+    /// the rows that moved, and once none asks the follow is let go; the
+    /// window that follows asks for them the same way.
+    #[tokio::test]
+    async fn every_agents_row_is_followed_once_for_the_windows_that_ask_and_only_while_they_do() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("hub-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // The rows' follows asked, the rows' connections gone, and the
+        // events to send the rows' follow.
+        let follows = Arc::new(std::sync::Mutex::new(0));
+        let ended = Arc::new(std::sync::Mutex::new(0));
+        let to_rows: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Value>>>> =
+            Default::default();
+        let heads = Arc::new(std::sync::Mutex::new(HashMap::from([
+            ("site.lead".to_owned(), 1),
+            ("tally.lead".to_owned(), 1),
+        ])));
+        {
+            let (follows, ended, to_rows, heads) = (
+                follows.clone(),
+                ended.clone(),
+                to_rows.clone(),
+                heads.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (follows, ended, to_rows, heads) = (
+                        follows.clone(),
+                        ended.clone(),
+                        to_rows.clone(),
+                        heads.clone(),
+                    );
+                    tokio::spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                        write
+                            .write_all(format!("{ready}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        let mut lines = BufReader::new(read).lines();
+                        let (send, mut events) = tokio::sync::mpsc::unbounded_channel::<Value>();
+                        let mut rows = false;
+                        let row = |name: &str, heads: &HashMap<String, i64>| {
+                            heads
+                                .get(name)
+                                .map(|head| json!({"name": name, "head": head}))
+                        };
+                        loop {
+                            tokio::select! {
+                                line = lines.next_line() => {
+                                    let Ok(Some(line)) = line else { break };
+                                    let request: Value = serde_json::from_str(&line).unwrap();
+                                    let heads = heads.lock().unwrap().clone();
+                                    let result = match request["op"].as_str() {
+                                        Some("bots") if request["names"].is_array() => {
+                                            let named: Vec<Value> = (request["names"].as_array().unwrap().iter())
+                                                .filter_map(|name| row(name.as_str().unwrap(), &heads))
+                                                .collect();
+                                            json!({"bots": named})
+                                        }
+                                        Some("bots") if request["active"] == true => json!({"bots": []}),
+                                        Some("bots") => {
+                                            let mut names: Vec<&String> = heads.keys().collect();
+                                            names.sort();
+                                            let all: Vec<Value> =
+                                                names.into_iter().filter_map(|name| row(name, &heads)).collect();
+                                            json!({"bots": all, "cursor": 1})
+                                        }
+                                        Some("approvals") => json!({"approvals": []}),
+                                        Some("follow") if request["kinds"] == json!(standing::KINDS) => {
+                                            rows = true;
+                                            *follows.lock().unwrap() += 1;
+                                            *to_rows.lock().unwrap() = Some(send.clone());
+                                            json!({"following": "*.*"})
+                                        }
+                                        _ => json!({}),
+                                    };
+                                    let out = json!({"id": request["id"], "result": result});
+                                    if write.write_all(format!("{out}\n").as_bytes()).await.is_err() {
+                                        break;
+                                    }
+                                    // Nothing to replay: each follow is live at once.
+                                    if request["op"] == "follow" {
+                                        let live = json!({"event": "follow_live",
+                                            "bot": request["bot"], "cursor": 0});
+                                        if write.write_all(format!("{live}\n").as_bytes()).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Some(event) = events.recv() => {
+                                    if write.write_all(format!("{event}\n").as_bytes()).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if rows {
+                            *ended.lock().unwrap() += 1;
+                        }
+                    });
+                }
+            });
+        }
+        let wait = std::time::Duration::from_secs(5);
+        async fn until(what: &str, done: impl Fn() -> bool) {
+            let began = std::time::Instant::now();
+            while !done() {
+                assert!(
+                    began.elapsed() < std::time::Duration::from_secs(5),
+                    "waiting for {what}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        let store = dir.join("state.sqlite");
+        let woken = Arc::new(Notify::new());
+        let first = Elsewhere::start(socket.clone(), store.clone(), "tally".into(), woken.clone());
+        let mut waiting = first.waiting.clone();
+        tokio::time::timeout(wait, waiting.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = Elsewhere::start(socket.clone(), store, "site".into(), woken);
+        // No window asks: no follow of every agent's row.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*follows.lock().unwrap(), 0);
+        let head = |open: &Elsewhere, name: &str| {
+            open.rows(|rows| {
+                rows.and_then(|rows| rows.agents.get(name))
+                    .and_then(|row| row.head)
+            })
+        };
+        // A window that hears asks: every row, followed once.
+        second.want_rows(true);
+        until("every row", || head(&second, "site.lead") == Some(1)).await;
+        assert_eq!(head(&second, "tally.lead"), Some(1));
+        assert_eq!(*follows.lock().unwrap(), 1);
+        // One moves: its row alone is read and told.
+        heads.lock().unwrap().insert("site.lead".into(), 9);
+        let tell = |event: Value| {
+            to_rows
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .send(event)
+                .unwrap()
+        };
+        tell(
+            json!({"cursor": 5, "bot": "site.lead", "event": "turn_finished",
+            "following": "*.*"}),
+        );
+        until("the moved row", || head(&second, "site.lead") == Some(9)).await;
+        // One goes: it is let go.
+        heads.lock().unwrap().remove("tally.lead");
+        tell(json!({"cursor": 6, "bot": "tally.lead", "event": "deleted",
+            "following": "*.*"}));
+        until("the row gone", || {
+            second.rows(|rows| rows.is_some_and(|rows| !rows.agents.contains_key("tally.lead")))
+        })
+        .await;
+        // The window that follows asks too: what is kept, no second follow.
+        first.want_rows(true);
+        until("the rows kept", || head(&first, "site.lead") == Some(9)).await;
+        assert_eq!(*follows.lock().unwrap(), 1);
+        // None asks any more: what each held is let go, and the follow too.
+        let read = second.rows(|rows| rows.unwrap().version);
+        second.want_rows(false);
+        first.want_rows(false);
+        assert!(second.rows(|rows| rows.is_none()));
+        until("the follow let go", || *ended.lock().unwrap() == 1).await;
+        // Asked again: followed again from a new listing.
+        second.want_rows(true);
+        until("every row again", || head(&second, "site.lead") == Some(9)).await;
+        assert_eq!(*follows.lock().unwrap(), 2);
+        // Listed anew, never at a version already read.
+        assert!(second.rows(|rows| rows.unwrap().version) > read);
+        // Let go and asked again at once, before the hub sees either: every
+        // row comes again, to a window that hears and to the one that
+        // follows.
+        first.want_rows(true);
+        until("the rows kept again", || {
+            head(&first, "site.lead") == Some(9)
+        })
+        .await;
+        for open in [&second, &first] {
+            open.want_rows(false);
+            open.want_rows(true);
+        }
+        until("every row after a quick reopen", || {
+            head(&second, "site.lead") == Some(9) && head(&first, "site.lead") == Some(9)
+        })
+        .await;
     }
 
     /// An approval held in another project is told the window as the

@@ -53,7 +53,7 @@ rmcp = { version = "3.8", default-features = false, features = ["client", "trans
 # beside V8, with a memory limit and an interrupt for a script's time.
 rquickjs = { version = "0.14", features = ["futures", "disable-assertions"] }
 # What `/status` read of each agent's history, kept for the next window.
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 # Runs command rules files as Codex runs them: Starlark (Meta's crate, as
 # Codex uses it), its examples split as shell words with shlex, as Codex
