@@ -867,7 +867,13 @@ fn own_home_in(home: PathBuf, given: &[String]) -> policy::Home {
         .flat_map(|(place, real, _)| std::iter::once(place).chain(real))
         .map(|agent| agent.join("worktrees"))
         .collect();
+    let holder = home.join(policy::HOLDER.0);
+    let holders = (agent_client::files::real(&holder).filter(|real| *real != holder))
+        .into_iter()
+        .chain(std::iter::once(holder))
+        .collect();
     policy::Home {
+        holders,
         home,
         kept: (places.into_iter())
             .flat_map(|(place, real, kept)| {

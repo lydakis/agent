@@ -467,6 +467,11 @@ pub const KEPT: [(&str, Kept); 4] = [
     (".agents/AGENTS.md", Kept::Agents),
 ];
 
+/// The folder in the home that holds kept places but is not one: a command
+/// that names it itself, as a copy's destination or a `cd`, can reach what
+/// it holds, so it is kept as they are.
+pub const HOLDER: (&str, Kept) = (".agents", Kept::Agents);
+
 /// The places [`KEPT`] names, as a planned call may name them: the judge's
 /// word alone never lets a call reach one, as Claude Code's `--restricted`
 /// keeps the classifier from its own paths, and Codex keeps `.agents`
@@ -479,6 +484,8 @@ pub struct Home {
     /// Each place in [`KEPT`], as `$HOME` spells it and by its real path,
     /// with what it holds.
     pub kept: Vec<(std::path::PathBuf, Kept)>,
+    /// [`HOLDER`], as `$HOME` spells it and by its real path.
+    pub holders: Vec<std::path::PathBuf>,
     /// The folders the agent may write, its own and the writable ones.
     pub given: Vec<std::path::PathBuf>,
     /// Folders in the home that hold agents' work folders, such as Sonny's
@@ -540,17 +547,35 @@ impl Home {
         let spelled: Vec<(String, Kept)> = (self.kept.iter())
             .map(|(place, kept)| (place.to_string_lossy().into_owned(), *kept))
             .collect();
-        let needles = (KEPT.iter().map(|(name, kept)| (*name, *kept)))
-            .chain(spelled.iter().map(|(place, kept)| (place.as_str(), *kept)));
-        let at: Vec<(usize, usize, Kept)> = needles
-            .flat_map(|(needle, kept)| {
-                (text.match_indices(needle)).map(move |(at, n)| (at, n.len(), kept))
+        // The holder too, named as itself: a word that goes no further.
+        let holders: Vec<String> = (self.holders.iter())
+            .map(|holder| holder.to_string_lossy().into_owned())
+            .collect();
+        let needles = (KEPT.iter().map(|(name, kept)| (*name, *kept, false)))
+            .chain(
+                spelled
+                    .iter()
+                    .map(|(place, kept)| (place.as_str(), *kept, false)),
+            )
+            .chain(std::iter::once((HOLDER.0, HOLDER.1, true)))
+            .chain(
+                holders
+                    .iter()
+                    .map(|holder| (holder.as_str(), HOLDER.1, true)),
+            );
+        let at: Vec<(usize, usize, Kept, bool)> = needles
+            .flat_map(|(needle, kept, whole)| {
+                (text.match_indices(needle)).map(move |(at, n)| (at, n.len(), kept, whole))
             })
-            .filter(|&(at, len, _)| {
-                !part(text[..at].chars().next_back()) && !part(text[at + len..].chars().next())
+            .filter(|&(at, len, _, whole)| {
+                let rest = &text[at + len..];
+                let rest = &rest[..rest.find(ends).unwrap_or(rest.len())];
+                !part(text[..at].chars().next_back())
+                    && !part(rest.chars().next())
+                    && (!whole || rest.is_empty() || rest == "/")
             })
             .collect();
-        at.into_iter().find_map(|(at, _, kept)| {
+        at.into_iter().find_map(|(at, _, kept, whole)| {
             let start = text[..at]
                 .char_indices()
                 .rev()
@@ -569,6 +594,11 @@ impl Home {
                 (false, Some(folder)) => lexical(&folder.join(path)),
                 (false, None) => return Some(kept),
             };
+            // The holder is the person's unless it was given by name.
+            if whole {
+                let holder = self.holders.contains(&path);
+                return (holder && !self.given.contains(&path)).then_some(kept);
+            }
             (!self.given_holds(&path)).then_some(kept)
         })
     }
@@ -2401,6 +2431,7 @@ mod tests {
             kept: (KEPT.iter())
                 .map(|(name, kept)| (format!("/Users/me/{name}").into(), *kept))
                 .collect(),
+            holders: vec!["/Users/me/.agents".into()],
             given: vec![
                 "/Users/me".into(),
                 "/Users/me/code/shop".into(),
@@ -2596,6 +2627,11 @@ mod tests {
             "rm -rf $HOME/.agents/skills/publish",
             "cat r.md > /Users/me/.agents/agents/r.md",
             "echo rule >> ${HOME}/.agents/AGENTS.md",
+            // Their folder, named as itself: a copy into it, or a `cd`.
+            "cp AGENTS.md ~/.agents/",
+            "cp -r skills $HOME/.agents",
+            "mv agents /Users/me/.agents/ && ls",
+            "cd ~/.agents; cp ../r.md agents/",
         ] {
             assert!(named(text), "{text}");
         }
@@ -2611,6 +2647,9 @@ mod tests {
             // Its own folder's skills are its work.
             "cp -r skill .agents/skills/x",
             "echo x > ~/.agents/notes.md",
+            "cp x ~/.agents/notes/",
+            "cp x .agents/",
+            "echo my.agents",
             "grep -r agent .",
             "echo my.agent.name",
             "rm -rf ~/.agent/sonny/zen/old",
@@ -2622,5 +2661,10 @@ mod tests {
         }
         // With no folder, a relative one could be anywhere.
         assert!(home.named_by("cat .agent/x", None).is_some());
+        assert!(home.named_by("cp x .agents/", None).is_some());
+        assert_eq!(
+            home.named_by("cp AGENTS.md ~/.agents/", folder),
+            Some(Kept::Agents)
+        );
     }
 }

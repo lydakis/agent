@@ -653,7 +653,9 @@ as one.
   `~/.agents/AGENTS.md` join `~/.agent` in the one list of kept places
   (`approver::KEPT`), matched the same ways (a write, edit or patch by the
   path it resolves to, the real path too; a command out of the sandbox by
-  its path words), and with the same verdict: the reviewer may refuse, and
+  its path words, and `~/.agents` itself, named as a copy's destination or
+  a `cd`, since what goes in it can land on them), and with the same
+  verdict: the reviewer may refuse, and
   what it would allow waits for the person, told the place holds the
   person's skills, agent profiles and standing instructions. A folder the
   agent was given (a task's worktree and the skills in it) is still its
