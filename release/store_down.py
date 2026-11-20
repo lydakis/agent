@@ -7,8 +7,9 @@ The daemon brings a store forward by itself when it starts, one schema at a
 time. Each of those steps has its way back here, newest first, so a release
 that knows only SCHEMA opens the store with nothing lost that it can hold:
 
-    110 -> 109  switches between model families go; each agent stays on
-                the model and history it has now (see back_110)
+    111 -> 110  switches between model families go; each agent stays on
+                the model and history it has now (see back_111)
+    110 -> 109  no `profile` on each bot
     109 -> 108  nothing: 0.10.2 (108) reads `yields`
     108 -> 107  the `namespace`, `speeds` and `context_windows` settings go
     107 -> 106  instructions back in each bot's row; `yields` is `lift` again
@@ -30,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import store_lift_yields  # noqa: E402
 
-NEWEST = 110
+NEWEST = 111
 OLDEST = 106
 
 
@@ -52,7 +53,7 @@ def on_lineage(conn, head, node):
     ).fetchone()[0] == 1
 
 
-def back_110(conn):
+def back_111(conn):
     """A switched agent's history was written again in the other family's
     items, each prompt node holding its turn beside the original's. A turn
     keeps one node again: the one its agent's history reaches, else the
@@ -75,6 +76,10 @@ def back_110(conn):
         "DROP INDEX bots_family_start;"
         "ALTER TABLE bots DROP COLUMN family_start;"
     )
+
+
+def back_110(conn):
+    run(conn, "ALTER TABLE bots DROP COLUMN profile")
 
 
 def back_109(conn):
@@ -112,7 +117,7 @@ def back_107(conn):
 
 
 # Each schema's way back to the one before it.
-BACK = {110: back_110, 109: back_109, 108: back_108, 107: back_107}
+BACK = {111: back_111, 110: back_110, 109: back_109, 108: back_108, 107: back_107}
 
 
 def down(store, to, dry=False):

@@ -1081,7 +1081,6 @@ async fn read_projects(
         .as_millis() as u64;
     // The calls waiting on the person, listed once for every project.
     let held = needs::listing(client, None).await.ok();
-    let kept = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_path_buf());
     let leads: Vec<&standing::Agent> = (listed.iter())
         .filter(|bot| {
             project::is_lead(&bot.name)
@@ -1155,7 +1154,7 @@ async fn read_projects(
         whole &= read.whole;
         let folder = lead.workspace.clone().unwrap_or_default();
         let superlead = *superleads.entry(lead.name.clone()).or_insert_with(|| {
-            seat_profile(&kept, &lead.name, true, std::path::Path::new(&folder)).as_deref()
+            seat_profile(lead.profile.as_deref(), true, std::path::Path::new(&folder)).as_deref()
                 == Some("superlead")
         });
         // When one of its agents last had a turn: now while one runs.
@@ -1633,16 +1632,16 @@ async fn read_status_of(
         // role of its own by `/new` keeps that.
         let profile = match project::is_lead(name) {
             _ if !view.details => None,
-            true => project::chosen(&store, name).or_else(|| {
+            true => bot.profile.clone().or_else(|| {
                 let folder = bot.workspace.clone().unwrap_or_default();
                 (profiles.entry(folder))
                     .or_insert_with_key(|folder| match folder.as_str() {
                         "" => None,
-                        folder => seat_profile(&store, name, true, std::path::Path::new(folder)),
+                        folder => seat_profile(None, true, std::path::Path::new(folder)),
                     })
                     .clone()
             }),
-            false => seat_profile(&store, name, false, std::path::Path::new("")),
+            false => bot.profile.clone(),
         }
         .unwrap_or_default();
         rows.push(status::Row {
@@ -2926,10 +2925,11 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
 /// What a start of Sonny's companions may do to those the daemon keeps.
 #[derive(Clone, Copy, PartialEq)]
 enum Companions {
-    /// Add those it keeps none of: what a window and an editor's session
-    /// do as they start or the daemon comes back. A window of another
-    /// build or path never replaces what runs, as replacing one stops the
-    /// scripts it runs.
+    /// Add those it keeps none of, and replace those an older Sonny
+    /// started: what a window and an editor's session do as they start or
+    /// the daemon comes back. One of a newer Sonny, or another build of
+    /// this version, is never replaced, as replacing one stops the scripts
+    /// it runs.
     Add,
     /// Replace them with this Sonny's, as `sonny upgrade` does, and as a
     /// window does that started the daemon itself, whose companions have
@@ -2953,7 +2953,7 @@ async fn start_companions(client: &Client, start: Companions) -> Result<(), Stri
         (LOOKOUT, named::LOOKOUT, "lookout"),
         (TOOL_HOST, named::TOOL_HOST, tool_host::NAME),
     ] {
-        if start == Companions::Add && kept_companion(&listed, name).is_some() {
+        if kept_companion(&listed, name).is_some_and(|kept| !replaces(kept, start, VERSION)) {
             continue;
         }
         let program = named::named(&me, program);
@@ -2961,6 +2961,23 @@ async fn start_companions(client: &Client, start: Companions) -> Result<(), Stri
     }
     keep_reviewer(client, &listed, None, start).await
 }
+
+/// Whether a start of companions `start` by Sonny `version` replaces the
+/// companion `kept`: always on [`Companions::Replace`]; on
+/// [`Companions::Add`] only one an older release of Sonny started, by the
+/// version in its `SONNY_BUILD`. One that names no version Sonny can read
+/// is left running.
+fn replaces(kept: &Value, start: Companions, version: &str) -> bool {
+    let started_by = (kept["env"]["SONNY_BUILD"].as_str())
+        .and_then(|build| build.split(' ').next())
+        .and_then(update::parse_version);
+    start == Companions::Replace
+        || started_by
+            .is_some_and(|theirs| update::parse_version(version).is_some_and(|ours| theirs < ours))
+}
+
+/// This Sonny's release.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The companions the daemon keeps, as it lists them.
 async fn companions(client: &Client) -> Result<Value, String> {
@@ -2982,7 +2999,7 @@ async fn keep_reviewer(
     model: Option<&str>,
     start: Companions,
 ) -> Result<(), String> {
-    if start == Companions::Add && kept_companion(listed, REVIEWER).is_some() {
+    if kept_companion(listed, REVIEWER).is_some_and(|kept| !replaces(kept, start, VERSION)) {
         return Ok(());
     }
     let me = named::me().map_err(|e| e.to_string())?;
@@ -3817,6 +3834,8 @@ async fn run() -> Result<(), String> {
         }
     };
     trigger::restamp_at_start(client.identity(), client.store());
+    // Before the lead's instructions are composed again from its profile.
+    upgrade::profiles_on_agents(&client, &options.store).await;
     upgrade::from_listing(client.clone(), &options.store);
     // A lead made just now starts in the row new leads start in.
     let mut fresh = false;
@@ -4000,9 +4019,9 @@ async fn run() -> Result<(), String> {
             .as_deref()
             .or(bot["workspace"].as_str().map(std::path::Path::new))
     {
-        let chosen = project::chosen(&app.options.store, &name);
+        let chosen = bot["profile"].as_str();
         let holds = bot["instructions"].as_str().unwrap_or_default();
-        match project::review(dir, holds, chosen.as_deref()) {
+        match project::review(dir, holds, chosen) {
             Ok((taken, left_out)) => {
                 app.warnings.extend(left_out);
                 app.instruct = taken;
@@ -6444,6 +6463,8 @@ struct App {
     /// The profile the agent runs as when not its seat's own, for the
     /// agent and folder it was read for.
     profile: std::cell::RefCell<Option<(Seat, Option<String>)>>,
+    /// The profile its agent was made in, as its record keeps it.
+    made_profile: Option<String>,
     /// The tools to declare on the bot so it can react, sent once no turn
     /// runs.
     declare: Option<Value>,
@@ -7173,23 +7194,16 @@ fn room_for(
     }
 }
 
-/// The profile an agent runs as: a lead's as the project in its `folder`
-/// or the config sets it; a task's as Sonny noted it when it started the
-/// task, which then had its own or its project's; none for another.
-fn seat_profile(
-    store: &std::path::Path,
-    bot: &str,
-    lead: bool,
-    folder: &std::path::Path,
-) -> Option<String> {
-    match lead {
-        // One `/new` made in a role of its own runs as that.
-        true => project::chosen(store, bot).or_else(|| {
-            crate::project::read(folder)
-                .ok()
-                .and_then(|info| project::lead_profile(&info).ok())
-        }),
-        false => task::noted_profile(store, bot),
+/// The profile an agent runs as: the one it was `made` in, which the
+/// daemon keeps on it; else a lead's as the project in its `folder` or the
+/// config sets it; none for another.
+fn seat_profile(made: Option<&str>, lead: bool, folder: &std::path::Path) -> Option<String> {
+    match (made, lead) {
+        (Some(made), _) => Some(made.to_owned()),
+        (None, true) => crate::project::read(folder)
+            .ok()
+            .and_then(|info| project::lead_profile(&info).ok()),
+        (None, false) => None,
     }
 }
 
@@ -8595,6 +8609,7 @@ impl App {
             finding: None,
             react_to: None,
             profile: Default::default(),
+            made_profile: record["profile"].as_str().map(str::to_owned),
             declare: None,
             role: served::Role::TASK,
             bot_reactions: Vec::new(),
@@ -20712,29 +20727,16 @@ impl App {
                     Ok(file) => file,
                     Err(error) => break 'lead Err(error),
                 };
-                // The project's own role is noted nowhere, so the lead
-                // follows the project when it changes.
-                let chosen = (!profile.default).then(|| profile.name.clone());
+                // The project's own role is kept on no lead, so the lead
+                // follows the project when it changes; one picked by name
+                // is kept on the lead it makes.
                 let pick = project::Pick::Made {
                     name: making.name.clone(),
                     words: brief.clone(),
-                    profile: chosen.clone(),
+                    profile: (!profile.default).then(|| profile.name.clone()),
                 };
                 match project::open(&self.client, &dir, None, &pick).await {
                     Ok(lead) => {
-                        // One made in the project's role keeps no note an
-                        // agent of its name before it left.
-                        match &chosen {
-                            Some(chosen) => {
-                                if let Err(error) =
-                                    task::note_profile(&self.store(), &lead.bot, chosen)
-                                {
-                                    self.notice =
-                                        Some(format!("{} runs as {chosen}: {error}", lead.bot));
-                                }
-                            }
-                            None => task::forget_profile(&self.store(), &lead.bot),
-                        }
                         // Its title is its first message's first line,
                         // noted by its id.
                         let first = crate::title::of_message(&brief);
@@ -23003,7 +23005,7 @@ impl App {
         }
         let lead = self.project.is_some();
         let here = std::path::Path::new(&self.workspace);
-        let profile = seat_profile(&self.store(), &self.bot, lead, here)
+        let profile = seat_profile(self.made_profile.as_deref(), lead, here)
             .filter(|profile| profile != if lead { "lead" } else { "task" });
         *self.profile.borrow_mut() = Some((key, profile.clone()));
         profile
@@ -26045,13 +26047,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_profiles_sonny_noted_go_onto_their_agents() {
+        let dir = std::env::temp_dir().join(unique("sonny-profiles-on-agents"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let mut notes = agent_client::socket::canonical_store(&store)
+            .unwrap()
+            .into_os_string();
+        notes.push(".profiles");
+        let notes = std::path::PathBuf::from(notes);
+        std::fs::create_dir_all(&notes).unwrap();
+        for (task, profile) in [
+            ("shop.fix", "reviewer"),
+            ("shop.kept", "task"),
+            ("shop.gone", "task"),
+        ] {
+            std::fs::write(notes.join(task), format!("{profile}\n")).unwrap();
+        }
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |ask| {
+            seen.lock().unwrap().push(ask.clone());
+            json!({"bot": ask["bot"], "changed": ["profile"]})
+        })
+        .await;
+        // One that has a profile of its own keeps it; one gone has none
+        // to take.
+        let bots = [
+            json!({"name": "shop.fix", "bot_id": 2}),
+            json!({"name": "shop.kept", "bot_id": 3, "profile": "lead"}),
+        ];
+        // A note that cannot be read leaves every note where it is, for
+        // the next start.
+        std::fs::create_dir(notes.join("shop.unread")).unwrap();
+        assert!(!task::profiles_onto_agents(&client, &bots, &store).await);
+        assert!(notes.join("shop.fix").exists());
+        assert!(asked.lock().unwrap().is_empty());
+        std::fs::remove_dir(notes.join("shop.unread")).unwrap();
+        assert!(task::profiles_onto_agents(&client, &bots, &store).await);
+        let asked: Vec<Value> = (asked.lock().unwrap().iter())
+            .map(|ask| {
+                json!({"op": ask["op"], "bot": ask["bot"], "bot_id": ask["bot_id"],
+                "profile": ask["profile"]})
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [json!({"op": "configure", "bot": "shop.fix", "bot_id": 2, "profile": "reviewer"})]
+        );
+        assert!(!notes.exists());
+        // Nothing left: done again at once.
+        assert!(task::profiles_onto_agents(&client, &bots, &store).await);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lead_s_noted_profile_is_on_it_once_the_move_is_awaited() {
+        let dir = std::env::temp_dir().join(unique("sonny-profiles-awaited"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let mut notes = agent_client::socket::canonical_store(&store)
+            .unwrap()
+            .into_os_string();
+        notes.push(".profiles");
+        let notes = std::path::PathBuf::from(notes);
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("shop.lead"), "planner\n").unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |ask| {
+            seen.lock().unwrap().push(ask["op"].clone());
+            match ask["op"].as_str() {
+                Some("bots") => json!({"bots": [{"name": "shop.lead", "bot_id": 1}],
+                    "next_after": null, "cursor": 0}),
+                _ => json!({"bot": ask["bot"], "changed": ["profile"]}),
+            }
+        })
+        .await;
+        upgrade::profiles_on_agents(&client, &store).await;
+        assert_eq!(*asked.lock().unwrap(), [json!("bots"), json!("configure")]);
+        assert!(!notes.exists());
+        // Done once: no listing again.
+        upgrade::profiles_on_agents(&client, &store).await;
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn status_reads_nothing_of_agents_with_no_history() {
         let dir = std::env::temp_dir().join(format!("status-unread-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
         resolved::keep(&store, "shop.done", 0, "c1").unwrap();
-        task::note_profile(&store, "shop.noted", "reviewer").unwrap();
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let client = daemon_answering(move |ask| {
@@ -26059,10 +26147,12 @@ mod tests {
             seen.lock().unwrap().push(op.clone());
             match op.as_str() {
                 "bots" => {
-                    let bots: Vec<Value> = ["shop.lead", "shop.done", "shop.noted", "shop.new"]
+                    let mut bots: Vec<Value> = ["shop.lead", "shop.done", "shop.noted", "shop.new"]
                         .iter()
                         .map(|name| json!({"name": name, "bot_id": 1, "head": null, "last": null}))
                         .collect();
+                    // Made in a profile, which the daemon keeps on it.
+                    bots[2]["profile"] = json!("reviewer");
                     json!({"bots": bots, "next_after": null})
                 }
                 "approvals" => json!({"approvals": []}),
@@ -27383,11 +27473,11 @@ mod tests {
                 {"name": "shop.lead", "bot_id": 1, "head": 1, "workspace": folder,
                     "status": "idle", "running_turn": null},
                 {"name": "shop.lead.rex", "bot_id": 4, "head": 1, "workspace": folder,
-                    "status": "idle", "running_turn": null},
+                    "status": "idle", "running_turn": null, "profile": "lead"},
                 {"name": "shop.lead.ada", "bot_id": 5, "head": 1, "workspace": folder,
                     "status": "idle", "running_turn": null},
                 {"name": "shop.fix", "bot_id": 2, "head": 1,
-                    "status": "idle", "running_turn": null},
+                    "status": "idle", "running_turn": null, "profile": "reviewer"},
                 {"name": "shop.old", "bot_id": 3, "head": 1,
                     "status": "idle", "running_turn": null},
             ], "next_after": null}),
@@ -27402,11 +27492,9 @@ mod tests {
         app.bot = "shop.lead".into();
         app.options.store = dir.join("store");
         // A task runs as the profile it was started with, whatever its
-        // project tells tasks by default.
-        task::note_profile(&app.store(), "shop.fix", "reviewer").unwrap();
-        // A lead `/new` made in a role of its own keeps it beside the
-        // folder's other leads, whichever is listed first.
-        task::note_profile(&app.store(), "shop.lead.rex", "lead").unwrap();
+        // project tells tasks by default; a lead `/new` made in a role of
+        // its own keeps it beside the folder's other leads, whichever is
+        // listed first: each as the daemon keeps it on the agent.
         let (_, rows) = app.status_rows().await.unwrap();
         let profile = |bot: &str| {
             rows.iter()
@@ -31673,15 +31761,15 @@ mod tests {
             text.contains(&format!(" {} · superlead · ", models::label(&app.model))),
             "{text}"
         );
-        // A task, as Sonny noted it when it started it: named only when
-        // it is not `task`.
+        // A task, as the daemon keeps the profile it was made in: named
+        // only when it is not `task`.
         app.options.store = dir.join("store");
         app.project = None;
         app.bot = "top.fix".into();
-        task::note_profile(&app.store(), "top.fix", "task").unwrap();
+        app.made_profile = Some("task".into());
         assert!(!app.footer_line(140).to_string().contains("task ·"));
         app.bot = "top.check".into();
-        task::note_profile(&app.store(), "top.check", "reviewer").unwrap();
+        app.made_profile = Some("reviewer".into());
         let text = app.footer_line(140).to_string();
         assert!(
             text.contains(&format!(" {} · reviewer · ", models::label(&app.model))),
@@ -33742,13 +33830,42 @@ mod tests {
         assert_eq!(removed, [OLD_REVIEWER]);
     }
 
+    #[test]
+    fn a_window_replaces_only_companions_an_older_sonny_started() {
+        let kept = |build: Option<&str>| match build {
+            Some(build) => json!({"env": {"SONNY_BUILD": build}}),
+            None => json!({"env": {}}),
+        };
+        // An older release's: replaced, by its version, not its digits.
+        for older in ["0.10.1 1", "0.9.5 1", "0.0.0 1"] {
+            assert!(
+                replaces(&kept(Some(older)), Companions::Add, "0.10.2"),
+                "{older}"
+            );
+        }
+        // A newer release's, another build of this one, or one that names
+        // no version: left running.
+        for build in [Some("0.10.3 1"), Some("0.10.2 9"), Some("nightly"), None] {
+            assert!(
+                !replaces(&kept(build), Companions::Add, "0.10.2"),
+                "{build:?}"
+            );
+        }
+        // A start of this build's own replaces whatever is kept.
+        assert!(replaces(
+            &kept(Some("0.10.3 1")),
+            Companions::Replace,
+            "0.10.2"
+        ));
+    }
+
     #[tokio::test]
     async fn a_window_adds_only_the_companions_the_daemon_keeps_none_of() {
-        // Kept by another build: a window of this one leaves them running,
+        // Kept by a newer Sonny: a window of this one leaves them running,
         // as replacing the tool host stops every script it runs.
         let other = |name: &str| {
             json!({"name": name, "command": "/other/sonny", "args": [],
-                "env": {"SONNY_BUILD": "0.9.5 1", named::PROGRAM: "/other/sonny"}})
+                "env": {"SONNY_BUILD": "999.0.0 1", named::PROGRAM: "/other/sonny"}})
         };
         let (added, removed) = companions_kept_from(
             json!([other(LOOKOUT), other(TOOL_HOST), other(REVIEWER)]),

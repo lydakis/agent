@@ -13,7 +13,7 @@ import store_down
 
 FIXTURES = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
 
-UP_110 = """
+UP_111 = """
 DROP INDEX nodes_turn;
 CREATE INDEX nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
 ALTER TABLE bots ADD COLUMN family_start INTEGER;
@@ -26,7 +26,7 @@ CREATE TABLE switches(id INTEGER PRIMARY KEY AUTOINCREMENT,
     compaction INTEGER, state TEXT NOT NULL, at_ms INTEGER NOT NULL);
 CREATE INDEX switches_bot ON switches(bot_id,id);
 CREATE INDEX switches_left ON switches(left) WHERE left IS NOT NULL;
-PRAGMA user_version=110;
+PRAGMA user_version=111;
 """
 
 
@@ -41,11 +41,14 @@ class StoreDownTest(unittest.TestCase):
         conn.executescript((FIXTURES / "store-v0.10.2.sql").read_text())
         # 109 differs from 108 only in that no list says `lift`, as none
         # 0.10.2 wrote does.
-        conn.execute("PRAGMA user_version=109")
-        # 110 as the daemon makes it (src/store/db.rs), with Helper switched
+        # 110 adds each bot's profile.
+        conn.execute("ALTER TABLE bots ADD COLUMN profile TEXT")
+        conn.execute("UPDATE bots SET profile='reviewer' WHERE name='Helper'")
+        conn.execute("PRAGMA user_version=110")
+        # 111 as the daemon makes it (src/store/db.rs), with Helper switched
         # to the other family: its newest prompt written again on a branch
         # from the root, holding the same turn, and Helper moved onto it.
-        conn.executescript(UP_110)
+        conn.executescript(UP_111)
         node, turn = conn.execute(
             "SELECT n.id,n.turn FROM nodes n JOIN turns t ON t.id=n.turn"
             " WHERE t.bot='Helper' ORDER BY n.id DESC LIMIT 1"
@@ -88,8 +91,8 @@ class StoreDownTest(unittest.TestCase):
         return json.loads(out.getvalue())
 
     def test_a_switched_agent_stays_where_it_is_and_each_turn_has_one_node(self):
-        self.assertEqual(self.down("109")["from"], 110)
-        self.assertEqual(self.read("PRAGMA user_version"), [(109,)])
+        self.assertEqual(self.down("110")["from"], 111)
+        self.assertEqual(self.read("PRAGMA user_version"), [(110,)])
         self.assertEqual(self.read(f"SELECT id FROM nodes WHERE turn={self.turn}"), [(self.switched,)])
         self.assertEqual(self.read(f"SELECT turn FROM nodes WHERE id={self.original}"), [(None,)])
         self.assertEqual(self.read("SELECT head FROM bots WHERE name='Helper'"), [(self.switched,)])
@@ -99,10 +102,11 @@ class StoreDownTest(unittest.TestCase):
                          [(1,)])
 
     def test_back_to_0_10_1_s_shape(self):
-        self.assertEqual(self.down("106")["from"], 110)
+        self.assertEqual(self.down("106")["from"], 111)
         self.assertEqual(self.read("PRAGMA user_version"), [(106,)])
         columns = {row[1] for row in self.read("PRAGMA table_info(bots)")}
         self.assertTrue({"instructions", "compaction_instructions"} <= columns)
+        self.assertNotIn("profile", columns)
         self.assertEqual(self.read("SELECT name FROM sqlite_master WHERE name='bot_instructions'"), [])
         self.assertEqual(self.read("SELECT DISTINCT instructions FROM bots"), [("Test agent.",)])
         self.assertEqual(self.read("SELECT count(*) FROM bots WHERE json_type(settings,'$.namespace') IS NOT NULL"),
@@ -116,13 +120,14 @@ class StoreDownTest(unittest.TestCase):
         # Every bot names a list the store keeps.
         self.assertEqual(self.read("SELECT count(*) FROM bots WHERE declared IS NOT NULL"
                                    " AND declared NOT IN (SELECT digest FROM tool_lists)"), [(0,)])
-        self.assertEqual(len(glob.glob(self.store + ".schema-110.*.backup")), 1)
+        self.assertEqual(len(glob.glob(self.store + ".schema-111.*.backup")), 1)
 
     def test_to_0_10_2_only_the_settings_it_refuses_go(self):
         lists = self.read("SELECT * FROM tool_lists")
         self.down("108")
         self.assertEqual(self.read("PRAGMA user_version"), [(108,)])
         self.assertEqual(self.read("SELECT * FROM tool_lists"), lists)
+        self.assertNotIn("profile", {row[1] for row in self.read("PRAGMA table_info(bots)")})
         self.assertEqual(self.read("SELECT count(*) FROM bot_instructions"), [(4,)])
 
     def test_a_dry_run_writes_nothing(self):
@@ -136,13 +141,13 @@ class StoreDownTest(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX)
             with self.assertRaisesRegex(SystemExit, "a daemon holds this store"):
                 self.down("106")
-        for to in ("105", "111"):
-            with self.assertRaisesRegex(SystemExit, "goes back to 106 through 110"):
+        for to in ("105", "112"):
+            with self.assertRaisesRegex(SystemExit, "goes back to 106 through 111"):
                 self.down(to)
         os.link(self.store, self.store + ".alias")
         with self.assertRaisesRegex(SystemExit, "another hard link"):
             self.down("106")
-        self.assertEqual(self.read("PRAGMA user_version"), [(110,)])
+        self.assertEqual(self.read("PRAGMA user_version"), [(111,)])
 
 
 if __name__ == "__main__":

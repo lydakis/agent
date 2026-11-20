@@ -2530,6 +2530,8 @@ async fn setup_lead(
     lead: &project::Lead,
     moving: Option<&str>,
 ) -> Result<(), String> {
+    // Its profile is on it before its instructions are composed from it.
+    crate::upgrade::profiles_on_agents(client, &agent.options.store).await;
     let record = client
         .request("inspect", json!({"bot": lead.bot}))
         .await
@@ -2543,7 +2545,7 @@ async fn setup_lead(
     if let Ok((taken, left)) = project::review(
         Path::new(&workspace),
         record["instructions"].as_str().unwrap_or_default(),
-        project::chosen(&agent.options.store, &lead.bot).as_deref(),
+        record["profile"].as_str(),
     ) {
         left_out = left;
         if let Some(text) = taken {

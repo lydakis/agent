@@ -32,9 +32,16 @@ Sonny's agents add and change automations with the `automations` tool, which
 Sonny's tool host answers outside the agent's sandbox, since an automation runs
 as the person outside it: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
-and `message`), `remove`, `run` or `show` NAME, or nothing to list them.
-An agent lists and shows only its own: those that wake it, send their answers
-to it, or start an agent it added; `sonny automation list` lists every one.
+and `message`), `remove`, `run` or `read` NAME, or nothing to list them.
+Nothing lists them as the other tools that list do (follows, memory, the
+commons): one line each, its name, when it runs (`when`), the agent it
+messages (`agent`), when its last run was and how it went (`last`, with how
+the turn it sent ended once known), and any `problem`, `missed` or `ended`;
+a long list comes in pages, `next` in the answer saying where the rest
+start, as `from`. `read` NAME shows one whole, its message and last result
+too. An agent lists and reads only its own: those that wake it, send their
+answers to it, or start an agent it added; `sonny automation list` lists
+every one.
 A look acts on nothing and runs as any read does, also for an agent whose
 sandbox no one reviews. An add, a removal or a run is judged by its parts,
 never as a whole, as a script's calls are: each part that reaches past the
@@ -970,8 +977,16 @@ protocol would otherwise leave the old daemon running), and even when it
 names the same version, as a nightly's next commit does: the old one
 stops at once, its running turns park and
 continue on the new one, and the new one waits on the store, so nothing
-started meanwhile takes it. Then the companions start on the new Sonny,
-and the scripts in `~/.agent`, every automation and the scheduler's job
+started meanwhile takes it. Then the companions are checked: the lookout,
+the tool host and the reviewer (when one is kept) each on the new Sonny's
+build, by a name that leads to its program, and running with no restart
+for five seconds. One that is not is replaced with the new Sonny's and
+watched again, up to fifteen seconds. A line says each: `Companion
+sonny-lookout: ok`, `replaced (was 0.10.1)`, `started (none was kept)`,
+or `still failing (exits 1, 3 restarts; its log: ...)`, and one still
+failing makes the upgrade exit non-zero. A daemon the upgrade could not
+start leaves them unchecked, and says so: once it runs, `sonny upgrade`
+puts them on the new build. Then the scripts in `~/.agent`, every automation and the scheduler's job
 are written again by the path that outlives a release. A line names each
 skill or role of Sonny's whose new text waits beside the person's edited
 copy (`Your lead role (~/.agents/agents/lead.md) is kept; Sonny's new text
@@ -989,10 +1004,15 @@ finished by `sonny update` or by opening a Sonny window: until one runs,
 the daemon, the scripts in `~/.agent`, automations and the scheduler's job
 stay on the old release. The companions are the exception: a window puts
 them on its own build only when it starts the daemon itself (none ran, or
-one of an older protocol it replaces), and otherwise adds only one the
-daemon keeps none of, since replacing a running tool host stops the
-scripts it runs; `sonny update` replaces them. A plain `agent start`
-replaces only the daemon.
+one of an older protocol it replaces), and otherwise adds one the daemon
+keeps none of and replaces one an older release of Sonny started (by the
+version its `SONNY_BUILD` names); one of a newer release, or another
+build of its own version, it leaves running, since replacing a running
+tool host stops the scripts it runs, and `sonny update` replaces those. A plain `agent start`
+replaces only the daemon, and brings the companions back as they were
+kept: by names that still lead to the old program, which runs on, removed
+from its install, until the first window of the new release opens, or
+`sonny upgrade` runs.
 
 Each open window notes the program it started from. When it loses the
 daemon and the Sonny installed where it runs from is another program
