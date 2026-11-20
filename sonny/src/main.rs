@@ -1412,9 +1412,11 @@ async fn read_status_of(
         if prune {
             listed_here.insert(name);
         }
-        // Its title as noted, else, with none, its first line read once.
+        // Its title as noted, else, with none, its first line read once;
+        // a project's lead takes its project's, never its first message.
         let mut title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
         let untitled = title.is_none()
+            && !crate::title::is_project_lead(name)
             && bot.head.is_some()
             && (bot.bot_id).is_some_and(|id| !crate::title::asked(name, id));
         // An idle agent no event moved stands as the last count built it,
