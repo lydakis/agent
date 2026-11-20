@@ -548,6 +548,48 @@ class BurstLedgerTests(unittest.TestCase):
             self.assertTrue(said.search(answer), answer)
         self.assertFalse(said.search('the tests pass'))
 
+    def test_a_task_started_by_a_code_mode_step_is_delegated_and_person_approvals_count(self):
+        code = next(e for e in role_eval.BURST_ASKS if e[3] == 'B1 code ask: gitignore')
+        events = [{'step': 1, 'id': 's1e0', 'source': code[0], 'from': code[1], 'text': code[2], 'plant': code[3]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, env = self.repo(tmp, role_eval.FILES)
+            out = Path(tmp) / 'out'
+            out.mkdir()
+            # `sonny acp` shows the script only as its `exec`.
+            script = {'sessionUpdate': 'tool_call', 'name': 'exec', 'rawInput': {'code': 'await tools.x()'}}
+            (out / 'acp.jsonl').write_text(json.dumps({'t': 30.0, 'm': {'method': 'session/update',
+                                                                        'params': {'update': script}}}) + '\n')
+            db = sqlite3.connect(Path(tmp) / 'state.sqlite')
+            db.execute('CREATE TABLE audit(id INTEGER PRIMARY KEY, at_ms INTEGER, bot TEXT, step TEXT, tool TEXT, '
+                       'outcome TEXT, preview TEXT, approved TEXT)')
+            db.executemany('INSERT INTO audit(at_ms, bot, step, tool, outcome, preview, approved) VALUES (?,?,?,?,?,?,?)', [
+                (40_000, 'shop.lead', 's1', 'start_task', 'completed',
+                 '{"name":"ignore","brief":"add a .gitignore for __pycache__"}', 'sandbox'),
+                (41_000, 'shop.lead', 's2', 'start_task', 'denied', '{"brief":"gitignore"}', 'person'),
+                (60_000, 'shop.ignore', None, 'shell', 'completed', 'git push', 'person')])
+            db.commit()
+            db.close()
+            summary = self.ledger.ledger(out, self.agent(tmp), repo, env, events, [{'step': 1, 't': 0.0}],
+                                         Path(tmp) / 'state.sqlite.lookout.jsonl', ended=500.0)
+            row = json.loads((out / 'asks.json').read_text())['asks'][0]
+        self.assertEqual((row['delegated_s'], summary['handled']), (40, 1))
+        self.assertEqual(summary['person_approvals'], {'lead': 1, 'others': 1})
+
+    def test_each_arm_takes_its_own_code_mode_and_settings(self):
+        import argparse
+        settings = role_eval.arm_settings(argparse.ArgumentParser(), ['direct=off', 'code=on'],
+                                          ['code:history_step=true', 'direct:task_effort=low'])
+        self.assertEqual(settings, {'direct': {'code_mode': False, 'task_effort': 'low'},
+                                    'code': {'code_mode': True, 'history_step': True}})
+        with tempfile.TemporaryDirectory() as tmp:
+            bins = Path(tmp) / 'build'
+            bins.mkdir()
+            for name in ('agent', 'sonny'):
+                (bins / name).write_text('#!/bin/sh\n')
+            home, *_ = role_eval.setup(Path(tmp) / 'd1', bins, 'chatgpt/gpt-6.1-sol', settings=settings['direct'])
+            self.assertIn('task_effort = "low"\nsuggest = false\ndefault_permissions = "eval"\ncode_mode = false\n',
+                          (home / '.agent/config.toml').read_text())
+
     def test_a_code_ask_the_lead_did_itself_counts_as_handled(self):
         code = next(e for e in role_eval.BURST_ASKS if e[3] == 'B1 code ask: gitignore')
         events = [{'step': 1, 'id': 's1e0', 'source': code[0], 'from': code[1], 'text': code[2], 'plant': code[3]}]

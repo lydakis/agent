@@ -16,6 +16,7 @@ still has the rows read from the transcript.
 """
 import json
 import re
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -112,8 +113,9 @@ class Recorder:
     """Every agent's turns, usage and ends as they come (`agent follow
     --all`), written to `path`, so evidence outlives a task deleted later."""
 
-    def __init__(self, agent, env, path):
-        self.file = open(path, 'w')
+    def __init__(self, agent, env, path, mode='w'):
+        # 'a' after a restart: the new daemon's stream follows the old one's.
+        self.file = open(path, mode)
         self.process = subprocess.Popen([str(agent), 'follow', '--all'], env=env, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, text=True)
         self.thread = threading.Thread(target=self.read, daemon=True)
@@ -193,6 +195,41 @@ def seconds(text):
     for part in clock.split(':'):
         total = total * 60 + float(part)
     return total + (int(days) * 86400 if days else 0)
+
+
+def steps(store, lead):
+    """The lead's code-mode steps from the run's audit trail, each as
+    (when, tool, arguments): `sonny acp` shows a script only as its `exec`,
+    so a task started by a step is found here."""
+    if not store or not Path(store).exists():
+        return []
+    db = sqlite3.connect(f'file:{store}?mode=ro', uri=True)
+    try:
+        rows = db.execute("SELECT at_ms, tool, preview FROM audit WHERE bot = ? AND step IS NOT NULL "
+                          "AND outcome != 'denied' ORDER BY id", (lead,)).fetchall()
+    except sqlite3.OperationalError:  # a build before the trail
+        rows = []
+    finally:
+        db.close()
+    return [(at / 1000, tool, preview or '') for at, tool, preview in rows]
+
+
+def person_approvals(store, lead):
+    """Calls a person approved, from the audit trail: the lead's and every
+    other agent's. In the eval's `ask` row the eval stands in for the
+    person; under `auto` the reviewer model would decide most of them."""
+    found = {'lead': 0, 'others': 0}
+    if not store or not Path(store).exists():
+        return found
+    db = sqlite3.connect(f'file:{store}?mode=ro', uri=True)
+    try:
+        for bot, count in db.execute("SELECT bot, count(*) FROM audit WHERE approved = 'person' GROUP BY bot"):
+            found['lead' if bot == lead else 'others'] += count
+    except sqlite3.OperationalError:  # a build before the trail
+        pass
+    finally:
+        db.close()
+    return found
 
 
 def lead_view(acp_log):
@@ -278,8 +315,8 @@ def agents(events_path):
         bot = e.get('bot')
         if not bot:
             continue
-        a = found.setdefault(bot, {'turns': {}, 'input_tokens': 0, 'cached_input_tokens': 0,
-                                   'output_tokens': 0, 'errors': [], 'deleted': False})
+        a = found.setdefault(bot, {'turns': {}, 'rounds': 0, 'input_tokens': 0, 'cached_input_tokens': 0,
+                                   'output_tokens': 0, 'errors': [], 'deleted': False, 'aside': {}})
         data = e.get('data') or {}
         if e['event'] == 'turn_finished':
             status = data.get('status', '?')
@@ -287,8 +324,15 @@ def agents(events_path):
             if data.get('error'):
                 a['errors'].append(data['error'])
         elif e['event'] == 'usage':
+            a['rounds'] += 1
             for k in ('input_tokens', 'cached_input_tokens', 'output_tokens'):
                 a[k] += data.get(k) or 0
+            # A round beside the turn's own work, such as a compaction's
+            # summary: its rounds and input by what it was for.
+            if data.get('purpose'):
+                side = a['aside'].setdefault(data['purpose'], {'rounds': 0, 'input_tokens': 0})
+                side['rounds'] += 1
+                side['input_tokens'] += data.get('input_tokens') or 0
         elif e['event'] == 'deleted':
             a['deleted'] = True
     return found
@@ -318,6 +362,10 @@ def ledger(out, agent, repo, env, events, timeline, lookout_log, resources=None,
     run's last evidence."""
     out = Path(out)
     notes, calls, said = lead_view(out / 'acp.jsonl')
+    # Code mode's steps count as the lead's calls: a `start_task` step
+    # delegates as the tool does. The store sits beside the lookout's log.
+    store = Path(lookout_log).parent / 'state.sqlite'
+    calls = sorted(calls + steps(store, lead))
     branches = confined(agent, env, ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads'],
                         repo).stdout.decode().split()
     # Written again later: what only the run could measure stays as the
@@ -379,6 +427,14 @@ def ledger(out, agent, repo, env, events, timeline, lookout_log, resources=None,
         'input_tokens': sum(a['input_tokens'] for a in found.values()),
         'cached_input_tokens': sum(a['cached_input_tokens'] for a in found.values()),
         'output_tokens': sum(a['output_tokens'] for a in found.values()),
+        'lead_rounds': (found.get(lead) or {}).get('rounds', 0),
+        'others_rounds': sum(a['rounds'] for bot, a in found.items() if bot != lead),
+        'aside_rounds': sum(side['rounds'] for a in found.values() for side in a['aside'].values()),
+        'aside_input_tokens': sum(side['input_tokens'] for a in found.values() for side in a['aside'].values()),
+        # Lead turns a note started, and how many of them said anything to
+        # the person: interruptions, right or not.
+        'note_turns': len(notes),
+        'person_approvals': person_approvals(store, lead),
         **unkept(lookout_log, lead),
         **(resources or {}),
         'ended': end,

@@ -956,6 +956,26 @@ def run(arm, n, bins, model, spec=None):
                         acp.collect(out_prompt[1])
                         heard_back()
                     answered(step, acp.ask('session/prompt', prompt))
+            if s.get('restart') is not None:
+                # The daemon stops mid-work and a fresh one starts on the
+                # same store, as a crash, an upgrade or a reboot leaves it:
+                # parked turns continue, and `sonny acp` follows again.
+                time.sleep(s['restart'])
+                timeline[-1]['busy_at_restart'] = len(active(env, agent))
+                # No grace: running calls are cut, as a crash cuts them.
+                subprocess.run([str(agent), 'shutdown', '--grace', '0ms'], env=env, capture_output=True)
+                if recorder:
+                    recorder.close()
+                for _ in range(30):
+                    time.sleep(2)
+                    if subprocess.run([str(agent), 'start', '--idle-exit', '0'], env=env,
+                                      capture_output=True).returncode == 0:
+                        break
+                else:
+                    raise RuntimeError(f'step {step}: the daemon did not start again')
+                timeline[-1]['restarted'] = time.time()
+                if recorder:
+                    recorder = burst_ledger.Recorder(agent, env, out / 'events.jsonl', mode='a')
             if not heard:
                 heard = until_subscribed(home)
                 release(step, s)
@@ -1316,7 +1336,8 @@ def main():
         blind()
     elif a.cmd == 'ledger':
         # A finished burst run's ledger again, while its root is still there.
-        for arm, n in ([(a.arm, a.n)] if a.runs == 0 else [(arm, n) for n in range(1, a.runs + 1) for arm in 'AB']):
+        arms = sorted(bins) or ['A', 'B']
+        for arm, n in ([(a.arm, a.n)] if a.runs == 0 else [(arm, n) for n in range(1, a.runs + 1) for arm in arms]):
             out, root = RUNS / f'{arm}{n}', ROOT / f'{zlib.crc32((a.model + DAY_NAME).encode()):08x}-{arm}{n}'
             if not (out / 'acp.jsonl').exists() or not (root / 'shop').exists():
                 continue

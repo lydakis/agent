@@ -14,9 +14,9 @@ def part(kind, said='', calls=()):
             'calls': [{'name': name, 'input': args} for name, args in calls]}
 
 
-def row(tool, bot='shop.lead', step=None, preview='', outcome='completed', turn=1):
+def row(tool, bot='shop.lead', step=None, preview='', outcome='completed', turn=1, approved=None):
     return {'bot': bot, 'turn': turn, 'call_id': 'c', 'step': step, 'tool': tool, 'kind': None,
-            'outcome': outcome, 'preview': preview}
+            'outcome': outcome, 'preview': preview, 'approved': approved}
 
 
 def run_dir(tmp, parts, audit=(), main=None, suite=True, origin=('refs/heads/main',), can=(), files=None,
@@ -34,10 +34,10 @@ def run_dir(tmp, parts, audit=(), main=None, suite=True, origin=('refs/heads/mai
 
 
 class CaseTests(unittest.TestCase):
-    def test_eleven_cases_over_every_area_and_every_check_in_the_docs(self):
-        self.assertEqual(len(golden_eval.CASES), 11)
+    def test_twelve_cases_over_every_area_and_every_check_in_the_docs(self):
+        self.assertEqual(len(golden_eval.CASES), 12)
         self.assertEqual({c['area'] for c in golden_eval.CASES},
-                         {'lead', 'coding', 'tasks', 'lookout', 'spawn_agent', 'history', 'skills'})
+                         {'lead', 'coding', 'tasks', 'lookout', 'spawn_agent', 'history', 'recovery', 'skills'})
         doc = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
         for case in golden_eval.CASES:
             self.assertIn(f"| {case['id']} |", doc)
@@ -256,6 +256,32 @@ class ScoreTests(unittest.TestCase):
             self.assertEqual(set(self.score('teammate-change', view).values()), {True})
 
 
+class RestartTests(unittest.TestCase):
+    def score(self, view):
+        return golden_eval.score(golden_eval.CASE['restart'], view)
+
+    def test_work_carried_through_a_restart_passes_and_a_failed_turn_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            timeline = json.dumps([{'step': 1, 'busy_at_restart': 1, 'restarted': 5.0}, {'step': 2}])
+            done = {'timeline.json': timeline, 'events.jsonl': json.dumps(
+                {'event': 'turn_finished', 'bot': 'shop.fix', 'data': {'status': 'completed'}})}
+            view = run_dir(Path(tmp) / 'a', [part('person', 'Started shop.fix'),
+                                              part('person', 'Yes, merged into main.')],
+                           main={'session': True}, files=done)
+            self.assertEqual(set(self.score(view).values()), {True})
+            failed = {**done, 'events.jsonl': json.dumps(
+                {'event': 'turn_finished', 'bot': 'shop.fix', 'data': {'status': 'failed'}})}
+            view = run_dir(Path(tmp) / 'b', [part('person', 'ok'), part('person', 'merged into main')],
+                           main={'session': True}, files=failed)
+            self.assertFalse(self.score(view)['no turn failed'])
+
+    def test_a_restart_with_nothing_running_tested_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            view = run_dir(tmp, [part('person', 'merged into main')], main={'session': True},
+                           files={'timeline.json': json.dumps([{'step': 1, 'busy_at_restart': 0}])})
+            self.assertFalse(self.score(view)['an agent was working when the daemon stopped'])
+
+
 class UsageTests(unittest.TestCase):
     def test_tools_steps_skills_rounds_and_tokens_by_lead_and_others(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,6 +310,21 @@ class UsageTests(unittest.TestCase):
             # shop.look called no tool: the event stream has it.
             self.assertEqual(used['agents'], ['shop.fix', 'shop.look'])
             self.assertEqual((used['messages'], used['seconds'], used['peak_rss_mb']), (2, 30, 80.5))
+
+    def test_person_approvals_note_turns_and_rounds_beside_the_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = '\n'.join(json.dumps(e) for e in [
+                {'event': 'usage', 'bot': 'shop.lead', 'data': {'input_tokens': 100}},
+                {'event': 'usage', 'bot': 'shop.lead', 'data': {'input_tokens': 900, 'purpose': 'compaction'}},
+                {'event': 'usage', 'bot': 'shop.fix', 'data': {'input_tokens': 40, 'purpose': 'compaction'}}])
+            view = run_dir(tmp, [part('person', 'ok'), part('note'), part('note', 'the freeze moved')], [
+                row('shell', approved='person'), row('shell', bot='shop.fix', approved='person'),
+                row('shell', bot='shop.fix', approved='sandbox')], files={'events.jsonl': events})
+            used = golden_eval.usage(view)
+            self.assertEqual((used['lead']['approvals'], used['others']['approvals']), (1, 1))
+            self.assertEqual((used['note turns'], used['note replies']), (2, 1))
+            self.assertEqual((used['lead']['aside rounds'], used['lead']['aside input tokens']), (1, 900))
+            self.assertEqual((used['lead']['rounds'], used['others']['aside rounds']), (2, 1))
 
 
 class ReportTests(unittest.TestCase):

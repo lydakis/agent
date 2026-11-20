@@ -190,7 +190,7 @@ a note.
 ## The golden set
 
 `bench/golden_eval.py` is the check to run before and after a big change,
-code mode first: eleven cases a lead must keep passing, each run several times
+code mode first: twelve cases a lead must keep passing, each run several times
 on every arm, with the outcome read from evidence and what each run used
 recorded beside it. Each case is a fresh lead in its own run of the shop
 repository above, through a step or three, with the role eval's sources,
@@ -245,6 +245,11 @@ it ships) is n/a.
 | recover-context | history | the context was cut before the answer |
 | | | gives the codename |
 | | | quotes the first message word for word |
+| restart | recovery | an agent was working when the daemon stopped |
+| | | sessions last five hours on main |
+| | | the tests pass on main |
+| | | no turn failed |
+| | | says the fix is on main |
 | remember | skills | saves it to memory |
 | | | starts no agent |
 | schedule | skills | sets an automation |
@@ -273,13 +278,27 @@ check says whether the context was cut before the answer gave the codename:
 when it was not, the window is too large for the model and the case tested
 nothing. A cut after the answer, as a turn's end may make, does not count.
 
+`restart` asks the lead for the sign-out fix through a task that merges it,
+then, 45 seconds after the lead's turn ends, stops the daemon with no grace
+and starts a fresh one on the same store, as a crash, an upgrade or a reboot
+leaves it. Parked turns must carry on and `sonny acp` must follow again: the
+fix lands on main, no turn fails, and the lead answers the person's next
+question. Its first check says whether any agent was working when the daemon
+stopped: when none was, the case tested nothing.
+
 Each run also records what it used, for the lead and for the agents it
 started: tools by name (a code-mode script counted as `exec`, each of its
 steps under its own tool's name, and which tools ran as steps), skills read
 (a `skills/NAME/SKILL.md` in a call's arguments, once per agent turn),
 agents made, messages between agents, compactions of the lead's context,
-model rounds and tokens (`events.jsonl`), the steps' wall time, and the
-run's peak memory and CPU (`resources.json`).
+model rounds and tokens (`events.jsonl`), rounds beside the work such as a
+compaction's summary (a `usage` event with a `purpose`), calls a person
+approved (the trail's `approved`, where the eval stands in for the person),
+the lead's turns a note started and how many of them said anything to the
+person, the steps' wall time, and the run's peak memory and CPU
+(`resources.json`). The eval's row extends `ask`, so the reviewer model
+decides nothing in these runs: under `auto` it would decide most of the
+calls counted as a person's.
 
 Runs sit under `.local/role-eval/<model>/golden/runs/<case>/<arm><n>/`,
 with the role eval's files and `evidence.json`, which holds what only the
@@ -303,7 +322,15 @@ builds passing. News waits for a busy lead (up to 1,024 events), so a lead
 that does the work itself answers late while it works; one that delegates
 stays free. Halfway through, the person asks a one-line
 question, and at the end comes back to ask what needs them. Its output sits
-under `.local/role-eval/<model>/burst/`. Score:
+under `.local/role-eval/<model>/burst/`. `--code-mode ARM=on|off` and
+`--set ARM:KEY=VALUE` set an arm's `[sonny]` keys, as for the golden set:
+
+```
+python3 -m bench.role_eval all --day burst --runs 3 --parallel 2 \
+  --bin direct=DIR --bin code=DIR --code-mode direct=off --code-mode code=on
+```
+
+Score:
 
 | Id | Counts when the lead |
 | --- | --- |
@@ -323,7 +350,8 @@ account of it:
 - when the ask was released;
 - whether a note brought it to the lead (`reached`);
 - whether the lead sent it to a task, from its calls (`delegated`), or
-  changed the code itself;
+  changed the code itself; a code-mode script's steps count as calls, read
+  from the audit trail, since `sonny acp` shows a script only as its `exec`;
 - for a code ask, whether its change works, checked on main and on every
   branch tip. The check runs the agents' code, and git in their repository,
   in `agent sandbox` with the network off and no provider key, as their own
@@ -337,9 +365,11 @@ The summary counts:
 
 - asks reached, handled and on main, and the oldest wait;
 - whether main's tests pass;
-- every agent's turns by how they ended, and their tokens. These are
+- every agent's turns by how they ended, their model rounds and tokens, and
+  rounds beside the work by purpose (a compaction's summary). These are
   recorded from the event stream while the run goes (`events.jsonl`), so a
-  task deleted before the end still counts.
+  task deleted before the end still counts;
+- the lead's turns a note started, and the calls a person approved;
 - the lookout's events that were not kept;
 - the run's peak memory and CPU time: the daemon, the lead's `sonny acp`
   and every process under them.
