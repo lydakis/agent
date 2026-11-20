@@ -34,6 +34,7 @@ mod drawing;
 mod elsewhere;
 mod embed;
 mod exec;
+mod find;
 mod footer;
 mod frames;
 mod fuzzy;
@@ -6214,6 +6215,10 @@ struct Latest {
     ask: Option<asks::Ask>,
 }
 
+/// What `esc` puts back when it drops a find in `/status`: the pick, the
+/// helpers shown and the folds open.
+type StatusBefore = (Option<usize>, Vec<String>, Vec<status::Group>);
+
 /// `/status` in the pane, its timers ticking and its rows read again
 /// every two seconds, until Esc.
 struct Watch {
@@ -6263,6 +6268,9 @@ struct Watch {
     /// that changed none of it, as a key typed into the composer, draws it
     /// again without laying out every row.
     drawn: std::cell::RefCell<Option<(CardFrom, Card)>>,
+    /// `ctrl+f` in `/status`: what is typed narrows its rows; `esc` puts
+    /// back the pick and the helpers shown as they were.
+    finding: Option<find::Find<StatusBefore>>,
 }
 
 /// `/status`'s card: its lines, whether a group folds, and the marks the
@@ -6282,9 +6290,30 @@ struct CardFrom {
     helpers: Vec<String>,
     more: bool,
     pick: Option<usize>,
+    find: Option<String>,
 }
 
 impl Watch {
+    /// `/status` as rows of its own: no other view and no run's page over
+    /// them.
+    fn rows_shown(&self) -> bool {
+        self.background.is_none()
+            && self.usage.is_none()
+            && self.audit.is_none()
+            && self.commons.is_none()
+            && self.memory.is_none()
+            && self.sky.is_none()
+            && self.run.is_none()
+            && self.stop.is_none()
+    }
+
+    /// What is typed to find, once anything is.
+    fn query(&self) -> Option<&str> {
+        (self.finding.as_ref())
+            .filter(|find| find.typed())
+            .map(|find| find.query.as_str())
+    }
+
     /// The helpers of `bot` shown under it, or folded: as `show` says, or
     /// the other way from now.
     fn helpers_of(&mut self, bot: &str, show: Option<bool>) {
@@ -15196,6 +15225,16 @@ impl App {
 
     /// The project's agents on one card, from the daemon and Rex alone,
     /// in the pane beside the conversation, live until Esc.
+    /// Whether a find is under way in the pane's view: `/status`,
+    /// `/background` or `/commons`.
+    fn view_finding(&self) -> bool {
+        self.watch.as_ref().is_some_and(|watch| {
+            (watch.finding.is_some() && watch.rows_shown())
+                || (watch.background.as_ref()).is_some_and(|view| view.finding())
+                || (watch.commons.as_ref()).is_some_and(|view| view.finding())
+        })
+    }
+
     async fn status(&mut self) {
         // Where each task's window sits as of now, not as when the card was
         // last open: windows closed for room and opened since included.
@@ -15243,6 +15282,7 @@ impl App {
             stop: None,
             listed: false,
             drawn: Default::default(),
+            finding: None,
         });
         self.open_pane(pane::Pane::card("status", PICK_KEYS));
     }
@@ -15284,6 +15324,7 @@ impl App {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
     }
@@ -15360,6 +15401,7 @@ impl App {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
     }
@@ -15391,6 +15433,7 @@ impl App {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         self.open_pane(pane::Pane::card("audit", STATUS_KEYS));
     }
@@ -15468,6 +15511,7 @@ impl App {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         self.open_pane(pane::Pane::card("memory", STATUS_KEYS));
     }
@@ -15500,6 +15544,7 @@ impl App {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
     }
@@ -15527,6 +15572,7 @@ impl App {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
     }
@@ -16641,6 +16687,37 @@ impl App {
                 program.paste(text);
                 return true;
             }
+            // A paste while finding in `/status` is more to find.
+            Event::Paste(text)
+                if self.pane_keys
+                    && self.finding.is_none()
+                    && let Some(watch) = &mut self.watch
+                    && watch.rows_shown()
+                    && let Some(find) = &mut watch.finding =>
+            {
+                find.paste(text);
+                watch.pick = status_first_match(watch, self.width.max(40));
+                watch.picked = None;
+                return true;
+            }
+            // A paste while finding in `/background` is more to find.
+            Event::Paste(text)
+                if self.pane_keys
+                    && self.finding.is_none()
+                    && let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut())
+                    && view.paste(text) =>
+            {
+                return true;
+            }
+            // And in `/commons`.
+            Event::Paste(text)
+                if self.pane_keys
+                    && self.finding.is_none()
+                    && let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut())
+                    && view.paste(text) =>
+            {
+                return true;
+            }
             // A paste over a preview or `/status` is for the composer,
             // which comes back into view to show it.
             Event::Paste(_) if self.pane_keys && self.finding.is_none() => {
@@ -16818,10 +16895,13 @@ impl App {
             Some(true) if !program => &esc,
             _ => key,
         };
+        // A find in the pane's view takes every letter, `?` and `h` `j` `k`
+        // `l` too.
+        let view_finding = self.pane_keys && self.view_finding();
         // `h` `j` `k` `l` are the arrows in every pane but a program's,
         // unlisted.
         let arrow;
-        let key = match (self.pane_keys && !program && self.finding.is_none())
+        let key = match (self.pane_keys && !program && self.finding.is_none() && !view_finding)
             .then(|| vim_arrow(key))
             .flatten()
         {
@@ -16841,6 +16921,7 @@ impl App {
         if self.finding.is_none()
             && self.pane_keys
             && !program
+            && !view_finding
             && let Some(pane) = &mut self.pane
             && !(pane.title_keys().split(" · ")).any(|pair| pair.starts_with("? "))
         {
@@ -16906,6 +16987,42 @@ impl App {
                     return true;
                 }
                 _ => {}
+            }
+        }
+        // `ctrl+f` in `/status`: what is typed narrows its rows, the pick
+        // on the first match; `esc` drops the find and puts the rows and
+        // the pick back. The arrows and `enter` stay the view's.
+        if self.finding.is_none()
+            && self.pane_keys
+            && self.pane.as_ref().is_some_and(|pane| pane.is_card())
+            && let Some(watch) = &mut self.watch
+            && watch.rows_shown()
+        {
+            match &mut watch.finding {
+                Some(find) => match find.key(key) {
+                    find::Typed::Dropped => {
+                        if let Some(find) = watch.finding.take() {
+                            (watch.pick, watch.helpers, watch.open) = find.before;
+                        }
+                        watch.picked = None;
+                        return true;
+                    }
+                    find::Typed::Changed => {
+                        watch.pick = status_first_match(watch, self.width.max(40));
+                        watch.picked = None;
+                        return true;
+                    }
+                    find::Typed::Other => {}
+                },
+                None if find::opens(key) => {
+                    watch.finding = Some(find::Find::new((
+                        watch.pick,
+                        watch.helpers.clone(),
+                        watch.open.clone(),
+                    )));
+                    return true;
+                }
+                None => {}
             }
         }
         // `/status` picks an agent from the keys and opens it, as a click
@@ -22333,7 +22450,9 @@ impl App {
             }
             // Finding in **Projects**: what is typed, where the
             // conversation's find has it.
-            if let Some(query) = (self.projects.as_ref()).and_then(|open| open.view.finding.clone())
+            if let Some(query) = (self.projects.as_ref())
+                .and_then(|open| open.view.finding.as_ref())
+                .map(|find| find.query.clone())
             {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
                 frame.render_widget(Paragraph::new(line), composer);
@@ -23594,6 +23713,18 @@ fn card_picks(watch: &Watch, width: usize) -> Vec<Picked> {
         .collect()
 }
 
+/// Where the pick goes while finding in `/status`: the first agent drawn
+/// that says what is typed itself, not one kept for what hangs under it.
+fn status_first_match(watch: &Watch, width: usize) -> Option<usize> {
+    let query = watch.query()?;
+    (card_picks(watch, width).iter()).position(|picked| match picked {
+        Picked::Agent(bot) => {
+            (watch.rows.iter()).any(|row| row.bot == *bot && status::says(row, query))
+        }
+        Picked::Group(_) => false,
+    })
+}
+
 /// `/status`'s card at `width`, each line after a space, its times
 /// running turns counted on from when its rows were read; whether a row
 /// in it folds; and the rows the keys pick, in the order drawn: each
@@ -23613,6 +23744,7 @@ fn watch_card(watch: &Watch, width: usize) -> Card {
         helpers: watch.helpers.clone(),
         more: watch.more,
         pick: watch.pick,
+        find: watch.finding.as_ref().map(|find| find.query.clone()),
     };
     if let Some((drawn, card)) = &*watch.drawn.borrow()
         && *drawn == from
@@ -23627,16 +23759,31 @@ fn watch_card(watch: &Watch, width: usize) -> Card {
 /// [`watch_card`] laid out from every row, its running times `since`
 /// seconds on from their read.
 fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
-    let rows = &watch.rows;
+    // While finding, the rows that say what is typed and those they hang
+    // under, every fold searched and standing open.
+    let found = watch.query().map(|query| status::found(&watch.rows, query));
+    let (rows, open, shown_helpers) = match &found {
+        Some((kept, opened)) => {
+            let mut helpers = watch.helpers.clone();
+            helpers.extend(
+                opened
+                    .iter()
+                    .filter(|bot| !watch.helpers.contains(bot))
+                    .cloned(),
+            );
+            (kept, status::GROUPS.to_vec(), helpers)
+        }
+        None => (&watch.rows, watch.open.clone(), watch.helpers.clone()),
+    };
     let card = |details| {
         status::card_after(
             &watch.project,
             rows,
             since,
             width,
-            &watch.open,
+            &open,
             details,
-            &watch.helpers,
+            &shown_helpers,
         )
     };
     let quiet = card(status::Details::Quiet);
@@ -23676,6 +23823,14 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
     }
     let added = above.len();
     card.splice(1..1, above);
+    if let Some(query) = watch.query() {
+        // The head counts the project's agents, whatever is found.
+        card[0] = status::head(&watch.project, &watch.rows);
+        if rows.is_empty() {
+            card.push(Line::default());
+            card.push(Line::from(format!("no agent matches {query}")).dim());
+        }
+    }
     // Each agent a row names, a row waits on or a window sits beside,
     // opens it as its name does anywhere.
     let names: Vec<(String, String)> = (rows.iter())
@@ -23697,6 +23852,11 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
         (below(at), screen::Mark::Link(link))
     }));
     marks.extend(named_agents);
+    // The find row, the view's last.
+    if let Some(find) = &watch.finding {
+        card.push(Line::default());
+        card.push(find::line(&find.query));
+    }
     let lines = card
         .into_iter()
         .map(|line| {
@@ -23845,6 +24005,11 @@ fn status_keys(watch: &Watch, folding: bool) -> String {
     let mut said = hint::Keys::new().pick().enter(hint::Enter::Open);
     if folding {
         said = said.key("→←", "fold");
+    }
+    said = said.find();
+    if watch.finding.is_some() {
+        // `esc` drops the find first; the next one closes the view.
+        return said.esc(hint::Esc::Cancel).text();
     }
     let more = match watch.more {
         true => "less",
@@ -31289,6 +31454,7 @@ mod tests {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         app.press("run/run1").await;
         assert_eq!(app.watch.as_ref().unwrap().run.as_deref(), Some("run1"));
@@ -37267,6 +37433,7 @@ mod tests {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         };
         // The folder's other lead opens by its own name, not its label.
         let (lines, _, marks) = watch_card(&watch, 80);
@@ -37769,6 +37936,7 @@ mod tests {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let pick = |app: &App| app.watch.as_ref().unwrap().pick;
@@ -37797,6 +37965,142 @@ mod tests {
         app.key(key(KeyCode::Enter)).await;
         app.beside_done().await;
         assert!(app.pane.is_none(), "closed, as Esc closes it");
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_in_status_narrows_its_rows_picks_the_first_match_and_esc_puts_them_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let mut app = app(daemon_answering(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            json!({})
+        })
+        .await);
+        let row = |name: &str, title: &str, group| status::Row {
+            name: name.into(),
+            bot: format!("calc.{name}"),
+            title: title.into(),
+            state: "working".into(),
+            group,
+            ..Default::default()
+        };
+        let helper = status::Row {
+            maker: "calc.add".into(),
+            ..row("halves", "Sum the halves", status::Group::Idle)
+        };
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![
+                row("readme", "Check the README", status::Group::NeedsYou),
+                row("add", "Round half cents to even", status::Group::Working),
+                helper,
+                row("neg", "Negate the totals", status::Group::Idle),
+                row("old", "Fix the sums", status::Group::Done),
+            ],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: vec![status::Group::Idle],
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: Some(1),
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let ctrl_f = Event::Key(event::KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+        let card = |app: &App| -> Vec<String> {
+            (watch_card(app.watch.as_ref().unwrap(), 80).0.iter())
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect()
+        };
+        let says = |app: &App, what: &str| card(app).iter().any(|line| line.contains(what));
+        let picked = |app: &App| {
+            let watch = app.watch.as_ref().unwrap();
+            (watch.pick).and_then(|at| card_picks(watch, 80).get(at).cloned())
+        };
+        // The hint names it, declared once with the view's keys.
+        let watch = app.watch.as_ref().unwrap();
+        assert_eq!(
+            status_keys(watch, true),
+            "↑↓ pick · enter open · →← fold · ctrl+f find · m more · esc close"
+        );
+        let before = asked.load(Ordering::SeqCst);
+        app.key(ctrl_f.clone()).await;
+        assert!(app.watch.as_ref().unwrap().finding.is_some());
+        assert!(app.input.is_empty() && app.finding.is_none());
+        // The find row is the view's last.
+        assert_eq!(card(&app).last().unwrap(), " find");
+        for c in "sums".chars() {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+        // A row that says it stays, its fold searched and standing open; a
+        // section with no match is not drawn.
+        assert!(says(&app, "Fix the sums"), "{:#?}", card(&app));
+        assert!(!says(&app, "Round half") && !says(&app, "Working"));
+        assert!(!says(&app, "Needs you") && !says(&app, "Idle"));
+        assert_eq!(card(&app).last().unwrap(), " find sums");
+        // The pick on the first match.
+        assert_eq!(picked(&app), Some(Picked::Agent("calc.old".into())));
+        // A fold opened or shut while finding is put back with the rest.
+        let watch = app.watch.as_mut().unwrap();
+        let done = (card_picks(watch, 80).iter())
+            .position(|picked| *picked == Picked::Group(status::Group::Done));
+        watch.pick = done;
+        app.key(key(KeyCode::Enter)).await;
+        let watch = app.watch.as_ref().unwrap();
+        assert_eq!(
+            watch.finding.as_ref().map(|find| find.query.as_str()),
+            Some("sums")
+        );
+        // A helper that says it keeps its task, its helpers shown.
+        for _ in 0.."sums".len() {
+            app.key(key(KeyCode::Backspace)).await;
+        }
+        for c in "halves".chars() {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+        assert!(
+            says(&app, "Round half cents to even") && says(&app, "Sum the halves"),
+            "{:#?}",
+            card(&app)
+        );
+        assert!(!says(&app, "Fix the sums") && !says(&app, "Negate"));
+        assert_eq!(picked(&app), Some(Picked::Agent("calc.halves".into())));
+        // Nothing found says so.
+        app.key(key(KeyCode::Char('z'))).await;
+        assert!(says(&app, "no agent matches halvesz"), "{:#?}", card(&app));
+        assert_eq!(picked(&app), None);
+        // Finding reads nothing more from the daemon.
+        assert_eq!(asked.load(Ordering::SeqCst), before);
+        // `esc` drops the find: every row and the pick as they were.
+        app.key(key(KeyCode::Esc)).await;
+        let watch = app.watch.as_ref().unwrap();
+        assert!(watch.finding.is_none() && watch.helpers.is_empty());
+        assert_eq!(watch.open, vec![status::Group::Idle]);
+        assert_eq!(watch.pick, Some(1));
+        assert!(says(&app, "Round half") && says(&app, "Check the README"));
+        assert!(!says(&app, "Fix the sums"), "the done fold shut again");
+        assert!(!card(&app).last().unwrap().contains("find"));
+        assert!(app.pane.is_some());
+        // The next `esc` closes the view.
+        app.key(key(KeyCode::Esc)).await;
+        app.beside_done().await;
+        assert!(app.pane.is_none());
     }
 
     #[tokio::test]
@@ -37842,6 +38146,7 @@ mod tests {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let watch = |app: &App| {
@@ -37960,6 +38265,7 @@ mod tests {
             stop: None,
             listed: true,
             drawn: Default::default(),
+            finding: None,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);
@@ -37997,7 +38303,7 @@ mod tests {
         assert!(app.pane.is_some() && !app.pane_keys);
         assert_eq!(
             status_keys(app.watch.as_ref().unwrap(), true),
-            "↑↓ pick · enter open · →← fold · m more · esc close"
+            "↑↓ pick · enter open · →← fold · ctrl+f find · m more · esc close"
         );
     }
 

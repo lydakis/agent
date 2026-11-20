@@ -2157,6 +2157,20 @@ beside included; while the pane has them the composer's `›` is muted,
 and a key the view does not name does nothing (`q` included), never
 typed into the composer.
 
+`ctrl+f` finds in a view of rows, as it does in Projects: `/status`,
+`/background` and `/commons`'s list of threads. What you type narrows the
+rows to those that say it, in any case unless you type a capital: a
+section with no match is not drawn, a fold is searched and stands open,
+and a row that holds a match (a task whose helper says it) stays, to keep
+it in its place. The pick goes to the first match, and `↑` `↓` and `enter`
+stay the view's. The find row is the view's last, a muted `find` and what
+you typed. `esc` drops the find and puts back the rows and the pick; the
+next `esc` closes the view. Each view's title names `ctrl+f find` with its
+keys. Find reads only what the view already read, nothing from the daemon
+as you type.
+
+![ctrl+f with a find typed in /status, /background and /commons: each narrowed to the rows that say it, the pick on the first, the find row last](../docs/sonny/find-views.png)
+
 Every view is laid out the same way, too. Its title row is the command
 that opens it (`mcp`, not "MCP servers") and the keys it takes. Under it
 the head says whose view it is, bold: the project (`shop`), `every
