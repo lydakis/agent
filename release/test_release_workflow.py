@@ -70,6 +70,9 @@ class StampTest(unittest.TestCase):
         for job, first in [(package, "cargo test"), (linux, "cargo build")]:
             self.assertEqual(job.count(stamp), 1)
             self.assertLess(job.index(stamp), job.index(first))
+        # These tests check main's 0.0.0, so they run on the tree unstamped.
+        self.assertLess(package.index("python3 -m unittest discover -s release"),
+                        package.index(stamp))
         # The source archive is the stamped tree, so Homebrew's build from
         # it, without git, says the tag's version.
         self.assertIn('git archive --format=tar.gz --prefix="agent-${version}/" \\\n'

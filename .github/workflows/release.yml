@@ -97,14 +97,16 @@ jobs:
             echo 'Release tag changed after approval' >&2
             exit 1
           fi
+      - name: Test the release scripts
+        # On the commit as main has it: their tests check main says 0.0.0.
+        run: python3 -m unittest discover -s release
       - name: Stamp the tag's version
         env:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: python3 release/stamp_version.py "${RELEASE_TAG#v}"
       - name: Test
-        run: |
-          python3 -m unittest discover -s release
-          cargo test --locked --workspace
+        # At the tag's version: one-off upgrade work past its release fails.
+        run: cargo test --locked --workspace
       - name: Package the source and formulas, and verify them
         env:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
