@@ -403,6 +403,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut idle_exit = None;
     let mut await_owner = None;
     let mut stall_timeout = None;
+    let mut durability = agent_runtime::store::Durability::Full;
     let mut shell_excludes = Vec::new();
     let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
     let mut protected_paths = Vec::new();
@@ -495,6 +496,10 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 idle_exit = (seconds > 0).then_some(seconds);
             }
             "--await-owner" => await_owner = Some(cli::duration_secs(flag, value)?),
+            "--durability" => {
+                durability = agent_runtime::store::Durability::parse(value)
+                    .ok_or(Error::with("usage", "--durability needs full or normal"))?
+            }
             _ => return fail_with("usage", format!("unknown option {flag}")),
         }
     }
@@ -529,5 +534,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         models,
         provider_config,
         max_depth,
+        durability,
     })
 }

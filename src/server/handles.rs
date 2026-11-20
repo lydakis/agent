@@ -19,6 +19,11 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+/// The handles a wait reads in one reader job: a quarter of the 64 one
+/// wait may name, so a full one gives its seat back between batches and
+/// checks it is still wanted.
+pub const LOOKUP_BATCH: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handle {
     /// A message, `BOT/N`: what it asked for, as the turn it opened or
@@ -518,8 +523,24 @@ impl Handles {
         any: bool,
         completion: Completion,
     ) {
+        let generation = self.register(waiter, handles, any, completion);
+        let stored = self.settle_held(waiter, generation, handles);
+        (self.settle_stored(&store.reader(), None, waiter, generation, stored)).await;
+        self.settle_deadline(waiter, generation, handles, deadline_ms);
+    }
+
+    /// The first step of `attach`: `waiter` registered for `handles`, so
+    /// any result told from now on reaches it. Answers the registration's
+    /// generation, for the steps after.
+    pub fn register(
+        &self,
+        waiter: Waiter,
+        handles: &[String],
+        any: bool,
+        completion: Completion,
+    ) -> u64 {
         let parsed: Vec<Result<Handle>> = handles.iter().map(|h| Handle::parse(h)).collect();
-        let generation = {
+        {
             let mut inner = self.inner.lock().unwrap();
             inner.next_generation += 1;
             let generation = inner.next_generation;
@@ -555,102 +576,186 @@ impl Handles {
                 },
             );
             generation
-        };
-        for (text, parsed) in handles.iter().zip(parsed) {
-            if let Some((result, durable)) = self.settled(store, text, parsed).await {
-                let mut inner = self.inner.lock().unwrap();
-                if inner
-                    .waiters
-                    .get(&waiter)
-                    .is_some_and(|w| w.generation == generation)
-                {
-                    Self::resolve_locked(&mut inner, &self.resume, waiter, text, result, durable);
-                }
-            }
-        }
-        if handles.is_empty() {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.waiters.contains_key(&waiter) {
-                Self::complete_locked(&mut inner, &self.resume, waiter);
-            }
-        }
-        if let Some(deadline) = deadline_ms {
-            let mut inner = self.inner.lock().unwrap();
-            let Some(waiting) = inner.waiters.get_mut(&waiter) else {
-                return;
-            };
-            if waiting.generation != generation || waiting.remaining.is_empty() {
-                return;
-            }
-            if deadline <= now_ms() {
-                // Polls inspect every handle above, then return pending results
-                // without waiting for the schedule.
-                Self::expire_locked(&mut inner, &self.resume, waiter);
-                return;
-            }
-            waiting.deadline = Some(deadline);
-            Self::schedule_locked(
-                &mut inner,
-                &self.sooner,
-                deadline,
-                Due::Wait(waiter, generation),
-            );
         }
     }
 
-    /// A handle's result if it has one: retained here, or found in the
-    /// store, where a result is durable before it reaches this registry.
-    /// Read on a reader, which sees every commit made before the read: one
-    /// told here before the waiter was registered is in it, and one told
-    /// after reaches the waiter, so the writer's queue is never waited on.
-    /// The flag says whether it is durable rather than an error reading it.
-    async fn settled(
+    /// Whether `waiter` is still registered as `generation`: not answered,
+    /// expired, let go with its session, or registered again since.
+    fn registered(&self, waiter: Waiter, generation: u64) -> bool {
+        (self.inner.lock().unwrap().waiters.get(&waiter))
+            .is_some_and(|w| w.generation == generation)
+    }
+
+    /// Resolve `handle` for `waiter` while it is still registered as
+    /// `generation`.
+    fn settle_one(
         &self,
-        store: &Store,
-        text: &str,
-        parsed: Result<Handle>,
-    ) -> Option<(Arc<Value>, bool)> {
-        let cached = self
-            .inner
-            .lock()
-            .unwrap()
-            .retained
-            .get(text)
-            .map(|r| r.value.clone());
-        if let Some(cached) = cached {
-            return Some((cached, true));
+        waiter: Waiter,
+        generation: u64,
+        handle: &str,
+        result: Arc<Value>,
+        durable: bool,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner
+            .waiters
+            .get(&waiter)
+            .is_some_and(|w| w.generation == generation)
+        {
+            Self::resolve_locked(&mut inner, &self.resume, waiter, handle, result, durable);
         }
-        let result = match parsed {
-            Err(error) => Some((failed(&error), false)),
-            Ok(Handle::Message { bot, message: turn }) => {
-                match store
-                    .read("turn_answer", move |db| db.turn_answer(&bot, turn))
-                    .await
-                {
-                    Ok(answer) if answer["pending"] == true => None,
-                    Ok(answer) => {
-                        let durable = answer["pruned"] != true;
-                        Some((answer, durable))
-                    }
-                    Err(error) => Some((failed(&error), false)),
+    }
+
+    /// The second step of `attach`: what the registry holds for `handles`
+    /// settled with no read, a retained result or a handle that does not
+    /// parse. Answers the handles left, whose results only the store has.
+    pub fn settle_held(&self, waiter: Waiter, generation: u64, handles: &[String]) -> Vec<String> {
+        let mut stored = Vec::new();
+        for text in handles {
+            match self.held(text) {
+                Some((result, durable)) => {
+                    self.settle_one(waiter, generation, text, result, durable)
+                }
+                None => stored.push(text.clone()),
+            }
+        }
+        stored
+    }
+
+    /// The third step of `attach`: the results the store has for `handles`,
+    /// read [`LOOKUP_BATCH`] to a job on `reader`, each job holding one of
+    /// `seats` while it reads when they are given. Before each it checks
+    /// the waiter is still registered: one answered by another handle, as
+    /// `any` is, or let go with its session reads nothing more. Off the run
+    /// loop it holds nothing up, however long the reads take, and it holds
+    /// no seat once they end.
+    pub async fn settle_stored(
+        &self,
+        reader: &Reader,
+        seats: Option<&tokio::sync::Semaphore>,
+        waiter: Waiter,
+        generation: u64,
+        handles: Vec<String>,
+    ) {
+        for batch in handles.chunks(LOOKUP_BATCH) {
+            if !self.registered(waiter, generation) {
+                return;
+            }
+            let seat = match seats {
+                Some(seats) => Some(seats.acquire().await.expect("seats are never closed")),
+                None => None,
+            };
+            for (text, found) in self.stored(reader, batch.to_vec()).await {
+                if let Some((result, durable)) = found {
+                    self.settle_one(waiter, generation, &text, result, durable);
                 }
             }
-            Ok(Handle::Process(id)) => {
-                match store
-                    .read("process_result", move |db| db.process_result(id))
-                    .await
-                {
-                    Ok(None) => Some((
-                        json!({"error":"unknown_handle","detail":format!("no command {id}")}),
-                        false,
-                    )),
-                    Ok(Some((_, Some(result)))) => Some((result, true)),
-                    Ok(Some((_, None))) => None,
-                    Err(error) => Some((failed(&error), false)),
-                }
+            drop(seat);
+        }
+    }
+
+    /// The last step of `attach`: the deadline put on the schedule for the
+    /// waiter registered as `generation`, or the wait ended now when it
+    /// has passed, or when there are no handles.
+    pub fn settle_deadline(
+        &self,
+        waiter: Waiter,
+        generation: u64,
+        handles: &[String],
+        deadline_ms: Option<u64>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        if handles.is_empty() {
+            if inner.waiters.contains_key(&waiter) {
+                Self::complete_locked(&mut inner, &self.resume, waiter);
             }
+            return;
+        }
+        let Some(deadline) = deadline_ms else {
+            return;
         };
-        result.map(|(value, durable)| (Arc::new(value), durable))
+        let Some(waiting) = inner.waiters.get_mut(&waiter) else {
+            return;
+        };
+        if waiting.generation != generation || waiting.remaining.is_empty() {
+            return;
+        }
+        if deadline <= now_ms() {
+            // Polls inspect every handle above, then return pending results
+            // without waiting for the schedule.
+            Self::expire_locked(&mut inner, &self.resume, waiter);
+            return;
+        }
+        waiting.deadline = Some(deadline);
+        Self::schedule_locked(
+            &mut inner,
+            &self.sooner,
+            deadline,
+            Due::Wait(waiter, generation),
+        );
+    }
+
+    /// A handle's result if the registry has it with no read: retained
+    /// here, or a failure when it does not parse. The flag says whether it
+    /// is durable rather than an error.
+    fn held(&self, text: &str) -> Option<(Arc<Value>, bool)> {
+        let retained = (self.inner.lock().unwrap().retained.get(text)).map(|r| r.value.clone());
+        if let Some(retained) = retained {
+            return Some((retained, true));
+        }
+        (Handle::parse(text).err()).map(|error| (Arc::new(failed(&error)), false))
+    }
+
+    /// The results the store has for `handles`, in one read on a reader,
+    /// which sees every commit made before the read: one told here before
+    /// the waiter was registered is in it, and one told after reaches the
+    /// waiter, so the writer's queue is never waited on. `None` for one
+    /// still pending.
+    async fn stored(
+        &self,
+        reader: &Reader,
+        handles: Vec<String>,
+    ) -> Vec<(String, Option<(Arc<Value>, bool)>)> {
+        let asked = handles.clone();
+        let read = reader
+            .read("wait_lookup", move |db| {
+                Ok(handles
+                    .into_iter()
+                    .map(|text| {
+                        let found = match Handle::parse(&text) {
+                            Err(error) => Some((failed(&error), false)),
+                            Ok(Handle::Message { bot, message: turn }) => {
+                                match db.turn_answer(&bot, turn) {
+                                    Ok(answer) if answer["pending"] == true => None,
+                                    Ok(answer) => {
+                                        let durable = answer["pruned"] != true;
+                                        Some((answer, durable))
+                                    }
+                                    Err(error) => Some((failed(&error), false)),
+                                }
+                            }
+                            Ok(Handle::Process(id)) => match db.process_result(id) {
+                                Ok(None) => Some((
+                                    json!({"error":"unknown_handle","detail":format!("no command {id}")}),
+                                    false,
+                                )),
+                                Ok(Some((_, Some(result)))) => Some((result, true)),
+                                Ok(Some((_, None))) => None,
+                                Err(error) => Some((failed(&error), false)),
+                            },
+                        };
+                        (text, found.map(|(value, durable)| (Arc::new(value), durable)))
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await;
+        read.unwrap_or_else(|error| {
+            let failure = Arc::new(failed(&error));
+            asked
+                .into_iter()
+                .map(|text| (text, Some((failure.clone(), false))))
+                .collect()
+        })
     }
 
     /// Consume a parked turn's results when it resumes early, before every
@@ -663,11 +768,21 @@ impl Handles {
         handles: &[String],
     ) -> BTreeMap<String, Arc<Value>> {
         let mut results = self.take(turn);
+        let mut unseen = Vec::new();
         for handle in handles {
             if !results.contains_key(handle) {
-                let found = self.settled(store, handle, Handle::parse(handle)).await;
+                match self.held(handle) {
+                    Some((result, _)) => {
+                        results.insert(handle.clone(), result);
+                    }
+                    None => unseen.push(handle.clone()),
+                }
+            }
+        }
+        for batch in unseen.chunks(LOOKUP_BATCH) {
+            for (handle, found) in self.stored(&store.reader(), batch.to_vec()).await {
                 let result = found.map_or_else(|| Arc::new(json!({"pending":true})), |(r, _)| r);
-                results.insert(handle.clone(), result);
+                results.insert(handle, result);
             }
         }
         results

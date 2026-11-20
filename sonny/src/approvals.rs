@@ -897,11 +897,7 @@ pub const NESTED_GONE: &str = "nested-repositories-gone";
 /// whole listing ([`crate::upgrade::from_listing`]): once done, it costs a
 /// read of the record. One that can't be read or changed now is tried
 /// again next time.
-pub fn nested_gone(
-    client: std::sync::Arc<agent_client::Client>,
-    bots: &[Value],
-    store: &std::path::Path,
-) {
+pub async fn nested_gone(client: &agent_client::Client, bots: &[Value], store: &std::path::Path) {
     let mut record = store.as_os_str().to_owned();
     record.push(".migrated");
     let record = std::path::PathBuf::from(record);
@@ -912,38 +908,35 @@ pub fn nested_gone(
         return;
     }
     // Only an agent with a folder has repositories inside it.
-    let bots: Vec<(Value, Value)> = (bots.iter())
+    let bots = (bots.iter())
         .filter(|bot| bot["workspace"].is_string())
-        .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()))
-        .collect();
-    tokio::spawn(async move {
-        let mut all = true;
-        for (name, id) in bots {
-            let Ok(inspected) = client
-                .request("inspect", json!({"bot": name, "bot_id": id}))
-                .await
-            else {
-                all = false;
-                continue;
-            };
-            let kept = tokio::task::spawn_blocking(move || without_nested(&inspected)).await;
-            let Ok(Some(mut asked)) = kept else {
-                all &= kept.is_ok();
-                continue;
-            };
-            asked.insert("bot".into(), name.clone());
-            asked.insert("bot_id".into(), id);
-            match client.request("configure", Value::Object(asked)).await {
-                Ok(_) => {}
-                Err(error) if error.code == "bot_not_found" => {}
-                // Said nowhere: a window's screen is up.
-                Err(_) => all = false,
-            }
+        .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()));
+    let mut all = true;
+    for (name, id) in bots {
+        let Ok(inspected) = client
+            .request("inspect", json!({"bot": name, "bot_id": id}))
+            .await
+        else {
+            all = false;
+            continue;
+        };
+        let kept = tokio::task::spawn_blocking(move || without_nested(&inspected)).await;
+        let Ok(Some(mut asked)) = kept else {
+            all &= kept.is_ok();
+            continue;
+        };
+        asked.insert("bot".into(), name.clone());
+        asked.insert("bot_id".into(), id);
+        match client.request("configure", Value::Object(asked)).await {
+            Ok(_) => {}
+            Err(error) if error.code == "bot_not_found" => {}
+            // Said nowhere: a window's screen is up.
+            Err(_) => all = false,
         }
-        if all {
-            crate::upgrade::once(&record, NESTED_GONE, || true);
-        }
-    });
+    }
+    if all {
+        crate::upgrade::once(&record, NESTED_GONE, || true);
+    }
 }
 
 /// The change that takes the repositories inside its folder, which are its

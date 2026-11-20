@@ -18,6 +18,8 @@ class LifecycleTests(unittest.TestCase):
 
     def check_result(self, result):
         self.assertEqual(result['status'], 'ok', result)
+        # As the binary said it as it started.
+        self.assertEqual(result['durability'], 'sqlite_full')
         self.assertEqual(result['completed_turns'], 4)
         self.assertEqual(result['provider']['completed_requests'], 8)
         self.assertEqual(result['provider']['tool_results'], 4)

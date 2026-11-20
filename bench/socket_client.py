@@ -41,7 +41,7 @@ class Connection:
         self.worker = threading.Thread(target=read, daemon=True)
         self.worker.start()
         try:
-            self.receive(lambda e: e.get('event') == 'ready')
+            self.ready = self.receive(lambda e: e.get('event') == 'ready')
         except Exception:
             self.close()
             raise
@@ -102,6 +102,8 @@ class SocketClient:
                     time.sleep(.01)
             self.control.tools = tools.split(',')
             self.control.settings = settings
+            # What the daemon said as it started, as the stdio client keeps it.
+            self.ready = self.control.ready
         except Exception:
             self.close(kill=True)
             raise

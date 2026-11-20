@@ -1205,6 +1205,9 @@ impl Command {
                 | Command::Audit { .. }
                 | Command::Prompts { .. }
                 | Command::ToolCalls { .. }
+                | Command::Pauses { .. }
+                | Command::Held { .. }
+                | Command::Processes { .. }
         )
     }
     /// A write that only records what its client says, which the write
@@ -1567,6 +1570,9 @@ pub struct Configuration {
     /// The most generations below the bot that starts its line a `create`
     /// or `fork` may make a bot at; none by default.
     pub max_depth: Option<u64>,
+    /// How far each commit is on the disk when it is answered; `Full` by
+    /// default.
+    pub durability: agent_runtime::store::Durability,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -2040,6 +2046,37 @@ fn gate(
         ),
     }
 }
+/// A `configure` that switches a bot to the other model family, waiting
+/// while its history is translated a page at a time, each page its own
+/// store job, so the run loop and other bots go on between pages. Once it
+/// is all written the run loop takes the change again with it.
+struct SwitchDone {
+    bot: String,
+    bot_id: Option<i64>,
+    change: Configure,
+    /// Who asked; `None` for a change kept for a turn's end.
+    asker: Option<lane::Asker>,
+    translation: Result<agent_runtime::store::Translation>,
+}
+struct Switching {
+    /// Bots being translated: other changes to them wait.
+    bots: std::collections::HashSet<String>,
+    /// Translations done, for the `configure` that takes them.
+    prepared: HashMap<String, agent_runtime::store::Translation>,
+    done: tokio::sync::mpsc::UnboundedSender<SwitchDone>,
+    finished: tokio::sync::mpsc::UnboundedReceiver<SwitchDone>,
+}
+impl Default for Switching {
+    fn default() -> Self {
+        let (done, finished) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            bots: std::collections::HashSet::new(),
+            prepared: HashMap::new(),
+            done,
+            finished,
+        }
+    }
+}
 struct Service {
     store: Store,
     /// Each waiting step's `approve_step`, by approval, answered from the
@@ -2075,7 +2112,7 @@ struct Service {
     /// the bot's own socket listening, and its sandbox's placeholders, held
     /// by the same locks every sandbox's are, so no side removes one
     /// another's sandbox still mounts.
-    lent: HashMap<u64, Vec<agent_runtime::sandbox::Hold>>,
+    lent: HashMap<u64, Lent>,
     limit_active: usize,
     /// Per bot: the live turn. A parked turn's task ends while a resumed
     /// task may already own the slot.
@@ -2089,6 +2126,9 @@ struct Service {
     replays: JoinSet<()>,
     /// Retention tasks own outputs and must release them before stdout joins.
     retention: JoinSet<()>,
+    /// Switches between model families whose history is translated in
+    /// pieces, beside the run loop.
+    switching: Switching,
     /// Reads that decide nothing, answered beside the run loop.
     lane: lane::Lane,
     /// A turn may be ready to start: set whenever a slot opens or a turn
@@ -2573,7 +2613,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     let wait =
         owner_until.map(|until| until.saturating_duration_since(tokio::time::Instant::now()));
     let (owned, owning) = tokio::sync::oneshot::channel();
-    let opening = Store::open_owning(&config.store, limits.readers, wait, owned);
+    let opening = Store::open_owning(
+        &config.store,
+        limits.readers,
+        config.durability,
+        wait,
+        owned,
+    );
     tokio::pin!(opening);
     // The socket is taken the moment the store is this daemon's, before the
     // store's own opening, which an upgrade can make minutes long: a client
@@ -2773,7 +2819,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "fallbacks":config.fallbacks.json(),
-        "durability":"sqlite_full","partial_text_durable":false});
+        "durability":config.durability.label(),"partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
     let mut callers: HashMap<u64, i64> = HashMap::new();
@@ -2947,6 +2993,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         tails: Default::default(),
         replays: JoinSet::new(),
         retention: JoinSet::new(),
+        switching: Switching::default(),
         lane,
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
@@ -3087,6 +3134,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                     service.chores.count("reload", chore);
                 }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
+                Some(done) = service.switching.finished.recv() => {
+                    let chore = std::time::Instant::now();
+                    service.switched(done).await?;
+                    service.chores.count("switched", chore);
+                }
                 // A paused daemon makes no calls: dropped, it comes to
                 // nothing, and the bot's next turn summarizes.
                 Some(tail) = service.tails.started.recv() => {
@@ -3712,6 +3764,11 @@ fn own_requests(
     })
 }
 
+/// What a session was lent, held until it closes: a lend fills it beside
+/// the run loop, and one that ends after its session closed drops its hold
+/// with the last reference.
+type Lent = Arc<std::sync::Mutex<Vec<agent_runtime::sandbox::Hold>>>;
+
 /// An in-process session, closed when what made it is dropped.
 struct Closing(Option<(session::Sender, u64)>);
 
@@ -4095,8 +4152,9 @@ impl Service {
                         && self.active.holding() + self.reserved + self.claims.len()
                             >= self.limit_active)
             }
-            // A read, or a wait, waits only for its own session's
-            // admissions, to be answered after them. Another session's are
+            // A read, a wait, or a lend of a bot's sandbox (a read of the
+            // bot) waits only for its own session's admissions, to be
+            // answered after them. Another session's are
             // not answered yet, so one that misses them misses nothing
             // anyone was told, and one session's admissions never hold
             // another's reads.
@@ -4106,7 +4164,10 @@ impl Service {
             Some(command)
                 if command.observes()
                     || command.records()
-                    || matches!(command, Command::Wait { .. } | Command::Hello { .. }) =>
+                    || matches!(
+                        command,
+                        Command::Wait { .. } | Command::Hello { .. } | Command::Lend { .. }
+                    ) =>
             {
                 (self.admissions.iter()).any(|admission| admission.session == session)
             }
@@ -5151,6 +5212,19 @@ impl Service {
         bot_id: Option<i64>,
         change: Configure,
     ) -> Result<Value> {
+        self.configure_for(bot, bot_id, change, None).await
+    }
+
+    /// [`Service::configure`], for `asker`: a switch to the other model
+    /// family with history to translate answers `deferred`, and `asker` is
+    /// answered once it is done (see [`SwitchDone`]).
+    async fn configure_for(
+        &mut self,
+        bot: String,
+        bot_id: Option<i64>,
+        change: Configure,
+        asker: Option<lane::Asker>,
+    ) -> Result<Value> {
         // Said of this change alone, before one kept goes under it.
         if change.effort.is_some() && change.model.is_none() {
             return fail_with("invalid_effort", "effort goes with model");
@@ -5177,6 +5251,35 @@ impl Service {
                 }
             }
             false => change,
+        };
+        // A bot whose history is being translated takes no other change
+        // until it is done; the change that switches it takes what was
+        // translated.
+        let prepared = self.switching.prepared.remove(&bot);
+        if prepared.is_none() && self.switching.bots.contains(&bot) {
+            return fail_with("bot_busy", "its history is moving to another model family");
+        }
+        // A model of the other family, for an idle bot with history: the
+        // history is translated a page at a time beside the run loop first.
+        let change = match (&prepared, &change.model) {
+            (None, Some(reference)) if !rules_only => {
+                match (self.switch_begin(
+                    &bot,
+                    bot_id,
+                    reference,
+                    change.effort.as_deref(),
+                    change.settings.as_ref(),
+                ))
+                .await?
+                {
+                    Some(translation) => {
+                        self.switch_pieces(bot, bot_id, change, asker, translation);
+                        return Err(Error::new("deferred"));
+                    }
+                    None => change,
+                }
+            }
+            _ => change,
         };
         // A digest is found and tools checked before the change is kept,
         // so what waits holds the tools themselves.
@@ -5297,12 +5400,13 @@ impl Service {
             }
             _ => None,
         };
-        // Another model of the bot's family: its history is kept in
-        // that family's encoding. So must a summarizer or a fallback
-        // be, which are sent its items as they are.
+        // A model of the other family moves the bot's history into that
+        // family's encoding (`switch_family`). A summarizer or a fallback
+        // must be of the family the bot will be in, as they are sent its
+        // items as they are.
+        let mut switch = None;
         let model = match &record {
             Some(record) => {
-                let family = record.family()?;
                 let reference = model.as_deref();
                 let (provider, name) = match reference {
                     Some(reference) => split_model(reference)?,
@@ -5312,11 +5416,9 @@ impl Service {
                     .providers
                     .get(provider)
                     .ok_or(Error::with("provider_unavailable", provider.to_owned()))?;
-                if served.family() != family {
-                    return fail_with(
-                        "provider_family_mismatch",
-                        reference.unwrap_or(provider).to_owned(),
-                    );
+                let family = served.family();
+                if family != record.family()? {
+                    switch = Some((family, custom_tools(served, record)));
                 }
                 turn::shaped(served, given.as_ref().unwrap_or(&record.settings))?;
                 if let Some(level) = &effort {
@@ -5370,6 +5472,7 @@ impl Service {
                         false => db.inspect(&bot)?.running_turn,
                     };
                     let kept_tools = declare.clone();
+                    let trial = running.is_some();
                     let write = move |db: &mut agent_runtime::store::Database| {
                         let mut changed: Vec<String> = Vec::new();
                         // First: the changes that may be refused here.
@@ -5385,16 +5488,45 @@ impl Service {
                             changed.extend(set);
                             kin = of_kin;
                         }
-                        if let Some((provider, name)) = &model
-                            && db.set_model(
-                                &bot_name,
-                                Some(id),
-                                provider,
-                                name,
-                                effort.as_deref(),
-                            )?
-                        {
-                            changed.push("model".into());
+                        match (&model, &switch) {
+                            // Kept for the running turn's end, which takes
+                            // it as this does: checked above.
+                            (Some(_), Some(_)) if trial => changed.push("model".into()),
+                            (Some((provider, name)), Some((family, custom))) => {
+                                let switched = db.switch_family(
+                                    &bot_name,
+                                    Some(id),
+                                    &agent_runtime::store::Switch {
+                                        provider,
+                                        model: name,
+                                        effort: effort.as_deref(),
+                                        family: *family,
+                                        custom: custom.clone(),
+                                    },
+                                    prepared,
+                                )?;
+                                if let Some(switched) = switched {
+                                    changed.push("model".into());
+                                    changed.push("family".into());
+                                    changed.extend(
+                                        (switched["changed"].as_array().into_iter().flatten())
+                                            .filter_map(Value::as_str)
+                                            .map(String::from),
+                                    );
+                                }
+                            }
+                            (Some((provider, name)), None) => {
+                                if db.set_model(
+                                    &bot_name,
+                                    Some(id),
+                                    provider,
+                                    name,
+                                    effort.as_deref(),
+                                )? {
+                                    changed.push("model".into());
+                                }
+                            }
+                            (None, _) => {}
                         }
                         if let Some(instructions) = instructions
                             && db.set_instructions(&bot_name, Some(id), &instructions)?
@@ -5490,6 +5622,162 @@ impl Service {
         Ok(answer)
     }
 
+    /// Begin translating `bot`'s history for `reference`, a model of the
+    /// other family, if it is idle and has any: `None` otherwise, and the
+    /// change goes on as any other, refused or switching at once.
+    async fn switch_begin(
+        &mut self,
+        bot: &str,
+        bot_id: Option<i64>,
+        reference: &str,
+        effort: Option<&str>,
+        settings: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<Option<agent_runtime::store::Translation>> {
+        let (provider, _) = split_model(reference)?;
+        let Some(served) = self.providers.get(provider) else {
+            return Ok(None);
+        };
+        let name = bot.to_owned();
+        let record = self
+            .store
+            .op("inspect", move |db| db.inspect(&name))
+            .await?;
+        let to = served.family();
+        if to == record.family()? || record.running_turn.is_some() || record.head.is_none() {
+            return Ok(None);
+        }
+        // Refused before anything is written, as it would be after.
+        if let Some(level) = effort {
+            to.check_effort(level)?;
+        }
+        let custom = custom_tools(served, &record);
+        // Its window as the settings the same change gives will have it,
+        // which the change takes before it switches. Settings it refuses
+        // are refused by the change itself, with nothing translated.
+        let given = match settings {
+            Some(changes) => {
+                let Value::Object(mut merged) = serde_json::to_value(&record.settings)? else {
+                    return Ok(None);
+                };
+                for (key, value) in changes {
+                    match value {
+                        Value::Null => merged.remove(key),
+                        value => merged.insert(key.clone(), value.clone()),
+                    };
+                }
+                match serde_json::from_value::<Settings>(Value::Object(merged)) {
+                    Ok(given) => given,
+                    Err(_) => return Ok(None),
+                }
+            }
+            None => record.settings.clone(),
+        };
+        let limits = (given.context_bytes() as i64, given.context_items() as i64);
+        let name = bot.to_owned();
+        self.store
+            .op("switch_begin", move |db| {
+                db.switch_begin(&name, bot_id, to, &custom, limits)
+            })
+            .await
+    }
+
+    /// Translate a switch's pages beside the run loop, each its own store
+    /// job, then hand the change back to the run loop ([`SwitchDone`]).
+    fn switch_pieces(
+        &mut self,
+        bot: String,
+        bot_id: Option<i64>,
+        change: Configure,
+        asker: Option<lane::Asker>,
+        translation: agent_runtime::store::Translation,
+    ) {
+        self.switching.bots.insert(bot.clone());
+        let (store, done) = (self.store.clone(), self.switching.done.clone());
+        self.retention.spawn(async move {
+            let mut translation = translation;
+            let translation = loop {
+                match store
+                    .op("switch_piece", move |db| {
+                        let done = db.switch_piece(&mut translation)?;
+                        Ok((translation, done))
+                    })
+                    .await
+                {
+                    Ok((written, true)) => break Ok(written),
+                    Ok((written, false)) => translation = written,
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = done.send(SwitchDone {
+                bot,
+                bot_id,
+                change,
+                asker,
+                translation,
+            });
+        });
+    }
+
+    /// A switch's history is all written, or its translation failed: the
+    /// change is taken with it, and its asker answered. A translation no
+    /// change took is let go, and the bot's turns go on.
+    async fn switched(&mut self, done: SwitchDone) -> Result<()> {
+        let SwitchDone {
+            bot,
+            bot_id,
+            change,
+            asker,
+            translation,
+        } = done;
+        let held = translation.as_ref().ok().map(|t| t.bot_id());
+        let result = match translation {
+            Ok(translation) => {
+                self.switching.prepared.insert(bot.clone(), translation);
+                match asker {
+                    Some(_) => self.configure_for(bot.clone(), bot_id, change, None).await,
+                    None => self.take_configure(&bot).await.map(|()| Value::Null),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        self.switching.prepared.remove(&bot);
+        self.switching.bots.remove(&bot);
+        // One no change took lets its bot go on at once; what it wrote is
+        // freed a page per store job, beside the run loop.
+        let name = bot.clone();
+        let released = self
+            .store
+            .op("switch_release", move |db| {
+                let id = match held {
+                    Some(id) => id,
+                    None => db.identity(&name, bot_id)?,
+                };
+                db.switch_release(id)
+            })
+            .await;
+        match released {
+            Err(error) if error.code == "storage_error" => return Err(error),
+            Ok(true) => {
+                let store = self.store.clone();
+                self.retention.spawn(async move {
+                    let _ = reclaim(&store).await;
+                });
+            }
+            _ => {}
+        }
+        self.ready_hint = true;
+        if let Some(asker) = asker {
+            self.retention.spawn(async move {
+                retention_reply(asker.session, &asker.output, asker.id, result).await;
+            });
+        } else if let Err(error) = result
+            && error.code == "storage_error"
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Take the `configure` kept for `bot` once no turn of it runs, as
     /// `configure` takes one; one still running keeps it. One that can no
     /// longer be taken (its model gone from the config, say) is let go,
@@ -5503,6 +5791,10 @@ impl Service {
         // the end costs the submissions after it nothing; once the end is
         // committing, the store says.
         if !self.kept.contains(bot) || self.active.get(bot).and_then(Active::running).is_some() {
+            return Ok(());
+        }
+        // Its history is being translated for it: it is taken once it is.
+        if self.switching.bots.contains(bot) && !self.switching.prepared.contains_key(bot) {
             return Ok(());
         }
         let name = bot.to_owned();
@@ -5534,6 +5826,10 @@ impl Service {
             .await
         {
             Ok(_) => Ok(()),
+            // Its history is being translated: it is taken once it is. One
+            // whose history changed meanwhile is translated afresh at the
+            // next start.
+            Err(error) if matches!(error.code.as_str(), "deferred" | "switch_stale") => Ok(()),
             Err(error) if error.code == "storage_error" => Err(error),
             Err(error) if error.code == "bot_not_found" => {
                 self.kept.remove(bot);
@@ -6275,7 +6571,12 @@ impl Service {
                     compaction_model,
                     profile,
                 };
-                self.configure(bot, bot_id, change).await
+                let asker = lane::Asker {
+                    session,
+                    output: output.clone(),
+                    id: id.clone(),
+                };
+                self.configure_for(bot, bot_id, change, Some(asker)).await
             }
             Command::Compact { bot, bot_id } => {
                 let name = bot.clone();
@@ -6316,46 +6617,53 @@ impl Service {
                 Ok(answer)
             }
             Command::Lend { bot, bot_id } => {
-                let record = store
-                    .read("inspect", move |db| db.inspect_held(&bot, bot_id))
-                    .await?;
-                let id = record.bot_id;
-                // As its turns' commands get them, past what only a turn has.
-                let mut environment: Vec<(String, String)> = (record.settings.env.iter())
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect();
-                environment.push(("AGENT_BOT".into(), record.name.clone()));
-                environment.push(("AGENT_BOT_ID".into(), id.to_string()));
-                let mut policy = None;
-                if record.sandboxed() {
-                    let root = (record.workspace.clone().map(std::path::PathBuf::from))
-                        .ok_or_else(|| {
-                            Error::with("sandbox_unavailable", "the bot has no folder")
-                        })?;
-                    // Opening its socket may bind: off the runtime thread,
-                    // as for its turns.
-                    let (daemon, settings) =
-                        (self.registry.daemon().clone(), record.settings.clone());
-                    policy = tokio::task::spawn_blocking(move || {
-                        turn::bot_sandbox(&settings, &root, id, &daemon)
-                    })
-                    .await
-                    .map_err(|_| Error::new("sandbox_unavailable"))??;
-                }
-                if let Some(policy) = policy.as_mut() {
-                    // Held for the session, as for one of the bot's own
-                    // commands: its socket, and its placeholders and what
-                    // its command may not leave, gone once the session is.
-                    let hold = agent_runtime::sandbox::hold(policy).await;
-                    self.lent.entry(session).or_default().push(hold);
-                    policy.listening = None;
-                    if let Some(own) = policy.reach() {
-                        environment.push(("AGENT_SOCKET".into(), own.display().to_string()));
+                // Beside the loop, as a read is: the bot's record, its
+                // sandbox made and held, each of which can wait on a busy
+                // disk. What it holds goes with the session; one that closed
+                // meanwhile drops it as the lend ends.
+                let reader = store.reader();
+                let daemon = self.registry.daemon().clone();
+                // What every command's environment is; the bot's own
+                // settings, set after, win as they do for its commands.
+                let mut env = agent_runtime::tools::shell_environment_whole(&self.registry, &[]);
+                let lent = self.lent.entry(session).or_default().clone();
+                self.observe(session, output, id, async move {
+                    let record = reader
+                        .read("inspect", move |db| db.inspect_held(&bot, bot_id))
+                        .await?;
+                    let id = record.bot_id;
+                    // As its turns' commands get them, past what only a turn has.
+                    env.extend(record.settings.env.clone());
+                    env.insert("AGENT_BOT".into(), record.name.clone());
+                    env.insert("AGENT_BOT_ID".into(), id.to_string());
+                    let mut policy = None;
+                    if record.sandboxed() {
+                        let root = (record.workspace.clone().map(std::path::PathBuf::from))
+                            .ok_or_else(|| {
+                                Error::with("sandbox_unavailable", "the bot has no folder")
+                            })?;
+                        // Opening its socket may bind: off the runtime thread,
+                        // as for its turns.
+                        let settings = record.settings.clone();
+                        policy = tokio::task::spawn_blocking(move || {
+                            turn::bot_sandbox(&settings, &root, id, &daemon)
+                        })
+                        .await
+                        .map_err(|_| Error::new("sandbox_unavailable"))??;
                     }
-                }
-                let env =
-                    agent_runtime::tools::shell_environment_whole(&self.registry, &environment);
-                Ok(json!({"bot": record.name, "bot_id": id, "policy": policy, "env": env}))
+                    if let Some(policy) = policy.as_mut() {
+                        // Held for the session, as for one of the bot's own
+                        // commands: its socket, and its placeholders and what
+                        // its command may not leave, gone once the session is.
+                        let hold = agent_runtime::sandbox::hold(policy).await;
+                        lent.lock().unwrap_or_else(|e| e.into_inner()).push(hold);
+                        policy.listening = None;
+                        if let Some(own) = policy.reach() {
+                            env.insert("AGENT_SOCKET".into(), own.display().to_string());
+                        }
+                    }
+                    Ok(json!({"bot": record.name, "bot_id": id, "policy": policy, "env": env}))
+                })
             }
             Command::Inspect { bot, bot_id } => {
                 let reader = store.reader();
@@ -6441,18 +6749,22 @@ impl Service {
                 limit,
                 newest,
             } => {
-                store
-                    .read("pauses", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("pauses", move |db| {
                         db.pauses(after, before, limit.unwrap_or(64), newest)
-                    })
+                    }))
                     .await
+                })
             }
             Command::Held { after, limit, bot } => {
-                store
-                    .read("held", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("held", move |db| {
                         db.held(after, limit.unwrap_or(64), bot.as_deref())
-                    })
+                    }))
                     .await
+                })
             }
             Command::Processes { bot, after } => {
                 if bot.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
@@ -6470,12 +6782,14 @@ impl Service {
                         }
                     },
                 };
-                store
-                    .read("processes", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("processes", move |db| {
                         let after = after.as_ref().map(|(bot, id)| (bot.as_str(), *id));
                         Ok(serde_json::to_value(db.processes(bot.as_deref(), after)?)?)
-                    })
+                    }))
                     .await
+                })
             }
             Command::StopProcess { bot, handle } => {
                 let id = match handles::Handle::parse(&handle) {
@@ -7179,21 +7493,37 @@ impl Service {
                 }
                 let waiter = self.handles.request_waiter();
                 let deadline = timeout_ms.map(|t| handles::now_ms() + t);
-                self.handles
-                    .attach(
-                        store,
-                        waiter,
-                        &handles,
-                        deadline,
-                        any,
-                        Completion::Respond {
-                            session,
-                            output: output.clone(),
-                            request: id,
-                            reader: store.reader(),
-                        },
-                    )
-                    .await;
+                let reader = store.reader();
+                // Registered here, so a result told from now on reaches it
+                // and its session's close lets it go. What the registry
+                // holds settles now; the results only the store has are
+                // read beside the loop, which a slow disk would otherwise
+                // hold for every handle's read in turn, on the observation
+                // lane's reader seats, each given back once its batch is
+                // read: a wait left waiting holds none.
+                let generation = self.handles.register(
+                    waiter,
+                    &handles,
+                    any,
+                    Completion::Respond {
+                        session,
+                        output: output.clone(),
+                        request: id,
+                        reader: reader.clone(),
+                    },
+                );
+                let stored = self.handles.settle_held(waiter, generation, &handles);
+                if stored.is_empty() {
+                    self.handles
+                        .settle_deadline(waiter, generation, &handles, deadline);
+                } else {
+                    let (registry, seats) = (self.handles.clone(), self.lane.seats());
+                    tokio::spawn(async move {
+                        (registry.settle_stored(&reader, Some(&seats), waiter, generation, stored))
+                            .await;
+                        registry.settle_deadline(waiter, generation, &handles, deadline);
+                    });
+                }
                 // The response is sent by the completion, not by this dispatch.
                 Err(Error::new("deferred"))
             }
@@ -8046,6 +8376,8 @@ async fn delete_pieces(
             break;
         }
     }
+    // What it left that nothing else holds now goes too, a page per job.
+    reclaim(&store).await?;
     // Its connections go with it, and a later bot of the
     // same name starts on a fresh one; so does its own socket.
     for provider in providers.values() {
@@ -8060,6 +8392,18 @@ async fn delete_pieces(
     }
     hub.live(&bot, gone).await?;
     Ok(deleted)
+}
+
+/// Free what switches left that no bot owns, a page per store job.
+async fn reclaim(store: &Store) -> Result<()> {
+    let mut at = agent_runtime::store::Reclaim::default();
+    while let Some(next) = store
+        .op("switch_reclaim", move |db| db.switch_reclaim(at))
+        .await?
+    {
+        at = next;
+    }
+    Ok(())
 }
 
 /// Answer a read from the observation lane, in its own task.
@@ -8078,6 +8422,26 @@ fn deliver(
 ///
 /// Match ordinary replies: the stdio owner (session zero) gets bounded
 /// backpressure; socket clients cannot hold up a reply task when they lag.
+/// Tools a model of `served` is shown as custom tools when a bot switches
+/// to it: their calls and results go as custom ones.
+fn custom_tools(
+    served: &Provider,
+    record: &agent_runtime::store::Bot,
+) -> std::collections::HashSet<String> {
+    match served.grammars() {
+        true => (record.offered().iter())
+            .filter(|name| *name == "apply_patch")
+            .cloned()
+            .chain(
+                (record.declared.iter())
+                    .filter(|tool| tool.grammar.is_some())
+                    .map(|tool| tool.name.clone()),
+            )
+            .collect(),
+        false => Default::default(),
+    }
+}
+
 async fn retention_reply(session: u64, output: &Output, id: Value, result: Result<Value>) -> bool {
     let sent = if session == 0 {
         matches!(
@@ -8654,6 +9018,7 @@ mod tests {
             tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            switching: Switching::default(),
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
@@ -8879,6 +9244,7 @@ mod tests {
             tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            switching: Switching::default(),
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
@@ -9200,6 +9566,7 @@ mod tests {
             tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            switching: Switching::default(),
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
@@ -9453,6 +9820,7 @@ mod tests {
             tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            switching: Switching::default(),
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
@@ -10635,7 +11003,43 @@ mod tests {
             bot: "A".into(),
             bot_id: Some(bot_id),
         };
-        for command in [approvals(), inspect] {
+        // Listings and a lend of a bot's sandbox, which read and decide
+        // nothing, as the reads above.
+        let pauses = || Command::Pauses {
+            after: 0,
+            before: None,
+            limit: None,
+            newest: false,
+        };
+        let listed = || Command::Held {
+            after: 0,
+            limit: None,
+            bot: None,
+        };
+        let processes = || Command::Processes {
+            bot: None,
+            after: None,
+        };
+        let lend = || Command::Lend {
+            bot: "A".into(),
+            bot_id: Some(bot_id),
+        };
+        for command in [pauses(), listed(), processes(), lend()] {
+            assert!(
+                !service.must_settle(Some(&command), 1, &output, Bound::default()),
+                "another session's admission holds no {}",
+                command.op()
+            );
+            assert!(service.must_settle(Some(&command), 0, &output, Bound::default()));
+        }
+        for command in [
+            approvals(),
+            inspect,
+            pauses(),
+            listed(),
+            processes(),
+            lend(),
+        ] {
             let deferred = (service.dispatch(command, 1, &output, json!("r"), Bound::default()))
                 .await
                 .unwrap_err();
@@ -10679,6 +11083,109 @@ mod tests {
             let (_, _, _, started) = service.settle().await;
             started.unwrap();
         }
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_wait_reads_what_its_handles_have_beside_the_loop() {
+        let dir = scratch("wait-beside");
+        let (store, _publications) = Store::open_with(&dir.join("state.sqlite"), 1)
+            .await
+            .unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        requests(&mut service, vec![create("A", &dir)], &output).await;
+        // The one reader, held, as a read is on a busy disk.
+        let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let (began, running) = tokio::sync::oneshot::channel::<()>();
+        let held = tokio::spawn({
+            let store = store.clone();
+            async move {
+                (store.read("hold", move |_| {
+                    let _ = began.send(());
+                    let _ = wait.recv();
+                    Ok(())
+                }))
+                .await
+            }
+        });
+        running.await.unwrap();
+        let (daemon, client) = tokio::io::duplex(1 << 16);
+        let asker = Output::writer(daemon);
+        let command = Command::Wait {
+            handles: vec!["A/1".into()],
+            timeout_ms: Some(0),
+            any: false,
+        };
+        let deferred = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.dispatch(command, 1, &asker, json!("w"), Bound::default()),
+        )
+        .await
+        .expect("the loop goes on while the wait's read waits for a reader");
+        assert_eq!(deferred.unwrap_err().code, "deferred");
+        // Once the reader is free the wait is answered: no such turn.
+        gate.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(client));
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the wait is answered")
+            .unwrap()
+            .unwrap();
+        let answer: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(answer["id"], json!("w"));
+        assert!(answer["result"]["results"]["A/1"].is_object(), "{answer}");
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_wait_reads_its_handles_a_batch_to_a_seat_and_stops_once_answered() {
+        let dir = scratch("wait-batches");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        requests(&mut service, vec![create("A", &dir)], &output).await;
+        let lookups = || {
+            store.stats()["operations"]["wait_lookup"]["count"]
+                .as_u64()
+                .unwrap_or(0)
+        };
+        // Every reader seat the lane has, taken.
+        let seats = service.lane.seats();
+        let taken = seats.clone().acquire_many_owned(2).await.unwrap();
+        let (daemon, client) = tokio::io::duplex(1 << 16);
+        let asker = Output::writer(daemon);
+        // More handles than one batch; any of them answers the wait.
+        let command = Command::Wait {
+            handles: (1..=handles::LOOKUP_BATCH as i64 + 4)
+                .map(|n| format!("A/{n}"))
+                .collect(),
+            timeout_ms: Some(10_000),
+            any: true,
+        };
+        let deferred = service.dispatch(command, 1, &asker, json!("w"), Bound::default());
+        assert_eq!(deferred.await.unwrap_err().code, "deferred");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(lookups(), 0, "a wait read without a seat");
+        drop(taken);
+        let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(client));
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the wait is answered")
+            .unwrap()
+            .unwrap();
+        let answer: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(answer["id"], json!("w"));
+        // The first batch answered it, so the second is never read, and
+        // the seat went back with the batch.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(lookups(), 1);
+        assert_eq!(seats.available_permits(), 2);
         drop(service);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);

@@ -7,9 +7,12 @@ from bench.lookout_scale import Bench
 from bench.perf_gate import compare
 
 
-def footprint(cpu, jobs=3, next_ready=1):
+def footprint(cpu, jobs=3, next_ready=1, checkpoints=0):
+    operations = {'begin': {'count': jobs}, 'commit': {'count': 9}, 'next_ready': {'count': next_ready}}
+    if checkpoints:
+        operations['checkpoint'] = {'count': checkpoints}
     return {'idle_rss_mib': 18.0, 'per_idle_bot_kib': 1.0, 'turns_rss_mib': 27.0, 'cpu_ms_per_turn': cpu,
-            'operations': {'begin': {'count': jobs}, 'commit': {'count': 9}, 'next_ready': {'count': next_ready}}}
+            'operations': operations}
 
 
 class PerfGateTests(unittest.TestCase):
@@ -27,7 +30,7 @@ class PerfGateTests(unittest.TestCase):
     def test_more_store_work_fails_and_timing_only_warns_when_runs_do_not_overlap(self):
         # Timed counts and overlapping runs say nothing.
         _, failed, warned = self.screen([footprint(1.0), footprint(1.5)],
-                                        [footprint(1.4, next_ready=7), footprint(1.1)])
+                                        [footprint(1.4, next_ready=7), footprint(1.1, checkpoints=4)])
         self.assertEqual((failed, warned), ([], []))
         # Every head run slower than every base run, by more than 15%.
         _, failed, warned = self.screen([footprint(1.0), footprint(1.1)], [footprint(1.4), footprint(1.5)])

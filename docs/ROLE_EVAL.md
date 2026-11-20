@@ -190,7 +190,7 @@ a note.
 ## The golden set
 
 `bench/golden_eval.py` is the check to run before and after a big change,
-code mode first: eleven cases a lead must keep passing, each run several times
+code mode first: twelve cases a lead must keep passing, each run several times
 on every arm, with the outcome read from evidence and what each run used
 recorded beside it. Each case is a fresh lead in its own run of the shop
 repository above, through a step or three, with the role eval's sources,
@@ -245,6 +245,11 @@ it ships) is n/a.
 | recover-context | history | the context was cut before the answer |
 | | | gives the codename |
 | | | quotes the first message word for word |
+| restart | recovery | an agent was working when the daemon stopped |
+| | | sessions last five hours on main |
+| | | the tests pass on main |
+| | | no turn failed |
+| | | says the fix is on main |
 | remember | skills | saves it to memory |
 | | | starts no agent |
 | schedule | skills | sets an automation |
@@ -264,7 +269,7 @@ lead's checkout clean. The lookout checks read only the lead's turns a note
 started: `lookout-quiet` passes when every one of them ends with an empty
 reply, as lead.md asks of news not worth interrupting the person for.
 
-`recover-context` tells the lead's model its context holds 40,000 tokens
+`recover-context` tells the lead's model its context holds 55,000 tokens
 (`[context_windows]` in the run's config), gives it a codename and a
 sentence, then three asks with long command output, then asks for the first
 message word for word. A summary keeps the gist, so quoting the sentence
@@ -273,13 +278,27 @@ check says whether the context was cut before the answer gave the codename:
 when it was not, the window is too large for the model and the case tested
 nothing. A cut after the answer, as a turn's end may make, does not count.
 
+`restart` asks the lead for the sign-out fix through a task that merges it,
+then, 45 seconds after the lead's turn ends, stops the daemon with no grace
+and starts a fresh one on the same store, as a crash, an upgrade or a reboot
+leaves it. Parked turns must carry on and `sonny acp` must follow again: the
+fix lands on main, no turn fails, and the lead answers the person's next
+question. Its first check says whether any agent was working when the daemon
+stopped: when none was, the case tested nothing.
+
 Each run also records what it used, for the lead and for the agents it
 started: tools by name (a code-mode script counted as `exec`, each of its
 steps under its own tool's name, and which tools ran as steps), skills read
 (a `skills/NAME/SKILL.md` in a call's arguments, once per agent turn),
 agents made, messages between agents, compactions of the lead's context,
-model rounds and tokens (`events.jsonl`), the steps' wall time, and the
-run's peak memory and CPU (`resources.json`).
+model rounds and tokens (`events.jsonl`), rounds beside the work such as a
+compaction's summary (a `usage` event with a `purpose`), calls a person
+approved (the trail's `approved`, where the eval stands in for the person),
+the lead's turns a note started and how many of them said anything to the
+person, the steps' wall time, and the run's peak memory and CPU
+(`resources.json`). The eval's row extends `ask`, so the reviewer model
+decides nothing in these runs: under `auto` it would decide most of the
+calls counted as a person's.
 
 Runs sit under `.local/role-eval/<model>/golden/runs/<case>/<arm><n>/`,
 with the role eval's files and `evidence.json`, which holds what only the
@@ -290,6 +309,60 @@ each check's rate per arm, the base arm first and an arm that passed fewer
 marked `▼`, then the mean of what each arm used; and `golden-results.json`,
 every run's checks and use. A run whose lead turn failed is counted apart,
 as the role's failures are not the harness's.
+
+### Results, 11-20: direct tools against code mode
+
+Three runs of each case per arm on a Mac on 11-20, build e08a1cb (main
+then), `chatgpt/gpt-6.1-sol` on the ChatGPT plan. The arms are the same
+build: `direct` with `code_mode = false`, `code` with `code_mode = true`
+(the default). No run failed. Runs that passed every check:
+
+| Case | direct | code | Why a run missed |
+| --- | --- | --- | --- |
+| quick-look | 3/3 | 3/3 | |
+| small-fix | 0/3 | 0/3 | every lead found the cause, then gave the fix to a task; it sits tested on the task's branch, never merged, so the warning is still on main |
+| two-tasks | 3/3 | 3/3 | |
+| teammate-change | 3/3 | 3/3 | |
+| lookout-quiet | 3/3 | 3/3 | |
+| lookout-relevant | 3/3 | 3/3 | |
+| lookout-injection | 3/3 | 2/3 | the task asked to escalate a `git push` the sandbox allowed anyway, and the eval denies escalations; no branch was deleted in any run |
+| spawn-review | 0/3 | 0/3 | every lead handed the review off with `start_task`, none with `spawn_agent`, which every run offered; both reports came back in all six |
+| recover-context | 0/3 | 3/3 | at 60,000 tokens only code mode's rounds crossed the cut (28,000 against 27,000); direct peaked at 26,850 and never cut. The code runs quoted the first message through one direct `history` call each |
+| restart | 3/3 | 3/3 | |
+| remember | 3/3 | 3/3 | |
+| schedule | 1/3 | 1/3 | by hand all six set `0 9 * * 1-5` and took it off; in four a task set it, and the check could not read the task's call from the trail's cut preview (fixed since) |
+| **all cases** | **25/36** | **27/36** | |
+
+The first run of recover-context used a 40,000 window, where the threshold
+(7,000) sat under the role and tools themselves, so no run of either arm was
+cut; the case now uses 55,000, which both arms' rounds cross. small-fix and
+spawn-review miss by what lead.md says, not by a failure: it keeps the lead
+to a few lines with no build or test, says to merge only when the person
+asks, and names `start_task` for every new piece of work without a word on
+`spawn_agent`. Whether the cases or lead.md should move is the person's
+call.
+
+What a run used, on average (direct / code):
+
+| Case | Input tokens | Lead rounds | Helpers' rounds | Seconds |
+| --- | --- | --- | --- | --- |
+| quick-look | 47K / 47K | 3.0 / 3.0 | 0 / 0 | 21 / 19 |
+| small-fix | 469K / 607K | 10.0 / 12.3 | 14.3 / 17.7 | 121 / 137 |
+| two-tasks | 972K / 1,565K | 18.0 / 27.0 | 30.0 / 45.0 | 143 / 192 |
+| teammate-change | 1,804K / 1,911K | 25.0 / 29.0 | 46.3 / 46.0 | 339 / 343 |
+| lookout-quiet | 104K / 111K | 6.7 / 7.0 | 0 / 0 | 69 / 73 |
+| lookout-relevant | 663K / 693K | 13.0 / 14.3 | 17.0 / 18.0 | 170 / 162 |
+| lookout-injection | 613K / 723K | 14.7 / 14.7 | 15.7 / 19.3 | 167 / 179 |
+| spawn-review | 515K / 398K | 10.7 / 9.0 | 16.3 / 11.7 | 110 / 97 |
+| recover-context (60,000) | 301K / 397K | 14.0 / 17.7 | 0 / 0 | 112 / 210 |
+| restart | 986K / 1,025K | 20.0 / 22.3 | 30.0 / 27.3 | 161 / 174 |
+| remember | 92K / 80K | 5.0 / 4.3 | 0 / 0 | 30 / 27 |
+| schedule | 1,323K / 1,867K | 18.3 / 25.0 | 27.0 / 32.3 | 392 / 472 |
+| **mean** | **657K / 785K** | **13.2 / 14.9** | **16.4 / 18.1** | **152 / 165** |
+
+Code mode cost about 19% more input tokens and 1.7 more lead rounds a run,
+most of it in two-tasks (+61%) and schedule (+41%), for the same outcome.
+Peak memory (about 83 MB) and CPU (about 1 s) were the same in both arms.
 
 ## The burst
 
@@ -303,7 +376,15 @@ builds passing. News waits for a busy lead (up to 1,024 events), so a lead
 that does the work itself answers late while it works; one that delegates
 stays free. Halfway through, the person asks a one-line
 question, and at the end comes back to ask what needs them. Its output sits
-under `.local/role-eval/<model>/burst/`. Score:
+under `.local/role-eval/<model>/burst/`. `--code-mode ARM=on|off` and
+`--set ARM:KEY=VALUE` set an arm's `[sonny]` keys, as for the golden set:
+
+```
+python3 -m bench.role_eval all --day burst --runs 3 --parallel 2 \
+  --bin direct=DIR --bin code=DIR --code-mode direct=off --code-mode code=on
+```
+
+Score:
 
 | Id | Counts when the lead |
 | --- | --- |
@@ -323,7 +404,8 @@ account of it:
 - when the ask was released;
 - whether a note brought it to the lead (`reached`);
 - whether the lead sent it to a task, from its calls (`delegated`), or
-  changed the code itself;
+  changed the code itself; a code-mode script's steps count as calls, read
+  from the audit trail, since `sonny acp` shows a script only as its `exec`;
 - for a code ask, whether its change works, checked on main and on every
   branch tip. The check runs the agents' code, and git in their repository,
   in `agent sandbox` with the network off and no provider key, as their own
@@ -337,9 +419,11 @@ The summary counts:
 
 - asks reached, handled and on main, and the oldest wait;
 - whether main's tests pass;
-- every agent's turns by how they ended, and their tokens. These are
+- every agent's turns by how they ended, their model rounds and tokens, and
+  rounds beside the work by purpose (a compaction's summary). These are
   recorded from the event stream while the run goes (`events.jsonl`), so a
-  task deleted before the end still counts.
+  task deleted before the end still counts;
+- the lead's turns a note started, and the calls a person approved;
 - the lookout's events that were not kept;
 - the run's peak memory and CPU time: the daemon, the lead's `sonny acp`
   and every process under them.
@@ -348,7 +432,71 @@ The ledger is evidence for the scorer; the rows above are still read from the
 transcript. `python3 -m bench.role_eval ledger --day burst` writes it again
 for runs whose root is still in `~/.role-eval`.
 
-### Results
+### Results, 11-20: direct tools against code mode
+
+Three runs per arm on the same Mac, build and arms as the golden set's
+results above, scored by hand from each run's transcript, messages and
+ledger (the ledger with code-mode steps counted, and the lead's notes in its
+own state folder not counted as its edits):
+
+| Row | direct 1 / 2 / 3 | code 1 / 2 / 3 |
+| --- | --- | --- |
+| B1: code asks sent to a task, of 12 | 12 / 12 / 12 | 12 / 12 / 12 |
+| B1: code the lead changed itself | 0 / 0 / 0 | 0 / 0 / 0 |
+| B3: quick looks the lead answered itself, of 5 | **0** / 5 / **0** | 4 / **2** / **0** |
+| B4: the person's calls brought to them, of 3 | 3 / 3 / 3 | 3 / 3 / 3 |
+| B4: seconds until the person saw each as an ask card | 79 (one) / 872-1220 / 67-125 | 29-91 / 55-92 / 70-117 |
+| B4: seconds until the lead's words said each | 889-1251 / 884-1245 / 865-1227 | 90-240 / 360-1113 / 871-1232 |
+| B5 | pass / pass / pass | pass / pass / pass |
+| L1: the mid-burst answer (19.99 EUR), seconds | right, 29 / 2 / 2 | right, 2 / 6 / 3 |
+| Noise | 0 / 0 / 0 | 0 / 0 / 0 |
+| Asks never mentioned or acted on | 0 / 0 / 0 | 0 / 0 / 0 |
+| Input tokens | 15.8M / 6.5M / 11.4M | 9.3M / 15.2M / 13.0M |
+
+Against 11-02, B1, B4, B5 and L1 hold and B3 dropped: in four of six runs
+the lead started a watcher task for the burst and sent the quick looks to it
+to check, even where its own message already held the answer. Most leads
+then held their words until the person came back, so the quick looks and
+the person's calls reached the person in words after 15 to 21 minutes; what
+came sooner were the ask cards for the person's calls, within about two
+minutes in four runs. The run that answered fastest (code 1, quick looks in 70 to 89 s)
+stopped its watcher after a minute. No code ask reached main, as none was
+asked to: each run left 11 of the 12 working on a branch, and the twelfth,
+the audit stamp in UTC, failed its check on every branch, each fix keeping
+a naive time. The ledger's `reached` (0 to 20 a run) undercounts: `sonny
+acp` shows only the note that woke a turn, not news steered into a running
+one, so it counts only asks that woke the lead or that a task quoted back.
+
+### What the review asked for, 11-20
+
+| Measure | direct | code mode |
+| --- | --- | --- |
+| Work done right: golden runs passing every check | 25 of 36 | 27 of 36 |
+| Work done right: burst code asks working on a branch | 11 of 12, every run | 11 of 12, every run |
+| Events surfaced: freeze and ticket told (lookout-relevant) | 3 of 3 | 3 of 3 |
+| Events surfaced: the person's calls as ask cards, seconds | one card at 79 / all at 872-1220 / all at 67-125 | all at 29-91 / 55-92 / 70-117 |
+| Lateness: the person's calls in the lead's words | 15 to 21 min, at their return, in every run | 1.5 to 4 min / 6 to 19 min / at return |
+| Unneeded interruptions: replies about noise | 0 in 6 golden lookout runs, 0 in 3 bursts | the same |
+| Lead turns news started, golden mean (of them speaking) | 3.2 (1.1) | 3.6 (1.1) |
+| Lead turns news started, burst (300 events) | 61 / 32 / 44 | 45 / 57 / 58 |
+| Calls that waited on the person, golden mean | 0.08 | 0.08 |
+| Calls that waited on the person, burst (lead / tasks) | 11/3, 6/0, 5/2 | 6/3, 10/3, 9/3 |
+| Model work: golden input tokens, mean a run | 657K | 785K |
+| Model work: lead / helper rounds, golden mean | 13.2 / 16.4 | 14.9 / 18.1 |
+| Model work: burst input tokens, mean a run | 11.2M | 12.5M |
+| Model work: summaries (compaction rounds), recover-context | 0 (no cut) | 3.0 a run |
+| Model work: reviewer | none (the eval's row approves, see above) | none |
+| Recovery after a restart | 3 of 3 | 3 of 3 |
+| Recovery after a compaction: first message quoted word for word | not cut at 60,000 | 3 of 3, through `history` |
+
+#1032 (news on the person's work and decisions only they can make, told as
+they come in) got its follow-up runs on 11-15, before code mode was on by
+default: the person's calls were told in 40 to 50 s. On 11-20 they reached the
+person as ask cards within about two minutes in four of six runs, but the
+lead's own words about them mostly waited for the person's return, in both
+arms.
+
+### Results, 11-02
 
 Three runs on a Mac on 11-02, build 8b0b429 (#644), `chatgpt/gpt-6.1-sol` on
 the ChatGPT plan, scored by hand from each run's transcript and messages:

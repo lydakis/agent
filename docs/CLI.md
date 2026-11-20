@@ -122,6 +122,10 @@ a formula of the machine, as `processes = "cpus * 64"` or
 daemon's to end, as `make -l` does, a turn held long parking until then.
 `stall_timeout = "15m"` sets how long a provider stream may send no
 content before it is retried (`--stall-timeout`, 10 minutes by default).
+`durability = "normal"` (`--durability`) has the store sync its log only
+at checkpoints, not before answering each commit: faster on a busy disk,
+and a crash of the machine or its power can lose the last commits, never a
+crash of the daemon alone; `"full"`, the default, syncs each.
 `depth = 2`, the default for `--max-depth`, is how many generations below
 the bot that starts its line a new bot may be, as Codex's
 `agents.max_depth`: a bot run with no `AGENT_BOT` starts one, its children

@@ -791,7 +791,8 @@ The adapter calls the exported `openNodeSqliteDatabase()`, sets
 unless they hold, then passes the database to `SqliteStorage.open()`. The
 `ready` event and the result record (`durability`) state the setting. With
 `--synchronous normal` the package default is kept and the run is recorded as
-`sqlite_wal_synchronous_normal`; Agent has only FULL. Under strace, one bot
+`sqlite_wal_synchronous_normal`; Agent's `--durability normal` is the same
+setting, passed by `--synchronous normal`, and its default FULL. Under strace, one bot
 and ten text turns of this workload's 20 × 25 ms streaming made 3.1
 `fsync`/`fdatasync` calls per turn in Agent, 9.0 in Pi Durable at FULL (one per
 commit, including partial-answer commits), and none in Pi Durable at NORMAL

@@ -20,16 +20,86 @@ pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, with
 pub use db::{
     Absorbed, AfterTurn, Answered, ApprovalPolicy, ArtifactLines, Binding, Blocked, Bot, CacheTtl,
     CallAnswer, Capture, CatchUp, Charge, Closing, CompactionPlan, CompactionView, CopiedCall,
-    Counts, DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, ENV_JSON, EVENT_PAGE_KINDS,
-    ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Identity, Joined, Kept, Lapsed,
-    Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS, PROCESSES_PAGE, ParkedFallback,
-    Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON, Replaced,
-    Resumed, Room, SANDBOX, SETTINGS, Served, Settings, Shared, Spend, Started, Step, StepAsk,
-    StepOpened, Stepped, Strip, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, TurnBudget, TurnOptions,
-    UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
+    Counts, DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, Durability, ENV_JSON,
+    EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Identity, Joined,
+    Kept, Lapsed, Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS, PROCESSES_PAGE,
+    ParkedFallback, Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON,
+    Reclaim, Replaced, Resumed, Room, SANDBOX, SETTINGS, Served, Settings, Shared, Spend, Started,
+    Step, StepAsk, StepOpened, Stepped, Strip, Switch, TRAILER, TURN_VIEW_ACCOUNTING, Trailer,
+    Translation, TurnBudget, TurnOptions, UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob,
+    listed_command, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
+
+/// The WAL's checkpoints, off the writer, on the reader pool: once it is
+/// open, each of the writer's asks queues one checkpoint as a read, which
+/// the next free reader runs on its own connection, so no thread or
+/// connection is kept for them. One reader at a time runs them: asks
+/// made while one is queued are that one, and an ask while it runs has
+/// that reader run one more after it. Each is counted as the
+/// `checkpoint` operation from when it was asked for. With no room in the
+/// queue the ask is dropped, and the writer checkpoints itself as the log
+/// grows, as SQLite would have. The writer's own checkpoints are counted
+/// as `writer_checkpoint`, and what every checkpoint found is kept for
+/// `stats`.
+fn checkpoints(
+    db: &mut Database,
+    pool: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<Pool>>>,
+    counters: std::sync::Arc<Counters>,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+    let running = std::sync::Arc::<std::sync::Mutex<()>>::default();
+    let held = running.clone();
+    let (own_log, own_counters) = (counters.log.clone(), counters.clone());
+    // None queued or running (0), one queued or running (1), and asked
+    // for again meanwhile (2): one reader at a time runs checkpoints, and
+    // an ask while it does is its next.
+    let state = std::sync::Arc::new(AtomicU8::new(0));
+    db.checkpoint_aside(
+        running,
+        own_log,
+        move || {
+            let Some(pool) = pool.get() else {
+                return;
+            };
+            let was = state.try_update(SeqCst, SeqCst, |s| Some(if s == 0 { 1 } else { 2 }));
+            if was != Ok(0) {
+                return;
+            }
+            let Ok(place) = pool.room.clone().try_acquire_owned() else {
+                state.store(0, SeqCst);
+                return;
+            };
+            let mut asked = std::time::Instant::now();
+            let (state, counters, running) = (state.clone(), counters.clone(), held.clone());
+            pool.push(
+                Box::new(move |db: &Database| {
+                    loop {
+                        let started = std::time::Instant::now();
+                        let found = {
+                            let _running = running.lock().unwrap_or_else(|e| e.into_inner());
+                            db.checkpoint()
+                        };
+                        if let Ok((frames, copied)) = found
+                            && frames >= 0
+                        {
+                            counters.log.note(frames, copied);
+                        }
+                        counters.record("checkpoint", asked, started, found.is_err());
+                        if state.compare_exchange(1, 0, SeqCst, SeqCst).is_ok() {
+                            break;
+                        }
+                        state.store(1, SeqCst);
+                        asked = std::time::Instant::now();
+                    }
+                }),
+                place,
+            );
+        },
+        move |started, failed| own_counters.record("writer_checkpoint", started, started, failed),
+    )
+}
 
 /// The store's main file readable and writable by its owner alone, made so
 /// when it is new, before SQLite first opens it: SQLite gives the `-wal`
@@ -351,6 +421,8 @@ where
 #[derive(Default)]
 pub struct Counters {
     inner: std::sync::Mutex<Inner>,
+    /// What the WAL's checkpoints found.
+    log: std::sync::Arc<db::LogState>,
 }
 #[derive(Default, Clone)]
 struct Inner {
@@ -694,7 +766,7 @@ impl Store {
         path: &Path,
         readers: usize,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE, None, None).await
+        Self::open_pooled(path, readers, READER_IDLE, Durability::Full, None, None).await
     }
     /// `open_with`, waiting up to `wait` for the process that owns the
     /// store to let it go rather than refusing at once: a daemon started
@@ -706,23 +778,34 @@ impl Store {
         readers: usize,
         wait: std::time::Duration,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE, Some(wait), None).await
+        Self::open_pooled(
+            path,
+            readers,
+            READER_IDLE,
+            Durability::Full,
+            Some(wait),
+            None,
+        )
+        .await
     }
     /// `open_with`, or `open_awaiting` with a `wait`, telling `owned` the
     /// moment the store is this process's, before its own opening (an
     /// upgrade perhaps) begins: a daemon answers on its socket from then.
+    /// Commits sync as `durability` asks.
     pub async fn open_owning(
         path: &Path,
         readers: usize,
+        durability: Durability,
         wait: Option<std::time::Duration>,
         owned: oneshot::Sender<()>,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE, wait, Some(owned)).await
+        Self::open_pooled(path, readers, READER_IDLE, durability, wait, Some(owned)).await
     }
     async fn open_pooled(
         path: &Path,
         readers: usize,
         idle: std::time::Duration,
+        durability: Durability,
         wait: Option<std::time::Duration>,
         owned: Option<oneshot::Sender<()>>,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
@@ -735,9 +818,14 @@ impl Store {
         // Said once the owner lock is held, so a wait for it is bounded
         // here while the store's own opening, a migration perhaps, is not.
         let (locked, held) = oneshot::channel::<()>();
+        // The reader pool, once open, where the writer's checkpoints go.
+        let checkpoint_pool =
+            std::sync::Arc::<std::sync::OnceLock<std::sync::Arc<Pool>>>::default();
+        let worker_pool = checkpoint_pool.clone();
         std::thread::Builder::new()
             .name("agent-storage".into())
             .spawn(move || {
+                #[allow(clippy::type_complexity)]
                 let opened: Result<(Database, File, std::path::PathBuf)> = (|| {
                     if let Some(parent) = path.parent() {
                         // A folder made here is the daemon's user's alone;
@@ -806,7 +894,9 @@ impl Store {
                         Err(error) => return Err(error.into()),
                     }
                     owner_only(&path)?;
-                    let db = Database::initialize(Connection::open(&path)?)?;
+                    let mut db = Database::initialize(Connection::open(&path)?)?;
+                    db.durability(durability)?;
+                    checkpoints(&mut db, worker_pool, worker_counters.clone())?;
                     Ok((db, lock, path))
                 })();
                 match opened {
@@ -908,6 +998,8 @@ impl Store {
                                 publisher.blocking_send(publication).is_ok()
                             });
                         }
+                        // Closed before the owner lock is let go.
+                        drop(db);
                     }
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -974,6 +1066,8 @@ impl Store {
         opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
+        // From here the writer's checkpoints go to the readers.
+        let _ = checkpoint_pool.set(pool.clone());
         let reader = std::sync::Arc::new(ReadQueue(pool));
         Ok((
             Self {
@@ -1007,6 +1101,7 @@ impl Store {
             "cache_kib": readers.cache_kib,
         });
         drop(readers);
+        stats["checkpoints"] = self.counters.log.json();
         stats["bytes"] = size("").into();
         stats["wal_bytes"] = size("-wal").into();
         stats
@@ -1822,13 +1917,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_sync_as_the_durability_asks_full_by_default() {
+        let store = scratch_store("durability-full").await;
+        let synchronous = store.call(|db| Ok(db.pragma("synchronous"))).await.unwrap();
+        assert_eq!(synchronous, 2);
+        for (durability, expected) in [(Durability::Full, 2), (Durability::Normal, 1)] {
+            let path = scratch_path(&format!("durability-{durability:?}"));
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            let (owned, _owning) = oneshot::channel();
+            let (store, _publications) = Store::open_owning(&path, 1, durability, None, owned)
+                .await
+                .unwrap();
+            let synchronous = store.call(|db| Ok(db.pragma("synchronous"))).await.unwrap();
+            assert_eq!(synchronous, expected, "{durability:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_log_is_checkpointed_beside_the_writer_and_starts_over() {
+        let store = scratch_store("checkpoint").await;
+        store
+            .call(|db| Ok(db.connection().execute_batch("CREATE TABLE b(x BLOB)")?))
+            .await
+            .unwrap();
+        // About 1,100 pages of WAL in one commit, which asks for a
+        // checkpoint with nothing appended after it.
+        (store.call(|db| {
+            db.connection().execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1100)
+                INSERT INTO b SELECT randomblob(4000) FROM n",
+            )?;
+            Ok(())
+        }))
+        .await
+        .unwrap();
+        let checkpoints = || store.stats()["operations"]["checkpoint"]["count"].as_u64();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while checkpoints().is_none_or(|n| n == 0) {
+            assert!(std::time::Instant::now() < deadline, "no checkpoint ran");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // All of the log is copied back, so the next commit starts it over
+        // and the log holds that commit alone.
+        (store.call(|db| Ok(db.connection().execute("INSERT INTO t VALUES (1)", [])?)))
+            .await
+            .unwrap();
+        // Its frames in the log, which a checkpoint names first.
+        let log: i64 = Connection::open(scratch_path("checkpoint"))
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
+            .unwrap();
+        assert!(log < 10, "the WAL went on from {log} frames");
+    }
+
+    #[tokio::test]
+    async fn a_log_a_reader_pins_is_checkpointed_ever_less_often_until_it_lets_go() {
+        let store = scratch_store("pinned-log").await;
+        store
+            .call(|db| Ok(db.connection().execute_batch("CREATE TABLE b(x BLOB)")?))
+            .await
+            .unwrap();
+        // The log starts empty, whatever the schema wrote to it, so the
+        // pages below are all it holds.
+        Connection::open(scratch_path("pinned-log"))
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        // A reader in a transaction from the start keeps every frame after
+        // its snapshot in the log: no checkpoint copies them back.
+        let reader = Connection::open(scratch_path("pinned-log")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM b;")
+            .unwrap();
+        let pages = |commits: usize| {
+            let store = store.clone();
+            async move {
+                for _ in 0..commits {
+                    (store.call(|db| {
+                        db.connection().execute_batch(
+                            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10)
+                            INSERT INTO b SELECT randomblob(4000) FROM n",
+                        )?;
+                        Ok(())
+                    }))
+                    .await
+                    .unwrap();
+                }
+            }
+        };
+        let count = |op: &str| {
+            store.stats()["operations"][op]["count"]
+                .as_u64()
+                .unwrap_or(0)
+        };
+        let settle = || async {
+            let mut seen = count("checkpoint");
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                if count("checkpoint") == seen {
+                    break;
+                }
+                seen = count("checkpoint");
+            }
+        };
+        // About 8,900 pages, in commits of 11. Asks at about 1,000, 2,000
+        // and 3,000 pages; the second copies nothing new, so the next waits
+        // for 2,000 more, then 4,000. The writer tries itself at 4,000,
+        // finds the log pinned, and tries again at 6,000, then 10,000, not
+        // every 1,000.
+        pages(800).await;
+        settle().await;
+        assert_eq!(count("writer_checkpoint"), 2);
+        assert!(
+            count("checkpoint") <= 5,
+            "{} checkpoints",
+            count("checkpoint")
+        );
+        let found = &store.stats()["checkpoints"];
+        let (log, copied) = (
+            found["log_frames"].as_i64().unwrap(),
+            found["copied_frames"].as_i64().unwrap(),
+        );
+        assert!(log > 8000 && copied < 200, "{found}");
+        assert!(found["pinned"].as_u64().unwrap() >= 3, "{found}");
+        // Once the reader lets go, the writer's next try copies it all
+        // back, and the log starts over.
+        reader.execute_batch("COMMIT").unwrap();
+        pages(150).await;
+        settle().await;
+        let frames: i64 = Connection::open(scratch_path("pinned-log"))
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
+            .unwrap();
+        // Some 1,650 pages came after the reader let go, on top of the
+        // 8,900 it held.
+        assert!(frames < 2000, "the WAL went on from {frames} frames");
+    }
+
+    #[tokio::test]
     async fn readers_open_while_reads_wait_and_close_once_idle() {
         let path = scratch_path("readers");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let idle = std::time::Duration::from_millis(500);
-        let (store, _publications) = Store::open_pooled(&path, 4, idle, None, None)
-            .await
-            .unwrap();
+        let (store, _publications) =
+            Store::open_pooled(&path, 4, idle, Durability::Full, None, None)
+                .await
+                .unwrap();
         let open = |store: &Store| store.stats()["readers"]["open"].as_u64().unwrap();
         // A quiet store holds one reader, with the whole cache budget.
         assert_eq!(open(&store), 1);
@@ -1904,9 +2138,10 @@ mod tests {
         let path = scratch_path("reader-shares");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let idle = std::time::Duration::from_millis(500);
-        let (store, _publications) = Store::open_pooled(&path, 4, idle, None, None)
-            .await
-            .unwrap();
+        let (store, _publications) =
+            Store::open_pooled(&path, 4, idle, Durability::Full, None, None)
+                .await
+                .unwrap();
         let held = |store: &Store| store.stats()["readers"]["cache_kib"].as_u64().unwrap();
         let budget = READER_CACHE_KIB as u64;
         store.read("warm", |_| Ok(())).await.unwrap();

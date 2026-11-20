@@ -437,6 +437,11 @@ fn parse(args: &[String]) -> Result<Options> {
                         crate::cli::duration_secs(flag, &value)?;
                         options.daemon_flags.push((flag.to_owned(), value));
                     }
+                    "--durability" => {
+                        agent_runtime::store::Durability::parse(&value)
+                            .ok_or(Error::with("usage", "--durability needs full or normal"))?;
+                        options.daemon_flags.push((flag.to_owned(), value));
+                    }
                     "--context-bytes"
                     | "--context-items"
                     | "--note-turns"
@@ -864,6 +869,16 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
         }
     }
     for (flag, value) in &options.daemon_flags {
+        if flag == "--durability" {
+            let requested = agent_runtime::store::Durability::parse(value).map(|d| d.label());
+            if ready["durability"].as_str() != requested {
+                let running = ready["durability"].as_str().unwrap_or("none");
+                differences.push(format!(
+                    "{flag}: requested {value} but daemon has {running}"
+                ));
+            }
+            continue;
+        }
         let key = match flag.as_str() {
             "--max-processes" => "processes",
             "--max-lasting" => "lasting",

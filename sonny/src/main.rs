@@ -1327,11 +1327,12 @@ fn project_mark(
             provider,
             workspace,
             profile,
+            closed,
         } = agent;
         (name, bot_id, head, running_turn, status).hash(&mut mark);
         waiting_on.to_string().hash(&mut mark);
         (last, started_ms, expire_ms, created_by, created_by_id).hash(&mut mark);
-        (model, provider, workspace, profile).hash(&mut mark);
+        (model, provider, workspace, profile, closed).hash(&mut mark);
     }
     asking.hash(&mut mark);
     marks.hash(&mut mark);
@@ -2065,6 +2066,45 @@ fn kept_by(listed: &[standing::Agent], bot: &str, project: &str) -> String {
         }
     }
     format!("{project}.lead")
+}
+
+/// Read `lead`'s agents' histories in one window of the store at a time,
+/// as windows that open together would each read every one: the lock to
+/// hold while this window reads them and keeps what it read, or none once
+/// the window that held it let go, what it kept to be taken. None too
+/// where the lock cannot be had, and the window reads them itself, and
+/// for a window with no store, which has none to share them beside.
+async fn first_reads(kept: &std::path::Path, lead: &str) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if kept.as_os_str().is_empty() {
+        return None;
+    }
+    let dir = reads_dir(kept);
+    let path = dir.join(format!("{lead}.lock"));
+    crate::scheduler::apart(move || {
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .ok()?;
+        // SAFETY: flock on a descriptor `file` owns and keeps open; closing
+        // it lets go, as the process ending does.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+        // Shared: every window waiting goes on at once when it is let go.
+        // SAFETY: as above.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+        None
+    })
+    .await
 }
 
 /// Keep what a window read for the next one, in `lead`'s file: in place
@@ -6707,8 +6747,9 @@ struct App {
     /// runs, so there is one copy.
     listed: Option<Vec<standing::Agent>>,
     /// The lead a task's window lists the agents of, with the agent it was
-    /// found for, as the last count's listing said: kept while a count
-    /// holds the listing, so a read beside it lists for the same lead.
+    /// found for, as the last count's listing said: found once a count,
+    /// not each time a frame asks, and kept while a count holds the
+    /// listing, so a read beside it lists for the same lead.
     listed_lead: Option<(String, String)>,
     rows_mark: Option<u64>,
     folded: Option<(bool, u64)>,
@@ -12998,11 +13039,16 @@ impl App {
                 agents: None,
                 kept: None,
             };
+            // The first count reads as one window of the store at a time,
+            // the others waiting to take what it kept.
+            let mut first = None;
             if take {
                 let kept =
                     agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
                 let lead = kept_by(&listed, &bot, &scope.project);
+                let held = first_reads(&kept, &lead).await;
                 take_reads(&kept, &lead, client.identity(), &mut latest, &mut seen);
+                first = held.map(|held| (held, kept, lead));
             }
             let (mut listed, mut kept_mark) = (listed, kept_mark);
             if !moved.is_empty() {
@@ -13083,6 +13129,9 @@ impl App {
             else {
                 return Some(unread(listed, (latest, seen)));
             };
+            if let Some((_held, kept, lead)) = first.filter(|_| read.fresh) {
+                keep_for(&kept, &lead, &bot, client.identity(), &latest, &seen);
+            }
             woken.notify_one();
             let whole = read.whole && read.listed;
             let mut built = read.rows;
@@ -15884,9 +15933,9 @@ impl App {
             Some(project) => (project.clone(), self.bot.clone()),
             None => (
                 self.bot.split('.').next().unwrap_or(&self.bot).to_owned(),
-                match (&self.listed, &self.listed_lead) {
-                    (None, Some((bot, lead))) if *bot == self.bot => lead.clone(),
-                    (listed, _) => task_lead(&self.bot, listed.as_deref()),
+                match (&self.listed_lead, &self.listed) {
+                    (Some((bot, lead)), _) if *bot == self.bot => lead.clone(),
+                    (_, listed) => task_lead(&self.bot, listed.as_deref()),
                 },
             ),
         };
@@ -15983,6 +16032,7 @@ impl App {
                     let kept = agent_client::socket::canonical_store(&store)
                         .unwrap_or_else(|_| store.clone());
                     let (mut latest, mut seen) = (HashMap::new(), HashMap::new());
+                    let _held = first_reads(&kept, &lead).await;
                     take_reads(&kept, &lead, client.identity(), &mut latest, &mut seen);
                     let view = StatusView {
                         bot: "",
@@ -26546,38 +26596,56 @@ mod tests {
         }
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
-        let client = daemon_answering(move |ask| {
-            seen.lock().unwrap().push(ask.clone());
-            json!({"bot": ask["bot"], "changed": ["profile"]})
-        })
-        .await;
         // One that has a profile of its own keeps it; one gone has none
         // to take.
         let bots = [
             json!({"name": "shop.fix", "bot_id": 2}),
             json!({"name": "shop.kept", "bot_id": 3, "profile": "lead"}),
         ];
+        let client = daemon_answering(move |ask| {
+            seen.lock().unwrap().push(ask.clone());
+            match ask["op"].as_str() {
+                Some("bots") => {
+                    let named = (bots.iter())
+                        .filter(|bot| (ask["names"].as_array().unwrap()).contains(&bot["name"]));
+                    json!({"bots": named.collect::<Vec<_>>(), "next_after": null})
+                }
+                _ => json!({"bot": ask["bot"], "changed": ["profile"]}),
+            }
+        })
+        .await;
         // A note that cannot be read leaves every note where it is, for
         // the next start.
         std::fs::create_dir(notes.join("shop.unread")).unwrap();
-        assert!(!task::profiles_onto_agents(&client, &bots, &store).await);
+        assert!(!task::profiles_onto_agents(&client, &store).await);
         assert!(notes.join("shop.fix").exists());
         assert!(asked.lock().unwrap().is_empty());
         std::fs::remove_dir(notes.join("shop.unread")).unwrap();
-        assert!(task::profiles_onto_agents(&client, &bots, &store).await);
-        let asked: Vec<Value> = (asked.lock().unwrap().iter())
+        assert!(task::profiles_onto_agents(&client, &store).await);
+        let said: Vec<Value> = (asked.lock().unwrap().iter())
             .map(|ask| {
-                json!({"op": ask["op"], "bot": ask["bot"], "bot_id": ask["bot_id"],
-                "profile": ask["profile"]})
+                let mut names: Vec<&str> = (ask["names"].as_array().into_iter().flatten())
+                    .filter_map(Value::as_str)
+                    .collect();
+                names.sort_unstable();
+                json!({"op": ask["op"], "names": names, "bot": ask["bot"],
+                "bot_id": ask["bot_id"], "profile": ask["profile"]})
             })
             .collect();
+        // Only the agents noted are read, by name.
         assert_eq!(
-            asked,
-            [json!({"op": "configure", "bot": "shop.fix", "bot_id": 2, "profile": "reviewer"})]
+            said,
+            [
+                json!({"op": "bots", "names": ["shop.fix", "shop.gone", "shop.kept"],
+                    "bot": null, "bot_id": null, "profile": null}),
+                json!({"op": "configure", "names": [], "bot": "shop.fix", "bot_id": 2,
+                    "profile": "reviewer"})
+            ]
         );
         assert!(!notes.exists());
-        // Nothing left: done again at once.
-        assert!(task::profiles_onto_agents(&client, &bots, &store).await);
+        // Nothing left: done again at once, with nothing read.
+        assert!(task::profiles_onto_agents(&client, &store).await);
+        assert_eq!(asked.lock().unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -26609,6 +26677,11 @@ mod tests {
         assert!(!notes.exists());
         // Done once: no listing again.
         upgrade::profiles_on_agents(&client, &store).await;
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        // A store with no notes is done with nothing read.
+        let other = dir.join("other.sqlite");
+        upgrade::profiles_on_agents(&client, &other).await;
+        upgrade::profiles_on_agents(&client, &other).await;
         assert_eq!(asked.lock().unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -27016,6 +27089,43 @@ mod tests {
         open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 12);
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn windows_opening_together_read_a_leads_agents_one_at_a_time() {
+        let home = std::env::temp_dir().join(format!("first-reads-{}", std::process::id()));
+        let store = home.join("state.sqlite");
+        let held = first_reads(&store, "shop.lead")
+            .await
+            .expect("the first reads");
+        // Another waits for it to let go, then takes what it kept.
+        let waiting = tokio::spawn({
+            let store = store.clone();
+            async move { first_reads(&store, "shop.lead").await.is_none() }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        // Another lead's agents are read beside it.
+        assert!(first_reads(&store, "docs.lead").await.is_some());
+        drop(held);
+        assert!(waiting.await.unwrap());
+        // A window opened later reads what moved since, keeping it.
+        assert!(first_reads(&store, "shop.lead").await.is_some());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(reads_dir(&store))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir_all(home).unwrap();
+        // A window with no store reads for itself and leaves nothing in
+        // the folder it runs in.
+        assert!(
+            first_reads(std::path::Path::new(""), "shop.lead")
+                .await
+                .is_none()
+        );
+        assert!(!std::path::Path::new(".status-reads").exists());
     }
 
     #[test]

@@ -19,6 +19,7 @@
 //! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
 //! stall_timeout = "10m"         # a provider stream with no content this long is retried, the default
 //! depth = 3                     # generations a new agent may be below the one that starts its line, 2 by default; 0 no end
+//! durability = "normal"         # commits sync at checkpoints, faster on a busy disk; a machine crash can lose the last ones; "full", the default, syncs each
 //!
 //! [fallbacks]                   # the model a declined request goes to, for every agent that names none; restart the daemon to apply
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"  # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
@@ -328,6 +329,11 @@ pub fn machine() -> (f64, f64) {
 pub const DAEMON_DURATIONS: [(&str, &str, u64, u64); 1] =
     [("stall_timeout", "--stall-timeout", 1000, 86_400_000)];
 
+/// The `[daemon]` keys that name one of a few words, as the `agent serve`
+/// flag each sets takes them: none given is the daemon's own default.
+pub const DAEMON_CHOICES: [(&str, &str, &[&str]); 1] =
+    [("durability", "--durability", &["full", "normal"])];
+
 /// A `[daemon]` value worked out: a number, or `cpus` and `memory` (bytes)
 /// with numbers, `KiB` `MiB` `GiB`, `+ - * /`, parentheses, and
 /// `min(a, b)` and `max(a, b)`, as `"cpus * 64"` or `"max(memory / 16,
@@ -516,6 +522,11 @@ pub fn daemon_flags(daemon: &BTreeMap<String, String>) -> Result<Vec<(String, St
     let (cpus, memory) = machine();
     let mut flags = Vec::new();
     for (key, flag, ..) in DAEMON_DURATIONS {
+        if let Some(text) = daemon.get(key) {
+            flags.push((flag.to_owned(), text.clone()));
+        }
+    }
+    for (key, flag, _) in DAEMON_CHOICES {
         if let Some(text) = daemon.get(key) {
             flags.push((flag.to_owned(), text.clone()));
         }
@@ -1747,6 +1758,21 @@ fn parse(text: &str) -> Result<Config, String> {
                     config.daemon.insert(key.clone(), text.to_owned());
                     continue;
                 }
+                if let Some((_, _, words)) = DAEMON_CHOICES.iter().find(|(known, ..)| known == key)
+                {
+                    match value.as_str() {
+                        Some(word) if words.contains(&word) => {
+                            config.daemon.insert(key.clone(), word.to_owned());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "daemon.{key} is one of \"{}\"",
+                                words.join("\", \"")
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 if !DAEMON_LIMITS.iter().any(|(known, ..)| known == key) {
                     return Err(format!("unknown key daemon.{key}"));
                 }
@@ -2826,6 +2852,14 @@ mod tests {
                 ("--max-load".to_owned(), (cpus * 2).to_string()),
                 ("--max-depth".to_owned(), "2".to_owned())
             ]
+        );
+        // Durability is a word, passed as given.
+        let normal = parse("[daemon]\ndurability = \"normal\"\n").unwrap();
+        let flags = daemon_flags(&normal.daemon).unwrap();
+        assert!(flags.contains(&("--durability".into(), "normal".into())));
+        assert_eq!(
+            parse("[daemon]\ndurability = \"off\"\n").unwrap_err(),
+            "daemon.durability is one of \"full\", \"normal\""
         );
         let deep = parse("[daemon]\ndepth = 0\n").unwrap();
         let flags = daemon_flags(&deep.daemon).unwrap();

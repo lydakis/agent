@@ -26,6 +26,9 @@ is:
         --layout spread --seed .local/ends-10k.sqlite --out high.json
 `--seed` keeps the stored agents from a first run (created by the daemon
 being measured when the file is missing) and copies it for each run.
+`--shim` (bench/held/slow_sync.c, built as bench.held_reads says) measures
+either end on a busy disk: every sync takes `--sync-ms` once the agents
+are made.
 """
 import argparse
 import fcntl
@@ -335,6 +338,11 @@ def main():
                         help='seconds each busy turn and each script take at least, so both sides do the same work')
     parser.add_argument('--turns', type=int, default=30)
     parser.add_argument('--seed', help='a store of the stored agents to copy, made when missing')
+    parser.add_argument('--shim', help='bench/held/slow_sync.c built: once its agents are made, '
+                        'the daemon runs again with every sync taking --sync-ms, as on a busy disk')
+    parser.add_argument('--sync-ms', type=int, default=300)
+    parser.add_argument('--durability', choices=('full', 'normal'),
+                        help="the daemon's --durability; its own default when not given")
     parser.add_argument('--dotted', action='store_true',
                         help="name each agent as its folder's project's, PROJECT.NAME, as Sonny names them")
     args = parser.parse_args()
@@ -367,11 +375,15 @@ def main():
                 if Path(args.seed + suffix).exists():
                     shutil.copy(args.seed + suffix, str(store) + suffix)
 
-        def serve():
+        def serve(slow=False):
+            held = ({'LD_PRELOAD': str(Path(args.shim).resolve()), 'SLOW_SYNC_MS': str(args.sync_ms)}
+                    if slow else {})
             process = subprocess.Popen(
                 [agent, 'serve', '--store', str(store), '--provider', f'openai=responses,{url}',
-                 '--socket', str(sock)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=open(work / 'daemon.err', 'a'), env=env, start_new_session=True)
+                 '--socket', str(sock),
+                 *(['--durability', args.durability] if args.durability else [])],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=open(work / 'daemon.err', 'a'), env={**env, **held}, start_new_session=True)
             return process, connect(sock, process)
 
         daemon, control = serve()
@@ -408,6 +420,12 @@ def main():
                 daemon, control = serve()
         made = time.monotonic() - made
         result = {'end': args.end, 'agent': agent, 'stored': len(names), 'created_s': round(made, 1)}
+        if args.shim:
+            # Made on a fast disk; measured on a slow one.
+            control.request('shutdown', grace_ms=0)
+            daemon.wait(60)
+            daemon, control = serve(slow=True)
+            result['sync_ms'] = args.sync_ms
 
         def window(n, name, folder):
             return windows.open(n, [sonny, '--store', str(store), '--socket', str(sock), '--agent', name,
