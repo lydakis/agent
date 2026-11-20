@@ -348,6 +348,15 @@ pub const SETTINGS: &[Setting] = &[
         default: "true",
     },
     Setting {
+        key: "sonny.boards",
+        group: "Commons and sky",
+        name: "boards",
+        label: "whether agents have boards; read when Sonny starts",
+        about: "whether agents have boards, work in the commons they take: the board tool, its skill, and start_task's board and agents; only with the commons; read when Sonny starts",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
         key: "sonny.commons_invites",
         group: "Commons and sky",
         name: "commons invites",
@@ -1396,7 +1405,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 37);
+        assert_eq!(listed().len(), 38);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",

@@ -1481,6 +1481,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    #[test]
+    fn with_boards_off_the_list_is_as_it_was_before_boards() {
+        let home = &commons("off");
+        let mut view = View::open(home, "shop".into()).without_boards();
+        let lines = card(&mut view, 80);
+        // No Boards section and no Threads heading: every thread a thread,
+        // an item's thread too, by its title alone.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("Boards") || l.starts_with("Threads")),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("shop/typed-errors")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim() == "Add typed errors to the api"),
+            "{lines:#?}"
+        );
+        assert!(!view.keys().contains("m "), "{}", view.keys());
+        // An item's thread opens as a thread, with no row for where it
+        // stands.
+        while !picked(&mut view, 80).contains("Add typed errors to the api") {
+            press(&mut view, KeyCode::Down);
+        }
+        press(&mut view, KeyCode::Enter);
+        let lines = card(&mut view, 80);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("item on ")),
+            "{lines:#?}"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     /// What 50 boards of 20 items each, 1,000 items, cost `/commons`: to
     /// open, to draw, to draw again, to read again with nothing changed
     /// and with one thread changed, a board's page, and the list with `m`.

@@ -164,7 +164,10 @@ pub fn tools(role: Role) -> Vec<Value> {
     tools.extend([follows(), show(), automations(), memory()]);
     tools.extend(crate::workflow::tool());
     if crate::commons::on() {
-        tools.extend([commons(), board()]);
+        tools.push(commons());
+    }
+    if crate::board::on() {
+        tools.push(board());
     }
     tools.extend(crate::exec::tool(role.escalates));
     tools.extend(crate::browser::tool());
@@ -173,7 +176,7 @@ pub fn tools(role: Role) -> Vec<Value> {
 }
 
 fn start() -> Value {
-    json!({
+    let mut start = json!({
         "name": START,
         "description": "Start a new task. A lead starts tasks for the person's work; another agent only for \
             help inside its own brief (a review, research, a watch), asking its lead for separate work. Unless \
@@ -212,10 +215,6 @@ fn start() -> Value {
                         without one, the project's task_model, else yours.{}", noted_models())},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
-                "agents": {"type": ["integer", "array"], "minimum": 1, "items": {"type": "string"},
-                    "description": "For several agents: a count, or a profile each. They are NAME.1 on."},
-                "board": {"type": "string", "minLength": 1,
-                    "description": "A board of this project whose items its agents take."},
                 "reason": {"type": "string", "minLength": 1,
                     "description": "Why none of your tasks still there should take this work, since a task \
                         given more keeps what it learned; without it, a start while you have tasks is refused, listing them."}
@@ -226,7 +225,16 @@ fn start() -> Value {
         "answered_by": TAG,
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
-    })
+    });
+    // Boards on, a start may make several agents and give them a board.
+    if crate::board::on() {
+        start["parameters"]["properties"]["agents"] = json!({
+            "type": ["integer", "array"], "minimum": 1, "items": {"type": "string"},
+            "description": "For several agents: a count, or a profile each. They are NAME.1 on."});
+        start["parameters"]["properties"]["board"] = json!({"type": "string", "minLength": 1,
+            "description": "A board of this project whose items its agents take."});
+    }
+    start
 }
 
 /// The profiles a start's agents are made as, one an agent: `agents` as
@@ -796,14 +804,13 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .map_err(|e| ("invalid_arguments", e))?;
             // A board its agents take items from: their own project's.
             let board = text("board");
+            if !crate::board::on() && (board.is_some() || !arguments["agents"].is_null()) {
+                return Err((
+                    "invalid_arguments",
+                    "boards are off: start one agent, without board or agents".to_owned(),
+                ));
+            }
             if let Some(board) = &board {
-                if !crate::commons::on() {
-                    return Err((
-                        "invalid_arguments",
-                        "the commons is off, and its boards with it: start without board"
-                            .to_owned(),
-                    ));
-                }
                 crate::board::valid_board(board).map_err(|e| ("invalid_arguments", e))?;
                 if crate::board::project_of(board) != line.project {
                     return Err((
@@ -1105,8 +1112,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             Ok(said.to_string())
         }
         BOARD => {
-            if !crate::commons::on() {
-                return Err(("board_refused", "the commons is off".to_owned()));
+            if !crate::board::on() {
+                return Err(("board_refused", "boards are off".to_owned()));
             }
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)

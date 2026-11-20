@@ -31,6 +31,16 @@ pub const CHANGING: [&str; 6] = ["for", "labels", "needs", "holder", "holder_id"
 /// Names a label never takes: what Sonny writes of an item.
 pub const PROTECTED: [&str; 7] = ["state", "holder", "board", "by", "project", "at", "do"];
 
+/// Whether agents have boards: `[sonny] boards`, on by default, and only
+/// with the commons, where their items live. Read once, as the commons'
+/// switch is.
+pub fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        commons::on() && agent_client::config::load().map_or(true, |config| config.sonny.boards)
+    })
+}
+
 /// The project a board is the work of: its first segment.
 pub fn project_of(board: &str) -> &str {
     board.split('/').next().unwrap_or(board)

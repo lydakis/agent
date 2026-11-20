@@ -359,8 +359,14 @@ pub fn task_of(bot: &str) -> Option<(&str, u64)> {
 fn several<'a>(
     listed: &[&'a Row],
     helping: &std::collections::HashSet<&str>,
+    boards: bool,
 ) -> HashMap<&'a str, Vec<&'a Row>> {
     let mut tasks: HashMap<&str, Vec<(u64, &Row)>> = HashMap::new();
+    // With boards off (`crate::board::on`) a task has one agent, and each
+    // agent is its own row, as before.
+    if !boards {
+        return HashMap::new();
+    }
     for row in listed {
         if row.name == "lead" || row.run.is_some() || helping.contains(row.bot.as_str()) {
             continue;
@@ -544,7 +550,7 @@ pub fn card_after(
     } = listing(rows);
     // A task with several agents is one row, in the group of its most
     // pressing agent, its agents under it wherever they stand.
-    let tasks = several(&listed, &helping);
+    let tasks = several(&listed, &helping, crate::board::on());
     let mut leads: HashMap<&str, &str> = HashMap::new();
     let mut members = std::collections::HashSet::new();
     for (task, agents) in &tasks {
@@ -859,7 +865,7 @@ pub fn agents<R: std::borrow::Borrow<Row>>(project: &str, rows: &[R]) -> Agents 
     };
     // A task with several agents is one row, its most pressing agent's,
     // with those of its agents the list shows under it.
-    let several = several(&listed, &helping);
+    let several = several(&listed, &helping, crate::board::on());
     let mut leads: HashMap<&str, (&str, &Vec<&Row>)> = HashMap::new();
     let mut members = std::collections::HashSet::new();
     for (task, agents) in &several {
@@ -2614,6 +2620,15 @@ mod tests {
         assert_eq!(task_of("calc.errors.3"), Some(("calc.errors", 3)));
         assert_eq!(task_of("calc.errors"), None);
         assert_eq!(task_of("calc.v2"), None);
+    }
+
+    #[test]
+    fn with_boards_off_a_task_s_agents_are_each_their_own_row() {
+        let rows = four_agents();
+        let listed: Vec<&Row> = rows.iter().collect();
+        let helping = std::collections::HashSet::new();
+        assert_eq!(several(&listed, &helping, true).len(), 1);
+        assert!(several(&listed, &helping, false).is_empty());
     }
 
     #[test]

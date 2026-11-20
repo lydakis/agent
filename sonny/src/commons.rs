@@ -2059,6 +2059,9 @@ pub struct View {
     /// among them is closed.
     present: crate::board_view::Present,
     notice: Option<String>,
+    /// Whether boards are on (`crate::board::on`): off, the list is as it
+    /// was before boards, an item's thread a thread like any.
+    boards_on: bool,
 }
 
 /// A row the pick lands on, by what it is.
@@ -2158,6 +2161,7 @@ impl View {
             golden: 0,
             present: crate::board_view::Present::default(),
             notice: None,
+            boards_on: crate::board::on(),
         };
         view.reload();
         view
@@ -2186,8 +2190,9 @@ impl View {
             Err(error) => self.notice = Some(error),
         }
         // Each item as its listing line says, its last post's time from
-        // what the listing kept of it.
+        // what the listing kept of it; none with boards off.
         self.items = (self.threads.iter())
+            .filter(|_| self.boards_on)
             .filter_map(|thread| {
                 let name = thread["thread"].as_str()?;
                 let at =
@@ -2485,6 +2490,14 @@ impl View {
     #[cfg(test)]
     pub fn press(&mut self, key: KeyEvent) -> Key {
         self.key(key, 0..usize::MAX)
+    }
+
+    /// The view as `[sonny] boards = false` has it, as a test reads it.
+    #[cfg(test)]
+    pub fn without_boards(mut self) -> Self {
+        self.boards_on = false;
+        self.reload();
+        self
     }
 
     fn is_finding(&self) -> bool {

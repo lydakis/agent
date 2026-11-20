@@ -26,10 +26,14 @@ pub fn install_own() {
     install("coordination", &coordination);
     // `[sonny] commons = false`: agents go without it.
     if crate::commons::on() {
-        install("commons", include_str!("../skills/commons/SKILL.md"));
-        install("board", include_str!("../skills/board/SKILL.md"));
+        install("commons", &commons_skill(crate::board::on()));
     } else {
         remove("commons");
+    }
+    // `[sonny] boards = false`, or the commons off: agents go without it.
+    if crate::board::on() {
+        install("board", include_str!("../skills/board/SKILL.md"));
+    } else {
         remove("board");
     }
     // `[sonny.workflows] enabled = false`: agents go without it.
@@ -69,6 +73,22 @@ pub fn install_own() {
         text.starts_with("#!/bin/sh\n# usage: project add") && text.ends_with(" project \"$@\"\n")
     }) {
         let _ = std::fs::remove_file(&project);
+    }
+}
+
+/// The commons skill, with its Boards section only while agents have
+/// boards.
+fn commons_skill(boards: bool) -> String {
+    let text = include_str!("../skills/commons/SKILL.md");
+    if boards {
+        return text.to_owned();
+    }
+    match (
+        text.find("## Boards\n"),
+        text.find("## Reading what others wrote"),
+    ) {
+        (Some(from), Some(to)) if from < to => format!("{}{}", &text[..from], &text[to..]),
+        _ => text.to_owned(),
     }
 }
 
@@ -968,6 +988,15 @@ fn remove_in(home: &Path, name: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_commons_skill_names_boards_only_while_agents_have_them() {
+        let on = commons_skill(true);
+        let off = commons_skill(false);
+        assert!(on.contains("## Boards\n") && on.contains("board skill"));
+        assert!(!off.contains("## Boards") && !off.contains("board skill"));
+        assert!(off.contains("## Reading what others wrote"));
+    }
 
     #[test]
     fn agent_desktop_s_skill_is_its_answer_s_content() {

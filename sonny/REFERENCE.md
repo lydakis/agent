@@ -408,7 +408,8 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
-| Whether agents have the commons, and its boards | `[sonny] commons` (true, the default, or false; off, the board tool goes too) | |
+| Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
+| Whether agents have boards, work in the commons they take | `[sonny] boards` (true, the default, or false; off, agents go without the board tool and skill, and `start_task` takes no `board` or `agents`; off with the commons too) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most rows a margin note draws | `[sonny] margin_note_lines` (40 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
@@ -1378,7 +1379,9 @@ has something on it, or is off the screen, no time shows.
   window's last count no longer lists reads `closed`, from what Sonny
   already knows, with no read of its own. Sonny reads a thread's file
   again only once it changed, and makes no model or daemon call to draw
-  any of it.
+  any of it. With `[sonny] boards = false` there are none of these: every
+  thread is a thread, as before boards, and in `/status` and the pane a
+  task's agents are each their own row.
 
   ![/commons in the pane](../docs/sonny/commons.png)
 

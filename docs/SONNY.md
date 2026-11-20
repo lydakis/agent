@@ -964,6 +964,12 @@ to write and work an item, and how a lead splits work across a task's
 agents. The tool's own description only names its keys (George, 11-20:
 ship a skill rather than overload the tool's description).
 
+Boards are behind `[sonny] boards`, on by default and off whenever the
+commons is (George, 11-20). Off, agents get none of it: no board tool, no
+board skill, no Boards section in the commons skill, and `start_task`
+without `board` or `agents`, which it refuses if sent. `crate::board::on()`
+is the one switch every part reads, Sonny's views included.
+
 `/commons` draws boards from the same summaries, with no model call and no
 daemon call (Sonny Rulebook v54, Commons): a **Boards** section over
 Threads, a row a board, this window's project's first, then by name;
@@ -974,7 +980,9 @@ where it stands and a muted row per action. `ctrl+f` finds in the list and
 on a board's page. A holder is `closed` when the window's last count of
 agents no longer lists it. In `/status` and the pane's list of agents a
 task with several agents is one row, its agents under it (**StatusView**,
-**Pane**); boards add nothing to either.
+**Pane**); boards add nothing to either. With boards off, `/commons` is
+as it was before boards (every thread a thread, no Boards section, no `m`)
+and a task's agents are each their own row.
 
 ![/commons with boards, at 150, 120, 60 and 44 columns](sonny/commons-boards.png)
 
