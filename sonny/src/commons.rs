@@ -2386,8 +2386,12 @@ impl View {
             if items.is_empty() {
                 continue;
             }
-            // Newest first within a state, as the threads are.
-            items.sort_by_key(|item| std::cmp::Reverse(self.items[*item].at));
+            // Newest first within a state, as the threads are; written
+            // in the same second, by name, whatever order the folder lists.
+            items.sort_by(|a, b| {
+                let (a, b) = (&self.items[*a], &self.items[*b]);
+                (b.at.cmp(&a.at)).then_with(|| a.thread.cmp(&b.thread))
+            });
             rows.push(Row::Heading(state));
             if !state.folds() || open.contains(&state) || finding.is_some() {
                 rows.extend(items.into_iter().map(Row::Item));

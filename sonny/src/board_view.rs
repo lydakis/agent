@@ -731,6 +731,13 @@ mod tests {
             .collect()
     }
 
+    /// Whether `text` ends in an age of seconds, `0s` to `59s`.
+    fn seconds_old(text: &str) -> bool {
+        let digits = text.strip_suffix('s').unwrap_or_default();
+        let digits = &digits[digits.trim_end_matches(|c: char| c.is_ascii_digit()).len()..];
+        !digits.is_empty() && digits.parse::<u32>().is_ok_and(|s| s < 60)
+    }
+
     fn card(view: &mut View, width: usize) -> Vec<String> {
         view.card(width).0.iter().map(text).collect()
     }
@@ -881,7 +888,8 @@ mod tests {
         let row = &lines[at("shop/typed-errors")];
         assert!(row.starts_with(" ● shop/typed-errors"), "{row:?}");
         assert!(row.contains("● 2  ○ 1  ◌ 2  ✓ 1"), "{row:?}");
-        assert!(row.trim_end().ends_with("0s"), "{row:?}");
+        // Seconds old: written as the test began, however slow the machine.
+        assert!(seconds_old(row.trim_end()), "{row:?}");
         assert!(lines[at("docs/api-pages")].starts_with(" ✗ docs/api-pages"));
         assert!(lines[at("docs/api-pages")].contains("✗ 1  ✓ 1"));
         // An item is no row among the threads.
@@ -1037,7 +1045,11 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("Write the error docs")));
         let api = &lines[at("Add typed errors to the api")];
         assert!(api.starts_with(" ● Add typed errors to the api"), "{api:?}");
-        assert!(api.trim_end().ends_with("errors-2 · 0s"), "{api:?}");
+        let age = api
+            .trim_end()
+            .rsplit_once("errors-2 · ")
+            .map(|(_, age)| age);
+        assert!(age.is_some_and(seconds_old), "{api:?}");
         let flaky = &lines[at("Fix the flaky error test")];
         assert!(
             flaky.contains("Fix the flaky error test  kind=bug"),
@@ -1050,7 +1062,7 @@ mod tests {
             lines[review]
         );
         assert_eq!(lines[review + 1], "   └ needs Remove the old error enum");
-        let gone = at("Remove the old error enum");
+        let gone = at(" ◌ Remove the old error enum");
         assert_eq!(lines[gone + 1], "   └ needs Add typed errors to the api +1");
         // The holder is a link to its agent.
         let card = view.card_rows(80);
