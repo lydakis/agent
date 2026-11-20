@@ -2182,10 +2182,14 @@ fn kept_by(listed: &[standing::Agent], bot: &str, project: &str) -> String {
 /// as windows that open together would each read every one: the lock to
 /// hold while this window reads them and keeps what it read, or none once
 /// the window that held it let go, what it kept to be taken. None too
-/// where the lock cannot be had, and the window reads them itself.
+/// where the lock cannot be had, and the window reads them itself, and
+/// for a window with no store, which has none to share them beside.
 async fn first_reads(kept: &std::path::Path, lead: &str) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if kept.as_os_str().is_empty() {
+        return None;
+    }
     let dir = reads_dir(kept);
     let path = dir.join(format!("{lead}.lock"));
     crate::scheduler::apart(move || {
@@ -27224,6 +27228,14 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o700);
         std::fs::remove_dir_all(home).unwrap();
+        // A window with no store reads for itself and leaves nothing in
+        // the folder it runs in.
+        assert!(
+            first_reads(std::path::Path::new(""), "shop.lead")
+                .await
+                .is_none()
+        );
+        assert!(!std::path::Path::new(".status-reads").exists());
     }
 
     #[test]
