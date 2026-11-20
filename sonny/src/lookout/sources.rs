@@ -46,7 +46,7 @@ pub const TEXT_BYTES: usize = 80 * 1024;
 /// How much of who wrote it and its link a note says.
 const FIELD_CHARS: usize = 300;
 /// The most a note says, in bytes, with the person's words the daemon
-/// quotes into it, well under the 256 KiB the daemon takes in one prompt:
+/// quotes into it, well under the 1 MiB the daemon takes in one prompt:
 /// past it, events wait for the next note.
 pub const NOTE_BYTES: usize = 192 * 1024;
 /// The most of the person's messages one note quotes, the most the daemon

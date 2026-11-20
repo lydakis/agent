@@ -194,7 +194,7 @@ class AcpTests(ModelFixture):
                             approve=['start_task'], approver='manual')
         thread, session = self.open(repo)
         self.adopt(thread, session)
-        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
         prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
         # The call waits for the person, who is asked in the thread.
         [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
@@ -285,7 +285,7 @@ class AcpTests(ModelFixture):
         thread, session = self.open(repo)
         self.adopt(thread, session)
         self.t3.delegating = False
-        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
         first = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
         [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
                    if m.get('method') == 'session/request_permission']
@@ -343,7 +343,7 @@ class AcpTests(ModelFixture):
                             approve=['start_task'], approver='manual')
         thread, session = self.open(repo)
         self.adopt(thread, session)
-        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
         first = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
         [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
                    if m.get('method') == 'session/request_permission']
@@ -608,7 +608,7 @@ class AcpTests(ModelFixture):
         session = opened['result']['sessionId']
         thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
-        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
         answered, updates = thread.answer_of(thread.ask('session/prompt', {
             'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]}))
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
@@ -674,7 +674,7 @@ class AcpTests(ModelFixture):
             'sessionId': session, 'prompt': [{'type': 'text', 'text': 'hi'}], '_meta': {'person': 'Ana Lopez'}}))
         self.assertEqual(refused['error']['code'], -32602)
         self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
-        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
         prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}],
                                                '_meta': {'person': 'ana'}})
         [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
@@ -949,7 +949,7 @@ class AcpTests(ModelFixture):
         thread.send({'id': queue_form['id'], 'result': {'action': 'accept', 'content': {'pick': '1'}}})
         self.assertIn('Which queue?\n\nNone', until_answered('calc.fix', 3)[-1])
         # Asked by a task the lead started after the thread came.
-        self.model.call_script = [('start_task', {'name': 'check', 'brief': 'Check calc.py.', 'reason': 'A check apart from the fix.'})]
+        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'check', 'brief': 'Check calc.py.', 'reason': 'A check apart from the fix.'})]
         answered, updates = thread.answer_of(thread.ask('session/prompt', {
             'sessionId': lead, 'prompt': [{'type': 'text', 'text': 'script'}]}))
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})

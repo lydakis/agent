@@ -43,8 +43,11 @@ enum Undo {
 /// A `start_task` call.
 pub struct Start {
     pub name: String,
-    /// Everything the task needs; its first line is the title the person
-    /// knows it by, noted beside its name.
+    /// What the task is for, in a few words the person knows the work by,
+    /// noted beside its name; none for one the person starts, which shows
+    /// its name.
+    pub title: Option<String>,
+    /// Everything the task needs.
     pub brief: String,
     pub profile: Option<String>,
     /// One of the person's `/permissions` rows to hold the task in, at
@@ -551,8 +554,8 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         // Noted by the id it started with, which no agent given its name
         // later has.
         let started: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
-        if let Some(id) = started["bot_id"].as_i64() {
-            let _ = crate::title::note(store, name, id, &crate::title::of_message(&start.brief));
+        if let (Some(id), Some(title)) = (started["bot_id"].as_i64(), &start.title) {
+            let _ = crate::title::note(store, name, id, title);
         }
     }
     let mut said = vec![format!(
@@ -3131,6 +3134,7 @@ mod tests {
         let store = dir.join("state.sqlite");
         let start = Start {
             name: "fix".into(),
+            title: Some("Fix the sums".into()),
             brief: String::new(),
             profile: None,
             permissions: None,

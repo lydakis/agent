@@ -111,8 +111,21 @@ this replaced:
   reply that could not be read is logged, its first 2 KB redacted, with
   the failure. A call too long to show the reviewer is the one call
   still handed to the person, where one can answer, as Codex asks the
-  person when a review's input is over its budget. The CLI's `auto` gate
-  lapses at 105 s to fit the longer budget.
+  person when its own estimate says a review's input is over its budget.
+  That budget is Codex's guardian's, sized to the judge model's own
+  window: the window the daemon gives it (the person's
+  `[context_windows]`, which the judge is given too, else its provider's
+  listing, else the daemon's default: 1M for Claude 5 on, else 200K),
+  read once as the reviewer starts, at its effective 95% less 256 tokens,
+  counted at 4 bytes a token as Codex counts text, less the judge's
+  instructions, its reply schema and 16 KiB of room: about 712 KiB for a
+  200K window. It fits one daemon prompt, 1 MiB as Codex bounds a
+  person's input, less the same room: about 1008 KiB for any window from
+  about 280K tokens. A provider that refuses an input as too long anyway
+  fails the review, which is denied back to the agent and not retried,
+  as Codex's guardian treats a context-window refusal it did not
+  foresee. The CLI's `auto` gate lapses at 105 s to fit the longer
+  budget.
 - **The breaker is Codex's:** 3 denials in a row, or 10 among the turn's
   last 50 decided calls, where it was 20 a turn.
 - **The reviewer reads the agent's history, outputs included** (2026-10-28).

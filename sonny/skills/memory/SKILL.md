@@ -36,8 +36,11 @@ rest, each group the most confirmed and most recently verified first.
 
 An agent made with its folder's instructions starts with the head of both
 indexes in them, each under `# Memory in DIR`, as they were when it was
-made. An index too long to give whole ends with how many facts it leaves
-out. When there is
+made. An index too long to give whole still names every fact, each
+description shortened alike, a cut one ending in `…`, or left out: a line
+is a short summary, so open the fact with `read` before acting on it when
+its line is cut. An index whose names alone do not fit ends with how many
+facts it leaves out; `search` finds them. When there is
 no such section, or yours may be out of date because the agent has been
 running a while, call the memory tool with nothing, or run
 `"$HOME/.agent/memory" show` where you have no memory tool. Either gives both

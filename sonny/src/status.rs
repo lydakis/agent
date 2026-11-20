@@ -61,7 +61,18 @@ pub struct Row {
 pub type Task = std::sync::Arc<serde_json::Value>;
 
 /// Where a task stands, as `/status` groups the tasks, in its order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum Group {
     /// Waiting on the person's approval or answer, or held on a cause
     /// they can fix.
@@ -384,7 +395,7 @@ fn listing<R: std::borrow::Borrow<Row>>(rows: &[R]) -> Listing<'_> {
 
 /// How many agents each of `/status`'s groups lists, as its head and its
 /// headings count them: the footer shows these same counts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Counts {
     pub needs_you: usize,
     pub failed: usize,
@@ -406,7 +417,7 @@ impl Counts {
 }
 
 /// `/status`'s groups in the page's order.
-const GROUPS: [Group; 5] = [
+pub const GROUPS: [Group; 5] = [
     Group::NeedsYou,
     Group::Failed,
     Group::Working,
@@ -466,18 +477,7 @@ pub fn card_after(
         under,
         helping,
     } = listing(rows);
-    // The head counts what each group's heading does, in the page's
-    // order: the agents listed there, a task's helpers inside its own.
-    let mut head = vec![Span::raw(project.to_owned()).bold()];
-    let counted = tally(&listed);
-    for group in GROUPS {
-        let n = counted.of(group);
-        if n > 0 {
-            head.push(Span::raw(" · ").dim());
-            head.push(Span::raw(format!("{n} {}", group.counted(n))));
-        }
-    }
-    let mut out = vec![Line::from(head)];
+    let mut out = vec![head_of(project, &listed)];
     let shown = |row: &Row| match details {
         Details::All => true,
         Details::Picked(picked) => picked == Some(row.bot.as_str()),
@@ -575,10 +575,75 @@ pub fn card_after(
     }
 }
 
+/// `/status`'s head: the project, then a count for each group with any,
+/// as each group's heading counts: the agents listed there, a task's
+/// helpers inside its own.
+pub fn head(project: &str, rows: &[Row]) -> Line<'static> {
+    head_of(project, &listing(rows).listed)
+}
+
+fn head_of(project: &str, listed: &[&Row]) -> Line<'static> {
+    let mut head = vec![Span::raw(project.to_owned()).bold()];
+    let counted = tally(listed);
+    for group in GROUPS {
+        let n = counted.of(group);
+        if n > 0 {
+            head.push(Span::raw(" · ").dim());
+            head.push(Span::raw(format!("{n} {}", group.counted(n))));
+        }
+    }
+    Line::from(head)
+}
+
+/// Whether `row` says what `query` is, in its title, its name or its
+/// words (its state, or a workflow's phase).
+pub fn says(row: &Row, query: &str) -> bool {
+    let name = match &row.run {
+        Some(run) => run.name.as_str(),
+        None => row.name.as_str(),
+    };
+    (crate::find::says(query, &row.title))
+        || crate::find::says(query, name)
+        || crate::find::says(query, &row.state)
+}
+
+/// What a find for `query` keeps of `rows` (**Keys and mouse**, Find):
+/// each row that says it, and each it hangs under on its line of makers,
+/// so a task whose helper matches stays to keep the helper in its place;
+/// and the tasks whose helpers are to stand open, since a fold is searched
+/// and stands open while finding.
+pub fn found(rows: &[Row], query: &str) -> (Vec<Row>, Vec<String>) {
+    let by_bot: HashMap<&str, &Row> = rows.iter().map(|row| (row.bot.as_str(), row)).collect();
+    let mut kept: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut open: Vec<String> = Vec::new();
+    for row in rows.iter().filter(|row| says(row, query)) {
+        kept.insert(&row.bot);
+        let mut at = row;
+        // Up its line of makers, a ring of them leading nowhere.
+        for _ in 0..rows.len() {
+            match by_bot.get(at.maker.as_str()) {
+                Some(maker) if maker.bot != at.bot && maker.name != "lead" => {
+                    kept.insert(&maker.bot);
+                    if !open.contains(&maker.bot) {
+                        open.push(maker.bot.clone());
+                    }
+                    at = maker;
+                }
+                _ => break,
+            }
+        }
+    }
+    let rows = (rows.iter())
+        .filter(|row| kept.contains(row.bot.as_str()))
+        .cloned()
+        .collect();
+    (rows, open)
+}
+
 /// One of the project's agents as the pane lists it above the margin: the
 /// lead, a task that needs the person, failed or works, or a workflow
 /// that runs.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Listed {
     pub bot: String,
     pub name: String,
@@ -589,6 +654,8 @@ pub struct Listed {
     pub lead: bool,
     /// Its helpers' groups: each agent whose line of makers leads to it.
     pub helpers: Vec<Group>,
+    /// Read live, never kept ([`crate::projects::Project`]).
+    #[serde(skip)]
     pub run: Option<Box<crate::workflow::view::Live>>,
 }
 
@@ -597,7 +664,7 @@ pub struct Listed {
 /// that needs the person, failed or works, in the order of the groups,
 /// each workflow under the agent that runs it. Its counts are the
 /// footer's, which the pane does not draw.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Agents {
     pub project: String,
     pub counts: Counts,

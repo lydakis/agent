@@ -1978,8 +1978,8 @@ class AutoApproverTests(ModelFixture):
         self.judge.answer = shell_danger
         # A 200 KiB script, as a monitor rewrites its own: written, then run.
         big = '# step\n' * (200 * 1024 // 7) + 'printf ok\n'
-        # Past the judge's input budget whole.
-        huge = 'x' * (300 * 1024) + '\nprintf ok\n'
+        # Past the judge's input budget whole, within what a write takes.
+        huge = 'x' * (1020 * 1024) + '\nprintf ok\n'
         self.model.call_script = [('write', {'path': 'run.sh', 'content': 'printf DANGER'}),
                                   ('shell', {'command': 'sh run.sh'}),
                                   ('write', {'path': 'big.sh', 'content': big}),
@@ -2015,7 +2015,7 @@ class AutoApproverTests(ModelFixture):
 
     def test_a_file_too_long_for_the_judge_goes_to_the_person(self):
         self.judge.answer = lambda round, id: .05
-        huge = 'x' * (300 * 1024) + '\nprintf ok\n'
+        huge = 'x' * (1020 * 1024) + '\nprintf ok\n'
         self.model.call_script = [('write', {'path': 'huge.sh', 'content': huge}),
                                   ('shell', {'command': 'sh huge.sh'})]
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
@@ -2028,6 +2028,44 @@ class AutoApproverTests(ModelFixture):
         self.assertTrue(self.denial(daemon, turn, 'script-1').startswith(
             'not reviewed: the call is too long to show'))
         # The judge was never asked: what it would see is not the whole.
+        self.assertTrue(self.judge.requests.empty())
+
+    def judged_with_window(self, window, config):
+        """A call that runs a file past what a 200K window holds, within
+        one prompt, reviewed by a judge whose provider lists `window`
+        tokens, with `config` in the reviewer's config file."""
+        self.judge.answer = lambda round, id: .05
+        self.model.context_window = window
+        self.model.models = ('synthetic-model', Judge.model)
+        large = 'x' * (900 * 1024) + '\nprintf ok\n'
+        self.model.call_script = [('write', {'path': 'large.sh', 'content': large}),
+                                  ('shell', {'command': 'sh large.sh'})]
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
+                       approve_expire_ms=15000)
+        home = self.path / 'home'
+        (home / '.agent').mkdir(parents=True)
+        (home / '.agent/config.toml').write_text(config)
+        self.approver(daemon, env={'HOME': str(home)})
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        return daemon, turn, large
+
+    def test_the_judge_s_budget_is_its_model_s_listed_window_as_in_codex(self):
+        daemon, turn, large = self.judged_with_window(400_000, '')
+        # A 400K window holds it: shown whole and judged, no person asked.
+        self.assertFalse(self.poll(daemon, turn, 'script-1').get('denied'))
+        [shell] = self.judge.requests.get(timeout=5)['state']['planned_calls']
+        self.assertEqual(shell['files_it_names'], [{'path': 'large.sh', 'content': large}])
+
+    def test_the_judge_s_budget_is_the_window_the_person_gives_its_model(self):
+        daemon, turn, _ = self.judged_with_window(
+            400_000, f'[context_windows]\n"openai/{Judge.model}" = 200000\n')
+        # The person says the judge's model holds 200K: too long for it, so
+        # it goes to the person.
+        self.assertTrue(self.denial(daemon, turn, 'script-1').startswith(
+            'not reviewed: the call is too long to show'))
         self.assertTrue(self.judge.requests.empty())
 
     def test_an_ungated_write_too_long_to_preview_still_shows_its_file(self):

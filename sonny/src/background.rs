@@ -791,6 +791,9 @@ pub struct View {
     /// Whether the scheduler runs, read beside the window while it lists
     /// an automation.
     scheduler: SchedulerState,
+    /// `ctrl+f`: what is typed narrows the rows to those that say it, and
+    /// the row picked when the find began, which `esc` puts back.
+    finding: Option<crate::find::Find<usize>>,
 }
 
 /// Whether the scheduler that fires the automations runs, as the last
@@ -1193,6 +1196,7 @@ impl View {
             source: SourcePage::default(),
             output: Output::default(),
             scheduler: SchedulerState::default(),
+            finding: None,
         };
         view.reload();
         view
@@ -1201,6 +1205,76 @@ impl View {
     /// Every row that can be picked: the items, then the commands.
     fn rows(&self) -> usize {
         self.items.len() + self.commands.rows.len()
+    }
+
+    /// Whether the row at `index`, an item or a command, says what is
+    /// typed to find, in the words it is drawn with: every row before
+    /// anything is typed.
+    fn shown(&self, index: usize) -> bool {
+        let Some(find) = self.finding.as_ref().filter(|find| find.typed()) else {
+            return true;
+        };
+        let lines = match self.items.get(index) {
+            Some(item) => self.item_rows(item, false, 1000),
+            None => match self.commands.rows.get(index - self.items.len()) {
+                Some(row) => {
+                    let name = self.scope.short(row["bot"].as_str().unwrap_or("?"));
+                    let said = format!("{name} {}", commands::said(row));
+                    return find.says(&said);
+                }
+                None => return false,
+            },
+        };
+        let words: String = (lines.iter())
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        find.says(&words)
+    }
+
+    /// The row shown next to the pick, after it or before it.
+    fn step(&self, down: bool) -> usize {
+        let mut at = self.selected;
+        loop {
+            at = match down {
+                true if at + 1 < self.rows() => at + 1,
+                false if at > 0 => at - 1,
+                _ => return self.selected,
+            };
+            if self.shown(at) {
+                return at;
+            }
+        }
+    }
+
+    /// Words pasted while finding, as if typed: whether a find took them.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(find) = self.finding.as_mut().filter(|_| self.page.is_none()) else {
+            return false;
+        };
+        find.paste(text);
+        // A removal or stop asked for is dropped, as any other key drops
+        // it: the paste may move the pick.
+        if self.confirm.take().is_some() {
+            self.notice = Some("not removed".into());
+        }
+        if self.stopping.take().is_some() {
+            self.notice = Some("not stopped".into());
+        }
+        self.found();
+        true
+    }
+
+    /// The pick on the first row that says what is typed.
+    fn found(&mut self) {
+        if let Some(at) = (0..self.rows()).find(|at| self.shown(*at)) {
+            self.selected = at;
+        }
+    }
+
+    /// Whether a find is under way.
+    pub fn finding(&self) -> bool {
+        self.finding.is_some() && self.page.is_none()
     }
 
     /// The command picked, when the pick is past the items.
@@ -1472,6 +1546,29 @@ impl View {
                 None => Key::Stay,
             };
         }
+        // `ctrl+f`: what is typed narrows the rows, the pick on the first
+        // that says it; `esc` drops the find and puts the pick back. The
+        // arrows and `enter` stay the list's.
+        if self.page.is_none() {
+            if let Some(find) = &mut self.finding {
+                match find.key(&key) {
+                    crate::find::Typed::Dropped => {
+                        self.selected = (self.finding.take().map(|find| find.before))
+                            .unwrap_or(self.selected)
+                            .min(self.rows().saturating_sub(1));
+                        return Key::Stay;
+                    }
+                    crate::find::Typed::Changed => {
+                        self.found();
+                        return Key::Stay;
+                    }
+                    crate::find::Typed::Other => {}
+                }
+            } else if crate::find::opens(&key) {
+                self.finding = Some(crate::find::Find::new(self.selected));
+                return Key::Stay;
+            }
+        }
         let code = match key.code {
             KeyCode::Char('k') if plain => KeyCode::Up,
             KeyCode::Char('j') if plain => KeyCode::Down,
@@ -1479,6 +1576,14 @@ impl View {
             KeyCode::Char('l') if plain => KeyCode::Right,
             code => code,
         };
+        // A find that keeps nothing picks nothing to open, remove or run.
+        let picks = matches!(
+            code,
+            KeyCode::Enter | KeyCode::Right | KeyCode::Delete | KeyCode::Char('x' | 'r')
+        );
+        if picks && self.page.is_none() && !self.shown(self.selected) {
+            return Key::Stay;
+        }
         match code {
             KeyCode::Esc => return Key::Close,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1501,10 +1606,8 @@ impl View {
             // automation, a follow, a command. The agent it belongs to is
             // the page's first link.
             KeyCode::Enter | KeyCode::Right => self.open_page(),
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => {
-                self.selected = (self.selected + 1).min(self.rows().saturating_sub(1));
-            }
+            KeyCode::Up => self.selected = self.step(false),
+            KeyCode::Down => self.selected = self.step(true),
             // A source is the person's to remove, where it is set; and it
             // runs on its own.
             KeyCode::Char('x') | KeyCode::Delete if self.source_open().is_some() => {
@@ -1773,7 +1876,9 @@ impl View {
     /// [`View::card_rows`] as of `now_ms`, which the commands' ages count
     /// to.
     fn card_at(&self, width: usize, now_ms: i64) -> (Vec<Line<'static>>, usize, Vec<usize>, Links) {
-        let mut starts = vec![0; self.rows()];
+        // A row a find leaves out has none, past the last line, so no
+        // click lands on it.
+        let mut starts = vec![usize::MAX; self.rows()];
         let mut links = Links::new();
         let mut out = vec![Line::from(self.scope.project.clone()).bold()];
         if !self.lookout.is_empty() {
@@ -1819,8 +1924,11 @@ impl View {
             false => "Failed",
         };
         for heading in ["Failed", "Automations", "Follows"] {
-            let takes = |item: &Item| section(item) == heading;
-            let n = self.items.iter().filter(|i| takes(i)).count();
+            // While finding, a section with no row that says it is not
+            // drawn.
+            let takes =
+                |(index, item): (usize, &Item)| section(item) == heading && self.shown(index);
+            let n = self.items.iter().enumerate().filter(|i| takes(*i)).count();
             if n == 0 {
                 continue;
             }
@@ -1836,7 +1944,7 @@ impl View {
                 ]));
             }
             for (index, item) in self.items.iter().enumerate() {
-                if !takes(item) {
+                if !takes((index, item)) {
                     continue;
                 }
                 if index == self.selected {
@@ -1858,17 +1966,21 @@ impl View {
                 out.extend(lines);
             }
         }
+        // The commands that say what is typed: all, before anything is.
+        let shown = (0..self.commands.rows.len())
+            .filter(|place| self.shown(self.items.len() + place))
+            .count();
         if let Some(error) = &self.commands.error {
             out.push(Line::default());
             out.push(Line::from(vec![
                 Span::raw("✗ ").fg(Color::Red),
                 Span::raw(format!("could not read what runs: {error}")),
             ]));
-        } else if !self.commands.rows.is_empty() {
+        } else if shown > 0 {
             out.push(Line::default());
             out.push(Line::from(vec![
                 Span::raw("Commands").bold(),
-                Span::raw(format!(" · {}", self.commands.rows.len())).dim(),
+                Span::raw(format!(" · {shown}")).dim(),
             ]));
             let names: Vec<String> = (self.commands.rows.iter())
                 .map(|row| self.scope.short(row["bot"].as_str().unwrap_or("?")))
@@ -1876,6 +1988,9 @@ impl View {
             let name_width = names.iter().map(|n| n.width()).max().unwrap_or(0).min(20);
             for (place, (row, name)) in self.commands.rows.iter().zip(&names).enumerate() {
                 let index = self.items.len() + place;
+                if !self.shown(index) {
+                    continue;
+                }
                 if index == self.selected {
                     at = out.len();
                 }
@@ -1890,6 +2005,16 @@ impl View {
                 }
                 out.push(commands::line(row, name, name_width, width, now_ms, picked));
             }
+        }
+        // The find row, the view's last; and a find that keeps nothing says
+        // so.
+        if let Some(find) = &self.finding {
+            if find.typed() && !(0..self.rows()).any(|at| self.shown(at)) {
+                out.push(Line::default());
+                out.push(Line::from(format!("nothing here matches {}", find.query)).dim());
+            }
+            out.push(Line::default());
+            out.push(crate::find::line(&find.query));
         }
         (out, at, starts, links)
     }
@@ -2965,6 +3090,13 @@ impl View {
                 if self.has_page() {
                     keys = keys.enter(crate::hint::Enter::Open);
                 }
+                if self.rows() > 0 {
+                    keys = keys.find();
+                }
+                // `esc` drops the find first; the next one closes the view.
+                if self.finding.is_some() {
+                    return keys.esc(Esc::Cancel).text();
+                }
             }
         }
         // A source's page edits nothing.
@@ -3346,7 +3478,131 @@ mod tests {
             source: SourcePage::default(),
             output: Output::default(),
             scheduler: SchedulerState::default(),
+            finding: None,
         }
+    }
+
+    #[test]
+    fn ctrl_f_finds_a_command_by_its_whole_text() {
+        let store = std::env::temp_dir().join("sonny-bg-find-command.sqlite");
+        let mut view = view_of(store, Vec::new());
+        view.commands_loaded(Ok(json!({"processes": [
+            {"handle": "proc:4", "bot": "calc.lead", "kind": "background",
+             "command": "cargo build", "started_ms": 1_000, "pid": null},
+            {"handle": "proc:9", "bot": "calc.fix", "kind": "background",
+             "command": "python scripts/maintenance_runner.py --task reconcile",
+             "started_ms": 1_000, "pid": null},
+        ]})));
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(view.key(ctrl_f, 0..0), Key::Stay));
+        // A word past what a stop's question shows is still found, as the
+        // row draws it at a width that holds it.
+        assert!(view.paste("reconcile"));
+        assert!(!view.shown(0) && view.shown(1));
+        assert_eq!(view.selected, 1);
+    }
+
+    #[test]
+    fn ctrl_f_narrows_the_rows_picks_the_first_match_and_esc_puts_them_back() {
+        let store = std::env::temp_dir().join("sonny-bg-find.sqlite");
+        let failed = Item {
+            failed: Some("exit status 1".into()),
+            ..item(Kind::Trigger, "pushcheck", &["calc.lead"], false)
+        };
+        let digest = Item {
+            what: "Sum the day's mail".into(),
+            message: "Sum the day's mail".into(),
+            ..item(Kind::Trigger, "digest", &["calc.lead"], false)
+        };
+        let mut view = view_of(
+            store,
+            vec![
+                failed,
+                item(Kind::Trigger, "nightly", &["calc.lead"], false),
+                digest,
+            ],
+        );
+        view.selected = 1;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let text = |view: &View| -> Vec<String> {
+            (view.card(80).0.iter())
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect()
+        };
+        let says = |view: &View, what: &str| text(view).iter().any(|line| line.contains(what));
+        // The hint names it with the view's keys.
+        assert!(view.keys().contains("ctrl+f find · "), "{}", view.keys());
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(view.key(ctrl_f, 0..0), Key::Stay));
+        assert!(view.finding());
+        assert_eq!(text(&view).last().unwrap(), "find");
+        assert!(view.keys().ends_with("esc cancel"), "{}", view.keys());
+        // Typed, even a letter the list keeps for itself, it narrows: the
+        // rows that say it stay, a section with none is not drawn, and the
+        // pick goes to the first match.
+        for c in "mail".chars() {
+            assert!(matches!(view.key(key(KeyCode::Char(c)), 0..0), Key::Stay));
+        }
+        assert!(
+            says(&view, "digest") && !says(&view, "nightly"),
+            "{:#?}",
+            text(&view)
+        );
+        assert!(!says(&view, "Failed") && !says(&view, "pushcheck"));
+        assert_eq!(view.selected, 2);
+        assert_eq!(text(&view).last().unwrap(), "find mail");
+        // Only a row found has a place a click lands on: one left out has
+        // none, so no click on a row shown, or on the head, opens it.
+        let (lines, _, starts, _) = view.card_linked(80);
+        for (index, start) in starts.iter().enumerate() {
+            assert_eq!(
+                *start < lines.len(),
+                view.shown(index),
+                "{index} {starts:?}"
+            );
+        }
+        assert!(
+            starts.iter().any(|start| *start >= lines.len()),
+            "{starts:?}"
+        );
+        // The arrows stay among the rows found.
+        view.key(key(KeyCode::Up), 0..0);
+        assert_eq!(view.selected, 2);
+        // A row found opened as a page: a paste there is no more to find.
+        assert!(matches!(view.key(key(KeyCode::Enter), 0..0), Key::Stay));
+        assert!(view.page.is_some() && !view.finding());
+        assert!(!view.paste("zz"));
+        view.key(key(KeyCode::Left), 0..0);
+        assert!(view.page.is_none() && view.finding());
+        // A removal asked for, then a paste: the paste moves the find, so
+        // the question is dropped, as any other key drops it.
+        assert!(matches!(view.key(key(KeyCode::Delete), 0..0), Key::Stay));
+        assert!(view.confirm.is_some());
+        assert!(view.paste("zz"));
+        assert!(view.confirm.is_none() && view.notice.as_deref() == Some("not removed"));
+        for _ in 0..2 {
+            view.key(key(KeyCode::Backspace), 0..0);
+        }
+        // Pasted, as typed; nothing found says so, and nothing is picked
+        // to open, remove or run.
+        assert!(view.paste("zz"));
+        assert!(
+            says(&view, "nothing here matches mailzz"),
+            "{:#?}",
+            text(&view)
+        );
+        for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Delete] {
+            assert!(matches!(view.key(key(code), 0..0), Key::Stay));
+        }
+        assert!(view.page.is_none() && view.confirm.is_none() && view.stopping.is_none());
+        // `esc` drops the find, the rows and the pick as they were; the
+        // next closes the view.
+        assert!(matches!(view.key(key(KeyCode::Esc), 0..0), Key::Stay));
+        assert!(!view.finding() && view.selected == 1);
+        assert!(says(&view, "nightly") && says(&view, "pushcheck"));
+        assert!(!text(&view).last().unwrap().contains("find"));
+        assert!(!view.paste("x"), "no find, no paste");
+        assert!(matches!(view.key(key(KeyCode::Esc), 0..0), Key::Close));
     }
 
     fn follow_item(sub: lookout::subs::Sub, own: bool) -> Item {
@@ -4267,6 +4523,7 @@ mod tests {
             source: SourcePage::default(),
             output: Output::default(),
             scheduler: SchedulerState::default(),
+            finding: None,
         };
         let rows: Vec<String> = (view.card(100).0.iter())
             .map(|l| l.to_string())
@@ -4350,6 +4607,7 @@ mod tests {
             source: SourcePage::default(),
             output: Output::default(),
             scheduler: SchedulerState::default(),
+            finding: None,
         };
         let clock = crate::asks::clock(at, now);
         // The pick reaches a column past the last word.
@@ -4707,6 +4965,7 @@ mod tests {
             source: SourcePage::default(),
             output: Output::default(),
             scheduler: SchedulerState::default(),
+            finding: None,
         };
         let (card, at) = view.card(100);
         let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
@@ -4731,7 +4990,7 @@ mod tests {
         assert_eq!(lines[8], "    chat server: auth_expired");
         assert_eq!(lines[9], "    memory fact unreadable-chat");
         assert_eq!(lines[11], "Automations · 1");
-        assert_eq!(view.keys(), "↑↓ pick · esc close");
+        assert_eq!(view.keys(), "↑↓ pick · ctrl+f find · esc close");
         assert_eq!(view.footer(), None);
         let press = |view: &mut View, code| {
             view.key(KeyEvent::new(code, KeyModifiers::NONE), 0..usize::MAX)
@@ -4921,6 +5180,7 @@ mod tests {
             source: SourcePage::default(),
             output: Output::default(),
             scheduler: SchedulerState::default(),
+            finding: None,
         };
         let text = |view: &View| -> Vec<String> {
             view.card(100)
@@ -4961,7 +5221,7 @@ mod tests {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
             view.keys(),
-            "↑↓ pick · enter open · r run now · x remove · esc close"
+            "↑↓ pick · enter open · ctrl+f find · r run now · x remove · esc close"
         );
         assert_eq!(view.key(enter, 0..usize::MAX), Key::Stay);
         assert!(view.on_page());
@@ -5073,7 +5333,10 @@ mod tests {
         assert_eq!(at + 3, lines.len(), "the commands come last");
         press(&mut view, KeyCode::Down);
         assert_eq!(view.card_at(80, 0).1, at + 1);
-        assert_eq!(view.keys(), "↑↓ pick · enter open · x stop · esc close");
+        assert_eq!(
+            view.keys(),
+            "↑↓ pick · enter open · ctrl+f find · x stop · esc close"
+        );
         // Enter opens the command as a page: its whole line, and who
         // left it running as its first link.
         press(&mut view, KeyCode::Down);

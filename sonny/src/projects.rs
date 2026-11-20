@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthStr;
 pub const IDLE_AFTER_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// A project as the page lists it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     /// Its lead, which `enter` goes to, by its own name.
     pub lead: String,
@@ -54,8 +54,7 @@ impl Project {
     }
 
     fn found(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        self.title.to_lowercase().contains(&query) || self.name.to_lowercase().contains(&query)
+        crate::find::says(query, &self.title) || crate::find::says(query, &self.name)
     }
 }
 
@@ -108,10 +107,15 @@ pub struct View {
     pick: Option<Pick>,
     /// Whether the idle projects are listed in place of their fold.
     fold_open: bool,
-    /// What `ctrl+f` narrows the rows to, while finding.
-    pub finding: Option<String>,
+    /// What `ctrl+f` narrows the rows to, while finding, and the pick
+    /// as it was before.
+    pub finding: Option<crate::find::Find<Option<Pick>>>,
     /// Whether a read landed: until then the page says `reading…`.
     pub read: bool,
+    /// Whether a read listed the project the window is in. Until one does
+    /// (what was kept from an earlier read can leave it out), the pick
+    /// waits on it, and the first that does opens the fold it is in.
+    here_read: bool,
     /// The first row in view, kept so the pick stays in view.
     top: usize,
     /// Whether the wheel moved the rows since the pick last moved: the
@@ -159,28 +163,34 @@ impl View {
     }
 
     /// The projects as read now. The pick stays on its project; where
-    /// that project is gone, on the first row. The first read opens the
-    /// fold when the project the window is in is in it, so the pick can
-    /// start there.
+    /// that project is gone, on the first row. The first read that lists
+    /// the project the window is in opens the fold when that project is
+    /// in it, so the pick can start there.
     pub fn set(&mut self, projects: Vec<Project>, now: u64) {
         self.projects = projects;
-        if !self.read {
-            self.read = true;
-            let idle = self.idle(now);
-            if let Some(at) = self.at(&self.here)
-                && idle[at]
-            {
+        self.read = true;
+        if !self.here_read
+            && let Some(at) = self.at(&self.here)
+        {
+            self.here_read = true;
+            if self.idle(now)[at] {
                 self.fold_open = true;
             }
         }
         let shown = self.shown(now);
         let kept = match &self.pick {
+            Some(Pick::Project(lead)) if !self.here_read && *lead == self.here => true,
             Some(pick) => shown.iter().any(|row| self.is(row, pick)),
             None => false,
         };
         if !kept {
             self.pick = shown.first().map(|row| self.pick_of(*row));
         }
+    }
+
+    /// The projects as last read, taken as the page closes, to be kept.
+    pub fn take_projects(&mut self) -> Vec<Project> {
+        std::mem::take(&mut self.projects)
     }
 
     #[cfg(test)]
@@ -242,7 +252,10 @@ impl View {
     pub fn shown(&self, now: u64) -> Vec<Shown> {
         let holders = self.holders();
         let idle = self.idle(now);
-        let keep: Vec<bool> = match self.finding.as_deref().filter(|q| !q.is_empty()) {
+        let keep: Vec<bool> = match (self.finding.as_ref())
+            .map(|find| find.query.as_str())
+            .filter(|q| !q.is_empty())
+        {
             Some(query) => {
                 let mut keep: Vec<bool> = self.projects.iter().map(|p| p.found(query)).collect();
                 for at in 0..self.projects.len() {
@@ -341,24 +354,19 @@ impl View {
         self.scrolled = false;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Finding: what is typed narrows the rows; the arrows still pick.
-        if let Some(query) = &mut self.finding {
-            match key.code {
-                KeyCode::Esc => {
-                    self.finding = None;
+        if let Some(find) = &mut self.finding {
+            match find.key(key) {
+                crate::find::Typed::Dropped => {
+                    // The rows and the pick as they were.
+                    self.pick = self.finding.take().and_then(|find| find.before);
                     self.settle(now);
                     return Act::Stay;
                 }
-                KeyCode::Backspace => {
-                    query.pop();
+                crate::find::Typed::Changed => {
                     self.found(now);
                     return Act::Stay;
                 }
-                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                    query.push(c);
-                    self.found(now);
-                    return Act::Stay;
-                }
-                _ => {}
+                crate::find::Typed::Other => {}
             }
         }
         let shown = self.shown(now);
@@ -412,8 +420,8 @@ impl View {
                 }
                 Act::Stay
             }
-            KeyCode::Char('f') if ctrl => {
-                self.finding = Some(String::new());
+            _ if crate::find::opens(key) => {
+                self.finding = Some(crate::find::Find::new(self.pick.clone()));
                 Act::Stay
             }
             KeyCode::Char('c') if ctrl => Act::Close,
@@ -432,10 +440,10 @@ impl View {
 
     /// Words pasted while finding, as if typed.
     pub fn paste(&mut self, text: &str, now: u64) {
-        let Some(query) = &mut self.finding else {
+        let Some(find) = &mut self.finding else {
             return;
         };
-        query.extend(text.chars().filter(|c| !c.is_control()));
+        find.paste(text);
         self.scrolled = false;
         self.found(now);
     }
@@ -445,7 +453,9 @@ impl View {
     /// because it holds a match.
     fn found(&mut self, now: u64) {
         let shown = self.shown(now);
-        let query = self.finding.clone().unwrap_or_default();
+        let query = (self.finding.as_ref())
+            .map(|find| find.query.clone())
+            .unwrap_or_default();
         let matches = |row: &Shown| match row {
             Shown::Project(at, _) => self.projects[*at].found(&query),
             Shown::Fold(..) => false,
@@ -488,11 +498,7 @@ impl View {
         use crate::hint::{Enter, Esc, Keys};
         match self.finding {
             Some(_) => Keys::new().pick().enter(Enter::Open).esc(Esc::Cancel),
-            None => Keys::new()
-                .pick()
-                .enter(Enter::Open)
-                .key("ctrl+f", "find")
-                .esc(Esc::Close),
+            None => Keys::new().pick().enter(Enter::Open).find().esc(Esc::Close),
         }
     }
 
@@ -518,7 +524,7 @@ impl View {
         let shown = self.shown(now);
         if shown.is_empty() {
             let said = match &self.finding {
-                Some(query) if !query.is_empty() => format!(" no project matches {query}"),
+                Some(find) if find.typed() => format!(" no project matches {}", find.query),
                 _ => " no project yet".to_owned(),
             };
             out.push(Line::from(said).dim());
@@ -874,6 +880,7 @@ mod tests {
     #[test]
     fn find_narrows_by_title_and_name_keeping_what_holds_a_match() {
         let mut view = rulebook();
+        let before = view.picked().map(|project| project.lead.clone());
         let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         view.key(&ctrl_f, NOW);
         for c in "ledg".chars() {
@@ -893,6 +900,8 @@ mod tests {
         assert_eq!(view.picked().unwrap().lead, "ledger.lead");
         assert_eq!(view.key(&KeyEvent::from(KeyCode::Esc), NOW), Act::Stay);
         assert_eq!(view.finding, None);
+        // The pick as it was before the find.
+        assert_eq!(view.picked().map(|project| project.lead.clone()), before);
         assert_eq!(view.key(&KeyEvent::from(KeyCode::Esc), NOW), Act::Close);
         // An idle project is found too.
         view.key(&ctrl_f, NOW);
@@ -928,6 +937,31 @@ mod tests {
         assert_eq!(fresh.picked().unwrap().lead, "tally.lead");
         assert!(text(&mut fresh, 70).contains(&" ▾ 5 idle projects".to_owned()));
         view.read = true;
+    }
+
+    #[test]
+    fn the_pick_waits_on_the_window_s_project_until_a_read_lists_it() {
+        let mut projects = rulebook().projects().to_vec();
+        projects[1].last = 0;
+        projects[1].counts = Counts {
+            needs_you: 0,
+            failed: 0,
+            working: 0,
+            idle: 0,
+            done: 0,
+        };
+        let here = projects.remove(1);
+        // What another window kept, without this window's project: the
+        // pick stays on it, though no row shows it yet.
+        let mut view = View::new("tally.lead");
+        view.set(projects.clone(), NOW);
+        assert!(view.read);
+        assert!(view.picked().is_none());
+        // The read that lists it picks it, and opens the fold it is in.
+        projects.insert(1, here);
+        view.set(projects, NOW);
+        assert_eq!(view.picked().unwrap().lead, "tally.lead");
+        assert!(text(&mut view, 70).contains(&" ▾ 5 idle projects".to_owned()));
     }
 
     #[test]

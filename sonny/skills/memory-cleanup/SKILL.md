@@ -1,6 +1,6 @@
 ---
 name: memory-cleanup
-description: The nightly memory cleanup. When it runs, merge duplicate facts, drop superseded ones, retire stale work, save what the person said that no agent saved, and note habits that keep costing them, between cleanup start and cleanup finish
+description: The nightly memory cleanup. When it runs, merge duplicate facts, drop superseded ones, retire stale work, fold facts by subject when an index no longer fits, save what the person said that no agent saved, and note habits that keep costing them, between cleanup start and cleanup finish
 ---
 
 # Memory cleanup
@@ -69,6 +69,25 @@ of it ends `tool_unserved`, run the same command with
    - **Unread facts.** An `unread` fact that a newer fact, or the file,
      command or setting it names, shows no longer holds: remove it. One
      that may still hold stays as it is; some facts are needed rarely.
+   - **Folding by subject.** Each index `start` lists under `over_head`
+     names more facts than fit the head a new agent starts with, so that
+     agent never sees the last of them. In that scope, fold related facts
+     into one fact per subject: many facts about build slots become one
+     `build-slots` fact. Read each fact you fold as a file. The new fact's
+     text holds every folded fact's whole text as it is, each under a line
+     with its name and source, so nothing is lost; its description names
+     the subject and what the facts in it cover; its `confirmed` is the
+     highest among them; it is `external` when any of them was; and when
+     any of them was `live`, save it with `live` true, since a fact under
+     a new name starts plain, keeping each blank as written. Then remove
+     the facts you folded. Fold the largest groups first, until `show`
+     for that scope names every fact, with no closing line of facts left
+     out. A fact holds at most
+     16 KiB: split a subject that would pass that into its parts. A fact
+     with no related fact stays as it is, and so does one with a
+     `pushed back` count: its count keeps counting against what it says,
+     as step 5 weighs it. `finish` counts a removed fact
+     whose whole text a fact you saved holds as folded, not lost.
 4. Call it with `said` true and `since_ms` as `start` gave it (leave it
    out when that is null). It lists what the person wrote to any agent
    since the last cleanup, newest first, each message with its agent
@@ -139,8 +158,8 @@ of it ends `tool_unserved`, run the same command with
    it removed are not counted. Only your changes go
    back: what other agents saved meanwhile stays. A refusal means you
    removed too much: do not try again tonight.
-7. Reply with one line per change: what you saved, merged, removed or
-   re-dated, and why, and a line for each server you could not read.
+7. Reply with one line per change: what you saved, merged, folded,
+   removed or re-dated, and why, and a line for each server you could not read.
    Reply `No changes.` when there were none.
 
 ## Do not

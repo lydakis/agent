@@ -17,14 +17,26 @@ use std::borrow::Cow;
 /// calls being judged take none of it: they are shown whole.
 pub const STATE_TOKENS: usize = 32_000;
 pub const EARLIER_TOKENS: usize = 16_000;
-/// The judge's input budget, as Codex's is its reviewer model's input limit
-/// less a margin: the most the whole state may take as text. A judge's
-/// prompt is one daemon turn's, at most 256 KiB, and the round's ids and
-/// keys take the rest; that is well inside the smallest context window a
-/// judge model has (200K tokens), so it is what binds. The calls being
-/// judged, and the files they run, are shown whole within it and the rest
-/// is fitted around them; a round they alone overflow goes to the person.
-pub const STATE_BYTES: usize = 240 * 1024;
+/// What the judge's prompt keeps, within one daemon prompt and within its
+/// window, for the round's ids and keys and the tools it may look with.
+pub const ROOM_BYTES: usize = 16 * 1024;
+/// The judge's input budget for a judge model whose context window is
+/// `window` tokens, as Codex's guardian takes its reviewer model's: the
+/// window's effective share (95%) less a margin of 256 tokens, counted at
+/// 4 bytes a token as Codex estimates text, over the whole request: less
+/// the judge's instructions, its reply schema and [`ROOM_BYTES`]. And
+/// within one daemon prompt, [`crate::PROMPT_BYTES`] (1 MiB, as Codex
+/// bounds a person's input), less [`ROOM_BYTES`]. The most the whole
+/// state may take as text. The calls being judged, and the files they
+/// run, are shown whole within it and the rest is fitted around them; a
+/// round they alone overflow goes to the person, as Codex's does.
+pub const fn state_bytes(window: u64) -> usize {
+    let tokens = (window as usize * 95 / 100).saturating_sub(256);
+    let window =
+        (tokens * 4).saturating_sub(JUDGE_INSTRUCTIONS.len() + VERDICT_SCHEMA.len() + ROOM_BYTES);
+    let prompt = crate::PROMPT_BYTES - ROOM_BYTES;
+    if window < prompt { window } else { prompt }
+}
 /// What the judge is shown of the agent's own history, as Codex's
 /// synchronous reviewer bounds it: each model message and each tool entry
 /// cut to its share, the newest kept within what messages and tool entries
@@ -1027,7 +1039,8 @@ fn size(value: &Value) -> usize {
     tokens(serde_json::to_string(value).map_or(0, |text| text.len()))
 }
 
-/// Build the state within the judge's input budget, as Codex's reviewer
+/// Build the state within `budget` bytes, the judge's input budget
+/// ([`state_bytes`]), as Codex's reviewer
 /// keeps the whole planned action and fits the rest around it: the note
 /// and the calls being judged, with the files they run, always whole, or
 /// the round does not fit at all. Then, newest first and each within its
@@ -1036,7 +1049,7 @@ fn size(value: &Value) -> usize {
 /// asks (each whole or left out whole), the standing instructions (whole
 /// or left out), and the transcript. Whatever is left out is marked, and
 /// never read as consent withheld.
-pub fn build(intent: &Intent, redactor: &Redactor) -> State {
+pub fn build(intent: &Intent, redactor: &Redactor, budget: usize) -> State {
     let mut state = Map::new();
     if let Some(note) = &intent.note {
         state.insert("environment_note".into(), json!(redactor.redact(note)));
@@ -1076,7 +1089,7 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
         "standing_instructions":[],"transcript":[],"transcript_cut":true,
         "context_omission":OMISSION});
     let fixed = Value::Object(state.clone()).to_string().len() + keys.to_string().len();
-    let Some(left) = STATE_BYTES.checked_sub(fixed) else {
+    let Some(left) = budget.checked_sub(fixed) else {
         return State::TooLong;
     };
     let left = std::cell::Cell::new(left);
@@ -1605,6 +1618,27 @@ fn tokens_and_assignments(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The budget of a judge whose window is the smallest a current model
+    /// has.
+    const STATE_BYTES: usize = state_bytes(200_000);
+
+    #[test]
+    fn the_budget_is_the_judge_window_as_codex_counts_it_within_one_prompt() {
+        let fixed = JUDGE_INSTRUCTIONS.len() + VERDICT_SCHEMA.len() + ROOM_BYTES;
+        // A 200K window: its 95% less 256 tokens, at 4 bytes a token, less
+        // the instructions, the schema and the room.
+        assert_eq!(state_bytes(200_000), (190_000 - 256) * 4 - fixed);
+        assert!((state_bytes(200_000) + fixed).div_ceil(4) <= 200_000 * 95 / 100 - 256);
+        // A 128K window, Codex's when it knows none, takes less.
+        assert_eq!(state_bytes(128_000), (121_600 - 256) * 4 - fixed);
+        // A window past one prompt's worth is held to the prompt.
+        for window in [400_000, 1_000_000] {
+            assert_eq!(state_bytes(window), crate::PROMPT_BYTES - ROOM_BYTES);
+        }
+        // A window too small for the instructions has no room at all.
+        assert_eq!(state_bytes(1024), 0);
+    }
+
     #[test]
     fn the_outcome_decides_and_a_denial_carries_the_reason() {
         assert_eq!(verdict(&json!({"outcome":"allow"})), Some(Verdict::Allow));
@@ -2050,7 +2084,7 @@ mod tests {
             )],
             ..Intent::default()
         };
-        let State::Built(state) = build(&intent, &Redactor::default()) else {
+        let State::Built(state) = build(&intent, &Redactor::default(), STATE_BYTES) else {
             panic!()
         };
         assert_eq!(
@@ -2095,7 +2129,7 @@ mod tests {
             decisions,
             ..Intent::default()
         };
-        let State::Built(state) = build(&intent, &Redactor::default()) else {
+        let State::Built(state) = build(&intent, &Redactor::default(), STATE_BYTES) else {
             panic!()
         };
         let shown = state["decisions"].as_array().unwrap();
@@ -2119,7 +2153,7 @@ mod tests {
             decisions: vec![long, decision("ask:5/a1", "A", Some((6, "Publish now")))],
             ..intent.clone()
         };
-        let State::Built(cut) = build(&few, &Redactor::default()) else {
+        let State::Built(cut) = build(&few, &Redactor::default(), STATE_BYTES) else {
             panic!()
         };
         assert_eq!(cut["decisions"].as_array().unwrap().len(), 1);
@@ -2137,7 +2171,8 @@ mod tests {
         ));
         assert!(JUDGE_INSTRUCTIONS.contains("An open ask approves nothing"));
         // No asks, no field.
-        let State::Built(state) = build(&Intent::default(), &Redactor::default()) else {
+        let State::Built(state) = build(&Intent::default(), &Redactor::default(), STATE_BYTES)
+        else {
             panic!()
         };
         assert!(state.get("decisions").is_none());
@@ -2170,19 +2205,29 @@ mod tests {
                 message: None,
             }],
             transcript: transcript.finish(),
-            instructions: vec![("/w/AGENTS.md".into(), "\"".repeat(60 * 1024))],
+            instructions: vec![("/w/AGENTS.md".into(), "\"".repeat(STATE_BYTES / 2))],
             ..Intent::default()
         };
-        let State::Built(state) = build(&intent, &Redactor::default()) else {
+        let State::Built(state) = build(&intent, &Redactor::default(), STATE_BYTES) else {
             panic!()
         };
-        assert!(model_prompt(&state, &["c1"]).len() <= 256 * 1024);
+        assert!(model_prompt(&state, &["c1"]).len() <= crate::PROMPT_BYTES);
         assert!(state.to_string().len() <= STATE_BYTES);
+        // A judge with the largest budget still fits one prompt.
+        let most = state_bytes(1_000_000);
+        let mut fuller = intent.clone();
+        fuller.instructions[0].1 = "x".repeat(most * 3 / 4);
+        let State::Built(full) = build(&fuller, &Redactor::default(), most) else {
+            panic!()
+        };
+        assert!(full.to_string().len() <= most && full.to_string().len() > STATE_BYTES);
+        assert!(model_prompt(&full, &["c1"]).len() <= crate::PROMPT_BYTES);
         // The judge is told, in Codex's words, how to read what remains.
         assert_eq!(state["context_omission"], OMISSION);
-        // A 200 KiB script the call runs and a 200 KiB write are each shown
-        // whole, and the rest fitted around them, the newest kept.
-        let script = "echo step\n".repeat(200 * 1024 / 10);
+        // A script of most of the budget the call runs, and a write of it,
+        // are each shown whole, and the rest fitted around them, the newest
+        // kept.
+        let script = "echo step\n".repeat(STATE_BYTES * 95 / 100 / 11);
         for planned in [
             Planned {
                 arguments: json!({"command":"sh monitor.sh","sandbox_permissions":"require_escalated"}),
@@ -2197,10 +2242,10 @@ mod tests {
         ] {
             let mut whole = intent.clone();
             whole.planned = vec![planned.clone()];
-            let State::Built(state) = build(&whole, &Redactor::default()) else {
+            let State::Built(state) = build(&whole, &Redactor::default(), STATE_BYTES) else {
                 panic!()
             };
-            assert!(model_prompt(&state, &["c1"]).len() <= 256 * 1024);
+            assert!(model_prompt(&state, &["c1"]).len() <= crate::PROMPT_BYTES);
             assert_eq!(state["planned_calls"][0]["arguments"], planned.arguments);
             if let Some((path, content)) = planned.files.first() {
                 assert_eq!(
@@ -2220,7 +2265,10 @@ mod tests {
         // person.
         let mut over = intent.clone();
         over.planned[0].files = vec![("big.sh".into(), "x".repeat(STATE_BYTES))];
-        assert_eq!(build(&over, &Redactor::default()), State::TooLong);
+        assert_eq!(
+            build(&over, &Redactor::default(), STATE_BYTES),
+            State::TooLong
+        );
     }
 
     #[test]
@@ -2286,7 +2334,7 @@ mod tests {
             persons: Vec::new(),
             persons_cut: false,
         };
-        let State::Built(state) = build(&intent, &redactor) else {
+        let State::Built(state) = build(&intent, &redactor, STATE_BYTES) else {
             panic!()
         };
         assert_eq!(state["sandbox"]["mode"], "workspace-write");
@@ -2307,7 +2355,7 @@ mod tests {
         // judge told, as Codex tells its reviewer: the round is judged.
         let mut unnamed = intent.clone();
         unnamed.allowed_cut = true;
-        let State::Built(cut) = build(&unnamed, &redactor) else {
+        let State::Built(cut) = build(&unnamed, &redactor, STATE_BYTES) else {
             panic!()
         };
         assert_eq!(cut["already_allowed_cut"], true);
@@ -2315,7 +2363,7 @@ mod tests {
         assert!(state_text(&cut).find("context_omission") < state_text(&cut).find("planned_calls"));
         // Earlier prompts stop at their share, newest kept.
         intent.earlier = vec![person(&"n".repeat(40_000)), person(&"o".repeat(40_000))];
-        let State::Built(state) = build(&intent, &redactor) else {
+        let State::Built(state) = build(&intent, &redactor, STATE_BYTES) else {
             panic!()
         };
         assert_eq!(state["earlier_prompts"].as_array().unwrap().len(), 1);
@@ -2327,7 +2375,7 @@ mod tests {
             status: "succeeded",
         };
         intent.allowed = vec![call(&"x".repeat(STATE_TOKENS * 3)), call("make test")];
-        let State::Built(state) = build(&intent, &redactor) else {
+        let State::Built(state) = build(&intent, &redactor, STATE_BYTES) else {
             panic!()
         };
         assert_eq!(
@@ -2345,7 +2393,7 @@ mod tests {
             person(&"o".repeat(STATE_TOKENS * 4)),
             person(&"n".repeat(STATE_TOKENS * 4)),
         ];
-        let State::Built(state) = build(&intent, &redactor) else {
+        let State::Built(state) = build(&intent, &redactor, STATE_BYTES) else {
             panic!()
         };
         assert_eq!(state["request_cut"], true);
@@ -2361,7 +2409,7 @@ mod tests {
         ];
         // Older words left out still leave the newest to authorize, and the
         // judge is told.
-        let State::Built(state) = build(&intent, &redactor) else {
+        let State::Built(state) = build(&intent, &redactor, STATE_BYTES) else {
             panic!()
         };
         assert_eq!(state["request_cut"], true);
@@ -2373,7 +2421,7 @@ mod tests {
         intent.request = vec![person("deploy the site")];
         intent.request_cut = true;
         intent.allowed_cut = true;
-        let State::Built(state) = build(&intent, &redactor) else {
+        let State::Built(state) = build(&intent, &redactor, STATE_BYTES) else {
             panic!()
         };
         assert_eq!(state["request_cut"], true);
@@ -2395,7 +2443,7 @@ mod tests {
             refused: vec![push],
             ..person("ship it")
         }];
-        let State::Built(state) = build(&intent, &redactor) else {
+        let State::Built(state) = build(&intent, &redactor, STATE_BYTES) else {
             panic!()
         };
         let shown = json!([{"tool":"shell","arguments":r#"{"command":"git push origin main"}"#}]);
@@ -2405,7 +2453,7 @@ mod tests {
         // Calls being judged are shown whole past every share, within the
         // judge's input budget; past it they are not judged.
         intent.planned[0].arguments = json!({"command":"y".repeat(STATE_TOKENS * 3)});
-        let State::Built(state) = build(&intent, &redactor) else {
+        let State::Built(state) = build(&intent, &redactor, STATE_BYTES) else {
             panic!()
         };
         assert_eq!(
@@ -2413,7 +2461,7 @@ mod tests {
             intent.planned[0].arguments
         );
         intent.planned[0].arguments = json!({"command":"y".repeat(STATE_BYTES)});
-        assert_eq!(build(&intent, &redactor), State::TooLong);
+        assert_eq!(build(&intent, &redactor, STATE_BYTES), State::TooLong);
     }
 
     #[test]
@@ -2485,7 +2533,7 @@ mod tests {
             ],
             ..Intent::default()
         };
-        let State::Built(state) = build(&intent, &Redactor::default()) else {
+        let State::Built(state) = build(&intent, &Redactor::default(), STATE_BYTES) else {
             panic!()
         };
         // What the earlier prompts show is not shown twice; words to the
@@ -2502,7 +2550,7 @@ mod tests {
             persons: vec![said(None, 5, &long), said(None, 3, &long)],
             ..Intent::default()
         };
-        let State::Built(cut) = build(&many, &Redactor::default()) else {
+        let State::Built(cut) = build(&many, &Redactor::default(), STATE_BYTES) else {
             panic!()
         };
         assert_eq!(cut["persons_words"].as_array().unwrap().len(), 1);
