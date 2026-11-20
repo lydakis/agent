@@ -7,7 +7,7 @@ def profile(engine):
               'provider': 'loopback_http1_responses_sse', 'retries': 0,
               'consumer': 'fast_normalized_text_events', 'isolation': 'caller_host_permissions'}
     footprints = {
-        'rust': ['native_daemon', 'stdio_jsonl_protocol', 'sqlite_full_store', 'one_scheduler',
+        'rust': ['native_daemon', 'stdio_jsonl_protocol', 'sqlite_wal_normal_store', 'one_scheduler',
                  'bounded_text_output', 'echo_tool_registered_not_called'],
         'pi': ['node_runtime', 'agent_core_and_pi_ai', 'no_coding_agent_session_manager',
                'steering_and_tool_loop_available', 'no_tools_registered'],
@@ -33,7 +33,7 @@ def profile(engine):
     if engine == 'fixture':
         common = {'scenario': 'binary_transport_calibration_v1', 'durability': 'none'}
     if engine == 'rust':
-        common = {**common, 'durability': 'sqlite_full', 'consumer': 'observer_driven_stdio_protocol'}
+        common = {**common, 'durability': 'sqlite_wal_synchronous_normal', 'consumer': 'observer_driven_stdio_protocol'}
     if engine == 'opencode':
         common = {**common, 'durability': 'sqlite_wal_synchronous_normal',
                   'retries': 'native_retry_available_but_rejected_by_fixture'}

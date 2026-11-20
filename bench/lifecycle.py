@@ -233,8 +233,9 @@ def main():
     parser.add_argument('--transport', choices=('stdio', 'socket'), default='stdio')
     parser.add_argument('--memory-detail', action='store_true', help='sample PSS/USS where supported; adds observer overhead')
     parser.add_argument('--engine', choices=('rust', 'pi-durable'), default='rust')
-    parser.add_argument('--synchronous', choices=('full', 'normal'), default='full',
-                        help="Pi Durable's SQLite synchronous setting; Agent always uses FULL")
+    parser.add_argument('--synchronous', choices=('full', 'normal'),
+                        help="Pi Durable's SQLite synchronous setting (default full); "
+                             "Agent always uses NORMAL in WAL mode")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     out = args.out.resolve()
@@ -242,8 +243,9 @@ def main():
         parser.error('run from repository root with a new output under .local')
     if args.mode == 'shell' and 'shell' not in args.tools.split(','):
         parser.error('shell workload requires the shell tool')
-    if args.engine == 'rust' and args.synchronous != 'full':
-        parser.error('Agent has one durability setting, synchronous=FULL')
+    if args.engine == 'rust' and args.synchronous not in (None, 'normal'):
+        parser.error('Agent has one durability setting, synchronous=NORMAL')
+    args.synchronous = args.synchronous or ('normal' if args.engine == 'rust' else 'full')
     if args.engine != 'rust' and args.transport != 'stdio':
         parser.error('only Agent has a socket transport')
     try:

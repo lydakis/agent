@@ -2701,6 +2701,36 @@ const STATEMENTS: usize = 256;
 /// Well above what a checkpoint every 1,000 pages leaves, so a steady log
 /// is never cut.
 const WAL_KEPT: i64 = 16 * 1024 * 1024;
+/// The WAL pages after a commit that ask for a checkpoint: SQLite's own
+/// default for its automatic checkpoint, about 4 MiB.
+pub const CHECKPOINT_PAGES: std::os::raw::c_int = 1000;
+/// The WAL pages after a commit past which the writer checkpoints itself,
+/// as [`Database::checkpoint_aside`] says: about the 16 MiB a log is cut
+/// back to.
+pub const CHECKPOINT_HELD: std::os::raw::c_int = 4 * CHECKPOINT_PAGES;
+/// A connection that only checkpoints the WAL, on a thread of its own, so
+/// a checkpoint's syncs hold no commit. PASSIVE, as SQLite's automatic
+/// checkpoint is: it copies back what no reader still needs and waits for
+/// no one; the writer goes on appending meanwhile.
+pub struct Checkpointer(Connection);
+impl Checkpointer {
+    pub fn new(conn: Connection) -> Result<Self> {
+        // Synced as the writer's own checkpoint was: the WAL before its
+        // pages are copied back, the database after, flushing the drive
+        // on macOS. It reads through no page cache of its own.
+        conn.execute_batch(&format!(
+            "PRAGMA synchronous=NORMAL; PRAGMA checkpoint_fullfsync=ON;
+            PRAGMA cache_size=-64; PRAGMA journal_size_limit={WAL_KEPT};"
+        ))?;
+        Ok(Self(conn))
+    }
+    /// Checkpoint the WAL as far as its readers allow.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.0
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        Ok(())
+    }
+}
 /// Plans that don't depend on bound values: SQLite's query planner
 /// stability guarantee. The store never runs ANALYZE, so no statistics
 /// could make a plan better for one value than another. Without it, SQLite
@@ -3720,8 +3750,8 @@ impl Database {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
         conn.execute_batch(&format!(
-            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;
-            PRAGMA journal_size_limit={WAL_KEPT};"
+            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA synchronous=NORMAL;
+            PRAGMA checkpoint_fullfsync=ON; PRAGMA journal_size_limit={WAL_KEPT};"
         ))?;
         Ok(Self {
             conn,
@@ -3745,6 +3775,33 @@ impl Database {
         })
     }
 
+    /// Ask `ask` for a checkpoint once a commit leaves the WAL at
+    /// [`CHECKPOINT_PAGES`] or more, in place of SQLite's own, which runs
+    /// the checkpoint on this connection right after the commit: two syncs
+    /// under NORMAL, and every job queued behind that group would wait for
+    /// them. A [`Checkpointer`] on its own connection takes the ask.
+    ///
+    /// The WAL starts over only once a checkpoint has copied all of it
+    /// back, and a checkpoint beside the writer never catches up while
+    /// commits keep coming faster than it syncs. Past [`CHECKPOINT_HELD`]
+    /// pages the writer checkpoints itself, as SQLite would have: nothing
+    /// is appended meanwhile, so it copies back the whole log and the next
+    /// commit starts it over.
+    pub fn checkpoint_aside(&mut self, mut ask: impl FnMut() + Send + 'static) -> Result<()> {
+        self.conn
+            .wal_hook(Some(move |wal: &mut rusqlite::hooks::Wal, pages| {
+                if pages >= CHECKPOINT_HELD {
+                    // Busy while the checkpointer runs; the next commit tries
+                    // again. The commit itself has been made either way.
+                    let _ = wal.checkpoint();
+                } else if pages >= CHECKPOINT_PAGES {
+                    ask();
+                }
+                Ok(())
+            }))?;
+        Ok(())
+    }
+
     /// Set this connection's page cache to `kib`, as a reader's share of
     /// the readers' budget.
     pub fn cache_kib(&self, kib: usize) -> Result<()> {
@@ -3754,14 +3811,15 @@ impl Database {
     }
 
     pub fn initialize(conn: Connection) -> Result<Self> {
-        // FULL syncs the WAL before a commit is answered. An answer survives
-        // a daemon crash, but on macOS plain fsync can leave writes in the
-        // drive's cache: an OS crash or power loss can lose recent commits.
-        // Per-commit F_FULLFSYNC doubled daemon CPU on the light path, so it
-        // is off. Checkpoints retain full flushing to preserve WAL/database
-        // write ordering; this does not make later commits durable across
-        // an OS crash or power loss.
-        // Elsewhere both change nothing.
+        // NORMAL in WAL mode, as Codex's state database and SQLite's own
+        // advice for WAL have it: a commit writes the WAL and is answered
+        // without waiting for the disk, and only a checkpoint syncs (the
+        // WAL before it copies pages back, the database after). An answer
+        // survives a daemon crash or kill, since what the daemon wrote is
+        // the OS's; an OS crash or power loss can take back the last
+        // commits, never corrupting the store. On macOS checkpoints flush
+        // the drive (F_FULLFSYNC) to keep the WAL and database in order;
+        // elsewhere that pragma changes nothing.
         //
         // Each job runs in a savepoint inside its group's transaction, and
         // SQLite journals the pages a savepoint changes so it can roll back
@@ -3772,7 +3830,7 @@ impl Database {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
             PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
             PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;",
         )?;

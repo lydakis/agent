@@ -1196,6 +1196,9 @@ impl Command {
                 | Command::Audit { .. }
                 | Command::Prompts { .. }
                 | Command::ToolCalls { .. }
+                | Command::Pauses { .. }
+                | Command::Held { .. }
+                | Command::Processes { .. }
         )
     }
     /// A write that only records what its client says, which the write
@@ -2058,7 +2061,7 @@ struct Service {
     /// the bot's own socket listening, and its sandbox's placeholders, held
     /// by the same locks every sandbox's are, so no side removes one
     /// another's sandbox still mounts.
-    lent: HashMap<u64, Vec<agent_runtime::sandbox::Hold>>,
+    lent: HashMap<u64, Lent>,
     limit_active: usize,
     /// Per bot: the live turn. A parked turn's task ends while a resumed
     /// task may already own the slot.
@@ -2756,7 +2759,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "fallbacks":config.fallbacks.json(),
-        "durability":"sqlite_full","partial_text_durable":false});
+        "durability":"sqlite_wal_synchronous_normal","partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
     let mut callers: HashMap<u64, i64> = HashMap::new();
@@ -3695,6 +3698,11 @@ fn own_requests(
     })
 }
 
+/// What a session was lent, held until it closes: a lend fills it beside
+/// the run loop, and one that ends after its session closed drops its hold
+/// with the last reference.
+type Lent = Arc<std::sync::Mutex<Vec<agent_runtime::sandbox::Hold>>>;
+
 /// An in-process session, closed when what made it is dropped.
 struct Closing(Option<(session::Sender, u64)>);
 
@@ -4078,8 +4086,9 @@ impl Service {
                         && self.active.holding() + self.reserved + self.claims.len()
                             >= self.limit_active)
             }
-            // A read, or a wait, waits only for its own session's
-            // admissions, to be answered after them. Another session's are
+            // A read, a wait, or a lend of a bot's sandbox (a read of the
+            // bot) waits only for its own session's admissions, to be
+            // answered after them. Another session's are
             // not answered yet, so one that misses them misses nothing
             // anyone was told, and one session's admissions never hold
             // another's reads.
@@ -4089,7 +4098,10 @@ impl Service {
             Some(command)
                 if command.observes()
                     || command.records()
-                    || matches!(command, Command::Wait { .. } | Command::Hello { .. }) =>
+                    || matches!(
+                        command,
+                        Command::Wait { .. } | Command::Hello { .. } | Command::Lend { .. }
+                    ) =>
             {
                 (self.admissions.iter()).any(|admission| admission.session == session)
             }
@@ -6283,46 +6295,53 @@ impl Service {
                 Ok(answer)
             }
             Command::Lend { bot, bot_id } => {
-                let record = store
-                    .read("inspect", move |db| db.inspect_held(&bot, bot_id))
-                    .await?;
-                let id = record.bot_id;
-                // As its turns' commands get them, past what only a turn has.
-                let mut environment: Vec<(String, String)> = (record.settings.env.iter())
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect();
-                environment.push(("AGENT_BOT".into(), record.name.clone()));
-                environment.push(("AGENT_BOT_ID".into(), id.to_string()));
-                let mut policy = None;
-                if record.sandboxed() {
-                    let root = (record.workspace.clone().map(std::path::PathBuf::from))
-                        .ok_or_else(|| {
-                            Error::with("sandbox_unavailable", "the bot has no folder")
-                        })?;
-                    // Opening its socket may bind: off the runtime thread,
-                    // as for its turns.
-                    let (daemon, settings) =
-                        (self.registry.daemon().clone(), record.settings.clone());
-                    policy = tokio::task::spawn_blocking(move || {
-                        turn::bot_sandbox(&settings, &root, id, &daemon)
-                    })
-                    .await
-                    .map_err(|_| Error::new("sandbox_unavailable"))??;
-                }
-                if let Some(policy) = policy.as_mut() {
-                    // Held for the session, as for one of the bot's own
-                    // commands: its socket, and its placeholders and what
-                    // its command may not leave, gone once the session is.
-                    let hold = agent_runtime::sandbox::hold(policy).await;
-                    self.lent.entry(session).or_default().push(hold);
-                    policy.listening = None;
-                    if let Some(own) = policy.reach() {
-                        environment.push(("AGENT_SOCKET".into(), own.display().to_string()));
+                // Beside the loop, as a read is: the bot's record, its
+                // sandbox made and held, each of which can wait on a busy
+                // disk. What it holds goes with the session; one that closed
+                // meanwhile drops it as the lend ends.
+                let reader = store.reader();
+                let daemon = self.registry.daemon().clone();
+                // What every command's environment is; the bot's own
+                // settings, set after, win as they do for its commands.
+                let mut env = agent_runtime::tools::shell_environment_whole(&self.registry, &[]);
+                let lent = self.lent.entry(session).or_default().clone();
+                self.observe(session, output, id, async move {
+                    let record = reader
+                        .read("inspect", move |db| db.inspect_held(&bot, bot_id))
+                        .await?;
+                    let id = record.bot_id;
+                    // As its turns' commands get them, past what only a turn has.
+                    env.extend(record.settings.env.clone());
+                    env.insert("AGENT_BOT".into(), record.name.clone());
+                    env.insert("AGENT_BOT_ID".into(), id.to_string());
+                    let mut policy = None;
+                    if record.sandboxed() {
+                        let root = (record.workspace.clone().map(std::path::PathBuf::from))
+                            .ok_or_else(|| {
+                                Error::with("sandbox_unavailable", "the bot has no folder")
+                            })?;
+                        // Opening its socket may bind: off the runtime thread,
+                        // as for its turns.
+                        let settings = record.settings.clone();
+                        policy = tokio::task::spawn_blocking(move || {
+                            turn::bot_sandbox(&settings, &root, id, &daemon)
+                        })
+                        .await
+                        .map_err(|_| Error::new("sandbox_unavailable"))??;
                     }
-                }
-                let env =
-                    agent_runtime::tools::shell_environment_whole(&self.registry, &environment);
-                Ok(json!({"bot": record.name, "bot_id": id, "policy": policy, "env": env}))
+                    if let Some(policy) = policy.as_mut() {
+                        // Held for the session, as for one of the bot's own
+                        // commands: its socket, and its placeholders and what
+                        // its command may not leave, gone once the session is.
+                        let hold = agent_runtime::sandbox::hold(policy).await;
+                        lent.lock().unwrap_or_else(|e| e.into_inner()).push(hold);
+                        policy.listening = None;
+                        if let Some(own) = policy.reach() {
+                            env.insert("AGENT_SOCKET".into(), own.display().to_string());
+                        }
+                    }
+                    Ok(json!({"bot": record.name, "bot_id": id, "policy": policy, "env": env}))
+                })
             }
             Command::Inspect { bot, bot_id } => {
                 let reader = store.reader();
@@ -6408,18 +6427,22 @@ impl Service {
                 limit,
                 newest,
             } => {
-                store
-                    .read("pauses", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("pauses", move |db| {
                         db.pauses(after, before, limit.unwrap_or(64), newest)
-                    })
+                    }))
                     .await
+                })
             }
             Command::Held { after, limit, bot } => {
-                store
-                    .read("held", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("held", move |db| {
                         db.held(after, limit.unwrap_or(64), bot.as_deref())
-                    })
+                    }))
                     .await
+                })
             }
             Command::Processes { bot, after } => {
                 if bot.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
@@ -6437,12 +6460,14 @@ impl Service {
                         }
                     },
                 };
-                store
-                    .read("processes", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("processes", move |db| {
                         let after = after.as_ref().map(|(bot, id)| (bot.as_str(), *id));
                         Ok(serde_json::to_value(db.processes(bot.as_deref(), after)?)?)
-                    })
+                    }))
                     .await
+                })
             }
             Command::StopProcess { bot, handle } => {
                 let id = match handles::Handle::parse(&handle) {
@@ -7146,21 +7171,26 @@ impl Service {
                 }
                 let waiter = self.handles.request_waiter();
                 let deadline = timeout_ms.map(|t| handles::now_ms() + t);
-                self.handles
-                    .attach(
-                        store,
-                        waiter,
-                        &handles,
-                        deadline,
-                        any,
-                        Completion::Respond {
-                            session,
-                            output: output.clone(),
-                            request: id,
-                            reader: store.reader(),
-                        },
-                    )
-                    .await;
+                let reader = store.reader();
+                // Registered here, so a result told from now on reaches it
+                // and its session's close lets it go; the results already
+                // stored are read beside the loop, which a slow disk would
+                // otherwise hold for every handle's read in turn.
+                let generation = self.handles.register(
+                    waiter,
+                    &handles,
+                    any,
+                    Completion::Respond {
+                        session,
+                        output: output.clone(),
+                        request: id,
+                        reader: reader.clone(),
+                    },
+                );
+                let registry = self.handles.clone();
+                tokio::spawn(async move {
+                    (registry.settle(&reader, waiter, generation, &handles, deadline)).await;
+                });
                 // The response is sent by the completion, not by this dispatch.
                 Err(Error::new("deferred"))
             }
@@ -10588,7 +10618,43 @@ mod tests {
             bot: "A".into(),
             bot_id: Some(bot_id),
         };
-        for command in [approvals(), inspect] {
+        // Listings and a lend of a bot's sandbox, which read and decide
+        // nothing, as the reads above.
+        let pauses = || Command::Pauses {
+            after: 0,
+            before: None,
+            limit: None,
+            newest: false,
+        };
+        let listed = || Command::Held {
+            after: 0,
+            limit: None,
+            bot: None,
+        };
+        let processes = || Command::Processes {
+            bot: None,
+            after: None,
+        };
+        let lend = || Command::Lend {
+            bot: "A".into(),
+            bot_id: Some(bot_id),
+        };
+        for command in [pauses(), listed(), processes(), lend()] {
+            assert!(
+                !service.must_settle(Some(&command), 1, &output, Bound::default()),
+                "another session's admission holds no {}",
+                command.op()
+            );
+            assert!(service.must_settle(Some(&command), 0, &output, Bound::default()));
+        }
+        for command in [
+            approvals(),
+            inspect,
+            pauses(),
+            listed(),
+            processes(),
+            lend(),
+        ] {
             let deferred = (service.dispatch(command, 1, &output, json!("r"), Bound::default()))
                 .await
                 .unwrap_err();
@@ -10632,6 +10698,61 @@ mod tests {
             let (_, _, _, started) = service.settle().await;
             started.unwrap();
         }
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_wait_reads_what_its_handles_have_beside_the_loop() {
+        let dir = scratch("wait-beside");
+        let (store, _publications) = Store::open_with(&dir.join("state.sqlite"), 1)
+            .await
+            .unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        requests(&mut service, vec![create("A", &dir)], &output).await;
+        // The one reader, held, as a read is on a busy disk.
+        let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let (began, running) = tokio::sync::oneshot::channel::<()>();
+        let held = tokio::spawn({
+            let store = store.clone();
+            async move {
+                (store.read("hold", move |_| {
+                    let _ = began.send(());
+                    let _ = wait.recv();
+                    Ok(())
+                }))
+                .await
+            }
+        });
+        running.await.unwrap();
+        let (daemon, client) = tokio::io::duplex(1 << 16);
+        let asker = Output::writer(daemon);
+        let command = Command::Wait {
+            handles: vec!["A/1".into()],
+            timeout_ms: Some(0),
+            any: false,
+        };
+        let deferred = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.dispatch(command, 1, &asker, json!("w"), Bound::default()),
+        )
+        .await
+        .expect("the loop goes on while the wait's read waits for a reader");
+        assert_eq!(deferred.unwrap_err().code, "deferred");
+        // Once the reader is free the wait is answered: no such turn.
+        gate.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(client));
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the wait is answered")
+            .unwrap()
+            .unwrap();
+        let answer: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(answer["id"], json!("w"));
+        assert!(answer["result"]["results"]["A/1"].is_object(), "{answer}");
         drop(service);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);

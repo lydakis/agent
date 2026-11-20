@@ -518,8 +518,22 @@ impl Handles {
         any: bool,
         completion: Completion,
     ) {
+        let generation = self.register(waiter, handles, any, completion);
+        (self.settle(&store.reader(), waiter, generation, handles, deadline_ms)).await;
+    }
+
+    /// The first half of `attach`: `waiter` registered for `handles`, so
+    /// any result told from now on reaches it. Answers the registration's
+    /// generation, for `settle`.
+    pub fn register(
+        &self,
+        waiter: Waiter,
+        handles: &[String],
+        any: bool,
+        completion: Completion,
+    ) -> u64 {
         let parsed: Vec<Result<Handle>> = handles.iter().map(|h| Handle::parse(h)).collect();
-        let generation = {
+        {
             let mut inner = self.inner.lock().unwrap();
             inner.next_generation += 1;
             let generation = inner.next_generation;
@@ -555,9 +569,23 @@ impl Handles {
                 },
             );
             generation
-        };
-        for (text, parsed) in handles.iter().zip(parsed) {
-            if let Some((result, durable)) = self.settled(store, text, parsed).await {
+        }
+    }
+
+    /// The second half of `attach`: the results `handles` already have,
+    /// read from the store, and then the deadline, for the waiter
+    /// `register` registered as `generation`. Off the run loop it holds
+    /// nothing up, however long the reads take.
+    pub async fn settle(
+        &self,
+        reader: &Reader,
+        waiter: Waiter,
+        generation: u64,
+        handles: &[String],
+        deadline_ms: Option<u64>,
+    ) {
+        for text in handles {
+            if let Some((result, durable)) = self.settled(reader, text, Handle::parse(text)).await {
                 let mut inner = self.inner.lock().unwrap();
                 if inner
                     .waiters
@@ -606,7 +634,7 @@ impl Handles {
     /// The flag says whether it is durable rather than an error reading it.
     async fn settled(
         &self,
-        store: &Store,
+        store: &Reader,
         text: &str,
         parsed: Result<Handle>,
     ) -> Option<(Arc<Value>, bool)> {
@@ -665,7 +693,7 @@ impl Handles {
         let mut results = self.take(turn);
         for handle in handles {
             if !results.contains_key(handle) {
-                let found = self.settled(store, handle, Handle::parse(handle)).await;
+                let found = (self.settled(&store.reader(), handle, Handle::parse(handle))).await;
                 let result = found.map_or_else(|| Arc::new(json!({"pending":true})), |(r, _)| r);
                 results.insert(handle.clone(), result);
             }

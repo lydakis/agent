@@ -31,6 +31,33 @@ pub use db::{
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 
+/// The WAL's checkpoints, off the writer: a thread with a connection of
+/// its own takes the writer's asks, one at a time, each counted as the
+/// `checkpoint` operation from when it was asked for. Asks made while one
+/// runs become the next. It ends once the writer's connection, which holds
+/// the asking end, closes.
+fn checkpoints(
+    path: &Path,
+    db: &mut Database,
+    counters: std::sync::Arc<Counters>,
+) -> Result<std::thread::JoinHandle<()>> {
+    let checkpointer = db::Checkpointer::new(Connection::open(path)?)?;
+    let (ask, asked) = std::sync::mpsc::sync_channel::<std::time::Instant>(1);
+    let thread = std::thread::Builder::new()
+        .name("agent-storage-checkpoint".into())
+        .spawn(move || {
+            while let Ok(queued) = asked.recv() {
+                let started = std::time::Instant::now();
+                let failed = checkpointer.checkpoint().is_err();
+                counters.record("checkpoint", queued, started, failed);
+            }
+        })?;
+    db.checkpoint_aside(move || {
+        let _ = ask.try_send(std::time::Instant::now());
+    })?;
+    Ok(thread)
+}
+
 /// The store's main file readable and writable by its owner alone, made so
 /// when it is new, before SQLite first opens it: SQLite gives the `-wal`
 /// and `-shm` it makes beside the main file that file's mode, so one mode
@@ -738,7 +765,13 @@ impl Store {
         std::thread::Builder::new()
             .name("agent-storage".into())
             .spawn(move || {
-                let opened: Result<(Database, File, std::path::PathBuf)> = (|| {
+                #[allow(clippy::type_complexity)]
+                let opened: Result<(
+                    Database,
+                    File,
+                    std::path::PathBuf,
+                    std::thread::JoinHandle<()>,
+                )> = (|| {
                     if let Some(parent) = path.parent() {
                         // A folder made here is the daemon's user's alone;
                         // one that exists keeps the mode its maker gave it.
@@ -806,11 +839,12 @@ impl Store {
                         Err(error) => return Err(error.into()),
                     }
                     owner_only(&path)?;
-                    let db = Database::initialize(Connection::open(&path)?)?;
-                    Ok((db, lock, path))
+                    let mut db = Database::initialize(Connection::open(&path)?)?;
+                    let checkpoints = checkpoints(&path, &mut db, worker_counters.clone())?;
+                    Ok((db, lock, path, checkpoints))
                 })();
                 match opened {
-                    Ok((mut db, _lock, path)) => {
+                    Ok((mut db, _lock, path, checkpoints)) => {
                         let mut watermark = match db.last_event_id() {
                             Ok(id) => id,
                             Err(error) => {
@@ -908,6 +942,11 @@ impl Store {
                                 publisher.blocking_send(publication).is_ok()
                             });
                         }
+                        // The writer's connection holds the checkpointer's
+                        // asking end: closed, it lets the checkpointer go,
+                        // which ends before the owner lock does.
+                        drop(db);
+                        let _ = checkpoints.join();
                     }
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -1804,18 +1843,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commits_sync_plainly_and_checkpoints_flush_the_drive() {
+    async fn commits_wait_for_no_sync_and_checkpoints_flush_the_drive() {
         let store = scratch_store("fullfsync").await;
+        // synchronous: 1 is NORMAL, 2 FULL.
         let writer = store
-            .call(|db| Ok((db.pragma("fullfsync"), db.pragma("checkpoint_fullfsync"))))
+            .call(|db| {
+                Ok((
+                    db.pragma("synchronous"),
+                    db.pragma("fullfsync"),
+                    db.pragma("checkpoint_fullfsync"),
+                ))
+            })
             .await
             .unwrap();
-        assert_eq!(writer, (0, 1));
+        assert_eq!(writer, (1, 0, 1));
         let reader = store
-            .read("pragma", |db| Ok(db.pragma("checkpoint_fullfsync")))
+            .read("pragma", |db| {
+                Ok((db.pragma("synchronous"), db.pragma("checkpoint_fullfsync")))
+            })
             .await
             .unwrap();
-        assert_eq!(reader, 1);
+        assert_eq!(reader, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_long_log_is_checkpointed_beside_the_writer_and_starts_over() {
+        let store = scratch_store("checkpoint").await;
+        store
+            .call(|db| Ok(db.connection().execute_batch("CREATE TABLE b(x BLOB)")?))
+            .await
+            .unwrap();
+        // About 1,500 pages of WAL, in commits of 50.
+        for _ in 0..30 {
+            (store.call(|db| {
+                db.connection().execute_batch(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<50)
+                    INSERT INTO b SELECT randomblob(4000) FROM n",
+                )?;
+                Ok(())
+            }))
+            .await
+            .unwrap();
+        }
+        let checkpoints = || store.stats()["operations"]["checkpoint"]["count"].as_u64();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while checkpoints().is_none_or(|n| n == 0) {
+            assert!(std::time::Instant::now() < deadline, "no checkpoint ran");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Asks made while one ran run after it; once none is left, all of
+        // the log is copied back, so the next commit starts it over and
+        // the log holds that commit alone.
+        let mut seen = checkpoints();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if checkpoints() == seen {
+                break;
+            }
+            seen = checkpoints();
+        }
+        (store.call(|db| Ok(db.connection().execute("INSERT INTO t VALUES (1)", [])?)))
+            .await
+            .unwrap();
+        // Its frames in the log, which a checkpoint names first.
+        let log: i64 = Connection::open(scratch_path("checkpoint"))
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
+            .unwrap();
+        assert!(log < 10, "the WAL went on from {log} frames");
     }
 
     #[tokio::test]
