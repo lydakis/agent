@@ -1006,6 +1006,7 @@ def run(arm, n, bins, model, spec=None):
             main += [f'--- main:{path}', shown.stdout or '(none)']
         (out / 'main.txt').write_text('\n'.join(main) + '\n')
         messages(home, out)
+        noted_titles(home, out)
         automation_runs(home, out)
         asks(home, out)
         if DAY is BURST:
@@ -1171,17 +1172,36 @@ def automation_notes(parts, out):
     runs.write_text(text)
 
 
+def noted_titles(home, out):
+    """Each agent's title as Sonny noted it beside the store: the one a
+    model wrote (`NAME@`), else its first message's."""
+    noted = {}
+    folder = home / '.agent/state.sqlite.titles'
+    for path in sorted(folder.iterdir()) if folder.is_dir() else []:
+        bot = path.name.rstrip('@')
+        title = path.read_text().partition('\n')[2].strip()
+        if path.name.endswith('@') or bot not in noted:
+            noted[bot] = title
+    (out / 'noted-titles.json').write_text(json.dumps(noted, indent=1))
+
+
 def titles(parts, out):
-    """Each task's title as the lead set it with `start_task`, its brief's
-    first line, beside its name, for T1: whether a title reads as work the
-    person would know."""
+    """Each task's title as the person sees it, written by the title model
+    from its brief as Codex titles a thread, beside its name, for T1:
+    whether a title reads as work the person would know. A run with no
+    noted titles shows each brief's first line."""
+    noted_file = out / 'noted-titles.json'
+    noted = json.loads(noted_file.read_text()) if noted_file.exists() else {}
     lines = []
     for p in parts:
         for c in p['calls']:
             given = c['input'] if isinstance(c['input'], dict) else {}
             if c['name'] == 'start_task' or ('name' in given and 'brief' in given):
-                first = next((line.strip() for line in str(given.get('brief', '')).splitlines() if line.strip()), '')
-                lines.append(f"- {given.get('name', '?')}: {first or '(no title)'}")
+                name = given.get('name', '?')
+                title = next((t for bot, t in noted.items() if bot == name or bot.endswith('.' + name)), None)
+                if title is None:
+                    title = next((line.strip() for line in str(given.get('brief', '')).splitlines() if line.strip()), '')
+                lines.append(f"- {name}: {title or '(no title)'}")
     (out / 'titles.md').write_text('\n'.join(lines) + '\n' if lines else '(no task started)\n')
 
 
@@ -1226,9 +1246,9 @@ def blind():
             if shared:
                 text = text.replace(os.path.join(shared, Path(build).relative_to(shared).parts[0]),
                                     os.path.join(shared, 'ARM'))
-        # T1 scores each task's title as the lead set it.
+        # T1 scores each task's title as the person sees it.
         if (RUNS / run_name / 'titles.md').exists():
-            text += '\n\n## Titles the lead set\n\n' + (RUNS / run_name / 'titles.md').read_text()
+            text += '\n\n## Titles of the tasks\n\n' + (RUNS / run_name / 'titles.md').read_text()
         # C1 scores what main ended up holding: carry it under the same name.
         if (RUNS / run_name / 'main.txt').exists():
             text += '\n### MAIN AT THE END (scoring only)\n\n```\n' + (RUNS / run_name / 'main.txt').read_text() + '```\n'

@@ -5187,7 +5187,13 @@ mod tests {
                 "setup": true}),
             "Started calc.fix: {\"handle\":\"calc.fix/3\"}",
         );
-        assert_eq!(task, ["• Started fix", "  └ Fix the failing tests"]);
+        assert_eq!(
+            task,
+            [
+                "• Started fix",
+                "  └ Fix the failing tests They fail on main."
+            ]
+        );
         // An agent a lead makes, and closes when its work is done.
         let made = clean(
             "spawn_agent",

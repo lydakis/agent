@@ -427,6 +427,9 @@ pub type Parse = fn(&str, &[&str]) -> Result<Answers, String>;
 pub struct Reply {
     pub schema: &'static str,
     pub parse: Parse,
+    /// Who the turn's prompt is said by, which clients draw so: the
+    /// reviewer, or what else a fork answers for.
+    pub origin: &'static str,
 }
 
 /// Whether a bot record is a judge given `instructions`, or an older
@@ -475,7 +478,7 @@ pub async fn turn_with(
             "submit",
             // Said by the judge, not the person: clients draw it so.
             json!({"bot": name, "request_id": name, "prompt": prompt, "delivery": "queue",
-                "origin": "reviewer", "output_schema": schema}),
+                "origin": reply.origin, "output_schema": schema}),
         )
         .await
     {

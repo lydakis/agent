@@ -1623,7 +1623,8 @@ Keep the rest.'"#,
             ),
             "Started fix"
         );
-        // Under it, the task's title, its brief's first line, never the rest.
+        // Under it, the task's brief on one line, as Codex shows a thread's
+        // first message until its title is written.
         let said = declared(
             "start_task",
             &serde_json::json!({"name": "fix", "brief": "\nFix the sums\nRound half cents to even."}),
@@ -1631,7 +1632,10 @@ Keep the rest.'"#,
         )
         .unwrap();
         assert_eq!(said.under.len(), 1);
-        assert_eq!(said.under[0].to_string(), "Fix the sums");
+        assert_eq!(
+            said.under[0].to_string(),
+            "Fix the sums Round half cents to even."
+        );
         assert_eq!(
             call("remove_task", serde_json::json!({"task": "fix"})),
             "Cleaned up fix"

@@ -214,6 +214,7 @@ enum Judged {
 const VERDICT: judge::Reply = judge::Reply {
     schema: policy::VERDICT_SCHEMA,
     parse: policy::assessments,
+    origin: "reviewer",
 };
 
 struct Judge {

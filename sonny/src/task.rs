@@ -43,8 +43,8 @@ enum Undo {
 /// A `start_task` call.
 pub struct Start {
     pub name: String,
-    /// Everything the task needs; its first line is the title the person
-    /// knows it by, noted beside its name.
+    /// Everything the task needs, of which a model writes the title the
+    /// person knows it by, noted beside its name.
     pub brief: String,
     pub profile: Option<String>,
     /// One of the person's `/permissions` rows to hold the task in, at
@@ -548,8 +548,11 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         // Noted by the id it started with, which no agent given its name
         // later has.
         let started: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        // Its brief shows until a model wrote its title, as Codex titles
+        // a thread.
         if let Some(id) = started["bot_id"].as_i64() {
             let _ = crate::title::note(store, name, id, &crate::title::of_message(&start.brief));
+            crate::title::spawn(&start.env, name, id, &start.brief);
         }
         match profile {
             Some(profile) => {

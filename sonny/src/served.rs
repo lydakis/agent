@@ -157,9 +157,7 @@ fn start() -> Value {
                     "description": "A short name for the task, valid as a git branch name, that no agent of \
                         this project has yet; Sonny puts your project's name and a dot before it."},
                 "brief": {"type": "string", "minLength": 1,
-                    "description": "Everything the task needs, since it never sees your conversation. \
-                        Its first line is the title the person knows the task by, so write it as one: \
-                        a few words, 60 characters at most, as Round half cents to even."},
+                    "description": "Everything the task needs, since it never sees your conversation."},
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
@@ -262,9 +260,9 @@ fn project() -> Value {
             "type": "object",
             "properties": {
                 "folder": {"type": "string", "minLength": 1, "description": "The project's folder, absolute."},
-                "title": {"type": "string", "minLength": 1,
-                    "description": "What the person calls the project, as Tally invoices; they \
-                        can change it in its file."},
+                "title": {"type": "string", "minLength": 1, "maxLength": 36,
+                    "description": "What the person calls the project, in a few words, as Tally \
+                        invoices; they can change it in its file."},
                 "model": {"type": "string", "minLength": 1,
                     "description": "The lead's PROVIDER/MODEL, as the person picked; else yours."},
                 "effort": {"type": "string", "minLength": 1, "description": "The lead's effort level."},
