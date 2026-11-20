@@ -19,7 +19,7 @@ CREATE INDEX nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
 ALTER TABLE bots ADD COLUMN family_start INTEGER;
 CREATE INDEX bots_family_start ON bots(family_start) WHERE family_start IS NOT NULL;
 CREATE TABLE switches(id INTEGER PRIMARY KEY AUTOINCREMENT,
-    bot_id INTEGER NOT NULL, node INTEGER, root INTEGER, first INTEGER, left INTEGER,
+    bot_id INTEGER, node INTEGER, root INTEGER, first INTEGER, left INTEGER,
     back INTEGER NOT NULL, from_provider TEXT NOT NULL, from_family TEXT NOT NULL,
     from_model TEXT NOT NULL, from_reasoning TEXT, to_provider TEXT NOT NULL,
     to_family TEXT NOT NULL, to_model TEXT NOT NULL, to_reasoning TEXT,

@@ -3829,7 +3829,7 @@ impl Database {
                 parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS switches(id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_id INTEGER NOT NULL, node INTEGER, root INTEGER, first INTEGER, left INTEGER,
+                bot_id INTEGER, node INTEGER, root INTEGER, first INTEGER, left INTEGER,
                 back INTEGER NOT NULL, from_provider TEXT NOT NULL, from_family TEXT NOT NULL,
                 from_model TEXT NOT NULL, from_reasoning TEXT, to_provider TEXT NOT NULL,
                 to_family TEXT NOT NULL, to_model TEXT NOT NULL, to_reasoning TEXT,
@@ -16437,9 +16437,13 @@ impl Database {
                 node = free_node(&tx, id, name)?;
                 freed += 1;
             }
+            // A branch a deleted bot left that another bot's history still
+            // reached then is freed by the deletion after it.
             let left: Vec<(i64, i64)> = tx
                 .prepare_cached(
-                    "SELECT id,left FROM switches WHERE bot_id=? AND left IS NOT NULL ORDER BY id",
+                    "SELECT id,left FROM switches WHERE bot_id=?1 AND left IS NOT NULL
+                     UNION ALL SELECT id,left FROM switches WHERE bot_id IS NULL AND left IS NOT NULL
+                     ORDER BY id",
                 )?
                 .query_map([bot.bot_id], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
@@ -16464,11 +16468,26 @@ impl Database {
                     id = parent;
                 }
             }
+            tx.execute(
+                "DELETE FROM switches WHERE bot_id IS NULL
+                   AND (left IS NULL OR NOT EXISTS(SELECT 1 FROM nodes WHERE id=switches.left))",
+                [],
+            )?;
             if freed == before {
                 break;
             }
         }
-        tx.execute("DELETE FROM switches WHERE bot_id=?", [bot.bot_id])?;
+        // What still holds a branch this bot left keeps it past the bot:
+        // the switch stays, owned by none, for a later deletion to free.
+        tx.execute(
+            "DELETE FROM switches WHERE bot_id=?
+               AND (left IS NULL OR NOT EXISTS(SELECT 1 FROM nodes WHERE id=switches.left))",
+            [bot.bot_id],
+        )?;
+        tx.execute(
+            "UPDATE switches SET bot_id=NULL WHERE bot_id=?",
+            [bot.bot_id],
+        )?;
         tx.execute("DELETE FROM events WHERE bot=?", [name])?;
         // The identity's name and creation key outlive it, so a resent
         // delete is told apart from a delete of some other identity, and a

@@ -1784,6 +1784,23 @@ class SwitchFamilyTests(unittest.TestCase):
         self.assertNotIn('reply:fourth', json.dumps(items))
         self.assert_all_freed(client, path, 'Bob')
 
+    def test_a_branch_left_behind_is_freed_by_whichever_agent_goes_last(self):
+        # A fork holds the summary written for the new family, which points
+        # back at the one on the branch Bob left: Bob deleted first cannot
+        # free that branch, and the fork deleted after must.
+        client, openai, anthropic, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        client.request('configure', bot='Bob', compaction_instructions='Summarize.')
+        self.run_turn(client, '1', 'tool:first')
+        self.run_turn(client, '2', 'hello')
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.run_turn(client, '3', 'third')
+        client.request('configure', bot='Bob', model='anthropic/synthetic-claude', effort='low')
+        self.run_turn(client, '4', 'fourth')
+        fork = client.request('fork', source='Bob', bot='Copy', workspace=str(path))
+        self.assertIn('result', fork, fork)
+        self.assert_all_freed(client, path, 'Bob', 'Copy')
+
 
 class ModelFixture(unittest.TestCase):
     handler = Model
