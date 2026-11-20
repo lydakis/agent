@@ -1467,11 +1467,12 @@ fn project_mark(
             provider,
             workspace,
             profile,
+            closed,
         } = agent;
         (name, bot_id, head, running_turn, status).hash(&mut mark);
         waiting_on.to_string().hash(&mut mark);
         (last, started_ms, expire_ms, created_by, created_by_id).hash(&mut mark);
-        (model, provider, workspace, profile).hash(&mut mark);
+        (model, provider, workspace, profile, closed).hash(&mut mark);
     }
     held.hash(&mut mark);
     marks.hash(&mut mark);
