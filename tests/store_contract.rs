@@ -8077,7 +8077,8 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
         .unwrap()
         .unwrap();
     assert!(!db.switch_piece(&mut pieces).unwrap());
-    assert!(nodes() > before);
+    assert!(!db.switch_piece(&mut pieces).unwrap());
+    assert!(nodes() > before + 512);
     assert_eq!(
         db.switch_begin("Bob", None, Family::Anthropic, &custom)
             .err()
@@ -8086,9 +8087,42 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
         "bot_busy"
     );
     assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
-    db.switch_settle(pieces.bot_id()).unwrap();
+    // Let go, the bot is free at once, and what it wrote is freed a page
+    // at a time.
+    assert!(db.switch_release(pieces.bot_id()).unwrap());
+    assert!(db.switch_reclaim().unwrap());
+    assert!(nodes() > before);
+    while db.switch_reclaim().unwrap() {}
     assert_eq!(nodes(), before);
     assert_eq!(db.inspect("Bob").unwrap().head, head);
+    let claude = Switch {
+        provider: "anthropic",
+        model: "synthetic-claude",
+        effort: None,
+        family: Family::Anthropic,
+        custom: Default::default(),
+    };
+    // Written for tools the change no longer shows as custom, it is
+    // refused as stale, and nothing moves.
+    let other: std::collections::HashSet<String> = ["apply_patch".to_owned()].into();
+    let mut pieces = db
+        .switch_begin("Bob", None, Family::Anthropic, &other)
+        .unwrap()
+        .unwrap();
+    while !db.switch_piece(&mut pieces).unwrap() {}
+    assert_eq!(
+        db.switch_family("Bob", None, &claude, Some(pieces))
+            .unwrap_err()
+            .code,
+        "switch_stale"
+    );
+    assert_eq!(db.inspect("Bob").unwrap().head, head);
+    assert!(
+        db.switch_release(db.inspect("Bob").unwrap().bot_id)
+            .unwrap()
+    );
+    while db.switch_reclaim().unwrap() {}
+    assert_eq!(nodes(), before);
     // Taken: a turn sent while it translates waits, then runs in the new
     // family, on the history the pages wrote.
     let mut pieces = db
@@ -8107,18 +8141,7 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
     assert_eq!(pages, 3);
     let written = nodes() - before;
     let switched = db
-        .switch_family(
-            "Bob",
-            None,
-            &Switch {
-                provider: "anthropic",
-                model: "synthetic-claude",
-                effort: None,
-                family: Family::Anthropic,
-                custom: Default::default(),
-            },
-            Some(pieces),
-        )
+        .switch_family("Bob", None, &claude, Some(pieces))
         .unwrap()
         .unwrap();
     assert_eq!(switched["translated"], json!(written));

@@ -28,7 +28,7 @@ CREATE INDEX switches_bot ON switches(bot_id,id);
 CREATE INDEX switches_left ON switches(left) WHERE left IS NOT NULL;
 CREATE TABLE translated(node INTEGER PRIMARY KEY, source INTEGER NOT NULL);
 CREATE INDEX translated_source ON translated(source);
-CREATE TABLE translating(bot_id INTEGER PRIMARY KEY, tip INTEGER);
+CREATE TABLE translating(id INTEGER PRIMARY KEY, bot_id INTEGER UNIQUE, tip INTEGER);
 PRAGMA user_version=111;
 """
 

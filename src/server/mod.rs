@@ -5242,7 +5242,8 @@ impl Service {
         // history is translated a page at a time beside the run loop first.
         let change = match (&prepared, &change.model) {
             (None, Some(reference)) if !rules_only => {
-                match self.switch_begin(&bot, bot_id, reference).await? {
+                match (self.switch_begin(&bot, bot_id, reference, change.effort.as_deref())).await?
+                {
                     Some(translation) => {
                         self.switch_pieces(bot, bot_id, change, asker, translation);
                         return Err(Error::new("deferred"));
@@ -5601,6 +5602,7 @@ impl Service {
         bot: &str,
         bot_id: Option<i64>,
         reference: &str,
+        effort: Option<&str>,
     ) -> Result<Option<agent_runtime::store::Translation>> {
         let (provider, _) = split_model(reference)?;
         let Some(served) = self.providers.get(provider) else {
@@ -5614,6 +5616,10 @@ impl Service {
         let to = served.family();
         if to == record.family()? || record.running_turn.is_some() || record.head.is_none() {
             return Ok(None);
+        }
+        // Refused before anything is written, as it would be after.
+        if let Some(level) = effort {
+            to.check_effort(level)?;
         }
         let custom = custom_tools(served, &record);
         let name = bot.to_owned();
@@ -5685,19 +5691,29 @@ impl Service {
         };
         self.switching.prepared.remove(&bot);
         self.switching.bots.remove(&bot);
+        // One no change took lets its bot go on at once; what it wrote is
+        // freed a page per store job, beside the run loop.
         let name = bot.clone();
-        let settled = self
+        let released = self
             .store
-            .op("switch_settle", move |db| {
+            .op("switch_release", move |db| {
                 let id = match held {
                     Some(id) => id,
                     None => db.identity(&name, bot_id)?,
                 };
-                db.switch_settle(id)
+                db.switch_release(id)
             })
             .await;
-        match settled {
+        match released {
             Err(error) if error.code == "storage_error" => return Err(error),
+            Ok(true) => {
+                let store = self.store.clone();
+                self.retention.spawn(async move {
+                    while let Ok(true) = store.op("switch_reclaim", |db| db.switch_reclaim()).await
+                    {
+                    }
+                });
+            }
             _ => {}
         }
         self.ready_hint = true;
@@ -5726,6 +5742,10 @@ impl Service {
         // the end costs the submissions after it nothing; once the end is
         // committing, the store says.
         if !self.kept.contains(bot) || self.active.get(bot).and_then(Active::running).is_some() {
+            return Ok(());
+        }
+        // Its history is being translated for it: it is taken once it is.
+        if self.switching.bots.contains(bot) && !self.switching.prepared.contains_key(bot) {
             return Ok(());
         }
         let name = bot.to_owned();
@@ -5757,8 +5777,10 @@ impl Service {
             .await
         {
             Ok(_) => Ok(()),
-            // Its history is being translated: it is taken once it is.
-            Err(error) if error.code == "deferred" => Ok(()),
+            // Its history is being translated: it is taken once it is. One
+            // whose history changed meanwhile is translated afresh at the
+            // next start.
+            Err(error) if matches!(error.code.as_str(), "deferred" | "switch_stale") => Ok(()),
             Err(error) if error.code == "storage_error" => Err(error),
             Err(error) if error.code == "bot_not_found" => {
                 self.kept.remove(bot);

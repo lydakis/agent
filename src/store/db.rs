@@ -3838,7 +3838,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS switches_left ON switches(left) WHERE left IS NOT NULL;
             CREATE TABLE IF NOT EXISTS translated(node INTEGER PRIMARY KEY, source INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS translated_source ON translated(source);
-            CREATE TABLE IF NOT EXISTS translating(bot_id INTEGER PRIMARY KEY, tip INTEGER);
+            CREATE TABLE IF NOT EXISTS translating(id INTEGER PRIMARY KEY, bot_id INTEGER UNIQUE, tip INTEGER);
             CREATE TABLE IF NOT EXISTS compactions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES compactions(node), cut INTEGER NOT NULL REFERENCES nodes(id),
                 summary TEXT NOT NULL, prompts TEXT NOT NULL,
@@ -4107,8 +4107,9 @@ impl Database {
                     r.get::<_, Option<i64>>(0)
                 })?
         {
-            db.switch_settle(bot_id)?;
+            db.switch_release(bot_id)?;
         }
+        while db.switch_reclaim()? {}
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
         let deleting: Vec<String> = db
@@ -4943,23 +4944,23 @@ impl Database {
         // What was translated in pieces beforehand, when it is this span;
         // else what it wrote is freed and the span translated here.
         let written = match (&span, prepared) {
-            (None, prepared) => {
-                if let Some(prepared) = prepared {
-                    free_branch(&tx, prepared.out.head)?;
-                }
-                Translated::default()
-            }
             (Some(span), Some(prepared))
                 if prepared.is_for(id, switch.family, &switch.custom, span) =>
             {
                 prepared.finish(&tx)?
             }
-            (Some(span), prepared) => {
-                if let Some(prepared) = prepared {
-                    free_branch(&tx, prepared.out.head)?;
-                }
+            // What it read moved while it translated (a summary landed,
+            // say): the change is sent again, and translates afresh.
+            (_, Some(_)) => {
+                return fail_with(
+                    "switch_stale",
+                    "its history changed while it was translated",
+                );
+            }
+            (Some(span), None) => {
                 Translation::new(&tx, id, from, switch.family, &switch.custom, span)?.finish(&tx)?
             }
+            (None, None) => Translated::default(),
         };
         // Turns held while it translated go on in the new family.
         let held = tx
@@ -5306,12 +5307,46 @@ impl Database {
         Ok(translation.done())
     }
     /// Let go of a switch of bot `bot_id` that `switch_family` did not
-    /// take: what it wrote is freed, and its bot's turns go on.
-    pub fn switch_settle(&mut self, bot_id: i64) -> Result<()> {
+    /// take: its bot's turns go on, and what it wrote is left for
+    /// `switch_reclaim`. Whether there was one.
+    pub fn switch_release(&mut self, bot_id: i64) -> Result<bool> {
         let tx = self.conn.savepoint()?;
-        settle_translating(&tx, bot_id)?;
+        let released = release_translating(&tx, bot_id)?;
         tx.commit()?;
-        Ok(())
+        Ok(released)
+    }
+    /// Free a page of the branches switches wrote and let go, oldest
+    /// first; whether any are left.
+    pub fn switch_reclaim(&mut self) -> Result<bool> {
+        let tx = self.conn.savepoint()?;
+        let mut left = TRANSLATE_PAGE;
+        loop {
+            let row: Option<(i64, Option<i64>)> = tx
+                .prepare_cached(
+                    "SELECT id,tip FROM translating WHERE bot_id IS NULL ORDER BY id LIMIT 1",
+                )?
+                .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((id, mut tip)) = row else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            while let Some(node) = tip {
+                if left == 0 {
+                    tx.prepare_cached("UPDATE translating SET tip=? WHERE id=?")?
+                        .execute(params![tip, id])?;
+                    tx.commit()?;
+                    return Ok(true);
+                }
+                if node_reached(&tx, node, "", -1)? {
+                    break;
+                }
+                tip = free_node(&tx, node, "")?;
+                left -= 1;
+            }
+            tx.prepare_cached("DELETE FROM translating WHERE id=?")?
+                .execute([id])?;
+        }
     }
     /// The bot's last switch, when `to` is the family it came from and
     /// going back can reuse the branch it left: the bot is still on the
@@ -22284,29 +22319,16 @@ struct SwitchPlan {
     through: Option<i64>,
     pins: Vec<i64>,
 }
-/// Free a branch a switch wrote and no bot took, from its tip down to the
-/// node it grew from.
-fn free_branch(conn: &Connection, tip: Option<i64>) -> Result<()> {
-    let mut at = tip;
-    while let Some(node) = at {
-        if node_reached(conn, node, "", -1)? {
-            break;
-        }
-        at = free_node(conn, node, "")?;
+/// Let go of bot `bot_id`'s switch in pieces, if one is under way: the
+/// bot's next turn may start, and the branch it wrote, owned by no bot,
+/// waits for `Database::switch_reclaim`. Whether there was one.
+fn release_translating(conn: &Connection, bot_id: i64) -> Result<bool> {
+    let released = conn
+        .prepare_cached("UPDATE translating SET bot_id=NULL WHERE bot_id=?")?
+        .execute([bot_id])?;
+    if released == 0 {
+        return Ok(false);
     }
-    Ok(())
-}
-/// Let go of bot `bot_id`'s switch in pieces, if one is under way: its
-/// branch is freed, and the bot's next turn may start.
-fn settle_translating(conn: &Connection, bot_id: i64) -> Result<()> {
-    let tip: Option<Option<i64>> = conn
-        .prepare_cached("DELETE FROM translating WHERE bot_id=? RETURNING tip")?
-        .query_row([bot_id], |r| r.get(0))
-        .optional()?;
-    let Some(tip) = tip else {
-        return Ok(());
-    };
-    free_branch(conn, tip)?;
     let name: Option<String> = conn
         .prepare_cached("SELECT name FROM bots WHERE id=?")?
         .query_row([bot_id], |r| r.get(0))
@@ -22316,7 +22338,7 @@ fn settle_translating(conn: &Connection, bot_id: i64) -> Result<()> {
     {
         promote(conn, &name)?;
     }
-    Ok(())
+    Ok(true)
 }
 /// Whether a switch of bot `bot_id` is being translated in pieces.
 fn translating(conn: &Connection, bot_id: i64) -> Result<bool> {
