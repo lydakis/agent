@@ -62,7 +62,7 @@ fn checkpoints(
             let Some(pool) = pool.get() else {
                 return;
             };
-            let was = state.fetch_update(SeqCst, SeqCst, |s| Some(if s == 0 { 1 } else { 2 }));
+            let was = state.try_update(SeqCst, SeqCst, |s| Some(if s == 0 { 1 } else { 2 }));
             if was != Ok(0) {
                 return;
             }
