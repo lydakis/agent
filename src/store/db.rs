@@ -3694,9 +3694,6 @@ impl Database {
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
     pub const SCHEMA: i32 = 109;
-    /// The oldest schema [`Database::migrate_down`] takes a store back to:
-    /// each step from it on has a way back.
-    pub const SCHEMA_DOWN_TO: i32 = 106;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -20555,97 +20552,8 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     Ok(())
 }
 
-impl Database {
-    /// Take the store `conn` opens back from its schema to `to`, for a
-    /// release that knows only `to`: each step's way back, newest first,
-    /// in one transaction, after the store is copied as an upgrade copies
-    /// it. Gives the schema it was at. The store must not be open
-    /// elsewhere; [`crate::store::migrate`] holds its owner lock.
-    pub fn migrate_down(conn: &Connection, to: i32) -> Result<i32> {
-        let from: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if from > Self::SCHEMA {
-            return fail_with(
-                "store_schema_newer",
-                format!("store schema {from}, binary supports {}", Self::SCHEMA),
-            );
-        }
-        if to < Self::SCHEMA_DOWN_TO || to > from {
-            return fail_with(
-                "store_schema_unsupported",
-                format!(
-                    "store schema {from} goes back to {} through {from}, not {to}",
-                    Self::SCHEMA_DOWN_TO
-                ),
-            );
-        }
-        if to == from {
-            return Ok(from);
-        }
-        back_up(conn, from)?;
-        // Dropping a table others point at, as SQLite's rebuild steps ask:
-        // checked below before the commit.
-        conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
-        let tx = conn.unchecked_transaction()?;
-        migrate_back(&tx, from, to)?;
-        let broken: Option<String> = tx
-            .query_row(
-                "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(table) = broken {
-            return fail_with(
-                "store_migration_invalid",
-                format!("foreign keys in {table}"),
-            );
-        }
-        tx.pragma_update(None, "user_version", to)?;
-        tx.commit()?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        Ok(from)
-    }
-}
-
-/// Each step's way back, from schema `from` to `to`, newest first: the
-/// store as a release at `to` wrote it, so that release opens it.
-fn migrate_back(conn: &Connection, from: i32, to: i32) -> Result<()> {
-    // 109 -> 108: nothing to undo. 0.10.2, at 108, reads `yields`; 109
-    // only makes sure no list still says `lift`.
-    // 108 -> 107: no `namespace` setting; a bot's group is its name up to
-    // its first dot again. The speed and context window tables bots took
-    // as settings with it (#1208) go too: older releases take them as
-    // daemon flags, and refuse settings they do not know.
-    if from >= 108 && to < 108 {
-        conn.execute_batch(
-            "UPDATE bots SET settings=json_remove(settings,'$.namespace','$.speeds','$.context_windows')
-             WHERE json_type(settings,'$.namespace') IS NOT NULL
-                OR json_type(settings,'$.speeds') IS NOT NULL
-                OR json_type(settings,'$.context_windows') IS NOT NULL;
-             UPDATE bots SET configure_pending=json_remove(configure_pending,
-                     '$.settings.namespace','$.settings.speeds','$.settings.context_windows')
-             WHERE json_type(configure_pending,'$.settings') IS NOT NULL;",
-        )?;
-    }
-    // 107 -> 106: each bot's instructions back in its row, and `yields`
-    // is `lift` again, as 0.10.1 names it (#1203 renamed it with no step
-    // of its own).
-    if from >= 107 && to < 107 {
-        migrate_declared_field(conn, "yields", "lift")?;
-        conn.execute_batch(
-            "ALTER TABLE bots ADD COLUMN instructions TEXT NOT NULL DEFAULT '';
-             ALTER TABLE bots ADD COLUMN compaction_instructions TEXT;
-             UPDATE bots SET (instructions,compaction_instructions)=
-                 (SELECT instructions,compaction_instructions FROM bot_instructions i
-                  WHERE i.id=bots.id);
-             DROP TABLE bot_instructions;",
-        )?;
-    }
-    Ok(())
-}
-
 /// Every declared tool's `old` field named `new`, in place: `lift` to
-/// `yields` going to 109, back going to 106.
+/// `yields` going to 109. release/store_down.py takes it back.
 /// A list is kept once under the digest of its bytes, so a list that
 /// changes moves to its new digest, and the bots holding it, the records
 /// of creations that declared it and kept `configure`s naming it follow.

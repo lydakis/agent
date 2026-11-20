@@ -266,14 +266,6 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
-        name: "migrate",
-        about: "Bring a store no daemon runs on to this release's schema, or back to an older release's",
-        usage: "migrate [--store PATH] [--schema N]",
-        flags: "--schema",
-        settings: "",
-        startup: false,
-    },
-    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
@@ -889,7 +881,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--checkpoint"
                     | "--request"
                     | "--before"
-                    | "--schema"
             ) {
                 let max = match flag {
                     "--max-output-tokens" => u32::MAX as u64,
@@ -899,7 +890,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--turn-budget-tokens"
                     | "--request"
                     | "--before" => i64::MAX as u64,
-                    "--schema" => i32::MAX as u64,
                     _ => usize::MAX as u64,
                 };
                 if !value.parse::<u64>().is_ok_and(|n| n > 0 && n <= max) {

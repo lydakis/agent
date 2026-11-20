@@ -151,9 +151,6 @@ fn run() -> Result<i32> {
             Ok(SANDBOX_FAILED)
         });
     }
-    if args[0] == "migrate" {
-        return migrate(&args[1..]);
-    }
     if args[0] == "serve" {
         SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
         // Before the runtime's threads: every one shares the limit.
@@ -381,40 +378,6 @@ fn run_in(
         use std::os::unix::process::ExitStatusExt;
         128 + status.signal().unwrap_or(0)
     }))
-}
-
-/// `agent migrate [--store PATH] [--schema N]`: the store, which no daemon
-/// may hold, brought forward to this binary's schema as a start would, or
-/// back to N for an older release; copied first either way. Prints the
-/// schema it was at and the one it is at.
-fn migrate(args: &[String]) -> Result<i32> {
-    let (mut store, mut schema) = (None, None);
-    let mut iter = args.iter();
-    while let Some(flag) = iter.next() {
-        let value = iter
-            .next()
-            .ok_or(Error::with("usage", format!("{flag} needs a value")))?;
-        match flag.as_str() {
-            "--store" => store = Some(std::path::PathBuf::from(value)),
-            // `prepare` has checked it is a positive integer.
-            "--schema" => schema = value.parse().ok(),
-            _ => return fail_with("usage", format!("migrate does not accept {flag}")),
-        }
-    }
-    // As every command finds it.
-    let store = store
-        .or_else(|| std::env::var_os("AGENT_STORE").map(Into::into))
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".agent/state.sqlite"))
-        })
-        .ok_or(Error::with("usage", "set --store, AGENT_STORE, or HOME"))?;
-    let (from, to) = agent_runtime::store::migrate(&store, schema)?;
-    println!(
-        "{}",
-        serde_json::json!({"store": store, "from": from, "schema": to})
-    );
-    Ok(0)
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
