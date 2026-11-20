@@ -18524,9 +18524,7 @@ impl App {
                     KeyCode::End => self.input.end(),
                     // With nothing typed, the open questions are a list.
                     KeyCode::Up | KeyCode::Down
-                        if self.input.is_empty()
-                            && self.asking().is_some()
-                            && self.asks.len() > 1 =>
+                        if self.blank() && self.asking().is_some() && self.asks.len() > 1 =>
                     {
                         self.step_ask(key.code == KeyCode::Down)
                     }
@@ -18559,7 +18557,7 @@ impl App {
                     }
                     // Calls set aside come back to be answered.
                     KeyCode::Enter
-                        if self.input.is_empty()
+                        if self.blank()
                             && self.waiting().is_none()
                             && self.calls_waiting().1 > 0 =>
                     {
@@ -20576,7 +20574,7 @@ impl App {
             || self.react_to.is_some()
             || self.making.is_some()
             || self.searching.is_some();
-        let shows = self.input.is_empty()
+        let shows = self.blank()
             && self.running.is_none()
             && self.asks.is_empty()
             && self.calls_waiting().0 == 0
@@ -22712,12 +22710,15 @@ impl App {
                     "An emoji for that reply",
                     &hint::Keys::new().esc(hint::Esc::Cancel).text(),
                 ),
-                // Answered with its keys, until Esc sets it aside.
-                _ if self.waiting().is_some() => said(
+                // Answered with its keys, until Esc sets it aside, or a
+                // quote over the composer makes them words.
+                _ if self.waiting().is_some() && self.quotes.is_empty() => said(
                     "An approval waits",
                     &hint::Keys::new().esc(hint::Esc::WriteInstead).text(),
                 ),
-                _ if self.calls_waiting().1 > 0 => said("A message of your own", "enter approval"),
+                _ if self.calls_waiting().1 > 0 && self.quotes.is_empty() => {
+                    said("A message of your own", "enter approval")
+                }
                 _ if !self.asks.is_empty() => said("A message of your own", "esc answer"),
                 Some(_) => vec![Span::raw(format!("Steer {name}")).dim()],
                 None => vec![Span::raw(format!("Message {name}")).dim()],
@@ -22734,6 +22735,7 @@ impl App {
             // to every project, then the keys. Too long, `← projects` goes
             // first.
             if answering.is_none()
+                && self.quotes.is_empty()
                 && self.asks.is_empty()
                 && self.react_to.is_none()
                 && !self.new_brief()
@@ -35396,6 +35398,15 @@ mod tests {
         app.beside_done().await;
         assert_eq!(&*app.input, "yan");
         assert!(app.waiting().is_some(), "the call still waits");
+        // Set aside, Enter under a quote alone sends it rather than
+        // bringing the call back.
+        app.input.set("");
+        app.key(key(KeyCode::Esc)).await;
+        assert!(app.waiting().is_none());
+        app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
+        assert!(app.waiting().is_none(), "the call stays aside");
+        assert!(app.quotes.is_empty(), "the quote went");
         let asked = asked.lock().unwrap();
         assert!(
             !asked
