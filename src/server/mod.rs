@@ -5242,7 +5242,14 @@ impl Service {
         // history is translated a page at a time beside the run loop first.
         let change = match (&prepared, &change.model) {
             (None, Some(reference)) if !rules_only => {
-                match (self.switch_begin(&bot, bot_id, reference, change.effort.as_deref())).await?
+                match (self.switch_begin(
+                    &bot,
+                    bot_id,
+                    reference,
+                    change.effort.as_deref(),
+                    change.settings.as_ref(),
+                ))
+                .await?
                 {
                     Some(translation) => {
                         self.switch_pieces(bot, bot_id, change, asker, translation);
@@ -5603,6 +5610,7 @@ impl Service {
         bot_id: Option<i64>,
         reference: &str,
         effort: Option<&str>,
+        settings: Option<&serde_json::Map<String, Value>>,
     ) -> Result<Option<agent_runtime::store::Translation>> {
         let (provider, _) = split_model(reference)?;
         let Some(served) = self.providers.get(provider) else {
@@ -5622,10 +5630,32 @@ impl Service {
             to.check_effort(level)?;
         }
         let custom = custom_tools(served, &record);
+        // Its window as the settings the same change gives will have it,
+        // which the change takes before it switches. Settings it refuses
+        // are refused by the change itself, with nothing translated.
+        let given = match settings {
+            Some(changes) => {
+                let Value::Object(mut merged) = serde_json::to_value(&record.settings)? else {
+                    return Ok(None);
+                };
+                for (key, value) in changes {
+                    match value {
+                        Value::Null => merged.remove(key),
+                        value => merged.insert(key.clone(), value.clone()),
+                    };
+                }
+                match serde_json::from_value::<Settings>(Value::Object(merged)) {
+                    Ok(given) => given,
+                    Err(_) => return Ok(None),
+                }
+            }
+            None => record.settings.clone(),
+        };
+        let limits = (given.context_bytes() as i64, given.context_items() as i64);
         let name = bot.to_owned();
         self.store
             .op("switch_begin", move |db| {
-                db.switch_begin(&name, bot_id, to, &custom)
+                db.switch_begin(&name, bot_id, to, &custom, limits)
             })
             .await
     }
@@ -5709,9 +5739,7 @@ impl Service {
             Ok(true) => {
                 let store = self.store.clone();
                 self.retention.spawn(async move {
-                    while let Ok(true) = store.op("switch_reclaim", |db| db.switch_reclaim()).await
-                    {
-                    }
+                    let _ = reclaim(&store).await;
                 });
             }
             _ => {}
@@ -8298,6 +8326,8 @@ async fn delete_pieces(
             break;
         }
     }
+    // What it left that nothing else holds now goes too, a page per job.
+    reclaim(&store).await?;
     // Its connections go with it, and a later bot of the
     // same name starts on a fresh one; so does its own socket.
     for provider in providers.values() {
@@ -8312,6 +8342,18 @@ async fn delete_pieces(
     }
     hub.live(&bot, gone).await?;
     Ok(deleted)
+}
+
+/// Free what switches left that no bot owns, a page per store job.
+async fn reclaim(store: &Store) -> Result<()> {
+    let mut after = 0;
+    while let Some(next) = store
+        .op("switch_reclaim", move |db| db.switch_reclaim(after))
+        .await?
+    {
+        after = next;
+    }
+    Ok(())
 }
 
 /// Answer a read from the observation lane, in its own task.

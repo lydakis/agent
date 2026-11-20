@@ -8063,6 +8063,17 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
     )
     .unwrap();
     db.finish(turn, None).unwrap();
+    for n in 0..20 {
+        let turn = begun(&mut db, "Bob", &format!("t{n}"));
+        db.append(
+            turn,
+            vec![assistant(&format!("t{n}"))],
+            &[],
+            Some(&usage(100, 10, "m")),
+        )
+        .unwrap();
+        db.finish(turn, None).unwrap();
+    }
     let read = Connection::open(&path).unwrap();
     let nodes = || -> i64 {
         read.query_row("SELECT count(*) FROM nodes", [], |r| r.get(0))
@@ -8071,16 +8082,27 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
     let before = nodes();
     let head = db.inspect("Bob").unwrap().head;
     let custom = Default::default();
+    let settings = db.inspect("Bob").unwrap().settings;
+    let limits = (
+        settings.context_bytes() as i64,
+        settings.context_items() as i64,
+    );
+    let reclaim = |db: &mut Database| {
+        let mut after = 0;
+        while let Some(next) = db.switch_reclaim(after).unwrap() {
+            after = next;
+        }
+    };
     // Let go after a page: what it wrote goes, and the bot is as it was.
     let mut pieces = db
-        .switch_begin("Bob", None, Family::Anthropic, &custom)
+        .switch_begin("Bob", None, Family::Anthropic, &custom, limits)
         .unwrap()
         .unwrap();
     assert!(!db.switch_piece(&mut pieces).unwrap());
     assert!(!db.switch_piece(&mut pieces).unwrap());
     assert!(nodes() > before + 512);
     assert_eq!(
-        db.switch_begin("Bob", None, Family::Anthropic, &custom)
+        db.switch_begin("Bob", None, Family::Anthropic, &custom, limits)
             .err()
             .unwrap()
             .code,
@@ -8090,9 +8112,9 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
     // Let go, the bot is free at once, and what it wrote is freed a page
     // at a time.
     assert!(db.switch_release(pieces.bot_id()).unwrap());
-    assert!(db.switch_reclaim().unwrap());
+    assert!(db.switch_reclaim(0).unwrap().is_some());
     assert!(nodes() > before);
-    while db.switch_reclaim().unwrap() {}
+    reclaim(&mut db);
     assert_eq!(nodes(), before);
     assert_eq!(db.inspect("Bob").unwrap().head, head);
     let claude = Switch {
@@ -8106,7 +8128,7 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
     // refused as stale, and nothing moves.
     let other: std::collections::HashSet<String> = ["apply_patch".to_owned()].into();
     let mut pieces = db
-        .switch_begin("Bob", None, Family::Anthropic, &other)
+        .switch_begin("Bob", None, Family::Anthropic, &other, limits)
         .unwrap()
         .unwrap();
     while !db.switch_piece(&mut pieces).unwrap() {}
@@ -8121,12 +8143,13 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
         db.switch_release(db.inspect("Bob").unwrap().bot_id)
             .unwrap()
     );
-    while db.switch_reclaim().unwrap() {}
+    reclaim(&mut db);
     assert_eq!(nodes(), before);
     // Taken: a turn sent while it translates waits, then runs in the new
-    // family, on the history the pages wrote.
+    // family, on the history the pages wrote. Translated for the smaller
+    // window the same change gives, which it takes before it switches.
     let mut pieces = db
-        .switch_begin("Bob", None, Family::Anthropic, &custom)
+        .switch_begin("Bob", None, Family::Anthropic, &custom, (limits.0, 100))
         .unwrap()
         .unwrap();
     let waiting = begun(&mut db, "Bob", "r2");
@@ -8140,6 +8163,10 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
     }
     assert_eq!(pages, 3);
     let written = nodes() - before;
+    let mut smaller = db.inspect("Bob").unwrap().settings.clone();
+    smaller.context_items = Some(100);
+    db.set_settings("Bob", None, &["context_items".to_owned()], &smaller)
+        .unwrap();
     let switched = db
         .switch_family("Bob", None, &claude, Some(pieces))
         .unwrap()
@@ -8168,6 +8195,7 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
         .filter(|text| text.starts_with('m'))
         .collect();
     assert_eq!(crossed, texts);
+    assert!(db.inspect("Bob").unwrap().settings.context_items() == 100);
     db.start(waiting, allow_provider).unwrap();
     drop(read);
     drop(db);
@@ -8252,6 +8280,57 @@ fn a_search_result_written_as_words_reads_through_its_handle_after_a_switch_and_
         .result_lines("Cy", words, 2, 2, false, usize::MAX)
         .unwrap();
     assert!(lines.contains("second line"), "{lines}");
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_deletion_takes_its_switch_rows_a_page_at_a_time() {
+    let path =
+        std::env::temp_dir().join(format!("agent-switch-rows-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let to = |family, provider, model| Switch {
+        provider,
+        model,
+        effort: None,
+        family,
+        custom: Default::default(),
+    };
+    for _ in 0..10 {
+        db.switch_family(
+            "Bob",
+            None,
+            &to(Family::Anthropic, "anthropic", "synthetic-claude"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        db.switch_family(
+            "Bob",
+            None,
+            &to(Family::Responses, "openai", "synthetic-model"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    }
+    let read = Connection::open(&path).unwrap();
+    let rows = || -> i64 {
+        read.query_row("SELECT count(*) FROM switches", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(), 20);
+    let (id, mut piece) = db.start_delete_bot("Bob", 4).unwrap();
+    let mut pieces = 1;
+    while piece["done"] != true {
+        piece = db.delete_bot_piece("Bob", id, 4).unwrap();
+        pieces += 1;
+    }
+    assert!(pieces >= 5, "{pieces}");
+    assert_eq!(rows(), 0);
     drop(read);
     drop(db);
     let _ = std::fs::remove_file(&path);

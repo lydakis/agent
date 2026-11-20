@@ -4110,7 +4110,10 @@ impl Database {
         {
             db.switch_release(bot_id)?;
         }
-        while db.switch_reclaim()? {}
+        let mut after = 0;
+        while let Some(next) = db.switch_reclaim(after)? {
+            after = next;
+        }
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
         let deleting: Vec<String> = db
@@ -4910,7 +4913,7 @@ impl Database {
         switch: &Switch<'_>,
         prepared: Option<Translation>,
     ) -> Result<Option<Value>> {
-        let Some(plan) = self.switch_plan(name, bot_id, switch.family)? else {
+        let Some(plan) = self.switch_plan(name, bot_id, switch.family, None)? else {
             return Ok(None);
         };
         let SwitchPlan {
@@ -5147,6 +5150,7 @@ impl Database {
         name: &str,
         bot_id: Option<i64>,
         to: Family,
+        limits: Option<(i64, i64)>,
     ) -> Result<Option<SwitchPlan>> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
@@ -5160,12 +5164,12 @@ impl Database {
         // A bot that has sent no request since it was made or forked has
         // no saved window start yet: find it as its next request would, so
         // only what that request can send is translated.
+        let (bytes, items) = limits.unwrap_or((
+            bot.settings.context_bytes() as i64,
+            bot.settings.context_items() as i64,
+        ));
         if bot.head.is_some()
-            && let Err(error) = self.window(
-                name,
-                bot.settings.context_bytes() as i64,
-                bot.settings.context_items() as i64,
-            )
+            && let Err(error) = self.window(name, bytes, items)
             && error.code != "context_limit"
         {
             return Err(error);
@@ -5273,8 +5277,9 @@ impl Database {
         bot_id: Option<i64>,
         to: Family,
         custom: &std::collections::HashSet<String>,
+        limits: (i64, i64),
     ) -> Result<Option<Translation>> {
-        let Some(plan) = self.switch_plan(name, bot_id, to)? else {
+        let Some(plan) = self.switch_plan(name, bot_id, to, Some(limits))? else {
             return Ok(None);
         };
         let Some(span) = &plan.span else {
@@ -5316,9 +5321,13 @@ impl Database {
         tx.commit()?;
         Ok(released)
     }
-    /// Free a page of the branches switches wrote and let go, oldest
-    /// first; whether any are left.
-    pub fn switch_reclaim(&mut self) -> Result<bool> {
+    /// Free a page of what switches left that no bot owns, oldest first:
+    /// branches a translation wrote and let go, then branches a deleted
+    /// bot left, from switch rows after `after`, each freed down to what
+    /// another bot still reaches. Each row looked at and each node freed
+    /// counts toward the page. Where to go on from, or `None` when all of
+    /// it was looked at.
+    pub fn switch_reclaim(&mut self, after: i64) -> Result<Option<i64>> {
         let tx = self.conn.savepoint()?;
         let mut left = TRANSLATE_PAGE;
         loop {
@@ -5329,15 +5338,14 @@ impl Database {
                 .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
             let Some((id, mut tip)) = row else {
-                tx.commit()?;
-                return Ok(false);
+                break;
             };
             while let Some(node) = tip {
                 if left == 0 {
                     tx.prepare_cached("UPDATE translating SET tip=? WHERE id=?")?
                         .execute(params![tip, id])?;
                     tx.commit()?;
-                    return Ok(true);
+                    return Ok(Some(after));
                 }
                 if node_reached(&tx, node, "", -1)? {
                     break;
@@ -5347,6 +5355,33 @@ impl Database {
             }
             tx.prepare_cached("DELETE FROM translating WHERE id=?")?
                 .execute([id])?;
+            left = (left - 1).max(0);
+        }
+        let mut cursor = after;
+        loop {
+            if left == 0 {
+                tx.commit()?;
+                return Ok(Some(cursor));
+            }
+            let row: Option<(i64, Option<i64>)> = tx
+                .prepare_cached(
+                    "SELECT id,left FROM switches WHERE bot_id IS NULL AND id>? ORDER BY id LIMIT 1",
+                )?
+                .query_row([cursor], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((switch, at)) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            left -= 1;
+            match free_left(&tx, switch, at, "", -1, &mut left)? {
+                // Freed as far as the page goes: looked at again next.
+                None => {
+                    tx.commit()?;
+                    return Ok(Some(switch - 1));
+                }
+                Some(_) => cursor = switch,
+            }
         }
     }
     /// The bot's last switch, when `to` is the family it came from and
@@ -16552,6 +16587,10 @@ impl Database {
                     json!(totals[key].as_i64().unwrap_or(0) + piece[key].as_i64().unwrap_or(0));
             }
             if piece["done"] == true {
+                let mut after = 0;
+                while let Some(next) = self.switch_reclaim(after)? {
+                    after = next;
+                }
                 return Ok(totals);
             }
             piece = self.delete_bot_piece(name, id, Self::RETENTION_PIECE)?;
@@ -16702,57 +16741,34 @@ impl Database {
                 node = free_node(&tx, id, name)?;
                 freed += 1;
             }
-            // A branch a deleted bot left that another bot's history still
-            // reached then is freed by the deletion after it.
-            let left: Vec<(i64, i64)> = tx
-                .prepare_cached(
-                    "SELECT id,left FROM switches WHERE bot_id=?1 AND left IS NOT NULL
-                     UNION ALL SELECT id,left FROM switches WHERE bot_id IS NULL AND left IS NOT NULL
-                     ORDER BY id",
-                )?
-                .query_map([bot.bot_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            // The branches it left for the other family's, a page of switch
+            // rows at a time: each freed down to what is still reached, then
+            // owned by none, so a branch something still holds is freed by
+            // `switch_reclaim` once nothing does.
+            let rows: Vec<(i64, Option<i64>)> = tx
+                .prepare_cached("SELECT id,left FROM switches WHERE bot_id=? ORDER BY id LIMIT ?")?
+                .query_map(params![bot.bot_id, piece], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            for (switch, mut id) in left {
-                loop {
-                    let gone = !tx
-                        .prepare_cached("SELECT 1 FROM nodes WHERE id=?")?
-                        .exists([id])?;
-                    if gone || node_reached(&tx, id, name, bot.bot_id)? {
-                        break;
-                    }
-                    if freed == budget {
-                        out["nodes"] = json!(freed);
-                        tx.commit()?;
-                        return Ok(out);
-                    }
-                    let parent = free_node(&tx, id, name)?;
-                    freed += 1;
-                    tx.prepare_cached("UPDATE switches SET left=? WHERE id=?")?
-                        .execute(params![parent, switch])?;
-                    let Some(parent) = parent else { break };
-                    id = parent;
+            let more = rows.len() as i64 == piece;
+            let mut left = budget - freed;
+            for (switch, at) in rows {
+                let walked = free_left(&tx, switch, at, name, bot.bot_id, &mut left)?;
+                freed = budget - left;
+                if walked.is_none() {
+                    out["nodes"] = json!(freed);
+                    tx.commit()?;
+                    return Ok(out);
                 }
             }
-            tx.execute(
-                "DELETE FROM switches WHERE bot_id IS NULL
-                   AND (left IS NULL OR NOT EXISTS(SELECT 1 FROM nodes WHERE id=switches.left))",
-                [],
-            )?;
+            if more {
+                out["nodes"] = json!(freed);
+                tx.commit()?;
+                return Ok(out);
+            }
             if freed == before {
                 break;
             }
         }
-        // What still holds a branch this bot left keeps it past the bot:
-        // the switch stays, owned by none, for a later deletion to free.
-        tx.execute(
-            "DELETE FROM switches WHERE bot_id=?
-               AND (left IS NULL OR NOT EXISTS(SELECT 1 FROM nodes WHERE id=switches.left))",
-            [bot.bot_id],
-        )?;
-        tx.execute(
-            "UPDATE switches SET bot_id=NULL WHERE bot_id=?",
-            [bot.bot_id],
-        )?;
         tx.execute("DELETE FROM events WHERE bot=?", [name])?;
         // The identity's name and creation key outlive it, so a resent
         // delete is told apart from a delete of some other identity, and a
@@ -22327,6 +22343,10 @@ fn release_translating(conn: &Connection, bot_id: i64) -> Result<bool> {
     if released == 0 {
         return Ok(false);
     }
+    // Its window start was found for the settings the change would have
+    // given: its next request finds it again for those it has.
+    conn.prepare_cached("UPDATE bots SET context_start=NULL WHERE id=?")?
+        .execute([bot_id])?;
     let name: Option<String> = conn
         .prepare_cached("SELECT name FROM bots WHERE id=?")?
         .query_row([bot_id], |r| r.get(0))
@@ -22661,6 +22681,47 @@ fn node_reached(conn: &Connection, id: i64, name: &str, bot_id: i64) -> Result<b
                 OR EXISTS(SELECT 1 FROM switches WHERE left=?1 AND bot_id!=?3)",
         )?
         .query_row(params![id, name, bot_id], |r| r.get(0))?)
+}
+/// Free the branch switch row `switch` left, from `at` down to what is
+/// still reached, within `left` nodes. The row then goes if its branch is
+/// all gone, else stays owned by none, its `left` where freeing stopped.
+/// `None` when the budget ran out first, the row kept as it was walked.
+fn free_left(
+    conn: &Connection,
+    switch: i64,
+    mut at: Option<i64>,
+    name: &str,
+    bot_id: i64,
+    left: &mut i64,
+) -> Result<Option<()>> {
+    while let Some(id) = at {
+        let gone = !conn
+            .prepare_cached("SELECT 1 FROM nodes WHERE id=?")?
+            .exists([id])?;
+        if gone {
+            at = None;
+            break;
+        }
+        if node_reached(conn, id, name, bot_id)? {
+            break;
+        }
+        if *left == 0 {
+            conn.prepare_cached("UPDATE switches SET left=? WHERE id=?")?
+                .execute(params![at, switch])?;
+            return Ok(None);
+        }
+        at = free_node(conn, id, name)?;
+        *left -= 1;
+    }
+    match at {
+        None => conn
+            .prepare_cached("DELETE FROM switches WHERE id=?")?
+            .execute([switch])?,
+        Some(_) => conn
+            .prepare_cached("UPDATE switches SET left=?,bot_id=NULL WHERE id=?")?
+            .execute(params![at, switch])?,
+    };
+    Ok(Some(()))
 }
 /// Free a node of a deleted bot and what is kept beside it; its parent.
 /// The bot's head follows it back.
