@@ -641,7 +641,7 @@ pub fn found_in_list(item: &Item, query: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::commons::View;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -760,7 +760,7 @@ mod tests {
     /// shop's typed errors: two claimed, one open with a label, two
     /// waiting, one done; shop's release, all open; docs' pages, failed
     /// and done; and one thread on no board.
-    fn commons(name: &str) -> PathBuf {
+    pub(crate) fn commons(name: &str) -> PathBuf {
         let home = home(name);
         let h = &home;
         let te = "shop/typed-errors";

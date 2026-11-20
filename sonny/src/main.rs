@@ -17876,8 +17876,15 @@ impl App {
             }
             // A link on a page of `/commons`.
             "commons" => {
-                if let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut()) {
+                if let Some(watch) = self.watch.as_mut()
+                    && let Some(view) = watch.commons.as_mut()
+                {
+                    let depth = view.depth();
                     let leaves = view.click(id);
+                    // A page opened from a link starts at its top.
+                    if view.depth() != depth {
+                        watch.picked = None;
+                    }
                     self.pane_keys = true;
                     if let Some(url) = leaves {
                         self.follow(&url);
@@ -23848,7 +23855,16 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
     let found = watch.query().map(|query| status::found(&watch.rows, query));
     let (rows, open, shown_helpers) = match &found {
         Some((kept, opened)) => {
-            let mut helpers = watch.helpers.clone();
+            // A task's agents folded with `←` stand open too; folded
+            // again when the find ends, as `watch.helpers` keeps them.
+            let mut helpers: Vec<String> = (watch.helpers.iter())
+                .filter(|fold| {
+                    !(kept.iter()).any(|row| {
+                        status::task_of(&row.bot).is_some_and(|(task, _)| task == fold.as_str())
+                    })
+                })
+                .cloned()
+                .collect();
             helpers.extend(
                 opened
                     .iter()
@@ -38474,6 +38490,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_find_in_status_opens_a_folded_task_and_esc_folds_it_again() {
+        let row = |n: u32| status::Row {
+            name: format!("errors.{n}"),
+            bot: format!("calc.errors.{n}"),
+            title: "Move shop to typed errors".into(),
+            state: "working".into(),
+            running: true,
+            group: status::Group::Working,
+            ..Default::default()
+        };
+        let mut watch = Watch {
+            project: "calc".into(),
+            rows: vec![row(1), row(2)],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            // The task folded with `←`.
+            helpers: vec!["calc.errors".into()],
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        };
+        let agent = Picked::Agent("calc.errors.2".into());
+        assert!(!card_picks(&watch, 80).contains(&agent));
+        let mut find = find::Find::new((None, Vec::new(), Vec::new()));
+        // Both agents say it: the task stays, two agents under it.
+        find.query = "errors.".into();
+        watch.finding = Some(find);
+        // A fold is searched and stands open while finding.
+        assert!(card_picks(&watch, 80).contains(&agent));
+        watch.finding = None;
+        assert!(!card_picks(&watch, 80).contains(&agent));
+        assert_eq!(watch.helpers, ["calc.errors"]);
+    }
+
     #[tokio::test]
     async fn h_j_k_l_typed_into_the_commons_find_are_letters() {
         let mut app = app(daemon_answering(|_| json!({})).await);
@@ -38517,6 +38580,46 @@ mod tests {
             .collect();
         assert_eq!(last, "find shjkl");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_link_clicked_on_an_item_s_page_opens_the_next_page_at_its_top() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let home = board_view::tests::commons("click-depth");
+        let mut view = commons::View::open(&home, "shop".into());
+        view.open_thread("api");
+        // Its links are laid as the pane draws it.
+        view.card(80);
+        let depth = view.depth();
+        app.open_pane(pane::Pane::card("commons", STATUS_KEYS));
+        app.watch = Some(Watch {
+            project: "shop".into(),
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: Some(view),
+            memory: None,
+            sky: None,
+            // Reading a thread: the page as it was scrolled.
+            picked: Some(usize::MAX),
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        });
+        // The head's first link, its board.
+        app.act("commons/link/0");
+        let watch = app.watch.as_ref().unwrap();
+        assert_eq!(watch.commons.as_ref().unwrap().depth(), depth + 1);
+        assert_eq!(watch.picked, None);
     }
 
     #[tokio::test]
