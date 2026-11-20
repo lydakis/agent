@@ -28,7 +28,8 @@ pub struct Translator {
     /// on an endpoint that takes them): their calls and results go as
     /// custom ones.
     custom: HashSet<String>,
-    /// Source calls that went as custom ones, whose results follow suit.
+    /// Source calls that went as custom ones, whose results follow suit;
+    /// each is dropped at its result, so only calls awaiting one are held.
     custom_calls: HashSet<String>,
     /// Source calls that went as text (the provider's own search, or
     /// arguments the target can't hold), each with the heading its result
@@ -110,6 +111,9 @@ impl Translator {
                     let source = block["id"].as_str().unwrap_or_default();
                     let id = self.id(source);
                     let name = block["name"].as_str().unwrap_or_default();
+                    // An id is the call's alone until its result: a later
+                    // call may use it again, as another kind.
+                    self.custom_calls.remove(source);
                     match (self.custom.contains(name), block["input"]["input"].as_str()) {
                         (true, Some(input)) => {
                             self.custom_calls.insert(source.to_owned());
@@ -139,7 +143,7 @@ impl Translator {
                         Value::String(text) => json!(text),
                         _ => json!(""),
                     };
-                    let kind = match self.custom_calls.contains(source) {
+                    let kind = match self.custom_calls.remove(source) {
                         true => "custom_tool_call_output",
                         false => "function_call_output",
                     };
@@ -212,6 +216,7 @@ impl Translator {
             }
             "function_call" | "custom_tool_call" => {
                 let source = item["call_id"].as_str().unwrap_or_default().to_owned();
+                self.words.remove(&source);
                 if item["namespace"] == RUN_NAMESPACE && item["name"] == RUN_NAME {
                     self.words.insert(source, "[web search results]".into());
                     let text = format!(
@@ -263,7 +268,7 @@ impl Translator {
                     Value::String(text) => json!(text),
                     _ => json!(""),
                 };
-                if let Some(heading) = self.words.get(source) {
+                if let Some(heading) = self.words.remove(source) {
                     let text = match &output {
                         Value::String(text) => text.clone(),
                         parts => (parts.as_array().into_iter().flatten())
@@ -541,5 +546,33 @@ mod tests {
                     {"type":"text","text":"[read result]\ninvalid_arguments"}]})]
             );
         }
+    }
+
+    #[test]
+    fn a_call_id_used_again_takes_the_kind_of_its_new_call() {
+        let custom: HashSet<String> = ["apply_patch".to_owned()].into();
+        let mut t = Translator::new(Family::Anthropic, Family::Responses, custom);
+        let call = |name: &str, input: Value| {
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"c1","name":name,"input":input}]})
+        };
+        let result = json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"c1","content":"done"}]});
+        assert_eq!(
+            run(
+                &mut t,
+                call("apply_patch", json!({"input":"*** Begin Patch"}))
+            )[0]["type"],
+            "custom_tool_call"
+        );
+        assert_eq!(
+            run(&mut t, result.clone())[0]["type"],
+            "custom_tool_call_output"
+        );
+        assert_eq!(
+            run(&mut t, call("read", json!({"path":"a"})))[0]["type"],
+            "function_call"
+        );
+        assert_eq!(run(&mut t, result)[0]["type"], "function_call_output");
     }
 }

@@ -4945,13 +4945,33 @@ impl Database {
         )?;
         let head = bot.head;
         let (root, written, state) = match (&back, head) {
-            (_, None) => (None, Translated::default(), Value::Null),
+            // Back before any turn: the settings it left come back.
+            (_, None) => {
+                let left: Option<String> = tx
+                    .prepare_cached(
+                        "SELECT state FROM switches WHERE id=(SELECT MAX(id) FROM switches WHERE bot_id=?1)
+                           AND left IS NULL AND from_family=?2 AND to_family=?3",
+                    )?
+                    .query_row(params![id, switch.family.name(), from.name()], |r| r.get(0))
+                    .optional()?;
+                let state = match left {
+                    Some(state) => serde_json::from_str(&state)?,
+                    None => Value::Null,
+                };
+                (None, Translated::default(), state)
+            }
             (Some(back), Some(head)) => {
                 // Only what the other model added since it took over.
                 let depth = node_depth(&tx, back.node)?;
-                let ids = lineage_from(&tx, head, depth + 1)?;
-                let written =
-                    translate_onto(&tx, &mut translator, switch.family, &ids, Some(back.left))?;
+                let wanted = bot.work.read.into_iter().collect();
+                let written = translate_onto(
+                    &tx,
+                    &mut translator,
+                    switch.family,
+                    (head, depth + 1),
+                    Some(back.left),
+                    &wanted,
+                )?;
                 (Some(back.left), written, back.state.clone())
             }
             (None, Some(head)) => {
@@ -4978,9 +4998,39 @@ impl Database {
                     None => ancestor(&tx, head, node_depth(&tx, head)?, 1)?.unwrap_or(head),
                 };
                 let depth = node_depth(&tx, start)?;
-                let ids = lineage_from(&tx, head, depth)?;
                 let root = place(&tx, start)?.and_then(|p| p.parent);
-                let written = translate_onto(&tx, &mut translator, switch.family, &ids, root)?;
+                // Only the nodes the state names are looked up after, so
+                // only theirs are kept while the history streams through.
+                let through = match bot.elision {
+                    Some(version) => Some(
+                        tx.prepare_cached("SELECT through FROM elisions WHERE node=?")?
+                            .query_row([version], |r| r.get::<_, i64>(0))?,
+                    ),
+                    None => None,
+                };
+                let pins = match bot.compaction {
+                    Some(version) if compaction.is_some() => pins_of(&tx, version)?,
+                    _ => Vec::new(),
+                };
+                let wanted: std::collections::HashSet<i64> =
+                    [context_start, bot.compaction, through, bot.work.read]
+                        .into_iter()
+                        .chain(
+                            compaction
+                                .iter()
+                                .flat_map(|(cut, pinned)| [Some(*cut), *pinned]),
+                        )
+                        .flatten()
+                        .chain(pins.iter().copied())
+                        .collect();
+                let written = translate_onto(
+                    &tx,
+                    &mut translator,
+                    switch.family,
+                    (head, depth),
+                    root,
+                    &wanted,
+                )?;
                 let state = json!({
                     "context_start": context_start.map(|n| written.first_of(n)),
                     "family_start": written.first_new,
@@ -5012,7 +5062,7 @@ impl Database {
                                 covered_to,
                                 pinned.map(|p| written.first_of(p))
                             ])?;
-                            for pin in pins_of(&tx, version)? {
+                            for &pin in &pins {
                                 tx.prepare_cached("INSERT INTO pins(compaction,node) VALUES (?,?)")?
                                     .execute(params![at, written.first_of(pin)])?;
                             }
@@ -5020,11 +5070,8 @@ impl Database {
                         }
                         _ => None,
                     },
-                    "elision": match bot.elision {
-                        Some(version) => {
-                            let through: i64 = tx
-                                .prepare_cached("SELECT through FROM elisions WHERE node=?")?
-                                .query_row([version], |r| r.get(0))?;
+                    "elision": match (bot.elision, through) {
+                        (Some(version), Some(through)) => {
                             // Stubs below the floor go on the new branch
                             // from the floor's place there: the newest node
                             // written for it, or the root when none was.
@@ -5046,7 +5093,7 @@ impl Database {
                                 None => None,
                             }
                         }
-                        None => None,
+                        _ => None,
                     },
                 });
                 (root, written, state)
@@ -22114,26 +22161,42 @@ fn pins_of(conn: &Connection, version: i64) -> Result<Vec<i64>> {
 /// `parent`: each with its turn, message, pictures, opening and sender,
 /// its stub naming the node it is now, and what a declined request left
 /// out of it. A prompt that becomes no item still keeps its turn.
+/// Nodes a switch translates per read of the lineage: the history streams
+/// through in pages of this many, so a switch holds one page at a time.
+const TRANSLATE_PAGE: i64 = 512;
+/// Translate the lineage of `head` from `from_depth` up to it onto a branch
+/// from `parent`, a page at a time. Only `wanted` nodes' places are kept.
 fn translate_onto(
     conn: &Connection,
     translator: &mut crate::translate::Translator,
     to: Family,
-    ids: &[i64],
+    (head, from_depth): (i64, i64),
     mut parent: Option<i64>,
+    wanted: &std::collections::HashSet<i64>,
 ) -> Result<Translated> {
     let mut out = Translated::default();
     let mut waiting: Vec<i64> = Vec::new();
-    for &old in ids {
-        type Row = (
-            Vec<u8>,
-            Option<i64>,
-            Option<i64>,
-            i64,
-            i64,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-        );
-        let (item, turn, message, extra, count, stub, declined): Row = conn
+    let head_depth = node_depth(conn, head)?;
+    let mut depth = from_depth;
+    while depth <= head_depth {
+        let end = (depth + TRANSLATE_PAGE - 1).min(head_depth);
+        let top = match end == head_depth {
+            true => head,
+            false => ancestor(conn, head, head_depth, end)?.ok_or(Error::new("storage_error"))?,
+        };
+        let ids = lineage_from(conn, top, depth)?;
+        depth = end + 1;
+        for old in ids {
+            type Row = (
+                Vec<u8>,
+                Option<i64>,
+                Option<i64>,
+                i64,
+                i64,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+            );
+            let (item, turn, message, extra, count, stub, declined): Row = conn
             .prepare_cached(
                 "SELECT n.item,n.turn,n.message,n.pictured,n.pictures,s.item,d.item FROM nodes n
                  LEFT JOIN stubs s ON s.node=n.id LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
@@ -22149,92 +22212,97 @@ fn translate_onto(
                     r.get(6)?,
                 ))
             })?;
-        let mut items = translator.item(&item)?;
-        if items.is_empty() && turn.is_some() {
-            items.push(to.user_item_from("(no text)", &[], &[])?);
-        }
-        waiting.push(old);
-        let single = items.len() == 1;
-        // The one item a node becomes, translated alone, else nothing.
-        let mut one = |source: &Option<Vec<u8>>| -> Result<Option<Vec<u8>>> {
-            match (source, single) {
-                (Some(source), true) => {
-                    let mut items = translator.item(source)?;
-                    Ok((items.len() == 1).then(|| items.remove(0)))
-                }
-                _ => Ok(None),
+            let mut items = translator.item(&item)?;
+            if items.is_empty() && turn.is_some() {
+                items.push(to.user_item_from("(no text)", &[], &[])?);
             }
-        };
-        let (stub, declined) = (one(&stub)?, one(&declined)?);
-        for (index, new_item) in items.iter().enumerate() {
-            let lead = index == 0;
-            let next = next_node(conn)?;
-            let pictured = match lead && single {
-                true => Pictured { count, extra },
-                false => Pictured::default(),
+            if wanted.contains(&old) {
+                waiting.push(old);
+            }
+            let single = items.len() == 1;
+            // The one item a node becomes, translated alone, else nothing.
+            let mut one = |source: &Option<Vec<u8>>| -> Result<Option<Vec<u8>>> {
+                match (source, single) {
+                    (Some(source), true) => {
+                        let mut items = translator.item(source)?;
+                        Ok((items.len() == 1).then(|| items.remove(0)))
+                    }
+                    _ => Ok(None),
+                }
             };
-            // A result's stub names the node that holds it in full.
-            let stub = stub.as_ref().filter(|_| lead).map(|stub| {
-                let (was, now) = (format!("result/{old}\\\""), format!("result/{next}\\\""));
-                match std::str::from_utf8(stub) {
-                    Ok(text) => text.replacen(&was, &now, 1).into_bytes(),
-                    Err(_) => stub.clone(),
+            let (stub, declined) = (one(&stub)?, one(&declined)?);
+            for (index, new_item) in items.iter().enumerate() {
+                let lead = index == 0;
+                let next = next_node(conn)?;
+                let pictured = match lead && single {
+                    true => Pictured { count, extra },
+                    false => Pictured::default(),
+                };
+                // A result's stub names the node that holds it in full.
+                let stub = stub.as_ref().filter(|_| lead).map(|stub| {
+                    let (was, now) = (format!("result/{old}\\\""), format!("result/{next}\\\""));
+                    match std::str::from_utf8(stub) {
+                        Ok(text) => text.replacen(&was, &now, 1).into_bytes(),
+                        Err(_) => stub.clone(),
+                    }
+                });
+                let weight = new_item.len() as i64 - pictured.extra;
+                let (stub, elided) = match stub {
+                    Some(stub) if (stub.len() as i64) < weight => {
+                        let elided = weight - stub.len() as i64;
+                        (Some(stub), elided)
+                    }
+                    _ => (None, 0),
+                };
+                let new = insert_node(
+                    conn,
+                    parent,
+                    new_item,
+                    turn.filter(|_| lead),
+                    message.filter(|_| lead),
+                    elided,
+                    pictured,
+                )?;
+                if new != next {
+                    return fail("storage_error");
                 }
-            });
-            let weight = new_item.len() as i64 - pictured.extra;
-            let (stub, elided) = match stub {
-                Some(stub) if (stub.len() as i64) < weight => {
-                    let elided = weight - stub.len() as i64;
-                    (Some(stub), elided)
+                if let Some(stub) = stub {
+                    conn.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
+                        .execute(params![new, stub])?;
                 }
-                _ => (None, 0),
-            };
-            let new = insert_node(
-                conn,
-                parent,
-                new_item,
-                turn.filter(|_| lead),
-                message.filter(|_| lead),
-                elided,
-                pictured,
-            )?;
-            if new != next {
-                return fail("storage_error");
-            }
-            if let Some(stub) = stub {
-                conn.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
-                    .execute(params![new, stub])?;
-            }
-            if lead {
-                // What it was first written as, for reads that name that node.
-                conn.prepare_cached(
-                    "INSERT INTO translated(node,source)
+                if lead {
+                    // What it was first written as, for reads that name that node.
+                    conn.prepare_cached(
+                        "INSERT INTO translated(node,source)
                      SELECT ?1,COALESCE((SELECT source FROM translated WHERE node=?2),?2)",
-                )?
-                .execute(params![new, old])?;
-                if let Some(declined) = &declined {
-                    conn.prepare_cached("INSERT INTO declined(node,item) VALUES (?,?)")?
-                        .execute(params![new, declined])?;
-                }
-                conn.prepare_cached(
+                    )?
+                    .execute(params![new, old])?;
+                    if let Some(declined) = &declined {
+                        conn.prepare_cached("INSERT INTO declined(node,item) VALUES (?,?)")?
+                            .execute(params![new, declined])?;
+                    }
+                    conn.prepare_cached(
                     "INSERT INTO openings(node,text,chars) SELECT ?1,text,chars FROM openings WHERE node=?2",
                 )?
                 .execute(params![new, old])?;
-                conn.prepare_cached(
+                    conn.prepare_cached(
                     "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes,attached)
                      SELECT ?1,bot,bot_id,turn,origin,person,quotes,attached FROM senders WHERE node=?2",
                 )?
                 .execute(params![new, old])?;
+                }
+                for source in waiting.drain(..) {
+                    out.first.insert(source, new);
+                }
+                out.first_new.get_or_insert(new);
+                out.head = Some(new);
+                out.count += 1;
+                parent = Some(new);
             }
-            for source in waiting.drain(..) {
-                out.first.insert(source, new);
+            if wanted.contains(&old) {
+                out.last.insert(old, out.head);
             }
-            out.first_new.get_or_insert(new);
-            out.head = Some(new);
-            out.count += 1;
-            parent = Some(new);
         }
-        out.last.insert(old, out.head);
     }
     Ok(out)
 }

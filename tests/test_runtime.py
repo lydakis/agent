@@ -1784,6 +1784,17 @@ class SwitchFamilyTests(unittest.TestCase):
         self.assertNotIn('reply:fourth', json.dumps(items))
         self.assert_all_freed(client, path, 'Bob')
 
+    def test_an_agent_switched_back_before_its_first_turn_keeps_its_fallback(self):
+        client, openai, anthropic, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        self.assertIn('result', client.request('configure', bot='Bob', fallback='openai/synthetic-backup'))
+        moved = client.request('configure', bot='Bob', model='anthropic/synthetic-claude', effort='low')['result']
+        self.assertIn('fallback', moved['changed'])
+        self.assertIsNone(client.request('inspect', bot='Bob')['result'].get('fallback'))
+        back = client.request('configure', bot='Bob', model='openai/synthetic-model', effort='low')['result']
+        self.assertIn('fallback', back['changed'])
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['fallback'], 'openai/synthetic-backup')
+
     def test_a_fork_in_the_translated_history_keeps_the_summary_made_before_it(self):
         client, openai, anthropic, path = self.start()
         client.request('create', bot='Bob', workspace=str(path), effort='low')

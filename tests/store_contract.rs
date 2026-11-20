@@ -7947,6 +7947,65 @@ fn work_charges_what_a_request_sends_new_once_and_survives_a_restart() {
 }
 
 #[test]
+fn a_long_history_crosses_in_order_a_page_at_a_time() {
+    let path =
+        std::env::temp_dir().join(format!("agent-long-switch-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    let texts: Vec<String> = (0..1300).map(|n| format!("m{n}")).collect();
+    db.append(
+        turn,
+        texts.iter().map(|t| assistant(t)).collect(),
+        &[],
+        Some(&usage(100, 10, "m")),
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+    db.switch_family(
+        "Bob",
+        None,
+        &Switch {
+            provider: "anthropic",
+            model: "synthetic-claude",
+            effort: None,
+            family: Family::Anthropic,
+            custom: Default::default(),
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(bob.work.read, bob.head);
+    let read = Connection::open(&path).unwrap();
+    let crossed: Vec<String> = read
+        .prepare(
+            "WITH RECURSIVE chain(id,parent,depth) AS (
+                SELECT id,parent,depth FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent)
+             SELECT n.item FROM chain c JOIN nodes n ON n.id=c.id ORDER BY c.depth",
+        )
+        .unwrap()
+        .query_map([bob.head.unwrap()], |r| r.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|item| {
+            let item: Value = serde_json::from_slice(&item.unwrap()).unwrap();
+            assert!(item.get("type").is_none(), "{item}");
+            item["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .filter(|text| text.starts_with('m'))
+        .collect();
+    assert_eq!(crossed, texts);
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn what_was_read_moves_with_the_history_to_the_other_family_and_back() {
     let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
