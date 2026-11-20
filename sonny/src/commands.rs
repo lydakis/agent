@@ -69,12 +69,18 @@ impl Commands {
 /// What a row names in the stop it asks for: the start of its command,
 /// or its handle.
 pub fn what(row: &Value) -> String {
+    crate::transcript::cut(&said(row), 32)
+}
+
+/// The whole command on one line, its controls as spaces; with none, its
+/// handle.
+pub fn said(row: &Value) -> String {
     let command: String = (row["command"].as_str().unwrap_or_default().chars())
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     match command.trim() {
         "" => row["handle"].as_str().unwrap_or_default().to_owned(),
-        command => crate::transcript::cut(command, 32),
+        command => command.to_owned(),
     }
 }
 

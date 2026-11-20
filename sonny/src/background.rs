@@ -1219,7 +1219,7 @@ impl View {
             None => match self.commands.rows.get(index - self.items.len()) {
                 Some(row) => {
                     let name = self.scope.short(row["bot"].as_str().unwrap_or("?"));
-                    let said = format!("{name} {}", commands::what(row));
+                    let said = format!("{name} {}", commands::said(row));
                     return find.says(&said);
                 }
                 None => return false,
@@ -3472,6 +3472,26 @@ mod tests {
             scheduler: SchedulerState::default(),
             finding: None,
         }
+    }
+
+    #[test]
+    fn ctrl_f_finds_a_command_by_its_whole_text() {
+        let store = std::env::temp_dir().join("sonny-bg-find-command.sqlite");
+        let mut view = view_of(store, Vec::new());
+        view.commands_loaded(Ok(json!({"processes": [
+            {"handle": "proc:4", "bot": "calc.lead", "kind": "background",
+             "command": "cargo build", "started_ms": 1_000, "pid": null},
+            {"handle": "proc:9", "bot": "calc.fix", "kind": "background",
+             "command": "python scripts/maintenance_runner.py --task reconcile",
+             "started_ms": 1_000, "pid": null},
+        ]})));
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(view.key(ctrl_f, 0..0), Key::Stay));
+        // A word past what a stop's question shows is still found, as the
+        // row draws it at a width that holds it.
+        assert!(view.paste("reconcile"));
+        assert!(!view.shown(0) && view.shown(1));
+        assert_eq!(view.selected, 1);
     }
 
     #[test]
