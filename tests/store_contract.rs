@@ -24399,7 +24399,8 @@ fn a_store_from_109_takes_profiles_with_none_on_its_bots() {
     let path = dir.join("state.sqlite");
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-        db.create("shop.fix", Some("/synthetic"), binding()).unwrap();
+        db.create("shop.fix", Some("/synthetic"), binding())
+            .unwrap();
     }
     // The store as 109 wrote it: what store_down.py's step leaves.
     Connection::open(&path)
@@ -24414,7 +24415,10 @@ fn a_store_from_109_takes_profiles_with_none_on_its_bots() {
     };
     assert_eq!(has_column(), 0);
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    assert_eq!(count(&path, "PRAGMA user_version"), i64::from(Database::SCHEMA));
+    assert_eq!(
+        count(&path, "PRAGMA user_version"),
+        i64::from(Database::SCHEMA)
+    );
     assert_eq!(has_column(), 1);
     assert_eq!(db.inspect("shop.fix").unwrap().profile, None);
     drop(db);
