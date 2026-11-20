@@ -984,6 +984,11 @@ impl App {
     /// follow says an agent moved, and while one runs at most every
     /// [`STATUS_AGAIN`], as `/status` reads its own: never oftener.
     async fn projects_tick(&mut self) {
+        // A read the page left under way is taken as it ends, and its
+        // connection let go, though the page stays closed.
+        if let Some(kept) = &mut self.projects_kept {
+            kept.landed();
+        }
         let Some(open) = &mut self.projects else {
             return;
         };
@@ -29049,6 +29054,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha.lead"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_read_left_under_way_by_closing_is_taken_as_it_ends() {
+        let mut kept = ProjectsKept {
+            job: Some(tokio::spawn(async {
+                Some(ProjectsRead {
+                    projects: vec![projects::Project {
+                        lead: "alpha.lead".into(),
+                        ..Default::default()
+                    }],
+                    listed: Vec::new(),
+                    state: ProjectsState::default(),
+                    whole: true,
+                })
+            })),
+            lent: Some(tokio::spawn(std::future::pending())),
+            ..Default::default()
+        };
+        while !kept.job.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.projects_kept = Some(Box::new(kept));
+        app.projects_tick().await;
+        kept = *app.projects_kept.take().unwrap();
+        assert!(kept.job.is_none() && kept.lent.is_none());
+        assert_eq!(kept.projects[0].lead, "alpha.lead");
     }
 
     #[test]
