@@ -47,8 +47,12 @@ jobs:
         run: |
           # Sandboxed commands run in bubblewrap; a test pushes over ssh
           # through one, to an sshd of its own.
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap openssh-server openssh-client
+          # A mirror outage is retried rather than skipping the tests.
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update && sudo apt-get install -y bubblewrap openssh-server openssh-client && break
+            [ "$attempt" = 5 ] && exit 1
+            sleep $((attempt * 30))
+          done
           # Ubuntu 24.04 keeps the unprivileged user namespaces bubblewrap
           # needs behind AppArmor.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -96,12 +100,19 @@ jobs:
       - name: Install bubblewrap
         # Sandboxed commands run in it; see the rust job for the sysctl.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          # A mirror outage is retried rather than skipping the tests.
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update && sudo apt-get install -y bubblewrap && break
+            [ "$attempt" = 5 ] && exit 1
+            sleep $((attempt * 30))
+          done
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Runtime tests
         env:
           AGENT_TEST_RUNTIME: "1"
+          # tests/test_release_stores.py fetches the releases it takes
+          # stores back to here.
+          AGENT_RELEASE_BINARIES: ${{ github.workspace }}/.local/releases
         run: |
           python3 -m venv .local/venv
           .local/venv/bin/pip install --quiet -r bench/requirements.txt

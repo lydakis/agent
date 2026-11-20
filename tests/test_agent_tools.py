@@ -331,6 +331,32 @@ class AgentToolsTests(ModelFixture):
         self.assertIn('from differs from the request that sent message', again)
         self.assertEqual(client.request('inspect', bot='shop.once')['result']['settings']['sandbox'], 'read-only')
 
+    def test_an_agent_keeps_the_profile_it_was_made_in(self):
+        agents = self.path / '.agents' / 'agents'
+        agents.mkdir(parents=True)
+        (agents / 'reviewer.md').write_text('Review it.\n')
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'review', 'message': 'q', 'profile': 'reviewer'}),
+                       ('spawn_agent', {'name': 'plain', 'message': 'q'}))
+        self.assertEqual(client.request('inspect', bot='shop.review')['result']['profile'], 'reviewer')
+        self.assertNotIn('profile', client.request('inspect', bot='shop.plain')['result'])
+        # A fork keeps its source's; the listing an agent reads names it.
+        client.request('fork', source='shop.review', bot='shop.review-copy')
+        self.run_calls(client, 'shop.lead', 'list', ('list_agents', {}))
+        rows = {row['name']: row for row in json.loads(self.output(client, 'shop.lead', 'list_agents-1'))['bots']}
+        self.assertEqual((rows['shop.review']['profile'], rows['shop.review-copy']['profile']),
+                         ('reviewer', 'reviewer'))
+        self.assertNotIn('profile', rows['shop.plain'])
+        # Named again by its client, or let go.
+        client.request('configure', bot='shop.plain', profile='task')
+        self.assertEqual(client.request('inspect', bot='shop.plain')['result']['profile'], 'task')
+        client.request('configure', bot='shop.plain', profile=None)
+        self.assertNotIn('profile', client.request('inspect', bot='shop.plain')['result'])
+        bad = client.request('configure', bot='shop.plain', profile='../x')
+        self.assertEqual(bad['error'], 'invalid_name', bad)
+
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
         client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))

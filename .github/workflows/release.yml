@@ -1,7 +1,10 @@
 name: Release
 
 # Packages a version tag's source and its Homebrew formulas, and static Linux
-# builds of Sonny and its daemon, as a draft release. Publishing the draft is
+# builds of Sonny and its daemon, as a draft release. Main's manifests say
+# 0.0.0, as Codex's do: each job writes the tag's version into its own build
+# tree (release/stamp_version.py) before it tests or builds, and the source
+# archive carries the stamped manifests. Publishing the draft is
 # the human step; publish-homebrew.yml then updates the tap. A tag push
 # starts release-request.yml, and this runs after it from main's definition,
 # so a tag's own commit never reaches the release's write token. Re-run a
@@ -26,6 +29,10 @@ jobs:
       github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # The gate reads the commit's Test runs.
+      actions: read
     outputs:
       tag: ${{ steps.source.outputs.tag }}
       commit: ${{ steps.source.outputs.commit }}
@@ -61,17 +68,15 @@ jobs:
             echo 'Release tag must point to a commit on main' >&2
             exit 1
           fi
-          # `agent --version` takes the runtime's version and `sonny
-          # --version` Sonny's; both must be the tag's.
-          for manifest in Cargo.toml sonny/Cargo.toml; do
-            version=$(git show "$commit:$manifest" | python3 -c \
-              'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
-            if [ "v$version" != "$RELEASE_TAG" ]; then
-              echo "$manifest has version $version, not ${RELEASE_TAG#v}" >&2
-              exit 1
-            fi
-          done
           printf 'tag=%s\ncommit=%s\n' "$RELEASE_TAG" "$commit" >> "$GITHUB_OUTPUT"
+      - name: Require a green test run
+        # A release ships only a commit Test passed whole: a test.yml run
+        # pushed for it with every job and step a success, a skipped one
+        # failing. The gate is main's, as checked out above.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: python3 release/green_gate.py "$GITHUB_REPOSITORY" "$RELEASE_COMMIT"
 
   package:
     needs: resolve
@@ -104,10 +109,16 @@ jobs:
             echo 'Release tag changed after approval' >&2
             exit 1
           fi
+      - name: Test the release scripts
+        # On the commit as main has it: their tests check main says 0.0.0.
+        run: python3 -m unittest discover -s release
+      - name: Stamp the tag's version
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: python3 release/stamp_version.py "${RELEASE_TAG#v}"
       - name: Test
-        run: |
-          python3 -m unittest discover -s release
-          cargo test --locked --workspace
+        # At the tag's version: one-off upgrade work past its release fails.
+        run: cargo test --locked --workspace
       - name: Package the source and formulas, and verify them
         env:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
@@ -117,11 +128,23 @@ jobs:
           mkdir dist
           # The formulas for the daemon and Sonny build both from this
           # commit's source on the person's machine; nothing in it is signed.
+          # It is the commit's tree with the stamped manifests and nothing
+          # else changed: Homebrew builds it without git, so its binaries
+          # say the version their manifests carry.
+          git add Cargo.toml Cargo.lock client/Cargo.toml sonny/Cargo.toml
+          test -z "$(git status --porcelain --untracked-files=no -- . ':!Cargo.toml' \
+            ':!Cargo.lock' ':!client/Cargo.toml' ':!sonny/Cargo.toml')"
+          tree=$(git write-tree)
           git archive --format=tar.gz --prefix="agent-${version}/" \
-            -o "dist/agent-${version}.tar.gz" "$RELEASE_COMMIT"
+            -o "dist/agent-${version}.tar.gz" "$tree"
           tar -tzf "dist/agent-${version}.tar.gz" > "$RUNNER_TEMP/source.txt"
-          for file in Cargo.toml Cargo.lock sonny/Cargo.toml; do
+          for file in Cargo.toml Cargo.lock client/Cargo.toml sonny/Cargo.toml; do
             grep -qx "agent-${version}/$file" "$RUNNER_TEMP/source.txt"
+          done
+          for file in Cargo.toml client/Cargo.toml sonny/Cargo.toml; do
+            # Read whole, so grep stopping early never fails the pipe.
+            tar -xzOf "dist/agent-${version}.tar.gz" "agent-${version}/$file" |
+              grep -x "version = \"${version}\"" > /dev/null
           done
           for name in agent sonny; do
             python3 release/homebrew_formula.py "$name" "$version" \
@@ -210,6 +233,10 @@ jobs:
             echo 'Release tag changed after approval' >&2
             exit 1
           fi
+      - name: Stamp the tag's version
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: python3 release/stamp_version.py "${RELEASE_TAG#v}"
       - name: Install Zig, as Codex's musl builds do
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:

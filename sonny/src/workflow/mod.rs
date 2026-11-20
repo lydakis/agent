@@ -1375,7 +1375,9 @@ impl Attempt {
                 "created_by": plan.caller, "created_by_id": plan.caller_id,
                 "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
                 "settings": settings,
-                "request_id": request});
+                "request_id": request,
+                // The profile it is composed in, kept on it.
+                "profile": asked.agent_type});
             let error = match refused {
                 Some(why) => Some(why),
                 None => match self.client.request("create", create).await {

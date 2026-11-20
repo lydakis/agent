@@ -364,7 +364,7 @@ class AcpTests(ModelFixture):
         self.assertEqual(again['params']['toolCall']['toolCallId'], asked['params']['toolCall']['toolCallId'])
 
     def test_a_thread_that_opens_leaves_the_tool_host_another_build_runs_and_its_scripts(self):
-        """Row 29 of code mode: a client of another build started the tool
+        """Row 29 of code mode: a client of a newer build started the tool
         host; a thread opening on this build adds what is missing and
         replaces nothing, so the script the host runs goes on to its end."""
         tool = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env=self.env, check=True,
@@ -372,8 +372,9 @@ class AcpTests(ModelFixture):
         made = dict(workspace=str(self.path), model='openai/synthetic-model', instructions='Task.',
                     tools=['echo', 'shell'], declare=[tool], settings={'steps_only': ['*']})
         self.daemon.request('create', bot='calc.task', **made)
-        # As a window of the release before this one kept it.
-        other = {'HOME': str(self.path), 'AGENT_BIN': str(self.binary), 'SONNY_BUILD': '0.9.5 1',
+        # As a window of a later release kept it: a window replaces only
+        # what an older release started.
+        other = {'HOME': str(self.path), 'AGENT_BIN': str(self.binary), 'SONNY_BUILD': '999.0.0 1',
                  'SONNY_PROGRAM': str(self.sonny)}
         self.daemon.request('companions', add={'name': 'sonny-tool-host', 'command': str(self.sonny),
                                                'args': ['tool-host'], 'env': other})

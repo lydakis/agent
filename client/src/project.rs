@@ -530,6 +530,10 @@ pub async fn create(
     if !settings.is_empty() {
         params["settings"] = Value::Object(settings);
     }
+    // The profile its client chose for it by name.
+    if !policy["profile"].is_null() {
+        params["profile"] = policy["profile"].clone();
+    }
     // The tools its client declares on the lead, from its first turn.
     if !policy["declare"].is_null() {
         params["declare"] = policy["declare"].clone();

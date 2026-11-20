@@ -1061,10 +1061,10 @@ pub fn unheld(
 /// A `follows` call of `subscriber`'s: `add` one, as `to_json`
 /// writes it, or `remove` one by name, answered with that one alone, and
 /// for one added that hears sources, what it would have heard of their
-/// last day; with neither, list them all, with the `sources` the person
-/// set up. Adding one again changes nothing; one under a name in use that
-/// differs is refused with the field, and one naming a source there is
-/// not with the sources there are.
+/// last day; with neither, the first page of its [`listing`]. Adding one
+/// again changes nothing; one under a name in use that differs is refused
+/// with the field, and one naming a source there is not with the sources
+/// there are.
 pub fn change(
     store: &Path,
     subscriber: &str,
@@ -1084,19 +1084,15 @@ pub fn change(
         made: sub.runs.map(|_| made),
         ..sub
     });
+    if add.is_none() && remove.is_none() {
+        return listing(store, subscriber, owner, sources, 0);
+    }
     // One change at a time, so two at once both land.
     let _held = held(store)?;
-    let mut subs = read_whole(store, subscriber)?;
-    // What another bot of the name held is gone with it.
-    let mine = |s: &Sub| s.owner.is_none() || owner.is_none() || s.owner == owner;
-    if !subs.iter().all(mine) {
-        subs.retain(mine);
-        write(store, subscriber, &subs)?;
-    }
+    let mut subs = mine(store, subscriber, owner)?;
     let mut said = json!({});
-    let changes = add.is_some() || remove.is_some();
     // What it added is all a change lists, one removed being gone: the
-    // whole listing is for a call that changes nothing.
+    // listing is for a call that changes nothing.
     let mut changed: Vec<Sub> = Vec::new();
     if let Some(name) = remove {
         said["removed"] = json!(drop_named(store, subscriber, &mut subs, name)?);
@@ -1156,40 +1152,183 @@ pub fn change(
             }
         }
     }
-    let listed = match changes {
-        true => &changed,
-        false => &subs,
-    };
-    // What each told lately, as the lookout counts it; when each was
-    // added is the lookout's to count by, not the bot's to read.
+    // What each told lately, as the lookout counts it.
     let (counts, now) = (counts(store, subscriber), super::epoch_ms() as u64);
-    let listing: Vec<Value> = (listed.iter())
-        .map(|sub| {
-            let mut listed = Sub {
-                made: None,
-                ..sub.clone()
-            }
-            .to_json();
-            if let Some(told) = counts.of(&sub.name, &sub.identity(owner), now) {
-                listed["lately"] = told;
-            }
-            listed
-        })
+    let listing: Vec<Value> = (changed.iter())
+        .map(|sub| whole(sub, &counts, owner, now))
         .collect();
     // One only removed lists nothing, rather than an empty list that
     // would read as none left.
-    if !(changes && listing.is_empty()) {
+    if !listing.is_empty() {
         said["follows"] = json!(listing);
     }
     // Whether what it lists is what the lookout listens for.
     said["lookout"] = taken(store, subscriber);
-    if changes {
-        return Ok(said);
+    Ok(said)
+}
+
+/// `subscriber`'s follows held by the bot `owner`, as its file holds
+/// them: what another bot of the name held is gone with it, and written
+/// so. Taken with the file held.
+fn mine(store: &Path, subscriber: &str, owner: Option<i64>) -> Result<Vec<Sub>, String> {
+    let mut subs = read_whole(store, subscriber)?;
+    let mine = |s: &Sub| s.owner.is_none() || owner.is_none() || s.owner == owner;
+    if !subs.iter().all(mine) {
+        subs.retain(mine);
+        write(store, subscriber, &subs)?;
     }
-    // Examples come only from events these subscriptions hear, and are
-    // what sources printed, as a note from them is.
-    let (listed, examples) = super::sources::listed(store, sources, &subs);
-    said["sources"] = json!(listed);
+    Ok(subs)
+}
+
+/// One follow whole, as `add` would take it again, with what it told
+/// lately; when it was added is the lookout's to count by, not the bot's
+/// to read.
+fn whole(sub: &Sub, counts: &Counts, owner: Option<i64>, now: u64) -> Value {
+    let mut whole = Sub {
+        made: None,
+        ..sub.clone()
+    }
+    .to_json();
+    if let Some(told) = counts.of(&sub.name, &sub.identity(owner), now) {
+        whole["lately"] = told;
+    }
+    whole
+}
+
+/// A `follows` call with nothing: `subscriber`'s follows, one line each,
+/// from the `from`th, as every tool that lists pages them
+/// ([`crate::served::paged`]); each line its name, whom and what it hears,
+/// when it ends, how many events it heard lately, and a source it names
+/// that is not there. With them the sources there are, each by name with
+/// how many events its shape counts, which `source` shows whole, and
+/// whether the lookout listens for what it lists.
+pub fn listing(
+    store: &Path,
+    subscriber: &str,
+    owner: Option<i64>,
+    sources: &[String],
+    from: usize,
+) -> Result<Value, String> {
+    if !plain(subscriber, BOT_NAME_MAX) {
+        return Err(format!("{subscriber:?} is not a bot's name"));
+    }
+    let subs = {
+        let _held = held(store)?;
+        mine(store, subscriber, owner)?
+    };
+    let (counts, now) = (counts(store, subscriber), super::epoch_ms() as u64);
+    let lines: Vec<Value> = (subs.iter())
+        .map(|sub| line(sub, &counts, owner, now, sources))
+        .collect();
+    let mut said = json!({});
+    crate::served::paged(&mut said, "follows", lines, from, crate::served::PAGE_BYTES);
+    said["sources"] = json!(super::sources::counted(store, sources));
+    said["lookout"] = taken(store, subscriber);
+    Ok(said)
+}
+
+/// A follow's line in the listing: what it takes to pick it.
+fn line(sub: &Sub, counts: &Counts, owner: Option<i64>, now: u64, sources: &[String]) -> Value {
+    let mut line = json!({"name": sub.name});
+    for (key, names) in [
+        ("tasks_of", &sub.tasks_of),
+        ("agents", &sub.agents),
+        ("sources", &sub.sources),
+    ] {
+        if !names.is_empty() {
+            line[key] = json!(names);
+        }
+    }
+    if let Some(until) = &sub.until {
+        line["until"] = json!(until);
+    }
+    if let Some(runs) = sub.runs {
+        line["runs"] = json!(runs);
+    }
+    if let Some(told) = counts.of(&sub.name, &sub.identity(owner), now) {
+        line["lately"] = told["heard"].clone();
+    }
+    let gone: Vec<&str> = (sub.sources.iter())
+        .map(|name| super::sources::named(name).0)
+        .filter(|source| !sources.iter().any(|there| there == source))
+        .collect();
+    if !gone.is_empty() {
+        line["problem"] = json!(format!("no source {} now", gone.join(", ")));
+    }
+    line
+}
+
+/// A `follows` call's `read`: `subscriber`'s follow `name` whole, with
+/// what it told lately and what its sources say now ([`status`]).
+pub fn read_one(
+    store: &Path,
+    subscriber: &str,
+    owner: Option<i64>,
+    name: &str,
+    sources: &[String],
+) -> Result<Value, String> {
+    if !plain(subscriber, BOT_NAME_MAX) {
+        return Err(format!("{subscriber:?} is not a bot's name"));
+    }
+    let subs = {
+        let _held = held(store)?;
+        mine(store, subscriber, owner)?
+    };
+    let sub = (subs.iter().find(|sub| sub.name == name))
+        .ok_or_else(|| format!("no follow {name:?}: a call with nothing lists yours"))?;
+    let (counts, now) = (counts(store, subscriber), super::epoch_ms() as u64);
+    let (follow, lookout) = (whole(sub, &counts, owner, now), taken(store, subscriber));
+    // What the follow and the lookout's word take is left out of what its
+    // sources' words may fill.
+    let reserve = follow.to_string().len() + lookout.to_string().len();
+    let mut said = status(store, sub, sources, reserve);
+    said["follow"] = follow;
+    said["lookout"] = lookout;
+    Ok(said)
+}
+
+/// A `follows` call's `source`: the source `name` whole, or one topic of
+/// it as `NAME:TOPIC`: its shape as the lookout last saw it, every field's
+/// kinds with an example only from the newest recent event one of
+/// `subscriber`'s follows hears, the topics it named lately, and what it
+/// says now ([`status`]). One there is not is refused with the sources
+/// there are.
+pub fn source(
+    store: &Path,
+    subscriber: &str,
+    owner: Option<i64>,
+    name: &str,
+    sources: &[String],
+) -> Result<Value, String> {
+    let reading = checked(&json!({"name": "source", "sources": [name]}), sources)?;
+    let subs = {
+        let _held = held(store)?;
+        mine(store, subscriber, owner)?
+    };
+    let (shape, examples) =
+        super::sources::listed(store, &[super::sources::named(name).0.to_owned()], &subs);
+    let mut source = shape.into_iter().next().unwrap_or_default();
+    // What its shape and the examples' warning take is left out of what
+    // its topics may fill.
+    let reserve = source.to_string().len()
+        + if examples {
+            super::sources::EXAMPLES.len()
+        } else {
+            0
+        };
+    let mut said = status(store, &reading, sources, reserve);
+    if let Some(now) = said.as_object_mut().and_then(|said| said.remove("now")) {
+        let now = now
+            .as_array()
+            .and_then(|now| now.first())
+            .cloned()
+            .unwrap_or_default();
+        source["now"] = now["topics"].clone();
+        if !now["down"].is_null() {
+            source["down"] = now["down"].clone();
+        }
+    }
+    said["source"] = source;
     if examples {
         said["examples"] = json!(super::sources::EXAMPLES);
     }
@@ -1217,37 +1356,18 @@ fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
     Ok(sub)
 }
 
-/// A `follows` call's `read`: what the sources the follow `add` names
-/// say now, adding nothing, as Alertmanager's alerts API reads the
-/// alerts it holds by a route's matchers or a receiver's name. An add
-/// that names nothing but its name reads `subscriber`'s follow of that
-/// name. Each source answers its status as the lookout keeps it
-/// ([`super::sources::status`]): the newest event of each topic it
+/// What the sources `sub` names say now, under `now`, as Alertmanager's
+/// alerts API reads the alerts it holds by a route's matchers or a
+/// receiver's name. Each source answers its status as the lookout keeps
+/// it ([`super::sources::status`]): the newest event of each topic it
 /// hears, newest first, as data, and that the source is down while it
 /// is. The tasks source and the commons keep none here, so they are said
-/// to be unread.
-pub fn read_now(
-    store: &Path,
-    subscriber: &str,
-    add: &Value,
-    sources: &[String],
-) -> Result<Value, String> {
-    let names_one = ["sources", "agents", "tasks_of"]
-        .iter()
-        .any(|key| add.get(*key).is_some());
-    let sub = match names_one {
-        true => checked(add, sources)?,
-        false => {
-            let name = add["name"].as_str().unwrap_or_default();
-            (read_whole(store, subscriber)?.into_iter())
-                .find(|sub| sub.name == name)
-                .ok_or_else(|| {
-                    format!("no follow {name:?}: a read names sources, or one of your follows")
-                })?
-        }
-    };
+/// to be unread; a source there is not now is left out. The answer fits
+/// what a tool's answer shows with `reserve` bytes more beside it.
+fn status(store: &Path, sub: &Sub, sources: &[String], reserve: usize) -> Value {
     let named: Vec<&str> = (sub.sources.iter())
         .map(|name| super::sources::named(name).0)
+        .filter(|source| sources.iter().any(|there| there == source))
         .collect();
     let mut unread: Vec<&str> = Vec::new();
     if !sub.tasks_of.is_empty() || !sub.agents.is_empty() {
@@ -1256,7 +1376,7 @@ pub fn read_now(
     let mut listed = Vec::new();
     // The whole answer fits what a tool's answer shows, its words besides
     // the topics (`outside`, `more`, `unread`) counted first.
-    let (mut bytes, mut more) = (READ_WORDS, 0);
+    let (mut bytes, mut more) = (READ_WORDS + reserve, 0);
     for (n, source) in named.iter().enumerate() {
         if named[..n].contains(source) {
             continue;
@@ -1298,12 +1418,15 @@ pub fn read_now(
         }
         listed.push(status);
     }
-    let mut answer = json!({"read": listed});
+    let mut answer = json!({});
     if listed
         .iter()
         .any(|status| status["topics"].as_array().is_some_and(|t| !t.is_empty()))
     {
         answer["outside"] = json!(super::sources::OUTSIDE);
+    }
+    if !listed.is_empty() {
+        answer["now"] = json!(listed);
     }
     if more > 0 {
         answer["more"] = json!(format!("{more} topics more than one answer holds"));
@@ -1314,7 +1437,7 @@ pub fn read_now(
             unread.join(" and ")
         ));
     }
-    Ok(answer)
+    answer
 }
 
 /// What a read's answer says besides its sources and topics, at most.
@@ -1909,25 +2032,22 @@ mod tests {
     }
 
     #[test]
-    fn a_read_gives_what_sources_say_now_and_follows_nothing() {
+    fn a_source_and_a_follow_read_say_what_sources_say_now_and_follow_nothing() {
         let store = std::env::temp_dir().join(format!("subs-read-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir(&store));
         let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
         kept_log(&store, "prs", 7, 3);
         let names = ["prs".to_owned(), COMMONS_SOURCE.to_owned()];
-        let read = |mut asked: Value| {
-            asked["name"] = json!(asked["name"].as_str().unwrap_or("r"));
-            read_now(&store, "shop.lead", &asked, &names)
-        };
-        let topics = |said: &Value| -> Vec<String> {
-            (said["read"][0]["topics"].as_array().unwrap().iter())
+        let topics = |now: &Value| -> Vec<String> {
+            (now.as_array().unwrap().iter())
                 .map(|t| t["topic"].as_str().unwrap().to_owned())
                 .collect()
         };
-        // Each topic's newest, newest first, as data.
-        let said = read(json!({"sources": ["prs"]})).unwrap();
-        assert_eq!(topics(&said), ["0", "2", "1"], "{said}");
-        let newest = &said["read"][0]["topics"][0];
+        // A source: each topic's newest, newest first, as data.
+        let said = source(&store, "shop.lead", None, "prs", &names).unwrap();
+        assert_eq!(topics(&said["source"]["now"]), ["0", "2", "1"], "{said}");
+        assert_eq!(said["source"]["name"], "prs");
+        let newest = &said["source"]["now"][0];
         assert!(
             newest["text"].as_str().unwrap().starts_with("#0 open"),
             "{newest}"
@@ -1937,38 +2057,46 @@ mod tests {
         assert_eq!(newest["url"], "https://example.com/0");
         assert_eq!(newest["fields"], json!({"state": "open"}));
         assert!(said["outside"].as_str().is_some());
-        // One topic, or a filter, as a follow names them.
-        assert_eq!(topics(&read(json!({"sources": ["prs:2"]})).unwrap()), ["2"]);
-        let red = read(json!({"sources": ["prs"], "filter": {"state": ["red"]}})).unwrap();
-        assert_eq!(topics(&red), ["2"], "{red}");
-        // A follow of the caller's, by its name alone: what it hears, and
-        // that its agents and the commons keep nothing here.
+        // One topic, as a follow names it.
+        let one = source(&store, "shop.lead", None, "prs:2", &names).unwrap();
+        assert_eq!(topics(&one["source"]["now"]), ["2"]);
+        // A follow of the caller's, by its name: it whole, what it hears,
+        // and that its agents and the commons keep nothing here.
         let follow = json!({"name": "mine", "sources": ["prs:1", format!("{COMMONS_SOURCE}:t")],
             "agents": ["shop.*"]});
         change(&store, "shop.lead", None, Some(&follow), None, &names).unwrap();
-        let mine = read(json!({"name": "mine"})).unwrap();
-        assert_eq!(topics(&mine), ["1"]);
-        assert_eq!(mine["read"].as_array().unwrap().len(), 1, "{mine}");
+        let mine = read_one(&store, "shop.lead", None, "mine", &names).unwrap();
+        assert_eq!(mine["follow"], follow, "{mine}");
+        assert_eq!(topics(&mine["now"][0]["topics"]), ["1"]);
+        assert_eq!(mine["now"].as_array().unwrap().len(), 1, "{mine}");
         assert_eq!(
             mine["unread"],
             "its agents and the commons: only what sources printed is kept to read"
         );
-        // An add's whole read the same, adding nothing.
-        assert_eq!(read(follow.clone()).unwrap(), mine);
-        assert_eq!(super::read(&store, "shop.lead").len(), 1);
+        assert!(mine["lookout"].is_object());
+        // A filter of a follow's narrows what its read says.
+        let red = json!({"name": "red", "sources": ["prs"], "filter": {"state": ["red"]}});
+        change(&store, "shop.lead", None, Some(&red), None, &names).unwrap();
+        let red = read_one(&store, "shop.lead", None, "red", &names).unwrap();
+        assert_eq!(topics(&red["now"][0]["topics"]), ["2"], "{red}");
+        // Reading adds nothing.
+        assert_eq!(super::read(&store, "shop.lead").len(), 2);
         // What it cannot read it says.
-        for (asked, why) in [
-            (json!({"name": "theirs"}), "no follow"),
-            (json!({"sources": ["mail"]}), "no source"),
-        ] {
-            let refused = read(asked.clone()).unwrap_err();
-            assert!(refused.contains(why), "{asked}: {refused}");
-        }
+        let none = read_one(&store, "shop.lead", None, "theirs", &names).unwrap_err();
+        assert_eq!(
+            none,
+            "no follow \"theirs\": a call with nothing lists yours"
+        );
+        let none = source(&store, "shop.lead", None, "mail", &names).unwrap_err();
+        assert!(
+            none.contains("no source \"mail\"") && none.contains("prs"),
+            "{none}"
+        );
         // More than a tool's answer shows is counted, and the answer whole
         // still fits.
         kept_log(&store, "prs", 300, 300);
-        let all = read(json!({"sources": ["prs"]})).unwrap();
-        let shown = all["read"][0]["topics"].as_array().unwrap().len();
+        let all = source(&store, "shop.lead", None, "prs", &names).unwrap();
+        let shown = all["source"]["now"].as_array().unwrap().len();
         assert!(
             all.to_string().len() <= crate::served::OUTPUT_BYTES,
             "{}",
@@ -1978,16 +2106,40 @@ mod tests {
             all["more"],
             format!("{} topics more than one answer holds", 300 - shown)
         );
-        // A source with nothing kept reads empty, and says nothing is outside.
-        let names = ["ci".to_owned()];
-        let empty = read_now(
-            &store,
-            "shop.lead",
-            &json!({"name": "r", "sources": ["ci"]}),
-            &names,
+        // Its shape counts against what its topics may fill: long topic
+        // names and many fields still leave the answer whole.
+        let shapes = super::super::beside(&store, ".sources").join(".shapes");
+        std::fs::create_dir_all(&shapes).unwrap();
+        let fields: serde_json::Map<String, Value> = (0..64)
+            .map(|n| {
+                (
+                    format!("field_{n:02}_{}", "f".repeat(40)),
+                    json!({"kinds": ["string"]}),
+                )
+            })
+            .collect();
+        let topics: Vec<String> = (0..32)
+            .map(|n| format!("{n}-{}", "t".repeat(280)))
+            .collect();
+        std::fs::write(
+            shapes.join("prs.json"),
+            json!({"events": 300, "fields": fields, "topics": topics, "recent": []}).to_string(),
         )
         .unwrap();
-        assert_eq!(empty, json!({"read": [{"source": "ci", "topics": []}]}));
+        let shaped = source(&store, "shop.lead", None, "prs", &names).unwrap();
+        assert!(
+            shaped.to_string().len() <= crate::served::OUTPUT_BYTES,
+            "{}",
+            shaped.to_string().len()
+        );
+        assert!(shaped["source"]["now"].as_array().unwrap().len() < shown);
+        // A source with nothing kept reads empty, and says nothing is outside.
+        let names = ["ci".to_owned()];
+        let empty = source(&store, "shop.lead", None, "ci", &names).unwrap();
+        assert_eq!(
+            empty,
+            json!({"source": {"name": "ci", "events": 0, "now": []}})
+        );
         let _ = std::fs::remove_dir_all(dir(&store));
         let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
     }
@@ -2013,18 +2165,16 @@ mod tests {
                     "filter",
                     json!({"name": "r", "sources": ["prs"], "filter": {"state": ["red"]}}),
                 ),
-            ];
+            ]
+            .map(|(what, asked)| (what, parse(&asked).unwrap()));
             for (what, asked) in &asks {
-                let _ = read_now(&store, "a", asked, &names).unwrap();
+                let _ = status(&store, asked, &names, 0);
                 let start = std::time::Instant::now();
                 for _ in 0..20 {
-                    let _ = read_now(&store, "a", asked, &names).unwrap();
+                    let _ = status(&store, asked, &names, 0);
                 }
                 let one = start.elapsed() / 20;
-                let size = read_now(&store, "a", asked, &names)
-                    .unwrap()
-                    .to_string()
-                    .len();
+                let size = status(&store, asked, &names, 0).to_string().len();
                 println!(
                     "agents {agents:>5} {what:>6}: one read {one:>9.2?}, answer {} KiB",
                     size / 1024
@@ -2053,8 +2203,9 @@ mod tests {
                                 .map(|agent| {
                                     let asked =
                                         json!({"name": "r", "sources": [format!("prs:{agent}")]});
+                                    let asked = parse(&asked).unwrap();
                                     let at = std::time::Instant::now();
-                                    let _ = read_now(store, "a", &asked, names).unwrap();
+                                    let _ = status(store, &asked, names, 0);
                                     at.elapsed()
                                 })
                                 .collect::<Vec<_>>()
@@ -2274,8 +2425,11 @@ mod tests {
         let file = counts_file(&store, "shop.lead");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, counts.to_json().to_string()).unwrap();
+        // The listing's line says how many it heard; a read, the rest.
         let listed = change(&store, "shop.lead", None, None, None, &[]).unwrap();
-        let lately = &listed["follows"][0]["lately"];
+        assert_eq!(listed["follows"][0]["lately"], 4, "{listed}");
+        let read = read_one(&store, "shop.lead", None, "prs", &[]).unwrap();
+        let lately = &read["follow"]["lately"];
         assert_eq!(
             (&lately["heard"], &lately["notes"], &lately["steers"]),
             (&json!(4), &json!(2), &json!(1))
@@ -2397,26 +2551,30 @@ mod tests {
             "no recent event of cr had path: the filter hears none until one does"
         );
         // A change answers with what changed alone; the sources are
-        // listed with all the subscriptions, on a call that changes nothing.
+        // named with every follow's line, on a call that changes nothing,
+        // and a source NAME shows one whole.
         assert_eq!(warned["follows"].as_array().unwrap().len(), 1);
         assert!(warned.get("sources").is_none(), "{warned}");
         let whole = change(&store, "shop.lead", None, None, None, &sources).unwrap();
         assert_eq!(whole["follows"].as_array().unwrap().len(), 4);
+        assert_eq!(whole["sources"], json!([{"name": "cr", "events": 3}]));
+        assert!(whole["follows"][0].get("filter").is_none(), "{whole}");
         // Examples only from the newest event its subscriptions hear, the
         // billing one rather than the later one its filter leaves out, with
         // the outside-content warning.
-        let listed = &whole["sources"][0];
+        let cr = source(&store, "shop.lead", None, "cr", &sources).unwrap();
+        let listed = &cr["source"];
         assert_eq!(listed["name"], "cr");
         assert_eq!(
             listed["fields"]["paths"],
             "list of strings, as [\"src/billing/a.rs\"]"
         );
         assert_eq!(listed["fields"]["meta.team"], "string, as \"core\"");
-        assert_eq!(whole["examples"], super::super::sources::EXAMPLES);
+        assert_eq!(cr["examples"], super::super::sources::EXAMPLES);
         // A caller hearing none of them sees each field's kinds alone.
-        let other = change(&store, "ops.lead", None, None, None, &sources).unwrap();
-        assert_eq!(other["sources"][0]["fields"]["paths"], "list of strings");
-        assert_eq!(other["sources"][0]["fields"]["text"], "string");
+        let other = source(&store, "ops.lead", None, "cr", &sources).unwrap();
+        assert_eq!(other["source"]["fields"]["paths"], "list of strings");
+        assert_eq!(other["source"]["fields"]["text"], "string");
         assert!(other.get("examples").is_none(), "{other}");
         // A file edited by hand with a filter that does not check hears
         // nothing rather than everything.
@@ -2635,5 +2793,115 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(files.all(&store).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Thirty follows of a lead, as the 11-19 feedback's: its tasks' and
+    /// other leads', sources with filters, digests and ends, and four
+    /// sources whose shapes the lookout has seen, each event with a dozen
+    /// fields. The store they are in, and the sources.
+    fn thirty(tag: &str) -> (PathBuf, Vec<String>) {
+        let root = std::env::temp_dir().join(format!("subs-thirty-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = root.join("state.sqlite");
+        let sources: Vec<String> = ["ci", "mail", "prs", "slack"].map(String::from).to_vec();
+        let shapes = super::super::beside(&store, ".sources").join(".shapes");
+        std::fs::create_dir_all(&shapes).unwrap();
+        for source in &sources {
+            let mut fields = serde_json::Map::new();
+            let mut sample = serde_json::Map::new();
+            for n in 0..14 {
+                fields.insert(format!("field_{n}"), json!({"kinds": ["string"]}));
+                sample.insert(
+                    format!("field_{n}"),
+                    json!(format!("{source} value {n} of an event, as printed")),
+                );
+            }
+            sample.insert(
+                "text".into(),
+                json!(format!("{source}: build 1234 failed on main")),
+            );
+            fields.insert("text".into(), json!({"kinds": ["string"]}));
+            let topics: Vec<String> = (0..32).map(|n| format!("topic-{n}")).collect();
+            let shape = json!({"events": 200, "fields": fields, "topics": topics,
+                "recent": [{"fields": sample, "cut": false}]});
+            std::fs::write(shapes.join(format!("{source}.json")), shape.to_string()).unwrap();
+        }
+        for n in 0..30 {
+            let sub = match n % 3 {
+                0 => json!({"name": format!("leads-{n}"),
+                    "agents": [format!("project{n}.lead"), "web.lead"], "sources": ["ci"]}),
+                1 => json!({"name": format!("ci-red-{n}"), "sources": ["ci", format!("prs:{n}")],
+                    "filter": {"status": ["failed"], "branch": [{"prefix": "release/"}],
+                        "author": [{"anything-but": "bot"}]},
+                    "digest": "15m", "steer": {"status": ["failed"]}}),
+                _ => json!({"name": format!("mail-{n}"), "sources": ["mail", "slack:deploys"],
+                    "until": "2026-12-01 09:00", "runs": 5}),
+            };
+            change(&store, "shop.lead", Some(1), Some(&sub), None, &sources).unwrap();
+        }
+        (store, sources)
+    }
+
+    /// A call with nothing lists one line each and names the sources, a
+    /// third or less of what it listed when it gave every follow whole and
+    /// every source's fields and examples.
+    #[test]
+    fn a_listing_is_one_line_each_paged_and_names_the_sources() {
+        let (store, sources) = thirty("bare");
+        let listed = listing(&store, "shop.lead", Some(1), &sources, 0).unwrap();
+        // What a call with nothing answered before, built of the same.
+        let subs = read(&store, "shop.lead");
+        let counts = counts(&store, "shop.lead");
+        let (shapes, examples) = super::super::sources::listed(&store, &sources, &subs);
+        let mut before = json!({"lookout": taken(&store, "shop.lead"), "sources": shapes,
+            "follows": subs.iter().map(|sub| whole(sub, &counts, Some(1), 0)).collect::<Vec<_>>()});
+        if examples {
+            before["examples"] = json!(super::super::sources::EXAMPLES);
+        }
+        let (before, after) = (before.to_string().len(), listed.to_string().len());
+        eprintln!("30 follows, a call with nothing: {before} characters before, {after} now");
+        assert!(after * 3 <= before, "{after} of {before}");
+        assert_eq!(listed["follows"].as_array().unwrap().len(), 30);
+        assert!(listed.get("next").is_none(), "{listed}");
+        assert_eq!(listed["sources"][0], json!({"name": "ci", "events": 200}));
+        let line = &listed["follows"][1];
+        assert_eq!(
+            line,
+            &json!({"name": "ci-red-1", "sources": ["ci", "prs:1"]}),
+            "{line}"
+        );
+        assert_eq!(listed["follows"][2]["until"], "2026-12-01 09:00");
+        assert_eq!(listed["follows"][2]["runs"], 5);
+        // A source no longer there is the follow's problem.
+        let fewer: Vec<String> = sources.iter().filter(|s| *s != "mail").cloned().collect();
+        let listed = listing(&store, "shop.lead", Some(1), &fewer, 0).unwrap();
+        assert_eq!(listed["follows"][2]["problem"], "no source mail now");
+        // Pages go on where next says, as every tool that lists pages.
+        let mut all = Vec::new();
+        for n in 0..1200 {
+            let sub = json!({"name": format!("many-{n:04}"), "agents": [format!("p{n}.lead")]});
+            change(&store, "big.lead", None, Some(&sub), None, &sources).unwrap();
+        }
+        let mut from = 0;
+        loop {
+            let page = listing(&store, "big.lead", None, &sources, from).unwrap();
+            assert!(page.to_string().len() <= crate::served::PAGE_BYTES + 1024);
+            let shown = page["follows"].as_array().unwrap();
+            all.extend(shown.iter().map(|line| line["name"].clone()));
+            match page["next"].as_u64() {
+                Some(next) => {
+                    assert_eq!(
+                        (next as usize, &page["of"]),
+                        (from + shown.len(), &json!(1200))
+                    );
+                    from = next as usize;
+                }
+                None => break,
+            }
+        }
+        assert!(from > 0, "one page held them all");
+        assert_eq!(all.len(), 1200);
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 }
