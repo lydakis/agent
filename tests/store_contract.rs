@@ -8196,6 +8196,17 @@ fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
         .collect();
     assert_eq!(crossed, texts);
     assert!(db.inspect("Bob").unwrap().settings.context_items() == 100);
+    // Each closed point the original had, its copy has too.
+    let closed = |of: &str| -> i64 {
+        read.query_row(
+            &format!("SELECT count(*) FROM checkpoints WHERE bot='Bob' AND head IN (SELECT {of} FROM translated)"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(closed("source") >= 21, "{}", closed("source"));
+    assert!(closed("node") >= closed("source"));
     db.start(waiting, allow_provider).unwrap();
     drop(read);
     drop(db);

@@ -22425,6 +22425,8 @@ const TRANSLATE_PAGE: i64 = 512;
 /// kept.
 pub struct Translation {
     bot_id: i64,
+    /// The bot's name, whose closed points its copies keep.
+    name: String,
     to: Family,
     custom: std::collections::HashSet<String>,
     translator: crate::translate::Translator,
@@ -22456,8 +22458,12 @@ impl Translation {
         custom: &std::collections::HashSet<String>,
         span: &Span,
     ) -> Result<Self> {
+        let name = conn
+            .prepare_cached("SELECT name FROM bots WHERE id=?")?
+            .query_row([bot_id], |r| r.get(0))?;
         Ok(Self {
             bot_id,
+            name,
             to,
             custom: custom.clone(),
             translator: crate::translate::Translator::new(from, to, custom.clone()),
@@ -22506,6 +22512,7 @@ impl Translation {
     fn piece(&mut self, conn: &Connection) -> Result<()> {
         let Self {
             translator,
+            name,
             to,
             head,
             head_depth,
@@ -22663,6 +22670,15 @@ impl Translation {
             if wanted.contains(&old) {
                 out.last.insert(old, out.head);
             }
+            // A closed point of its history is one of the copy's too, so a
+            // fork there stops at the nearest one as it would on the original.
+            if let Some(at) = out.head {
+                conn.prepare_cached(
+                    "INSERT OR IGNORE INTO checkpoints(bot,head)
+                     SELECT bot,?1 FROM checkpoints WHERE head=?2 AND bot=?3",
+                )?
+                .execute(params![at, old, name.as_str()])?;
+            }
         }
         Ok(())
     }
@@ -22742,6 +22758,7 @@ fn free_node(conn: &Connection, id: i64, name: &str) -> Result<Option<i64>> {
         "DELETE FROM translated WHERE node=?",
         "DELETE FROM translated WHERE source=?",
         "DELETE FROM worded WHERE node=?",
+        "DELETE FROM checkpoints WHERE head=?",
         "DELETE FROM lineage WHERE node=?",
         "DELETE FROM nodes WHERE id=?",
     ] {
