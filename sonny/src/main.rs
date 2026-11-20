@@ -17,6 +17,7 @@ mod audit;
 mod background;
 mod banner;
 mod board;
+mod board_view;
 mod boot;
 mod browser;
 mod budget;
@@ -928,8 +929,8 @@ impl App {
     /// projects' as **Projects** lists them, from the one after this
     /// project's around ([`elsewhere::round`]).
     fn next_needing(&mut self) {
-        let mut local: Vec<String> = (self.margin.agents().listed.iter())
-            .filter(|agent| agent.run.is_none() && agent.group == status::Group::NeedsYou)
+        let mut local: Vec<String> = (self.margin.agents().steps())
+            .filter(|agent| agent.group == status::Group::NeedsYou)
             .map(|agent| agent.bot.clone())
             .collect();
         if let Some(fleet) = &self.fleet {
@@ -15514,7 +15515,14 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            commons: Some(commons::View::open(&home, project)),
+            commons: Some({
+                let mut view = commons::View::open(&home, project.clone());
+                view.set_present(board_view::Present {
+                    project: project.clone(),
+                    bots: self.kept_rows.bots.clone(),
+                });
+                view
+            }),
             memory: None,
             sky: None,
             picked: None,
@@ -15640,6 +15648,12 @@ impl App {
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.commons
         {
+            // What the window's count already knows of its project's
+            // agents: a holder it no longer lists is closed.
+            view.set_present(board_view::Present {
+                project: watch.project.clone(),
+                bots: self.kept_rows.bots.clone(),
+            });
             view.reload();
             watch.read = Instant::now();
             return;
@@ -16883,7 +16897,7 @@ impl App {
         // `l` too.
         let view_finding = self.pane_keys && self.view_finding();
         // `h` `j` `k` `l` are the arrows in every pane but a program's,
-        // unlisted.
+        // unlisted; typed into a find, they are letters.
         let arrow;
         let key = match (self.pane_keys && !program && self.finding.is_none() && !view_finding)
             .then(|| vim_arrow(key))
@@ -17045,7 +17059,9 @@ impl App {
                 match (key.code, picked) {
                     // Enter goes to the picked agent; on a heading it
                     // does the heading's one thing, opening or folding.
-                    (KeyCode::Enter, Some(Picked::Agent(bot))) => self.open_picked(&bot),
+                    (KeyCode::Enter, Some(Picked::Agent(bot) | Picked::Task(_, bot))) => {
+                        self.open_picked(&bot)
+                    }
                     // `→` goes into a workflow's row, as `enter` does.
                     (KeyCode::Right, Some(Picked::Agent(bot)))
                         if workflow::view::split(&bot).1.is_some() =>
@@ -17184,51 +17200,64 @@ impl App {
                 }
                 return true;
             }
-            // `/commons` takes its own keys: picking a thread, reading it.
+            // `/commons` takes its own keys: picking a board, a thread or
+            // an item, its pages, finding.
             if self.pane_keys
                 && pane.is_card()
                 && let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut())
             {
                 let reading = view.reading();
+                let depth = view.depth();
                 match key.code {
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
                         pane.screen.unselect();
                         self.copied(&text);
                     }
-                    // A thread read is a page: ↑↓ pick its links, as Lynx
-                    // does, and scroll where none is left that way.
-                    KeyCode::Up if reading && !pane.screen.pick_link(false, pane.is_margin()) => {
-                        pane.screen.scroll(1)
-                    }
-                    KeyCode::Down if reading && !pane.screen.pick_link(true, pane.is_margin()) => {
-                        pane.screen.scroll(-1)
-                    }
-                    KeyCode::Up | KeyCode::Down if reading => {}
-                    KeyCode::Enter | KeyCode::Right
-                        if reading && let Some(url) = pane.screen.picked_link() =>
-                    {
-                        let url = url.to_owned();
-                        self.follow(&url);
-                    }
                     KeyCode::PageUp => pane.screen.page(true),
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Char(' ') if reading => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
-                    // The list of threads: nothing to close.
-                    KeyCode::Left if key.modifiers.is_empty() && !reading => self.left_ends(),
-                    _ => {
-                        if view.key(*key) == commons::Key::Close {
-                            self.close_pane(true);
-                        } else if view.reading() != reading {
-                            // A thread opened or left starts at its top.
+                    // The list, with nothing to close: the keys go back.
+                    KeyCode::Left if key.modifiers.is_empty() && view.left_ends() => {
+                        self.left_ends()
+                    }
+                    // A thread's page: its head's links and its posts' are
+                    // one run of picks, as Lynx moves among a page's links.
+                    KeyCode::Up | KeyCode::Down | KeyCode::Char('k' | 'j')
+                        if reading
+                            && !(key.modifiers)
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
+                        if let commons::Key::Scroll(up) = view.arrow(down, &mut pane.screen) {
+                            pane.screen.scroll(if up { 1 } else { -1 });
+                        }
+                    }
+                    _ => match view.key(*key, pane.screen.in_view()) {
+                        commons::Key::Close => self.close_pane(true),
+                        commons::Key::Scroll(up) => pane.screen.scroll(if up { 1 } else { -1 }),
+                        commons::Key::Open(url) => self.follow(&url),
+                        commons::Key::Stay if view.depth() != depth => {
+                            // A page opened or left starts at its top, or
+                            // at the pick it was left on.
                             pane.screen.hold(usize::MAX);
                             if let Some(watch) = &mut self.watch {
                                 watch.picked = None;
                             }
                         }
-                    }
+                        commons::Key::Stay => {
+                            // A post's own link picked from the keys opens.
+                            if reading
+                                && matches!(key.code, KeyCode::Enter | KeyCode::Right)
+                                && let Some(url) = pane.screen.picked_link()
+                            {
+                                let url = url.to_owned();
+                                self.follow(&url);
+                            }
+                        }
+                    },
                 }
                 return true;
             }
@@ -17548,9 +17577,29 @@ impl App {
                     self.left_ends();
                 }
             }
+            // A task's agents start open: its fold is in `helpers` when
+            // shut.
+            Picked::Task(task, _) => {
+                if watch.helpers.contains(&task) == open {
+                    watch.helpers_of(&task, Some(!open));
+                } else if !open {
+                    self.left_ends();
+                }
+            }
             Picked::Agent(bot) if open => watch.helpers_of(&bot, Some(true)),
             Picked::Agent(bot) if watch.helpers.contains(&bot) => {
                 watch.helpers_of(&bot, Some(false))
+            }
+            // `←` on one of a task's agents folds the task, the pick on it.
+            Picked::Agent(bot)
+                if let Some(at) = status::task_of(&bot).and_then(|(task, _)| {
+                    (card_picks(watch, width).iter())
+                        .position(|p| matches!(p, Picked::Task(t, _) if t == task))
+                }) =>
+            {
+                let task = status::task_of(&bot).map(|(task, _)| task.to_owned());
+                watch.helpers_of(&task.unwrap_or_default(), Some(true));
+                watch.pick = Some(at);
             }
             Picked::Agent(bot) => {
                 let group = (watch.rows.iter())
@@ -17585,8 +17634,7 @@ impl App {
     /// agents, around its ends, as a multiplexer's previous and next tab.
     /// From an agent the list does not show, either goes to the lead.
     fn step_agent(&mut self, down: bool) {
-        let listed: Vec<&str> = (self.margin.agents().listed.iter())
-            .filter(|agent| agent.run.is_none())
+        let listed: Vec<&str> = (self.margin.agents().steps())
             .map(|agent| agent.bot.as_str())
             .collect();
         let Some(to) = stepped(&listed, &self.bot, down) else {
@@ -17825,6 +17873,23 @@ impl App {
                 }
                 self.pane_keys = true;
             }
+            // A link on a page of `/commons`.
+            "commons" => {
+                if let Some(watch) = self.watch.as_mut()
+                    && let Some(view) = watch.commons.as_mut()
+                {
+                    let depth = view.depth();
+                    let leaves = view.click(id);
+                    // A page opened from a link starts at its top.
+                    if view.depth() != depth {
+                        watch.picked = None;
+                    }
+                    self.pane_keys = true;
+                    if let Some(url) = leaves {
+                        self.follow(&url);
+                    }
+                }
+            }
             // A row or a link in `/memory`.
             "memory" => {
                 if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
@@ -17844,6 +17909,21 @@ impl App {
                         watch.pick = Some(at);
                     }
                     watch.toggle(group_of(id));
+                }
+            }
+            // A task's row in `/status`, picked: its most pressing agent.
+            "agents" => {
+                let width = self.width.max(40);
+                if let Some(watch) = &mut self.watch
+                    && let Some(picked) =
+                        Picked::from_link(&format!("{}agents/{id}", screen::BUTTON))
+                {
+                    if let Some(at) = card_picks(watch, width).iter().position(|p| *p == picked) {
+                        watch.pick = Some(at);
+                    }
+                    if let Picked::Task(_, bot) = picked {
+                        self.open_picked(&bot);
+                    }
                 }
             }
             // A task's helpers in `/status`: shown under it, or folded.
@@ -18050,6 +18130,7 @@ impl App {
             && let Some(watch) = &mut self.watch
             && (watch.run.take().is_some()
                 || watch.memory.as_mut().is_some_and(memory::View::back)
+                || watch.commons.as_mut().is_some_and(commons::View::back)
                 || watch
                     .background
                     .as_mut()
@@ -21415,7 +21496,7 @@ impl App {
             .then(|| watch.pick.and_then(|at| picks.get(at).cloned()))
             .flatten()
             .and_then(|picked| match picked {
-                Picked::Agent(bot) => Some(bot),
+                Picked::Agent(bot) | Picked::Task(_, bot) => Some(bot),
                 Picked::Group(_) => None,
             })
             .filter(|bot| *bot != self.bot)
@@ -22082,19 +22163,39 @@ impl App {
                         }
                     }
                 }
-            } else if let Some(view) = &watch.commons {
-                let (card, at, starts) = view.card_rows(width);
-                let lines: Vec<Line<'static>> = card
-                    .into_iter()
+            } else if let Some(view) = &mut watch.commons {
+                // A page open: the title's ‹ goes back from it.
+                pane.page = view.on_page();
+                let card = view.card_rows(width);
+                let lines: Vec<Line<'static>> = (card.lines.into_iter())
                     .map(|line| {
                         let mut spans = vec![Span::raw(" ")];
                         spans.extend(line.spans);
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                let marks = row_marks(&lines, &starts);
+                let mut marks = row_marks(&lines, &card.starts);
+                marks.extend(agent_marks(
+                    (card.agents.into_iter())
+                        .map(|(row, from, to, bot)| (row, from as u16, to as u16, bot))
+                        .collect(),
+                ));
+                let mut links: Vec<(usize, screen::Buttons)> = Vec::new();
+                for (row, from, to, at) in card.links {
+                    let button = (
+                        from as u16 + 1,
+                        to as u16 + 1,
+                        format!("{}{}link/{at}", screen::BUTTON, commons::BUTTON),
+                    );
+                    match links.last_mut() {
+                        Some((last, buttons)) if *last == row => buttons.push(button),
+                        _ => links.push((row, vec![button])),
+                    }
+                }
+                marks.extend((links.into_iter()).map(|(row, b)| (row, screen::Mark::Buttons(b))));
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
+                let at = card.at;
                 if view.reading() {
                     // A thread just opened starts at its top, after the
                     // card's swap kept the list's scroll.
@@ -23706,6 +23807,10 @@ fn status_first_match(watch: &Watch, width: usize) -> Option<usize> {
         Picked::Agent(bot) => {
             (watch.rows.iter()).any(|row| row.bot == *bot && status::says(row, query))
         }
+        // A task with several agents says it where one of its agents does.
+        Picked::Task(task, _) => (watch.rows.iter()).any(|row| {
+            status::task_of(&row.bot).is_some_and(|(of, _)| of == task) && status::says(row, query)
+        }),
         Picked::Group(_) => false,
     })
 }
@@ -23749,7 +23854,16 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
     let found = watch.query().map(|query| status::found(&watch.rows, query));
     let (rows, open, shown_helpers) = match &found {
         Some((kept, opened)) => {
-            let mut helpers = watch.helpers.clone();
+            // A task's agents folded with `←` stand open too; folded
+            // again when the find ends, as `watch.helpers` keeps them.
+            let mut helpers: Vec<String> = (watch.helpers.iter())
+                .filter(|fold| {
+                    !(kept.iter()).any(|row| {
+                        status::task_of(&row.bot).is_some_and(|(task, _)| task == fold.as_str())
+                    })
+                })
+                .cloned()
+                .collect();
             helpers.extend(
                 opened
                     .iter()
@@ -23779,16 +23893,17 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
         named,
         folds,
         helpers,
+        tasks,
     } = match watch.more {
         true => {
             let picked = (watch.pick)
                 .and_then(|at| {
-                    picks_in_order(&quiet.named, &quiet.folds)
+                    picks_in_order(&quiet.named, &quiet.folds, &quiet.tasks)
                         .into_iter()
                         .nth(at)
                 })
                 .and_then(|(_, picked)| match picked {
-                    Picked::Agent(bot) => Some(bot),
+                    Picked::Agent(bot) | Picked::Task(_, bot) => Some(bot),
                     Picked::Group(_) => None,
                 });
             card(status::Details::Picked(picked.as_deref()))
@@ -23827,10 +23942,11 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
     let below = |at: usize| at + if at >= 1 { added } else { 0 };
     // The rows the keys pick first, in the order they are drawn: each
     // agent, and each heading that opens and folds its group.
-    let folding = !folds.is_empty() || !helpers.is_empty();
-    let mut marks: Vec<(usize, screen::Mark)> = (picks_in_order(&named, &folds).into_iter())
-        .map(|(at, picked)| (below(at), screen::Mark::Link(picked.link())))
-        .collect();
+    let folding = !folds.is_empty() || !helpers.is_empty() || !tasks.is_empty();
+    let mut marks: Vec<(usize, screen::Mark)> = (picks_in_order(&named, &folds, &tasks)
+        .into_iter())
+    .map(|(at, picked)| (below(at), screen::Mark::Link(picked.link())))
+    .collect();
     marks.extend(opening);
     marks.extend(helpers.into_iter().map(|(at, bot)| {
         let link = format!("{}helpers/{bot}", screen::BUTTON);
@@ -23926,12 +24042,13 @@ fn row_marks(lines: &[Line<'static>], starts: &[usize]) -> Vec<(usize, screen::M
     marks
 }
 
-/// A row `/status`'s keys pick: an agent, or the heading of a group that
-/// folds.
+/// A row `/status`'s keys pick: an agent, the heading of a group that
+/// folds, or a task with several agents, with its most pressing one.
 #[derive(Clone, Debug, PartialEq)]
 enum Picked {
     Agent(String),
     Group(status::Group),
+    Task(String, String),
 }
 
 impl Picked {
@@ -23940,6 +24057,7 @@ impl Picked {
         match self {
             Picked::Agent(bot) => format!("{}task/{bot}", screen::BUTTON),
             Picked::Group(group) => format!("{}group/{}", screen::BUTTON, group_id(*group)),
+            Picked::Task(task, bot) => format!("{}agents/{task}/{bot}", screen::BUTTON),
         }
     }
 
@@ -23949,21 +24067,29 @@ impl Picked {
         if let Some(bot) = button.strip_prefix("task/") {
             return Some(Picked::Agent(bot.to_owned()));
         }
+        if let Some((task, bot)) = button
+            .strip_prefix("agents/")
+            .and_then(|t| t.split_once('/'))
+        {
+            return Some(Picked::Task(task.to_owned(), bot.to_owned()));
+        }
         button
             .strip_prefix("group/")
             .map(|id| Picked::Group(group_of(id)))
     }
 }
 
-/// The agents and the folding groups' headings of a card, by the row
-/// each is drawn on, in that order.
+/// The agents, the folding groups' headings and the tasks with several
+/// agents of a card, by the row each is drawn on, in that order.
 fn picks_in_order(
     named: &[(usize, String)],
     folds: &[(usize, status::Group)],
+    tasks: &[(usize, String, String)],
 ) -> Vec<(usize, Picked)> {
     let mut picks: Vec<(usize, Picked)> = (named.iter())
         .map(|(at, bot)| (*at, Picked::Agent(bot.clone())))
         .chain(folds.iter().map(|(at, group)| (*at, Picked::Group(*group))))
+        .chain((tasks.iter()).map(|(at, task, bot)| (*at, Picked::Task(task.clone(), bot.clone()))))
         .collect();
     picks.sort_by_key(|(at, _)| *at);
     picks
@@ -38312,6 +38438,252 @@ mod tests {
             status_keys(app.watch.as_ref().unwrap(), true),
             "↑↓ pick · enter open · →← fold · ctrl+f find · m more · esc close"
         );
+    }
+
+    #[test]
+    fn a_find_in_status_picks_a_task_s_row_where_its_agents_say_it() {
+        let row = |n: u32, title: &str, group| status::Row {
+            name: format!("errors.{n}"),
+            bot: format!("calc.errors.{n}"),
+            title: title.into(),
+            state: "working".into(),
+            running: true,
+            group,
+            ..Default::default()
+        };
+        let mut find = find::Find::new((None, Vec::new(), Vec::new()));
+        find.query = "typed".into();
+        let watch = Watch {
+            project: "calc".into(),
+            rows: vec![
+                row(1, "Move shop to typed errors", status::Group::Working),
+                row(2, "Move shop to typed errors", status::Group::Working),
+            ],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: Some(find),
+        };
+        let at = status_first_match(&watch, 80).expect("a match");
+        assert_eq!(
+            card_picks(&watch, 80)[at],
+            Picked::Task("calc.errors".into(), "calc.errors.1".into())
+        );
+    }
+
+    #[test]
+    fn a_find_in_status_opens_a_folded_task_and_esc_folds_it_again() {
+        let row = |n: u32| status::Row {
+            name: format!("errors.{n}"),
+            bot: format!("calc.errors.{n}"),
+            title: "Move shop to typed errors".into(),
+            state: "working".into(),
+            running: true,
+            group: status::Group::Working,
+            ..Default::default()
+        };
+        let mut watch = Watch {
+            project: "calc".into(),
+            rows: vec![row(1), row(2)],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            // The task folded with `←`.
+            helpers: vec!["calc.errors".into()],
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        };
+        let agent = Picked::Agent("calc.errors.2".into());
+        assert!(!card_picks(&watch, 80).contains(&agent));
+        let mut find = find::Find::new((None, Vec::new(), Vec::new()));
+        // Both agents say it: the task stays, two agents under it.
+        find.query = "errors.".into();
+        watch.finding = Some(find);
+        // A fold is searched and stands open while finding.
+        assert!(card_picks(&watch, 80).contains(&agent));
+        watch.finding = None;
+        assert!(!card_picks(&watch, 80).contains(&agent));
+        assert_eq!(watch.helpers, ["calc.errors"]);
+    }
+
+    #[tokio::test]
+    async fn h_j_k_l_typed_into_the_commons_find_are_letters() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let home = std::env::temp_dir().join(format!("sonny-commons-find-{}", std::process::id()));
+        app.open_pane(pane::Pane::card("commons", STATUS_KEYS));
+        app.pane_keys = true;
+        app.watch = Some(Watch {
+            project: "shop".into(),
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: Some(commons::View::open(&home, "shop".into())),
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        });
+        let key = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        app.key(key(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        for c in "shjkl".chars() {
+            app.key(key(KeyCode::Char(c), KeyModifiers::NONE)).await;
+        }
+        let view = (app.watch.as_mut())
+            .and_then(|w| w.commons.as_mut())
+            .unwrap();
+        let (lines, _) = view.card(80);
+        let last: String = (lines.last().unwrap().spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(last, "find shjkl");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_link_clicked_on_an_item_s_page_opens_the_next_page_at_its_top() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let home = board_view::tests::commons("click-depth");
+        let mut view = commons::View::open(&home, "shop".into());
+        view.open_thread("api");
+        // Its links are laid as the pane draws it.
+        view.card(80);
+        let depth = view.depth();
+        app.open_pane(pane::Pane::card("commons", STATUS_KEYS));
+        app.watch = Some(Watch {
+            project: "shop".into(),
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: Some(view),
+            memory: None,
+            sky: None,
+            // Reading a thread: the page as it was scrolled.
+            picked: Some(usize::MAX),
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        });
+        // The head's first link, its board.
+        app.act("commons/link/0");
+        let watch = app.watch.as_ref().unwrap();
+        assert_eq!(watch.commons.as_ref().unwrap().depth(), depth + 1);
+        assert_eq!(watch.picked, None);
+    }
+
+    #[tokio::test]
+    async fn status_folds_a_task_s_agents_and_enter_goes_to_its_most_pressing() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let row = |n: u32, state: &str, group| status::Row {
+            name: format!("errors.{n}"),
+            bot: format!("calc.errors.{n}"),
+            title: "Move shop to typed errors".into(),
+            state: state.into(),
+            running: group == status::Group::Working,
+            group,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![
+                row(1, "working", status::Group::Working),
+                row(2, "needs you", status::Group::NeedsYou),
+            ],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: Some(0),
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);
+        let picked = |app: &App| picks(app)[app.watch.as_ref().unwrap().pick.unwrap()].clone();
+        let task = Picked::Task("calc.errors".into(), "calc.errors.2".into());
+        let agent = |n: u32| Picked::Agent(format!("calc.errors.{n}"));
+        // They start open, in the order of their names.
+        assert_eq!(picks(&app), [task.clone(), agent(1), agent(2)]);
+        // ← on the task's row folds them; → opens them.
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picks(&app), std::slice::from_ref(&task));
+        let lines = watch_card(app.watch.as_ref().unwrap(), 80).0;
+        let row: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            row.trim_end(),
+            "  ? Move shop to typed errors  ▸ 2 agents, 1 needs you, 1 working"
+        );
+        app.key(key(KeyCode::Right)).await;
+        assert_eq!(picks(&app).len(), 3);
+        // ← on one of its agents folds the task, the pick on its row.
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(picked(&app), agent(1));
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picks(&app), std::slice::from_ref(&task));
+        assert_eq!(picked(&app), task);
+        // `enter` on it goes to the agent whose mark it shows: here, this
+        // window's own, so the view closes.
+        app.bot = "calc.errors.2".into();
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.pane.is_none() || !app.pane.as_ref().unwrap().is_card());
     }
 
     #[tokio::test]
