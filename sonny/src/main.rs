@@ -2188,7 +2188,7 @@ async fn first_reads(kept: &std::path::Path, lead: &str) -> Option<std::fs::File
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let dir = reads_dir(kept);
     let path = dir.join(format!("{lead}.lock"));
-    let wait = tokio::task::spawn_blocking(move || {
+    crate::scheduler::apart(move || {
         let _ = std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -2209,8 +2209,8 @@ async fn first_reads(kept: &std::path::Path, lead: &str) -> Option<std::fs::File
         // SAFETY: as above.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
         None
-    });
-    wait.await.ok().flatten()
+    })
+    .await
 }
 
 /// Keep what a window read for the next one, in `lead`'s file: in place

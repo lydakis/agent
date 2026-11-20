@@ -380,10 +380,7 @@ pub async fn profiles_on_agents(client: &agent_client::Client, store: &Path) {
     }
     let mut path = record.as_os_str().to_owned();
     path.push(format!(".{id}.lock"));
-    let _held = tokio::task::spawn_blocking(move || waited(Path::new(&path)))
-        .await
-        .ok()
-        .flatten();
+    let _held = crate::scheduler::apart(move || waited(Path::new(&path))).await;
     if !done(&record, id) && crate::task::profiles_onto_agents(client, store).await {
         once(&record, id, || true);
     }
