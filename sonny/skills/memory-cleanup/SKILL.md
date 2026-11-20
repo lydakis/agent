@@ -77,10 +77,12 @@ of it ends `tool_unserved`, run the same command with
      text holds every folded fact's whole text as it is, each under a line
      with its name and source, so nothing is lost; its description names
      the subject and what the facts in it cover; its `confirmed` is the
-     highest among them; it is `external` when any of them was, and keeps
-     each live blank as written. Then remove the facts you folded. Fold
-     the largest groups first, until `show` for that scope names every
-     fact, with no closing line of facts left out. A fact holds at most
+     highest among them; it is `external` when any of them was; and when
+     any of them was `live`, save it with `live` true, since a fact under
+     a new name starts plain, keeping each blank as written. Then remove
+     the facts you folded. Fold the largest groups first, until `show`
+     for that scope names every fact, with no closing line of facts left
+     out. A fact holds at most
      16 KiB: split a subject that would pass that into its parts. A fact
      with no related fact stays as it is. `finish` counts a removed fact
      whose whole text a fact you saved holds as folded, not lost.
