@@ -7,11 +7,13 @@
 //! commons, a trigger, the margin, or a prompt. Daemon reads each time the
 //! view changes and every minute while it is open: `usage`, and for the
 //! tasks `bots`, `usage` by their names, the person's `messages` and the
-//! calls they decided in `audit`, this period and the one before. They read
-//! every matching turn, so they are not asked for often. With the person's price
-//! sheet (`~/.agent/prices.toml`, or the file config's `prices` names),
-//! each model's cost and their sum, priced here from the sheet as it
-//! stands at each read; the daemon counts tokens only.
+//! calls they decided in `audit`, this period and the one before, and each
+//! task's first message once (it never changes, so it is kept beside the
+//! store for every window). They read every matching turn, so they are not
+//! asked for often. With the person's price sheet (`~/.agent/prices.toml`,
+//! or the file config's `prices` names), each model's cost and their sum,
+//! priced here from the sheet as it stands at each read; the daemon counts
+//! tokens only.
 use crate::background::Scope;
 use agent_client::config::Prices;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1227,7 +1229,8 @@ pub async fn read(
         let _ = read.send(usage.as_ref().ok().cloned());
         usage
     };
-    let (usage, tasks) = tokio::join!(usage, tasks(&socket, &ask, store, this));
+    let identity = window.identity().map(str::to_owned);
+    let (usage, tasks) = tokio::join!(usage, tasks(&socket, &ask, store, identity, this));
     let mut usage = usage.map_err(|error| error.to_string())?;
     if let Some(tasks) = tasks {
         usage["tasks"] = serde_json::to_value(tasks).unwrap_or_default();
@@ -1242,13 +1245,16 @@ pub async fn read(
 /// window as `usage`) and the period before's, or by their names when more
 /// worked than one read lists, the person's messages from `messages` and
 /// the calls they decided from `audit`, all asked at once; their done
-/// marks and roles beside `store`. None when any of it could not be read:
+/// marks and roles beside `store`, and each task's first message where an
+/// earlier read found it ([`take_firsts`], of the daemon `identity`
+/// names). None when any of it could not be read:
 /// without every message and call, a task the person stepped into would
 /// read as one that finished without them.
 async fn tasks(
     socket: &std::path::Path,
     ask: &Ask,
     store: PathBuf,
+    identity: Option<String>,
     usage: tokio::sync::oneshot::Receiver<Option<Value>>,
 ) -> Option<Tasks> {
     let (since, now) = (ask.since, ask.now);
@@ -1295,14 +1301,19 @@ async fn tasks(
     let (spent, wrote, decided) = tokio::join!(
         spent,
         async {
+            let (kept, ident) = (store.clone(), identity.clone());
+            let firsts = tokio::task::spawn_blocking(move || take_firsts(&kept, ident.as_deref()));
             let wrote = person(&clients, 1, Person::Messages, &scope, (before, now)).await?;
-            without_briefs(&clients, wrote).await
+            without_briefs(&clients, wrote, &firsts.await.ok()?).await
         },
         person(&clients, 3, Person::Calls, &scope, (before, now)),
     );
-    let ((tasks, this, last), wrote, decided) = (spent?, wrote?, decided?);
+    let ((tasks, this, last), (wrote, found), decided) = (spent?, wrote?, decided?);
     let (wrote, decided) = (split(&wrote, since), split(&decided, since));
     let tally = move || {
+        if !found.is_empty() {
+            keep_firsts(&store, identity.as_deref(), found);
+        }
         let this = rows(&tasks, &this, &wrote.0, &decided.0, (since, now));
         let last = last.map(|last| rows(&tasks, &last, &wrote.1, &decided.1, (before, since)));
         let mut tasks = Tasks::tally(&this, |bot, last, running| {
@@ -1483,12 +1494,15 @@ fn split(done: &[Did], since: i64) -> Split {
 
 /// The person's messages in `wrote` but each task's first: Sonny starts a
 /// task with the person's words as its brief, which is no stepping in. A
-/// task's first message here is its first of all when it has none before
-/// it, which one read a task asks, all of them side by side.
+/// task's first message is the first a read of its messages lists, before
+/// the first of the person's here; none before it makes that one the
+/// first. It never changes, so a task in `firsts` is read no more: the
+/// rest are read side by side, and come back with what they found.
 async fn without_briefs(
     clients: &[Arc<agent_client::Client>],
     wrote: Vec<Did>,
-) -> Option<Vec<Did>> {
+    firsts: &HashMap<i64, i64>,
+) -> Option<(Vec<Did>, HashMap<i64, i64>)> {
     let mut first: HashMap<i64, (&str, i64)> = HashMap::new();
     // Leads, workflow workers and Sonny's own are no tasks.
     let task = |bot: &str| {
@@ -1501,26 +1515,77 @@ async fn without_briefs(
         let earliest = first.entry(did.bot_id).or_insert((&did.bot, message));
         earliest.1 = earliest.1.min(message);
     }
+    let mut briefs = std::collections::HashSet::new();
     let mut reads = tokio::task::JoinSet::new();
-    for (at, (bot, message)) in first.into_values().enumerate() {
-        let client = clients[at % clients.len()].clone();
+    for (bot_id, (bot, message)) in first {
+        if let Some(first) = firsts.get(&bot_id) {
+            briefs.insert(*first);
+            continue;
+        }
+        let client = clients[reads.len() % clients.len()].clone();
         let query = json!({"bot": bot, "before": message, "limit": 1});
         reads.spawn(async move {
             // A task gone since is no brief to leave out.
-            let page = client.request("messages", query).await.ok();
-            let first = page.is_some_and(|page| page["messages"] == json!([]));
-            first.then_some(message)
+            let page = client.request("messages", query).await.ok()?;
+            let first = match page["messages"].as_array()?.first() {
+                None => message,
+                Some(earlier) => earlier["message"].as_i64()?,
+            };
+            Some((bot_id, first))
         });
     }
-    let mut briefs = std::collections::HashSet::new();
+    let mut found = HashMap::new();
     while let Some(read) = reads.join_next().await {
-        briefs.extend(read.ok()?);
+        if let Some((bot_id, first)) = read.ok()? {
+            briefs.insert(first);
+            found.insert(bot_id, first);
+        }
     }
-    Some(
-        (wrote.into_iter())
-            .filter(|did| !did.message.is_some_and(|message| briefs.contains(&message)))
-            .collect(),
-    )
+    let wrote = (wrote.into_iter())
+        .filter(|did| !did.message.is_some_and(|message| briefs.contains(&message)))
+        .collect();
+    Some((wrote, found))
+}
+
+/// [`keep_firsts`]'s file, among the reads kept beside the store (a
+/// leading dot, as no lead is named).
+fn firsts_file(store: &std::path::Path) -> PathBuf {
+    crate::reads_dir(store).join(".firsts.json")
+}
+
+/// Each task's first message by the task's number, as any window's
+/// `/usage` found them in the daemon's store `identity` names: a store
+/// made again at the same path numbers its agents and messages anew.
+fn take_firsts(store: &std::path::Path, identity: Option<&str>) -> HashMap<i64, i64> {
+    #[derive(serde::Deserialize)]
+    struct Kept {
+        store: String,
+        firsts: HashMap<i64, i64>,
+    }
+    std::fs::read(firsts_file(store))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
+        .filter(|kept| kept.store == identity.unwrap_or(""))
+        .map(|kept| kept.firsts)
+        .unwrap_or_default()
+}
+
+/// Keep the first messages `found` for every window, with those kept.
+fn keep_firsts(store: &std::path::Path, identity: Option<&str>, found: HashMap<i64, i64>) {
+    #[derive(serde::Serialize)]
+    struct Kept<'a> {
+        store: &'a str,
+        firsts: HashMap<i64, i64>,
+    }
+    let mut firsts = take_firsts(store, identity);
+    firsts.extend(found);
+    let kept = Kept {
+        store: identity.unwrap_or(""),
+        firsts,
+    };
+    if let Ok(bytes) = serde_json::to_vec(&kept) {
+        crate::keep_beside(&firsts_file(store), &bytes);
+    }
 }
 
 /// What the person did that [`person`] counts.
@@ -2308,5 +2373,63 @@ mod tests {
         assert_eq!((bucket, buckets), (6 * HOUR, 28));
         assert_eq!(local(since / 1000).hour, 0);
         assert!(now - since <= 7 * DAY && now - since > 6 * DAY - 2 * HOUR);
+    }
+    #[tokio::test]
+    async fn a_tasks_first_message_is_read_once_and_kept_beside_the_store() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        // `a.one` began with the person's 10; `b.two` with its lead's 15.
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock()
+                .unwrap()
+                .push(request["bot"].as_str().unwrap_or_default().to_owned());
+            match request["bot"].as_str() {
+                Some("b.two") => json!({"messages": [{"message": 15}]}),
+                _ => json!({"messages": []}),
+            }
+        })
+        .await;
+        let did = |bot: &str, bot_id, message| Did {
+            bot: bot.to_owned(),
+            bot_id,
+            message: Some(message),
+            at: message,
+        };
+        let wrote = || {
+            vec![
+                did("a.one", 1, 10),
+                did("a.one", 1, 12),
+                did("b.two", 2, 20),
+            ]
+        };
+        let left = |wrote: &[Did]| {
+            wrote
+                .iter()
+                .map(|did| did.message.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let (first, found) =
+            without_briefs(std::slice::from_ref(&client), wrote(), &HashMap::new())
+                .await
+                .unwrap();
+        assert_eq!(left(&first), [12, 20]);
+        assert_eq!(found, HashMap::from([(1, 10), (2, 15)]));
+        let mut bots = std::mem::take(&mut *asked.lock().unwrap());
+        bots.sort();
+        assert_eq!(bots, ["a.one", "b.two"]);
+        // Kept beside the store for the daemon that numbered them, another
+        // window's read is the same with no read at all.
+        let dir = std::env::temp_dir().join(format!("sonny-firsts-{}", std::process::id()));
+        let store = dir.join("state.sqlite");
+        keep_firsts(&store, Some("store-1"), HashMap::from([(1, 10)]));
+        keep_firsts(&store, Some("store-1"), HashMap::from([(2, 15)]));
+        let kept = take_firsts(&store, Some("store-1"));
+        assert_eq!(kept, found);
+        assert!(take_firsts(&store, Some("store-2")).is_empty());
+        let (again, found) = without_briefs(&[client], wrote(), &kept).await.unwrap();
+        assert_eq!(left(&again), [12, 20]);
+        assert!(found.is_empty());
+        assert!(asked.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
