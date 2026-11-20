@@ -1536,7 +1536,10 @@ mod tests {
         // row comes again, to a window that hears and to the one that
         // follows.
         first.want_rows(true);
-        until("the rows kept again", || head(&first, "site.lead") == Some(9)).await;
+        until("the rows kept again", || {
+            head(&first, "site.lead") == Some(9)
+        })
+        .await;
         for open in [&second, &first] {
             open.want_rows(false);
             open.want_rows(true);
