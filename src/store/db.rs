@@ -20549,7 +20549,7 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     // Schema 109: a declared tool's `lift` is `yields` (#1203), in every
     // list the store keeps and every `configure` kept for a turn's end.
     if from < 109 {
-        rename_declared(conn, "lift", "yields")?;
+        migrate_declared_field(conn, "lift", "yields")?;
     }
 
     Ok(())
@@ -20631,7 +20631,7 @@ fn migrate_back(conn: &Connection, from: i32, to: i32) -> Result<()> {
     // is `lift` again, as 0.10.1 names it (#1203 renamed it with no step
     // of its own).
     if from >= 107 && to < 107 {
-        rename_declared(conn, "yields", "lift")?;
+        migrate_declared_field(conn, "yields", "lift")?;
         conn.execute_batch(
             "ALTER TABLE bots ADD COLUMN instructions TEXT NOT NULL DEFAULT '';
              ALTER TABLE bots ADD COLUMN compaction_instructions TEXT;
@@ -20650,7 +20650,7 @@ fn migrate_back(conn: &Connection, from: i32, to: i32) -> Result<()> {
 /// changes moves to its new digest, and the bots holding it, the records
 /// of creations that declared it and kept `configure`s naming it follow.
 /// A kept `configure` holding its tools whole has them renamed there.
-fn rename_declared(conn: &Connection, old: &str, new: &str) -> Result<()> {
+fn migrate_declared_field(conn: &Connection, old: &str, new: &str) -> Result<()> {
     let invalid = |_| Error::new("store_migration_invalid_declared");
     let lists: Vec<(String, String)> = conn
         .prepare("SELECT digest,tools FROM tool_lists")?
