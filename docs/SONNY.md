@@ -964,6 +964,12 @@ to write and work an item, and how a lead splits work across a task's
 agents. The tool's own description only names its keys (George, 11-20:
 ship a skill rather than overload the tool's description).
 
+Boards are behind `[sonny] boards`, on by default and off whenever the
+commons is (George, 11-20). Off, agents get none of it: no board tool, no
+board skill, no Boards section in the commons skill, and `start_task`
+without `board` or `agents`, which it refuses if sent. `crate::board::on()`
+is the one switch every part reads, Sonny's views included.
+
 ## Pause
 
 `/pause REASON` stops every agent of every project at once, through the
