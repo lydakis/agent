@@ -4101,12 +4101,12 @@ impl Database {
         };
         // A switch a stop cut short is let go: what it wrote goes, and the
         // bot's turns go on in the family it is in.
-        let translating: Vec<i64> = db
-            .conn
-            .prepare("SELECT bot_id FROM translating")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for bot_id in translating {
+        while let Some(bot_id) =
+            db.conn
+                .query_row("SELECT MIN(bot_id) FROM translating", [], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })?
+        {
             db.switch_settle(bot_id)?;
         }
         // A deletion interrupted between pieces finishes now: the bot was
