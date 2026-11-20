@@ -822,14 +822,18 @@ impl App {
                 *kept
             }
             // What this window read of its own project's agents is read,
-            // and the projects as any window last read them show at once.
+            // and the projects as any window last read them show at once,
+            // those another build read too: this one reads each again.
             None => {
                 let store = self.store();
-                let each = take_projects(&store, self.client.identity());
+                let (mut each, this_build) = take_projects(&store, self.client.identity());
                 let shown: Vec<projects::Project> =
                     (each.values()).map(|read| read.project.clone()).collect();
                 if !shown.is_empty() {
                     view.set(shown, now_ms());
+                }
+                if !this_build {
+                    each.clear();
                 }
                 ProjectsKept {
                     state: ProjectsState {
@@ -1227,8 +1231,10 @@ async fn read_projects(
     // each one that moved since is read again, as one read here would be.
     if !state.took_kept {
         state.took_kept = true;
-        for (lead, read) in take_projects(&kept, identity) {
-            state.each.entry(lead).or_insert(read);
+        if let (each, true) = take_projects(&kept, identity) {
+            for (lead, read) in each {
+                state.each.entry(lead).or_insert(read);
+            }
         }
     }
     let leads: Vec<&standing::Agent> = (listed.iter())
@@ -1486,19 +1492,24 @@ fn projects_file(store: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The projects as **Projects** last read them in any window, by lead,
-/// as this build reads them ([`reads_build`]) from the daemon `identity`
-/// names.
-fn take_projects(store: &std::path::Path, identity: Option<&str>) -> HashMap<String, ProjectRead> {
+/// from the daemon's store `identity` names, and whether this build read
+/// them ([`reads_build`]): another build's are shown, not reused, as it
+/// may read a project otherwise.
+fn take_projects(
+    store: &std::path::Path,
+    identity: Option<&str>,
+) -> (HashMap<String, ProjectRead>, bool) {
     #[derive(serde::Deserialize)]
     struct Kept {
         build: String,
+        store: String,
         each: HashMap<String, ProjectRead>,
     }
     std::fs::read(projects_file(store))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-        .filter(|kept| kept.build == reads_build(identity))
-        .map(|kept| kept.each)
+        .filter(|kept| kept.store == identity.unwrap_or(""))
+        .map(|kept| (kept.each, kept.build == reads_build(identity)))
         .unwrap_or_default()
 }
 
@@ -1512,10 +1523,12 @@ fn keep_projects(
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
+        store: &'a str,
         each: HashMap<&'a String, &'a ProjectRead>,
     }
     let kept = Kept {
         build: reads_build(identity),
+        store: identity.unwrap_or(""),
         each: (each.iter())
             .filter(|(_, read)| {
                 (read.project.agents.listed.iter()).all(|agent| agent.run.is_none())
@@ -29085,12 +29098,24 @@ mod tests {
         assert_eq!(found, ["alpha.lead"]);
         assert_eq!(fresh.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
         assert!(!fresh.latest.contains_key("beta.two"));
-        assert_eq!(
-            take_projects(&store, client.identity())
-                .keys()
-                .collect::<Vec<_>>(),
-            ["alpha.lead"]
-        );
+        let (kept, this_build) = take_projects(&store, client.identity());
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        assert!(this_build);
+        // Another build's projects show, but are not reused; another
+        // store's are not taken.
+        let file = projects_file(&store);
+        let mut written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        written["build"] = json!("0.0.0 older");
+        std::fs::write(&file, written.to_string()).unwrap();
+        let (kept, this_build) = take_projects(&store, client.identity());
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        assert!(!this_build);
+        let mut other = ProjectsState::default();
+        page(&client, &store, &asked, &listed, &mut other).await;
+        assert_eq!(other.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        written["store"] = json!("another store");
+        std::fs::write(&file, written.to_string()).unwrap();
+        assert!(take_projects(&store, client.identity()).0.is_empty());
     }
 
     #[tokio::test]
