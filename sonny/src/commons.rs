@@ -2155,7 +2155,8 @@ impl View {
         self.items = (self.threads.iter())
             .filter_map(|thread| {
                 let name = thread["thread"].as_str()?;
-                let at = (self.known.get(name)).map_or(0, |(_, kept)| kept["at"].as_i64().unwrap_or(0));
+                let at =
+                    (self.known.get(name)).map_or(0, |(_, kept)| kept["at"].as_i64().unwrap_or(0));
                 crate::board_view::item_of(thread, at)
             })
             .collect();
@@ -2288,9 +2289,12 @@ impl View {
             Row::Board(at) => Pick::Board(self.boards[at].name.clone()),
             Row::Fold(_) => Pick::Fold,
             Row::Hung(at) | Row::Item(at) => Pick::Thread(self.items[at].thread.clone()),
-            Row::Thread(at) => {
-                Pick::Thread(self.threads[at]["thread"].as_str().unwrap_or_default().to_owned())
-            }
+            Row::Thread(at) => Pick::Thread(
+                self.threads[at]["thread"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
             Row::Heading(state) => Pick::Heading(state),
         }
     }
@@ -2311,7 +2315,7 @@ impl View {
         }
         for at in 0..self.pages.len() {
             if let Page::Board { name, pick, .. } = &self.pages[at] {
-                let rows = self.board_rows(name, at);
+                let rows = Self::pickable(&self.board_rows(name, at));
                 let kept = (pick.as_ref()).and_then(|pick| self.find_pick(&rows, pick));
                 if kept.is_none() {
                     let first = rows.first().map(|row| self.pick_of(*row));
@@ -2333,7 +2337,9 @@ impl View {
         let (open, finding) = match self.pages.get(page) {
             Some(Page::Board { open, finding, .. }) => (
                 open.clone(),
-                (finding.as_ref()).map(|(query, _)| query.clone()).filter(|q| !q.is_empty()),
+                (finding.as_ref())
+                    .map(|(query, _)| query.clone())
+                    .filter(|q| !q.is_empty()),
             ),
             _ => (Vec::new(), None),
         };
@@ -2342,7 +2348,8 @@ impl View {
             let mut items: Vec<usize> = (board.items.iter().copied())
                 .filter(|item| self.items[*item].state == state)
                 .filter(|item| {
-                    (finding.as_deref()).is_none_or(|q| crate::board_view::found_on_page(&self.items[*item], q))
+                    (finding.as_deref())
+                        .is_none_or(|q| crate::board_view::found_on_page(&self.items[*item], q))
                 })
                 .collect();
             if items.is_empty() {
@@ -2587,7 +2594,10 @@ impl View {
                 self.open_thread_page(name);
             }
             Row::Thread(at) => {
-                let name = self.threads[at]["thread"].as_str().unwrap_or_default().to_owned();
+                let name = self.threads[at]["thread"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 self.open_thread_page(name);
             }
         }
@@ -2758,7 +2768,10 @@ impl View {
         };
         let mut facts = String::new();
         if boards > 0 {
-            facts.push_str(&format!(" · {}", crate::board_view::counted(boards, "board")));
+            facts.push_str(&format!(
+                " · {}",
+                crate::board_view::counted(boards, "board")
+            ));
         }
         facts.push_str(&format!(
             " · {threads} thread{} · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
@@ -2822,7 +2835,10 @@ impl View {
             })
             .max()
             .unwrap_or(0);
-        let board_rows = rows.iter().filter(|row| !matches!(row, Row::Thread(_))).count();
+        let board_rows = rows
+            .iter()
+            .filter(|row| !matches!(row, Row::Thread(_)))
+            .count();
         let thread_rows = rows.len() - board_rows;
         for (index, row) in rows.iter().enumerate() {
             let pick = picked == Some(index);
@@ -2844,7 +2860,8 @@ impl View {
                 ];
                 if self.more {
                     heading.push(
-                        Span::raw(format!(" · {}", crate::board_view::counted(items, "item"))).dim(),
+                        Span::raw(format!(" · {}", crate::board_view::counted(items, "item")))
+                            .dim(),
                     );
                 }
                 out.push(Line::from(heading));
@@ -2855,7 +2872,8 @@ impl View {
                         card.at = out.len();
                     }
                     card.starts.push(out.len());
-                    let mut line = crate::board_view::board_row(&self.boards[*at], column, width, now);
+                    let mut line =
+                        crate::board_view::board_row(&self.boards[*at], column, width, now);
                     if pick {
                         crate::list::pick(&mut line);
                     }
@@ -2869,8 +2887,11 @@ impl View {
                     let mark = if self.fold_open { "▾" } else { "▸" };
                     let mut line = Line::from(vec![
                         Span::raw(" "),
-                        Span::raw(format!("{mark} {}", crate::board_view::counted(*n, "finished board")))
-                            .dim(),
+                        Span::raw(format!(
+                            "{mark} {}",
+                            crate::board_view::counted(*n, "finished board")
+                        ))
+                        .dim(),
                     ]);
                     if pick {
                         crate::list::pick(&mut line);
@@ -2945,7 +2966,11 @@ impl View {
         let posts = thread["posts"].as_u64().unwrap_or(0);
         let mut facts = Vec::new();
         if let Some(item) = item {
-            facts.push(crate::board_view::state_words(item, &self.project, &self.present));
+            facts.push(crate::board_view::state_words(
+                item,
+                &self.project,
+                &self.present,
+            ));
         }
         facts.push(format!("{posts} post{}", if posts == 1 { "" } else { "s" }));
         facts.push(format!("by {}", text("started_by")));
@@ -3080,7 +3105,9 @@ impl View {
             }
         };
         let picked_link = *link;
-        let title = (posts.first()).and_then(|post| post["title"].as_str()).unwrap_or_default();
+        let title = (posts.first())
+            .and_then(|post| post["title"].as_str())
+            .unwrap_or_default();
         let mut out = crate::transcript::wrap(
             Line::from(title.to_owned()).bold(),
             width,
@@ -3091,7 +3118,8 @@ impl View {
         let item = self.item_at.get(name.as_str()).map(|at| &self.items[*at]);
         let mut links = Vec::new();
         if let Some(item) = item {
-            let (rows, found) = crate::board_view::item_head(item, &self.project, &self.present, width);
+            let (rows, found) =
+                crate::board_view::item_head(item, &self.project, &self.present, width);
             let first = out.len();
             for (row, from, to, target) in found {
                 links.push((first + row, from, to, target));
@@ -4274,7 +4302,7 @@ mod tests {
         assert!(at("New one") < at("Old one"), "{listed:?}");
         assert_eq!(
             view.keys(),
-            "↑↓ pick · enter open · a this project · esc close"
+            "↑↓ pick · enter open · a this project · ctrl+f find · esc close"
         );
         assert_eq!(view.footer(), None);
         view.press(KeyEvent::from(KeyCode::Down));
@@ -4729,9 +4757,8 @@ mod tests {
         post("calc.lead", "calc", "theirs");
         let mut view = View::open(home, "shop".into());
         let head = |view: &mut View| line_text(&view.card(80).0[0]);
-        let listed = |view: &mut View| -> Vec<String> {
-            view.card(80).0.iter().map(line_text).collect()
-        };
+        let listed =
+            |view: &mut View| -> Vec<String> { view.card(80).0.iter().map(line_text).collect() };
         // Every project's, as it opens.
         assert!(listed(&mut view).iter().any(|l| l.contains("theirs")));
         assert!(head(&mut view).starts_with("every project · 2 threads"));

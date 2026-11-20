@@ -223,7 +223,10 @@ pub fn age(seconds: i64) -> String {
 /// An agent's name as Sonny writes it in a window of `here`: the short
 /// one inside its own project, the whole one outside it.
 pub fn named(bot: &str, here: &str) -> String {
-    match bot.strip_prefix(here).and_then(|rest| rest.strip_prefix('.')) {
+    match bot
+        .strip_prefix(here)
+        .and_then(|rest| rest.strip_prefix('.'))
+    {
         Some(short) if !short.is_empty() => short.to_owned(),
         _ => bot.to_owned(),
     }
@@ -243,7 +246,9 @@ impl Present {
     pub fn closed(&self, bot: &str) -> bool {
         !self.project.is_empty()
             && !self.bots.is_empty()
-            && bot.strip_prefix(&self.project).is_some_and(|rest| rest.starts_with('.'))
+            && bot
+                .strip_prefix(&self.project)
+                .is_some_and(|rest| rest.starts_with('.'))
             && !self.bots.contains(bot)
     }
 }
@@ -399,7 +404,11 @@ pub fn page_row(
         }
     };
     let fits = |labels_on: bool, with_age: bool| -> bool {
-        let labels_w = if labels_on && !labels.is_empty() { 2 + labels.len() } else { 0 };
+        let labels_w = if labels_on && !labels.is_empty() {
+            2 + labels.len()
+        } else {
+            0
+        };
         let r = right(with_age);
         lead_width + title_width + labels_w + if r > 0 { 2 + r } else { 0 } <= width
     };
@@ -447,11 +456,15 @@ pub fn page_detail(
         State::Waiting => {
             // Only what is not done yet: a need done waits for nothing.
             let not_done: Vec<&String> = (item.needs.iter())
-                .filter(|need| others.get(need.as_str()).is_none_or(|n| n.state != State::Done))
+                .filter(|need| {
+                    others
+                        .get(need.as_str())
+                        .is_none_or(|n| n.state != State::Done)
+                })
                 .collect();
             let first = not_done.first()?;
-            let first = (others.get(first.as_str()))
-                .map_or(first.as_str(), |need| need.title.as_str());
+            let first =
+                (others.get(first.as_str())).map_or(first.as_str(), |need| need.title.as_str());
             match not_done.len() {
                 1 => format!("needs {first}"),
                 n => format!("needs {first} +{}", n - 1),
@@ -620,4 +633,754 @@ pub fn found_in_list(item: &Item, query: &str) -> bool {
     let query = query.to_lowercase();
     item.title.to_lowercase().contains(&query)
         || (item.holder.as_deref()).is_some_and(|h| h.to_lowercase().contains(&query))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commons::View;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    fn home(name: &str) -> PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("sonny-board-view-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        home
+    }
+
+    /// The board tool called as `name` of its project, every post of the
+    /// thread it acts on shown to it first.
+    fn send(home: &Path, name: &str, arguments: Value) -> Value {
+        let project = name.split('.').next().unwrap_or(name);
+        if let Some(thread) = arguments["act"]["thread"].as_str()
+            && let Ok(posts) =
+                crate::commons::posts(&crate::commons::dir(home).join(format!("{thread}.jsonl")))
+        {
+            crate::commons::told(home, name, thread, &(0..posts.len()).collect::<Vec<_>>());
+        }
+        let caller = crate::board::Caller {
+            name,
+            id: None,
+            reader: name,
+            model: None,
+            project: Some(project),
+            profile: None,
+        };
+        crate::board::call(home, &caller, &arguments, &|_, _| false).unwrap()
+    }
+
+    fn add(home: &Path, by: &str, board: &str, name: &str, title: &str, extra: Value) {
+        let mut add = json!({"name": name, "title": title, "text": "x", "board": board});
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            add[key] = value.clone();
+        }
+        send(home, by, json!({"add": add}));
+    }
+
+    fn act(home: &Path, by: &str, thread: &str, what: &str, text: &str) {
+        send(
+            home,
+            by,
+            json!({"act": {"thread": thread, "do": what, "text": text}}),
+        );
+    }
+
+    /// A plain thread, on no board.
+    fn thread(home: &Path, by: &str, name: &str, title: &str) {
+        let project = by.split('.').next().unwrap_or(by);
+        crate::commons::call(
+            home,
+            by,
+            None,
+            by,
+            None,
+            Some(project),
+            &json!({"post": {"name": name, "title": title, "text": "?"}}),
+        )
+        .unwrap();
+    }
+
+    /// Every post of `thread` written `seconds` earlier.
+    fn age_by(home: &Path, thread: &str, seconds: i64) {
+        let path = crate::commons::dir(home).join(format!("{thread}.jsonl"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut out = String::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let mut post: Value = serde_json::from_str(line).unwrap();
+            post["at"] = json!(post["at"].as_i64().unwrap() - seconds);
+            out.push_str(&format!("{post}\n"));
+        }
+        std::fs::write(&path, out).unwrap();
+    }
+
+    fn text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn card(view: &mut View, width: usize) -> Vec<String> {
+        view.card(width).0.iter().map(text).collect()
+    }
+
+    fn press(view: &mut View, code: KeyCode) -> crate::commons::Key {
+        view.press(KeyEvent::from(code))
+    }
+
+    fn ctrl_f(view: &mut View) {
+        view.press(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    }
+
+    fn typed(view: &mut View, words: &str) {
+        for c in words.chars() {
+            press(view, KeyCode::Char(c));
+        }
+    }
+
+    fn picked(view: &mut View, width: usize) -> String {
+        let (lines, at) = view.card(width);
+        text(&lines[at])
+    }
+
+    /// shop's typed errors: two claimed, one open with a label, two
+    /// waiting, one done; shop's release, all open; docs' pages, failed
+    /// and done; and one thread on no board.
+    fn commons(name: &str) -> PathBuf {
+        let home = home(name);
+        let h = &home;
+        let te = "shop/typed-errors";
+        add(
+            h,
+            "shop.lead",
+            te,
+            "api",
+            "Add typed errors to the api",
+            json!({}),
+        );
+        add(
+            h,
+            "shop.lead",
+            te,
+            "cli",
+            "Add typed errors to the cli",
+            json!({}),
+        );
+        add(
+            h,
+            "shop.lead",
+            te,
+            "flaky",
+            "Fix the flaky error test",
+            json!({"labels": {"kind": "bug"}}),
+        );
+        add(
+            h,
+            "shop.lead",
+            te,
+            "enum",
+            "Remove the old error enum",
+            json!({"needs": ["api", "cli"]}),
+        );
+        add(
+            h,
+            "shop.lead",
+            te,
+            "review",
+            "Review the typed errors change",
+            json!({"needs": ["enum"], "for": "reviewer"}),
+        );
+        add(
+            h,
+            "shop.lead",
+            te,
+            "docs",
+            "Write the error docs",
+            json!({}),
+        );
+        act(h, "shop.errors-2", "api", "claim", "mine");
+        act(h, "shop.errors-3", "cli", "claim", "mine");
+        act(h, "shop.errors-1", "docs", "claim", "mine");
+        act(
+            h,
+            "shop.errors-1",
+            "docs",
+            "done",
+            "Docs written.\nAll of them.",
+        );
+        add(
+            h,
+            "shop.lead",
+            "shop/release",
+            "notes",
+            "Write the release notes",
+            json!({}),
+        );
+        add(
+            h,
+            "docs.lead",
+            "docs/api-pages",
+            "pages",
+            "Draw the api pages",
+            json!({}),
+        );
+        add(
+            h,
+            "docs.lead",
+            "docs/api-pages",
+            "links",
+            "Fix the broken links",
+            json!({}),
+        );
+        act(h, "docs.pager", "pages", "claim", "mine");
+        act(h, "docs.pager", "pages", "fail", "The generator is gone.");
+        act(h, "docs.pager", "links", "claim", "mine");
+        act(h, "docs.pager", "links", "done", "Fixed.");
+        thread(
+            h,
+            "mail.lead",
+            "backoff",
+            "Provider 429s: how long to back off?",
+        );
+        home
+    }
+
+    #[test]
+    fn boards_sit_over_the_threads_this_project_s_first_one_row_each() {
+        let home = &commons("section");
+        let mut view = View::open(home, "shop".into());
+        let lines = card(&mut view, 80);
+        assert!(
+            lines[0].starts_with("every project · 3 boards · 1 thread ·"),
+            "{}",
+            lines[0]
+        );
+        let at = |needle: &str| {
+            (lines.iter().position(|l| l.contains(needle)))
+                .unwrap_or_else(|| panic!("{needle}: {lines:#?}"))
+        };
+        assert!(at("Boards · 3") < at("shop/release"));
+        // This window's project's first, then by name: never by state.
+        assert!(at("shop/release") < at("shop/typed-errors"));
+        assert!(at("shop/typed-errors") < at("docs/api-pages"));
+        assert!(at("docs/api-pages") < at("Threads · 1"));
+        assert!(at("Threads · 1") < at("Provider 429s"));
+        // Its most pressing item's mark, its name whole, a count a state
+        // that has any, in the page's order, and its last post's age.
+        let row = &lines[at("shop/typed-errors")];
+        assert!(row.starts_with(" ● shop/typed-errors"), "{row:?}");
+        assert!(row.contains("● 2  ○ 1  ◌ 2  ✓ 1"), "{row:?}");
+        assert!(row.trim_end().ends_with("0s"), "{row:?}");
+        assert!(lines[at("docs/api-pages")].starts_with(" ✗ docs/api-pages"));
+        assert!(lines[at("docs/api-pages")].contains("✗ 1  ✓ 1"));
+        // An item is no row among the threads.
+        assert!(
+            !lines.iter().any(|l| l.contains("Add typed errors")),
+            "{lines:#?}"
+        );
+        // In a project its boards come first, so the pick starts on one.
+        assert!(picked(&mut view, 80).contains("shop/release"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_row_keeps_its_place_when_an_item_moves() {
+        let home = &commons("order");
+        let mut view = View::open(home, "web".into());
+        let order = |view: &mut View| -> Vec<String> {
+            (card(view, 80).into_iter())
+                .filter(|l| l.contains('/') && !l.contains('·'))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|l| l.split_whitespace().nth(1).unwrap_or_default().to_owned())
+                .collect()
+        };
+        let before = order(&mut view);
+        assert_eq!(
+            before,
+            ["docs/api-pages", "shop/release", "shop/typed-errors"]
+        );
+        act(home, "shop.errors-4", "notes", "claim", "mine");
+        view.reload();
+        assert_eq!(order(&mut view), before);
+        let lines = card(&mut view, 80);
+        let release = lines.iter().find(|l| l.contains("shop/release")).unwrap();
+        assert!(release.starts_with(" ● shop/release"), "{release:?}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn finished_boards_fold_to_one_last_row() {
+        let home = &commons("fold");
+        for thread in ["pages", "links"] {
+            age_by(home, thread, FINISHED_AFTER + 60);
+        }
+        // Failed is not over: a board stays while one failed.
+        let mut view = View::open(home, "shop".into());
+        assert!(
+            card(&mut view, 80)
+                .iter()
+                .any(|l| l.contains("docs/api-pages"))
+        );
+        act(home, "docs.pager", "pages", "reopen", "again");
+        act(home, "docs.pager", "pages", "claim", "mine");
+        act(home, "docs.pager", "pages", "done", "Drawn.");
+        age_by(home, "pages", FINISHED_AFTER + 60);
+        view.reload();
+        let lines = card(&mut view, 80);
+        assert!(lines.iter().any(|l| l.contains("Boards · 2")), "{lines:#?}");
+        let fold = lines
+            .iter()
+            .position(|l| l.contains("▸ 1 finished board"))
+            .unwrap();
+        assert!(!lines[..fold].iter().any(|l| l.contains("docs/api-pages")));
+        assert!(
+            lines[fold + 1].is_empty(),
+            "the fold is the boards' last row"
+        );
+        // → opens it in its place.
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Down);
+        assert!(picked(&mut view, 80).contains("finished board"));
+        press(&mut view, KeyCode::Right);
+        let lines = card(&mut view, 80);
+        assert!(lines.iter().any(|l| l.contains("▾ 1 finished board")));
+        assert!(
+            lines.iter().any(|l| l.starts_with(" ✓ docs/api-pages")),
+            "{lines:#?}"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn m_lists_every_item_among_the_threads_with_its_board_and_state() {
+        let home = &commons("more");
+        let mut view = View::open(home, "shop".into());
+        assert!(view.keys().contains("m items"), "{}", view.keys());
+        press(&mut view, KeyCode::Char('m'));
+        let lines = card(&mut view, 100);
+        assert!(
+            lines.iter().any(|l| l == "Threads · 1 · 9 items"),
+            "{lines:#?}"
+        );
+        let api = lines
+            .iter()
+            .position(|l| l.contains("Add typed errors to the api"))
+            .unwrap();
+        assert_eq!(lines[api], "● Add typed errors to the api");
+        assert!(
+            lines[api + 1].starts_with("  shop/typed-errors · claimed by errors-2 · 2 posts · by shop.lead · last shop.errors-2 · "),
+            "{:?}",
+            lines[api + 1]
+        );
+        let backoff = lines
+            .iter()
+            .position(|l| l.contains("Provider 429s"))
+            .unwrap();
+        assert!(
+            lines[backoff].starts_with("  Provider"),
+            "a thread keeps its two columns"
+        );
+        // Another project's holder by its whole name.
+        let pages = lines
+            .iter()
+            .position(|l| l.contains("Draw the api pages"))
+            .unwrap();
+        assert!(lines[pages].starts_with("✗ "));
+        assert!(
+            lines[pages + 1].starts_with("  docs/api-pages · failed · "),
+            "{:?}",
+            lines[pages + 1]
+        );
+        press(&mut view, KeyCode::Char('m'));
+        assert!(
+            !card(&mut view, 100)
+                .iter()
+                .any(|l| l.contains("Add typed errors"))
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_board_opens_as_its_page_by_state_and_back_keeps_the_pick() {
+        let home = &commons("page");
+        let mut view = View::open(home, "shop".into());
+        press(&mut view, KeyCode::Down);
+        assert!(picked(&mut view, 80).contains("shop/typed-errors"));
+        press(&mut view, KeyCode::Enter);
+        assert!(view.on_page());
+        let lines = card(&mut view, 80);
+        assert_eq!(
+            lines[0],
+            "shop/typed-errors · 2 claimed · 1 open · 2 waiting · 1 done"
+        );
+        assert_eq!(lines[1], "board of shop");
+        let at = |needle: &str| {
+            (lines.iter().position(|l| l.contains(needle)))
+                .unwrap_or_else(|| panic!("{needle}: {lines:#?}"))
+        };
+        assert!(at("Claimed · 2") < at("Open · 1"));
+        assert!(at("Open · 1") < at("Waiting · 2"));
+        assert!(at("Waiting · 2") < at("Done · 1 ▸"));
+        // Done starts folded.
+        assert!(!lines.iter().any(|l| l.contains("Write the error docs")));
+        let api = &lines[at("Add typed errors to the api")];
+        assert!(api.starts_with(" ● Add typed errors to the api"), "{api:?}");
+        assert!(api.trim_end().ends_with("errors-2 · 0s"), "{api:?}");
+        let flaky = &lines[at("Fix the flaky error test")];
+        assert!(
+            flaky.contains("Fix the flaky error test  kind=bug"),
+            "{flaky:?}"
+        );
+        let review = at("Review the typed errors change");
+        assert!(
+            lines[review].contains("for reviewer"),
+            "{:?}",
+            lines[review]
+        );
+        assert_eq!(lines[review + 1], "   └ needs Remove the old error enum");
+        let gone = at("Remove the old error enum");
+        assert_eq!(lines[gone + 1], "   └ needs Add typed errors to the api +1");
+        // The holder is a link to its agent.
+        let card = view.card_rows(80);
+        assert!(
+            card.agents
+                .iter()
+                .any(|(_, _, _, bot)| bot == "shop.errors-2")
+        );
+        // → on Done opens it: a done item's result's first line under it.
+        while !picked(&mut view, 80).contains("Done") {
+            press(&mut view, KeyCode::Down);
+        }
+        press(&mut view, KeyCode::Right);
+        let lines = card_of(&mut view);
+        let docs = lines
+            .iter()
+            .position(|l| l.contains("Write the error docs"))
+            .unwrap();
+        assert_eq!(lines[docs + 1], "   └ Docs written.");
+        // ← goes back with the pick on the board left.
+        press(&mut view, KeyCode::Left);
+        assert!(!view.on_page());
+        assert!(picked(&mut view, 80).contains("shop/typed-errors"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn card_of(view: &mut View) -> Vec<String> {
+        card(view, 80)
+    }
+
+    #[test]
+    fn an_item_opens_as_its_thread_with_where_it_stands_and_what_agents_did() {
+        let home = &commons("item");
+        send(
+            home,
+            "shop.errors-2",
+            json!({"act": {"thread": "api", "do": "label", "text": "x", "labels": {"kind": "refactor"}}}),
+        );
+        let mut view = View::open(home, "shop".into());
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Enter);
+        while !picked(&mut view, 80).contains("Add typed errors to the api") {
+            press(&mut view, KeyCode::Down);
+        }
+        press(&mut view, KeyCode::Enter);
+        assert!(view.reading(), "{:#?}", card(&mut view, 80));
+        let lines = card(&mut view, 80);
+        assert_eq!(lines[0], "Add typed errors to the api");
+        assert_eq!(lines[1], "api");
+        assert_eq!(
+            lines[2],
+            "item on shop/typed-errors · claimed by errors-2 · kind=refactor"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("shop.errors-2 · claimed · ")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("shop.errors-2 · labeled kind=refactor · ")),
+            "{lines:#?}"
+        );
+        // The board and the holder are links, picked among with the arrows.
+        assert_eq!(view.keys(), "↑↓ pick · esc back");
+        press(&mut view, KeyCode::Down);
+        let (shown, _) = view.card(80);
+        assert!(
+            (shown[2].spans.iter()).any(|s| s.content == "shop/typed-errors"
+                && s.style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)),
+            "{:?}",
+            shown[2]
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            crate::commons::Key::Open(format!("{}shop.errors-2", crate::links::AGENT))
+        );
+        // The board's link opens its page; ← back to the item, then to
+        // the board it came from with the pick on it.
+        press(&mut view, KeyCode::Up);
+        press(&mut view, KeyCode::Enter);
+        assert_eq!(view.depth(), 3);
+        assert!(card(&mut view, 80)[0].starts_with("shop/typed-errors · "));
+        press(&mut view, KeyCode::Left);
+        press(&mut view, KeyCode::Left);
+        assert!(picked(&mut view, 80).contains("Add typed errors to the api"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_closing_post_shows_its_text_and_a_takeover_says_so() {
+        let home = &commons("closing");
+        let mut view = View::open(home, "shop".into());
+        view.open_thread("pages");
+        let lines = card(&mut view, 80);
+        assert_eq!(lines[2], "item on docs/api-pages · failed");
+        let failed = lines
+            .iter()
+            .position(|l| l.starts_with("docs.pager · failed · "))
+            .unwrap();
+        assert_eq!(lines[failed + 1], "  The generator is gone.");
+        // A claim on a closed holder's item takes it over.
+        let caller = crate::board::Caller {
+            name: "shop.errors-4",
+            id: None,
+            reader: "shop.errors-4",
+            model: None,
+            project: Some("shop"),
+            profile: None,
+        };
+        let posts = crate::commons::posts(&crate::commons::dir(home).join("api.jsonl")).unwrap();
+        crate::commons::told(
+            home,
+            "shop.errors-4",
+            "api",
+            &(0..posts.len()).collect::<Vec<_>>(),
+        );
+        crate::board::call(
+            home,
+            &caller,
+            &json!({"act": {"thread": "api", "do": "claim", "text": "mine now"}}),
+            &|_, _| true,
+        )
+        .unwrap();
+        view.open_thread("api");
+        let lines = card(&mut view, 80);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("shop.errors-4 · took it over from errors-2, closed · ")),
+            "{lines:#?}"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_holder_the_window_no_longer_lists_is_closed() {
+        let home = &commons("closed");
+        let mut view = View::open(home, "shop".into());
+        view.set_present(Present {
+            project: "shop".into(),
+            bots: ["shop.lead", "shop.errors-3"].map(str::to_owned).into(),
+        });
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Enter);
+        let lines = card(&mut view, 80);
+        let api = lines
+            .iter()
+            .find(|l| l.contains("Add typed errors to the api"))
+            .unwrap();
+        assert!(api.contains("errors-2 closed"), "{api:?}");
+        let cli = lines
+            .iter()
+            .find(|l| l.contains("Add typed errors to the cli"))
+            .unwrap();
+        assert!(cli.contains("errors-3 · "), "{cli:?}");
+        // Another project's agent is never said closed: the window does
+        // not list them.
+        assert!(
+            !Present {
+                project: "shop".into(),
+                bots: ["shop.lead".into()].into()
+            }
+            .closed("docs.pager")
+        );
+        // Nor before the window has counted any.
+        assert!(
+            !Present {
+                project: "shop".into(),
+                bots: Default::default()
+            }
+            .closed("shop.errors-2")
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn find_in_the_list_keeps_a_board_with_its_matching_items_hung_under_it() {
+        let home = &commons("find");
+        let mut view = View::open(home, "shop".into());
+        let before = picked(&mut view, 80);
+        ctrl_f(&mut view);
+        typed(&mut view, "enum");
+        let lines = card(&mut view, 80);
+        assert_eq!(lines.last().unwrap(), "find enum");
+        assert!(
+            lines.iter().any(|l| l.starts_with(" ● shop/typed-errors")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim_end() == "   ◌ Remove the old error enum"),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("shop/release")),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("Provider")), "{lines:#?}");
+        // The pick goes to the first match, not the board that holds it.
+        assert!(picked(&mut view, 80).contains("Remove the old error enum"));
+        assert_eq!(view.keys(), "↑↓ pick · enter open · esc cancel");
+        // A board by its name; a thread by its title.
+        for _ in 0..4 {
+            press(&mut view, KeyCode::Backspace);
+        }
+        typed(&mut view, "429");
+        let lines = card(&mut view, 80);
+        assert!(lines.iter().any(|l| l.contains("Provider 429s")));
+        assert!(!lines.iter().any(|l| l.contains("Boards")), "{lines:#?}");
+        // esc drops the find first, the pick as it was; then closes.
+        press(&mut view, KeyCode::Esc);
+        assert_eq!(picked(&mut view, 80), before);
+        assert!(!card(&mut view, 80).iter().any(|l| l.starts_with("find")));
+        assert_eq!(press(&mut view, KeyCode::Esc), crate::commons::Key::Close);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn find_on_a_board_reads_titles_holders_and_labels() {
+        let home = &commons("find-page");
+        let mut view = View::open(home, "shop".into());
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Enter);
+        assert_eq!(view.keys(), "↑↓ pick · enter open · ctrl+f find · esc back");
+        ctrl_f(&mut view);
+        typed(&mut view, "kind=bug");
+        let lines = card(&mut view, 80);
+        assert!(lines.iter().any(|l| l.contains("Fix the flaky error test")));
+        assert!(
+            !lines.iter().any(|l| l.contains("Add typed errors")),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("Claimed")), "{lines:#?}");
+        press(&mut view, KeyCode::Esc);
+        // A fold is searched and stands open while finding.
+        ctrl_f(&mut view);
+        typed(&mut view, "errors-1");
+        let lines = card(&mut view, 80);
+        assert!(
+            lines.iter().any(|l| l.contains("Write the error docs")),
+            "{lines:#?}"
+        );
+        press(&mut view, KeyCode::Esc);
+        assert!(view.on_page(), "esc drops the find before the page");
+        press(&mut view, KeyCode::Esc);
+        assert!(!view.on_page());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn too_long_for_its_row_a_board_gives_up_its_age_then_its_counts() {
+        let home = &commons("narrow");
+        let mut view = View::open(home, "shop".into());
+        for width in [150, 120, 60, 44, 30] {
+            let lines = card(&mut view, width);
+            let row = lines
+                .iter()
+                .find(|l| l.contains("shop/typed-errors"))
+                .unwrap();
+            assert!(row.starts_with(" ● shop/typed-errors"), "{width}: {row:?}");
+            assert!(row.trim_end().chars().count() <= width, "{width}: {row:?}");
+        }
+        let mut rows = |w| {
+            let lines = card(&mut view, w);
+            lines
+                .into_iter()
+                .find(|l| l.contains("shop/typed-errors"))
+                .unwrap()
+        };
+        assert!(rows(44).contains("● 2  ○ 1  ◌ 2  ✓ 1") && rows(44).trim_end().ends_with('s'));
+        assert!(rows(40).contains("● 2  ○ 1  ◌ 2  ✓ 1") && !rows(40).trim_end().ends_with('s'));
+        assert_eq!(rows(30).trim_end(), " ● shop/typed-errors  ● 2  ○ 1");
+        // A page row: the labels go first, then the age; the holder stays.
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Enter);
+        let mut flaky = |w| {
+            card(&mut view, w)
+                .into_iter()
+                .find(|l| l.contains("flaky"))
+                .unwrap()
+        };
+        assert!(flaky(60).contains("kind=bug"));
+        assert!(
+            !flaky(36).contains("kind=bug") && flaky(36).trim_end().ends_with('s'),
+            "{:?}",
+            flaky(36)
+        );
+        let mut api = |w| {
+            card(&mut view, w)
+                .into_iter()
+                .find(|l| l.contains("errors-2"))
+                .unwrap()
+        };
+        assert!(api(30).trim_end().ends_with("errors-2"), "{:?}", api(30));
+        assert!(api(30).contains('…'), "{:?}", api(30));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn enter_on_a_board_s_page_opens_its_first_item() {
+        let home = &commons("first");
+        let mut view = View::open(home, "shop".into());
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Enter);
+        assert!(picked(&mut view, 80).contains("Add typed errors to the"));
+        press(&mut view, KeyCode::Enter);
+        assert!(view.reading(), "{:#?}", card(&mut view, 80));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn with_no_board_the_list_is_as_it_was() {
+        let home = &home("none");
+        thread(
+            home,
+            "mail.lead",
+            "backoff",
+            "Provider 429s: how long to back off?",
+        );
+        let mut view = View::open(home, "shop".into());
+        let lines = card(&mut view, 80);
+        assert!(
+            lines[0].starts_with("every project · 1 thread ·"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("Boards") || l.starts_with("Threads"))
+        );
+        assert!(!view.keys().contains("m "), "{}", view.keys());
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
