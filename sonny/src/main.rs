@@ -16,6 +16,7 @@ mod attach;
 mod audit;
 mod background;
 mod banner;
+mod board_view;
 mod boot;
 mod browser;
 mod budget;
@@ -15294,7 +15295,14 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            commons: Some(commons::View::open(&home, project)),
+            commons: Some({
+                let mut view = commons::View::open(&home, project.clone());
+                view.set_present(board_view::Present {
+                    project: project.clone(),
+                    bots: self.kept_rows.bots.clone(),
+                });
+                view
+            }),
             memory: None,
             sky: None,
             picked: None,
@@ -15418,6 +15426,12 @@ impl App {
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.commons
         {
+            // What the window's count already knows of its project's
+            // agents: a holder it no longer lists is closed.
+            view.set_present(board_view::Present {
+                project: watch.project.clone(),
+                bots: self.kept_rows.bots.clone(),
+            });
             view.reload();
             watch.read = Instant::now();
             return;
@@ -16446,6 +16460,15 @@ impl App {
                 program.paste(text);
                 return true;
             }
+            // A paste while `/commons` finds is more to find.
+            Event::Paste(text)
+                if self.pane_keys
+                    && let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut())
+                    && view.finding() =>
+            {
+                view.paste(text);
+                return true;
+            }
             // A paste over a preview or `/status` is for the composer,
             // which comes back into view to show it.
             Event::Paste(_) if self.pane_keys && self.finding.is_none() => {
@@ -16888,51 +16911,58 @@ impl App {
                 }
                 return true;
             }
-            // `/commons` takes its own keys: picking a thread, reading it.
+            // `/commons` takes its own keys: picking a board, a thread or
+            // an item, its pages, finding.
             if self.pane_keys
                 && pane.is_card()
                 && let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut())
             {
                 let reading = view.reading();
+                let depth = view.depth();
                 match key.code {
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
                         pane.screen.unselect();
                         self.copied(&text);
                     }
-                    // A thread read is a page: ↑↓ pick its links, as Lynx
-                    // does, and scroll where none is left that way.
-                    KeyCode::Up if reading && !pane.screen.pick_link(false, pane.is_margin()) => {
-                        pane.screen.scroll(1)
-                    }
-                    KeyCode::Down if reading && !pane.screen.pick_link(true, pane.is_margin()) => {
-                        pane.screen.scroll(-1)
-                    }
-                    KeyCode::Up | KeyCode::Down if reading => {}
-                    KeyCode::Enter | KeyCode::Right
-                        if reading && let Some(url) = pane.screen.picked_link() =>
-                    {
-                        let url = url.to_owned();
-                        self.follow(&url);
-                    }
                     KeyCode::PageUp => pane.screen.page(true),
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Char(' ') if reading => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
-                    // The list of threads: nothing to close.
-                    KeyCode::Left if key.modifiers.is_empty() && !reading => self.left_ends(),
-                    _ => {
-                        if view.key(*key) == commons::Key::Close {
-                            self.close_pane(true);
-                        } else if view.reading() != reading {
-                            // A thread opened or left starts at its top.
+                    // The list, with nothing to close: the keys go back.
+                    KeyCode::Left if key.modifiers.is_empty() && view.left_ends() => {
+                        self.left_ends()
+                    }
+                    _ => match view.key(*key, pane.screen.in_view()) {
+                        commons::Key::Close => self.close_pane(true),
+                        // No link of the page's own that way: a link a
+                        // post holds, as Lynx picks, else a row.
+                        commons::Key::Scroll(up) => {
+                            if !pane.screen.pick_link(!up, false) {
+                                pane.screen.scroll(if up { 1 } else { -1 });
+                            }
+                        }
+                        commons::Key::Open(url) => self.follow(&url),
+                        commons::Key::Stay if view.depth() != depth => {
+                            // A page opened or left starts at its top, or
+                            // at the pick it was left on.
                             pane.screen.hold(usize::MAX);
                             if let Some(watch) = &mut self.watch {
                                 watch.picked = None;
                             }
                         }
-                    }
+                        commons::Key::Stay => {
+                            // A post's own link picked from the keys opens.
+                            if reading
+                                && matches!(key.code, KeyCode::Enter | KeyCode::Right)
+                                && let Some(url) = pane.screen.picked_link()
+                            {
+                                let url = url.to_owned();
+                                self.follow(&url);
+                            }
+                        }
+                    },
                 }
                 return true;
             }
@@ -17528,6 +17558,16 @@ impl App {
                 }
                 self.pane_keys = true;
             }
+            // A link on a page of `/commons`.
+            "commons" => {
+                if let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut()) {
+                    let leaves = view.click(id);
+                    self.pane_keys = true;
+                    if let Some(url) = leaves {
+                        self.follow(&url);
+                    }
+                }
+            }
             // A row or a link in `/memory`.
             "memory" => {
                 if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
@@ -17753,6 +17793,7 @@ impl App {
             && let Some(watch) = &mut self.watch
             && (watch.run.take().is_some()
                 || watch.memory.as_mut().is_some_and(memory::View::back)
+                || watch.commons.as_mut().is_some_and(commons::View::back)
                 || watch
                     .background
                     .as_mut()
@@ -21752,19 +21793,39 @@ impl App {
                         }
                     }
                 }
-            } else if let Some(view) = &watch.commons {
-                let (card, at, starts) = view.card_rows(width);
-                let lines: Vec<Line<'static>> = card
-                    .into_iter()
+            } else if let Some(view) = &mut watch.commons {
+                // A page open: the title's ‹ goes back from it.
+                pane.page = view.on_page();
+                let card = view.card_rows(width);
+                let lines: Vec<Line<'static>> = (card.lines.into_iter())
                     .map(|line| {
                         let mut spans = vec![Span::raw(" ")];
                         spans.extend(line.spans);
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                let marks = row_marks(&lines, &starts);
+                let mut marks = row_marks(&lines, &card.starts);
+                marks.extend(agent_marks(
+                    (card.agents.into_iter())
+                        .map(|(row, from, to, bot)| (row, from as u16, to as u16, bot))
+                        .collect(),
+                ));
+                let mut links: Vec<(usize, screen::Buttons)> = Vec::new();
+                for (row, from, to, at) in card.links {
+                    let button = (
+                        from as u16 + 1,
+                        to as u16 + 1,
+                        format!("{}{}link/{at}", screen::BUTTON, commons::BUTTON),
+                    );
+                    match links.last_mut() {
+                        Some((last, buttons)) if *last == row => buttons.push(button),
+                        _ => links.push((row, vec![button])),
+                    }
+                }
+                marks.extend((links.into_iter()).map(|(row, b)| (row, screen::Mark::Buttons(b))));
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
+                let at = card.at;
                 if view.reading() {
                     // A thread just opened starts at its top, after the
                     // card's swap kept the list's scroll.
