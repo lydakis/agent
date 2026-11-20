@@ -59,7 +59,7 @@ def durability_of(engine, ready):
 
 
 def run_once(binary, directory, config, mode, toolset, transport='stdio', memory_detail=False,
-             engine='rust', synchronous='full'):
+             engine='rust', synchronous=None):
     if engine != 'rust' and transport != 'stdio':
         raise ValueError('only Agent has a socket transport')
     workload = directory / 'workload.json'
@@ -122,12 +122,13 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
             if engine == 'pi-durable':
                 env = {**clean_env(), 'AGENT_BENCH_PORT': str(port),
                        'AGENT_BENCH_STORE': str(directory/'state.sqlite'),
-                       'AGENT_BENCH_SYNCHRONOUS': synchronous, 'AGENT_BENCH_TOOLS': toolset}
+                       'AGENT_BENCH_SYNCHRONOUS': synchronous or 'full', 'AGENT_BENCH_TOOLS': toolset}
                 client = Client(None, None, None, env=env,
                                 command=[shutil.which('node'), str(PI_DURABLE_ADAPTER)])
             else:
                 controller = SocketClient if transport == 'socket' else Client
-                client = controller(binary, directory/'state.sqlite', url, tools=toolset)
+                extra = ('--durability', synchronous) if synchronous else ()
+                client = controller(binary, directory/'state.sqlite', url, tools=toolset, extra=extra)
             clients.append(client)
             trees.append(Tree(client.process.pid))
             return client
@@ -245,8 +246,8 @@ def main():
     parser.add_argument('--memory-detail', action='store_true', help='sample PSS/USS where supported; adds observer overhead')
     parser.add_argument('--engine', choices=('rust', 'pi-durable'), default='rust')
     parser.add_argument('--synchronous', choices=('full', 'normal'),
-                        help="Pi Durable's SQLite synchronous setting (default full); Agent's is "
-                             "the one its binary names as it starts")
+                        help="Pi Durable's SQLite synchronous setting (default full), or Agent's "
+                             "--durability (default the binary's own, which it names as it starts)")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     out = args.out.resolve()
@@ -254,9 +255,6 @@ def main():
         parser.error('run from repository root with a new output under .local')
     if args.mode == 'shell' and 'shell' not in args.tools.split(','):
         parser.error('shell workload requires the shell tool')
-    if args.engine == 'rust' and args.synchronous:
-        parser.error("Agent's durability is the one its binary names as it starts")
-    args.synchronous = args.synchronous or 'full'
     if args.engine != 'rust' and args.transport != 'stdio':
         parser.error('only Agent has a socket transport')
     try:

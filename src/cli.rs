@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --stall-timeout --idle-exit --durability";
 
 struct Command {
     name: &'static str,
@@ -472,6 +472,10 @@ fn print_flags(flags: &str) {
                 "A new bot's speed tier, sent to each model that serves it, at a higher price per token; standard on the rest; default standard",
             ),
             "--idle-exit" => ("DURATION", "Exit after this long idle; 0 disables"),
+            "--durability" => (
+                "full|normal",
+                "full syncs each commit before answering it; normal syncs at checkpoints, faster on a busy disk, and a machine crash or power loss can lose the last commits; default full",
+            ),
             "--await-owner" => (
                 "DURATION",
                 "Wait up to this long for the daemon holding the store and socket to exit, then take them, rather than refusing at once; clients replacing an older daemon pass it, so the new one starts as the old stops and no other start can take the store in between",

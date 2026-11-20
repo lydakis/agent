@@ -2761,6 +2761,39 @@ impl LogState {
             "pinned": self.pinned_count.load(Relaxed)})
     }
 }
+/// How far a commit is on the disk when the writer answers it: the
+/// daemon's `--durability`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// The WAL is synced before each commit is answered (`synchronous=FULL`):
+    /// an answered commit survives a crash of the daemon, the machine, or
+    /// its power. On macOS the drive's own cache can still lose the last
+    /// commits; only checkpoints flush it.
+    #[default]
+    Full,
+    /// The WAL is synced only when it is checkpointed (WAL with
+    /// `synchronous=NORMAL`, as Codex keeps its state store): an answered
+    /// commit survives a crash of the daemon, but a crash of the machine
+    /// or its power can lose the commits since the last checkpoint. The
+    /// store is never corrupted either way.
+    Normal,
+}
+impl Durability {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "full" => Some(Self::Full),
+            "normal" => Some(Self::Normal),
+            _ => None,
+        }
+    }
+    /// As `ready` names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "sqlite_full",
+            Self::Normal => "sqlite_wal_synchronous_normal",
+        }
+    }
+}
 /// Plans that don't depend on bound values: SQLite's query planner
 /// stability guarantee. The store never runs ANALYZE, so no statistics
 /// could make a plan better for one value than another. Without it, SQLite
@@ -3930,6 +3963,15 @@ impl Database {
 
     /// Set this connection's page cache to `kib`, as a reader's share of
     /// the readers' budget.
+    /// Sync commits as `durability` asks; `initialize` leaves them `Full`.
+    pub fn durability(&self, durability: Durability) -> Result<()> {
+        self.conn.execute_batch(match durability {
+            Durability::Full => "PRAGMA synchronous=FULL;",
+            Durability::Normal => "PRAGMA synchronous=NORMAL;",
+        })?;
+        Ok(())
+    }
+
     pub fn cache_kib(&self, kib: usize) -> Result<()> {
         self.conn
             .execute_batch(&format!("PRAGMA cache_size=-{}", kib.max(1)))?;
@@ -3937,7 +3979,8 @@ impl Database {
     }
 
     pub fn initialize(conn: Connection) -> Result<Self> {
-        // FULL syncs the WAL before a commit is answered. An answer survives
+        // FULL, the default `Durability`, syncs the WAL before a commit is
+        // answered; `durability` can trade it for NORMAL. An answer survives
         // a daemon crash, but on macOS plain fsync can leave writes in the
         // drive's cache: an OS crash or power loss can lose recent commits.
         // Per-commit F_FULLFSYNC doubled daemon CPU on the light path, so it

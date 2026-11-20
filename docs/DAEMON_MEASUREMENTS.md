@@ -12594,3 +12594,35 @@ matched main's.
 At 1 s a sync, FULL commits on both sides wait 2 s each and the busy bots
 time out; the durability setting that follows this change measures what
 NORMAL does there.
+
+## Durability setting: full against normal
+
+2026-11-20, Linux x86_64 cloud VM, 4 CPUs. One build of the
+`--durability` change, on top of #1243, run both ways in alternation. Each
+row names its runs. `normal` is WAL with `synchronous=NORMAL`: commits
+stop syncing, and only checkpoints sync. Busy-disk rounds preload
+`bench/held/slow_sync.c`. Each run records its `ready.durability` beside
+its numbers.
+
+| Bench | Measure | Full | Normal |
+| --- | --- | ---: | ---: |
+| held reads, 424 agents, 30 busy, fast disk, 8 s (2 runs) | turns finished | 8,241 / 8,769 | 9,216 / 9,133 |
+| held reads, fast disk | script call taken, p50 ms | 3.3 / 2.6 | 1.7 / 1.7 |
+| held reads, every sync 300 ms (2 runs) | turns finished | 307 / 270 | 7,387 / 7,109 |
+| held reads, every sync 300 ms | script call taken, p50 ms | 607 / 603 | 1.2 / 1.5 |
+| held reads, every sync 1 s (2 runs) | turns finished | stalled (a reply waited past 5 s) | 4,525 / 4,363 |
+| lifecycle, 32-bot socket echo (2 runs) | CPU, s | 0.57 / 0.53 | 0.47 / 0.49 |
+| lifecycle | peak RSS, MiB | 26.8 / 26.7 | 27.4 / 26.9 |
+| low end, static musl, one window (3 runs) | turn p50, ms | 47.9 / 48.0 / 47.3 | 44.0 / 44.0 / 44.0 |
+| low end | idle daemon PSS, MiB | 19.0 / 18.2 / 18.6 | 18.2 / 19.1 / 18.3 |
+| high end, static musl, 100 windows over 10,000 agents (2 runs) | window start p50, s | 2.93 / 2.92 | 2.94 / 3.01 |
+| high end | busy daemon CPU, % | 137 / 136 | 135 / 135 |
+| high end | turns / scripts finished | 1,992 / 528, 2,008 / 529 | 2,010 / 532, 2,006 / 532 |
+| high end, every sync 300 ms (1 run) | window start p50, s | 17.0 | 2.8 |
+| high end, every sync 300 ms | turns / scripts finished | 330 / 16 | 1,890 / 502 |
+
+On a fast disk, normal is a few percent ahead. On a slow disk, normal
+keeps the daemon at speed, where full spends each commit waiting on the
+drive. The cost: a crash of the machine or a power loss can lose the
+commits made since the last checkpoint. A crash of the daemon loses
+nothing in either mode, and the store is never corrupted.

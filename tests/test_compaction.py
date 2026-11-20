@@ -293,8 +293,9 @@ class CompactionTests(ModelFixture):
             self.assertEqual(last['data']['status'], 'completed')
         # The last of these ends past the threshold and summarizes after it
         # reports. Let that summary land before counting the large turns':
-        # its own, as earlier small turns summarize after they end too.
-        client.summarized('Bob', turn=last['turn'])
+        # its own, as earlier small turns summarize after they end too. A
+        # shared CI runner can take longer than the default wait for it.
+        client.summarized('Bob', timeout=30, turn=last['turn'])
         previous = client.request('inspect', bot='Bob')['result']['compaction']
         self.assertIsNotNone(previous)
         self.requests()
