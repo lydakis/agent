@@ -41,6 +41,16 @@ def is_summary(request):
     return (isinstance(content, list) and bool(content) and items[-1].get('role') == 'user'
             and content[-1].get('text', '').startswith('[compaction request]'))
 
+def read_body(handler):
+    """The request's body, or None when the daemon stopped while sending
+    it, as one a test closes mid-upload does: no request arrived."""
+    length = int(handler.headers['Content-Length'])
+    body = handler.rfile.read(length)
+    if len(body) < length:
+        handler.close_connection = True
+        return None
+    return body
+
 class Model(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -68,7 +78,9 @@ class Model(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            body = self.rfile.read(int(self.headers['Content-Length']))
+            body = read_body(self)
+            if body is None:
+                return
             request = json.loads(body)
             self.server.requests.put(request)
             if hasattr(self.server, 'bodies'):
@@ -644,7 +656,10 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            body = read_body(self)
+            if body is None:
+                return
+            request = json.loads(body)
             self.server.requests.put(request)
             if hasattr(self.server, 'arrivals'):
                 self.server.arrivals.append((time.monotonic(), request))
