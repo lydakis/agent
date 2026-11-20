@@ -1948,6 +1948,12 @@ mod tests {
             .call(|db| Ok(db.connection().execute_batch("CREATE TABLE b(x BLOB)")?))
             .await
             .unwrap();
+        // The log starts empty, whatever the schema wrote to it, so the
+        // pages below are all it holds.
+        Connection::open(scratch_path("pinned-log"))
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         // A reader in a transaction from the start keeps every frame after
         // its snapshot in the log: no checkpoint copies them back.
         let reader = Connection::open(scratch_path("pinned-log")).unwrap();
