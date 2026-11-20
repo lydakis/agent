@@ -7947,6 +7947,44 @@ fn work_charges_what_a_request_sends_new_once_and_survives_a_restart() {
 }
 
 #[test]
+fn ids_a_switched_agent_held_are_not_given_again_after_it_is_deleted() {
+    let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    db.append(turn, vec![assistant("a")], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let to = |family, provider, model| Switch {
+        provider,
+        model,
+        effort: None,
+        family,
+        custom: Default::default(),
+    };
+    db.switch_family(
+        "Bob",
+        None,
+        &to(Family::Anthropic, "anthropic", "synthetic-claude"),
+    )
+    .unwrap()
+    .unwrap();
+    let branch = db.inspect("Bob").unwrap().head.unwrap();
+    db.switch_family(
+        "Bob",
+        None,
+        &to(Family::Responses, "openai", "synthetic-model"),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(db.inspect("Bob").unwrap().head.unwrap() < branch);
+    db.delete_bot("Bob").unwrap();
+    db.create("Cy", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Cy", "r1");
+    db.finish(turn, None).unwrap();
+    assert!(db.inspect("Cy").unwrap().head.unwrap() > branch);
+}
+
+#[test]
 fn a_long_history_crosses_in_order_a_page_at_a_time() {
     let path =
         std::env::temp_dir().join(format!("agent-long-switch-{}.sqlite", std::process::id()));

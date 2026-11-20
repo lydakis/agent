@@ -28,9 +28,15 @@ pub struct Translator {
     /// on an endpoint that takes them): their calls and results go as
     /// custom ones.
     custom: HashSet<String>,
+    calls: Calls,
+}
+
+/// What the translator knows of calls awaiting their results.
+#[derive(Clone, Default)]
+pub struct Calls {
     /// Source calls that went as custom ones, whose results follow suit;
     /// each is dropped at its result, so only calls awaiting one are held.
-    custom_calls: HashSet<String>,
+    custom: HashSet<String>,
     /// Source calls that went as text (the provider's own search, or
     /// arguments the target can't hold), each with the heading its result
     /// goes under, also as text.
@@ -43,9 +49,23 @@ impl Translator {
             from,
             to,
             custom,
-            custom_calls: HashSet::new(),
-            words: HashMap::new(),
+            calls: Calls::default(),
         }
+    }
+
+    /// The calls awaiting their results, as of now.
+    pub fn calls(&self) -> Calls {
+        self.calls.clone()
+    }
+
+    /// The items `item` becomes read against `calls`, leaving what the
+    /// translator knows of calls as it was: another form of a result
+    /// already translated.
+    pub fn item_as_of(&mut self, calls: &Calls, item: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let now = std::mem::replace(&mut self.calls, calls.clone());
+        let items = self.item(item);
+        self.calls = now;
+        items
     }
 
     /// The items `item` becomes: none for reasoning alone, several where
@@ -113,10 +133,10 @@ impl Translator {
                     let name = block["name"].as_str().unwrap_or_default();
                     // An id is the call's alone until its result: a later
                     // call may use it again, as another kind.
-                    self.custom_calls.remove(source);
+                    self.calls.custom.remove(source);
                     match (self.custom.contains(name), block["input"]["input"].as_str()) {
                         (true, Some(input)) => {
-                            self.custom_calls.insert(source.to_owned());
+                            self.calls.custom.insert(source.to_owned());
                             out.push(json!({"type":"custom_tool_call","call_id":id,
                                 "name":name,"input":input}));
                         }
@@ -143,7 +163,7 @@ impl Translator {
                         Value::String(text) => json!(text),
                         _ => json!(""),
                     };
-                    let kind = match self.custom_calls.remove(source) {
+                    let kind = match self.calls.custom.remove(source) {
                         true => "custom_tool_call_output",
                         false => "function_call_output",
                     };
@@ -216,9 +236,11 @@ impl Translator {
             }
             "function_call" | "custom_tool_call" => {
                 let source = item["call_id"].as_str().unwrap_or_default().to_owned();
-                self.words.remove(&source);
+                self.calls.words.remove(&source);
                 if item["namespace"] == RUN_NAMESPACE && item["name"] == RUN_NAME {
-                    self.words.insert(source, "[web search results]".into());
+                    self.calls
+                        .words
+                        .insert(source, "[web search results]".into());
                     let text = format!(
                         "[web search {}]",
                         item["arguments"].as_str().unwrap_or("{}")
@@ -239,7 +261,7 @@ impl Translator {
                         _ => {
                             let name = item["name"].as_str().unwrap_or_default();
                             let arguments = item["arguments"].as_str().unwrap_or_default();
-                            self.words.insert(source, format!("[{name} result]"));
+                            self.calls.words.insert(source, format!("[{name} result]"));
                             let text = format!("[{name} called with {arguments}]");
                             return Ok(one("assistant", vec![json!({"type":"text","text":text})]));
                         }
@@ -268,7 +290,7 @@ impl Translator {
                     Value::String(text) => json!(text),
                     _ => json!(""),
                 };
-                if let Some(heading) = self.words.remove(source) {
+                if let Some(heading) = self.calls.words.remove(source) {
                     let text = match &output {
                         Value::String(text) => text.clone(),
                         parts => (parts.as_array().into_iter().flatten())
@@ -574,5 +596,30 @@ mod tests {
             "function_call"
         );
         assert_eq!(run(&mut t, result)[0]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn another_form_of_a_result_reads_the_call_as_the_result_did() {
+        let custom: HashSet<String> = ["apply_patch".to_owned()].into();
+        let mut t = Translator::new(Family::Anthropic, Family::Responses, custom);
+        run(
+            &mut t,
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"c1",
+                "name":"apply_patch","input":{"input":"*** Begin Patch"}}]}),
+        );
+        let result = |text: &str| {
+            serde_json::to_vec(&json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"c1","content":text}]}))
+            .unwrap()
+        };
+        let calls = t.calls();
+        let whole: Value = serde_json::from_slice(&t.item(&result("done")).unwrap()[0]).unwrap();
+        let stub: Value =
+            serde_json::from_slice(&t.item_as_of(&calls, &result("[elided]")).unwrap()[0]).unwrap();
+        assert_eq!(whole["type"], "custom_tool_call_output");
+        assert_eq!(stub["type"], "custom_tool_call_output");
+        // The result itself still closed the call.
+        let again: Value = serde_json::from_slice(&t.item(&result("late")).unwrap()[0]).unwrap();
+        assert_eq!(again["type"], "function_call_output");
     }
 }

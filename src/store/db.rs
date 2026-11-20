@@ -16431,15 +16431,15 @@ impl Database {
                     "a command it started is running or messages are queued; `processes` lists its commands and `stop_process` ends one",
                 );
             }
-            // Preserve identity before freeing the suffix, in the same transaction.
-            // The head is the largest ID on this append-only lineage. Together
-            // with surviving nodes, this floor covers every committed node ID.
-            if let Some(head) = bot.head {
-                tx.execute(
-                    "UPDATE node_sequence SET last_id=MAX(last_id,?) WHERE singleton=1",
-                    [head],
-                )?;
-            }
+            // Preserve identity before freeing anything, in the same
+            // transaction: the newest node id yet, read off the rowid, covers
+            // every node this deletion frees, on whichever branch (a switch
+            // leaves branches newer than the head it went back to).
+            tx.execute(
+                "UPDATE node_sequence SET last_id=MAX(last_id,(SELECT COALESCE(MAX(id),0) FROM nodes))
+                 WHERE singleton=1",
+                [],
+            )?;
             // Reserve the deletion's event range for both replay scopes before
             // any piece commits. RETURNING shares the existing indexed lookup
             // with the global watermark, without another query per piece.
@@ -22212,6 +22212,9 @@ fn translate_onto(
                     r.get(6)?,
                 ))
             })?;
+            // A result's stub and declined form are the same result: they
+            // read the calls as the result itself found them.
+            let calls = (stub.is_some() || declined.is_some()).then(|| translator.calls());
             let mut items = translator.item(&item)?;
             if items.is_empty() && turn.is_some() {
                 items.push(to.user_item_from("(no text)", &[], &[])?);
@@ -22222,9 +22225,9 @@ fn translate_onto(
             let single = items.len() == 1;
             // The one item a node becomes, translated alone, else nothing.
             let mut one = |source: &Option<Vec<u8>>| -> Result<Option<Vec<u8>>> {
-                match (source, single) {
-                    (Some(source), true) => {
-                        let mut items = translator.item(source)?;
+                match (source, single, &calls) {
+                    (Some(source), true, Some(calls)) => {
+                        let mut items = translator.item_as_of(calls, source)?;
                         Ok((items.len() == 1).then(|| items.remove(0)))
                     }
                     _ => Ok(None),
