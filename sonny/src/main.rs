@@ -574,6 +574,10 @@ struct StatusView<'a> {
     /// The calls waiting on the person, read once for many projects'
     /// reads (**Projects**); else each read lists them.
     held: Option<&'a [needs::Held]>,
+    /// The agents with a question open, as the store's one follow of every
+    /// project keeps them ([`elsewhere`]), in place of what their histories
+    /// say (**Projects**, which reads none).
+    waiting: Option<&'a std::collections::HashSet<String>>,
 }
 
 /// What a window's reads of its agents' histories (its count, its card,
@@ -653,11 +657,15 @@ struct ProjectsOpen {
     listed: Option<Vec<standing::Agent>>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
     read_at: Option<Instant>,
-    /// What was read, for the next read: the read under way holds it.
+    /// What was counted, for the next read: the read under way holds it.
     state: ProjectsState,
-    /// Whether the last read read every history it asked for: one that
-    /// did not is read again after [`STATUS_AGAIN`], though nothing moved.
+    /// Whether the last read read all it asked for: one that did not is
+    /// read again after [`STATUS_AGAIN`], though nothing moved.
     whole: bool,
+    /// The agents with a question open, as the store's follow of every
+    /// project said at the last read: once it says otherwise, every
+    /// project is counted again.
+    waiting: std::collections::HashSet<String>,
     /// Where the page and the pane beside it were drawn, for the mouse.
     page: Rect,
     side: Rect,
@@ -706,39 +714,29 @@ impl Drop for ProjectsOpen {
     }
 }
 
-/// What **Projects** read, for its next read, as an informer's cache
-/// keeps what it listed: each project as read, and of each agent its
-/// history and question as read.
+/// What **Projects** counted, for its next read, as an informer's cache
+/// keeps what it listed: each project as counted.
 #[derive(Default)]
 struct ProjectsState {
-    /// What was read of each agent's history and question, as `/status`
-    /// keeps it.
-    latest: HashMap<String, (Value, Latest)>,
-    seen: HashMap<String, (i64, Seen)>,
-    /// Each project as last read, by its lead: one none of whose agents
-    /// moved is not read again.
+    /// Each project as last counted, by its lead: one none of whose
+    /// agents moved is not counted again.
     each: HashMap<String, ProjectRead>,
-    /// The leads whose files of reads kept beside the store were taken.
-    taken: std::collections::HashSet<String>,
     /// Whether the projects some window kept beside the store were taken.
     took_kept: bool,
-    /// The leads whose agents' histories were read since they were last
-    /// kept beside the store: kept once the project is quiet.
-    unkept: std::collections::HashSet<String>,
     /// What the last read keeps beside the store, being written.
     writing: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// What **Projects** read, kept by the window once the page closes: the
+/// What **Projects** counted, kept by the window once the page closes: the
 /// page opens again on the projects it showed, and its first read, from a
-/// new snapshot, reads only the projects whose agents moved since, and of
-/// those only the histories that moved. A read under way as the page
-/// closed is let finish, here.
+/// new snapshot, counts again only the projects whose agents moved since.
+/// A read under way as the page closed is let finish, here.
 #[derive(Default)]
 struct ProjectsKept {
     projects: Vec<projects::Project>,
     state: ProjectsState,
     whole: bool,
+    waiting: std::collections::HashSet<String>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
     /// The drain of the connection that read reads on, until it ends.
     lent: Option<tokio::task::JoinHandle<()>>,
@@ -769,17 +767,7 @@ impl ProjectsKept {
         self.projects = read.projects;
         self.state = read.state;
         self.whole = read.whole;
-        self.trim();
-    }
-
-    /// Closed, it keeps each project as read and not each agent's history:
-    /// what was read of those is kept beside the store, and taken again
-    /// for the projects that moved, so a closed page holds little.
-    fn trim(&mut self) {
-        let state = &mut self.state;
-        (state.latest, state.seen) = (HashMap::new(), HashMap::new());
-        state.taken = Default::default();
-        state.unkept = Default::default();
+        self.waiting = read.waiting;
     }
 }
 
@@ -823,20 +811,21 @@ impl App {
                 }
                 *kept
             }
-            // What this window read of its own project's agents is read,
-            // and the projects as any window last read them show at once.
+            // The projects as any window last counted them show at once,
+            // those another build counted too: this one counts each again.
             None => {
                 let store = self.store();
-                let each = take_projects(&store, self.client.identity());
+                let (mut each, this_build) = take_projects(&store, self.client.identity());
                 let shown: Vec<projects::Project> =
                     (each.values()).map(|read| read.project.clone()).collect();
                 if !shown.is_empty() {
                     view.set(shown, now_ms());
                 }
+                if !this_build {
+                    each.clear();
+                }
                 ProjectsKept {
                     state: ProjectsState {
-                        latest: self.status_read.clone(),
-                        seen: self.asks_seen.clone(),
                         each,
                         took_kept: true,
                         ..Default::default()
@@ -857,6 +846,7 @@ impl App {
             read_at: None,
             state: kept.state,
             whole: kept.whole,
+            waiting: kept.waiting,
             page: Rect::default(),
             side: Rect::default(),
             connected_at: Instant::now(),
@@ -878,10 +868,10 @@ impl App {
             projects: open.view.take_projects(),
             state: std::mem::take(&mut open.state),
             whole: open.whole,
+            waiting: std::mem::take(&mut open.waiting),
             job,
             lent,
         };
-        kept.trim();
         kept.landed();
         self.projects_kept = Some(Box::new(kept));
     }
@@ -995,6 +985,14 @@ impl App {
         let Some(open) = &mut self.projects else {
             return;
         };
+        // The agents with a question open, as the store's one follow of
+        // every project keeps them: no history is read here.
+        let waiting: std::collections::HashSet<String> = match &self.other_projects {
+            Some((shared, _)) => (shared.waiting.borrow().agents.iter())
+                .map(|(_, _, bot)| bot.clone())
+                .collect(),
+            None => Default::default(),
+        };
         // Its connection went, as when the daemon did: a new one, followed
         // from a new snapshot, at most every few seconds.
         if (open.drain.as_ref()).is_none_or(|drain| drain.is_finished())
@@ -1026,6 +1024,7 @@ impl App {
                     open.listed = Some(read.listed);
                     open.state = read.state;
                     open.whole = read.whole;
+                    open.waiting = read.waiting;
                 }
                 // What moved is unknown: start over from a new snapshot.
                 _ => {
@@ -1056,7 +1055,13 @@ impl App {
         };
         let running = listed.iter().any(|bot| bot.running_turn.is_some());
         let moved = changes.moved;
-        if !whole && moved.is_empty() && !running && open.view.read && open.whole {
+        if !whole
+            && moved.is_empty()
+            && !running
+            && open.view.read
+            && open.whole
+            && waiting == open.waiting
+        {
             open.listed = Some(listed);
             return;
         }
@@ -1084,7 +1089,7 @@ impl App {
                     }
                 }
                 let (projects, whole) = read_projects(
-                    &client, &store, &listed, &bot, &asks, &approvals, &mut state,
+                    &client, &store, &listed, &bot, &asks, &approvals, &waiting, &mut state,
                 )
                 .await?;
                 Some(ProjectsRead {
@@ -1092,6 +1097,7 @@ impl App {
                     listed,
                     state,
                     whole,
+                    waiting,
                 })
             }
             .await;
@@ -1194,8 +1200,10 @@ struct ProjectsRead {
     projects: Vec<projects::Project>,
     listed: Vec<standing::Agent>,
     state: ProjectsState,
-    /// Whether every history it asked for was read.
+    /// Whether every read it asked for was read.
     whole: bool,
+    /// The agents with a question open it counted with.
+    waiting: std::collections::HashSet<String>,
 }
 
 /// The pattern that names every project's agents: a project's are
@@ -1203,11 +1211,15 @@ struct ProjectsRead {
 const EVERY_PROJECT: &str = "*.*";
 
 /// Every project in `listed` (every agent [`EVERY_PROJECT`] names), each
-/// read as `/status` reads it: its counts, its most pressing state, its
-/// agents as the pane lists them, and when one last had a turn, which
-/// the listing says (`last.finished_ms`, or now while one runs); and
-/// whether every history it asked for was read. A project in `state` none
-/// of whose agents moved since is as it was read, and not read again.
+/// counted as `/status` counts it, from the listing alone: no history is
+/// read. Its counts, its most pressing state and its agents as the pane
+/// lists them say what the listing does, the calls held for the person,
+/// and `waiting`: the agents with a question open, as the store's one
+/// follow of every project keeps them ([`elsewhere`]). When one last had a
+/// turn is the listing's (`last.finished_ms`, or now while one runs). Also
+/// whether every read it asked for was read. A project in `state` none of
+/// whose agents moved since is as it was counted, and not counted again.
+#[allow(clippy::too_many_arguments)]
 async fn read_projects(
     client: &Client,
     store: &std::path::Path,
@@ -1215,6 +1227,7 @@ async fn read_projects(
     bot: &str,
     asks: &[asks::Ask],
     approvals: &[Value],
+    waiting: &std::collections::HashSet<String>,
     state: &mut ProjectsState,
 ) -> Option<(Vec<projects::Project>, bool)> {
     let now = std::time::SystemTime::now()
@@ -1225,12 +1238,14 @@ async fn read_projects(
     let held = needs::listing(client, None).await.ok();
     let kept = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_path_buf());
     let identity = client.identity();
-    // The projects some window read last, on the page's first read here:
-    // each one that moved since is read again, as one read here would be.
+    // The projects some window counted last, on the page's first read
+    // here: each one that moved since is counted again.
     if !state.took_kept {
         state.took_kept = true;
-        for (lead, read) in take_projects(&kept, identity) {
-            state.each.entry(lead).or_insert(read);
+        if let (each, true) = take_projects(&kept, identity) {
+            for (lead, read) in each {
+                state.each.entry(lead).or_insert(read);
+            }
         }
     }
     let leads: Vec<&standing::Agent> = (listed.iter())
@@ -1242,18 +1257,16 @@ async fn read_projects(
         })
         .collect();
     let mut found = Vec::with_capacity(leads.len());
-    let mut whole = true;
+    let mut whole = held.is_some();
     let turns = HashMap::new();
     let mut titles = crate::title::Titles::read(&kept);
     // The done marks kept beside the store, which move no listing.
     let marked = resolved::marked(store);
     let mut was = std::mem::take(&mut state.each);
-    // Whether a project was read to another mark than it was kept with.
+    // Whether a project was counted to another mark than it was kept with.
     let mut moved = false;
-    // What each project read of its agents' histories, to keep.
-    let mut to_keep = Vec::new();
     // Each agent under the lead it answers to, so a folder with two leads
-    // counts each agent in one row: read once for every project.
+    // counts each agent in one row: counted once for every project.
     let makers: HashMap<&str, &str> = (listed.iter())
         .map(|agent| (agent.name.as_str(), agent.maker()))
         .collect();
@@ -1269,22 +1282,26 @@ async fn read_projects(
             continue;
         };
         let theirs: Vec<standing::Agent> = under.remove(&lead.name).unwrap_or_default();
-        // What it is read from: its agents as listed, their calls waiting
-        // on the person, their done marks and its file's title. One none of
-        // which moved is
-        // as it was read, but while one of its agents runs, which moves
-        // with no event, or where it holds the window's own agent, whose
-        // row reads the window's own questions.
+        // What it is counted from: its agents as listed, their calls
+        // waiting on the person, their questions open, their done marks
+        // and its file's title. One none of which moved is as it was
+        // counted, but while one of its agents runs, which moves with no
+        // event, or where it holds the window's own agent, whose row
+        // reads the window's own questions.
         let held_here: Vec<needs::Held> = (held.iter().flatten())
             .filter(|call| theirs.iter().any(|bot| bot.name == call.bot))
             .cloned()
+            .collect();
+        let asking: Vec<&str> = (theirs.iter())
+            .filter(|bot| waiting.contains(&bot.name))
+            .map(|bot| bot.name.as_str())
             .collect();
         let titled = titles.named(&lead.name, lead.bot_id, lead.workspace.as_deref());
         let marks: Vec<(&str, Option<i64>)> = (theirs.iter())
             .filter(|bot| marked.contains(&bot.name))
             .map(|bot| (bot.name.as_str(), resolved::read(store, &bot.name)))
             .collect();
-        let mark = project_mark(&theirs, &held_here, &marks, titled.as_deref());
+        let mark = project_mark(&theirs, &held_here, &asking, &marks, titled.as_deref());
         let keeps = !theirs
             .iter()
             .any(|agent| agent.running_turn.is_some() || agent.name == bot);
@@ -1301,28 +1318,6 @@ async fn read_projects(
                 state.each.insert(lead.name.clone(), read);
             }
         }
-        // What a window kept of its agents' histories, where this holds none.
-        if state.taken.insert(lead.name.clone())
-            && theirs
-                .iter()
-                .any(|bot| !state.latest.contains_key(&bot.name))
-        {
-            take_reads(
-                &kept,
-                &lead.name,
-                identity,
-                &mut state.latest,
-                &mut state.seen,
-            );
-        }
-        // Each read keeps only its own agents' reads: the project's are
-        // lent to it and taken back.
-        let mut read_here: HashMap<String, (Value, Latest)> = (theirs.iter())
-            .filter_map(|bot| state.latest.remove_entry(&bot.name))
-            .collect();
-        let mut seen_here: HashMap<String, (i64, Seen)> = (theirs.iter())
-            .filter_map(|bot| state.seen.remove_entry(&bot.name))
-            .collect();
         let scope = background::Scope {
             project: name.to_owned(),
             lead: lead.name.clone(),
@@ -1336,9 +1331,10 @@ async fn read_projects(
             places: Default::default(),
             aside: &|_| false,
             details: false,
-            fill: false,
+            fill: true,
             readers: None,
             held: held.as_deref(),
+            waiting: Some(waiting),
         };
         let read = read_status_of(
             client,
@@ -1346,32 +1342,13 @@ async fn read_projects(
             scope,
             &theirs,
             &turns,
-            &mut read_here,
-            &mut seen_here,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
             view,
             None,
         )
-        .await;
-        // What it read of histories, kept for the lead's window and the
-        // next page in any window, as `/status` keeps its own: once the
-        // project is quiet, not at each read while one of its agents runs.
-        // A quiet project's reads are let go here, as it is not read again
-        // until it moves: then taken again from beside the store.
-        if read.as_ref().is_ok_and(|read| read.fresh) {
-            state.unkept.insert(lead.name.clone());
-        }
-        if keeps && read.as_ref().is_ok_and(|read| read.whole) {
-            state.taken.remove(&lead.name);
-            if state.unkept.remove(&lead.name) {
-                to_keep.push((lead.name.clone(), read_here, seen_here));
-            }
-        } else {
-            state.latest.extend(read_here);
-            state.seen.extend(seen_here);
-        }
-        let Ok(read) = read else {
-            return None;
-        };
+        .await
+        .ok()?;
         whole &= read.whole;
         let folder = lead.workspace.clone().unwrap_or_default();
         let superlead = seat_profile(lead.profile.as_deref(), true, std::path::Path::new(&folder))
@@ -1416,37 +1393,26 @@ async fn read_projects(
                 .insert(lead.name.clone(), ProjectRead { mark, project });
         }
     }
-    // What was read of agents no longer listed is let go.
-    if state.latest.len() > listed.len() || state.seen.len() > listed.len() {
-        let names: std::collections::HashSet<&str> =
-            listed.iter().map(|bot| bot.name.as_str()).collect();
-        state.latest.retain(|name, _| names.contains(name.as_str()));
-        state.seen.retain(|name, _| names.contains(name.as_str()));
-    }
-    // The projects as read, for the next page in any window, once one
+    // The projects as counted, for the next page in any window, once one
     // moved or went, written beside the page, which shows them at once.
-    let each = (moved || !was.is_empty()).then(|| state.each.clone());
-    if each.is_some() || !to_keep.is_empty() {
+    if moved || !was.is_empty() {
+        let each = state.each.clone();
         let identity = identity.map(str::to_owned);
         state.writing = Some(tokio::task::spawn_blocking(move || {
-            for (lead, latest, seen) in to_keep {
-                keep_for(&kept, &lead, "", identity.as_deref(), &latest, &seen);
-            }
-            if let Some(each) = each {
-                keep_projects(&kept, identity.as_deref(), &each);
-            }
+            keep_projects(&kept, identity.as_deref(), &each);
         }));
     }
     Some((found, whole))
 }
 
-/// The mark of what a project is read from ([`ProjectRead`]): every field
-/// of its agents as listed, their calls waiting on the person, the done
-/// marks kept for them beside the store (an outer lead marking one moves
-/// no listing), and its file's title.
+/// The mark of what a project is counted from ([`ProjectRead`]): every
+/// field of its agents as listed, their calls waiting on the person, those
+/// with a question open, the done marks kept for them beside the store (an
+/// outer lead marking one moves no listing), and its file's title.
 fn project_mark(
     agents: &[standing::Agent],
     held: &[needs::Held],
+    asking: &[&str],
     marks: &[(&str, Option<i64>)],
     title: Option<&str>,
 ) -> u64 {
@@ -1476,6 +1442,7 @@ fn project_mark(
         (model, provider, workspace, profile).hash(&mut mark);
     }
     held.hash(&mut mark);
+    asking.hash(&mut mark);
     marks.hash(&mut mark);
     title.hash(&mut mark);
     mark.finish()
@@ -1488,19 +1455,24 @@ fn projects_file(store: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The projects as **Projects** last read them in any window, by lead,
-/// as this build reads them ([`reads_build`]) from the daemon `identity`
-/// names.
-fn take_projects(store: &std::path::Path, identity: Option<&str>) -> HashMap<String, ProjectRead> {
+/// from the daemon's store `identity` names, and whether this build read
+/// them ([`reads_build`]): another build's are shown, not reused, as it
+/// may read a project otherwise.
+fn take_projects(
+    store: &std::path::Path,
+    identity: Option<&str>,
+) -> (HashMap<String, ProjectRead>, bool) {
     #[derive(serde::Deserialize)]
     struct Kept {
         build: String,
+        store: String,
         each: HashMap<String, ProjectRead>,
     }
     std::fs::read(projects_file(store))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-        .filter(|kept| kept.build == reads_build(identity))
-        .map(|kept| kept.each)
+        .filter(|kept| kept.store == identity.unwrap_or(""))
+        .map(|kept| (kept.each, kept.build == reads_build(identity)))
         .unwrap_or_default()
 }
 
@@ -1514,10 +1486,12 @@ fn keep_projects(
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
+        store: &'a str,
         each: HashMap<&'a String, &'a ProjectRead>,
     }
     let kept = Kept {
         build: reads_build(identity),
+        store: identity.unwrap_or(""),
         each: (each.iter())
             .filter(|(_, read)| {
                 (read.project.agents.listed.iter()).all(|agent| agent.run.is_none())
@@ -1882,6 +1856,11 @@ async fn read_status_of(
         let itself = seen.itself && ran_status == Some("completed");
         let resolved = itself || resolved::holds(resolved::read(&store, name), turn, running);
         let open = seen.ask.clone();
+        // Whether the store's follow of every project has its question
+        // open, where it is asked: it says so in place of its history.
+        let asking = (view.waiting)
+            .filter(|_| name != view.bot)
+            .map(|waiting| waiting.contains(name));
         // This window's own agent waits on what it shows open here too,
         // its transcript read only so far back.
         let ask = match name == view.bot {
@@ -1889,7 +1868,7 @@ async fn read_status_of(
                 .find(|ask| ask.task.is_none())
                 .cloned()
                 .or(open),
-            false => open,
+            false => open.filter(|_| asking != Some(false)),
         };
         // Unlisted, this window's own calls still say what they wait on.
         if name == view.bot && held.is_err() {
@@ -1905,7 +1884,7 @@ async fn read_status_of(
         if let Some(ask) = &ask {
             step = format!("asks: {}", first_line(&ask.question));
         }
-        let state = match needs.waits(name) {
+        let state = match needs.waits(name) || asking == Some(true) {
             true => "needs you".to_owned(),
             false => state,
         };
@@ -3907,6 +3886,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             fill: false,
             readers: None,
             held: None,
+            waiting: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
@@ -13197,6 +13177,7 @@ impl App {
                 fill: false,
                 readers: Some(&readers),
                 held: held.as_deref(),
+                waiting: None,
             };
             let Ok(read) = read_status_of(
                 &client,
@@ -15757,6 +15738,7 @@ impl App {
                 fill: fill.is_some(),
                 readers: Some(&readers),
                 held: None,
+                waiting: None,
             };
             let Some(fill) = fill else {
                 let alerts = read_alerts(&client, &logs, temp_due).await;
@@ -16058,6 +16040,7 @@ impl App {
             fill: false,
             readers: Some(&self.readers),
             held: None,
+            waiting: None,
         };
         let read = read_status(
             &self.client,
@@ -16123,6 +16106,7 @@ impl App {
                         fill: false,
                         readers: Some(&readers),
                         held: None,
+                        waiting: None,
                     };
                     let turns = HashMap::new();
                     let read =
@@ -26757,6 +26741,7 @@ mod tests {
             fill: false,
             readers: None,
             held: None,
+            waiting: None,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let read = read_status(
@@ -29110,11 +29095,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projects_read_again_only_the_projects_that_moved() {
+    async fn projects_count_from_the_listing_and_again_only_the_projects_that_moved() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let answer = |asked: Arc<std::sync::Mutex<Vec<String>>>| {
             move |request: &Value| {
-                if request["op"] == "history_nodes" {
+                if request["op"] == "history_nodes" || request["op"] == "history_items" {
                     let bot = request["bot"].as_str().unwrap_or("").to_owned();
                     asked.lock().unwrap().push(bot);
                 }
@@ -29131,6 +29116,11 @@ mod tests {
             head: Some(1),
             created_by: maker.map(str::to_owned),
             workspace: Some(home.to_string_lossy().into_owned()),
+            last: Some(standing::Ended {
+                turn: 1,
+                status: "completed".into(),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mut listed = vec![
@@ -29139,70 +29129,89 @@ mod tests {
             agent("beta.lead", 3, None),
             agent("beta.two", 4, Some("beta.lead")),
         ];
+        // Each read: the projects found, and those counted again (their
+        // mark moved), and no history read.
         async fn page(
             client: &Client,
             store: &std::path::Path,
             asked: &std::sync::Mutex<Vec<String>>,
             listed: &[standing::Agent],
+            waiting: &[&str],
             state: &mut ProjectsState,
-        ) -> (Vec<String>, Vec<String>) {
-            asked.lock().unwrap().clear();
-            let (found, whole) = read_projects(client, store, listed, "x.lead", &[], &[], state)
-                .await
-                .unwrap();
+        ) -> Vec<String> {
+            let waiting = waiting.iter().map(|bot| bot.to_string()).collect();
+            let (found, whole) =
+                read_projects(client, store, listed, "x.lead", &[], &[], &waiting, state)
+                    .await
+                    .unwrap();
             assert!(whole);
+            assert!(asked.lock().unwrap().is_empty(), "a history was read");
             if let Some(writing) = state.writing.take() {
                 writing.await.unwrap();
             }
-            let mut read = asked.lock().unwrap().clone();
-            read.sort();
-            read.dedup();
-            (found.into_iter().map(|p| p.lead).collect(), read)
+            found.into_iter().map(|p| p.lead).collect()
         }
+        let needs = |state: &ProjectsState, lead: &str| {
+            state.each[lead].project.counts.of(status::Group::NeedsYou)
+        };
         let mut state = ProjectsState::default();
         let leads = ["alpha.lead", "beta.lead"];
-        // The first read reads every history.
-        let (found, read) = page(&client, &store, &asked, &listed, &mut state).await;
+        let found = page(&client, &store, &asked, &listed, &[], &mut state).await;
         assert_eq!(found, leads);
-        assert_eq!(read, ["alpha.lead", "alpha.one", "beta.lead", "beta.two"]);
-        // Nothing moved: no project is read again, and both are listed.
-        let (found, read) = page(&client, &store, &asked, &listed, &mut state).await;
-        assert_eq!(found, leads);
-        assert!(read.is_empty(), "{read:?}");
-        // One task moved: its project alone is read, and of it only the
-        // history that moved.
+        assert_eq!(needs(&state, "alpha.lead"), 0);
+        let marks = |state: &ProjectsState| leads.map(|lead| state.each[lead].mark);
+        let before = marks(&state);
+        // Nothing moved: no project is counted again.
+        page(&client, &store, &asked, &listed, &[], &mut state).await;
+        assert_eq!(marks(&state), before);
+        // A task asks the person, as the store's follow says: its project
+        // alone is counted again, and counts it.
+        page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
+        assert_eq!(needs(&state, "alpha.lead"), 1);
+        assert_ne!(marks(&state)[0], before[0]);
+        assert_eq!(marks(&state)[1], before[1]);
+        // A task moved: its project alone is counted again.
+        let before = marks(&state);
         listed[3].head = Some(2);
-        let (found, read) = page(&client, &store, &asked, &listed, &mut state).await;
-        assert_eq!(found, leads);
-        assert_eq!(read, ["beta.two"]);
+        page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
+        assert_eq!(marks(&state)[0], before[0]);
+        assert_ne!(marks(&state)[1], before[1]);
         // An outer lead marks a quiet project's lead done, which moves no
-        // listing: that project is read again, and counts it done.
+        // listing: that project is counted again, and counts it done.
         let done = state.each["beta.lead"].project.counts.done;
         resolved::keep(&store, "beta.lead", 1, "call-1").unwrap();
-        page(&client, &store, &asked, &listed, &mut state).await;
+        page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
         assert_eq!(state.each["beta.lead"].project.counts.done, done + 1);
         assert_eq!(state.each["alpha.lead"].project.counts.done, 0);
-        // Another window (a new process: nothing in memory) reads only
-        // what moved since this one kept its read beside the store.
-        listed[1].head = Some(2);
-        let other = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = daemon_answering(answer(other.clone())).await;
+        // Another window (a new process: nothing in memory) takes what
+        // this one kept beside the store.
         let mut fresh = ProjectsState::default();
-        let (found, read) = page(&client, &store, &other, &listed, &mut fresh).await;
+        let found = page(&client, &store, &asked, &listed, &["alpha.one"], &mut fresh).await;
         assert_eq!(found, leads);
-        assert_eq!(read, ["alpha.one"]);
-        // A project gone is let go, with what was read of its agents.
+        assert_eq!(marks(&fresh), marks(&state));
+        // A project gone is let go, from memory and from the kept file.
         listed.truncate(2);
-        let (found, _) = page(&client, &store, &other, &listed, &mut fresh).await;
+        let found = page(&client, &store, &asked, &listed, &["alpha.one"], &mut fresh).await;
         assert_eq!(found, ["alpha.lead"]);
         assert_eq!(fresh.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
-        assert!(!fresh.latest.contains_key("beta.two"));
-        assert_eq!(
-            take_projects(&store, client.identity())
-                .keys()
-                .collect::<Vec<_>>(),
-            ["alpha.lead"]
-        );
+        let (kept, this_build) = take_projects(&store, client.identity());
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        assert!(this_build);
+        // Another build's projects show, but are not reused; another
+        // store's are not taken.
+        let file = projects_file(&store);
+        let mut written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        written["build"] = json!("0.0.0 older");
+        std::fs::write(&file, written.to_string()).unwrap();
+        let (kept, this_build) = take_projects(&store, client.identity());
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        assert!(!this_build);
+        let mut other = ProjectsState::default();
+        page(&client, &store, &asked, &listed, &[], &mut other).await;
+        assert_eq!(other.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        written["store"] = json!("another store");
+        std::fs::write(&file, written.to_string()).unwrap();
+        assert!(take_projects(&store, client.identity()).0.is_empty());
     }
 
     #[tokio::test]
@@ -29217,6 +29226,7 @@ mod tests {
                     listed: Vec::new(),
                     state: ProjectsState::default(),
                     whole: true,
+                    waiting: Default::default(),
                 })
             })),
             lent: Some(tokio::spawn(std::future::pending())),
