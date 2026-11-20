@@ -30,6 +30,7 @@ pub const FOLLOWS: &str = "follows";
 pub const AUTOMATIONS: &str = "automations";
 pub const MEMORY: &str = "memory";
 pub const COMMONS: &str = "commons";
+pub const BOARD: &str = crate::board::NAME;
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
 pub const DESKTOP: &str = crate::desktop::NAME;
@@ -128,7 +129,7 @@ pub fn tools(role: Role) -> Vec<Value> {
     tools.extend([follows(), show(), automations(), memory()]);
     tools.extend(crate::workflow::tool());
     if crate::commons::on() {
-        tools.push(commons());
+        tools.extend([commons(), board()]);
     }
     tools.extend(crate::exec::tool(role.escalates));
     tools.extend(crate::browser::tool());
@@ -557,6 +558,74 @@ pub fn commons() -> Value {
     })
 }
 
+pub fn board() -> Value {
+    let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
+    let board = json!({"type": "string", "minLength": 1,
+        "description": "A board: its project's name, then parts joined by /, as shop/typed-errors."});
+    let labels = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]},
+        "description": "Labels saying what the item is, as {\"kind\": \"bug\"}."});
+    json!({
+        "name": BOARD,
+        "description": "Boards: work in the commons that agents take, which the commons skill's Boards \
+            section describes. An item is a commons thread on a board, with where it stands: open, \
+            waiting on its needs, claimed by one agent, done, failed or canceled. open lists a board's \
+            open items; add starts one, as the commons tool's post starts a thread; act takes one, \
+            closes it or changes it, as reply adds to a thread, or shows posts you missed. Only the \
+            board's project's agents take items; anyone reads and posts in their threads with the \
+            commons tool.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "open": {"type": "string", "minLength": 1,
+                    "description": "A board: its open items, newest first, as many as fit, with next where the rest start."},
+                "filter": {"type": "object",
+                    "description": "With open: narrows its items as the commons tool's filter does, \
+                        on an item's labels, for, needs, by and the rest, as {\"labels\": {\"kind\": [\"bug\"]}}."},
+                "from": {"type": "integer", "minimum": 0,
+                    "description": "With open: where to start, as an earlier answer's next says."},
+                "add": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
+                            "description": "The item's thread's file name, which no thread has yet."},
+                        "title": {"type": "string", "minLength": 1, "maxLength": crate::board::TITLE_CHARS,
+                            "description": "What to do, its verb first, as Fix the login redirect."},
+                        "text": text.clone(),
+                        "board": board.clone(),
+                        "needs": {"type": "array", "items": {"type": "string", "minLength": 1},
+                            "description": "Items on the board that are done before this one opens."},
+                        "labels": labels.clone(),
+                        "for": {"type": "string", "minLength": 1,
+                            "description": "The agent, or the profile, that alone may take it."}
+                    },
+                    "required": ["name", "title", "text", "board"],
+                    "additionalProperties": false
+                },
+                "act": {
+                    "type": "object",
+                    "properties": {
+                        "thread": {"type": "string", "minLength": 1},
+                        "do": {"type": "string", "enum": &crate::board::ACTIONS[1..],
+                            "description": "claim takes an open item, or one whose holder was closed; \
+                                done, fail or release closes or gives back the one you hold; cancel one you \
+                                added that nobody holds; reopen a failed one; label or assign changes one; \
+                                item puts a thread already there on a board."},
+                        "text": text,
+                        "board": {"type": "string", "minLength": 1, "description": "With item: the board."},
+                        "labels": labels,
+                        "for": {"type": "string",
+                            "description": "With assign: the agent or profile that alone may take it; empty for anyone."}
+                    },
+                    "required": ["thread", "do", "text"],
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        },
+        "answered_by": TAG
+    })
+}
+
 fn show() -> Value {
     json!({
         "name": SHOW,
@@ -927,6 +996,64 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
                 && let Some(subscribed) =
                     crate::commons::subscribed(&store, &caller, caller_id, &thread)
+            {
+                said["follow"] = subscribed;
+            }
+            if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
+                said["invited"] =
+                    json!(crate::commons::invite(&home, &said, &caller, &invite).await);
+            }
+            Ok(said.to_string())
+        }
+        BOARD => {
+            if !crate::commons::on() {
+                return Err(("board_refused", "the commons is off".to_owned()));
+            }
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or(("board_refused", "no HOME".to_owned()))?;
+            let caller_id = std::env::var("AGENT_BOT_ID")
+                .ok()
+                .and_then(|id| id.parse().ok());
+            let model = std::env::var("AGENT_MODEL").ok();
+            let reader = crate::commons::who(
+                &std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone()),
+                std::env::var("AGENT_CALL_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok())
+                    .or(caller_id),
+            );
+            let writes = arguments["add"].is_object() || arguments["act"].is_object();
+            if arguments["add"].is_object() {
+                crate::commons::recount(&home).await;
+            }
+            // Whose agents take a board's items: the project the caller is
+            // named in, as its posts say, and the profile it was made as.
+            let project = writes.then(|| Line::of(&caller, &here).project);
+            let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
+            let profile = (store.as_deref())
+                .filter(|_| arguments["act"]["do"] == "claim")
+                .and_then(|store| crate::task::noted_profile(store, &caller));
+            let board_caller = crate::board::Caller {
+                name: &caller,
+                id: caller_id,
+                reader: &reader,
+                model: model.as_deref(),
+                project: project.as_deref(),
+                profile: profile.as_deref(),
+            };
+            let mut said = crate::board::call(&home, &board_caller, arguments, &|holder, id| {
+                crate::task::gone(holder, id)
+            })
+            .map_err(|e| ("board_refused", e))?;
+            // As a post or a reply does, adding or acting follows the
+            // item's thread for the agent.
+            if writes
+                && said["posted"] != false
+                && let Some(thread) = said["thread"].as_str().map(str::to_owned)
+                && let Some(store) = &store
+                && let Some(subscribed) =
+                    crate::commons::subscribed(store, &caller, caller_id, &thread)
             {
                 said["follow"] = subscribed;
             }
@@ -2495,8 +2622,8 @@ async fn answer(
         arguments["save"]["external"] = json!(true);
     }
     // A post is marked from the turn, never from what the agent says.
-    if call["name"] == COMMONS {
-        for key in ["post", "reply"] {
+    if call["name"] == COMMONS || call["name"] == BOARD {
+        for key in ["post", "reply", "add", "act"] {
             if let Some(post) = arguments[key].as_object_mut() {
                 post.remove("external");
                 if read_outside(client, bot, turn).await {
@@ -3872,7 +3999,7 @@ mod tests {
                 .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [FOLLOWS, SHOW, AUTOMATIONS, MEMORY, WORKFLOW, COMMONS];
+        let every = [FOLLOWS, SHOW, AUTOMATIONS, MEMORY, WORKFLOW, COMMONS, BOARD];
         // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);

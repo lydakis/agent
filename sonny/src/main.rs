@@ -16,6 +16,7 @@ mod attach;
 mod audit;
 mod background;
 mod banner;
+mod board;
 mod board_view;
 mod boot;
 mod browser;

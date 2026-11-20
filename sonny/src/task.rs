@@ -1243,6 +1243,36 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Whether the agent `name`, which the daemon knew as `id` when given,
+/// is closed or no longer there, as the daemon lists it: a board's item
+/// it holds is then another's to take over. False when the daemon can't
+/// be read, so no claim is taken from an agent still working.
+pub fn gone(name: &str, id: Option<i64>) -> bool {
+    let Some(agent) = crate::agent_bin() else {
+        return false;
+    };
+    let Ok(output) = Command::new(agent)
+        .args(["ls", "--name", name])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(Value::Array(bots)) => gone_from(&bots, name, id),
+        _ => false,
+    }
+}
+
+/// [`gone`], from the daemon's listing `bots`.
+fn gone_from(bots: &[Value], name: &str, id: Option<i64>) -> bool {
+    let theirs = (bots.iter()).find(|bot| {
+        bot["name"] == name && id.is_none_or(|id| bot["id"].as_i64().is_none_or(|i| i == id))
+    });
+    theirs.is_none_or(|bot| !bot["closed_ms"].is_null())
+}
+
 /// Whether the daemon `env` names, or this shell's, lists `name`: so when
 /// it can't be read, to keep a task's folder. One whose start failed after
 /// it was made keeps its folder, since a retry continues it there.
