@@ -20589,7 +20589,14 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     // named it, on the bot. Bots made before have none: what a client
     // noted elsewhere stays the client's.
     if from < 110 {
-        conn.execute("ALTER TABLE bots ADD COLUMN profile TEXT", [])?;
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='profile')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute("ALTER TABLE bots ADD COLUMN profile TEXT", [])?;
+        }
     }
 
     Ok(())
