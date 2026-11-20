@@ -157,10 +157,7 @@ fn start() -> Value {
                     "description": "A short name for the task, valid as a git branch name, that no agent of \
                         this project has yet; Sonny puts your project's name and a dot before it."},
                 "brief": {"type": "string", "minLength": 1,
-                    "description": format!("Everything the task needs, since it never sees your \
-                        conversation. Its first line is the title the person knows the task by, so \
-                        write it as one: a sentence that starts with its verb, {} characters at most, \
-                        as Round half cents to even.", crate::title::WRITTEN)},
+                    "description": "Everything the task needs, since it never sees your conversation."},
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
@@ -2674,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn whoever_writes_a_title_is_told_it_is_a_sentence_of_30_characters_at_most() {
+    fn a_project_s_title_is_two_or_three_words_in_30_characters_and_a_brief_is_no_title() {
         let said = |tool: Value, field: &str| {
             tool["parameters"]["properties"][field]["description"]
                 .as_str()
@@ -2683,15 +2680,6 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let brief = said(start(), "brief");
-        assert!(
-            brief.contains(
-                "Its first line is the title the person knows the task by, so write it \
-                as one: a sentence that starts with its verb, 30 characters at most, as Round half \
-                cents to even."
-            ),
-            "{brief}"
-        );
         let title = said(project(), "title");
         assert!(
             title.contains(
@@ -2700,11 +2688,14 @@ mod tests {
             ),
             "{title}"
         );
-        // The examples keep the rule they teach.
-        for example in ["Round half cents to even", "Tally invoices"] {
-            assert!(example.chars().count() <= crate::title::WRITTEN);
-        }
-        // 30 is for whoever writes one; Sonny keeps 60 of what was written.
+        assert!("Tally invoices".chars().count() <= crate::title::WRITTEN);
+        // A task's title is written for it, not taken from its brief.
+        let brief = said(start(), "brief");
+        assert!(
+            !brief.contains("title") && !brief.contains("first line"),
+            "{brief}"
+        );
+        // 30 is for whoever writes one; Sonny keeps 60 of a first line.
         assert_eq!(crate::title::WRITTEN, 30);
         assert_eq!(crate::title::MOST, 60);
     }

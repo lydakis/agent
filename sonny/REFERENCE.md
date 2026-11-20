@@ -185,12 +185,11 @@ had titles, has its first line read once from its history, beside the
 window, and noted. A lead sets a project's with `new_project`'s `title`,
 which goes in `.agents/project.toml` as `title`, where you can change it; a
 folder that is a project already keeps its own, and one with none shows its
-name. A lead's title is its project's. Whoever writes a title for you
-writes it as a sentence in 30 characters at most, what the pane's row
-holds beside a name: `start_task` asks the lead for a brief whose first
-line starts with its verb, and `new_project` for two or three words. Sonny
-draws a title as it was written and changes no letter; the 60 it keeps is
-for a first line no one wrote as one. Sonny keeps each agent's beside the
+name. A lead's title is its project's. A title written for you is a
+sentence of 30 characters at most, what the pane's row holds beside a
+name: `new_project` asks the lead for two or three words. Sonny draws a
+title as it was written and changes no letter; the 60 it keeps is for a
+first line no one wrote as one. Sonny keeps each agent's beside the
 store (`STORE.titles/NAME`) with the agent's id, so one given the name later
 takes none of it, and a noted title is never read again or replaced; the
 daemon keeps none.

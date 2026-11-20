@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 /// no one wrote as a title, cut at a word, changing no letter of it.
 pub const MOST: usize = 60;
 
-/// The most characters a title written for the person takes, a task's by
-/// its lead and a project's: what the pane's row holds beside a name. The
-/// tools that take one say so; Sonny keeps [`MOST`] of what was written.
+/// The most characters a title written for the person takes, a sentence
+/// that fits the pane's row beside a name: a project's, as `new_project`
+/// asks for it, and whatever writes a task's. Sonny keeps [`MOST`] of
+/// what was written and changes no letter.
 pub const WRITTEN: usize = 30;
 
 /// Where Sonny keeps the title each agent was started with: beside the
