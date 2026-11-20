@@ -12522,7 +12522,8 @@ impl Database {
         if !self.in_lineage(head, item)? {
             return Err(missing());
         }
-        let row: Option<(Vec<u8>, Option<i64>, Option<i64>, Option<String>)> = self
+        type Row = (Vec<u8>, Option<i64>, Option<i64>, Option<String>);
+        let row: Option<Row> = self
             .conn
             .prepare_cached(
                 "SELECT COALESCE(d.item,n.item),n.message,s.turn,t.bot FROM nodes n
