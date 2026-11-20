@@ -73,6 +73,7 @@ def back_111(conn):
         "DROP INDEX nodes_turn;"
         "CREATE UNIQUE INDEX nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;"
         "DROP TABLE switches;"
+        "DROP TABLE translated;"
         "DROP INDEX bots_family_start;"
         "ALTER TABLE bots DROP COLUMN family_start;"
     )

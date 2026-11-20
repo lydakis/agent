@@ -1784,6 +1784,47 @@ class SwitchFamilyTests(unittest.TestCase):
         self.assertNotIn('reply:fourth', json.dumps(items))
         self.assert_all_freed(client, path, 'Bob')
 
+    def test_turns_the_window_let_go_cross_for_the_first_summary(self):
+        # No summary yet, and the window has let the first turns go: the
+        # first summary on the new side reads from the first node, so all
+        # of it crosses.
+        client, openai, anthropic, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low', settings={'context_items': 6})
+        for n, prompt in enumerate(('tool:first', 'second', 'third', 'fourth')):
+            self.run_turn(client, str(n), prompt)
+        record = client.request('inspect', bot='Bob')['result']
+        self.assertIsNone(record['compaction'])
+        client.request('configure', bot='Bob', model='anthropic/synthetic-claude', effort='low',
+                       compaction_instructions='Summarize.')
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.run_turn(client, '5', 'fifth')
+        sent = []
+        while not anthropic.requests.empty():
+            sent.append(anthropic.requests.get())
+        self.assertTrue(sent)
+        for request in sent:
+            for message in request['messages']:
+                self.assertIn(message['role'], ('user', 'assistant'), message)
+                for block in message['content']:
+                    self.assertIn(block['type'], ('text', 'tool_use', 'tool_result', 'image'), block)
+        # The summary reads the first turn, in the new family's shape.
+        self.assertTrue(is_summary(sent[0]))
+        self.assertIn('tool:first', json.dumps(sent[0]))
+        self.assert_all_freed(client, path, 'Bob')
+
+    def test_a_fork_reads_the_output_it_inherited_after_switching(self):
+        client, openai, anthropic, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        big = self.run_turn(client, 'big', "shell:i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done")
+        turn = client.request('turns', bot='Bob')['result']['turns'][-1]['turn']
+        client.request('fork', source='Bob', bot='Copy', workspace=str(path))
+        client.request('configure', bot='Copy', model='anthropic/synthetic-claude', effort='low')
+        for bot in ('Bob', 'Copy'):
+            read = client.request('artifact', bot=bot, turn=turn, call_id='shell-1', stream='stdout', offset=0,
+                                  limit=64)
+            self.assertIn('line-0', read.get('result', {}).get('text', ''), (bot, read, big))
+        self.assert_all_freed(client, path, 'Copy', 'Bob')
+
     def test_a_branch_left_behind_is_freed_by_whichever_agent_goes_last(self):
         # A fork holds the summary written for the new family, which points
         # back at the one on the branch Bob left: Bob deleted first cannot

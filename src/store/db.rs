@@ -3836,6 +3836,8 @@ impl Database {
                 compaction INTEGER, state TEXT NOT NULL, at_ms INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS switches_bot ON switches(bot_id,id);
             CREATE INDEX IF NOT EXISTS switches_left ON switches(left) WHERE left IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS translated(node INTEGER PRIMARY KEY, source INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS translated_source ON translated(source);
             CREATE TABLE IF NOT EXISTS compactions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES compactions(node), cut INTEGER NOT NULL REFERENCES nodes(id),
                 summary TEXT NOT NULL, prompts TEXT NOT NULL,
@@ -4955,7 +4957,8 @@ impl Database {
             (None, Some(head)) => {
                 // From the oldest node a request or a summary reads: the
                 // window's start, the summary's cut, or the prompt it keeps
-                // whole; else the head's own turn.
+                // whole. With no summary yet, the next one reads from the
+                // first node, whatever the window has let go: all of it.
                 let compaction = match bot.compaction {
                     Some(version) => tx
                         .prepare_cached("SELECT cut,pinned FROM compactions WHERE node=?")?
@@ -4966,18 +4969,13 @@ impl Database {
                     None => None,
                 };
                 // Ids grow along a lineage: the least is the oldest.
-                let start = [
-                    context_start,
-                    compaction.map(|c| c.0),
-                    compaction.and_then(|c| c.1),
-                ]
-                .into_iter()
-                .flatten()
-                .min();
-                let start = match start {
-                    Some(start) => start,
-                    None => (place(&tx, head)?.and_then(|p| p.start))
-                        .unwrap_or(ancestor(&tx, head, node_depth(&tx, head)?, 1)?.unwrap_or(head)),
+                let start = match compaction {
+                    Some((cut, pinned)) => [context_start, Some(cut), pinned]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                        .unwrap_or(cut),
+                    None => ancestor(&tx, head, node_depth(&tx, head)?, 1)?.unwrap_or(head),
                 };
                 let depth = node_depth(&tx, start)?;
                 let ids = lineage_from(&tx, head, depth)?;
@@ -5904,6 +5902,24 @@ impl Database {
         ))
     }
     /// Is `node` on the path from `head` back to the root?
+    /// Whether `head`'s history holds `node`, as written or as written
+    /// again for a switch to the other family.
+    fn history_holds(&self, head: Option<i64>, node: i64) -> Result<bool> {
+        if self.in_lineage(head, node)? {
+            return Ok(true);
+        }
+        let copies: Vec<i64> = self
+            .conn
+            .prepare_cached("SELECT node FROM translated WHERE source=?")?
+            .query_map([node], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for copy in copies {
+            if self.in_lineage(head, copy)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     fn in_lineage(&self, head: Option<i64>, node: i64) -> Result<bool> {
         let Some(head) = head else {
             return Ok(false);
@@ -17593,7 +17609,7 @@ impl Database {
             .optional()?;
         if let Some(delivered) = process {
             if let (Some(Some(head)), Some(delivered)) = (head, delivered)
-                && self.in_lineage(Some(head), delivered)?
+                && self.history_holds(Some(head), delivered)?
             {
                 return Ok(());
             }
@@ -17604,7 +17620,7 @@ impl Database {
              AND json_extract(data,'$.call_id')=? ORDER BY id DESC LIMIT 1",
             params![turn, call_id], |r| r.get(0)).optional()?;
         if let (Some(head), Some(node)) = (head, node)
-            && self.in_lineage(head, node)?
+            && self.history_holds(head, node)?
         {
             return Ok(());
         }
@@ -22164,6 +22180,12 @@ fn translate_onto(
                     .execute(params![new, stub])?;
             }
             if lead {
+                // What it was first written as, for reads that name that node.
+                conn.prepare_cached(
+                    "INSERT INTO translated(node,source)
+                     SELECT ?1,COALESCE((SELECT source FROM translated WHERE node=?2),?2)",
+                )?
+                .execute(params![new, old])?;
                 if let Some(declined) = &declined {
                     conn.prepare_cached("INSERT INTO declined(node,item) VALUES (?,?)")?
                         .execute(params![new, declined])?;
@@ -22221,6 +22243,8 @@ fn free_node(conn: &Connection, id: i64, name: &str) -> Result<Option<i64>> {
         "DELETE FROM declined WHERE node=?",
         "DELETE FROM openings WHERE node=?",
         "DELETE FROM senders WHERE node=?",
+        "DELETE FROM translated WHERE node=?",
+        "DELETE FROM translated WHERE source=?",
         "DELETE FROM lineage WHERE node=?",
         "DELETE FROM nodes WHERE id=?",
     ] {
