@@ -641,7 +641,11 @@ struct ProjectsOpen {
     client: Arc<Client>,
     follower: Arc<std::sync::Mutex<standing::Follower>>,
     /// Takes the connection's events to the follow.
-    drain: tokio::task::JoinHandle<()>,
+    drain: Option<tokio::task::JoinHandle<()>>,
+    /// Where the page opened again before a read begun while it was last
+    /// open ended: the drain of that read's connection, which lives until
+    /// the read ends (a connection whose events go untaken is let go).
+    lent: Option<tokio::task::JoinHandle<()>>,
     /// Every project's agents, as the follow keeps them.
     listed: Option<Vec<standing::Agent>>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
@@ -690,7 +694,9 @@ async fn projects_connect(
 
 impl Drop for ProjectsOpen {
     fn drop(&mut self) {
-        self.drain.abort();
+        for drain in [&self.drain, &self.lent].into_iter().flatten() {
+            drain.abort();
+        }
         if let Some(job) = &self.job {
             job.abort();
         }
@@ -733,6 +739,8 @@ struct ProjectsKept {
     state: ProjectsState,
     whole: bool,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
+    /// The drain of the connection that read reads on, until it ends.
+    lent: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProjectsKept {
@@ -742,8 +750,14 @@ impl ProjectsKept {
             // The read is over, so this does not wait.
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             match std::future::Future::poll(std::pin::Pin::new(&mut job), &mut cx) {
-                std::task::Poll::Ready(Ok(Some(read))) => self.take(read),
-                std::task::Poll::Ready(_) => {}
+                std::task::Poll::Ready(read) => {
+                    if let Some(lent) = self.lent.take() {
+                        lent.abort();
+                    }
+                    if let Ok(Some(read)) = read {
+                        self.take(read);
+                    }
+                }
                 // Its task's budget spent: taken at the next look.
                 std::task::Poll::Pending => self.job = Some(job),
             }
@@ -835,7 +849,8 @@ impl App {
             view,
             client,
             follower,
-            drain,
+            drain: Some(drain),
+            lent: kept.lent,
             listed: None,
             job: kept.job,
             read_at: None,
@@ -854,11 +869,16 @@ impl App {
         let Some(mut open) = self.projects.take() else {
             return;
         };
+        // A read under way reads on its connection, whose events are taken
+        // until it ends.
+        let job = open.job.take();
+        let lent = (job.as_ref()).and_then(|_| open.lent.take().or_else(|| open.drain.take()));
         let mut kept = ProjectsKept {
             projects: open.view.take_projects(),
             state: std::mem::take(&mut open.state),
             whole: open.whole,
-            job: open.job.take(),
+            job,
+            lent,
         };
         kept.trim();
         kept.landed();
@@ -971,7 +991,9 @@ impl App {
         };
         // Its connection went, as when the daemon did: a new one, followed
         // from a new snapshot, at most every few seconds.
-        if open.drain.is_finished() && open.connected_at.elapsed() >= STATUS_AGAIN {
+        if (open.drain.as_ref()).is_none_or(|drain| drain.is_finished())
+            && open.connected_at.elapsed() >= STATUS_AGAIN
+        {
             open.connected_at = Instant::now();
             if let Some((client, follower, drain)) =
                 projects_connect(&self.options.socket, &self.woken).await
@@ -979,13 +1001,19 @@ impl App {
                 if let Some(job) = open.job.take() {
                     job.abort();
                 }
-                (open.client, open.follower, open.drain) = (client, follower, drain);
+                if let Some(lent) = open.lent.take() {
+                    lent.abort();
+                }
+                (open.client, open.follower, open.drain) = (client, follower, Some(drain));
                 open.listed = None;
                 open.read_at = None;
             }
         }
         let now = now_ms();
         if let Some(job) = open.job.take_if(|job| job.is_finished()) {
+            if let Some(lent) = open.lent.take() {
+                lent.abort();
+            }
             match job.await {
                 Ok(Some(read)) => {
                     open.view.set(read.projects, now);
@@ -1211,6 +1239,8 @@ async fn read_projects(
     let mut whole = true;
     let turns = HashMap::new();
     let mut titles = crate::title::Titles::read(&kept);
+    // The done marks kept beside the store, which move no listing.
+    let marked = resolved::marked(store);
     let mut was = std::mem::take(&mut state.each);
     // Whether a project was read to another mark than it was kept with.
     let mut moved = false;
@@ -1234,7 +1264,8 @@ async fn read_projects(
         };
         let theirs: Vec<standing::Agent> = under.remove(&lead.name).unwrap_or_default();
         // What it is read from: its agents as listed, their calls waiting
-        // on the person and its file's title. One none of which moved is
+        // on the person, their done marks and its file's title. One none of
+        // which moved is
         // as it was read, but while one of its agents runs, which moves
         // with no event, or where it holds the window's own agent, whose
         // row reads the window's own questions.
@@ -1243,7 +1274,11 @@ async fn read_projects(
             .cloned()
             .collect();
         let titled = titles.named(&lead.name, lead.bot_id, lead.workspace.as_deref());
-        let mark = project_mark(&theirs, &held_here, titled.as_deref());
+        let marks: Vec<(&str, Option<i64>)> = (theirs.iter())
+            .filter(|bot| marked.contains(&bot.name))
+            .map(|bot| (bot.name.as_str(), resolved::read(store, &bot.name)))
+            .collect();
+        let mark = project_mark(&theirs, &held_here, &marks, titled.as_deref());
         let keeps = !theirs
             .iter()
             .any(|agent| agent.running_turn.is_some() || agent.name == bot);
@@ -1404,9 +1439,15 @@ async fn read_projects(
 }
 
 /// The mark of what a project is read from ([`ProjectRead`]): every field
-/// of its agents as listed, their calls waiting on the person, and its
-/// file's title.
-fn project_mark(agents: &[standing::Agent], held: &[needs::Held], title: Option<&str>) -> u64 {
+/// of its agents as listed, their calls waiting on the person, the done
+/// marks kept for them beside the store (an outer lead marking one moves
+/// no listing), and its file's title.
+fn project_mark(
+    agents: &[standing::Agent],
+    held: &[needs::Held],
+    marks: &[(&str, Option<i64>)],
+    title: Option<&str>,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut mark = std::hash::DefaultHasher::new();
     for agent in agents {
@@ -1432,6 +1473,7 @@ fn project_mark(agents: &[standing::Agent], held: &[needs::Held], title: Option<
         (model, provider, workspace).hash(&mut mark);
     }
     held.hash(&mut mark);
+    marks.hash(&mut mark);
     title.hash(&mut mark);
     mark.finish()
 }
@@ -28895,6 +28937,13 @@ mod tests {
         let (found, read) = page(&client, &store, &asked, &listed, &mut state).await;
         assert_eq!(found, leads);
         assert_eq!(read, ["beta.two"]);
+        // An outer lead marks a quiet project's lead done, which moves no
+        // listing: that project is read again, and counts it done.
+        let done = state.each["beta.lead"].project.counts.done;
+        resolved::keep(&store, "beta.lead", 1, "call-1").unwrap();
+        page(&client, &store, &asked, &listed, &mut state).await;
+        assert_eq!(state.each["beta.lead"].project.counts.done, done + 1);
+        assert_eq!(state.each["alpha.lead"].project.counts.done, 0);
         // Another window (a new process: nothing in memory) reads only
         // what moved since this one kept its read beside the store.
         listed[1].head = Some(2);
