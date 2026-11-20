@@ -111,7 +111,9 @@ this replaced:
   reply that could not be read is logged, its first 2 KB redacted, with
   the failure. A call too long to show the reviewer is the one call
   still handed to the person, where one can answer, as Codex asks the
-  person when a review's input is over its budget. The CLI's `auto` gate
+  person when a review's input is over its budget. That budget is one
+  daemon prompt, 1 MiB as Codex bounds a person's input (256 KiB until
+  protocol 98), less room for the round's ids and keys. The CLI's `auto` gate
   lapses at 105 s to fit the longer budget.
 - **The breaker is Codex's:** 3 denials in a row, or 10 among the turn's
   last 50 decided calls, where it was 20 a turn.

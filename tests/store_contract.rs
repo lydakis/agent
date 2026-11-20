@@ -11176,7 +11176,12 @@ fn every_steer_joins_the_running_turn_which_keeps_its_own_folder_and_model() {
 
 #[test]
 fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
-    for (prompt, count, batch) in [("small".into(), 70, 32), ("é".repeat(128 * 1024), 3, 1)] {
+    // A steer longer than a batch is taken in alone, never left waiting.
+    for (prompt, count, batch) in [
+        ("small".into(), 70, 32),
+        ("é".repeat(128 * 1024), 3, 1),
+        ("y".repeat(Database::PROMPT_BYTES), 2, 1),
+    ] {
         let mut db = db();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         let first = db

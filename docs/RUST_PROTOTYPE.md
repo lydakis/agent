@@ -1242,7 +1242,9 @@ or stringify the full conversation on each turn. Provider HTTP/TLS comes from
 transactions from [rusqlite](https://docs.rs/rusqlite/0.41.1/rusqlite/).
 
 Current limits: 8 MiB / 4,096 items of model context per request (stored
-history is unbounded), 256 KiB input prompt, 64 KiB instructions, no bound of
+history is unbounded), 1 MiB input prompt (`prompt_limit` past it, as
+Codex bounds a person's input; protocol 98, from 256 KiB, so a reviewer's
+prompt holds a large change whole), 64 KiB instructions, no bound of
 the daemon's own on one reply (the model's own output cap bounds it; see
 [Replies the model's cap cuts short](#replies-the-models-cap-cuts-short)), 64 KiB JSON-encoded
 tool call id without NUL, unique within its turn (a longer one, one with a
@@ -2183,7 +2185,8 @@ the message's number and handle at once, and `wait`, `messages`, and
   `carried: true`. A steer that starts a turn of its own, on a bot
   at rest, runs with what it names as any turn does and keeps nothing. The
   snapshot is drained in batches of
-  at most 32 steers and 256 KiB of UTF-8 prompt bytes, releasing each batch
+  at most 32 steers and 256 KiB of UTF-8 prompt bytes (a longer steer is
+  taken in alone, as a batch's first always is), releasing each batch
   before another storage call. Batching adds no model calls; arrivals beyond
   the snapshot wait for the next boundary. An interrupt completes any in-flight
   batch's commit, event publication, and waiter notifications before stopping;

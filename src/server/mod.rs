@@ -7547,8 +7547,14 @@ impl Service {
                     );
                 }
 
-                if prompt.len() > 256 * 1024 {
-                    return fail_with("prompt_limit", "prompt may be up to 262144 bytes");
+                if prompt.len() > agent_runtime::store::Database::PROMPT_BYTES {
+                    return fail_with(
+                        "prompt_limit",
+                        format!(
+                            "prompt may be up to {} bytes",
+                            agent_runtime::store::Database::PROMPT_BYTES
+                        ),
+                    );
                 }
                 // What a busy bot does with it is the client's to say.
                 let delivery = match delivery.as_deref() {
