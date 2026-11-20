@@ -924,10 +924,7 @@ pub fn agents_drawn(
     // The names in one column, as `/status` has them: past the widest
     // title, as far left as leaves the widest name room.
     let named = || (agents.listed.iter()).filter(|agent| agent.run.is_none());
-    let names = (named().map(|agent| said(agent).width()))
-        .chain((named().flat_map(|agent| &agent.agents)).map(|one| 4 + one.name.width()))
-        .max()
-        .unwrap_or(0);
+    let names = named().map(|agent| said(agent).width()).max().unwrap_or(0);
     let column = (named())
         .filter(|agent| !titled(agents, agent).is_empty())
         .map(|agent| if agent.lead { lead_at } else { task_at } + titled(agents, agent).width() + 2)
