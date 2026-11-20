@@ -212,16 +212,75 @@ pub fn hiding<T>(hidden: &[PathBuf], compose: impl FnOnce() -> T) -> T {
     compose()
 }
 
+std::thread_local! {
+    /// Where [`noting`] keeps the path this thread waits on the file
+    /// system for.
+    static WAITING: std::cell::RefCell<Option<Waiting>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The path a composition waits on its file system for, while it waits:
+/// shared with whoever waits for the composition.
+pub type Waiting = std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>;
+
+/// Run `compose` on this thread with the path each read waits on kept in
+/// `waiting` until the file system answers it. A read that never comes
+/// back (a mount whose server is gone) holds the thread, and whoever waits
+/// for it can say where.
+pub fn noting<T>(waiting: Waiting, compose: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Waiting>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let before = self.0.take();
+            WAITING.with(|waiting| *waiting.borrow_mut() = before);
+        }
+    }
+    let _restore = Restore(WAITING.with(|held| held.replace(Some(waiting))));
+    compose()
+}
+
+/// `path` noted as the one this thread waits on, until the result drops.
+fn waiting_on(path: &Path) -> impl Drop {
+    struct Answered(Option<Waiting>);
+    impl Drop for Answered {
+        fn drop(&mut self) {
+            if let Some(waiting) = &self.0 {
+                *waiting.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+    }
+    let waiting = WAITING.with(|waiting| waiting.borrow().clone());
+    if let Some(waiting) = &waiting {
+        *waiting.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+    }
+    Answered(waiting)
+}
+
+/// `path` opened to read, when it is a regular file. It is opened without
+/// waiting: a FIFO, a socket or a device named like an instructions file
+/// would hold the read until something outside answered it.
+fn open_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("it is not a regular file"));
+    }
+    Ok(file)
+}
+
 /// The first `limit + 1` bytes at most: enough to know whether a file
 /// fits in `limit`. Nothing beyond that is ever read, so a runaway file
 /// fails before it fills memory.
 fn read_head(path: &Path, limit: usize) -> Result<Vec<u8>, Failure> {
     use std::io::Read;
+    let _waiting = waiting_on(path);
     let unreadable = |error: std::io::Error| Failure::Unreadable {
         path: path.to_path_buf(),
         reason: error.to_string(),
     };
-    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let file = open_file(path).map_err(unreadable)?;
     if HIDDEN.with(|hidden| crate::hidden::holds(&hidden.borrow(), &file)) {
         return Err(Failure::Unreadable {
             path: path.to_path_buf(),
@@ -545,6 +604,7 @@ impl Kind {
 /// is reported, so an unreadable workspace file never lets the user's file of
 /// the same name stand in for it.
 fn is_file(path: &Path) -> Result<bool, Failure> {
+    let _waiting = waiting_on(path);
     match std::fs::metadata(path) {
         Ok(meta) => Ok(meta.is_file()),
         Err(error)
@@ -723,6 +783,10 @@ fn project_name(name: &str) -> bool {
         && !name.ends_with('.')
 }
 
+/// The most of a worktree's `.git` file or its `commondir` that is read:
+/// each names one folder.
+const GIT_FILE: usize = 4096;
+
 /// The same place as `dir` in its repository's main checkout, when `dir` is
 /// in a linked worktree: its `.git` is a file naming the worktree's git
 /// folder, whose `commondir` names the main checkout's `.git`. Read from
@@ -739,9 +803,9 @@ fn main_checkout(dir: &Path) -> Option<PathBuf> {
         if !meta.is_file() {
             return None;
         }
-        let text = std::fs::read_to_string(&dot).ok()?;
+        let text = read_bounded(&dot, GIT_FILE).ok()??;
         let gitdir = top.join(text.strip_prefix("gitdir: ")?.trim());
-        let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+        let common = read_bounded(&gitdir.join("commondir"), GIT_FILE).ok()??;
         let common = gitdir.join(common.trim()).canonicalize().ok()?;
         if common.file_name()? != ".git" {
             return None;
@@ -871,7 +935,11 @@ fn scan(
     let mut used = 0usize;
     let mut visited = 0usize;
     'dirs: for dir in dirs {
-        let entries = match std::fs::read_dir(&dir) {
+        let listed = {
+            let _waiting = waiting_on(&dir);
+            std::fs::read_dir(&dir)
+        };
+        let entries = match listed {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Err(failure) = not_dangling(&dir) {
@@ -2007,6 +2075,49 @@ mod tests {
         std::fs::write(root.join(".agents/skills/big/SKILL.md"), long).unwrap();
         let composed = instructions(&root, None, &[]).unwrap();
         assert_eq!(composed.skills[0].summary, "Big skill");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A FIFO, which a read would wait on until something else wrote to
+    /// it, is never opened to wait: named as a memory index, a skill or a
+    /// worktree's `.git`, composing goes on at once, refusing or passing
+    /// over it, and nothing is left noted as waited on.
+    #[test]
+    fn a_file_that_is_not_regular_is_refused_without_waiting_on_it() {
+        let root = temp("fifo");
+        let fifo = |path: &Path| {
+            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `name` is a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        };
+        std::fs::create_dir_all(root.join(".agents/skills/stuck")).unwrap();
+        fifo(&root.join(".agents/skills/stuck/SKILL.md"));
+        fifo(&root.join(".git"));
+        let memory = root.join("MEMORY.md");
+        fifo(&memory);
+        let waiting = Waiting::default();
+        let (done, composed) = std::sync::mpsc::channel();
+        let (root_in, noted) = (root.clone(), waiting.clone());
+        std::thread::spawn(move || {
+            let composed = noting(noted, || {
+                instructions(&root_in, None, std::slice::from_ref(&memory))
+            });
+            let _ = done.send(composed);
+        });
+        let error = composed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("composing never waits on a FIFO")
+            .unwrap_err();
+        assert!(
+            matches!(&error, Failure::Unreadable { path, reason }
+                if *path == root.join("MEMORY.md") && reason == "it is not a regular file"),
+            "{error:?}"
+        );
+        assert_eq!(*waiting.lock().unwrap(), None);
+        // Without the index, the rest composes: the skill is left out of
+        // its list and the `.git` names no other checkout.
+        let composed = instructions(&root, None, &[]).unwrap();
+        assert!(composed.skills.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
