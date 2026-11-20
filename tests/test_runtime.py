@@ -2361,10 +2361,11 @@ class RuntimeTests(ModelFixture):
 
         def call(request_id, name, arguments, **delivery):
             prompt = 'calls:' + json.dumps([[name, arguments]])
-            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt,
-                                  **delivery)['result']['turn']
-            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-            return json.loads(poll(client, 'Bob', turn)['result']['text'][5:])
+            # Followed by its message: one queued behind a turn has no turn yet.
+            message = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt,
+                                     **delivery)['result']['message']
+            self.assertEqual(client.finished(message)['data']['status'], 'completed')
+            return json.loads(poll(client, 'Bob', message)['result']['text'][5:])
 
         background = call('b', 'shell', {'command': 'sleep 600', 'background': True})['handle']
         turn = client.request('submit', bot='Bob', request_id='k', prompt=f'kill:{background}')['result']['turn']
