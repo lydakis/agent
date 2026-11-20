@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from bench.runtime_client import node_item, poll
+from bench.slow_socket import SlowSocket
 from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_elision import drain, encoded
@@ -1521,6 +1522,42 @@ class AutoApproverTests(ModelFixture):
         self.assertTrue(completed.get('denied'), completed)
         output = node_item(daemon, 'Bob', completed['node'])['result']['output']
         return json.loads(output)['detail']
+
+    def test_a_reviewer_keeps_its_lease_while_a_slow_store_holds_its_start(self):
+        # Calls wait with no reviewer serving, as they do across its
+        # restart. It starts behind a store whose every reply takes 2 s:
+        # taking the lease, making its judge and reading the calls waiting
+        # take longer than the 5 s lease, which it keeps by renewing from
+        # the moment it holds it.
+        daemon = self.daemon()
+        turn = daemon.request('submit', bot='Bob', request_id='a',
+                              prompt='shell:printf safe > out')['result']['message']
+        deadline = time.monotonic() + 10
+        while not daemon.request('approvals', bot='Bob')['result']['approvals']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        slow = SlowSocket(daemon.socket_path, self.path / 'slow.sock', delay_s=2)
+        self.addCleanup(slow.close)
+        process = subprocess.Popen(
+            [str(self.binary.parent / 'sonny'), 'reviewer', '--store', str(self.path / 'state.sqlite'),
+             '--socket', str(slow.path), '--model', f'openai/{Judge.model}'],
+            env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.addCleanup(lambda: (process.kill(), process.wait(), process.stdout.close()))
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [lines.put(json.loads(line)) for line in process.stdout],
+                         daemon=True).start()
+        began = time.monotonic()
+        serving = lines.get(timeout=30)
+        self.assertEqual(serving['event'], 'serving', serving)
+        self.assertGreater(time.monotonic() - began, 6)
+        self.assertGreaterEqual(slow.renewals, 3)
+        slow.delay_s = 0
+        judged = lines.get(timeout=30)
+        self.assertEqual((judged['event'], judged['calls'][0]['decision']), ('reviewed', 'allow'), judged)
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'out').read_text(), 'safe')
+        self.assertIsNone(process.poll())
+        self.assertEqual(daemon.request('stats')['result']['approvers'], ['auto'])
 
     def test_every_call_is_judged_once_a_round_and_risky_ones_are_denied(self):
         daemon = self.daemon()
