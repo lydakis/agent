@@ -99,8 +99,16 @@ impl Sub {
     /// opening there as it comes, cutting into a busy turn, so a worker
     /// that finished one hears of the next.
     pub fn board(board: &str, owner: Option<i64>) -> Sub {
+        // A long board's name is cut, and ends in a digest of the whole,
+        // so it stays within NAME_MAX and two boards never share it.
+        let mut name = format!("board.{}", board.replace('/', "."));
+        if name.len() > NAME_MAX {
+            let digest = super::digest(&name);
+            name.truncate(NAME_MAX - digest.len() - 1);
+            name = format!("{name}.{digest}");
+        }
         Sub {
-            name: format!("board.{}", board.replace('/', ".")),
+            name,
             tasks_of: Vec::new(),
             agents: Vec::new(),
             sources: vec![COMMONS_SOURCE.to_owned()],
@@ -1801,6 +1809,20 @@ fn parse(value: &Value) -> Result<Sub, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_board_follow_reads_back_whatever_the_board_s_length() {
+        let short = Sub::board("shop/errors", Some(7));
+        assert_eq!(short.name, "board.shop.errors");
+        let long = format!("shop/{}/{}", "a".repeat(64), "b".repeat(64));
+        let other = format!("shop/{}/{}", "a".repeat(64), "c".repeat(64));
+        let (one, two) = (Sub::board(&long, Some(7)), Sub::board(&other, Some(7)));
+        assert!(one.name.len() <= NAME_MAX && two.name.len() <= NAME_MAX);
+        assert_ne!(one.name, two.name);
+        let back = Sub::from_json(&one.to_json()).expect("reads back");
+        assert_eq!(back.name, one.name);
+        assert_eq!(back.filter, Some(serde_json::json!({"board": [long]})));
+    }
 
     #[test]
     fn the_goals_folder_goes_once_and_subscriptions_stay() {

@@ -498,6 +498,12 @@ fn act(
                             "board_invalid: {thread} is {state}; reopen only a failed item"
                         ));
                     }
+                    let title = posts[0]["title"].as_str().unwrap_or_default();
+                    if let Some(same) = same_title(&items(dir), board, title) {
+                        return Err(format!(
+                            "board_exists: {same} on {board} is \"{title}\" already"
+                        ));
+                    }
                     post["opened"] = json!([thread]);
                 }
                 "label" => {
@@ -1002,6 +1008,51 @@ mod tests {
             assert!(valid_board(bad).is_err(), "{bad}");
         }
         assert_eq!(project_of("shop.web/typed-errors"), "shop.web");
+    }
+
+    #[test]
+    fn a_read_and_a_search_see_an_item_as_the_listing_does() {
+        let home = home("seen");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(add("store", "Type the store errors", json!({}))).unwrap();
+        lead(add("enum", "Remove the enum", json!({"needs": ["store"]}))).unwrap();
+        lead(act("store", "claim")).unwrap();
+        let commons =
+            |args: Value| commons::call(&home, "x.y", None, "x.y", None, Some("x"), &args);
+        // A read shows what each post did, and where the item stands.
+        let read = commons(json!({"read": "store"})).unwrap();
+        assert_eq!(read["item"]["state"], "claimed");
+        assert_eq!(read["posts"][0]["do"], "add");
+        assert_eq!(read["posts"][0]["board"], "shop/errors");
+        assert_eq!(read["posts"][1]["do"], "claim");
+        // A search filters on the item's state, waiting included.
+        let found = |state: &str| {
+            let found = commons(json!({"search": "", "filter": {"state": [state]}})).unwrap();
+            (found["threads"].as_array().into_iter().flatten())
+                .map(|t| t["thread"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found("claimed"), ["store"]);
+        assert_eq!(found("waiting"), ["enum"]);
+        assert!(found("open").is_empty());
+        // Its own fields still stand: by is who wrote each post.
+        let by = commons(json!({"search": "", "filter": {"by": ["shop.lead"], "do": ["claim"]}}))
+            .unwrap();
+        assert_eq!(by["threads"][0]["item"]["state"], "claimed");
+    }
+
+    #[test]
+    fn a_failed_item_reopens_only_while_no_other_holds_its_title() {
+        let home = home("reopen-title");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(add("store", "Type the store errors", json!({}))).unwrap();
+        lead(act("store", "claim")).unwrap();
+        lead(act("store", "fail")).unwrap();
+        lead(add("store-2", "Type the store errors", json!({}))).unwrap();
+        let refused = lead(act("store", "reopen")).unwrap_err();
+        assert!(refused.starts_with("board_exists: store-2"), "{refused}");
+        lead(act("store-2", "cancel")).unwrap();
+        lead(act("store", "reopen")).unwrap();
     }
 
     /// How long a board's listing takes with 50 boards and 1,000 items,
