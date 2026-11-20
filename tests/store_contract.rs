@@ -5,8 +5,8 @@ use agent_runtime::{
     store::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Joined, Lifted,
-        Limit, Planning, ProcessKind, QuoteRef, Retained, Settings, Strip, Trailer, TurnBudget,
-        TurnOptions, Wake,
+        Limit, Planning, ProcessKind, QuoteRef, Reclaim, Retained, Settings, Strip, Switch,
+        Trailer, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome, ToolList},
 };
@@ -7944,6 +7944,589 @@ fn work_charges_what_a_request_sends_new_once_and_survives_a_restart() {
     .unwrap();
     assert_eq!(db.inspect("Later").unwrap().work.read, read);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn ids_a_switched_agent_held_are_not_given_again_after_it_is_deleted() {
+    let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    db.append(turn, vec![assistant("a")], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let to = |family, provider, model| Switch {
+        provider,
+        model,
+        effort: None,
+        family,
+        custom: Default::default(),
+    };
+    db.switch_family(
+        "Bob",
+        None,
+        &to(Family::Anthropic, "anthropic", "synthetic-claude"),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let branch = db.inspect("Bob").unwrap().head.unwrap();
+    db.switch_family(
+        "Bob",
+        None,
+        &to(Family::Responses, "openai", "synthetic-model"),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(db.inspect("Bob").unwrap().head.unwrap() < branch);
+    db.delete_bot("Bob").unwrap();
+    db.create("Cy", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Cy", "r1");
+    db.finish(turn, None).unwrap();
+    assert!(db.inspect("Cy").unwrap().head.unwrap() > branch);
+}
+
+#[test]
+fn a_long_history_crosses_in_order_a_page_at_a_time() {
+    let path =
+        std::env::temp_dir().join(format!("agent-long-switch-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    let texts: Vec<String> = (0..1300).map(|n| format!("m{n}")).collect();
+    db.append(
+        turn,
+        texts.iter().map(|t| assistant(t)).collect(),
+        &[],
+        Some(&usage(100, 10, "m")),
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+    db.switch_family(
+        "Bob",
+        None,
+        &Switch {
+            provider: "anthropic",
+            model: "synthetic-claude",
+            effort: None,
+            family: Family::Anthropic,
+            custom: Default::default(),
+        },
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(bob.work.read, bob.head);
+    let read = Connection::open(&path).unwrap();
+    let crossed: Vec<String> = read
+        .prepare(
+            "WITH RECURSIVE chain(id,parent,depth) AS (
+                SELECT id,parent,depth FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent)
+             SELECT n.item FROM chain c JOIN nodes n ON n.id=c.id ORDER BY c.depth",
+        )
+        .unwrap()
+        .query_map([bob.head.unwrap()], |r| r.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|item| {
+            let item: Value = serde_json::from_slice(&item.unwrap()).unwrap();
+            assert!(item.get("type").is_none(), "{item}");
+            item["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .filter(|text| text.starts_with('m'))
+        .collect();
+    assert_eq!(crossed, texts);
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_switch_written_a_page_at_a_time_holds_its_bot_until_taken_or_let_go() {
+    let path =
+        std::env::temp_dir().join(format!("agent-pieced-switch-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    let texts: Vec<String> = (0..1300).map(|n| format!("m{n}")).collect();
+    db.append(
+        turn,
+        texts.iter().map(|t| assistant(t)).collect(),
+        &[],
+        Some(&usage(100, 10, "m")),
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+    for n in 0..20 {
+        let turn = begun(&mut db, "Bob", &format!("t{n}"));
+        db.append(
+            turn,
+            vec![assistant(&format!("t{n}"))],
+            &[],
+            Some(&usage(100, 10, "m")),
+        )
+        .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    let read = Connection::open(&path).unwrap();
+    let nodes = || -> i64 {
+        read.query_row("SELECT count(*) FROM nodes", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = nodes();
+    let head = db.inspect("Bob").unwrap().head;
+    let custom = Default::default();
+    let settings = db.inspect("Bob").unwrap().settings;
+    let limits = (
+        settings.context_bytes() as i64,
+        settings.context_items() as i64,
+    );
+    let reclaim = |db: &mut Database| {
+        let mut at = Reclaim::default();
+        while let Some(next) = db.switch_reclaim(at).unwrap() {
+            at = next;
+        }
+    };
+    // Let go after a page: what it wrote goes, and the bot is as it was.
+    let mut pieces = db
+        .switch_begin("Bob", None, Family::Anthropic, &custom, limits)
+        .unwrap()
+        .unwrap();
+    assert!(!db.switch_piece(&mut pieces).unwrap());
+    assert!(!db.switch_piece(&mut pieces).unwrap());
+    assert!(nodes() > before + 512);
+    assert_eq!(
+        db.switch_begin("Bob", None, Family::Anthropic, &custom, limits)
+            .err()
+            .unwrap()
+            .code,
+        "bot_busy"
+    );
+    assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
+    // Let go, the bot is free at once, and what it wrote is freed a page
+    // at a time.
+    assert!(db.switch_release(pieces.bot_id()).unwrap());
+    assert!(db.switch_reclaim(Reclaim::default()).unwrap().is_some());
+    assert!(nodes() > before);
+    reclaim(&mut db);
+    assert_eq!(nodes(), before);
+    assert_eq!(db.inspect("Bob").unwrap().head, head);
+    let claude = Switch {
+        provider: "anthropic",
+        model: "synthetic-claude",
+        effort: None,
+        family: Family::Anthropic,
+        custom: Default::default(),
+    };
+    // Written for tools the change no longer shows as custom, it is
+    // refused as stale, and nothing moves.
+    let other: std::collections::HashSet<String> = ["apply_patch".to_owned()].into();
+    let mut pieces = db
+        .switch_begin("Bob", None, Family::Anthropic, &other, limits)
+        .unwrap()
+        .unwrap();
+    while !db.switch_piece(&mut pieces).unwrap() {}
+    assert_eq!(
+        db.switch_family("Bob", None, &claude, Some(pieces))
+            .unwrap_err()
+            .code,
+        "switch_stale"
+    );
+    assert_eq!(db.inspect("Bob").unwrap().head, head);
+    assert!(
+        db.switch_release(db.inspect("Bob").unwrap().bot_id)
+            .unwrap()
+    );
+    reclaim(&mut db);
+    assert_eq!(nodes(), before);
+    // Taken: a turn sent while it translates waits, then runs in the new
+    // family, on the history the pages wrote. Translated for the smaller
+    // window the same change gives, which it takes before it switches.
+    let mut pieces = db
+        .switch_begin("Bob", None, Family::Anthropic, &custom, (limits.0, 100))
+        .unwrap()
+        .unwrap();
+    let waiting = begun(&mut db, "Bob", "r2");
+    assert_eq!(
+        db.start(waiting, allow_provider).unwrap_err().code,
+        "bot_busy"
+    );
+    let mut pages = 1;
+    while !db.switch_piece(&mut pieces).unwrap() {
+        pages += 1;
+    }
+    assert_eq!(pages, 3);
+    let written = nodes() - before;
+    let mut smaller = db.inspect("Bob").unwrap().settings.clone();
+    smaller.context_items = Some(100);
+    db.set_settings("Bob", None, &["context_items".to_owned()], &smaller)
+        .unwrap();
+    let switched = db
+        .switch_family("Bob", None, &claude, Some(pieces))
+        .unwrap()
+        .unwrap();
+    assert_eq!(switched["translated"], json!(written));
+    assert_eq!(nodes() - before, written);
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(bob.family, "anthropic");
+    let crossed: Vec<String> = read
+        .prepare(
+            "WITH RECURSIVE chain(id,parent) AS (
+                SELECT id,parent FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent)
+             SELECT n.item FROM chain c JOIN nodes n ON n.id=c.id ORDER BY n.depth",
+        )
+        .unwrap()
+        .query_map([bob.head.unwrap()], |r| r.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|item| {
+            let item: Value = serde_json::from_slice(&item.unwrap()).unwrap();
+            item["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .filter(|text| text.starts_with('m'))
+        .collect();
+    assert_eq!(crossed, texts);
+    assert!(db.inspect("Bob").unwrap().settings.context_items() == 100);
+    // Each closed point the original had, its copy has too.
+    let closed = |of: &str| -> i64 {
+        read.query_row(
+            &format!("SELECT count(*) FROM checkpoints WHERE bot='Bob' AND head IN (SELECT {of} FROM translated)"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(closed("source") >= 21, "{}", closed("source"));
+    assert!(closed("node") >= closed("source"));
+    db.start(waiting, allow_provider).unwrap();
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_search_result_written_as_words_reads_through_its_handle_after_a_switch_and_a_fork() {
+    let path =
+        std::env::temp_dir().join(format!("agent-words-result-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    let item = |value: Value| -> Bytes { serde_json::to_vec(&value).unwrap().into() };
+    db.append(
+        turn,
+        vec![
+            item(
+                json!({"type":"function_call","namespace":"web","name":"run",
+                "call_id":"s1","arguments":"{\"q\":\"rust\"}"}),
+            ),
+            item(json!({"type":"function_call_output","call_id":"s1",
+                "output":"first line\nsecond line\nthird line"})),
+            assistant("found"),
+        ],
+        &[],
+        Some(&usage(100, 10, "m")),
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+    let read = Connection::open(&path).unwrap();
+    let output: i64 = read
+        .query_row(
+            "SELECT id FROM nodes WHERE CAST(item AS TEXT) LIKE '%function_call_output%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.switch_family(
+        "Bob",
+        None,
+        &Switch {
+            provider: "anthropic",
+            model: "synthetic-claude",
+            effort: None,
+            family: Family::Anthropic,
+            custom: Default::default(),
+        },
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let words: i64 = read
+        .query_row(
+            "SELECT node FROM translated WHERE source=?",
+            [output],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let text: Vec<u8> = read
+        .query_row("SELECT item FROM nodes WHERE id=?", [words], |r| r.get(0))
+        .unwrap();
+    let text: Value = serde_json::from_slice(&text).unwrap();
+    assert_eq!(text["content"][0]["type"], "text", "{text}");
+    let lines = db
+        .result_lines("Bob", words, 2, 2, false, usize::MAX)
+        .unwrap();
+    assert!(lines.contains("second line"), "{lines}");
+    assert!(lines.contains("third line"), "{lines}");
+    assert!(!lines.contains("first line"), "{lines}");
+    // A fork keeps reading it after the original is gone.
+    db.fork("Bob", "Cy", Fork::default()).unwrap();
+    db.delete_bot("Bob").unwrap();
+    let gone: i64 = read
+        .query_row("SELECT count(*) FROM nodes WHERE id=?", [output], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(gone, 0);
+    let lines = db
+        .result_lines("Cy", words, 2, 2, false, usize::MAX)
+        .unwrap();
+    assert!(lines.contains("second line"), "{lines}");
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_deletion_takes_its_switch_rows_a_page_at_a_time() {
+    let path =
+        std::env::temp_dir().join(format!("agent-switch-rows-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let to = |family, provider, model| Switch {
+        provider,
+        model,
+        effort: None,
+        family,
+        custom: Default::default(),
+    };
+    for _ in 0..10 {
+        db.switch_family(
+            "Bob",
+            None,
+            &to(Family::Anthropic, "anthropic", "synthetic-claude"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        db.switch_family(
+            "Bob",
+            None,
+            &to(Family::Responses, "openai", "synthetic-model"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    }
+    let read = Connection::open(&path).unwrap();
+    let rows = || -> i64 {
+        read.query_row("SELECT count(*) FROM switches", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(), 20);
+    let (id, mut piece) = db.start_delete_bot("Bob", 4).unwrap();
+    let mut pieces = 1;
+    while piece["done"] != true {
+        piece = db.delete_bot_piece("Bob", id, 4).unwrap();
+        pieces += 1;
+    }
+    assert!(pieces >= 5, "{pieces}");
+    assert_eq!(rows(), 0);
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_way_back_starts_where_the_other_models_window_did_and_copies_keep_their_times() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-switch-back-window-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut small = db.inspect("Bob").unwrap().settings.clone();
+    small.context_items = Some(6);
+    db.set_settings("Bob", None, &["context_items".to_owned()], &small)
+        .unwrap();
+    let turn = begun(&mut db, "Bob", "r0");
+    db.append(turn, vec![assistant("a")], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let left = db.inspect("Bob").unwrap().head.unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let to = |family, provider, model| Switch {
+        provider,
+        model,
+        effort: None,
+        family,
+        custom: Default::default(),
+    };
+    db.switch_family(
+        "Bob",
+        None,
+        &to(Family::Anthropic, "anthropic", "synthetic-claude"),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let read = Connection::open(&path).unwrap();
+    // Each copy was written when its source was.
+    let (copies, moved): (i64, i64) = read
+        .query_row(
+            "SELECT count(*),COALESCE(SUM(n.written_ms IS NOT s.written_ms),0)
+             FROM translated t JOIN nodes n ON n.id=t.node JOIN nodes s ON s.id=t.source",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(copies >= 2, "{copies}");
+    assert_eq!(moved, 0);
+    // Many turns on the other side, then back: the window starts where the
+    // other model's did, not where it was when it left.
+    for n in 0..20 {
+        let turn = begun(&mut db, "Bob", &format!("r{}", n + 1));
+        let reply = serde_json::to_vec(
+            &json!({"role":"assistant","content":[{"type":"text","text":format!("b{n}")}]}),
+        )
+        .unwrap()
+        .into();
+        db.append(turn, vec![reply], &[], Some(&usage(100, 10, "m")))
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    db.switch_family(
+        "Bob",
+        None,
+        &to(Family::Responses, "openai", "synthetic-model"),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let head = db.inspect("Bob").unwrap().head.unwrap();
+    let (start, start_depth, head_depth): (i64, i64, i64) = read
+        .query_row(
+            "SELECT b.context_start,s.depth,h.depth FROM bots b JOIN nodes s ON s.id=b.context_start
+             JOIN nodes h ON h.id=b.head WHERE b.name='Bob'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(start > left, "{start} {left}");
+    assert!(head_depth - start_depth < 8, "{head_depth} {start_depth}");
+    assert!(
+        db.window("Bob", 1 << 30, 6)
+            .unwrap()
+            .is_some_and(|w| w.ids.len() <= 6)
+    );
+    assert!(head > left);
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_reclaim_sweeps_again_once_a_later_branch_lets_go_of_an_earlier_one() {
+    let path =
+        std::env::temp_dir().join(format!("agent-switch-sweep-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    for name in ["X", "Y"] {
+        db.create(name, Some("/synthetic"), binding()).unwrap();
+        let turn = begun(&mut db, name, "r1");
+        db.append(turn, vec![assistant("a")], &[], Some(&usage(100, 10, "m")))
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    let x = db.inspect("X").unwrap().head.unwrap();
+    let y = db.inspect("Y").unwrap().head.unwrap();
+    // Two branches no bot owns, the later one's summary made on the
+    // earlier one's: the earlier is held until the later is freed.
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch(&format!(
+        "UPDATE bots SET head=NULL,context_start=NULL,work_read=NULL;
+         UPDATE messages SET node=NULL;
+         DELETE FROM checkpoints;
+         INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to)
+            VALUES ({x},NULL,{x},'s','[]',0,0),({y},{x},{y},'s','[]',0,0);
+         INSERT INTO switches(bot_id,node,root,first,left,back,from_provider,from_family,from_model,
+            to_provider,to_family,to_model,state,at_ms)
+            VALUES (NULL,{x},NULL,{x},{x},0,'openai','responses','m','anthropic','anthropic','c','{{}}',0),
+                   (NULL,{y},NULL,{y},{y},0,'openai','responses','m','anthropic','anthropic','c','{{}}',0);"
+    ))
+    .unwrap();
+    let count = |sql: &str| -> i64 { raw.query_row(sql, [], |r| r.get(0)).unwrap() };
+    let nodes = count("SELECT count(*) FROM nodes");
+    let mut at = Reclaim::default();
+    while let Some(next) = db.switch_reclaim(at).unwrap() {
+        at = next;
+    }
+    assert_eq!(count("SELECT count(*) FROM switches"), 0);
+    assert_eq!(count("SELECT count(*) FROM compactions"), 0);
+    assert_eq!(count("SELECT count(*) FROM nodes"), nodes - 4);
+    drop(raw);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn what_was_read_moves_with_the_history_to_the_other_family_and_back() {
+    let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    db.append(turn, vec![assistant("a")], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let left = db.inspect("Bob").unwrap();
+    assert_eq!(left.work.read, left.head);
+    let to = |family, provider, model| Switch {
+        provider,
+        model,
+        effort: None,
+        family,
+        custom: Default::default(),
+    };
+    let claude = to(Family::Anthropic, "anthropic", "synthetic-claude");
+    let back = to(Family::Responses, "openai", "synthetic-model");
+    // Everything read was translated: its copy is read, and the next call
+    // sends nothing new.
+    db.switch_family("Bob", None, &claude, None)
+        .unwrap()
+        .unwrap();
+    let moved = db.inspect("Bob").unwrap();
+    assert_ne!(moved.head, left.head);
+    assert_eq!(moved.work.read, moved.head);
+    // Straight back: the branch it left, read as it was.
+    db.switch_family("Bob", None, &back, None).unwrap().unwrap();
+    let home = db.inspect("Bob").unwrap();
+    assert_eq!((home.head, home.work.read), (left.head, left.head));
+    // What the other model read and added comes back read.
+    db.switch_family("Bob", None, &claude, None)
+        .unwrap()
+        .unwrap();
+    let turn = begun(&mut db, "Bob", "r2");
+    let reply =
+        serde_json::to_vec(&json!({"role":"assistant","content":[{"type":"text","text":"b"}]}))
+            .unwrap()
+            .into();
+    db.append(turn, vec![reply], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    db.switch_family("Bob", None, &back, None).unwrap().unwrap();
+    let home = db.inspect("Bob").unwrap();
+    assert!(home.head > left.head);
+    assert_eq!(home.work.read, home.head);
 }
 
 #[test]
