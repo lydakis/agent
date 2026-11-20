@@ -1937,6 +1937,41 @@ fn kept_by(listed: &[standing::Agent], bot: &str, project: &str) -> String {
     format!("{project}.lead")
 }
 
+/// Read `lead`'s agents' histories in one window of the store at a time,
+/// as windows that open together would each read every one: the lock to
+/// hold while this window reads them and keeps what it read, or none once
+/// the window that held it let go, what it kept to be taken. None too
+/// where the lock cannot be had, and the window reads them itself.
+async fn first_reads(kept: &std::path::Path, lead: &str) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let dir = reads_dir(kept);
+    let path = dir.join(format!("{lead}.lock"));
+    let wait = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .ok()?;
+        // SAFETY: flock on a descriptor `file` owns and keeps open; closing
+        // it lets go, as the process ending does.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+        // Shared: every window waiting goes on at once when it is let go.
+        // SAFETY: as above.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+        None
+    });
+    wait.await.ok().flatten()
+}
+
 /// Keep what a window read for the next one, in `lead`'s file: in place
 /// of what it held when the window is the lead's own (`own`), else added
 /// to it, as the lead's window reads more agents than a task's does.
@@ -12927,11 +12962,16 @@ impl App {
                 agents: None,
                 kept: None,
             };
+            // The first count reads as one window of the store at a time,
+            // the others waiting to take what it kept.
+            let mut first = None;
             if take {
                 let kept =
                     agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
                 let lead = kept_by(&listed, &bot, &scope.project);
+                let held = first_reads(&kept, &lead).await;
                 take_reads(&kept, &lead, client.identity(), &mut latest, &mut seen);
+                first = held.map(|held| (held, kept, lead));
             }
             let (mut listed, mut kept_mark) = (listed, kept_mark);
             if !moved.is_empty() {
@@ -13011,6 +13051,9 @@ impl App {
             else {
                 return Some(unread(listed, (latest, seen)));
             };
+            if let Some((_held, kept, lead)) = first.filter(|_| read.fresh) {
+                keep_for(&kept, &lead, &bot, client.identity(), &latest, &seen);
+            }
             woken.notify_one();
             let whole = read.whole && read.listed;
             let mut built = read.rows;
@@ -15879,6 +15922,7 @@ impl App {
                     let kept = agent_client::socket::canonical_store(&store)
                         .unwrap_or_else(|_| store.clone());
                     let (mut latest, mut seen) = (HashMap::new(), HashMap::new());
+                    let _held = first_reads(&kept, &lead).await;
                     take_reads(&kept, &lead, client.identity(), &mut latest, &mut seen);
                     let view = StatusView {
                         bot: "",
@@ -26677,6 +26721,35 @@ mod tests {
         std::fs::write(&kept, file.to_string()).unwrap();
         open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 12);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn windows_opening_together_read_a_leads_agents_one_at_a_time() {
+        let home = std::env::temp_dir().join(format!("first-reads-{}", std::process::id()));
+        let store = home.join("state.sqlite");
+        let held = first_reads(&store, "shop.lead")
+            .await
+            .expect("the first reads");
+        // Another waits for it to let go, then takes what it kept.
+        let waiting = tokio::spawn({
+            let store = store.clone();
+            async move { first_reads(&store, "shop.lead").await.is_none() }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        // Another lead's agents are read beside it.
+        assert!(first_reads(&store, "docs.lead").await.is_some());
+        drop(held);
+        assert!(waiting.await.unwrap());
+        // A window opened later reads what moved since, keeping it.
+        assert!(first_reads(&store, "shop.lead").await.is_some());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(reads_dir(&store))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
         std::fs::remove_dir_all(home).unwrap();
     }
 
