@@ -6127,13 +6127,15 @@ impl Turn {
             Agents::Send {
                 to,
                 message,
-                delivery,
                 interrupt,
                 quotes,
                 replaces,
                 request_id,
             } => {
-                let mut delivery = delivery;
+                // A message to another bot steers, as Codex's agent mail
+                // joins the running turn; only an interrupt's message
+                // waits, for the turn after the one it stopped.
+                let mut delivery = "steer";
                 // The turn to stop, of a bot this one made, read before the
                 // message goes; it is stopped only once the message is in
                 // line, so a retried call, which sends nothing new, stops

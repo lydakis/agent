@@ -262,11 +262,10 @@ impl Tool {
             // ([`Agents`]): what its shell's `agent` would send, held to
             // what the bot's own socket allows.
             Tool::SendMessage => (
-                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. delivery steer (the default) joins the bot's running turn at its next step, or starts a turn when none runs; queue waits for a turn of its own after what it has in line. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote lists the messages, one or several, whose words the daemon copies after the message in that order, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with, such as [\"shop.lead/12\",\"shop.lead/15\"]. replaces, the handle BOT/N of a message this bot sent to the same bot, withdraws that message if it still waits in line and sends this one in its place (the result says replaced: BOT/N), or, once that message was taken in, sends this one after it (the result says taken: BOT/N, with taken_turn, the turn that took it in). A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
+                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. The message joins the bot's running turn at its next step, or starts a turn when none runs. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote lists the messages, one or several, whose words the daemon copies after the message in that order, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with, such as [\"shop.lead/12\",\"shop.lead/15\"]. replaces, the handle BOT/N of a message this bot sent to the same bot, withdraws that message if it still waits in line and sends this one in its place (the result says replaced: BOT/N), or, once that message was taken in, sends this one after it (the result says taken: BOT/N, with taken_turn, the turn that took it in). A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
                 json!({"type":"object","properties":{
                 "to":{"type":"string","minLength":1,"maxLength":128},
                 "message":{"type":"string","minLength":1},
-                "delivery":{"enum":["steer","queue"]},
                 "interrupt":{"type":"boolean"},
                 "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16},
                 "replaces":{"type":"string","minLength":3,"maxLength":256},
@@ -1244,8 +1243,6 @@ pub enum Agents {
     Send {
         to: String,
         message: String,
-        /// `steer` or `queue`.
-        delivery: &'static str,
         interrupt: bool,
         /// `{"bot","message","reply"?}`, as `submit` takes them.
         quotes: Vec<serde_json::Value>,
@@ -2427,7 +2424,6 @@ impl Registry {
                 struct Send {
                     to: String,
                     message: String,
-                    delivery: Option<String>,
                     #[serde(default)]
                     interrupt: bool,
                     #[serde(default)]
@@ -2436,16 +2432,6 @@ impl Registry {
                     request_id: Option<String>,
                 }
                 let args: Send = serde_json::from_str(args).map_err(invalid)?;
-                let delivery = match args.delivery.as_deref() {
-                    None | Some("steer") => "steer",
-                    Some("queue") => "queue",
-                    Some(other) => {
-                        return fail_with(
-                            "invalid_tool_arguments",
-                            format!("delivery is steer or queue, not {other:?}"),
-                        );
-                    }
-                };
                 if args.to.is_empty() || args.to.len() > 128 || args.message.is_empty() {
                     return fail_with("invalid_tool_arguments", "to and message are needed");
                 }
@@ -2482,7 +2468,6 @@ impl Registry {
                 Prepared::Agents(Agents::Send {
                     to: args.to,
                     message: args.message,
-                    delivery,
                     interrupt: args.interrupt,
                     quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
                     replaces,

@@ -25,13 +25,15 @@ pub use search::{RUN_NAME, RUN_NAMESPACE, Search};
 pub use pace::Report;
 pub use socket::Sockets;
 
-/// Bytes one response may deliver, over HTTP or a socket: a bound against
-/// an endpoint that never stops, far past what any model writes. The model's
-/// own output cap is what bounds a reply; a cut one comes back as
-/// [`cut_short`] says. Nothing downstream needs a reply in one event: events
-/// carry previews of calls, and a history read answers `item_too_large` for
-/// an item past a line.
-pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+/// Bytes one event of a response may take: an SSE frame, or a WebSocket
+/// message. Each is held whole until it ends, so it is bounded, at what
+/// Codex keeps for a WebSocket message (tungstenite's default). A whole
+/// response has no bound of its own, as in Codex and Pi: the model's output
+/// cap ends a long reply, which comes back as [`cut_short`] says, and a
+/// stream that stops sending content stalls out. Nothing downstream needs a
+/// reply in one event: events carry previews of calls, and a history read
+/// answers `item_too_large` for an item past a line.
+pub const EVENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// What an output item writes, as a cut reply names it: `text`, `reasoning`,
 /// or the tool it calls. A few fields of the item's opening, read once.
@@ -747,7 +749,6 @@ where
 {
     let mut stream = std::pin::pin!(stream);
     let mut decoder = Decoder::default();
-    let mut total = 0usize;
     // Only a content frame renews the stall deadline. The client's read
     // timeout restarts on any byte, so pings alone never trip it.
     let stall = tokio::time::sleep(stall_timeout);
@@ -759,10 +760,6 @@ where
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
-        total += chunk.len();
-        if total > MAX_RESPONSE {
-            return fail("provider_response_limit");
-        }
         if unnamed && *frames == 0 && preview.len() < 4096 {
             let room = 4096 - preview.len();
             preview.extend_from_slice(&chunk[..chunk.len().min(room)]);
@@ -3701,6 +3698,48 @@ mod tests {
         assert!(stalled < gap * 5 + bound + gap / 4, "{stalled:?}");
     }
 
+    /// A whole response has no bound, as in Codex and Pi: a stream longer
+    /// than one event's bound reads to its end, each event under it.
+    #[tokio::test]
+    async fn a_response_longer_than_an_event_reads_whole() {
+        let piece = "x".repeat(1024 * 1024);
+        let pieces = EVENT_BYTES / piece.len() + 2;
+        let opening = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        );
+        let delta = format!(
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{piece}\"}}}}\n\n"
+        );
+        let body = stream::iter(
+            std::iter::once(Bytes::from_static(opening.as_bytes()))
+                .chain(std::iter::repeat_n(Bytes::from(delta), pieces))
+                .map(Ok::<_, std::convert::Infallible>),
+        );
+        let mut parser = Parser::Anthropic(anthropic::State::new(false));
+        let mut read = 0usize;
+        let mut delta = |delta| {
+            if let Delta::Text(_, part) = delta {
+                read += part.len();
+            }
+            async { Ok(()) }
+        };
+        let (mut frames, mut preview) = (0, Vec::new());
+        read_body(
+            body,
+            Duration::from_secs(60),
+            &mut parser,
+            &mut delta,
+            false,
+            &mut frames,
+            &mut preview,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read, pieces * piece.len());
+        assert!(read > EVENT_BYTES);
+    }
+
     /// Over HTTP, keepalives arrive well inside the bound, so only the
     /// guard can end this call; the client's read timeout never fires.
     #[tokio::test]
@@ -4300,6 +4339,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(upgrades.try_recv().unwrap(), "Bearer second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Over a socket too, a whole response has no bound: messages that
+    /// add up past one message's bound read to the response's end.
+    #[tokio::test]
+    async fn a_socket_response_longer_than_a_message_reads_whole() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let dir = login::tests::temp("socket-long");
+        let path = dir.join("chatgpt.json");
+        login::tests::save(&path, "token");
+        let login = Arc::new(login::Login::open(&path, None).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let piece = "x".repeat(1024 * 1024);
+        let pieces = EVENT_BYTES / piece.len() + 2;
+        let delta = format!(
+            r#"{{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"{piece}"}}"#
+        );
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            if let Some(Ok(Message::Text(_))) = socket.next().await {
+                for _ in 0..pieces {
+                    socket.send(Message::text(delta.clone())).await.unwrap();
+                }
+                let event = concat!(
+                    "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",",
+                    "\"status\":\"completed\",\"output\":[],",
+                    "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}",
+                );
+                socket.send(Message::text(event)).await.unwrap();
+            }
+        });
+        let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+            .unwrap()
+            .with_login(login)
+            .unwrap()
+            .with_socket()
+            .unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            output_schema: None,
+            web_search: false,
+            fallback_credit: None,
+            asker: Asker::Waits,
+            cache_key: None,
+            items: Items::empty(),
+            chain: Some(Chain {
+                bot: "b",
+                window: None,
+                tail: Box::new(|_| Items::empty()),
+            }),
+            route: None,
+            sent: None,
+        };
+        let read = std::sync::atomic::AtomicUsize::new(0);
+        provider
+            .complete(request, |delta| {
+                if let Delta::Thinking(_, part) = delta {
+                    read.fetch_add(part.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+        let read = read.into_inner();
+        assert_eq!(read, pieces * piece.len());
+        assert!(read > EVENT_BYTES);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

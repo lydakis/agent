@@ -37,7 +37,7 @@ def cases(agents):
     names = sorted(['p.lead', *(f'p.b{i}' for i in range(agents))])
     middle, last = names[len(names) // 2], names[max(len(names) - 61, 0)]
     every = {
-        'send_message': ['send_message', {'to': 'p.b1', 'message': 'hi', 'delivery': 'queue'}],
+        'send_message': ['send_message', {'to': 'p.b1', 'message': 'hi'}],
         'agent run (shell)': ['shell', {'command': '"$AGENT_BIN" run --bot p.b1 --detach --delivery queue -- hi'}],
         'list_agents, first 50': ['list_agents', {'name': 'p.*'}],
         'list_agents, 256 from the middle': ['list_agents', {'name': 'p.*', 'limit': 256, 'after': middle}],

@@ -1,8 +1,9 @@
 use crate::{Result, fail};
 
-/// One frame is bounded as the whole response is: a reply's items come whole
-/// in one, and again in the terminal frame.
-pub const MAX_FRAME: usize = crate::provider::MAX_RESPONSE;
+/// One frame is held whole until it ends, so it is bounded as a WebSocket
+/// message is: a reply's items come whole in one, and again in the terminal
+/// frame.
+pub const MAX_FRAME: usize = crate::provider::EVENT_BYTES;
 
 /// Incremental SSE decoder. UTF-8 is decoded only after complete data lines.
 #[derive(Default)]

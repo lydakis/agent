@@ -1195,6 +1195,30 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.assertIsNone(new.poll())
         self.assertNotEqual((self.path / 'state.sqlite.lookout.sonny').read_text(), '0.0.1 1')
 
+    def test_a_tool_host_reads_each_agent_once_at_its_start(self):
+        """Its start brings every agent of Sonny's to this build's tools and
+        to the config on one read of each: at 10,000 agents, 10,000 reads
+        where it made 20,000."""
+        bots = [f'calc{n}.lead' for n in range(4)]
+        for bot in bots:
+            self.daemon.request('create', bot=bot, workspace=str(self.path), instructions='Lead.',
+                                declare=[declared('memory')])
+
+        def inspected():
+            ops = self.daemon.request('stats')['result']['commands']['ops']
+            return ops.get('inspect', {}).get('count', 0)
+
+        before = inspected()
+        host = self.host()
+        refreshed = set()
+        while refreshed != set(bots):
+            line = json.loads(host.stdout.readline())
+            if line['event'] == 'tools_refreshed':
+                refreshed.add(line['bot'])
+        # Long enough for a second pass, which once came apart from the first.
+        time.sleep(2)
+        self.assertEqual(inspected() - before, len(bots))
+
     def test_one_tool_host_a_store_and_the_next_starts_where_it_stopped(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('memory')])
