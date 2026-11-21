@@ -490,7 +490,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
                 max_depth = (depth > 0).then_some(depth);
             }
-            "--max-restarts" => {
+            "--restarts" => {
                 let restarts: u32 = value
                     .parse()
                     .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;

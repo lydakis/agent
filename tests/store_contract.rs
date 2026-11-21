@@ -5714,7 +5714,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     assert_eq!(
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
-            "compact_keep":25,"compact_tokens":null,"post_turn_compact_percent":70,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
+            "compact_keep":25,"compact_tokens":null,"post_turn_compact_percent":70,"keep_turns":1,"max_rounds":null,"max_drops":3,"max_restarts":null,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
             "approval_policy":null,"steps_only":null,"speeds":{},"context_windows":{},"namespace":null})
@@ -13621,9 +13621,9 @@ fn a_turn_cut_off_again_and_again_with_nothing_recorded_ends_at_the_limit() {
     cut(&mut db);
     cut(&mut db);
     assert_eq!(db.turn_view("Bob", turn).unwrap()["status"], "running");
-    // A reply recorded between is progress: the count starts over.
-    db.append(turn, vec![assistant("thinking aloud")], &[], None)
-        .unwrap();
+    // A round recorded between is progress: the count starts over.
+    let (item, asked) = call("between");
+    db.append(turn, vec![item], &[asked], None).unwrap();
     cut(&mut db);
     cut(&mut db);
     let events = db.events("Bob", 0, 256).unwrap()["events"]
@@ -13656,6 +13656,91 @@ fn a_turn_cut_off_again_and_again_with_nothing_recorded_ends_at_the_limit() {
         db.resume(next).unwrap();
     }
     assert_eq!(db.turn_status("Bob", next).unwrap(), "running");
+}
+
+#[test]
+fn a_turn_cut_off_after_its_final_reply_ends_with_it_and_asks_nothing_again() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A round with a call, answered, then the reply that ends the turn,
+    // recorded before the process ended and the turn's end was not.
+    let (item, asked) = call("first");
+    db.append(turn, vec![item], std::slice::from_ref(&asked), None)
+        .unwrap();
+    db.tool_start(turn, &asked, false, false).unwrap();
+    db.tool_finish(turn, "first", &result("ok")).unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.continue_cut_off(Some(5), |_| 300).unwrap();
+    let view = db.turn_view("Bob", turn).unwrap();
+    assert_eq!(
+        (&view["status"], &view["error"]),
+        (&json!("completed"), &json!(null)),
+        "{view}"
+    );
+    let events = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["event"] == "retry" || e["event"] == "turn_paced")
+    );
+}
+
+#[test]
+fn a_bots_own_restart_limit_stands_over_the_daemons() {
+    let mut db = db();
+    let own = |max_restarts| Binding {
+        settings: Settings {
+            max_restarts: Some(max_restarts),
+            ..Settings::default()
+        },
+        ..binding()
+    };
+    db.create("Ann", Some("/synthetic"), own(0)).unwrap();
+    db.create("Bob", Some("/synthetic"), own(2)).unwrap();
+    let begin = |db: &mut Database, bot: &str| {
+        db.begin(
+            bot,
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    let (ann, bob) = (begin(&mut db, "Ann"), begin(&mut db, "Bob"));
+    for limit in [Some(1), None] {
+        db.continue_cut_off(limit, |_| 0).unwrap();
+        for (bot, turn) in [("Ann", ann), ("Bob", bob)] {
+            if db.turn_status(bot, turn).unwrap() == "paced" {
+                db.resume(turn).unwrap();
+            }
+        }
+    }
+    // Ann set none: past the daemon's one, she goes on. Bob set two: with
+    // the daemon setting none, his second ends him.
+    assert_eq!(db.turn_status("Ann", ann).unwrap(), "running");
+    let view = db.turn_view("Bob", bob).unwrap();
+    assert_eq!(
+        (&view["status"], &view["restarts"]),
+        (&json!("interrupted"), &json!(2)),
+        "{view}"
+    );
 }
 
 #[test]

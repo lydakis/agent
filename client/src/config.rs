@@ -308,7 +308,7 @@ pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 11] = [
     // which start none.
     ("depth", "--max-depth", Some("2")),
     // As Pi Durable's restartLimit, the daemon's own default.
-    ("restarts", "--max-restarts", None),
+    ("restarts", "--restarts", None),
 ];
 
 /// The machine a formula is worked out for: its logical CPUs and its

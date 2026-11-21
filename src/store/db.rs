@@ -460,6 +460,12 @@ pub struct Settings {
     /// the model told. Unset, `MAX_DROPS`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_drops: Option<usize>,
+    /// Times in a row the daemon's process may end while one of its turns
+    /// runs, with nothing recorded between, before the next start ends
+    /// that turn rather than continuing it; zero continues it always.
+    /// Unset, the daemon's `--restarts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_restarts: Option<u32>,
     /// Unix sockets, or folders of them, the only ones a sandbox's commands
     /// reach, each an absolute path
     /// ([`crate::sandbox::Policy::sockets`]).
@@ -852,6 +858,8 @@ impl Settings {
                 .unwrap_or(POST_TURN_COMPACT_PERCENT),
             "keep_turns":self.keep_turns,"max_rounds":self.max_rounds,
             "max_drops":self.max_drops(),
+            // Null when never set: the daemon's own limit applies.
+            "max_restarts":self.max_restarts,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             // Null when never set (five minutes), so a client's default can
             // tell it from five minutes someone chose.
@@ -885,7 +893,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 29] = [
+pub const SETTINGS: [&str; 30] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -907,6 +915,7 @@ pub const SETTINGS: [&str; 29] = [
     "hold_ms",
     "max_rounds",
     "max_drops",
+    "max_restarts",
     "unix_sockets",
     "rules",
     "env",
@@ -14837,6 +14846,7 @@ impl Database {
         for call_id in released.ended {
             self.call_ended(turn, &call_id);
         }
+        self.forget_files(released.files);
     }
     /// Continue each turn the daemon's process left running when it ended
     /// unplanned, a crash, a kill or a fatal error, rather than end it, as
@@ -14864,9 +14874,23 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         for (turn, restarts, mark) in running {
             let bot = self.active(turn)?;
+            // Cut off after its final reply was recorded and before its end
+            // was: the turn has its answer, so it ends as it would have,
+            // with no model call asked again.
+            if self.answered(turn, bot.head)? {
+                self.finish(turn, None)?;
+                self.retain(&bot.name, Some(turn))?;
+                continue;
+            }
             let restarts = match restarts > 0 && mark == bot.head {
                 true => restarts + 1,
                 false => 1,
+            };
+            // A bot's own limit, zero for none, over the daemon's.
+            let limit = match bot.settings.max_restarts {
+                Some(0) => None,
+                Some(own) => Some(own),
+                None => limit,
             };
             if limit.is_some_and(|limit| restarts >= i64::from(limit)) {
                 let ended = Error::with(
@@ -14882,6 +14906,47 @@ impl Database {
             self.park_cut_off(turn, bot, restarts, delay_ms(turn))?;
         }
         Ok(())
+    }
+    /// Whether `turn`'s last recorded item, its bot's history at `head`,
+    /// is its model's reply with no call in it or after it: the reply that
+    /// ends a turn, the rest of which is the turn's end.
+    fn answered(&self, turn: i64, head: Option<i64>) -> Result<bool> {
+        let Some(head) = head else {
+            return Ok(false);
+        };
+        if self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM tools WHERE turn=? AND status IN ('planned','executing')",
+            )?
+            .exists([turn])?
+        {
+            return Ok(false);
+        }
+        // Written in the turn: not its prompt, under it.
+        let (prompt, owner, item): (Option<i64>, Option<i64>, Vec<u8>) = self
+            .conn
+            .prepare_cached(
+                "SELECT n.turn,s.turn,n.item FROM nodes n LEFT JOIN lineage l ON l.node=n.id
+                 LEFT JOIN nodes s ON s.id=l.start WHERE n.id=?",
+            )?
+            .query_row([head], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        if prompt.is_some() || owner != Some(turn) {
+            return Ok(false);
+        }
+        let Ok(item) = serde_json::from_slice::<Value>(&item) else {
+            return Ok(false);
+        };
+        // A reply that asked for a tool, or that its provider paused
+        // partway through its own tools, carries the call in its content.
+        let calls = item["content"].as_array().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part["type"].as_str().is_some_and(|k| k.contains("tool")))
+        });
+        Ok(item["type"].as_str().is_none_or(|kind| kind == "message")
+            && item["role"] == "assistant"
+            && !calls)
     }
     /// Park `turn`, cut off for the `restarts`th time in a row, for
     /// `continue_cut_off`.
@@ -19320,11 +19385,13 @@ fn announcements(calls: Vec<Value>) -> Result<Vec<Vec<Value>>> {
     Ok(events)
 }
 /// What a park that answered its turn's open calls let go of: their
-/// requests, the steps they asked about, and the answered calls that end.
+/// requests, the steps they asked about, the answered calls that end, and
+/// the files that held what those calls' daemon steps kept.
 struct Released {
     requests: i64,
     steps: Vec<i64>,
     ended: Vec<String>,
+    files: Vec<String>,
 }
 /// Answer every call of `turn` that has no result with what `result` says
 /// of it (`executing`: it had started, so its outcome is unknown), close
@@ -19360,6 +19427,7 @@ fn release_unanswered(
         requests: 0,
         steps: Vec::new(),
         ended: Vec::new(),
+        files: Vec::new(),
     };
     for call_id in unanswered {
         let asked: Vec<(i64, String, String)> = tx
@@ -19384,6 +19452,10 @@ fn release_unanswered(
             .execute(params![turn, call_id])?
             > 0
         {
+            // What its daemon steps kept goes with it, as when it ends.
+            released
+                .files
+                .extend(drop_step_outputs(tx, turn, &call_id)?);
             released.ended.push(call_id);
         }
     }
@@ -23702,6 +23774,7 @@ mod tests {
             quiet_background: true,
             max_rounds: Some(1),
             max_drops: Some(1),
+            max_restarts: Some(1),
             unix_sockets: vec!["/".into()],
             rules: Some(crate::rules::Policy {
                 invalid: Some("x".into()),

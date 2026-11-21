@@ -3277,12 +3277,12 @@ class RuntimeTests(ModelFixture):
         client.close()
         # With a restart limit of one, the first cut-off ends it, and the
         # restart launches no paid or repeated request.
-        client = self.client(extra=('--max-restarts', '1'))
+        client = self.client(extra=('--restarts', '1'))
         self.assertEqual(client.ready['limits']['restarts'], 1)
         ended = client.request('submit', bot='Bob', request_id='wait-3', prompt='wait')['result']['message']
         self.model.requests.get(timeout=3)
         client.close(kill=True)
-        client = self.client(extra=('--max-restarts', '1'))
+        client = self.client(extra=('--restarts', '1'))
         self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'interrupted')
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         finished = next(e for e in events if e['event'] == 'turn_finished' and e.get('turn') == ended)

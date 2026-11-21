@@ -424,7 +424,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-input-bytes"
                     | "--max-readers"
                     | "--max-depth"
-                    | "--max-restarts" => {
+                    | "--restarts" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
@@ -452,6 +452,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--post-turn-compact-percent"
                     | "--max-rounds"
                     | "--max-drops"
+                    | "--max-restarts"
                     | "--max-output-tokens" => {
                         let number = value.parse::<u64>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
@@ -891,7 +892,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-readers" => "readers",
             "--max-load" => "load",
             "--max-depth" => "depth",
-            "--max-restarts" => "restarts",
+            "--restarts" => "restarts",
             "--stall-timeout" => "stall_timeout_seconds",
             "--idle-exit" => "idle_exit_seconds",
             _ => continue,
@@ -911,10 +912,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             _ => value.parse::<u64>().ok(),
         }
         .filter(|value| {
-            !matches!(
-                flag.as_str(),
-                "--idle-exit" | "--max-depth" | "--max-restarts"
-            ) || *value != 0
+            !matches!(flag.as_str(), "--idle-exit" | "--max-depth" | "--restarts") || *value != 0
         });
         if running.as_u64() != requested {
             differences.push(format!(

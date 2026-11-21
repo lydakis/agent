@@ -1689,7 +1689,7 @@ class CliTests(ModelFixture):
             barrier = threading.Barrier(16)
             common = ['--store', str(path), '--provider', 'openai=responses,'+self.url,
                       '--model', 'openai/synthetic-model', '--tools', 'echo', '--workspace', directory,
-                      '--max-restarts', '1']
+                      '--restarts', '1']
             def run(n):
                 barrier.wait(timeout=5)
                 return subprocess.run([str(self.binary), 'run', '--detach', '--new', '--bot', f'new-{n}',

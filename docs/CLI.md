@@ -131,11 +131,13 @@ the bot that starts its line a new bot may be, as Codex's
 `agents.max_depth`: a bot run with no `AGENT_BOT` starts one, its children
 are at 1 and theirs at 2, and a `run --new` or `fork` deeper is refused as
 `depth_limit`; 0 is no end.
-`restarts = 5`, the default for `--max-restarts`, is how many times in a
+`restarts = 5`, the default for `--restarts`, is how many times in a
 row the daemon may stop unplanned (a crash, a kill, a fatal error) while a
 turn runs, with nothing recorded for it between, before the next start
 ends that turn `process_interrupted` rather than continuing it, as Pi
-Durable's `restartLimit`; 0 continues it always.
+Durable's `restartLimit`; 0 continues it always. A bot's own
+`max_restarts` setting (`--max-restarts` on `run --new`) takes its place
+for that bot.
 A key it does not know, or a formula it cannot work out for this machine
 (one below 0 here included), is `config_invalid` when the file is read.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
