@@ -341,25 +341,53 @@ struct Given<'a> {
 /// Read each of `bots` once, and configure each that `given` would make
 /// otherwise and, with `tools`, each this build's tools would; those at
 /// work, to ask again: the config's returned, the tools' put in `tools`.
+/// The next agent is read while this one's `configure`s are out, and both
+/// go out at once, as two passes apart kept two requests out.
 async fn apply_config(
     client: &Client,
     given: Option<&Given<'_>>,
     bots: Vec<Value>,
     mut tools: Option<&mut Vec<Value>>,
 ) -> Vec<Value> {
+    let refreshing = tools.is_some();
     let mut busy = Vec::new();
-    for bot in bots {
-        let Some(record) = inspect(client, &bot).await else {
-            continue;
-        };
-        if let Some(tools) = tools.as_deref_mut()
-            && refresh(client, &bot, &record).await
-        {
+    let mut bots = bots.into_iter();
+    let mut read = match bots.next() {
+        Some(bot) => {
+            let record = inspect(client, &bot).await;
+            Some((bot, record))
+        }
+        None => None,
+    };
+    while let Some((bot, record)) = read.take() {
+        let next = bots.next();
+        let ((refreshed, applied), after) = tokio::join!(
+            async {
+                let Some(record) = &record else {
+                    return (false, false);
+                };
+                tokio::join!(
+                    async { refreshing && refresh(client, &bot, record).await },
+                    async {
+                        match given {
+                            Some(given) => apply(client, given, &bot, record).await,
+                            None => false,
+                        }
+                    },
+                )
+            },
+            async {
+                match &next {
+                    Some(next) => inspect(client, next).await,
+                    None => None,
+                }
+            },
+        );
+        read = next.map(|next| (next, after));
+        if refreshed && let Some(tools) = tools.as_deref_mut() {
             tools.push(bot.clone());
         }
-        if let Some(given) = given
-            && apply(client, given, &bot, &record).await
-        {
+        if applied {
             busy.push(bot);
         }
     }
