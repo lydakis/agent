@@ -2653,16 +2653,12 @@ pub async fn run(config: Configuration) -> Result<()> {
         opened => opened?,
     };
     let (pending, pending_bytes) = (limits.pending, limits.pending_bytes);
-    let (max_depth, max_restarts) = (config.max_depth, config.max_restarts);
+    let max_depth = config.max_depth;
     store
         .call(move |db| {
             db.set_pending_limits(pending, pending_bytes);
             db.set_max_depth(max_depth);
-            // Turns the process left running when it ended unplanned go on,
-            // a model call it cut off asked again after its first backoff.
-            db.continue_cut_off(max_restarts, |turn| {
-                turn::backoff(1, turn as u64).as_millis() as u64
-            })
+            Ok(())
         })
         .await?;
     let mut environment = vec![
@@ -2892,6 +2888,18 @@ pub async fn run(config: Configuration) -> Result<()> {
                 ends.call_ended(turn, call_id)
             }));
             Ok(())
+        })
+        .await?;
+    // Turns the process left running when it ended unplanned go on, a model
+    // call it cut off asked again after its first backoff. Once the
+    // publisher runs, so their events, several a turn, never fill its
+    // channel; no request is served before the run loop starts below.
+    let max_restarts = config.max_restarts;
+    store
+        .call(move |db| {
+            db.continue_cut_off(max_restarts, |turn| {
+                turn::backoff(1, turn as u64).as_millis() as u64
+            })
         })
         .await?;
     if let Some(gate) = registry.load_gate() {

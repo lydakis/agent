@@ -80,7 +80,10 @@ class FleetScreenTests(unittest.TestCase):
 class FleetRestartTests(unittest.TestCase):
     def test_restart_continues_held_turns_for_single_and_full_wave_fleets(self):
         root = Path(__file__).resolve().parent.parent
-        for bots, limit in ((1, 0), (8, 0), (8, 2)):
+        # 600 cut off at once publish past the store's channel of 1,024
+        # before the daemon serves anyone: each turn's continuation writes
+        # more than one event.
+        for bots, limit in ((1, 0), (8, 0), (8, 2), (600, 600)):
             with self.subTest(bots=bots, limit=limit), tempfile.TemporaryDirectory(dir=root/'.local') as d:
                 screen = Screen(root/'.local/target/release/agent', Path(d), bots=bots,
                                 max_active=limit, model=None, parked=0, delay_ms=0)
