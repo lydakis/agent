@@ -192,7 +192,7 @@ fn start() -> Value {
                     "description": "A short name, valid as a git branch, that no agent of this project has \
                         yet; Sonny puts your project's name and a dot before it."},
                 "title": {"type": "string", "maxLength": crate::title::WRITTEN,
-                    "description": "Verb first, as Round half cents to even."},
+                    "description": "Verb first, as Round half cents to even; a task joined keeps its own."},
                 "brief": {"type": "string", "minLength": 1,
                     "description": "Everything the task needs, since it never sees your conversation."},
                 "profile": {"type": "string", "minLength": 1,
@@ -219,7 +219,7 @@ fn start() -> Value {
                     "description": "Why none of your tasks still there should take this work, since a task \
                         given more keeps what it learned; without it, a start while you have tasks is refused, listing them."}
             },
-            "required": ["name", "title", "brief"],
+            "required": ["name", "brief"],
             "additionalProperties": false
         },
         "answered_by": TAG,
@@ -229,34 +229,79 @@ fn start() -> Value {
     // Boards on, a start may make several agents and give them a board.
     if crate::board::on() {
         start["parameters"]["properties"]["agents"] = json!({
-            "type": ["integer", "array"], "minimum": 1, "items": {"type": "string"},
-            "description": "For several agents: a count, or a profile each. They are NAME.1 on."});
+            "type": "array", "minItems": 1, "items": {"type": "object", "properties": {
+                "model": {"type": "string", "minLength": 1},
+                "profile": {"type": "string", "minLength": 1},
+                "effort": {"type": "string", "minLength": 1},
+                "count": {"type": "integer", "minimum": 1}},
+                "additionalProperties": false},
+            "description": "Several agents, a mix: each entry count agents (default 1) with its own \
+                model, profile and effort, else the call's; a profile's model applies when none is named. \
+                They are NAME.1 on. With the name of a task on a board, they join it as its next numbers."});
         start["parameters"]["properties"]["board"] = json!({"type": "string", "minLength": 1,
-            "description": "A board of this project whose items its agents take."});
+            "description": "A board of this project whose work its agents take."});
     }
     start
 }
 
-/// The profiles a start's agents are made as, one an agent: `agents` as
-/// a count of agents made as `profile`, or a list of profiles.
-fn agents_of(agents: &Value, profile: Option<String>) -> Result<Vec<Option<String>>, String> {
-    let refused = || "agents is a count of 1 or more, or a list of profiles".to_owned();
-    match agents {
-        Value::Null => Ok(vec![profile]),
-        Value::Number(count) => match count.as_u64() {
-            Some(count) if count >= 1 => Ok(vec![profile; count as usize]),
-            _ => Err(refused()),
-        },
-        Value::Array(list) if !list.is_empty() => (list.iter())
-            .map(|p| {
-                (p.as_str().map(str::trim))
-                    .filter(|p| !p.is_empty())
-                    .map(|p| Some(p.to_owned()))
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(refused),
-        _ => Err(refused()),
+/// One agent a start makes: the profile it is made as, and the model
+/// and effort it runs with, each none for the start's default.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Made {
+    profile: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// The agents a start makes, one entry an agent: one as the call names
+/// it, or each of `agents`' entries `count` times, what an entry leaves
+/// out the call's own `call` gives.
+fn agents_of(agents: &Value, call: Made) -> Result<Vec<Made>, String> {
+    let refused = || {
+        "agents is a list of {model, profile, effort, count}, count 1 or more, each value a \
+         non-empty string"
+            .to_owned()
+    };
+    let list = match agents {
+        Value::Null => return Ok(vec![call]),
+        Value::Array(list) if !list.is_empty() => list,
+        _ => return Err(refused()),
+    };
+    let mut made = Vec::new();
+    for entry in list {
+        let Some(entry) = entry.as_object() else {
+            return Err(refused());
+        };
+        if entry
+            .keys()
+            .any(|key| !matches!(key.as_str(), "model" | "profile" | "effort" | "count"))
+        {
+            return Err(refused());
+        }
+        let field = |key: &str, own: &Option<String>| match entry.get(key) {
+            None => Ok(own.clone()),
+            Some(value) => (value.as_str().map(str::trim))
+                .filter(|value| !value.is_empty())
+                .map(|value| Some(value.to_owned()))
+                .ok_or_else(refused),
+        };
+        let one = Made {
+            profile: field("profile", &call.profile)?,
+            // A profile named here brings its own model unless the entry
+            // names one: the call's model is for the call's profile.
+            model: match (entry.get("model"), entry.get("profile")) {
+                (None, Some(_)) => None,
+                _ => field("model", &call.model)?,
+            },
+            effort: field("effort", &call.effort)?,
+        };
+        let count = match entry.get("count") {
+            None => 1,
+            Some(count) => count.as_u64().filter(|n| *n >= 1).ok_or_else(refused)?,
+        };
+        made.extend(std::iter::repeat_n(one, count as usize));
     }
+    Ok(made)
 }
 
 /// The most of the person's model notes the start tool carries.
@@ -733,8 +778,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
-            let title = crate::title::checked(&text("title").unwrap_or_default())
-                .map_err(|e| ("invalid_arguments", e))?;
             // The daemon bounds how deep a line goes and refuses the
             // agent past it; asked first, by its own facts, so a start it
             // would refuse makes no folder and runs no setup.
@@ -764,9 +807,51 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
+            let short = text("name").unwrap_or_default();
+            let short = short.trim();
+            let whole = match short.strip_prefix(&format!("{}.", line.project)) {
+                Some(_) => short.to_owned(),
+                None => format!("{}.{short}", line.project),
+            };
+            // A task with several agents already takes more as its next
+            // numbers, on its board, by its title: more hands, not a new task.
+            let joined = match crate::board::on() && !short.is_empty() {
+                true => crate::task::agents_of(&whole),
+                false => Vec::new(),
+            };
+            let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
+            let (title, board) = match joined.last() {
+                Some((_, bot)) => {
+                    let (name, id) = (bot["name"].as_str().unwrap_or_default(), bot["bot_id"].as_i64());
+                    let board = (store.as_deref()).and_then(|store| crate::board::followed(store, name));
+                    let Some(board) = board else {
+                        return Err((
+                            "task_not_started",
+                            format!(
+                                "{whole} works from no board, so it takes no more agents: message \
+                                 it, and it can start helpers of its own"
+                            ),
+                        ));
+                    };
+                    if text("board").is_some_and(|asked| asked.trim() != board) {
+                        return Err((
+                            "invalid_arguments",
+                            format!("{whole} works from {board}; start it without board, or with that one"),
+                        ));
+                    }
+                    let noted = (store.as_deref())
+                        .zip(id)
+                        .and_then(|(store, id)| crate::title::noted(store, name, id));
+                    let title = noted.or_else(|| text("title")).unwrap_or_default();
+                    (title, Some(board))
+                }
+                None => (text("title").unwrap_or_default(), text("board")),
+            };
+            let title = crate::title::checked(&title).map_err(|e| ("invalid_arguments", e))?;
             // Work that one of the starter's tasks may hold already goes to
-            // it, unless the starter says why it is separate.
-            if text("reason").is_none_or(|reason| reason.trim().is_empty()) {
+            // it, unless the starter says why it is separate. Joining one
+            // is that task's work.
+            if joined.is_empty() && text("reason").is_none_or(|reason| reason.trim().is_empty()) {
                 let there = crate::task::still_there(&line.project, &caller);
                 if !there.is_empty() {
                     let listed: Vec<String> = (there.iter())
@@ -798,12 +883,15 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 },
                 false => Value::Null,
             };
-            // The agents it starts with, each made as its profile: one, as
-            // profile names, unless agents says more.
-            let profiles = agents_of(&arguments["agents"], text("profile"))
-                .map_err(|e| ("invalid_arguments", e))?;
-            // A board its agents take items from: their own project's.
-            let board = text("board");
+            // The agents it starts with: one, as the call names it, unless
+            // agents gives a mix.
+            let call = Made {
+                profile: text("profile"),
+                model: text("model"),
+                effort: text("effort"),
+            };
+            let made = agents_of(&arguments["agents"], call).map_err(|e| ("invalid_arguments", e))?;
+            // A board its agents take work from: their own project's.
             if !crate::board::on() && (board.is_some() || !arguments["agents"].is_null()) {
                 return Err((
                     "invalid_arguments",
@@ -823,7 +911,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ));
                 }
             }
-            let short = text("name").unwrap_or_default();
             // A last part all digits names one of a task's several agents.
             if (short.rsplit('.').next())
                 .is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
@@ -836,22 +923,25 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
-            let several = profiles.len() > 1;
+            // A task on a board, or with several agents, numbers them from
+            // 1, so one more joins it as the next; one that joins counts on
+            // from the last.
+            let numbered = board.is_some() || made.len() > 1;
+            let after = joined.last().map_or(0, |(n, _)| *n);
             let mut said: Vec<String> = Vec::new();
-            for (n, profile) in profiles.into_iter().enumerate() {
+            for (n, made) in made.into_iter().enumerate() {
                 let start = crate::task::Start {
-                    // Several are the task's name and their number from 1.
-                    name: match several {
-                        true => format!("{short}.{}", n + 1),
-                        false => short.clone(),
+                    name: match numbered {
+                        true => format!("{short}.{}", after + n as u64 + 1),
+                        false => short.to_owned(),
                     },
                     title: Some(title.clone()),
                     brief: text("brief").unwrap_or_default(),
-                    profile,
+                    profile: made.profile,
                     permissions: text("permissions"),
                     setup: arguments["setup"] == true,
-                    model: text("model"),
-                    effort: text("effort"),
+                    model: made.model,
+                    effort: made.effort,
                     own_folder: arguments["own_folder"] == true,
                     here: false,
                     folder: text("folder"),
@@ -4145,17 +4235,42 @@ mod tests {
     }
 
     #[test]
-    fn a_start_makes_one_agent_or_as_many_as_agents_says() {
-        let worker = Some("worker".to_owned());
+    fn a_start_makes_one_agent_or_the_mix_agents_says() {
+        let made = |profile: Option<&str>, model: Option<&str>, effort: Option<&str>| Made {
+            profile: profile.map(str::to_owned),
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+        };
+        let call = made(Some("worker"), Some("a/one"), Some("high"));
+        assert_eq!(agents_of(&Value::Null, call.clone()).unwrap(), [call.clone()]);
+        let mix = json!([
+            {"model": "a/fable", "count": 2},
+            {"model": "b/astra"},
+            {"profile": "reviewer"},
+            {"profile": "reviewer", "model": "c/sol", "effort": "low"},
+        ]);
         assert_eq!(
-            agents_of(&Value::Null, worker.clone()).unwrap(),
-            std::slice::from_ref(&worker)
+            agents_of(&mix, call.clone()).unwrap(),
+            [
+                made(Some("worker"), Some("a/fable"), Some("high")),
+                made(Some("worker"), Some("a/fable"), Some("high")),
+                made(Some("worker"), Some("b/astra"), Some("high")),
+                // Its own profile, with that profile's model.
+                made(Some("reviewer"), None, Some("high")),
+                made(Some("reviewer"), Some("c/sol"), Some("low")),
+            ]
         );
-        assert_eq!(agents_of(&json!(3), None).unwrap(), [None, None, None]);
-        let named = agents_of(&json!(["worker", "reviewer"]), None).unwrap();
-        assert_eq!(named, [worker, Some("reviewer".to_owned())]);
-        for bad in [json!(0), json!([]), json!([""]), json!("two")] {
-            assert!(agents_of(&bad, None).is_err(), "{bad}");
+        for bad in [
+            json!(3),
+            json!([]),
+            json!(["worker"]),
+            json!([{"model": ""}]),
+            json!([{"count": 0}]),
+            json!([{"count": "two"}]),
+            json!([{"name": "x"}]),
+            json!("two"),
+        ] {
+            assert!(agents_of(&bad, Made::default()).is_err(), "{bad}");
         }
     }
 

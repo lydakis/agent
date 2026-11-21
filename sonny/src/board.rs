@@ -88,6 +88,14 @@ pub fn follow(board: &str, owner: Option<i64>) -> Sub {
     }
 }
 
+/// The board the agent `agent` works from, as its board follow in
+/// `store` names it: none when it follows none.
+pub fn followed(store: &std::path::Path, agent: &str) -> Option<String> {
+    (crate::lookout::subs::read(store, agent).into_iter())
+        .filter(|sub| sub.name.starts_with("board."))
+        .find_map(|sub| sub.filter?["board"][0].as_str().map(str::to_owned))
+}
+
 /// An item's title: one line of at most [`TITLE_CHARS`], as a task's.
 pub fn valid_title(title: &str) -> Result<(), String> {
     let fine = !title.trim().is_empty()
