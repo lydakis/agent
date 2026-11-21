@@ -15023,6 +15023,8 @@ impl Database {
             holder: None,
             since_ms: None,
             served: Vec::new(),
+            refilled: false,
+            refused: None,
             answer: None,
             copied: None,
             summary_retry_ms: None,

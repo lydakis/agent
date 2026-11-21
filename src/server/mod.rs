@@ -27,8 +27,8 @@ use agent_runtime::{
         Waiting, Wake,
     },
     tools::{
-        ANSWER_BYTES, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Prepared, Registry, ToolList,
-        is_digest,
+        ANSWERED_ARGUMENTS, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Prepared, Registry,
+        ToolList, is_digest,
     },
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -64,8 +64,9 @@ const FIELDS_JSON: usize = 1024;
 /// One gate in JSON without its tools: a tag at the name limit (plain
 /// ASCII, never escaped), the keys, the longest expiry, and a separator.
 const GATE_JSON: usize = 192;
-/// The longest a fork may sit idle before the daemon deletes it.
-const MAX_EXPIRE_MS: u64 = 7 * 24 * 3600 * 1000;
+/// The longest a fork may sit idle before the daemon deletes it: as long
+/// as a hold, the longest any wait lasts.
+const MAX_EXPIRE_MS: u64 = agent_runtime::store::HOLD_MAX_MS;
 /// Idle bots whose time ran out but which still have work, such as a
 /// command they started or a queued turn, are looked at again this often.
 const EXPIRY_RETRY: Duration = Duration::from_secs(60);
@@ -4715,47 +4716,23 @@ impl Service {
     /// Check the calls a message lifted, by their commands: see
     /// [`turn::Lifts::check`].
     /// A client's output for a call it answers, as the model reads it:
-    /// bounded as an answer is, its pictures checked, its words redacted.
+    /// its pictures checked, its words redacted and, past the preview, cut
+    /// to a head and tail.
     async fn answer_output(&self, output: ToolOutput) -> Result<Outcome> {
         use agent_runtime::codec::Part;
         Ok(match output {
-            ToolOutput::Text(output) if output.len() > ANSWER_BYTES => {
-                return fail_with(
-                    "tool_output_limit",
-                    format!("output may be up to {ANSWER_BYTES} bytes"),
-                );
+            ToolOutput::Text(output) => {
+                Outcome::text(self.registry.answered(vec![output]).await?.remove(0))
             }
-            ToolOutput::Text(output) => Outcome::text(self.registry.redact_text(output)),
             ToolOutput::Parts(parts) => {
-                let words: usize = parts
-                    .iter()
-                    .map(|part| match part {
-                        Part::Text { text } => text.len(),
-                        Part::Image(_) => 0,
-                    })
-                    .sum();
-                if words > ANSWER_BYTES {
-                    return fail_with(
-                        "tool_output_limit",
-                        format!("output's text may be up to {ANSWER_BYTES} bytes"),
-                    );
-                }
-                let parts = images_checked(
+                let mut parts = images_checked(
                     parts,
                     |parts| parts.iter().filter_map(Part::image).collect(),
                     "a tool result",
                 )
                 .await?;
-                let mut parts: Vec<Part> = parts
-                    .into_iter()
-                    .map(|part| match part {
-                        Part::Text { text } => Part::Text {
-                            text: self.registry.redact_text(text),
-                        },
-                        image => image,
-                    })
-                    .collect();
-                // Words before the first picture are the output.
+                // Words before the first picture are the output; none
+                // when a picture comes first.
                 let output = match parts.first_mut() {
                     Some(Part::Text { text }) => {
                         let text = std::mem::take(text);
@@ -4764,6 +4741,19 @@ impl Service {
                     }
                     _ => String::new(),
                 };
+                let texts = std::iter::once(output)
+                    .chain(parts.iter_mut().filter_map(|part| match part {
+                        Part::Text { text } => Some(std::mem::take(text)),
+                        Part::Image(_) => None,
+                    }))
+                    .collect();
+                let mut shown = self.registry.answered(texts).await?.into_iter();
+                let output = shown.next().unwrap_or_default();
+                for part in &mut parts {
+                    if let Part::Text { text } = part {
+                        *text = shown.next().unwrap_or_default();
+                    }
+                }
                 Outcome {
                     parts,
                     ..Outcome::text(output)
@@ -7162,13 +7152,12 @@ impl Service {
                                 "an error's code is 1 to 64 lowercase letters, digits or _",
                             );
                         }
-                        if detail.as_ref().is_some_and(|d| d.len() > ANSWER_BYTES) {
-                            return fail_with(
-                                "tool_output_limit",
-                                format!("detail may be up to {ANSWER_BYTES} bytes"),
-                            );
-                        }
-                        let detail = detail.map(|d| self.registry.redact_text(d));
+                        let detail = match detail {
+                            Some(detail) => {
+                                Some(self.registry.answered(vec![detail]).await?.remove(0))
+                            }
+                            None => None,
+                        };
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
@@ -7270,10 +7259,10 @@ impl Service {
                         "no step runs while the daemon is held; ask again after resume",
                     );
                 }
-                if serde_json::to_vec(&arguments)?.len() > ANSWER_BYTES {
+                if serde_json::to_vec(&arguments)?.len() > ANSWERED_ARGUMENTS {
                     return fail_with(
                         "step_arguments_limit",
-                        format!("arguments may be up to {ANSWER_BYTES} bytes"),
+                        format!("arguments may be up to {ANSWERED_ARGUMENTS} bytes"),
                     );
                 }
                 let stepping = Stepping {
@@ -7352,10 +7341,10 @@ impl Service {
                 // time stops while it runs, so no clock kills it.
                 let bounded = arguments.get("timeout_ms").is_some();
                 let arguments = serde_json::to_string(&arguments)?;
-                if arguments.len() > ANSWER_BYTES {
+                if arguments.len() > ANSWERED_ARGUMENTS {
                     return fail_with(
                         "step_arguments_limit",
-                        format!("arguments may be up to {ANSWER_BYTES} bytes"),
+                        format!("arguments may be up to {ANSWERED_ARGUMENTS} bytes"),
                     );
                 }
                 // Read as the call would be: a step that reads anything but
@@ -7603,7 +7592,7 @@ impl Service {
                 }
                 let budget_counts = counts(budget_tokens, budget_counts)?;
                 if expire_ms.is_some_and(|ms| !(1000..=MAX_EXPIRE_MS).contains(&ms)) {
-                    return fail_with("invalid_expire", "expire_ms is from 1 s to 7 days");
+                    return fail_with("invalid_expire", "expire_ms is from 1 s to 365 days");
                 }
                 if let Some(key) = &request_id {
                     name("request_id", key)?;

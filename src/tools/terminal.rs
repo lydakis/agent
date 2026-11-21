@@ -22,8 +22,9 @@ use tokio::{
 };
 
 /// Terminals one bot keeps running; a new one past this ends the one it
-/// used least recently, as Codex prunes its sessions.
-pub const MAX_TERMINALS: usize = 16;
+/// used least recently, as Codex prunes its sessions past its 64
+/// (`MAX_UNIFIED_EXEC_PROCESSES`).
+pub const MAX_TERMINALS: usize = 64;
 /// How long a write waits for output by default: Codex's waits.
 const WRITE_YIELD_MS: u64 = 250;
 /// How long an empty `write_stdin` waits for its terminal by default.
@@ -113,30 +114,38 @@ impl Terminal {
     }
 
     async fn write(&self, mut input: &[u8]) -> Result<()> {
-        let typed = async {
-            while !input.is_empty() {
-                let mut ready = self.master.writable().await?;
-                match ready.try_io(|fd| {
-                    // SAFETY: the pointer and length are the slice's own.
-                    let n =
-                        unsafe { libc::write(fd.as_raw_fd(), input.as_ptr().cast(), input.len()) };
-                    match n {
-                        n if n < 0 => Err(std::io::Error::last_os_error()),
-                        n => Ok(n as usize),
+        // However much is typed, a program that takes none of it for
+        // `INPUT_WAIT` ends the write; one that reads it on keeps it going.
+        while !input.is_empty() {
+            let taken = async {
+                loop {
+                    let mut ready = self.master.writable().await?;
+                    match ready.try_io(|fd| {
+                        // SAFETY: the pointer and length are the slice's own.
+                        let n = unsafe {
+                            libc::write(fd.as_raw_fd(), input.as_ptr().cast(), input.len())
+                        };
+                        match n {
+                            n if n < 0 => Err(std::io::Error::last_os_error()),
+                            n => Ok(n as usize),
+                        }
+                    }) {
+                        Ok(written) => break Ok::<_, Error>(written?),
+                        Err(_) => continue,
                     }
-                }) {
-                    Ok(written) => input = &input[written?..],
-                    Err(_) => continue,
                 }
-            }
-            Ok::<_, Error>(())
-        };
-        tokio::time::timeout(INPUT_WAIT, typed).await.map_err(|_| {
-            Error::with(
-                "terminal_input_blocked",
-                "the program read none of the input for 5 s",
-            )
-        })?
+            };
+            let written = tokio::time::timeout(INPUT_WAIT, taken)
+                .await
+                .map_err(|_| {
+                    Error::with(
+                        "terminal_input_blocked",
+                        "the program read none of the input for 5 s",
+                    )
+                })??;
+            input = &input[written..];
+        }
+        Ok(())
     }
 
     /// What the command wrote since the last read, and how it ended once

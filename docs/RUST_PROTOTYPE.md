@@ -2964,7 +2964,7 @@ deleted once idle:
   or a duplicate turn. If the name was recreated meanwhile, a retry carrying
   the old `bot_id` is still refused; one without it is fresh work on the new
   identity.
-- `fork {expire_ms}` (1 s to 7 days; `--expires` on `agent fork` and
+- `fork {expire_ms}` (1 s to 365 days, as long as a hold; `--expires` on `agent fork` and
   `agent run --fork`) makes a fork the daemon deletes, as `delete` would,
   once it has been idle that long: no turn has run, waited, or been queued
   since it was made or its last turn ended. Its record shows `expire_ms`
@@ -3224,8 +3224,9 @@ for a slot), as Codex prunes a session's processes, and its handle says it was
 killed for that (`stopped`). So a bot that loses track of what it started
 cannot crowd out the rest of the fleet, and one that needs many keeps them
 while there is room. Detached commands never count, and with no bound
-(`--max-processes 0`) nothing is pruned. Commands are at
-most 16 KiB. At most `--max-processes` child processes run at once across the
+(`--max-processes 0`) nothing is pruned. A command has no bound of its own,
+as in Codex: one past what the system passes a program as arguments ends
+`command_too_long` (E2BIG). At most `--max-processes` child processes run at once across the
 service, foreground or background; waiting never counts. Background commands
 the service has accepted but not started are bounded by the same number: when
 that many are already in line, a background `shell` call returns
@@ -3296,7 +3297,9 @@ call returns what it wrote within `yield_time_ms` (default 1 s, at most 30 s)
 with a `proc:N` handle while it runs. `write_stdin` types into that handle
 (`chars`, with a control key as its character, such as `\u0003` for Ctrl-C)
 and returns what the command wrote since the last read, after waiting
-`yield_time_ms` (250 ms after typing, 5 s when only reading); `kill: true` ends
+`yield_time_ms` (250 ms after typing, 5 s when only reading); `chars` has no
+bound, as in Codex, and a write ends `terminal_input_blocked` only when the
+program takes none of it for 5 s; `kill: true` ends
 the command's process group. A read that waits longer than the bot's
 `approval_hold_ms` waits live only for that hold; then its turn parks as
 `wait` parks on the terminal's handle, holding no task and no active slot,
@@ -3315,8 +3318,9 @@ starts and keeps it until its whole session is gone: a kill ends the
 command's group, the job in the terminal's foreground, and every other
 group in its session (found under `/proc` on Linux and from the process
 list on macOS), so a job a shell with job control started, ignoring
-SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
-first kills the one it used least recently, as Codex prunes its sessions,
+SIGHUP, does not outlive it. Each bot keeps at most 64, Codex's number;
+starting another first kills the one it used least recently, as Codex prunes
+its sessions,
 so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
 other, and for one that ended; `not_a_terminal` for its own background
@@ -3787,8 +3791,9 @@ declared with `answered_by`, a tag of 1 to 64 letters, digits, `_`, `-` or
 `.` that the daemon never reads, takes no `result`: a call that fits its
 `parameters` starts, and waits for the answer of whichever client acts for
 that tag. Its `tool_started` names `answered_by` and `expires_ms`, when it
-stops waiting: `expire_ms` after it started (1 to 3,600,000, default
-60,000). A client finds such calls by following the bot, or every bot with
+stops waiting: `expire_ms` after it started (1 to 365 days in
+milliseconds, as long as a hold, since a waiting call parks holding
+nothing; default 60,000). A client finds such calls by following the bot, or every bot with
 `*`, and lists those still waiting with
 `{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
 `bot`, `turn`, `call_id`, `name`, `arguments`, `expires_ms` and
@@ -3799,12 +3804,13 @@ turn's end, at most
 `{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
 reads, or with `"error":{"code","detail"?}` in place of `output`, a refusal
 the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
-lowercase letters, digits or `_`; output and detail each up to 64 KiB,
-redacted as command output is; anything else is `invalid_tool_result` or
-`tool_output_limit`). `output` may instead be a list of parts the model
+lowercase letters, digits or `_`; output and detail are bounded only by
+the request line, redacted as command output is, and the model reads them
+whole: what to keep is the client's to decide; anything else is
+`invalid_tool_result`). `output` may instead be a list of parts the model
 reads in that order, as providers' own tool results and MCP's take them:
-`{"type":"text","text"}` and `{"type":"image","media_type","data"}`. Its
-text is up to 64 KiB together, redacted the same way, and its pictures
+`{"type":"text","text"}` and `{"type":"image","media_type","data"}`. Each
+text is redacted the same way and taken whole, and its pictures
 are a prompt's: up to 20 of PNG, JPEG, GIF or WebP, 5 MiB together once
 decoded, else `invalid_image` or `image_limit`. A picture counts at its
 token cost, and a result with pictures elides to its text as a read
@@ -3937,8 +3943,9 @@ steps instead. The client asks with
 `step` its own id for the step within the call (1 to 128 of `A-Z a-z 0-9
 . _ -`, never reused for the call), `name` the step's tool (1 to 512 bytes,
 no control characters), and
-`arguments` an object of at most 64 KiB (`invalid_step`,
-`step_arguments_limit`). The call must be the bot's and still waiting for
+`arguments` an object of at most 768 KiB as JSON, what an answered call's
+arguments take, so it is listed and asked about within a 1 MiB line
+(`invalid_step`, `step_arguments_limit`). The call must be the bot's and still waiting for
 its answer (`turn_not_found`, `stale_turn`, `no_pending_call`,
 `call_already_answered`), of a tool that takes steps (`invalid_step`).
 Under no gate the reply comes at once:
@@ -4896,7 +4903,9 @@ versions it kept, after models offered it never called it (docs/DAEMON_MEASUREME
 calls' arguments, in its history.
 
 `read` returns numbered lines with `offset`/`limit` paging and a 64 KiB result
-bound including paging notices (files up to 4 MiB). If the first requested line
+bound including paging notices. A file has no bound, as in Pi: it is paged a
+line at a time on a blocking thread, so only the page is held, and a file
+that says it is empty, as procfs files do, is read to its end. If the first requested line
 cannot fit the page, it returns `read_line_too_long` with the line number; use a
 byte-oriented tool to inspect that line. A page ending before an oversized line
 still returns its preceding lines and the next offset. A PNG, JPEG, GIF or
@@ -4909,9 +4918,9 @@ provider takes. Any other binary file is `file_not_text`, naming its kind, and
 an image that cannot be decoded is `invalid_image`. One that must be scaled
 but has more than 64 megapixels is `image_limit`, refused before it is
 decoded; scaling runs off the daemon's thread, one picture at a time. `write` creates parent
-directories and writes up to
-1 MiB. `edit` replaces an exact string that must occur once unless `replace_all`
-is set. `apply_patch` takes Codex's patch format: one patch adds, deletes,
+directories. `edit` replaces an exact string that must occur once unless `replace_all`
+is set. Neither they nor `apply_patch` bound a file or its content, as Codex's
+`apply_patch` and Pi's `edit` do not; reading and matching run on a blocking thread. `apply_patch` takes Codex's patch format: one patch adds, deletes,
 updates and moves any number of files, every change checked before any file is
 written, so a patch that does not apply changes nothing. Its context lines
 match exactly, then ignoring trailing and surrounding whitespace, then with

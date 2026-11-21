@@ -269,7 +269,7 @@ class DaemonStepTests(ModelFixture):
                               ({'name': 'mcp__x__y'}, 'invalid_step'), ({'arguments': []}, 'invalid_step'),
                               ({'arguments': {'nope': 1}}, 'invalid_tool_arguments'),
                               ({'name': 'history'}, 'invalid_step'),
-                              ({'arguments': {'text': 'x' * 65537}}, 'step_arguments_limit'),
+                              ({'arguments': {'text': 'x' * (768 * 1024)}}, 'step_arguments_limit'),
                               ({'call_id': 'nope'}, 'no_pending_call'), ({'bot': 'Other'}, 'turn_not_found'),
                               ({'call_id': ''}, 'invalid_call_id')]:
             self.assertEqual(client.request('run_step', **(ask | change))['error'], error, change)

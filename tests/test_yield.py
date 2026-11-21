@@ -245,13 +245,11 @@ class YieldedCalls(Calls):
         refused = client.request('yield_call', bot='Lead', turn=turn, call_id='script-0', output='x')
         self.assertEqual(refused['error'], 'call_not_yieldable', refused)
 
-    def test_a_call_yields_once_and_only_its_answer_s_worth_of_output(self):
+    def test_a_call_yields_once(self):
         client, turn = self.script()
         self.yielded(client, turn)
         again = client.request('yield_call', bot='Lead', turn=turn, call_id='script-0', output='x')
         self.assertIn('error', again)
-        big = client.request('yield_call', bot='Lead', turn=turn, call_id='script-0', output='x' * 70000)
-        self.assertEqual(big['error'], 'tool_output_limit', big)
 
 
 if __name__ == '__main__':
