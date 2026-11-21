@@ -12663,5 +12663,5 @@ bound allocates up front: a buffer grows only as an event arrives.
 
 Store work per turn matched on every run. The first two rounds of the
 first screen read the change 6% slower on completion p99 and 10% on burst
-submit p99; the three rounds after them turned both around, and every
+submit p99; over all five rounds those read -4% and +0.6%, and every
 range overlaps main's.
