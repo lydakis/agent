@@ -336,45 +336,16 @@ async fn serve(settings: Settings) -> Result<i32> {
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
     };
-    // It looks before it answers only where a sandbox keeps it read-only,
-    // as Codex's guardian does: the daemon refuses the sandbox where none
-    // runs.
-    let name = base_name(&tag);
-    let windows = match settings.windows.is_empty() {
-        true => Value::Null,
-        false => json!(settings.windows),
+    // The lease is renewed from the moment it is held, apart from
+    // everything else the reviewer does: making its judge and reading the
+    // calls already waiting take as long as the store takes, which a
+    // backlog or a slow disk stretches past the lease.
+    let mut lease_kept = Renewal::start(client.clone(), tag.clone(), lease);
+    let shared = tokio::select! {
+        biased;
+        code = lease_kept.ended() => return Ok(let_go(&tag, &code)),
+        ready = ready(client, settings, &named, window, lease) => ready?,
     };
-    let make = |tools: &'static [&'static str]| {
-        judge::Base::make(
-            &client,
-            &name,
-            &named,
-            settings.effort.as_deref(),
-            policy::JUDGE_INSTRUCTIONS,
-            tools,
-            &windows,
-        )
-    };
-    let base = match make(&judge::LOOKING).await {
-        Err(error) if error.code == "sandbox_unavailable" => make(&[]).await?,
-        made => made?,
-    };
-    retire_old_base(&client, &tag).await;
-    let shared = Arc::new(Shared {
-        client,
-        judge: Judge {
-            base,
-            deadline_ms: settings.timeout_ms.unwrap_or(policy::DEADLINE_MS),
-            budget: policy::state_bytes(window),
-        },
-        tag: tag.clone(),
-        lease,
-        note: settings.note,
-        redactor: Redactor::from_env(std::env::vars()),
-        seen: Mutex::default(),
-        tripped: Mutex::default(),
-        lost: Notify::new(),
-    });
     // Printed once the reviewer is ready, not just the lease held: tests
     // wait for it.
     report(
@@ -382,35 +353,21 @@ async fn serve(settings: Settings) -> Result<i32> {
         "pid":std::process::id()}),
     );
     let mut rounds = tokio::task::JoinSet::new();
-    // The calls already waiting, page by page up to where serving began;
-    // later ones are pushed. Every page first, so a round that spans two
-    // is judged whole.
-    let mut waiting = Vec::new();
-    let mut page = served;
-    loop {
-        if let Value::Array(calls) = page["approvals"].take() {
-            waiting.extend(calls);
-        }
-        let Some(after) = page["next_after"].as_i64() else {
-            break;
-        };
-        page = shared
-            .client
-            .request(
-                "approvals",
-                json!({"tag":tag,"after":after,"through":through,"limit":256}),
-            )
-            .await?;
-    }
-    for (bot, turn, calls) in group(waiting) {
-        rounds.spawn(round(shared.clone(), bot, turn, calls));
-    }
+    // The calls already waiting are read beside everything else, so calls
+    // announced meanwhile are judged and their announcements drained.
+    let catch_up = waiting(&shared, served, through);
+    tokio::pin!(catch_up);
+    let mut caught_up = false;
     // The parts of a pushed round so far, until its last part arrives.
     let mut parts: HashMap<(String, i64, i64), Vec<Value>> = HashMap::new();
-    let mut renew = tokio::time::interval(RENEW);
-    renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            waiting = &mut catch_up, if !caught_up => {
+                caught_up = true;
+                for (bot, turn, calls) in group(waiting?) {
+                    rounds.spawn(round(shared.clone(), bot, turn, calls));
+                }
+            }
             event = events.recv() => {
                 let Some(event) = event else {
                     report(json!({"event":"daemon_gone","tag":tag}));
@@ -438,16 +395,7 @@ async fn serve(settings: Settings) -> Result<i32> {
                     _ => {}
                 }
             }
-            _ = renew.tick() => {
-                if let Err(error) = shared
-                    .client
-                    .request("renew_approvals", json!({"tag":tag,"lease":lease}))
-                    .await
-                {
-                    report(json!({"event":error.code,"tag":tag}));
-                    return Ok(if error.code == "approvals_lost" { 0 } else { 1 });
-                }
-            }
+            code = lease_kept.ended() => return Ok(let_go(&tag, &code)),
             _ = shared.lost.notified() => {
                 report(json!({"event":"approvals_lost","tag":tag}));
                 return Ok(0);
@@ -455,6 +403,132 @@ async fn serve(settings: Settings) -> Result<i32> {
             Some(_) = rounds.join_next() => {}
         }
     }
+}
+
+/// The reviewer's judge and what its rounds share, made once the tag's
+/// lease is held.
+async fn ready(
+    client: Arc<Client>,
+    settings: Settings,
+    named: &str,
+    window: u64,
+    lease: u64,
+) -> Result<Arc<Shared>> {
+    let tag = settings.tag;
+    // It looks before it answers only where a sandbox keeps it read-only,
+    // as Codex's guardian does: the daemon refuses the sandbox where none
+    // runs.
+    let name = base_name(&tag);
+    let windows = match settings.windows.is_empty() {
+        true => Value::Null,
+        false => json!(settings.windows),
+    };
+    let make = |tools: &'static [&'static str]| {
+        judge::Base::make(
+            &client,
+            &name,
+            named,
+            settings.effort.as_deref(),
+            policy::JUDGE_INSTRUCTIONS,
+            tools,
+            &windows,
+        )
+    };
+    let base = match make(&judge::LOOKING).await {
+        Err(error) if error.code == "sandbox_unavailable" => make(&[]).await?,
+        made => made?,
+    };
+    retire_old_base(&client, &tag).await;
+    Ok(Arc::new(Shared {
+        client,
+        judge: Judge {
+            base,
+            deadline_ms: settings.timeout_ms.unwrap_or(policy::DEADLINE_MS),
+            budget: policy::state_bytes(window),
+        },
+        tag,
+        lease,
+        note: settings.note,
+        redactor: Redactor::from_env(std::env::vars()),
+        seen: Mutex::default(),
+        tripped: Mutex::default(),
+        lost: Notify::new(),
+    }))
+}
+
+/// The calls already waiting, page by page up to where serving began;
+/// later ones are pushed. Every page first, so a round that spans two is
+/// judged whole.
+async fn waiting(shared: &Shared, served: Value, through: i64) -> Result<Vec<Value>> {
+    let mut waiting = Vec::new();
+    let mut page = served;
+    loop {
+        if let Value::Array(calls) = page["approvals"].take() {
+            waiting.extend(calls);
+        }
+        let Some(after) = page["next_after"].as_i64() else {
+            return Ok(waiting);
+        };
+        page = shared
+            .client
+            .request(
+                "approvals",
+                json!({"tag":shared.tag,"after":after,"through":through,"limit":256}),
+            )
+            .await?;
+    }
+}
+
+/// The task that renews a tag's lease every [`RENEW`] for as long as the
+/// reviewer runs, on its own so nothing else the reviewer waits on delays
+/// it. A renewal is written ahead of the requests queued for room
+/// ([`Client::bound`]) and the daemon answers it as it reads it.
+struct Renewal {
+    task: tokio::task::JoinHandle<()>,
+    ended: tokio::sync::oneshot::Receiver<String>,
+}
+
+impl Renewal {
+    fn start(client: Arc<Client>, tag: String, lease: u64) -> Self {
+        let (end, ended) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut renew = tokio::time::interval(RENEW);
+            renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick is now, and the lease was just taken.
+            renew.tick().await;
+            loop {
+                renew.tick().await;
+                if let Err(error) = client
+                    .request("renew_approvals", json!({"tag":tag,"lease":lease}))
+                    .await
+                {
+                    let _ = end.send(error.code);
+                    return;
+                }
+            }
+        });
+        Renewal { task, ended }
+    }
+
+    /// The error code of the renewal that failed, once one does.
+    async fn ended(&mut self) -> String {
+        (&mut self.ended)
+            .await
+            .unwrap_or_else(|_| "daemon_disconnected".to_owned())
+    }
+}
+
+impl Drop for Renewal {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Said when a renewal failed: `approvals_lost` is a clean end, the tag
+/// taken over or its lease run out; anything else is a failure.
+fn let_go(tag: &str, code: &str) -> i32 {
+    report(json!({"event":code,"tag":tag}));
+    if code == "approvals_lost" { 0 } else { 1 }
 }
 
 fn report(line: Value) {
