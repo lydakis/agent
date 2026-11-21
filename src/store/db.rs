@@ -14729,10 +14729,9 @@ impl Database {
         &mut self,
         turn: i64,
         stop: Halt,
-        retries: u64,
-        paced_ms: u64,
-        summary_ms: u64,
+        (retries, paced_ms, summary_ms): (u64, u64, u64),
         route: Option<&str>,
+        (refilled, refused): (bool, Option<String>),
     ) -> Result<Halted> {
         let bot = self.active(turn)?;
         match bot.status.as_str() {
@@ -14790,8 +14789,8 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: false,
-            refilled: false,
-            refused: None,
+            refilled,
+            refused,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;

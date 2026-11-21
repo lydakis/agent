@@ -775,10 +775,24 @@ impl Turn {
                 .await
         } else if let Some(stop) = stopped {
             let route = accounting.route.get().cloned();
+            // A refusal's recovery goes on from where the halt found it.
+            let full = (
+                accounting.refilled,
+                accounting
+                    .full
+                    .as_ref()
+                    .map(|(error, _)| error.detail.clone().unwrap_or_default()),
+            );
             let parked = self
                 .store
                 .op("suspend_halted", move |db| {
-                    db.suspend_halted(turn, stop, retries, paced_ms, summary_ms, route.as_deref())
+                    db.suspend_halted(
+                        turn,
+                        stop,
+                        (retries, paced_ms, summary_ms),
+                        route.as_deref(),
+                        full,
+                    )
                 })
                 .await;
             // Parked: nothing more to commit, and the service keeps a
