@@ -774,7 +774,7 @@ class AcpTests(ModelFixture):
             return ('ask', {'question': question, 'why': 'It decides the schema.',
                             'options': [{'label': first, 'explanation': f'{first} it is.'},
                                         {'label': second, 'explanation': f'{second} it is.'}],
-                            'recommended': 1, 'reason': 'Simplest.', 'if_unanswered': 'wait'})
+                            'recommended': 1, 'one_way': True})
 
         self.model.call_script = [[asked('Which database?', 'SQLite', 'Postgres'),
                                    asked('Which cache?', 'None', 'Redis')]]
@@ -805,7 +805,7 @@ class AcpTests(ModelFixture):
         database = forms[0]['params']
         self.assertEqual(database['mode'], 'form')
         self.assertEqual(database['message'],
-                         'Which database?\n\nIt decides the schema.\n\nRecommended: SQLite. Simplest.')
+                         'Which database?\n\nIt decides the schema.\n\nRecommended: SQLite.')
         self.assertNotIn('toolCallId', database)
         pick = database['requestedSchema']['properties']['pick']
         self.assertEqual(database['requestedSchema']['required'], ['pick'])
@@ -880,7 +880,7 @@ class AcpTests(ModelFixture):
         def asked(question, first, second):
             return ('ask', {'question': question, 'why': 'It decides the schema.',
                             'options': [{'label': first, 'explanation': ''}, {'label': second, 'explanation': ''}],
-                            'if_unanswered': 'wait'})
+                            'one_way': True})
 
         def ran(bot, prompt):
             deadline = time.monotonic() + 30

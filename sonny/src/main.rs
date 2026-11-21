@@ -6417,9 +6417,6 @@ struct App {
     /// message of their own after them: out of the composer and the
     /// count, their options still answering them.
     aside: Vec<asks::Ask>,
-    /// The line each ask for a step of the person's gave them to run, by
-    /// its call: a click on its card copies it.
-    commands: HashMap<String, String>,
     /// The questions' cards drawn here, by [`asks::Ask::key`]: the number
     /// their rows are tagged with, the ask, and whether a settled one is
     /// open whole.
@@ -8663,7 +8660,6 @@ impl App {
             asks: Vec::new(),
             focus: None,
             aside: Vec::new(),
-            commands: HashMap::new(),
             cards: HashMap::new(),
             card_count: 0,
             cards_kept: 0,
@@ -11676,10 +11672,6 @@ impl App {
                 written.open = !written.open;
             }
             self.draw_written(&key);
-        }
-        if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
-            term::copy(command);
-            self.notice = Some("copied".into());
         }
         if let Some((at, id)) = button
             .strip_prefix("answer/")
@@ -20228,13 +20220,6 @@ impl App {
             );
         }
         marks.extend((card.question).map(|row| (from + row, link(format!("card/{key}")))));
-        // The line to run, a click on it copies.
-        if let Some(command) = &ask.command {
-            marks.extend(
-                (card.command.clone()).map(|row| (from + row, link(format!("copy/{key}")))),
-            );
-            self.commands.insert(key.clone(), command.clone());
-        }
         // Drawn narrower later, as when the margin opens, its bar goes on
         // down every row.
         marks.extend(
@@ -30006,7 +29991,6 @@ mod tests {
             .position(|r| r == "? Tag 0.4.1?")
             .expect("asked");
         assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
-        assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         let at = rows
             .iter()
             .position(|r| r == "✓ Write notes?")
@@ -30344,7 +30328,7 @@ mod tests {
         let step = asks::call(
             "ask:1/c1",
             &json!({"question": "Sign in to the registry?", "why": "Publishing needs it.",
-                "command": "npm login", "if_unanswered": "wait"}),
+                "one_way": true}),
         )
         .unwrap();
         let pick = asks::call(
@@ -30419,7 +30403,7 @@ mod tests {
         app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
         let step = asks::call(
             "ask:1/c1",
-            &json!({"question": "Sign in?", "why": "w", "command": "npm login"}),
+            &json!({"question": "Sign in?", "why": "w", "one_way": true}),
         )
         .unwrap();
         let mut tasks = step.clone();

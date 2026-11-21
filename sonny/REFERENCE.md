@@ -1633,8 +1633,9 @@ has something on it, or is off the screen, no time shows.
   folder is made for it, and a task removes only agents of its own line.
 - **Decisions:** when the lead reaches a fork in the road, an
   architectural choice or a step that cannot be undone, it calls its `ask`
-  tool with the question, why it asks, two to four options each with what
-  picking it means, and the one it recommends and why. Sonny draws the
+  tool with the question, why it asks (and why it recommends what it
+  does), two to four options each with what picking it means, the one it
+  recommends, and whether it is a one-way door. Sonny draws the
   decision in the conversation where it was asked, its words read as
   Markdown with the same renderer a reply uses, and the composer's hint
   names it: a pick answers it (an option's number, or a click on the
@@ -1665,21 +1666,22 @@ has something on it, or is off the screen, no time shows.
   ones, `--all` for every agent, `--json`), so it goes with an answer you
   already gave instead of asking again; the agent reads and decides, and
   nothing matches wording. The lead does not wait on you blindly: each
-  ask says what it does until you answer, and the card's last row says
-  so. It goes on with the option it recommends at once when that can be
-  undone (`Going with 2 meanwhile; another pick undoes it.`), goes on with
-  it at a deadline when it can be undone but you should see it first
-  (`Goes with 2 at 21:30 unless you pick.`), or waits for anything that
+  ask says whether it is a one-way door (`one_way`), and the card's last
+  row says what that means. One that can be undone goes on with the
+  option it recommends once your wait passes (`Goes with 2 at 21:30
+  unless you pick.`), or at once with no wait set (`Going with 2
+  meanwhile; another pick undoes it.`); a one-way door, anything that
   goes out in your name or to other people, approves, merges, deletes or
-  cannot be undone (`Waits for your pick; a reminder at 21:30.`). The
+  cannot be undone, waits (`Waits for your pick; a reminder at 21:30.`).
+  The agent says only which it is; how long it waits is yours. The
   deadline is a one-off automation the tool host sets. `/background`
   lists it as the question, not its gate: `question from halves  21:30`,
   the card's own sentence under it, then the question; it takes no `r`
   or `x`, since it goes once the question is answered, and `enter` opens
   its page with the agent that asked as its first link. It runs
-  `[sonny] ask_wait_minutes` after the ask (60 by default, 0 for none,
-  which makes every ask wait) unless the agent sets its own for work on a
-  clock. Your answer, picked or typed, removes it once the agent
+  `[sonny] ask_wait_minutes` after the ask (60 by default; 0 goes on at
+  once where it can be undone and reminds of no one-way door). Your
+  answer, picked or typed, removes it once the agent
   takes it up, as the agent's close does; it runs nothing once you answer or write to that agent, since the
   conversation moved on, nor for an ask whose call failed and showed no card; when it runs, it is Sonny's words, never yours,
   so it allows nothing that needs your own. Pick another option later and
@@ -1696,9 +1698,8 @@ has something on it, or is off the screen, no time shows.
 - **Steps only you can take:** when an agent needs something only you can
   do, such as signing in or a command that needs your own terminal and
   keyboard (`ssh -t`, a password prompt), it asks with `ask` too, with no
-  options and the exact line to run as `command`. The card shows that line
-  at the text's own weight under `Run this in your own terminal; a click
-  copies it.`, and a click on it copies it. Such an ask always waits
+  options and the exact line to run in its why, as a code block. Such an
+  ask always waits
   (`Waits for you to run it; a reminder at 21:30.`), and what you type next
   says how it went. Run it here with `!` while the question is in focus
   and that answers it too: the agent is given what it printed, as for any
@@ -1707,13 +1708,15 @@ has something on it, or is off the screen, no time shows.
   other, and its lead hears the line to run. Agents no longer send such
   commands to a pane, where they sat unnoticed.
 
-  ![An action card: Sign in to the package registry, why, then npm login --auth-type=web under Run this in your own terminal; a click copies it.](../docs/sonny/action-card.png)
+  ![A step whose line to run is in its why: a bare ! typed and the composer answering “Make the local HTTPS certificate?”](../docs/sonny/ask-step-bang.png)
 
   ![A step to run in focus: the composer answering “Make the local HTTPS certificate?” with !./scripts/dev-cert.sh typed](../docs/sonny/ask-bang-before.png)
 
   ![After the ! run: the card folded to Answered · Ran ! ./scripts/dev-cert.sh · exit 0, the output, the answer and the agent going on](../docs/sonny/ask-bang-after.png)
 
   ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
+
+  ![A decision that can be undone with ask_wait_minutes = 0: Going with 2 meanwhile; another pick undoes it.](../docs/sonny/ask-undoable-now.png)
 
   ![Three decisions: one the lead goes ahead with meanwhile, one that goes ahead at 21:17 unless you pick, and one that waits for you with a reminder](../docs/sonny/ask-meanwhile.png)
 

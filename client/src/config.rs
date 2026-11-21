@@ -65,7 +65,7 @@
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
 //! commons_pointer = false       # a new task's brief names no commons threads sharing its words, on by default
-//! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
+//! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0: go now, no reminder
 //! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! most_task_tabs = 64          # task tabs a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
@@ -717,7 +717,8 @@ pub struct Sonny {
     pub own_sources: Vec<Source>,
     /// How long an `ask` the person has not answered waits, in minutes,
     /// before its agent goes on with what it recommended, where it said
-    /// it could, or is reminded of it; 0 lets every ask wait for them.
+    /// it can be undone, or is reminded of a one-way door; 0 has one
+    /// that can be undone go on at once and reminds of none.
     pub ask_wait_minutes: u64,
     /// Which tasks open in a tab of their own in the lead's multiplexer.
     pub task_tabs: TaskTabs,
