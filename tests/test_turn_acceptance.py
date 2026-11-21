@@ -135,40 +135,48 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         self.assertEqual(all_events(control, 'Bob'), stored)
 
     def test_a_restart_after_a_cut_inside_the_turn_neither_reruns_nor_forgets(self):
-        # Expected: after a kill mid-turn, past at least one cut, the bot
-        # resumes interrupted without a model call or a tool rerun; every
-        # recorded round ran once; the next turn's request carries the
-        # compaction the store holds, the task's prompt whole, and every
-        # call paired with a result.
+        # Expected: after a kill mid-turn, past at least one cut, the next
+        # start continues the turn: its first request carries the compaction
+        # the store holds, the task's prompt whole, and every call paired
+        # with a result; the call the kill caught is answered, never run
+        # again; every round ran at most once and the task finishes; the
+        # next turn's request is whole and paired the same way.
         client = self.client(tools='shell,read,echo', settings={'context_bytes': BUDGET})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'echo'],
                        compaction_instructions='Summarize.')
-        client.request('submit', bot='Bob', request_id='1', prompt='long:40')
+        first = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['message']
         client.receive(lambda m: m.get('event') == 'compacted', timeout=30)
         # A tool that completed after the cut, not one held from before it.
         client.saved.clear()
         client.receive(lambda m: m.get('event') == 'tool_completed', timeout=30)
         client.close(kill=True)
         drain(self.model)
+        before = len(rounds(self.path))
         client = self.client(tools='shell,read,echo', settings={'context_bytes': BUDGET})
-        resumed = client.request('inspect', bot='Bob')['result']
-        self.assertEqual(resumed['status'], 'interrupted')
-        time.sleep(.2)
-        self.assertTrue(self.model.requests.empty())
+        self.assertEqual(client.finished(first, timeout=60)['data']['status'], 'completed')
+        continued = work(drain(self.model))
+        self.assertTrue(all(encoded(r['input']) <= BUDGET for r in continued))
+        texts = users(continued[0])
+        self.assertTrue(texts[0].startswith('[compaction summary, version'))
+        self.assertIn('long:40', texts)
+        paired(self, continued[0])
         events = all_events(client, 'Bob')
-        compacted = [e['data'] for e in events if e['event'] == 'compacted']
-        self.assertTrue(compacted)
-        self.assertEqual(resumed['compaction'], compacted[-1]['version'])
+        retried = [e['data'] for e in events if e['event'] == 'retry']
         completed = [e['data'] for e in events if e['event'] == 'tool_completed']
-        # A call the kill caught before it started is known not to have run.
-        known = [c['call_id'] for c in completed
-                 if not c.get('outcome_unknown') and not c.get('cancelled')]
-        self.assertEqual(known, [f'long-{n}' for n in range(len(known))])
-        self.assertLessEqual(sum(1 for c in completed if c.get('outcome_unknown')), 1)
-        # A call cut short by the kill ran at most once; none ran again.
-        ran = len(rounds(self.path))
-        self.assertIn(ran, (len(known), len(known) + 1))
-        self.assertEqual(rounds(self.path), [str(n) for n in range(ran)])
+        unknown = [c['call_id'] for c in completed if c.get('outcome_unknown')]
+        # The kill caught a call or the model call, never both; a call it
+        # caught is answered once and asked no more.
+        self.assertEqual(len(unknown) + len(retried), 1, (unknown, retried))
+        calls = [c['call_id'] for c in completed if c['call_id'].startswith('long-')
+                 and c['call_id'][5:].isdigit()]
+        self.assertEqual(calls, [f'long-{n}' for n in range(40)])
+        # Each round ran at most once, in order, and every one after the
+        # kill ran.
+        ran = [int(n) for n in rounds(self.path)]
+        self.assertEqual(ran, sorted(set(ran)))
+        self.assertEqual(ran[before:], list(range(ran[before], 40)))
+        self.assertGreaterEqual(len(ran), 39)
+        ran = len(ran)
         turn = client.request('submit', bot='Bob', request_id='2', prompt='tool:next')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = work(drain(self.model))

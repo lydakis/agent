@@ -376,10 +376,25 @@ class Soak:
         started = time.monotonic()
         self.daemon()
         ready_s = round(time.monotonic() - started, 3)
+        # The turns the kill cut off go on and end (a daemon from before
+        # crash continuation ended them at once): wait for each to settle.
+        cut = {bot for (_, bot), turn in zip([b for b in self.bots if b[0] == 'plain'][:16], held) if turn}
+        deadline = time.monotonic() + 120
+        while cut and time.monotonic() < deadline:
+            cut = {bot for bot in cut
+                   if self.control.request('inspect', bot=bot)['result']['status'] in ('running', 'paced')}
+            if cut:
+                time.sleep(.05)
+        settled_s = round(time.monotonic() - started, 3)
         statuses = {}
         for _, name in self.bots:
             state = self.control.request('inspect', bot=name)['result']
             statuses[state['status']] = statuses.get(state['status'], 0) + 1
+        cut_off = {}
+        for (_, bot), turn in zip([b for b in self.bots if b[0] == 'plain'][:16], held):
+            if turn:
+                status = self.control.request('turns', bot=bot)['result']['turns'][-1]['status']
+                cut_off[status] = cut_off.get(status, 0) + 1
         self.control.request('shutdown')
         self.client.close()
         return {'schema': 'soak_v3', 'created_at': datetime.now(timezone.utc).isoformat(),
@@ -392,7 +407,8 @@ class Soak:
                               'n': len(self.cancel_ms)},
                 'follower_mismatches': mismatches, 'slow_followers': slow_status, 'in_flight_at_end': len(self.in_flight),
                 'unfinished_after_drain': unfinished,
-                'restart': {'held': len([h for h in held if h]), 'ready_s': ready_s, 'bot_statuses': statuses},
+                'restart': {'held': len([h for h in held if h]), 'ready_s': ready_s, 'settled_s': settled_s,
+                            'cut_off': cut_off, 'bot_statuses': statuses},
                 'final_sample': final, 'samples': self.samples}
 
 

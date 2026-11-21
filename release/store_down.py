@@ -7,6 +7,7 @@ The daemon brings a store forward by itself when it starts, one schema at a
 time. Each of those steps has its way back here, newest first, so a release
 that knows only SCHEMA opens the store with nothing lost that it can hold:
 
+    112 -> 111  turns no longer count the daemon's process ending under them
     111 -> 110  switches between model families go; each agent stays on
                 the model and history it has now (see back_111)
     110 -> 109  no `profile` on each bot
@@ -31,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import store_lift_yields  # noqa: E402
 
-NEWEST = 111
+NEWEST = 112
 OLDEST = 106
 
 
@@ -51,6 +52,10 @@ def on_lineage(conn, head, node):
         " SELECT EXISTS(SELECT 1 FROM up WHERE id=?2)",
         (head, node),
     ).fetchone()[0] == 1
+
+
+def back_112(conn):
+    run(conn, "ALTER TABLE turns DROP COLUMN restarts; ALTER TABLE turns DROP COLUMN restart_head")
 
 
 def back_111(conn):
@@ -121,7 +126,7 @@ def back_107(conn):
 
 
 # Each schema's way back to the one before it.
-BACK = {111: back_111, 110: back_110, 109: back_109, 108: back_108, 107: back_107}
+BACK = {112: back_112, 111: back_111, 110: back_110, 109: back_109, 108: back_108, 107: back_107}
 
 
 def down(store, to, dry=False):

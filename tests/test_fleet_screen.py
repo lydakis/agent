@@ -78,9 +78,12 @@ class FleetScreenTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires built Rust runtime')
 class FleetRestartTests(unittest.TestCase):
-    def test_restart_recovers_held_turns_for_single_and_full_wave_fleets(self):
+    def test_restart_continues_held_turns_for_single_and_full_wave_fleets(self):
         root = Path(__file__).resolve().parent.parent
-        for bots, limit in ((1, 0), (8, 0), (8, 2)):
+        # 600 cut off at once publish past the store's channel of 1,024
+        # before the daemon serves anyone: each turn's continuation writes
+        # more than one event.
+        for bots, limit in ((1, 0), (8, 0), (8, 2), (600, 600)):
             with self.subTest(bots=bots, limit=limit), tempfile.TemporaryDirectory(dir=root/'.local') as d:
                 screen = Screen(root/'.local/target/release/agent', Path(d), bots=bots,
                                 max_active=limit, model=None, parked=0, delay_ms=0)
@@ -95,10 +98,11 @@ class FleetRestartTests(unittest.TestCase):
                     expected = min(limit or bots, bots)
                     self.assertIsNotNone(original.process.poll())
                     self.assertEqual(phase['in_flight_at_kill'], expected)
-                    self.assertEqual(phase['bot_statuses'].get('interrupted'), expected)
+                    # The daemon continues each turn the kill cut off.
+                    self.assertEqual(phase['cut_off'], {'completed': expected})
                     for i in range(expected):
                         row = screen.client.request('turns', bot=f'b{i}')['result']['turns'][-1]
-                        self.assertEqual(row['status'], 'interrupted')
+                        self.assertEqual(row['status'], 'completed')
                     # Recovery releases the active slots for new work.
                     self.assertEqual(screen.run_all('after', 'delay:0')['completed'], bots)
                 finally:
