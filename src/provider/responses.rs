@@ -184,6 +184,8 @@ impl State {
         }
         let code = if named(super::quota) {
             "provider_quota_exhausted"
+        } else if named(super::context_full) {
+            super::CONTEXT_FULL
         } else if named(super::plan_unavailable) {
             "provider_plan_unavailable"
         } else if rate_limited || named(|code| code == "slow_down") {
@@ -595,6 +597,14 @@ mod tests {
             .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached."}}}"#)
             .unwrap_err();
         assert_eq!(spent.code, "provider_quota_exhausted");
+        // Past the window, as a failed response or a top-level error event.
+        for frame in [
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}}"#,
+            r#"{"type":"error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model.","param":"input"}"#,
+        ] {
+            let full = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(full.code, super::super::CONTEXT_FULL, "{frame}");
+        }
         let unavailable = State::default()
             .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_unavailable","message":"Try again later."}}}"#)
             .unwrap_err();

@@ -17,7 +17,7 @@
 //! *** Delete File: path
 //! *** End Patch
 //! ```
-use super::{FILE_BYTES, files};
+use super::files;
 use crate::{Error, Result, sandbox::Policy};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -82,9 +82,6 @@ pub struct Patch {
 fn invalid(line: usize, detail: impl std::fmt::Display) -> Error {
     Error::with("invalid_patch", format!("line {line}: {detail}"))
 }
-
-/// The most a patch's changed files may hold together while it is staged.
-const STAGED_BYTES: usize = 16 * FILE_BYTES;
 
 /// A path as the file it names: `./f` and `d/../f` are `f`.
 fn file_key(path: &str) -> PathBuf {
@@ -279,13 +276,11 @@ impl Patch {
     /// refused, as the `read` tool refuses it.
     pub async fn stage(&self, workspace: &Path, hidden: &[std::path::PathBuf]) -> Result<Staged> {
         let mut writes = Vec::new();
-        let mut staged = 0;
         let mut summary = String::from("Success. Updated the following files:\n");
         for change in &self.changes {
             match change {
                 Change::Add { path, contents } => {
                     writable(workspace, path).await?;
-                    staged += contents.len();
                     writes.push(Write::Put(workspace.join(path), contents.clone(), None));
                     summary.push_str(&format!("A {path}\n"));
                 }
@@ -306,31 +301,19 @@ impl Patch {
                     chunks,
                 } => {
                     let source = workspace.join(path);
-                    let bytes = files::read_bounded(&source, hidden).await?;
-                    let text = String::from_utf8(bytes)
-                        .map_err(|_| Error::with("file_not_utf8", path.clone()))?;
-                    // Matching can take a while on a long file: off the
-                    // runtime's thread.
+                    let mut opened = files::open_std(&source, hidden).await?;
+                    // Reading, checking and matching grow with the file: in
+                    // one job off the runtime's thread.
                     let (chunks, name) = (chunks.clone(), path.clone());
-                    let updated =
-                        tokio::task::spawn_blocking(move || update(&text, &chunks, &name))
-                            .await
-                            .map_err(|_| {
-                                Error::with(
-                                    "invalid_patch",
-                                    format!("{path}: could not be matched"),
-                                )
-                            })??;
-                    if updated.len() > FILE_BYTES {
-                        return Err(Error::with("tool_output_limit", path.clone()));
-                    }
-                    staged += updated.len();
-                    if staged > STAGED_BYTES {
-                        return Err(Error::with(
-                            "tool_output_limit",
-                            "the files a patch changes hold at most 64 MiB together",
-                        ));
-                    }
+                    let updated = tokio::task::spawn_blocking(move || {
+                        let text = String::from_utf8(files::read_std(&mut opened)?)
+                            .map_err(|_| Error::with("file_not_utf8", name.clone()))?;
+                        update(&text, &chunks, &name)
+                    })
+                    .await
+                    .map_err(|_| {
+                        Error::with("invalid_patch", format!("{path}: could not be matched"))
+                    })??;
                     match move_to {
                         Some(to) => {
                             writable(workspace, to).await?;

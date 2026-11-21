@@ -12626,3 +12626,177 @@ keeps the daemon at speed, where full spends each commit waiting on the
 drive. The cost: a crash of the machine or a power loss can lose the
 commits made since the last checkpoint. A crash of the daemon loses
 nothing in either mode, and the store is never corrupted.
+
+## Continuing turns after a crash
+
+2026-11-21, Linux x86_64 cloud VM, 4 CPUs. Base is main at db1ec0b, head the
+crash-continuation change; both built `--release --locked --bin agent` in
+their own worktree and target folder, copied together, with each binary's
+page cache dropped before each run.
+
+Low end, the Perf workflow's daemon screens, two alternating rounds (Sonny's
+screen left to CI). Store work per turn is the same on both sides.
+
+| Bench | Measure | Base | Head |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 44.9 | 46.5 |
+| admission | burst submit p99, ms | 5.20 | 5.11 |
+| completion | release to terminal p99, ms | 12.6 | 13.6 |
+| footprint | idle RSS, MiB | 20.8 | 20.6 |
+| footprint | per idle bot, KiB | 1.33 | 1.28 |
+| footprint | RSS after a turn each, MiB | 35.8 | 37.9 |
+| footprint | CPU per turn, ms | 0.94 | 0.95 |
+| lifecycle, 32 bots | CPU, s | 0.67 | 0.68 |
+| lifecycle | p95 turn, ms | 588 | 585 |
+| lifecycle | peak RSS, MiB | 28.1 | 28.4 |
+
+High end, `bench.fleet_screen --bots 10000 --max-active 1024`, two runs a
+side (base, head, head, base). The restart phase kills the daemon with 1,024
+turns held in their model call.
+
+| Phase | Measure | Base | Head |
+| --- | --- | ---: | ---: |
+| create | 10,000 bots, s | 12.3 / 11.4 | 12.0 / 14.3 |
+| burst | 10,000 turns, s | 22.1 / 22.7 | 22.8 / 24.2 |
+| burst | p95, ms | 515 / 515 | 516 / 517 |
+| park | 5,000 parked RSS, MiB | 45.0 / 45.5 | 43.3 / 43.2 |
+| park | drain, s | 5.2 / 5.2 | 5.4 / 5.2 |
+| restart | ready, s | 0.49 / 0.64 | 0.04 / 0.04 |
+| restart | the 1,024 cut-off turns | ended interrupted | continued, completed |
+| restart | until all settled, s | 0.74 / 0.99 | 2.4 / 3.5 |
+| restart | RSS once settled, MiB | 20.0 / 20.1 | 39.9 / 45.6 |
+
+Ready comes sooner because the continuation runs after the daemon greets
+its clients and before it serves them, where main ended the turns before
+the greeting. Settling takes longer and ends with more memory because head
+does more: each of the 1,024 turns parks, waits its first backoff, asks the
+model again and finishes, where main only marks them ended. That RSS is the
+same order as after any 1,024-turn wave (the park phase's drain).
+
+The first high-end run found a hang, fixed before these numbers: the
+store's publication channel holds 1,024 entries, its reader started after
+the startup call, and continuing more than about 500 turns there filled it.
+
+## No bound on a whole provider reply (#1269)
+
+2026-11-21, Linux x86_64 cloud VM, 4 CPUs. Main is `db1ec0b`, copied when
+the change was built; each binary's page cache is dropped before each run,
+and the sides alternate. The change drops the running total that read_body
+and the socket loop kept and checked per chunk, and raises the bound on one
+event (an SSE frame or a WebSocket message) from 16 to 64 MiB. Neither
+bound allocates up front: a buffer grows only as an event arrives.
+
+### Matched screen (perf gate's benches, alternating, five rounds)
+
+| Bench | Measure | Main | Change |
+| --- | --- | ---: | ---: |
+| lifecycle, 32-bot socket echo | CPU, s | 0.78 | 0.76 |
+| lifecycle | p95 turn, ms | 591 | 594 |
+| lifecycle | peak RSS, MiB | 28.6 | 28.4 |
+| completion_burst | release to terminal p99, ms | 15.0 (12.2 to 17.2) | 14.5 (11.5 to 22.0) |
+| admission_burst | lone submit CPU, ms | 48.0 | 47.3 |
+| admission_burst | burst submit p99, ms | 6.16 | 6.20 |
+| footprint | idle RSS, MiB | 20.8 | 20.2 |
+| footprint | per idle bot, KiB | 1.21 | 1.21 |
+| footprint | RSS after a turn each, MiB | 36.2 | 35.1 |
+| footprint | CPU per turn, ms | 1.09 (0.99 to 1.34) | 1.08 (0.99 to 1.25) |
+
+### High end: 10,000 bots, one turn each (medians)
+
+| Measure | Main | Change |
+| --- | ---: | ---: |
+| idle PSS, MiB (5 runs) | 18.6 | 18.7 |
+| PSS after 10,000 bots (5 runs) | 20.9 | 20.9 |
+| PSS after a turn each (5 runs) | 40.2 (34.1 to 42.2) | 39.8 (38.1 to 41.0) |
+| RSS after a turn each, MiB (7 runs) | 41.9 (35.9 to 44.0) | 41.5 (39.9 to 43.0) |
+| CPU per turn, ms (7 runs) | 1.15 | 1.15 |
+
+Store work per turn matched on every run. The first two rounds of the
+first screen read the change 6% slower on completion p99 and 10% on burst
+submit p99; over all five rounds those read -4% and +0.6%, and every
+range overlaps main's.
+## Summarize and retry once on a full context window (#1273)
+
+2026-11-21, Linux x86_64 cloud VM, 4 CPUs. The perf gate's benches
+(`bench/perf_gate.py`), base (main at db1ec0b, a fresh build) and head
+(31f71f3) alternating, two rounds each. Later commits on the pull request
+change only the refusal path. Sonny's screen was not run: the change
+touches no Sonny code.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.465 | 43.248 | -0.5% |
+| admission | burst submit p99, ms | 5.451 | 5.189 | -4.8% |
+| completion | release to terminal p99, ms | 12.839 | 13.52 | +5.3% |
+| footprint | idle RSS, MiB | 17.371 | 17.619 | +1.4% |
+| footprint | per idle bot, KiB | 1.926 | 1.688 | -12.4% |
+| footprint | RSS after a turn each, MiB | 33.133 | 32.42 | -2.2% |
+| footprint | CPU per turn, ms | 0.89 | 0.957 | +7.5% |
+| lifecycle | CPU, s | 0.665 | 0.675 | +1.5% |
+| lifecycle | p95 turn, ms | 586.673 | 586.689 | +0.0% |
+| lifecycle | peak RSS, MiB | 26.898 | 27.051 | +0.6% |
+
+Store work per turn is the same on both sides, and no timed measure passes
+the gate's warning (a median 15% past the base's with every head run worse
+than every base run): the moves are within run-to-run noise. A call the
+provider answers takes no new work; the new steps run only on a refusal.
+
+## Tools without caps Codex and Pi don't share
+
+2026-11-21, Linux x86_64 cloud VM, 4 CPUs. Main is `0bd642d`, built
+beside the change; each binary's page cache is dropped before each run,
+and the sides alternate.
+
+### Matched screen (perf gate's benches, alternating, five rounds)
+
+| Bench | Measure | Main | Change |
+| --- | --- | ---: | ---: |
+| lifecycle, 32-bot socket echo | CPU, s | 0.75 | 0.75 |
+| lifecycle | p95 turn, ms | 590 | 588 |
+| lifecycle | peak RSS, MiB | 28.3 | 28.7 |
+| completion_burst | release to terminal p99, ms | 14.4 | 14.3 |
+| admission_burst | lone submit CPU, ms | 44.3 | 44.6 |
+| admission_burst | burst submit p99, ms | 6.04 | 5.89 |
+| footprint (13 rounds) | idle RSS, MiB | 20.3 | 20.6 |
+| footprint | RSS after a turn each, MiB | 34.7 (32.3 to 42.0) | 36.2 (33.6 to 40.1) |
+| footprint | CPU per turn, ms | 1.09 | 1.12 |
+
+None of these benches calls a tool this change touches. Footprint's
+reading after a turn each moves with the allocator from run to run, so it
+was run again with anonymous PSS from `smaps_rollup` (8 rounds each,
+alternating which side ran first), and against an A/A of two copies of
+main's binary:
+
+| Pair | Anonymous PSS after a turn each, MiB | PSS after a turn each, MiB |
+| --- | ---: | ---: |
+| main, main's copy (A/A) | 16.1 / 16.6 | 33.0 / 33.9 |
+| main, change | 15.5 / 16.5 | 32.7 / 34.1 |
+
+Two identical binaries differ by as much as main and the change do. At
+10,000 bots (2 runs each) the change read PSS after a turn each of 37.9
+and 39.7 MiB against main's 38.9 and 39.9, and 1.08 to 1.24 ms CPU per
+turn against 1.12 to 1.13.
+
+### The tools themselves (`Registry::execute`, release build, five rounds)
+
+Files of 100, 25,000 and 95,000 lines (4 KiB, 1 MiB, 3.8 MiB, under
+main's 4 MiB bound); `read` asks for 200 lines, and `edit` makes one
+replacement.
+
+| Call | Main, µs | Change, µs |
+| --- | ---: | ---: |
+| read, small | 541 | 158 |
+| read, medium, first page | 2,129 | 1,109 |
+| read, medium, last page | 2,383 | 1,080 |
+| read, large, first page | 6,121 | 3,245 |
+| read, large, last page | 7,671 | 2,752 |
+| edit, small | 970 | 676 |
+| edit, medium | 2,938 | 2,268 |
+| edit, large | 14,950 | 7,058 |
+
+`read` pages the file on one blocking job instead of reading it whole
+through Tokio's file, which takes a trip to the blocking pool for each
+piece; `edit` reads, matches and replaces in one blocking job. A first
+revision of `edit` read the file through Tokio and matched on a job of
+its own: 10% slower than main on small and medium files, so it was
+changed to this one.

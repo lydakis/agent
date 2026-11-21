@@ -27,8 +27,8 @@ use agent_runtime::{
         Waiting, Wake,
     },
     tools::{
-        ANSWER_BYTES, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Prepared, Registry, ToolList,
-        is_digest,
+        ANSWERED_ARGUMENTS, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Prepared, Registry,
+        ToolList, is_digest,
     },
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -64,8 +64,9 @@ const FIELDS_JSON: usize = 1024;
 /// One gate in JSON without its tools: a tag at the name limit (plain
 /// ASCII, never escaped), the keys, the longest expiry, and a separator.
 const GATE_JSON: usize = 192;
-/// The longest a fork may sit idle before the daemon deletes it.
-const MAX_EXPIRE_MS: u64 = 7 * 24 * 3600 * 1000;
+/// The longest a fork may sit idle before the daemon deletes it: as long
+/// as a hold, the longest any wait lasts.
+const MAX_EXPIRE_MS: u64 = agent_runtime::store::HOLD_MAX_MS;
 /// Idle bots whose time ran out but which still have work, such as a
 /// command they started or a queued turn, are looked at again this often.
 const EXPIRY_RETRY: Duration = Duration::from_secs(60);
@@ -1570,6 +1571,10 @@ pub struct Configuration {
     /// The most generations below the bot that starts its line a `create`
     /// or `fork` may make a bot at; none by default.
     pub max_depth: Option<u64>,
+    /// The times in a row the daemon's process may end while a turn runs,
+    /// with nothing recorded between, before the next start ends that turn
+    /// rather than continuing it; none never ends one for it.
+    pub max_restarts: Option<u32>,
     /// How far each commit is on the disk when it is answered; `Full` by
     /// default.
     pub durability: agent_runtime::store::Durability,
@@ -2815,6 +2820,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "readers":limits.readers,"connections":limits.connections,
             "load":(limits.load > 0.0).then_some(limits.load),
             "idle_exit_seconds":config.idle_exit,"depth":config.max_depth,
+            "restarts":config.max_restarts,
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
@@ -2883,6 +2889,18 @@ pub async fn run(config: Configuration) -> Result<()> {
                 ends.call_ended(turn, call_id)
             }));
             Ok(())
+        })
+        .await?;
+    // Turns the process left running when it ended unplanned go on, a model
+    // call it cut off asked again after its first backoff. Once the
+    // publisher runs, so their events, several a turn, never fill its
+    // channel; no request is served before the run loop starts below.
+    let max_restarts = config.max_restarts;
+    store
+        .call(move |db| {
+            db.continue_cut_off(max_restarts, |turn| {
+                turn::backoff(1, turn as u64).as_millis() as u64
+            })
         })
         .await?;
     if let Some(gate) = registry.load_gate() {
@@ -3518,18 +3536,31 @@ pub async fn run(config: Configuration) -> Result<()> {
     answer_observed(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
-    // A planned stop parks each running turn for the next start; a fatal
-    // error ends it, as a crash would, so a failing daemon never brings a
-    // turn back on its own.
+    // A planned stop parks each running turn for the next start. A fatal
+    // error leaves them as a crash would, with nothing more written: the
+    // next start continues each, counted against its restart limit
+    // (`continue_cut_off`), so a daemon that keeps failing under a turn
+    // ends it rather than bringing it back forever.
     let planned = served.is_ok();
-    let cause = if planned { turn::SHUTDOWN } else { turn::DIED };
     for active in service.active.drain() {
-        active.cancel(cause);
+        if planned {
+            active.cancel(turn::SHUTDOWN);
+        }
+    }
+    if !planned {
+        service.jobs.abort_all();
     }
     // A completion that could not commit leaves its turn for the next start
-    // to end as interrupted; the rest still drain, and the exit reports it.
+    // to continue; the rest still drain, and the exit reports it.
     let mut failed = None;
     while let Some(result) = service.jobs.join_next().await {
+        if result
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled)
+            && !planned
+        {
+            continue;
+        }
         let completed = match result.map_err(|_| Error::new("turn_task_failed")) {
             Ok((bot, turn, task, exit)) => service.complete(bot, turn, task, exit).await,
             Err(error) => Err(error),
@@ -4685,47 +4716,23 @@ impl Service {
     /// Check the calls a message lifted, by their commands: see
     /// [`turn::Lifts::check`].
     /// A client's output for a call it answers, as the model reads it:
-    /// bounded as an answer is, its pictures checked, its words redacted.
+    /// its pictures checked, its words redacted and, past the preview, cut
+    /// to a head and tail.
     async fn answer_output(&self, output: ToolOutput) -> Result<Outcome> {
         use agent_runtime::codec::Part;
         Ok(match output {
-            ToolOutput::Text(output) if output.len() > ANSWER_BYTES => {
-                return fail_with(
-                    "tool_output_limit",
-                    format!("output may be up to {ANSWER_BYTES} bytes"),
-                );
+            ToolOutput::Text(output) => {
+                Outcome::text(self.registry.answered(vec![output]).await?.remove(0))
             }
-            ToolOutput::Text(output) => Outcome::text(self.registry.redact_text(output)),
             ToolOutput::Parts(parts) => {
-                let words: usize = parts
-                    .iter()
-                    .map(|part| match part {
-                        Part::Text { text } => text.len(),
-                        Part::Image(_) => 0,
-                    })
-                    .sum();
-                if words > ANSWER_BYTES {
-                    return fail_with(
-                        "tool_output_limit",
-                        format!("output's text may be up to {ANSWER_BYTES} bytes"),
-                    );
-                }
-                let parts = images_checked(
+                let mut parts = images_checked(
                     parts,
                     |parts| parts.iter().filter_map(Part::image).collect(),
                     "a tool result",
                 )
                 .await?;
-                let mut parts: Vec<Part> = parts
-                    .into_iter()
-                    .map(|part| match part {
-                        Part::Text { text } => Part::Text {
-                            text: self.registry.redact_text(text),
-                        },
-                        image => image,
-                    })
-                    .collect();
-                // Words before the first picture are the output.
+                // Words before the first picture are the output; none
+                // when a picture comes first.
                 let output = match parts.first_mut() {
                     Some(Part::Text { text }) => {
                         let text = std::mem::take(text);
@@ -4734,6 +4741,19 @@ impl Service {
                     }
                     _ => String::new(),
                 };
+                let texts = std::iter::once(output)
+                    .chain(parts.iter_mut().filter_map(|part| match part {
+                        Part::Text { text } => Some(std::mem::take(text)),
+                        Part::Image(_) => None,
+                    }))
+                    .collect();
+                let mut shown = self.registry.answered(texts).await?.into_iter();
+                let output = shown.next().unwrap_or_default();
+                for part in &mut parts {
+                    if let Part::Text { text } = part {
+                        *text = shown.next().unwrap_or_default();
+                    }
+                }
                 Outcome {
                     parts,
                     ..Outcome::text(output)
@@ -7132,13 +7152,12 @@ impl Service {
                                 "an error's code is 1 to 64 lowercase letters, digits or _",
                             );
                         }
-                        if detail.as_ref().is_some_and(|d| d.len() > ANSWER_BYTES) {
-                            return fail_with(
-                                "tool_output_limit",
-                                format!("detail may be up to {ANSWER_BYTES} bytes"),
-                            );
-                        }
-                        let detail = detail.map(|d| self.registry.redact_text(d));
+                        let detail = match detail {
+                            Some(detail) => {
+                                Some(self.registry.answered(vec![detail]).await?.remove(0))
+                            }
+                            None => None,
+                        };
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
@@ -7240,10 +7259,10 @@ impl Service {
                         "no step runs while the daemon is held; ask again after resume",
                     );
                 }
-                if serde_json::to_vec(&arguments)?.len() > ANSWER_BYTES {
+                if serde_json::to_vec(&arguments)?.len() > ANSWERED_ARGUMENTS {
                     return fail_with(
                         "step_arguments_limit",
-                        format!("arguments may be up to {ANSWER_BYTES} bytes"),
+                        format!("arguments may be up to {ANSWERED_ARGUMENTS} bytes"),
                     );
                 }
                 let stepping = Stepping {
@@ -7322,10 +7341,10 @@ impl Service {
                 // time stops while it runs, so no clock kills it.
                 let bounded = arguments.get("timeout_ms").is_some();
                 let arguments = serde_json::to_string(&arguments)?;
-                if arguments.len() > ANSWER_BYTES {
+                if arguments.len() > ANSWERED_ARGUMENTS {
                     return fail_with(
                         "step_arguments_limit",
-                        format!("arguments may be up to {ANSWER_BYTES} bytes"),
+                        format!("arguments may be up to {ANSWERED_ARGUMENTS} bytes"),
                     );
                 }
                 // Read as the call would be: a step that reads anything but
@@ -7573,7 +7592,7 @@ impl Service {
                 }
                 let budget_counts = counts(budget_tokens, budget_counts)?;
                 if expire_ms.is_some_and(|ms| !(1000..=MAX_EXPIRE_MS).contains(&ms)) {
-                    return fail_with("invalid_expire", "expire_ms is from 1 s to 7 days");
+                    return fail_with("invalid_expire", "expire_ms is from 1 s to 365 days");
                 }
                 if let Some(key) = &request_id {
                     name("request_id", key)?;
@@ -10598,7 +10617,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })
@@ -10662,7 +10696,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })
@@ -10702,7 +10751,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })

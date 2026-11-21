@@ -668,6 +668,7 @@ keeps what it started with; the next start takes a change.
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count; a connection that sends no bytes at all, keepalives included, fails sooner, after 2 minutes. Whole seconds, `1s` to `24h`. `[daemon] stall_timeout` in `~/.agent/config.toml` sets it, as a duration such as `"15m"`. | `10m` |
 | `--max-depth` | How many generations below the bot that starts its line `create` and `fork` may make a bot (Codex's `agents.max_depth`). A bot made with no creator, or with `starts_line`, is at 0; one another bot creates is one below its creator; a fork its source makes stands where its source does, and one another bot makes is one below that bot. Each bot keeps its `depth`, so the check reads only its creator's row. Past the bound, `depth_limit`, with `depth` and `max_depth`, and nothing made; a resend of a keyed creation still answers with the bot it made. Zero is unbounded. Reported in `ready` as `limits.depth`, `null` for none (protocol 52). | none (the agent CLI passes `[daemon] depth`, 2 by default) |
+| `--restarts` | How many times in a row the daemon's process may end unplanned while a turn runs, with nothing recorded for it between, before the next start ends that turn `process_interrupted` rather than continuing it, for a bot that sets no `max_restarts` of its own ([Durable state and recovery](#durable-state-and-recovery)); Pi Durable's `restartLimit`. Zero continues it always. `[daemon] restarts` sets it. Reported in `ready` as `limits.restarts`, `null` for none. | 5 |
 | `--durability` | How far each commit is on the disk when it is answered: `full` syncs it first, `normal` syncs at checkpoints, faster on a busy disk, and a crash of the machine or its power can lose the last commits ([Durable state and recovery](#durable-state-and-recovery)). `[daemon] durability` sets it. Reported in `ready` as `durability`. | `full` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
@@ -700,6 +701,7 @@ when it sets either.
 | `post_turn_compact_percent` (`--post-turn-compact-percent`) | The soft limit: percent of the model's context window at which a turn that ends on its reply is summarized then, [after the turn](#summaries-after-the-turn), rather than mid-turn once a call reaches `compact_tokens`, the hard limit. At most the hard limit; like `compact_tokens` it needs the view's token estimate. 0 to 100; 0 leaves only the hard limit. Codex's `model_post_turn_compact_threshold_percent`. | 70 |
 | `max_rounds` (`--max-rounds`) | Model calls each turn may make; the last goes with no tool call allowed, and the turn fails `tool_round_limit` past it. | none |
 | `max_drops` (`--max-drops`) | Replies in a row the model's own output cap may cut short in a turn; each before the last is dropped and the model told, and the last ends the turn `provider_incomplete`. | 3 |
+| `max_restarts` (`--max-restarts`) | Times in a row the daemon's process may end unplanned while one of its turns runs, with nothing recorded for it between, before the next start ends that turn `process_interrupted` rather than continuing it ([Durable state and recovery](#durable-state-and-recovery)). 0 continues it always. | the daemon's `--restarts` (5) |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_policy` (`--approval never`) | `never`: a call a gate would hold is refused with `approval_refused` and no one is asked, as Codex's `approval_policy = "never"` refuses what would need approval; the bot keeps its gates, so what they name is what it refuses, and a call its sandbox confines still runs inside it. A bot another made takes its creator's `never`, and it can't be configured away from a bot whose creator never asks (see [tool approval](#tool-approval)). | none (ask) |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
@@ -1252,9 +1254,11 @@ the daemon's own on one reply (the model's own output cap bounds it; see
 tool call id without NUL, unique within its turn (a longer one, one with a
 NUL, or one an earlier call of the response or turn used fails the response
 with `invalid_tool_call_id`, so every gated call can be listed and answered
-by a command naming it alone), a 16 MiB response stream, over HTTP or a
-socket, which also bounds one SSE frame (an endpoint that never stops; no
-model writes that much), and the configurable
+by a command naming it alone), 64 MiB for one event of a response (an SSE
+frame or a WebSocket message, held whole until it ends; Codex's WebSocket
+message bound), no bound on a whole response (as in Codex and Pi: the model's
+output cap ends it, and a stream that stops sending content stalls out), and
+the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission, when bounded, has a 60-second timeout and releases its permit when
 response headers arrive. Both live providers hold headers until the first
@@ -1373,9 +1377,9 @@ the turn parks, and its retry count starts over when it continues. The time the 
 was down is not counted in `paced_ms`. A client's `wait` still open is
 answered as its deadline would answer it, the parked turn reported pending
 as it stands. Background commands and terminals end with the daemon as
-before. Only a planned stop parks: a daemon that exits on a fatal error ends
-its running turns `interrupted` with `process_interrupted`, as a crash would,
-and leaves its waits unanswered. A panic inside one turn is not fatal: that
+before. A daemon that exits on a fatal error writes nothing more for its
+running turns and leaves its waits unanswered, as a crash would: the next
+start continues them ([Durable state and recovery](#durable-state-and-recovery)). A panic inside one turn is not fatal: that
 turn alone fails with `turn_panicked` and the panic's words, and the daemon
 and its other turns go on. A park says which halt held it in the
 turn's `waiting` record (`halt`: `pause` or `shutdown`); schema 74 moves a
@@ -2472,24 +2476,42 @@ committed before execution and the result before continuing the model loop. A
 completed checkpoint and terminal event are committed together before emitting
 completion.
 
-On recovery, unfinished active turns are marked interrupted and their bots
-accept new work. Every unanswered tool call receives a durable result: a
-planned call is cancelled before execution; an executing call with no committed
-result receives `tool_outcome_unknown`. Its effects may already have happened,
-and execution may still be running. The model sees this in history and can
-inspect current state before deciding what to do. The same rule applies to
-explicit cancellation and other terminal failures. Uncertainty never blocks the
-named bot, and no external request or tool is automatically repeated. Existing
-queued work remains eligible to start. Explicitly stopped turns stay stopped.
+On recovery, a turn the daemon was running when its process ended unplanned
+(a crash, a kill, a fatal error) goes on, as Pi Durable continues a task its
+host was cut off in (schema 112). It parks at a model-call boundary as a
+planned stop parks it, and the daemon resumes it as capacity allows. Every
+unanswered tool call receives a durable result, `{error:
+"process_interrupted", detail}`: a planned call did not run (its
+`tool_completed` says `cancelled`); an executing call's effects may already
+have happened, and execution may still be running (`outcome_unknown`). The
+model sees this in history and can inspect current state before deciding what
+to do. No tool is run again. A turn cut off after its final reply was
+recorded, before its end was, ends `completed` as it would have, its model not
+asked again. A turn with no call open was waiting on its
+model, or about to ask it: that call counts as a failed attempt, announced as
+a `retry` (`attempt: 1`, `error: "process_interrupted"`, its `delay_ms`), and
+is asked again after the first backoff, the turn's `turn_paced` and
+`waiting_on` saying `{"resume_at_ms": AT, "retrying": "process_interrupted"}`.
+Both events carry `restarts`, the times in a row the process ended under the
+turn with nothing recorded for it between (its bot's history where the last
+one left it). At the bot's `max_restarts`, else the daemon's `--restarts` (5 by
+default, `[daemon] restarts`; 0 never),
+the next start ends the turn instead, `interrupted` with
+`process_interrupted`, its detail saying so and `restarts` beside it: a turn
+whose request kills the daemon ends rather than looping. Its calls are then
+answered as terminal failures answer them: a planned call is cancelled; an
+executing one receives `tool_outcome_unknown`. Uncertainty never blocks the
+named bot. Queued work behind a continued turn waits for it, as it would
+have; behind an ended one it is eligible to start. Explicitly stopped turns
+stay stopped.
 
 An interrupted turn's `turn_finished` error names the cause, so a client can
-decide whether to resubmit: `cancelled` for a client's `interrupt`
-and `process_interrupted` when the daemon died with it running and the next
-open ended it, or stopped on a fatal error, such as a store that refuses
-writes, and ended it on the way out. The daemon never continues such a turn on its own. A turn the
-daemon was asked to stop around (`shutdown` or a signal) is not interrupted:
-it parks as a pause parks it, each call still open answered `daemon_shutdown`,
-and continues at the next start; the time down is not pacing.
+decide whether to resubmit: `cancelled` for a client's `interrupt`, and
+`process_interrupted` when the daemon's process ended under it
+that many times in a row. A turn the daemon was asked to stop around
+(`shutdown` or a signal) is not counted: it parks as a pause parks it, each
+call still open answered `daemon_shutdown`, and continues at the next start;
+the time down is not pacing.
 
 `inspect` reports the identity's state and changes nothing; no operation
 automatically continues an interrupted network request. A new submission is an
@@ -2593,7 +2615,8 @@ the request from the store: within 5 minutes, up to 8 attempts for capacity
 (any 5xx, as `_should_retry` in anthropic-sdk-python 4421d56 treats it,
 observed 2026-09-26), transport failures, or a stalled stream and up to 64 for refusals for pace, which the pool
 spaces and which are not the request's fault; never for a response the model
-could not finish (`provider_incomplete`) or a client error. The providers'
+could not finish (`provider_incomplete`) or a client error. A view past the
+model's window is sent once more after a summary instead (see below). The providers'
 reset headers are only how long a full refill takes; the pool learns the level
 and refills continuously, so it never idles waiting for a reset. Rate limits wait on
 the pool; other transient failures back off from 250 ms doubling to 30 s with
@@ -2647,9 +2670,38 @@ call, which reads it. The cap cutting `max_drops` replies of a turn in a row
 facts on its `turn_finished`, since each can cost a whole reply's output. The
 turn keeps the count, so a park or a restart counts on; a reply it keeps sets
 it back to none. The daemon puts
-no bound of its own on a reply under the 16 MiB response stream: events carry
+no bound of its own on a reply: events carry
 previews of calls (2 KiB of arguments), text streams live in pieces of at most
 128 KiB, and a history read answers `item_too_large` for one item past a line.
+
+### Views past the model's window
+
+A provider's refusal of a request as past the model's context window ends in
+one code, `provider_context_full`, read only from typed signals, never from a
+message's words: OpenAI's `context_length_exceeded` (a 400, a failed stream
+or a socket `error` event, as Codex reads it), Anthropic's
+`model_context_window_exceeded` stop, whose reply is dropped, and any HTTP
+413, a request past the endpoint's size limit (Anthropic's
+`request_too_large`). Anthropic's and Bedrock's refusal of an input past the
+window names no code, only words, so it stays `provider_http_400`.
+
+The refused view then counts as one that fills the window, as Codex marks
+the window full: the bot's token estimate takes its bytes for the model's
+whole window, so the threshold falls under it. The turn says so in a `retry`
+event (`error: "provider_context_full"`, `compact: true`), and its next
+boundary summarizes before the call, whatever the view measures, with
+`trigger.reason` `context_full`; the call then goes once more, as Pi Durable
+compacts and asks again. A boundary that makes no room (nothing to summarize
+or elide, or no compaction instructions) ends the turn on the refusal, and so
+does a second refusal of the same call. A park between the refusal and that
+second call, on a rate limit for the summary or the call, a pause or a
+stop, keeps where the turn was. That summary keeps its shares of the
+refused view, also for a bot whose token threshold is off. The estimate
+stays, so a bot with a token threshold summarizes before its next turn's
+first call; the next answered call sets it from what the provider counted. A
+view the estimate puts at the window or past it never goes beside its
+summary, as Codex compacts before such a call. Neither step adds work to a
+call the provider answers.
 
 ### Held turns
 
@@ -2912,7 +2964,7 @@ deleted once idle:
   or a duplicate turn. If the name was recreated meanwhile, a retry carrying
   the old `bot_id` is still refused; one without it is fresh work on the new
   identity.
-- `fork {expire_ms}` (1 s to 7 days; `--expires` on `agent fork` and
+- `fork {expire_ms}` (1 s to 365 days, as long as a hold; `--expires` on `agent fork` and
   `agent run --fork`) makes a fork the daemon deletes, as `delete` would,
   once it has been idle that long: no turn has run, waited, or been queued
   since it was made or its last turn ended. Its record shows `expire_ms`
@@ -3057,7 +3109,9 @@ the daemon about other agents, as Codex's `send_message`, `list_agents` and
 call is a request on a session of its own, answered as the calling bot, as
 its own socket answers the `agent` in a sandboxed bot's shell (see the
 request table under [sandbox](#sandbox)), for every bot, sandboxed or not: a
-message reads as that turn's (`from`), never another's; `interrupt` stops a
+message reads as that turn's (`from`), never another's; it steers, joining
+the running turn at its next step or starting one, as Codex's agent mail
+joins the running turn, and takes no `delivery`; `interrupt` stops a
 running turn only of the caller or a bot it made, and the message then
 waits for a turn of its own (`queue`); and `pause_agents` names the caller
 as who pulled the cord. A message's `request_id` is the call's own unless
@@ -3170,8 +3224,9 @@ for a slot), as Codex prunes a session's processes, and its handle says it was
 killed for that (`stopped`). So a bot that loses track of what it started
 cannot crowd out the rest of the fleet, and one that needs many keeps them
 while there is room. Detached commands never count, and with no bound
-(`--max-processes 0`) nothing is pruned. Commands are at
-most 16 KiB. At most `--max-processes` child processes run at once across the
+(`--max-processes 0`) nothing is pruned. A command has no bound of its own,
+as in Codex: one past what the system passes a program as arguments ends
+`command_too_long` (E2BIG). At most `--max-processes` child processes run at once across the
 service, foreground or background; waiting never counts. Background commands
 the service has accepted but not started are bounded by the same number: when
 that many are already in line, a background `shell` call returns
@@ -3242,7 +3297,9 @@ call returns what it wrote within `yield_time_ms` (default 1 s, at most 30 s)
 with a `proc:N` handle while it runs. `write_stdin` types into that handle
 (`chars`, with a control key as its character, such as `\u0003` for Ctrl-C)
 and returns what the command wrote since the last read, after waiting
-`yield_time_ms` (250 ms after typing, 5 s when only reading); `kill: true` ends
+`yield_time_ms` (250 ms after typing, 5 s when only reading); `chars` has no
+bound, as in Codex, and a write ends `terminal_input_blocked` only when the
+program takes none of it for 5 s; `kill: true` ends
 the command's process group. A read that waits longer than the bot's
 `approval_hold_ms` waits live only for that hold; then its turn parks as
 `wait` parks on the terminal's handle, holding no task and no active slot,
@@ -3261,8 +3318,9 @@ starts and keeps it until its whole session is gone: a kill ends the
 command's group, the job in the terminal's foreground, and every other
 group in its session (found under `/proc` on Linux and from the process
 list on macOS), so a job a shell with job control started, ignoring
-SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
-first kills the one it used least recently, as Codex prunes its sessions,
+SIGHUP, does not outlive it. Each bot keeps at most 64, Codex's number;
+starting another first kills the one it used least recently, as Codex prunes
+its sessions,
 so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
 other, and for one that ended; `not_a_terminal` for its own background
@@ -3733,8 +3791,9 @@ declared with `answered_by`, a tag of 1 to 64 letters, digits, `_`, `-` or
 `.` that the daemon never reads, takes no `result`: a call that fits its
 `parameters` starts, and waits for the answer of whichever client acts for
 that tag. Its `tool_started` names `answered_by` and `expires_ms`, when it
-stops waiting: `expire_ms` after it started (1 to 3,600,000, default
-60,000). A client finds such calls by following the bot, or every bot with
+stops waiting: `expire_ms` after it started (1 to 365 days in
+milliseconds, as long as a hold, since a waiting call parks holding
+nothing; default 60,000). A client finds such calls by following the bot, or every bot with
 `*`, and lists those still waiting with
 `{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
 `bot`, `turn`, `call_id`, `name`, `arguments`, `expires_ms` and
@@ -3745,12 +3804,13 @@ turn's end, at most
 `{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
 reads, or with `"error":{"code","detail"?}` in place of `output`, a refusal
 the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
-lowercase letters, digits or `_`; output and detail each up to 64 KiB,
-redacted as command output is; anything else is `invalid_tool_result` or
-`tool_output_limit`). `output` may instead be a list of parts the model
+lowercase letters, digits or `_`; output and detail are bounded only by
+the request line, redacted as command output is, and the model reads them
+whole: what to keep is the client's to decide; anything else is
+`invalid_tool_result`). `output` may instead be a list of parts the model
 reads in that order, as providers' own tool results and MCP's take them:
-`{"type":"text","text"}` and `{"type":"image","media_type","data"}`. Its
-text is up to 64 KiB together, redacted the same way, and its pictures
+`{"type":"text","text"}` and `{"type":"image","media_type","data"}`. Each
+text is redacted the same way and taken whole, and its pictures
 are a prompt's: up to 20 of PNG, JPEG, GIF or WebP, 5 MiB together once
 decoded, else `invalid_image` or `image_limit`. A picture counts at its
 token cost, and a result with pictures elides to its text as a read
@@ -3883,8 +3943,9 @@ steps instead. The client asks with
 `step` its own id for the step within the call (1 to 128 of `A-Z a-z 0-9
 . _ -`, never reused for the call), `name` the step's tool (1 to 512 bytes,
 no control characters), and
-`arguments` an object of at most 64 KiB (`invalid_step`,
-`step_arguments_limit`). The call must be the bot's and still waiting for
+`arguments` an object of at most 768 KiB as JSON, what an answered call's
+arguments take, so it is listed and asked about within a 1 MiB line
+(`invalid_step`, `step_arguments_limit`). The call must be the bot's and still waiting for
 its answer (`turn_not_found`, `stale_turn`, `no_pending_call`,
 `call_already_answered`), of a tool that takes steps (`invalid_step`).
 Under no gate the reply comes at once:
@@ -4822,7 +4883,8 @@ include `context_before`, `context_after`, `input_limit`, `reclaimed_bytes`,
 complete logical view since the cut; headroom can be negative during catch-up,
 while the actual request still uses a bounded window. `trigger` says what
 started it: its `reason` (`bytes` or `items` past the threshold, `requested`
-by a client, or `overflow`, a view that could not be sent), the model's context
+by a client, `overflow`, a view that could not be sent, or `context_full`, a
+view the provider refused as past the model's window), the model's context
 `window` and the `compact_tokens` threshold it gives, what the last call `sent`
 in bytes and the tokens counted for it, the view's threshold in bytes
 (`at_bytes`), the instructions and tools sent beside the view
@@ -4841,7 +4903,9 @@ versions it kept, after models offered it never called it (docs/DAEMON_MEASUREME
 calls' arguments, in its history.
 
 `read` returns numbered lines with `offset`/`limit` paging and a 64 KiB result
-bound including paging notices (files up to 4 MiB). If the first requested line
+bound including paging notices. A file has no bound, as in Pi: it is paged a
+line at a time on a blocking thread, so only the page is held, and a file
+that says it is empty, as procfs files do, is read to its end. If the first requested line
 cannot fit the page, it returns `read_line_too_long` with the line number; use a
 byte-oriented tool to inspect that line. A page ending before an oversized line
 still returns its preceding lines and the next offset. A PNG, JPEG, GIF or
@@ -4854,9 +4918,9 @@ provider takes. Any other binary file is `file_not_text`, naming its kind, and
 an image that cannot be decoded is `invalid_image`. One that must be scaled
 but has more than 64 megapixels is `image_limit`, refused before it is
 decoded; scaling runs off the daemon's thread, one picture at a time. `write` creates parent
-directories and writes up to
-1 MiB. `edit` replaces an exact string that must occur once unless `replace_all`
-is set. `apply_patch` takes Codex's patch format: one patch adds, deletes,
+directories. `edit` replaces an exact string that must occur once unless `replace_all`
+is set. Neither they nor `apply_patch` bound a file or its content, as Codex's
+`apply_patch` and Pi's `edit` do not; reading and matching run on a blocking thread. `apply_patch` takes Codex's patch format: one patch adds, deletes,
 updates and moves any number of files, every change checked before any file is
 written, so a patch that does not apply changes nothing. Its context lines
 match exactly, then ignoring trailing and surrounding whitespace, then with

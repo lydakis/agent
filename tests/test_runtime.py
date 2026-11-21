@@ -153,6 +153,23 @@ class Model(http.server.BaseHTTPRequestHandler):
             # An automation's message comes after its one-line header.
             if user.startswith('[automation ') and '\n' in user:
                 user = user.split('\n', 1)[1]
+            # Past the model's window, as `context_full` says for a work
+            # call: a 400 naming OpenAI's code, or (`stream`) a failed
+            # response with it.
+            full = getattr(self.server, 'context_full', None)
+            full = full(request, user) if full and not is_summary(request) else None
+            if full == 'http':
+                body = json.dumps({'error': {
+                    'message': 'Your input exceeds the context window of this model.',
+                    'type': 'invalid_request_error', 'param': 'input',
+                    'code': 'context_length_exceeded'}}).encode()
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if user in getattr(self.server, 'unauthorized_prompts', ()):
                 # A key the provider refuses: the person's to fix.
                 body = b'{"error":{"message":"synthetic bad key"}}'
@@ -576,6 +593,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # A rate limit the provider reports inside the stream.
                 events = [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {
                     'code': 'rate_limit_exceeded', 'message': 'Rate limit reached. Please try again in 300ms.'}}}]
+            if full == 'stream':
+                events = [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {
+                    'code': 'context_length_exceeded',
+                    'message': 'Your input exceeds the context window of this model.'}}}]
             if user.startswith('streamlimit-flat:') and attempt == 1:
                 events = [{'type': 'error', 'code': 'rate_limit_exceeded',
                            'message': 'Please try again in 300ms.', 'param': None, 'sequence_number': 1}]
@@ -923,6 +944,24 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 else:
                     blocks.append({'type': 'text', 'text': 'reply:' + user})
                     stop = 'max_tokens' if user == 'incomplete' else 'end_turn'
+            # Past the model's window, as `context_full` says for a work
+            # call: a reply cut at the window (`stop`), or a request past
+            # the endpoint's size limit (`413`).
+            full = getattr(self.server, 'context_full', None)
+            full = full(request) if full and not summary else None
+            if full == '413':
+                body = (b'{"type":"error","error":{"type":"request_too_large",'
+                        b'"message":"Request exceeds the maximum allowed number of bytes."}}')
+                self.send_response(413)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
+            if full == 'stop':
+                blocks = blocks[:1] + [{'type': 'text', 'text': 'Partial '}]
+                stop = 'model_context_window_exceeded'
             start = {'model': request['model'] + '-20260926',
                      'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2,
                                **getattr(self.server, 'start_usage', {})}}
@@ -3252,7 +3291,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(client.request('inspect', bot='Nomad')['result']['workspace'], str(other.resolve()))
 
-    def test_interrupt_and_crash_recovery_are_explicit(self):
+    def test_interrupts_end_turns_and_crashes_continue_them_up_to_the_restart_limit(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='wait-1', prompt='wait')['result']['message']
@@ -3262,14 +3301,34 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
         pending = client.request('submit', bot='Bob', request_id='wait-2', prompt='wait')['result']['message']
         self.model.requests.get(timeout=3)
+        # Killed while the model answered: the next start continues the turn,
+        # the cut-off call charged as one failed attempt and asked again.
         client.close(kill=True)
         client = self.client()
+        self.assertEqual(client.finished(pending, timeout=15)['data']['status'], 'completed')
+        self.model.requests.get(timeout=3)
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        retry = next(e for e in events if e['event'] == 'retry' and e.get('turn') == pending)
+        self.assertEqual((retry['data']['attempt'], retry['data']['error'], retry['data']['restarts']),
+                         (1, 'process_interrupted', 1))
+        paced = next(e for e in events if e['event'] == 'turn_paced' and e.get('turn') == pending)
+        self.assertEqual(paced['data']['retrying'], 'process_interrupted')
+        client.close()
+        # With a restart limit of one, the first cut-off ends it, and the
+        # restart launches no paid or repeated request.
+        client = self.client(extra=('--restarts', '1'))
+        self.assertEqual(client.ready['limits']['restarts'], 1)
+        ended = client.request('submit', bot='Bob', request_id='wait-3', prompt='wait')['result']['message']
+        self.model.requests.get(timeout=3)
+        client.close(kill=True)
+        client = self.client(extra=('--restarts', '1'))
         self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'interrupted')
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
-        self.assertTrue(any(e.get('turn') == pending and e['data'].get('error') == 'process_interrupted' for e in events))
-        self.assertTrue(self.model.requests.empty())  # Restart did not launch a paid/repeated request.
+        finished = next(e for e in events if e['event'] == 'turn_finished' and e.get('turn') == ended)
+        self.assertEqual((finished['data']['error'], finished['data']['restarts']), ('process_interrupted', 1))
+        self.assertTrue(self.model.requests.empty())
 
-    def test_crash_during_a_tool_keeps_the_same_bot_usable(self):
+    def test_a_crash_during_a_tool_answers_it_and_continues_the_turn(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='crash',
@@ -3280,20 +3339,27 @@ class RuntimeTests(ModelFixture):
         self.assertTrue((self.path / 'crash-marker').exists())
         client.close(kill=True)
         self.model.requests.get(timeout=1)
+        # The next start answers the cut-off call, never runs it again, and
+        # continues the turn: the model reads the answer at once.
+        (self.path / 'crash-marker').unlink()
         client = self.client('echo,shell')
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'interrupted')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertFalse((self.path / 'crash-marker').exists())
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         results = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0]['data']['outcome_unknown'])
-        self.assertTrue(self.model.requests.empty())  # Recovery never replays the tool.
-        again = client.request('submit', bot='Bob', request_id='continue', prompt='hi')['result']['message']
-        self.assertEqual(client.finished(again)['data']['status'], 'completed')
+        # No model call was cut off, so none is charged.
+        self.assertFalse(any(e['event'] == 'retry' and e['turn'] == turn for e in events))
         history = self.model.requests.get(timeout=1)['input']
         call = next(i for i in history if i.get('type') == 'function_call')
         result = next(i for i in history if i.get('type') == 'function_call_output')
         self.assertEqual(result['call_id'], call['call_id'])
-        self.assertEqual(json.loads(result['output'])['error'], 'tool_outcome_unknown')
+        answered = json.loads(result['output'])
+        self.assertEqual(answered['error'], 'process_interrupted')
+        self.assertIn('may have had effects', answered['detail'])
+        again = client.request('submit', bot='Bob', request_id='continue', prompt='hi')['result']['message']
+        self.assertEqual(client.finished(again)['data']['status'], 'completed')
 
     def test_shell_workspace_result_and_cancelled_descendants(self):
         import psutil

@@ -849,7 +849,7 @@ class SocketAndCliTests(ModelFixture):
                            (('--bot', 'Bob', '--allow=', 'q'), 'is for a copy made with --fork'),
                            (('--fork', 'Bob', '--bot', 'C', '--new', 'q'), 'conflicts with'),
                            (('--fork', 'Bob', '--bot', 'C', '--instructions', 'x', 'q'), 'is for a new bot'),
-                           (('--fork', 'Bob', '--bot', 'C', '--expires', '500ms', 'q'), 'from 1s to 168h')):
+                           (('--fork', 'Bob', '--bot', 'C', '--expires', '500ms', 'q'), 'from 1s to 365d')):
             refused = self.agent('run', *store, *args, check=False)
             self.assertEqual(refused.returncode, 2, refused.stderr)
             self.assertIn(says, refused.stderr)
@@ -1666,7 +1666,9 @@ class CliTests(ModelFixture):
                         self.assertEqual([json.loads(line) for line in result.stdout.splitlines()], fast)
 
     def test_concurrent_cli_startup_waits_for_store_recovery(self):
-        # Recreate a crash with the maximum admitted number of unfinished turns.
+        # Recreate a crash with the maximum admitted number of unfinished
+        # turns. They hold no prompt, so none could go on: a limit of one
+        # restart ends each as a turn an older daemon left running would be.
         with tempfile.TemporaryDirectory(dir='/tmp') as directory:
             path = Path(directory)/'state.db'
             bootstrap = Client(self.binary, path, self.url)
@@ -1686,7 +1688,8 @@ class CliTests(ModelFixture):
                 db.execute("UPDATE bot_sequence SET last_id=1024 WHERE singleton=1")
             barrier = threading.Barrier(16)
             common = ['--store', str(path), '--provider', 'openai=responses,'+self.url,
-                      '--model', 'openai/synthetic-model', '--tools', 'echo', '--workspace', directory]
+                      '--model', 'openai/synthetic-model', '--tools', 'echo', '--workspace', directory,
+                      '--restarts', '1']
             def run(n):
                 barrier.wait(timeout=5)
                 return subprocess.run([str(self.binary), 'run', '--detach', '--new', '--bot', f'new-{n}',

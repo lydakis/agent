@@ -107,6 +107,76 @@ async fn shell_preserves_exit_status_and_separate_outputs() {
     );
 }
 
+/// A command has no bound of its own, as in Codex; the system's limit on
+/// one argument (128 KiB on Linux) is the one it meets, named.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_is_bounded_only_by_the_system() {
+    let tools = Registry::new("shell").unwrap();
+    let cwd = std::env::temp_dir();
+    let run = |bytes: usize| {
+        let command = format!(": {}; echo ran", "x".repeat(bytes));
+        tools
+            .prepare("shell", &json!({"command": command}).to_string())
+            .unwrap()
+    };
+    let output: Value = serde_json::from_str(
+        &tools
+            .execute(run(100_000), &cwd, &[], None)
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
+    assert_eq!(output["stdout"], "ran\n");
+    #[cfg(target_os = "linux")]
+    {
+        let error = tools
+            .execute(run(200_000), &cwd, &[], None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "command_too_long");
+    }
+}
+
+/// A terminal takes input of any length, as Codex's write_stdin does, so
+/// long as the program reads it on.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_terminal_takes_a_long_write() {
+    let tools = Registry::all().unwrap();
+    let (done, _end) = tokio::sync::oneshot::channel();
+    tools
+        .terminal(
+            1,
+            1,
+            "wc -c".into(),
+            std::env::temp_dir(),
+            Some(100),
+            Vec::new(),
+            None,
+            None,
+            done,
+        )
+        .await
+        .unwrap();
+    let line = format!("{}\n", "y".repeat(99));
+    let typed = tools
+        .write_stdin(1, 1, &line.repeat(1000), Some(100), false, None)
+        .await
+        .unwrap();
+    assert!(!typed.failed, "{}", typed.output);
+    let ended = tools
+        .write_stdin(1, 1, "\u{4}", Some(5000), false, None)
+        .await
+        .unwrap();
+    let ended: Value = serde_json::from_str(&ended.output).unwrap();
+    assert!(
+        ended["output"].as_str().unwrap().contains("100000"),
+        "{ended}"
+    );
+}
+
 #[tokio::test]
 async fn shell_timeout_and_output_overflow_are_bounded() {
     let tools = Registry::new("echo,shell").unwrap();
@@ -327,9 +397,9 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
         std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
         "one\n2\nthree\n"
     );
-    // Expansion must be rejected without mutating the file. A separate
-    // allocation probe verifies that rejection precedes building the output.
-    let oversized = tools
+    // No bound on what an edit makes, as Codex's apply_patch and Pi's edit
+    // have none: five replacements of 1 MiB make a file past 4 MiB.
+    let large = tools
         .prepare(
             "edit",
             &json!({"path":"src/lib.rs",
@@ -337,20 +407,31 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
             .to_string(),
         )
         .unwrap();
-    // Three replacements fit; five replacements exceed the file bound.
     std::fs::write(dir.join("src/lib.rs"), "a\nb\nc\nd\ne\n").unwrap();
-    assert_eq!(
+    assert!(
         tools
-            .execute(oversized, &dir, &[], None)
+            .execute(large, &dir, &[], None)
             .await
-            .unwrap_err()
-            .code,
-        "tool_output_limit"
+            .unwrap()
+            .output
+            .contains("replaced 5")
     );
     assert_eq!(
         std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
-        "a\nb\nc\nd\ne\n"
+        format!("a{0}b{0}c{0}d{0}e{0}", "x".repeat(1024 * 1024))
     );
+    // Read pages it a line at a time.
+    let read = tools
+        .prepare(
+            "read",
+            &json!({"path":"src/lib.rs","offset":1,"limit":1}).to_string(),
+        )
+        .unwrap();
+    assert_eq!(
+        tools.execute(read, &dir, &[], None).await.unwrap_err().code,
+        "read_line_too_long"
+    );
+    std::fs::write(dir.join("src/lib.rs"), "one\n2\nthree\n").unwrap();
     let rewrite = tools
         .prepare(
             "write",
@@ -386,6 +467,46 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
     assert!(result["stdout"].as_str().unwrap().contains("bytes omitted"));
     assert_eq!(outcome.artifacts[0].0, "stdout");
     assert_eq!(outcome.artifacts[0].1.len(), 200000);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A file has no bound, as in Pi: past what the read tool once took
+/// (4 MiB), any page of it reads, and one procfs says is empty reads too.
+#[tokio::test]
+async fn read_pages_a_file_of_any_size() {
+    let tools = Registry::new("read").unwrap();
+    let dir = std::env::temp_dir().join(format!("agent-read-large-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lines = 600_000;
+    let text: String = (1..=lines).map(|n| format!("line {n:07}\n")).collect();
+    assert!(text.len() > 6 << 20);
+    std::fs::write(dir.join("large"), &text).unwrap();
+    let read = |path: &str, offset: usize| {
+        tools
+            .prepare(
+                "read",
+                &json!({"path":path,"offset":offset,"limit":2}).to_string(),
+            )
+            .unwrap()
+    };
+    let page = tools
+        .execute(read("large", lines - 1), &dir, &[], None)
+        .await
+        .unwrap()
+        .output;
+    assert!(
+        page.contains("line 0599999") && page.contains("line 0600000"),
+        "{page}"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let page = tools
+            .execute(read("/proc/self/status", 1), &dir, &[], None)
+            .await
+            .unwrap()
+            .output;
+        assert!(page.contains("Name:"), "{page}");
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1807,7 +1928,7 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
 
     // A bot at its share of terminals ends its least recently used before
     // the next one starts, so the next one finds that permit free.
-    let share = 16;
+    let share = 64;
     let tools = Registry::all().unwrap().with_lasting_budget(share);
     let mut ends = Vec::new();
     for handle in 1..=share as i64 + 1 {

@@ -28,7 +28,6 @@ mod patch;
 mod picture;
 #[cfg(unix)]
 mod terminal;
-use files::read_bounded;
 pub use patch::Patch;
 /// The daemon's tools a script may run as daemon steps (`run_step`): every
 /// one but those [`Tool::direct_only`] keeps for the model's own calls. A
@@ -61,8 +60,6 @@ const KEPT_END: usize = (ARTIFACT_BYTES - 256) / 2;
 /// The most of one stream a file in a bot's outputs folder holds, written
 /// as the command runs: a sanity bound on one that writes without end.
 pub const SPILL_BYTES: u64 = 1 << 30;
-const FILE_BYTES: usize = 4 * 1024 * 1024;
-const WRITE_BYTES: usize = 1024 * 1024;
 /// How long a foreground command holds its turn before it moves to the
 /// background and keeps running, as Codex's unified exec yields one: no
 /// clock kills a command its call did not bound.
@@ -90,8 +87,6 @@ pub fn default_lasting() -> usize {
 /// it or a write waits at most.
 const START_YIELD_MS: u64 = 1_000;
 const MAX_YIELD_MS: u64 = 30_000;
-/// The most a write to a terminal may type at once.
-const INPUT_BYTES: usize = 16 * 1024;
 
 /// Why `name`, one of the daemon's tools, runs only as a direct call and
 /// never as a step of a script; `None` for a step or a name that is none.
@@ -213,7 +208,7 @@ impl Tool {
                 "additionalProperties":false}),
             ),
             Tool::Write => (
-                "Create or overwrite a file with the given content, creating parent directories. Content is limited to 1 MiB.",
+                "Create or overwrite a file with the given content, creating parent directories.",
                 json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},
                 "required":["path","content"],"additionalProperties":false}),
             ),
@@ -254,7 +249,7 @@ impl Tool {
             Tool::WriteStdin => (
                 "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started; on a background or detached command's proc handle, or a call a message moved to the background while it waited for approval or an answer, kill=true stops it (a call still waiting never runs).",
                 json!({"type":"object","properties":{"handle":{"type":"string"},
-                "chars":{"type":"string","maxLength":INPUT_BYTES},
+                "chars":{"type":"string"},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS},"kill":{"type":"boolean"}},
                 "required":["handle"],"additionalProperties":false}),
             ),
@@ -262,11 +257,10 @@ impl Tool {
             // ([`Agents`]): what its shell's `agent` would send, held to
             // what the bot's own socket allows.
             Tool::SendMessage => (
-                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. delivery steer (the default) joins the bot's running turn at its next step, or starts a turn when none runs; queue waits for a turn of its own after what it has in line. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote lists the messages, one or several, whose words the daemon copies after the message in that order, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with, such as [\"shop.lead/12\",\"shop.lead/15\"]. replaces, the handle BOT/N of a message this bot sent to the same bot, withdraws that message if it still waits in line and sends this one in its place (the result says replaced: BOT/N), or, once that message was taken in, sends this one after it (the result says taken: BOT/N, with taken_turn, the turn that took it in). A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
+                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. The message joins the bot's running turn at its next step, or starts a turn when none runs. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote lists the messages, one or several, whose words the daemon copies after the message in that order, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with, such as [\"shop.lead/12\",\"shop.lead/15\"]. replaces, the handle BOT/N of a message this bot sent to the same bot, withdraws that message if it still waits in line and sends this one in its place (the result says replaced: BOT/N), or, once that message was taken in, sends this one after it (the result says taken: BOT/N, with taken_turn, the turn that took it in). A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
                 json!({"type":"object","properties":{
                 "to":{"type":"string","minLength":1,"maxLength":128},
                 "message":{"type":"string","minLength":1},
-                "delivery":{"enum":["steer","queue"]},
                 "interrupt":{"type":"boolean"},
                 "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16},
                 "replaces":{"type":"string","minLength":3,"maxLength":256},
@@ -303,7 +297,7 @@ impl Tool {
                 "fork":{"type":"boolean"},
                 "checkpoint":{"type":"integer","minimum":1,"description":"With fork: copy the conversation up to this node, not all of it"},
                 "allow":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"With fork: the tools the copy may call, within this agent's; [] allows none"},
-                "expire_ms":{"type":"integer","minimum":1000,"maximum":604800000,"description":"With fork: delete the copy once idle this long"},
+                "expire_ms":{"type":"integer","minimum":1000,"maximum":crate::store::HOLD_MAX_MS,"description":"With fork: delete the copy once idle this long"},
                 "workspace":{"type":"string","minLength":1,"description":"Its folder, within what this agent may reach; default this turn's folder"},
                 "tools":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Its tools, within this agent's; default this agent's, or the profile's"},
                 "settings":{"type":"object","description":"Its settings over this agent's own, never looser: sandbox, writable, network, unix_sockets, approval_policy, speed, cache_ttl, context_bytes, context_items, note_turns, compact_at, compact_keep, compact_tokens, post_turn_compact_percent, keep_turns, max_rounds, max_drops, max_output_tokens, approval_hold_ms, hold_ms, outputs, trailer, quiet_background, rules, env"},
@@ -648,11 +642,10 @@ pub fn is_digest(text: &str) -> bool {
 /// The most tools a bot may have declared, and the most bytes they take.
 pub const MAX_DECLARED: usize = 32;
 pub const DECLARED_BYTES: usize = 64 * 1024;
-/// How long an answered call waits by default, and at most.
+/// How long an answered call waits by default, and at most: as long as a
+/// hold, since a call waiting on its answer parks holding nothing.
 pub const ANSWER_EXPIRE_MS: u64 = 60_000;
-pub const MAX_ANSWER_EXPIRE_MS: u64 = 3_600_000;
-/// The most bytes an answer's output or detail may take.
-pub const ANSWER_BYTES: usize = 64 * 1024;
+pub const MAX_ANSWER_EXPIRE_MS: u64 = crate::store::HOLD_MAX_MS;
 
 /// A bot's declared tools must be few, small, named apart from each other
 /// and from the daemon's own tools, and take an object of arguments.
@@ -1244,8 +1237,6 @@ pub enum Agents {
     Send {
         to: String,
         message: String,
-        /// `steer` or `queue`.
-        delivery: &'static str,
         interrupt: bool,
         /// `{"bot","message","reply"?}`, as `submit` takes them.
         quotes: Vec<serde_json::Value>,
@@ -2201,8 +2192,6 @@ impl Registry {
                 let args: Shell = serde_json::from_str(args).map_err(invalid)?;
                 let invalid = if args.command.is_empty() {
                     Some("command is empty".to_owned())
-                } else if args.command.len() > 16 * 1024 {
-                    Some("command is over 16 KiB".to_owned())
                 } else if args.command.contains('\0') {
                     Some("command contains a NUL byte".to_owned())
                 } else if (args.workdir.as_deref())
@@ -2398,9 +2387,6 @@ impl Registry {
                     .filter(|id| *id > 0 && args.handle == format!("proc:{id}"));
                 let invalid = match handle {
                     None => Some(format!("{:?} is no proc handle", args.handle)),
-                    Some(_) if args.chars.len() > INPUT_BYTES => {
-                        Some(format!("chars is over {INPUT_BYTES} bytes"))
-                    }
                     Some(_) if args.kill && !args.chars.is_empty() => {
                         Some("kill takes no chars".to_owned())
                     }
@@ -2427,7 +2413,6 @@ impl Registry {
                 struct Send {
                     to: String,
                     message: String,
-                    delivery: Option<String>,
                     #[serde(default)]
                     interrupt: bool,
                     #[serde(default)]
@@ -2436,16 +2421,6 @@ impl Registry {
                     request_id: Option<String>,
                 }
                 let args: Send = serde_json::from_str(args).map_err(invalid)?;
-                let delivery = match args.delivery.as_deref() {
-                    None | Some("steer") => "steer",
-                    Some("queue") => "queue",
-                    Some(other) => {
-                        return fail_with(
-                            "invalid_tool_arguments",
-                            format!("delivery is steer or queue, not {other:?}"),
-                        );
-                    }
-                };
                 if args.to.is_empty() || args.to.len() > 128 || args.message.is_empty() {
                     return fail_with("invalid_tool_arguments", "to and message are needed");
                 }
@@ -2482,7 +2457,6 @@ impl Registry {
                 Prepared::Agents(Agents::Send {
                     to: args.to,
                     message: args.message,
-                    delivery,
                     interrupt: args.interrupt,
                     quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
                     replaces,
@@ -2723,9 +2697,6 @@ impl Registry {
             Tool::Write => {
                 let args: Write = serde_json::from_str(args).map_err(invalid)?;
                 path(&args.path)?;
-                if args.content.len() > WRITE_BYTES {
-                    return fail("tool_input_limit");
-                }
                 Prepared::Write {
                     path: args.path,
                     content: args.content,
@@ -2733,9 +2704,6 @@ impl Registry {
             }
             Tool::ApplyPatch => {
                 let args: ApplyPatch = serde_json::from_str(args).map_err(invalid)?;
-                if args.input.len() > WRITE_BYTES {
-                    return fail("tool_input_limit");
-                }
                 let patch = Patch::parse(&args.input)?;
                 for target in patch.paths() {
                     path(target)?;
@@ -2745,7 +2713,7 @@ impl Registry {
             Tool::Edit => {
                 let args: Edit = serde_json::from_str(args).map_err(invalid)?;
                 path(&args.path)?;
-                if args.old.is_empty() || args.new.len() > WRITE_BYTES {
+                if args.old.is_empty() {
                     return fail("invalid_tool_arguments");
                 }
                 Prepared::Edit {
@@ -2853,28 +2821,36 @@ impl Registry {
                 let hidden = sandbox
                     .as_ref()
                     .map_or(&[][..], |policy| &policy.unreadable);
-                // A picture goes to the model as one, after a line on it.
-                // Its header says so; the file is read only in its turn.
-                if picture::kind(&files::read_head(&file, picture::HEAD, hidden).await?).is_some()
+                // Paged a line at a time on a blocking worker, as Pi's read
+                // streams a file: only the page is held, however long the
+                // file is.
+                let opened = files::open_std(&file, hidden).await?;
+                let paged = tokio::task::spawn_blocking(move || page_text(opened, offset, limit))
+                    .await
+                    .map_err(|_| Error::new("io_error"))??;
+                let (kind, size, picture) = match paged {
+                    Paged::Text(page) => return Ok(Outcome::text(self.redact(page))),
+                    Paged::Binary {
+                        kind,
+                        size,
+                        picture,
+                    } => (kind, size, picture),
+                };
+                // A picture goes to the model as one, after a line on it;
+                // the file is read whole only in its turn.
+                if picture
                     && let Some((image, line)) =
-                        picture::read_apart(read_bounded(&file, hidden)).await?
+                        picture::read_apart(files::read_whole(&file, hidden)).await?
                 {
                     return Ok(Outcome {
                         parts: vec![crate::codec::Part::Image(image)],
                         ..Outcome::text(format!("{path}: {line}"))
                     });
                 }
-                let bytes = read_bounded(&file, hidden).await?;
-                if let Some(kind) = binary(&bytes) {
-                    return fail_with(
-                        "file_not_text",
-                        format!("{kind} of {} bytes; read returns text", bytes.len()),
-                    );
-                }
-                let text = String::from_utf8_lossy(&bytes);
-                Ok(Outcome::text(
-                    self.redact(page_lines(&text, offset, limit)?),
-                ))
+                fail_with(
+                    "file_not_text",
+                    format!("{kind} of {size} bytes; read returns text"),
+                )
             }
             Prepared::Write { path, content } => {
                 let target = resolve(workspace, &path);
@@ -2921,31 +2897,31 @@ impl Registry {
                 let hidden = sandbox
                     .as_ref()
                     .map_or(&[][..], |policy| &policy.unreadable);
-                let bytes = read_bounded(&target, hidden).await?;
-                let text = String::from_utf8(bytes).map_err(|_| Error::new("file_not_utf8"))?;
-                let count = text.matches(&old).count();
-                if count == 0 {
-                    return fail("edit_target_not_found");
-                }
-                if count > 1 && !replace_all {
-                    return Err(Error::with(
-                        "edit_target_ambiguous",
-                        format!("{count} occurrences; add context or set replace_all"),
-                    ));
-                }
-                let replacements = if replace_all { count } else { 1 };
-                let expanded = new
-                    .len()
-                    .checked_mul(replacements)
-                    .and_then(|added| (text.len() - old.len() * replacements).checked_add(added))
-                    .filter(|size| *size <= FILE_BYTES)
-                    .ok_or(Error::new("tool_output_limit"))?;
-                let updated = if replace_all {
-                    text.replace(&old, &new)
-                } else {
-                    text.replacen(&old, &new, 1)
-                };
-                debug_assert_eq!(updated.len(), expanded);
+                let mut opened = files::open_std(&target, hidden).await?;
+                // Reading, matching and replacing grow with the file: in
+                // one job off the runtime's thread, as a patch's matching is.
+                let (count, updated) = tokio::task::spawn_blocking(move || {
+                    let bytes = files::read_std(&mut opened)?;
+                    let text = String::from_utf8(bytes).map_err(|_| Error::new("file_not_utf8"))?;
+                    let count = text.matches(&old).count();
+                    if count == 0 {
+                        return fail("edit_target_not_found");
+                    }
+                    if count > 1 && !replace_all {
+                        return Err(Error::with(
+                            "edit_target_ambiguous",
+                            format!("{count} occurrences; add context or set replace_all"),
+                        ));
+                    }
+                    let updated = if replace_all {
+                        text.replace(&old, &new)
+                    } else {
+                        text.replacen(&old, &new, 1)
+                    };
+                    Ok((count, updated))
+                })
+                .await
+                .map_err(|_| Error::new("io_error"))??;
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = self.helper_slot(&sandbox, &mut slot).await?;
                 files::write(&target, updated.as_bytes(), sandbox, held.as_mut()).await?;
@@ -2999,6 +2975,20 @@ impl Registry {
             parts: Vec::new(),
             failed: !success,
         }
+    }
+
+    /// A client's answer to a call, as the model reads it: each text (the
+    /// output, an error's detail, or a later text part) redacted, and whole:
+    /// what it keeps is the client's to decide, within the request line
+    /// that carries it. Off the runtime's thread when large.
+    pub async fn answered(&self, texts: Vec<String>) -> Result<Vec<String>> {
+        let bytes = texts.iter().map(String::len).sum();
+        self.off_runtime(bytes, move |registry| {
+            (texts.into_iter())
+                .map(|text| registry.redact(text))
+                .collect()
+        })
+        .await
     }
 
     fn shell_outcome(
@@ -3849,7 +3839,6 @@ pub fn page_lines(text: &str, offset: usize, limit: usize) -> Result<String> {
 /// whole. None when it is gone or no longer a file; links are not followed.
 #[cfg(unix)]
 pub fn page_file(file: &str, offset: usize, limit: usize) -> Result<Option<String>> {
-    use std::io::BufRead;
     use std::os::unix::fs::OpenOptionsExt;
     let Ok(opened) = std::fs::OpenOptions::new()
         .read(true)
@@ -3867,8 +3856,49 @@ pub fn page_file(file: &str, offset: usize, limit: usize) -> Result<Option<Strin
     if found.len() > FILE_RETAINED_BYTES {
         return fail("storage_error");
     }
-    let mut reader =
+    let reader =
         std::io::BufReader::with_capacity(256 << 10, std::io::Read::take(opened, found.len()));
+    page_reader(reader, offset, limit).map(Some)
+}
+
+/// What `read` makes of a file: a page of its text, or the kind of binary
+/// file it is ([`binary`]), its size, and whether its header says it is a
+/// picture.
+enum Paged {
+    Text(String),
+    Binary {
+        kind: &'static str,
+        size: u64,
+        picture: bool,
+    },
+}
+
+/// A file `read` pages, opened: told apart from a binary
+/// one by its first bytes, then paged a line at a time as [`page_file`]
+/// pages, never held whole. A file that says it is empty, as procfs files
+/// do, is read to its end; any other, as far as it was when opened.
+fn page_text(mut file: std::fs::File, offset: usize, limit: usize) -> Result<Paged> {
+    use std::io::{Read, Seek};
+    let size = file.metadata()?.len();
+    let mut head = Vec::with_capacity(8192);
+    (&mut file).take(8192).read_to_end(&mut head)?;
+    if let Some(kind) = binary(&head) {
+        let picture = picture::kind(&head).is_some();
+        return Ok(Paged::Binary {
+            kind,
+            size,
+            picture,
+        });
+    }
+    file.rewind()?;
+    let bound = if size == 0 { u64::MAX } else { size };
+    let reader = std::io::BufReader::with_capacity(256 << 10, file.take(bound));
+    page_reader(reader, offset, limit).map(Paged::Text)
+}
+
+/// `page_lines` of what `reader` reads, a line at a time up to the page
+/// and counted past it.
+fn page_reader(mut reader: impl std::io::BufRead, offset: usize, limit: usize) -> Result<String> {
     // The page's lines, as `str::lines` reads them; each kept to just past
     // the page's bound, which is all `page` needs to refuse a longer one,
     // and none kept once the page is full.
@@ -3917,7 +3947,7 @@ pub fn page_file(file: &str, offset: usize, limit: usize) -> Result<Option<Strin
             .and_then(|at| window.get(at))
             .map_or("", String::as_str)
     });
-    page(lines, offset, limit, PREVIEW_BYTES, false).map(Some)
+    page(lines, offset, limit, PREVIEW_BYTES, false)
 }
 
 /// The widest piece `page_pieces` numbers as a line.
@@ -4603,6 +4633,14 @@ pub fn shell_environment_whole(
 /// system's own words. Looked at only once a start failed.
 #[cfg(unix)]
 pub(crate) fn not_started(error: std::io::Error, folder: &Path) -> Error {
+    // The command has no bound of its own, as in Codex: the system's is
+    // the one it meets, on the arguments it passes the shell.
+    if error.raw_os_error() == Some(libc::E2BIG) {
+        return Error::with(
+            "command_too_long",
+            "the system refused to start a command this long (E2BIG)",
+        );
+    }
     if error.kind() == std::io::ErrorKind::NotFound && !folder.is_dir() {
         return Error::with(
             "path_not_found",

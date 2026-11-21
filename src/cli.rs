@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --stall-timeout --idle-exit --durability";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --restarts --stall-timeout --idle-exit --durability";
 
 struct Command {
     name: &'static str,
@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --replaces --agents --profile --profile-name --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs --namespace",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --max-restarts --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs --namespace",
         startup: true,
     },
     Command {
@@ -335,7 +335,7 @@ fn print_flags(flags: &str) {
             ),
             "--expires" => (
                 "DURATION",
-                "Delete the fork once it has been idle this long, from 1s to 168h",
+                "Delete the fork once it has been idle this long, from 1s to 365d",
             ),
             "--detach" => (
                 "",
@@ -455,6 +455,10 @@ fn print_flags(flags: &str) {
                 "N",
                 "Most generations a new bot may be below the bot that starts its line; 0 is unbounded",
             ),
+            "--restarts" => (
+                "N",
+                "The times in a row the daemon's process may end while a turn runs, with nothing recorded between, before the next start ends that turn rather than continuing it, for bots that set none; 0 continues it always; default 5",
+            ),
             "--max-output-tokens" => (
                 "N",
                 "A new bot's output token cap per model call; default the model's limit",
@@ -533,6 +537,10 @@ fn print_flags(flags: &str) {
             "--max-rounds" => (
                 "N",
                 "Model calls each of a new bot's turns may make, the last with no tool call; default unbounded",
+            ),
+            "--max-restarts" => (
+                "N",
+                "The times in a row the daemon's process may end while one of a new bot's turns runs, with nothing recorded between, before that turn ends rather than going on; 0 continues it always; default the daemon's --restarts",
             ),
             "--max-drops" => (
                 "N",
@@ -719,7 +727,13 @@ const DURATIONS: &[(&str, u64, u64, bool, &str)] = &[
         "up to 1h; 0 parks at once",
     ),
     ("--grace", 0, 86_400_000, false, "up to 24h"),
-    ("--expires", 1000, 604_800_000, false, "from 1s to 168h"),
+    (
+        "--expires",
+        1000,
+        agent_runtime::store::HOLD_MAX_MS,
+        false,
+        "from 1s to 365d",
+    ),
     ("--stall-timeout", 1000, 86_400_000, true, "from 1s to 24h"),
     (
         "--idle-exit",

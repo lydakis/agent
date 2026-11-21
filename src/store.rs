@@ -21,13 +21,13 @@ pub use db::{
     Absorbed, AfterTurn, Answered, ApprovalPolicy, ArtifactLines, Binding, Blocked, Bot, CacheTtl,
     CallAnswer, Capture, CatchUp, Charge, Closing, CompactionPlan, CompactionView, CopiedCall,
     Counts, DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, Durability, ENV_JSON,
-    EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Identity, Joined,
-    Kept, Lapsed, Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS, PROCESSES_PAGE,
-    ParkedFallback, Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON,
-    Reclaim, Replaced, Resumed, Room, SANDBOX, SETTINGS, Served, Settings, Shared, Spend, Started,
-    Step, StepAsk, StepOpened, Stepped, Strip, Switch, TRAILER, TURN_VIEW_ACCOUNTING, Trailer,
-    Translation, TurnBudget, TurnOptions, UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob,
-    listed_command, share, unserved,
+    EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, HOLD_MAX_MS, Halt, Halted,
+    Identity, Joined, Kept, Lapsed, Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS,
+    PROCESSES_PAGE, ParkedFallback, Plan, Planning, ProcessKind, ProcessesPage, Publication,
+    QuoteRef, RESTART_LIMIT, RULES_JSON, Reclaim, Replaced, Resumed, Room, SANDBOX, SETTINGS,
+    Served, Settings, Shared, Spend, Started, Step, StepAsk, StepOpened, Stepped, Strip, Switch,
+    TRAILER, TURN_VIEW_ACCOUNTING, Trailer, Translation, TurnBudget, TurnOptions, UsageQuery,
+    Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;

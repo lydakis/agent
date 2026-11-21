@@ -10,8 +10,8 @@ screen measures, on the same store:
 - submit-to-finish latency on light and heavy bots, text and shell;
 - paging every bot, one heavy bot's turns, and one bot's events;
 - a fork, deleting that fork, and deleting one heavy bot with its artifacts;
-- a clean restart, a crash restart with 32 turns in flight, and the
-  schema-21 migration replayed against the store;
+- a clean restart, a crash restart with 32 turns in flight, continued to
+  their end, and the schema-21 migration replayed against the store;
 - the storage worker's own per-operation histograms over the growth phase;
 - daemon RSS and WAL size, sampled throughout.
 
@@ -253,11 +253,24 @@ class Screen:
         client.close(kill=True)
         self.server.release.set()
         ready_ms = self.connect()
+        # The next start continues each cut-off turn: its model call counts
+        # as one failed attempt and is asked again after a backoff, and the
+        # released model answers it.
+        before = time.monotonic()
+        waiting = dict(held)
+        while waiting:
+            for bot, turn in list(waiting.items()):
+                row = self.client.request('turns', bot=bot, after=turn - 1, limit=1)['result']['turns'][0]
+                assert row['turn'] == turn and row['status'] in ('running', 'paced', 'completed'), row
+                if row['status'] == 'completed':
+                    del waiting[bot]
+            if waiting and time.monotonic() - before >= timeout:
+                raise TimeoutError(f'cut-off turns still going on: {len(waiting)}/{len(held)}')
+            time.sleep(.02)
+        continued_ms = round((time.monotonic() - before) * 1000, 1)
         self.server.release.clear()
-        for bot, turn in held:
-            row = self.client.request('turns', bot=bot, after=turn - 1, limit=1)['result']['turns'][0]
-            assert row['turn'] == turn and row['status'] == 'interrupted', row
-        return {'ready_ms': ready_ms, 'requests_started': started, 'recovered_turns': len(held)}
+        return {'ready_ms': ready_ms, 'requests_started': started, 'recovered_turns': len(held),
+                'continued_ms': continued_ms}
 
     def checkpoint(self, label):
         client = self.client

@@ -1,6 +1,5 @@
 //! Native file tools operate only on regular files. Special files need an I/O
 //! owner with cancellation semantics, not Tokio's blocking filesystem workers.
-use super::FILE_BYTES;
 use crate::{
     Error, Result, fail,
     sandbox::{PATCH, Policy, WRITE},
@@ -12,7 +11,7 @@ use std::{
     process::Stdio,
     sync::Arc,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 /// Open `path`, a regular file, refused when what was opened is, or is
 /// under, one of `hidden`: the paths a sandboxed bot may not read
@@ -70,27 +69,34 @@ async fn open_regular(path: &Path, write: bool, hidden: &[PathBuf]) -> Result<to
     Ok(file)
 }
 
-/// A file's bytes, up to the tools' limit; `hidden` as [`open_regular`]
-/// takes it.
-pub(super) async fn read_bounded(path: &Path, hidden: &[PathBuf]) -> Result<Vec<u8>> {
-    let file = open_regular(path, false, hidden).await?;
-    let mut bytes = Vec::new();
-    file.take(FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > FILE_BYTES {
-        return fail("file_too_large");
-    }
-    Ok(bytes)
+/// A file's bytes, whole, as Codex's `apply_patch` and Pi's `edit` read
+/// one; `hidden` as [`open_regular`] takes it. Read in one job on the
+/// blocking pool, as [`read_std`] reads it.
+pub(super) async fn read_whole(path: &Path, hidden: &[PathBuf]) -> Result<Vec<u8>> {
+    let mut file = open_std(path, hidden).await?;
+    tokio::task::spawn_blocking(move || read_std(&mut file))
+        .await
+        .map_err(|_| Error::new("io_error"))?
 }
 
-/// The first `count` bytes of a file, or fewer when it is shorter.
-pub(super) async fn read_head(path: &Path, count: u64, hidden: &[PathBuf]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    (open_regular(path, false, hidden).await?)
-        .take(count)
-        .read_to_end(&mut bytes)
-        .await?;
+/// `path`, a regular file, opened to read on a blocking worker; `hidden`
+/// as [`open_regular`] takes it.
+pub(super) async fn open_std(path: &Path, hidden: &[PathBuf]) -> Result<std::fs::File> {
+    Ok(open_regular(path, false, hidden).await?.into_std().await)
+}
+
+/// What is left of an open file, read on the calling thread, which is a
+/// blocking worker. A regular file is read as far as it was when opened,
+/// so one that grows still ends; one that says it is empty, as procfs
+/// files do, is read to its end.
+pub(super) fn read_std(file: &mut std::fs::File) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let size = file.metadata()?.len();
+    let mut bytes = Vec::with_capacity(size as usize);
+    match size {
+        0 => file.read_to_end(&mut bytes)?,
+        size => file.take(size).read_to_end(&mut bytes)?,
+    };
     Ok(bytes)
 }
 

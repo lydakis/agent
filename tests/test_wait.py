@@ -311,10 +311,12 @@ class WaitTests(ModelFixture):
         client.close(kill=True)
         self.assertFalse(survivor.exists())
         client = self.client('echo,shell,wait')
-        self.assertEqual(client.request('inspect', bot='Alice')['result']['status'], 'interrupted')
-        self.assertEqual(client.finished(bob)['data']['status'], 'completed')
+        # Alice's turn was running: the restart continues it, and Bob's wait
+        # gets its end.
+        self.assertEqual(client.finished(bob, timeout=15)['data']['status'], 'completed')
+        self.assertEqual(client.request('inspect', bot='Alice')['result']['status'], 'completed')
         result = self.tool_output(client, 'Bob', 'wait-1')['results'][alice['handle']]
-        self.assertEqual((result['status'], result['error']), ('interrupted', 'process_interrupted'))
+        self.assertEqual(result['status'], 'completed')
         self.assertEqual(client.finished(dave)['data']['status'], 'completed')
         outcome = self.tool_output(client, 'Dave', 'wait-1')
         lost = list(outcome['results'].keys())[0]
@@ -859,13 +861,20 @@ class WaitTests(ModelFixture):
             lock.execute('ROLLBACK')
             lock.close()
         self.assertEqual(client.process.wait(timeout=10), 1)
+        replies = {}
         for line in lines:
             reply = client.receive(lambda m, id=line['id']: m.get('id') == id)
             self.assertIn('result', reply)
-        # The submission's turn started, and shutdown ended it like any
-        # running turn instead of leaving it for the next start to find.
+            replies[line['id']] = reply['result']
+        # The submission's turn started, and the failure left it as a crash
+        # would, writing nothing more for it: the next start continues it.
         with sqlite3.connect(database) as db:
             status = db.execute("SELECT t.status FROM messages m JOIN turns t ON t.id=m.turn"
                                 " WHERE m.request_id='late'").fetchone()[0]
-            self.assertEqual(status, 'interrupted')
+            self.assertEqual(status, 'running')
             self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE name LIKE 'New%'").fetchone()[0], 8)
+        with sqlite3.connect(database) as db:
+            db.execute("DROP TRIGGER reject_completion")
+        client = self.client('echo,shell,wait')
+        late = replies['submit']['message']
+        self.assertEqual(client.finished(late)['data']['status'], 'completed')

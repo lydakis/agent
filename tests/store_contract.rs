@@ -6,7 +6,7 @@ use agent_runtime::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Joined, Lifted,
         Limit, Planning, ProcessKind, QuoteRef, Reclaim, Retained, Settings, Strip, Switch,
-        Trailer, TurnBudget, TurnOptions, Wake,
+        Trailer, TurnBudget, TurnOptions, Waiting, Wake,
     },
     tools::{Declared, Inherit, Outcome, ToolList},
 };
@@ -590,6 +590,8 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
         let mut original = None;
         for _ in 0..2 {
             let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            // A daemon told to continue no turn its process ended under.
+            db.continue_cut_off(Some(1), |_| 0).unwrap();
             assert_eq!(db.turn_status("Bob", turn).unwrap(), "interrupted");
             let history = stored(&mut db, "Bob");
             assert_eq!(history.len(), 5);
@@ -3808,6 +3810,7 @@ fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
             Some(blocked),
             None,
             None,
+            (false, None),
         )
         .unwrap();
     assert_eq!(entry["event"], "turn_paced");
@@ -3861,6 +3864,7 @@ fn an_ordinary_retry_between_holds_keeps_when_they_began() {
             None,
             Some("provider_stream_failed".into()),
             Some(5),
+            (false, None),
         )
         .unwrap();
     // A retry the provider asked for, not a hold: nothing says held, and
@@ -5712,7 +5716,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     assert_eq!(
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
-            "compact_keep":25,"compact_tokens":null,"post_turn_compact_percent":70,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
+            "compact_keep":25,"compact_tokens":null,"post_turn_compact_percent":70,"keep_turns":1,"max_rounds":null,"max_drops":3,"max_restarts":null,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
             "approval_policy":null,"steps_only":null,"speeds":{},"context_windows":{},"namespace":null})
@@ -13330,6 +13334,33 @@ fn a_store_from_before_skip_pointers_places_every_node() {
 }
 
 #[test]
+fn a_halt_keeps_where_a_refusal_s_recovery_was() {
+    let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+    for (bot, full) in [
+        ("Bob", (false, Some("past the window".to_owned()))),
+        ("Ann", (true, None)),
+    ] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                bot,
+                "first",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.suspend_halted(turn, Halt::Pause, (0, 0, 0), None, full.clone())
+            .unwrap();
+        let parked = db.waiting_turns().unwrap();
+        let parked = parked.iter().find(|w| w.turn == turn).unwrap();
+        assert_eq!((parked.refilled, parked.refused.clone()), full);
+    }
+}
+
+#[test]
 fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_pause() {
     let path = std::env::temp_dir().join(format!("agent-halt-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -13346,7 +13377,7 @@ fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_p
         )
         .unwrap()
         .turn;
-    db.suspend_halted(turn, Halt::Shutdown, 0, 0, 0, None)
+    db.suspend_halted(turn, Halt::Shutdown, (0, 0, 0), None, (false, None))
         .unwrap();
     // A stop leaves no deadline: the next start wakes it at once.
     let parked = db.waiting_turns().unwrap();
@@ -13416,7 +13447,10 @@ fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started
             .collect();
         db.append(turn, items, &calls, None).unwrap();
         db.tool_start(turn, &calls[0], false, false).unwrap();
-        let Halted::Parked(events) = db.suspend_halted(turn, halt, 0, 0, 0, None).unwrap() else {
+        let Halted::Parked(events) = db
+            .suspend_halted(turn, halt, (0, 0, 0), None, (false, None))
+            .unwrap()
+        else {
             panic!("a running turn parks");
         };
         let completed: Vec<_> = events
@@ -13439,6 +13473,348 @@ fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started
             ],
             "{halt:?}"
         );
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+/// A turn the daemon's process was cut off in, read back for the next start.
+fn cut_off(db: &Database, turn: i64) -> (Waiting, Value) {
+    let parked = db.waiting_turns().unwrap();
+    let waiting = parked.into_iter().find(|w| w.turn == turn).unwrap();
+    (waiting, db.turn_view("Bob", turn).unwrap())
+}
+
+#[test]
+fn a_turn_the_process_ended_under_goes_on_its_model_call_charged_as_one_failed_attempt() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let before = now_ms();
+    db.continue_cut_off(Some(5), |_| 300).unwrap();
+    let (waiting, view) = cut_off(&db, turn);
+    assert_eq!(view["status"], "paced");
+    assert_eq!(view["waiting_on"]["retrying"], "process_interrupted");
+    let at = view["waiting_on"]["resume_at_ms"].as_i64().unwrap();
+    assert!(at >= before + 300, "{view}");
+    assert_eq!(
+        (
+            waiting.call_attempts,
+            waiting.retrying.as_deref(),
+            waiting.halt,
+            waiting.compaction
+        ),
+        (1, Some("process_interrupted"), None, true)
+    );
+    // The retry and the park say how many times in a row it was cut off.
+    let events = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let retry = events.iter().find(|e| e["event"] == "retry").unwrap();
+    assert_eq!(
+        (
+            &retry["data"]["attempt"],
+            &retry["data"]["error"],
+            &retry["data"]["delay_ms"],
+            &retry["data"]["restarts"]
+        ),
+        (
+            &json!(1),
+            &json!("process_interrupted"),
+            &json!(300),
+            &json!(1)
+        )
+    );
+    let paced = events
+        .iter()
+        .rev()
+        .find(|e| e["event"] == "turn_paced")
+        .unwrap();
+    assert_eq!(paced["data"]["restarts"], 1);
+    // Nothing was answered for it: the bot's history is as it was.
+    assert_eq!(db.inspect("Bob").unwrap().status, "paced");
+}
+
+#[test]
+fn calls_the_process_ended_under_are_answered_and_never_run_again() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls = ["executing", "planned"].map(|id| ToolCall {
+        custom: false,
+        name: "write".into(),
+        call_id: id.into(),
+        arguments: r#"{"path":"file","content":"hello"}"#.into(),
+        links: Default::default(),
+    });
+    let items = calls
+        .iter()
+        .map(|call| {
+            serde_json::to_vec(&json!({"type":"function_call","call_id":call.call_id,
+                "name":call.name,"arguments":call.arguments}))
+            .unwrap()
+            .into()
+        })
+        .collect();
+    db.append(turn, items, &calls, None).unwrap();
+    db.tool_start(turn, &calls[0], false, false).unwrap();
+    db.continue_cut_off(Some(5), |_| 300).unwrap();
+    let (waiting, view) = cut_off(&db, turn);
+    // No model call was open: it goes on at once, with no attempt charged.
+    assert_eq!((waiting.call_attempts, waiting.call_spent_ms), (0, 0));
+    assert!(view["waiting_on"]["resume_at_ms"].as_i64().unwrap() <= now_ms());
+    let events = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(!events.iter().any(|e| e["event"] == "retry"));
+    let completed: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "tool_completed")
+        .map(|e| {
+            (
+                e["data"]["call_id"].clone(),
+                e["data"]["outcome_unknown"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        completed,
+        [
+            (json!("executing"), json!(true)),
+            (json!("planned"), json!(false))
+        ]
+    );
+    let head = db.inspect("Bob").unwrap().head.unwrap();
+    let said = read_item(&db, "Bob", head).unwrap();
+    let output: Value = serde_json::from_str(said["output"].as_str().unwrap()).unwrap();
+    assert_eq!(output["error"], "process_interrupted");
+    assert!(
+        output["detail"].as_str().unwrap().contains("did not run"),
+        "{output}"
+    );
+}
+
+#[test]
+fn a_turn_cut_off_again_and_again_with_nothing_recorded_ends_at_the_limit() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let queued = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let next = db
+        .begin("Bob", "n", "next", true, &queued, allow_provider)
+        .unwrap()
+        .turn;
+    let cut = |db: &mut Database| {
+        db.continue_cut_off(Some(3), |_| 0).unwrap();
+        // The next start resumes it, and the process ends under it again.
+        if db.turn_status("Bob", turn).unwrap() == "paced" {
+            db.resume(turn).unwrap();
+        }
+    };
+    cut(&mut db);
+    cut(&mut db);
+    assert_eq!(db.turn_view("Bob", turn).unwrap()["status"], "running");
+    // A round recorded between is progress: the count starts over.
+    let (item, asked) = call("between");
+    db.append(turn, vec![item], &[asked], None).unwrap();
+    cut(&mut db);
+    cut(&mut db);
+    let events = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let counts: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "turn_paced")
+        .map(|e| e["data"]["restarts"].clone())
+        .collect();
+    assert_eq!(counts, [json!(1), json!(2), json!(1), json!(2)]);
+    // The third in a row ends it, saying so, and the queued message goes on.
+    cut(&mut db);
+    let view = db.turn_view("Bob", turn).unwrap();
+    assert_eq!(
+        (&view["status"], &view["error"], &view["restarts"]),
+        (
+            &json!("interrupted"),
+            &json!("process_interrupted"),
+            &json!(3)
+        ),
+        "{view}"
+    );
+    assert_eq!(db.turn_status("Bob", next).unwrap(), "ready");
+    // No limit continues it always.
+    db.start(next, allow_provider).unwrap();
+    for _ in 0..8 {
+        db.continue_cut_off(None, |_| 0).unwrap();
+        db.resume(next).unwrap();
+    }
+    assert_eq!(db.turn_status("Bob", next).unwrap(), "running");
+}
+
+#[test]
+fn a_turn_cut_off_after_its_final_reply_ends_with_it_and_asks_nothing_again() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A round with a call, answered, then the reply that ends the turn,
+    // recorded before the process ended and the turn's end was not.
+    let (item, asked) = call("first");
+    db.append(turn, vec![item], std::slice::from_ref(&asked), None)
+        .unwrap();
+    db.tool_start(turn, &asked, false, false).unwrap();
+    db.tool_finish(turn, "first", &result("ok")).unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.continue_cut_off(Some(5), |_| 300).unwrap();
+    let view = db.turn_view("Bob", turn).unwrap();
+    assert_eq!(
+        (&view["status"], &view["error"]),
+        (&json!("completed"), &json!(null)),
+        "{view}"
+    );
+    let events = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["event"] == "retry" || e["event"] == "turn_paced")
+    );
+}
+
+#[test]
+fn a_bots_own_restart_limit_stands_over_the_daemons() {
+    let mut db = db();
+    let own = |max_restarts| Binding {
+        settings: Settings {
+            max_restarts: Some(max_restarts),
+            ..Settings::default()
+        },
+        ..binding()
+    };
+    db.create("Ann", Some("/synthetic"), own(0)).unwrap();
+    db.create("Bob", Some("/synthetic"), own(2)).unwrap();
+    let begin = |db: &mut Database, bot: &str| {
+        db.begin(
+            bot,
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    let (ann, bob) = (begin(&mut db, "Ann"), begin(&mut db, "Bob"));
+    for limit in [Some(1), None] {
+        db.continue_cut_off(limit, |_| 0).unwrap();
+        for (bot, turn) in [("Ann", ann), ("Bob", bob)] {
+            if db.turn_status(bot, turn).unwrap() == "paced" {
+                db.resume(turn).unwrap();
+            }
+        }
+    }
+    // Ann set none: past the daemon's one, she goes on. Bob set two: with
+    // the daemon setting none, his second ends him.
+    assert_eq!(db.turn_status("Ann", ann).unwrap(), "running");
+    let view = db.turn_view("Bob", bob).unwrap();
+    assert_eq!(
+        (&view["status"], &view["restarts"]),
+        (&json!("interrupted"), &json!(2)),
+        "{view}"
+    );
+}
+
+#[test]
+fn schema_112_counts_cut_offs_and_ends_what_an_older_daemon_left_running() {
+    let path = std::env::temp_dir().join(format!("agent-restarts-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE turns DROP COLUMN restarts; ALTER TABLE turns DROP COLUMN restart_head;
+             PRAGMA user_version=111;",
+        )
+        .unwrap();
+    // The daemon that left it running would have ended it at its next open.
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.turn_status("Bob", turn).unwrap(), "interrupted");
+    drop(db);
+    let restarts: (i64, Option<i64>) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT restarts,restart_head FROM turns WHERE id=?",
+            [turn],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(restarts, (0, None));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
 
@@ -13927,6 +14303,10 @@ fn quoted_words_wait_with_their_turn_and_count_against_the_pending_bytes() {
     };
     // Recounted at open: the waiting turn still holds its quoted words.
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.pending().unwrap(), (1, waiting));
+    // It waits behind the running turn until that ends.
+    assert_eq!(db.next_ready().unwrap(), None);
+    db.continue_cut_off(Some(1), |_| 0).unwrap();
     assert_eq!(db.pending().unwrap(), (1, waiting));
     let (_, turn) = db.next_ready().unwrap().unwrap();
     db.start(turn, |_, _| Ok(())).unwrap();
@@ -21901,6 +22281,7 @@ fn paced(db: &mut Database, turn: i64) {
         Some(blocked),
         None,
         None,
+        (false, None),
     )
     .unwrap();
 }
@@ -23617,7 +23998,7 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
         vec![(turn, "c2".to_owned()), (turn, "c3".to_owned())]
     );
     // A pause that parks a turn ends the answered calls it leaves.
-    db.suspend_halted(halted, Halt::Pause, 0, 0, 0, None)
+    db.suspend_halted(halted, Halt::Pause, (0, 0, 0), None, (false, None))
         .unwrap();
     assert_eq!(heard(&mut db), vec![(halted, "c1".to_owned())]);
 }
