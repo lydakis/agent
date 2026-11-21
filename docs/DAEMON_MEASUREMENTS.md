@@ -12626,3 +12626,28 @@ keeps the daemon at speed, where full spends each commit waiting on the
 drive. The cost: a crash of the machine or a power loss can lose the
 commits made since the last checkpoint. A crash of the daemon loses
 nothing in either mode, and the store is never corrupted.
+
+## Summarize and retry once on a full context window (#1273)
+
+2026-11-21, Linux x86_64 cloud VM, 4 CPUs. The perf gate's benches
+(`bench/perf_gate.py`), base (main at db1ec0b, a fresh build) and head
+alternating, two rounds each. Sonny's screen was not run: the change
+touches no Sonny code.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.465 | 43.248 | -0.5% |
+| admission | burst submit p99, ms | 5.451 | 5.189 | -4.8% |
+| completion | release to terminal p99, ms | 12.839 | 13.52 | +5.3% |
+| footprint | idle RSS, MiB | 17.371 | 17.619 | +1.4% |
+| footprint | per idle bot, KiB | 1.926 | 1.688 | -12.4% |
+| footprint | RSS after a turn each, MiB | 33.133 | 32.42 | -2.2% |
+| footprint | CPU per turn, ms | 0.89 | 0.957 | +7.5% |
+| lifecycle | CPU, s | 0.665 | 0.675 | +1.5% |
+| lifecycle | p95 turn, ms | 586.673 | 586.689 | +0.0% |
+| lifecycle | peak RSS, MiB | 26.898 | 27.051 | +0.6% |
+
+Store work per turn is the same on both sides, and no timed measure passes
+the gate's warning (a median 15% past the base's with every head run worse
+than every base run): the moves are within run-to-run noise. A call the
+provider answers takes no new work; the new steps run only on a refusal.

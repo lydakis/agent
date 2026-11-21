@@ -1880,6 +1880,10 @@ pub struct Waiting {
     /// next reading that lets it start wakes the turn, which runs it then.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub load: bool,
+    /// The unfinished call went once more after the provider refused its
+    /// view as past the model's window: a second refusal ends the turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refilled: bool,
     /// What the command rules made of the calls still to run, as their
     /// round was announced, by call id: read from them as the park resumes.
     #[serde(skip)]
@@ -11088,6 +11092,7 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: false,
+            refilled: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -11157,6 +11162,7 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: true,
+            refilled: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -11369,6 +11375,7 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: false,
+            refilled: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14598,6 +14605,7 @@ impl Database {
             held_since_ms: None,
             poll,
             load: false,
+            refilled: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14637,6 +14645,7 @@ impl Database {
         blocked: Option<Blocked>,
         retrying: Option<String>,
         held_since_ms: Option<u64>,
+        refilled: bool,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -14675,6 +14684,7 @@ impl Database {
             blocked,
             poll: false,
             load: false,
+            refilled,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14770,6 +14780,7 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: false,
+            refilled: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;

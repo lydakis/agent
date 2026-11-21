@@ -458,6 +458,10 @@ struct Accounting {
     call_spent_ms: u64,
     /// The fallback the unfinished call went to.
     call_fallback: Option<agent_runtime::store::ParkedFallback>,
+    /// The unfinished call went once more after the provider refused its
+    /// view as past the model's window, kept in the park record: a second
+    /// refusal ends the turn.
+    refilled: bool,
     /// Set when a call parked the turn on a closed pool.
     parked_until: u64,
     /// Persist the call's phase with its existing park transaction.
@@ -735,6 +739,7 @@ impl Turn {
             let blocked = accounting.blocked.take();
             let retrying = accounting.backing_off.take();
             let held_since = accounting.held_since;
+            let refilled = accounting.refilled;
             // Commit the park and its accounting together, outside cancellation.
             self.store
                 .op("suspend_paced", move |db| {
@@ -754,6 +759,7 @@ impl Turn {
                         blocked,
                         retrying,
                         held_since,
+                        refilled,
                     )
                     .map(|_| ())
                 })
@@ -1572,6 +1578,17 @@ impl Turn {
                 .map_or(hard, |soft| soft.min(hard)),
             false => hard,
         };
+        // A refused view filled the model's window: its summary keeps
+        // shares of that view, also for a bot whose token threshold is off.
+        let window = u128::from(self.window.get().copied().unwrap_or(200_000));
+        let limit_at = match (full, record.sent) {
+            (true, Some((bytes, counted))) if counted > 0 => limit_at.min(
+                ((window * u128::from(bytes) / u128::from(counted)) as usize)
+                    .saturating_sub(overhead)
+                    .max(1),
+            ),
+            _ => limit_at,
+        };
         let at = limit_at.min(limit.bytes - reserve);
         if !requested
             && !full
@@ -1610,7 +1627,6 @@ impl Turn {
         // it cannot go beside its summary: as Codex compacts before such a
         // call, it is summarized first. A refusal records its view as the
         // whole window, so the next view that size is one.
-        let window = u128::from(self.window.get().copied().unwrap_or(200_000));
         let past_window =
             record
                 .sent
@@ -3107,6 +3123,7 @@ impl Turn {
                 accounting.call_attempts = waiting.call_attempts;
                 accounting.call_spent_ms = waiting.call_spent_ms;
                 accounting.call_fallback = waiting.fallback.clone();
+                accounting.refilled = waiting.refilled;
                 resume_window = !waiting.compaction;
                 copied = waiting.copied.clone().filter(|_| waiting.compaction);
             } else {
@@ -3327,9 +3344,9 @@ impl Turn {
         // A call the provider refused as past the model's window, and
         // whether a summary installed since made room: the next boundary
         // summarizes, and the call goes once more only if it made room.
-        // A second refusal (`refilled`) ends the turn on it.
+        // A second refusal (`refilled`, kept across parks) ends the turn
+        // on it.
         let mut full: Option<(Error, bool)> = None;
-        let mut refilled = false;
         // A summary planned at this boundary to run beside its call.
         let mut beside: Option<Beside<'_>>;
         // Until this task calls or changes the view, the view is taken as
@@ -3559,7 +3576,7 @@ impl Turn {
                 if !(room || made_room) {
                     return Err(error);
                 }
-                refilled = true;
+                accounting.refilled = true;
             }
             // A steer the turn had no room for is tried again once elision
             // or a summary makes some, and so is one that arrived while this
@@ -3728,7 +3745,7 @@ impl Turn {
                 let window = self.window.get().copied().unwrap_or(200_000);
                 record.sent = Some((bytes as u64, window));
                 // Said as a retry when the turn goes on to make room.
-                let retry = (!refilled).then(|| {
+                let retry = (!accounting.refilled).then(|| {
                     json!({"attempt":1,"error":error.code,"detail":error.detail,
                         "delay_ms":0,"parked":false,"compact":true})
                 });
@@ -3747,12 +3764,15 @@ impl Turn {
                 Ok(Some(response)) => {
                     drops = 0;
                     // Each call may go once more after a refusal.
-                    refilled = false;
+                    accounting.refilled = false;
                     response
                 }
                 // The view did not fit the model's window: summarized at the
                 // next boundary, as Pi Durable compacts and asks once more.
-                Err(error) if error.code == agent_runtime::provider::CONTEXT_FULL && !refilled => {
+                Err(error)
+                    if error.code == agent_runtime::provider::CONTEXT_FULL
+                        && !accounting.refilled =>
+                {
                     let installed = self
                         .join_summary(
                             running,

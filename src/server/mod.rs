@@ -10598,7 +10598,7 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None, false,
                 )
                 .map(|_| ())
             })
@@ -10662,7 +10662,7 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None, false,
                 )
                 .map(|_| ())
             })
@@ -10702,7 +10702,7 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None, false,
                 )
                 .map(|_| ())
             })
