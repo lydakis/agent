@@ -382,10 +382,22 @@ pub fn close_tool() -> Value {
 }
 
 /// What the agent wrote to be read, trimmed, its paragraphs kept apart
-/// by one blank line.
+/// by one blank line; a fenced code block, such as a step's line to run,
+/// kept as written, since a blank line or a space in a quoted value or a
+/// here-document is part of what it does.
 fn prose(text: Option<&str>) -> String {
     let mut out: Vec<&str> = Vec::new();
-    for line in text.unwrap_or("").lines().map(str::trim_end) {
+    let mut fenced = false;
+    for line in text.unwrap_or("").lines() {
+        let fence = ["```", "~~~"]
+            .iter()
+            .any(|f| line.trim_start().starts_with(f));
+        if fenced && !fence {
+            out.push(line);
+            continue;
+        }
+        fenced ^= fence;
+        let line = line.trim_end();
         if !(line.is_empty() && out.last().is_none_or(|last| last.is_empty())) {
             out.push(line);
         }
@@ -2748,6 +2760,25 @@ mod tests {
                 clock(now + 3600, now)
             )
         );
+    }
+
+    #[test]
+    fn the_line_to_run_keeps_its_blank_lines_and_spaces() {
+        let mut asked = sign_in();
+        asked["why"] = json!(
+            "Writes the notes.\n\n\n```\ncat <<'EOF' > notes.txt\nfirst  \n\n\nsecond\nEOF\n```  \n\n\nThen go on."
+        );
+        let ask = call("c9", &asked).unwrap();
+        // Prose around it is tidied; the block is as written.
+        assert_eq!(
+            ask.why,
+            "Writes the notes.\n\n```\ncat <<'EOF' > notes.txt\nfirst  \n\n\nsecond\nEOF\n```\n\nThen go on."
+        );
+        let shown: Vec<String> = (card(&ask, &State::Open, false, 60).rows.iter())
+            .map(|row| row.to_string())
+            .collect();
+        let first = shown.iter().position(|row| row.contains("first")).unwrap();
+        assert!(shown[first + 3].contains("second"), "{shown:?}");
     }
 
     #[test]
