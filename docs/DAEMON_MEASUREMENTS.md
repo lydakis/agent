@@ -12631,7 +12631,8 @@ nothing in either mode, and the store is never corrupted.
 
 2026-11-21, Linux x86_64 cloud VM, 4 CPUs. The perf gate's benches
 (`bench/perf_gate.py`), base (main at db1ec0b, a fresh build) and head
-alternating, two rounds each. Sonny's screen was not run: the change
+(31f71f3) alternating, two rounds each. Later commits on the pull request
+change only the refusal path. Sonny's screen was not run: the change
 touches no Sonny code.
 
 | Bench | Measure | Base | Head | Change |

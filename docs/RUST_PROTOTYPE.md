@@ -2671,7 +2671,9 @@ boundary summarizes before the call, whatever the view measures, with
 `trigger.reason` `context_full`; the call then goes once more, as Pi Durable
 compacts and asks again. A boundary that makes no room (nothing to summarize
 or elide, or no compaction instructions) ends the turn on the refusal, and so
-does a second refusal of the same call. That summary keeps its shares of the
+does a second refusal of the same call. A park between the refusal and that
+second call, on a rate limit for the summary or the call, keeps where the
+turn was. That summary keeps its shares of the
 refused view, also for a bot whose token threshold is off. The estimate
 stays, so a bot with a token threshold summarizes before its next turn's
 first call; the next answered call sets it from what the provider counted. A

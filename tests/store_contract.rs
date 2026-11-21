@@ -3808,7 +3808,7 @@ fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
             Some(blocked),
             None,
             None,
-            false,
+            (false, None),
         )
         .unwrap();
     assert_eq!(entry["event"], "turn_paced");
@@ -3862,7 +3862,7 @@ fn an_ordinary_retry_between_holds_keeps_when_they_began() {
             None,
             Some("provider_stream_failed".into()),
             Some(5),
-            false,
+            (false, None),
         )
         .unwrap();
     // A retry the provider asked for, not a hold: nothing says held, and
@@ -21903,7 +21903,7 @@ fn paced(db: &mut Database, turn: i64) {
         Some(blocked),
         None,
         None,
-        false,
+        (false, None),
     )
     .unwrap();
 }

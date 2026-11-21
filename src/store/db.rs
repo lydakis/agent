@@ -1884,6 +1884,11 @@ pub struct Waiting {
     /// view as past the model's window: a second refusal ends the turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refilled: bool,
+    /// The provider refused the unfinished call's view as past the model's
+    /// window, with the refusal's detail, and no summary has made room
+    /// yet: the turn summarizes first as it resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
     /// What the command rules made of the calls still to run, as their
     /// round was announced, by call id: read from them as the park resumes.
     #[serde(skip)]
@@ -11093,6 +11098,7 @@ impl Database {
             poll: false,
             load: false,
             refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -11163,6 +11169,7 @@ impl Database {
             poll: false,
             load: true,
             refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -11376,6 +11383,7 @@ impl Database {
             poll: false,
             load: false,
             refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14606,6 +14614,7 @@ impl Database {
             poll,
             load: false,
             refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14645,7 +14654,7 @@ impl Database {
         blocked: Option<Blocked>,
         retrying: Option<String>,
         held_since_ms: Option<u64>,
-        refilled: bool,
+        (refilled, refused): (bool, Option<String>),
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -14685,6 +14694,7 @@ impl Database {
             poll: false,
             load: false,
             refilled,
+            refused,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14781,6 +14791,7 @@ impl Database {
             poll: false,
             load: false,
             refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;

@@ -458,9 +458,13 @@ struct Accounting {
     call_spent_ms: u64,
     /// The fallback the unfinished call went to.
     call_fallback: Option<agent_runtime::store::ParkedFallback>,
-    /// The unfinished call went once more after the provider refused its
-    /// view as past the model's window, kept in the park record: a second
-    /// refusal ends the turn.
+    /// A call the provider refused as past the model's window, and whether
+    /// a summary installed since made room: the next boundary summarizes,
+    /// and the call goes once more only if it made room. Kept in the park
+    /// record until it does.
+    full: Option<(Error, bool)>,
+    /// The unfinished call went once more after such a refusal, kept in
+    /// the park record: a second refusal ends the turn.
     refilled: bool,
     /// Set when a call parked the turn on a closed pool.
     parked_until: u64,
@@ -740,6 +744,11 @@ impl Turn {
             let retrying = accounting.backing_off.take();
             let held_since = accounting.held_since;
             let refilled = accounting.refilled;
+            // A refusal whose summary has not yet made room.
+            let refused = accounting
+                .full
+                .as_ref()
+                .map(|(error, _)| error.detail.clone().unwrap_or_default());
             // Commit the park and its accounting together, outside cancellation.
             self.store
                 .op("suspend_paced", move |db| {
@@ -759,7 +768,7 @@ impl Turn {
                         blocked,
                         retrying,
                         held_since,
-                        refilled,
+                        (refilled, refused),
                     )
                     .map(|_| ())
                 })
@@ -3124,6 +3133,11 @@ impl Turn {
                 accounting.call_spent_ms = waiting.call_spent_ms;
                 accounting.call_fallback = waiting.fallback.clone();
                 accounting.refilled = waiting.refilled;
+                accounting.full = waiting.refused.clone().map(|detail| {
+                    let mut error = Error::new(agent_runtime::provider::CONTEXT_FULL);
+                    error.detail = Some(detail).filter(|detail| !detail.is_empty());
+                    (error, false)
+                });
                 resume_window = !waiting.compaction;
                 copied = waiting.copied.clone().filter(|_| waiting.compaction);
             } else {
@@ -3341,12 +3355,6 @@ impl Turn {
         // Whether this task has made a call, whose cache a summary beside
         // the next one reads.
         let mut sent_here = false;
-        // A call the provider refused as past the model's window, and
-        // whether a summary installed since made room: the next boundary
-        // summarizes, and the call goes once more only if it made room.
-        // A second refusal (`refilled`, kept across parks) ends the turn
-        // on it.
-        let mut full: Option<(Error, bool)> = None;
         // A summary planned at this boundary to run beside its call.
         let mut beside: Option<Beside<'_>>;
         // Until this task calls or changes the view, the view is taken as
@@ -3449,7 +3457,7 @@ impl Turn {
             // runs, this task starts no summary of its own.
             if !resuming && self.ahead.is_some() {
                 let requested = record.compaction_requested || self.compact.load(Relaxed);
-                let pending = full.as_ref().is_some_and(|(_, room)| !room);
+                let pending = accounting.full.as_ref().is_some_and(|(_, room)| !room);
                 let wait = self.ahead_pending()
                     && (requested
                         || self
@@ -3462,7 +3470,7 @@ impl Turn {
                             )
                             .is_some_and(|due| !due.fits));
                 if self.settle_ahead(&mut record, wait).await? {
-                    if let Some((_, room)) = &mut full {
+                    if let Some((_, room)) = &mut accounting.full {
                         *room = true;
                     }
                     if requested {
@@ -3532,7 +3540,7 @@ impl Turn {
                 // one that parks finds it again as the turn resumes.
                 let requested = std::mem::take(&mut record.compaction_requested)
                     | self.compact.swap(false, Relaxed);
-                let pending = full.as_ref().is_some_and(|(_, room)| !room);
+                let pending = accounting.full.as_ref().is_some_and(|(_, room)| !room);
                 // Only behind a call this task made, whose cache the next
                 // call reads: at a turn's start, or as a turn resumes, the
                 // cache may have lapsed, and a summary first keeps that call
@@ -3572,7 +3580,7 @@ impl Turn {
             // A view the provider refused as past the window goes once more
             // only when this boundary made it room; with none to make, the
             // turn ends on the refusal.
-            if let Some((error, room)) = full.take() {
+            if let Some((error, room)) = accounting.full.take() {
                 if !(room || made_room) {
                     return Err(error);
                 }
@@ -3782,7 +3790,7 @@ impl Turn {
                             accounting,
                         )
                         .await?;
-                    full = Some((error, installed));
+                    accounting.full = Some((error, installed));
                     continue;
                 }
                 // The model's own output cap cut its reply short. The reply

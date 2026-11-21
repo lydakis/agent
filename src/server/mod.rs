@@ -10598,7 +10598,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None, false,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })
@@ -10662,7 +10677,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None, false,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })
@@ -10702,7 +10732,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None, false,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })
