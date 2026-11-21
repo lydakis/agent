@@ -9,7 +9,8 @@ until it has judged every call:
 - first_verdict_s: until its first round's verdict;
 - verdict_s_p50 / p99 / max: until each call's verdict;
 - peak_rss_mib: the reviewer's own, sampled every quarter second;
-- lost: whether it let its lease go, and the event it ended on.
+- lost: whether it let its lease go, and the event it ended on;
+- requests: the daemon's requests while it ran, by op.
 
 One daemon on the synthetic model of `bench.lookout_scale`, its judge
 answering after J ms. Run from the repo root after
@@ -24,7 +25,7 @@ import threading
 import time
 from pathlib import Path
 
-from bench.lookout_scale import Bench, Sampler
+from bench.lookout_scale import TICK, Bench, Sampler
 from bench.slow_socket import SlowSocket
 
 
@@ -45,6 +46,9 @@ def restart(bench, gated, store_ms, limit_s):
         if time.monotonic() > deadline:
             raise RuntimeError(f'{waiting(bench)} of {gated} calls waiting')
         time.sleep(.25)
+    ops = lambda: {op: entry['count'] for op, entry in
+                   bench.control.request('stats')['result']['commands']['ops'].items()}
+    before = ops()
     slow = SlowSocket(bench.socket, bench.tmp / 'slow.sock', store_ms / 1000)
     log = open(bench.out / 'reviewer.err', 'w')
     started = time.monotonic()
@@ -67,6 +71,10 @@ def restart(bench, gated, store_ms, limit_s):
     while len(verdicts()) < gated and process.poll() is None and time.monotonic() - started < limit_s:
         time.sleep(.1)
     took = time.monotonic() - started
+    user, system = cpu_split(process.pid)
+    # The daemon's requests while the reviewer ran, by op: what it asked.
+    requests = {op: count - before.get(op, 0) for op, count in ops().items()
+                if op != 'stats' and count > before.get(op, 0)}
     stats = sampler.done()
     alive = process.poll() is None
     process.terminate()
@@ -86,8 +94,18 @@ def restart(bench, gated, store_ms, limit_s):
             'verdict_s_p50': pct(at, .5), 'verdict_s_p99': pct(at, .99),
             'verdict_s_max': round(max(at), 2) if at else None,
             'peak_rss_mib': stats['peak_rss_mib'], 'cpu_s': stats['cpu_s'],
-            'renewals': slow.renewals, 'alive': alive,
+            'cpu_user_s': user, 'cpu_system_s': system,
+            'renewals': slow.renewals, 'alive': alive, 'requests': requests,
             'lost': end is not None, 'ended_on': end.get('event') if end else None}
+
+
+def cpu_split(pid):
+    """A process's user and system CPU seconds so far."""
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+    except OSError:
+        return None, None
+    return round(int(fields[11]) / TICK, 2), round(int(fields[12]) / TICK, 2)
 
 
 def waiting(bench):
