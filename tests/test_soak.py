@@ -164,7 +164,8 @@ class SoakTests(unittest.TestCase):
             self.assertEqual(len(result['slow_followers']), 4)
             self.assertTrue(all(f['bytes_read'] > 0 for f in result['slow_followers']))
             self.assertEqual(counts['follower_disconnects'], sum(f['disconnected'] for f in result['slow_followers']))
-            self.assertEqual(result['restart']['bot_statuses'].get('interrupted'), result['restart']['held'])
+            # The restart continues every turn the kill cut off to its end.
+            self.assertEqual(result['restart']['cut_off'], {'completed': result['restart']['held']})
             self.assertGreater(result['provider_requests'], counts['turns'])
             self.assertTrue(result['samples'])
             self.assertEqual(set(PACE) - {'fork'}, set(ROLES))

@@ -15,6 +15,10 @@ use serde_json::{Map, Value, json};
 const MAX_DECLARED: usize = 32;
 const DECLARED_BYTES: usize = 64 * 1024;
 
+/// The result the daemon keeps for a declared tool that names none, and
+/// `inspect` reads back.
+const RESULT: &str = "ok";
+
 /// Sonny's tools, as it declares them on a bot in `role`: a workflow's
 /// worker, which no one talks to, goes without those that reach the
 /// person.
@@ -51,6 +55,24 @@ fn kinded(mut tool: Value) -> Value {
     };
     tool["kind"] = json!(kind);
     tool
+}
+
+/// Whether two tools are one as the daemon keeps them, and `inspect`
+/// reads them back: a tool that names no result has the daemon's. What a
+/// bot has is compared so, so one read back after its tools were declared
+/// has nothing to declare again.
+fn same(a: &Value, b: &Value) -> bool {
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return a == b;
+    };
+    fn result(tool: &Map<String, Value>) -> Option<&str> {
+        tool.get("result").map_or(Some(RESULT), Value::as_str)
+    }
+    let rest = |tool: &Map<String, Value>| tool.len() - usize::from(tool.contains_key("result"));
+    a["name"] == b["name"]
+        && result(a) == result(b)
+        && rest(a) == rest(b)
+        && (a.iter()).all(|(key, value)| key == "result" || b.get(key) == Some(value))
 }
 
 /// The lead whose line the bot `record` describes is in: the nearest of
@@ -129,7 +151,7 @@ pub fn held(declared: &Value, settings: &Value) -> Option<Value> {
         tool["name"] == crate::served::EXEC && tool["answered_by"] == crate::served::TAG
     })?;
     let exec = kinded(crate::exec::tool(Role::TASK.within(settings).escalates)?);
-    (tools[at] != exec).then(|| {
+    (!same(&tools[at], &exec)).then(|| {
         let mut tools = tools.clone();
         tools[at] = exec;
         Value::Array(tools)
@@ -141,19 +163,22 @@ pub fn held(declared: &Value, settings: &Value) -> Option<Value> {
 /// when they fit, or it has them already.
 pub fn too_many(record: &Value, role: Role) -> Option<String> {
     let declared = wanted(record, role)?;
-    let bytes = serde_json::to_vec(&declared).map_or(0, |json| json.len());
-    (!fits(&declared)).then(|| {
-        format!(
-            "{} tools of {bytes} bytes, past the {MAX_DECLARED} tools and {DECLARED_BYTES} bytes an agent takes",
-            declared.len()
-        )
-    })
+    (!fits(&declared)).then(|| too_large(&declared))
+}
+
+/// What [`too_many`] says of `declared`, past what the daemon takes.
+fn too_large(declared: &[Value]) -> String {
+    let bytes = serde_json::to_vec(declared).map_or(0, |json| json.len());
+    format!(
+        "{} tools of {bytes} bytes, past the {MAX_DECLARED} tools and {DECLARED_BYTES} bytes an agent takes",
+        declared.len()
+    )
 }
 
 /// The tools [`declare`] would give the bot `record` describes, in
 /// `role`, fitting or not; `None` when it has them already.
 fn wanted(record: &Value, role: Role) -> Option<Vec<Value>> {
-    let mut declared = record["declared"].as_array().cloned().unwrap_or_default();
+    let declared: &[Value] = record["declared"].as_array().map_or(&[], Vec::as_slice);
     let mut ours = tools(role.within(&record["settings"]));
     // A task resolves itself, as its lead resolves it.
     if !role.lead && !role.worker && resolves(record) {
@@ -175,15 +200,20 @@ fn wanted(record: &Value, role: Role) -> Option<Vec<Value>> {
         other["answered_by"] == crate::served::TAG
             || names.iter().any(|tool| tool["name"] == other["name"])
     };
-    if ours.iter().all(|tool| declared.contains(tool))
+    if ours
+        .iter()
+        .all(|tool| declared.iter().any(|have| same(have, tool)))
         && declared
             .iter()
-            .all(|other| ours.contains(other) || !sonnys(other))
+            .all(|other| ours.iter().any(|tool| same(other, tool)) || !sonnys(other))
     {
         return None;
     }
     // Any of Sonny's there gives way to these: a lead's only on a lead.
-    declared.retain(|other| !sonnys(other));
+    let mut declared: Vec<Value> = (declared.iter())
+        .filter(|other| !sonnys(other))
+        .cloned()
+        .collect();
     declared.extend(ours);
     Some(declared)
 }
@@ -200,28 +230,38 @@ fn fits(declared: &[Value]) -> bool {
 /// upgrade, such as a task out of sight, gets a tool added since. A lead
 /// stays a lead, by the tool only a lead has; any other bot takes a
 /// task's; and a tool Sonny gates is gated as the bot's mode gates the
-/// rest.
-pub fn refresh(record: &Value) -> Option<Map<String, Value>> {
+/// rest. Why not, when its own beside Sonny's are past what the daemon
+/// takes ([`too_many`]).
+pub fn refresh(record: &Value) -> Result<Option<Map<String, Value>>, String> {
     // A trigger's shadow copy keeps the few tools it was made with, and
     // no gate a person answers.
     if (record["name"].as_str()).is_some_and(|name| crate::trigger::shadow_source(name).is_some()) {
-        return None;
+        return Ok(None);
     }
     // Sonny's own by a tool its lookout answers, not by a name another
     // client's tool could share.
-    let declared = record["declared"].as_array()?;
+    let Some(declared) = record["declared"].as_array() else {
+        return Ok(None);
+    };
     if !declared
         .iter()
         .any(|tool| tool["answered_by"] == crate::served::TAG)
     {
-        return None;
+        return Ok(None);
     }
     // A workflow's worker stays one, by its name.
     let role = match (record["name"].as_str()).is_some_and(crate::workflow::is_worker) {
         true => Role::WORKER,
         false => declared_role(declared),
     };
-    fields(record, role)
+    // Read once: what it should declare, and why not when it can't.
+    let Some(declare) = wanted(record, role) else {
+        return Ok(None);
+    };
+    if !fits(&declare) {
+        return Err(too_large(&declare));
+    }
+    Ok(Some(given(record, Value::Array(declare))))
 }
 
 /// The role of a bot Sonny declared `declared` on: a lead by the tool only
@@ -250,7 +290,12 @@ pub fn adopt(record: &Value) -> Option<Map<String, Value>> {
 /// The `configure` fields that bring `record` to Sonny's tools in `role`,
 /// with the approvals its mode gives the ones it gates.
 fn fields(record: &Value, role: Role) -> Option<Map<String, Value>> {
-    let declare = declare(record, role)?;
+    Some(given(record, declare(record, role)?))
+}
+
+/// The `configure` fields that `declare` the tools of the bot `record`
+/// describes, with the approvals its mode gives the ones Sonny gates.
+fn given(record: &Value, declare: Value) -> Map<String, Value> {
     let mut fields = Map::new();
     if let Some(mode) = crate::approvals::mode(record).filter(|mode| *mode != "full") {
         let tools: Vec<String> = (record["tools"].as_array().into_iter().flatten())
@@ -265,7 +310,7 @@ fn fields(record: &Value, role: Role) -> Option<Map<String, Value>> {
     fields.insert("declare".into(), declare);
     fields.insert("bot".into(), record["name"].clone());
     fields.insert("bot_id".into(), json!(record["bot_id"]));
-    Some(fields)
+    fields
 }
 
 #[cfg(test)]
@@ -318,6 +363,28 @@ mod tests {
         // Opened under a row that lets it out, it is declared that way.
         let record = json!({"declared": declared, "settings": free});
         assert!(!exec(&declare(&record, Role::TASK).unwrap()).contains("sandbox_permissions"));
+    }
+
+    /// Sonny's tools as the daemon keeps them, every field it fills in
+    /// named, are the ones Sonny declares: a bot read back after they were
+    /// declared has nothing to declare again.
+    #[test]
+    fn tools_read_back_from_the_daemon_are_not_declared_again() {
+        for role in [Role::LEAD, Role::TASK, Role::WORKER] {
+            let declared = declare(&json!({}), role).unwrap();
+            // The daemon gives a tool that names no result its own.
+            let read: Vec<Value> = (declared.as_array().unwrap().iter())
+                .map(|tool| {
+                    let mut tool = tool.clone();
+                    let fields = tool.as_object_mut().unwrap();
+                    fields.entry("result").or_insert(json!("ok"));
+                    tool
+                })
+                .collect();
+            assert_ne!(json!(read), declared);
+            let again = declare(&json!({"declared": read}), role);
+            assert_eq!(again, None);
+        }
     }
 
     #[test]
@@ -381,7 +448,7 @@ mod tests {
             "declared": tools(Role::WORKER.within(&Value::Null))});
         assert_eq!(role(&record), Role::WORKER);
         assert_eq!(declare(&record, Role::WORKER), None);
-        assert!(refresh(&record).is_none_or(
+        assert!(refresh(&record).unwrap().is_none_or(
             |fields| fields["declare"] == json!(tools(Role::WORKER.within(&Value::Null)))
         ));
     }
@@ -474,31 +541,31 @@ mod tests {
         };
         // Another client's bot, or one with no tools declared, is left alone.
         let other = json!({"name": "x", "declared": [{"name": "theirs"}]});
-        assert_eq!(refresh(&other), None);
+        assert_eq!(refresh(&other), Ok(None));
         // Nor is one whose tool only shares a name with one of Sonny's.
         let named =
             json!({"name": "x", "declared": [{"name": crate::served::MEMORY, "result": "ok"}]});
-        assert_eq!(refresh(&named), None);
-        assert_eq!(refresh(&json!({"name": "x"})), None);
+        assert_eq!(refresh(&named), Ok(None));
+        assert_eq!(refresh(&json!({"name": "x"})), Ok(None));
         // A lead from an older build, missing a tool: it stays a lead.
         let mut old: Vec<Value> = tools(a_lead());
         old.pop();
         let lead = json!({"name": "calc.lead", "bot_id": 7, "declared": old});
-        let fields = refresh(&lead).unwrap();
+        let fields = refresh(&lead).unwrap().unwrap();
         assert_eq!(fields["bot"], "calc.lead");
         assert_eq!(fields["bot_id"], 7);
         assert!(names(&fields).contains(&crate::served::START.to_owned()));
         assert!(!fields.contains_key("approve"));
         let mut current = lead.clone();
         current["declared"] = fields["declare"].clone();
-        assert_eq!(refresh(&current), None);
+        assert_eq!(refresh(&current), Ok(None));
         // A task under auto: its new tools are gated as the rest are.
         let mut old: Vec<Value> = tools(a_helper());
         old.retain(|tool| tool["name"] != crate::served::FOLLOWS);
         let task = json!({"name": "calc.fix", "bot_id": 8, "created_by": "calc.lead",
             "tools": ["shell", "read"], "declared": old,
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
-        let fields = refresh(&task).unwrap();
+        let fields = refresh(&task).unwrap().unwrap();
         // Every agent starts tasks, as deep as the daemon lets it.
         assert!(names(&fields).contains(&crate::served::START.to_owned()));
         assert!(!names(&fields).contains(&crate::served::PROJECT.to_owned()));
@@ -513,7 +580,9 @@ mod tests {
         old.push(json!({"name": "goal", "parameters": {"type": "object"},
             "answered_by": crate::served::TAG}));
         old.push(json!({"name": "theirs", "result": "ok"}));
-        let fields = refresh(&json!({"name": "calc.lead", "bot_id": 7, "declared": old})).unwrap();
+        let fields = refresh(&json!({"name": "calc.lead", "bot_id": 7, "declared": old}))
+            .unwrap()
+            .unwrap();
         let names: Vec<&str> = (fields["declare"].as_array().unwrap().iter())
             .filter_map(|tool| tool["name"].as_str())
             .collect();

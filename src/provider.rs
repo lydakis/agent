@@ -101,6 +101,24 @@ pub fn was_cut_short(error: &Error) -> bool {
         })
 }
 
+/// The code every provider's refusal of a request past the model's context
+/// window maps to, so a turn compacts and sends it once more (as Pi Durable
+/// does) and the bot's next call compacts first (as Codex marks the window
+/// full). Only typed signals map to it, never a message's words: OpenAI's
+/// `context_length_exceeded` (a 400, or a failed stream or socket event, as
+/// Codex reads it in `codex-api/src/error.rs`), Anthropic's
+/// `model_context_window_exceeded` stop, and HTTP 413, a request past the
+/// endpoint's size limit (Anthropic's `request_too_large`), which a smaller
+/// history also fits. Anthropic's and Bedrock's input-too-long refusal is an
+/// untyped 400 told apart only by its message, so it stays `provider_http_400`.
+pub const CONTEXT_FULL: &str = "provider_context_full";
+
+/// A provider error code that means the request does not fit the model's
+/// context window: OpenAI's, which Bedrock's OpenAI endpoint shares.
+pub(crate) fn context_full(code: &str) -> bool {
+    code == "context_length_exceeded"
+}
+
 /// JSON-encoded bytes one tool call id may take. Real ids run tens of bytes;
 /// the bound keeps every call listable and answerable: its approval entry
 /// and answer fit a 1 MiB line, and the printed `agent answer` command
@@ -1642,6 +1660,8 @@ impl Provider {
             reservation.settle(0);
             let code = if quota {
                 "provider_quota_exhausted".to_owned()
+            } else if status == 413 || (status == 400 && body.context_full) {
+                CONTEXT_FULL.to_owned()
             } else {
                 format!("provider_http_{status}")
             };
@@ -2470,6 +2490,8 @@ struct ErrorBody {
     /// A refusal for traffic that grew too fast, which Anthropic names
     /// `ramp_limit_exceeded` in `details.error_code`.
     ramp: bool,
+    /// A request past the model's context window, by its code.
+    context_full: bool,
 }
 
 async fn error_body(response: reqwest::Response) -> Option<ErrorBody> {
@@ -2561,6 +2583,7 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
             ]
             .iter()
             .any(|field| field.as_str() == Some("ramp_limit_exceeded")),
+            context_full: value["error"]["code"].as_str().is_some_and(context_full),
             detail: value
                 .as_str()
                 .or_else(|| value["error"]["message"].as_str())
@@ -2575,8 +2598,7 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
         Err(_) if expects_json || text.starts_with(['{', '[', '"']) => None,
         Err(_) => Some(ErrorBody {
             detail: Some(text.to_owned()),
-            quota: false,
-            ramp: false,
+            ..ErrorBody::default()
         }),
     }
 }
@@ -3868,7 +3890,7 @@ mod tests {
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n",
                     "request-id: req_014\r\nconnection: close\r\n\r\n",
                     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":",
-                    "{\"stop_reason\":\"model_context_window_exceeded\"},",
+                    "{\"stop_reason\":\"a_new_stop\"},",
                     "\"usage\":{\"output_tokens\":0}}\n\n",
                     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 ),
@@ -3946,6 +3968,20 @@ mod tests {
     fn an_error_body_keeps_a_top_level_detail() {
         let body = parse_error_body(br#"{"detail":"Unsupported region."}"#, true).unwrap();
         assert_eq!(body.detail.as_deref(), Some("Unsupported region."));
+    }
+
+    #[test]
+    fn a_window_refusal_reads_from_its_code_never_its_words() {
+        let openai = br#"{"error":{"message":"Your input exceeds the context window of this model.","type":"invalid_request_error","param":"input","code":"context_length_exceeded"}}"#;
+        assert!(parse_error_body(openai, true).unwrap().context_full);
+        // Anthropic's names no code: its words alone are not read.
+        let anthropic = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#;
+        assert!(!parse_error_body(anthropic, true).unwrap().context_full);
+        assert!(
+            !parse_error_body(b"context_length_exceeded", false)
+                .unwrap()
+                .context_full
+        );
     }
 
     #[test]

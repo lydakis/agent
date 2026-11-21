@@ -787,8 +787,9 @@ class DeliveryTests(ModelFixture):
         third = client.request('submit', bot='Bob', request_id='3', prompt='third', delivery='steer')['result']['message']
         client.close(kill=True)
         client = self.client()
-        # Recovery ends the interrupted turn and the line moves at once.
-        self.assertEqual(poll(client, 'Bob', first)['result']['status'], 'interrupted')
+        # Recovery continues the turn the kill cut off, and the line moves
+        # once it ends.
+        self.assertEqual(client.finished(first, timeout=15)['data']['status'], 'completed')
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
         # The steer joins the first turn if it reached a boundary before the
         # restart, the next turn at its first boundary, or runs alone. The

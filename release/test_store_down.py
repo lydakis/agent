@@ -33,6 +33,12 @@ CREATE TABLE translating(id INTEGER PRIMARY KEY, bot_id INTEGER UNIQUE, tip INTE
 PRAGMA user_version=111;
 """
 
+UP_112 = """
+ALTER TABLE turns ADD COLUMN restarts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turns ADD COLUMN restart_head INTEGER;
+PRAGMA user_version=112;
+"""
+
 
 class StoreDownTest(unittest.TestCase):
     """The way back on the store 0.10.2 made; tests/test_release_stores.py
@@ -69,6 +75,9 @@ class StoreDownTest(unittest.TestCase):
             "'anthropic','anthropic','b','{}',0 FROM bots WHERE name='Helper'",
             (self.switched, node),
         )
+        # 112 counts each turn's cut-offs; one turn was cut off twice.
+        conn.executescript(UP_112)
+        conn.execute("UPDATE turns SET restarts=2,restart_head=? WHERE id=?", (self.switched, turn))
         conn.execute(
             "UPDATE bots SET settings=json_set(coalesce(settings,'{}'),'$.namespace','fixture')"
             " WHERE name='Helper'"
@@ -94,8 +103,15 @@ class StoreDownTest(unittest.TestCase):
             store_down.main([self.store, *args])
         return json.loads(out.getvalue())
 
+    def test_turns_lose_their_count_of_cut_offs(self):
+        self.assertEqual(self.down("111")["from"], 112)
+        self.assertEqual(self.read("PRAGMA user_version"), [(111,)])
+        columns = {row[1] for row in self.read("PRAGMA table_info(turns)")}
+        self.assertFalse({"restarts", "restart_head"} & columns)
+        self.assertEqual(self.read(f"SELECT count(*) FROM turns WHERE id={self.turn}"), [(1,)])
+
     def test_a_switched_agent_stays_where_it_is_and_each_turn_has_one_node(self):
-        self.assertEqual(self.down("110")["from"], 111)
+        self.assertEqual(self.down("110")["from"], 112)
         self.assertEqual(self.read("PRAGMA user_version"), [(110,)])
         self.assertEqual(self.read(f"SELECT id FROM nodes WHERE turn={self.turn}"), [(self.switched,)])
         self.assertEqual(self.read(f"SELECT turn FROM nodes WHERE id={self.original}"), [(None,)])
@@ -106,7 +122,7 @@ class StoreDownTest(unittest.TestCase):
                          [(1,)])
 
     def test_back_to_0_10_1_s_shape(self):
-        self.assertEqual(self.down("106")["from"], 111)
+        self.assertEqual(self.down("106")["from"], 112)
         self.assertEqual(self.read("PRAGMA user_version"), [(106,)])
         columns = {row[1] for row in self.read("PRAGMA table_info(bots)")}
         self.assertTrue({"instructions", "compaction_instructions"} <= columns)
@@ -124,7 +140,7 @@ class StoreDownTest(unittest.TestCase):
         # Every bot names a list the store keeps.
         self.assertEqual(self.read("SELECT count(*) FROM bots WHERE declared IS NOT NULL"
                                    " AND declared NOT IN (SELECT digest FROM tool_lists)"), [(0,)])
-        self.assertEqual(len(glob.glob(self.store + ".schema-111.*.backup")), 1)
+        self.assertEqual(len(glob.glob(self.store + ".schema-112.*.backup")), 1)
 
     def test_to_0_10_2_only_the_settings_it_refuses_go(self):
         lists = self.read("SELECT * FROM tool_lists")
@@ -145,13 +161,13 @@ class StoreDownTest(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX)
             with self.assertRaisesRegex(SystemExit, "a daemon holds this store"):
                 self.down("106")
-        for to in ("105", "112"):
-            with self.assertRaisesRegex(SystemExit, "goes back to 106 through 111"):
+        for to in ("105", "113"):
+            with self.assertRaisesRegex(SystemExit, "goes back to 106 through 112"):
                 self.down(to)
         os.link(self.store, self.store + ".alias")
         with self.assertRaisesRegex(SystemExit, "another hard link"):
             self.down("106")
-        self.assertEqual(self.read("PRAGMA user_version"), [(111,)])
+        self.assertEqual(self.read("PRAGMA user_version"), [(112,)])
 
 
 if __name__ == "__main__":

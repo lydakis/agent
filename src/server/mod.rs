@@ -1571,6 +1571,10 @@ pub struct Configuration {
     /// The most generations below the bot that starts its line a `create`
     /// or `fork` may make a bot at; none by default.
     pub max_depth: Option<u64>,
+    /// The times in a row the daemon's process may end while a turn runs,
+    /// with nothing recorded between, before the next start ends that turn
+    /// rather than continuing it; none never ends one for it.
+    pub max_restarts: Option<u32>,
     /// How far each commit is on the disk when it is answered; `Full` by
     /// default.
     pub durability: agent_runtime::store::Durability,
@@ -2816,6 +2820,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "readers":limits.readers,"connections":limits.connections,
             "load":(limits.load > 0.0).then_some(limits.load),
             "idle_exit_seconds":config.idle_exit,"depth":config.max_depth,
+            "restarts":config.max_restarts,
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
@@ -2884,6 +2889,18 @@ pub async fn run(config: Configuration) -> Result<()> {
                 ends.call_ended(turn, call_id)
             }));
             Ok(())
+        })
+        .await?;
+    // Turns the process left running when it ended unplanned go on, a model
+    // call it cut off asked again after its first backoff. Once the
+    // publisher runs, so their events, several a turn, never fill its
+    // channel; no request is served before the run loop starts below.
+    let max_restarts = config.max_restarts;
+    store
+        .call(move |db| {
+            db.continue_cut_off(max_restarts, |turn| {
+                turn::backoff(1, turn as u64).as_millis() as u64
+            })
         })
         .await?;
     if let Some(gate) = registry.load_gate() {
@@ -3519,18 +3536,31 @@ pub async fn run(config: Configuration) -> Result<()> {
     answer_observed(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
-    // A planned stop parks each running turn for the next start; a fatal
-    // error ends it, as a crash would, so a failing daemon never brings a
-    // turn back on its own.
+    // A planned stop parks each running turn for the next start. A fatal
+    // error leaves them as a crash would, with nothing more written: the
+    // next start continues each, counted against its restart limit
+    // (`continue_cut_off`), so a daemon that keeps failing under a turn
+    // ends it rather than bringing it back forever.
     let planned = served.is_ok();
-    let cause = if planned { turn::SHUTDOWN } else { turn::DIED };
     for active in service.active.drain() {
-        active.cancel(cause);
+        if planned {
+            active.cancel(turn::SHUTDOWN);
+        }
+    }
+    if !planned {
+        service.jobs.abort_all();
     }
     // A completion that could not commit leaves its turn for the next start
-    // to end as interrupted; the rest still drain, and the exit reports it.
+    // to continue; the rest still drain, and the exit reports it.
     let mut failed = None;
     while let Some(result) = service.jobs.join_next().await {
+        if result
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled)
+            && !planned
+        {
+            continue;
+        }
         let completed = match result.map_err(|_| Error::new("turn_task_failed")) {
             Ok((bot, turn, task, exit)) => service.complete(bot, turn, task, exit).await,
             Err(error) => Err(error),
@@ -10587,7 +10617,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })
@@ -10651,7 +10696,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })
@@ -10691,7 +10751,22 @@ mod tests {
         store
             .call(move |db| {
                 db.suspend_paced(
-                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                    bob,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (false, None),
                 )
                 .map(|_| ())
             })
