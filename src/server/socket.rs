@@ -237,22 +237,40 @@ fn prepare(folder: &Path, socket: &Path) -> Result<()> {
     }
 }
 
-/// The process umask set to `177` until dropped, which restores it: a
-/// socket is made `0777` less the mask, as a folder is, so `077` would
-/// leave it `0700`.
-struct Umask(libc::mode_t);
-impl Umask {
-    fn owner_only() -> Self {
-        // SAFETY: umask only replaces the calling process's mask and
-        // returns the old one.
-        Self(unsafe { libc::umask(0o177) })
+/// Listen on `path`, owner-only from the moment the name exists. Whoever
+/// can connect has every bot, so a chmod after a bind in place would leave
+/// an instant in which another user's connect lands in the backlog and is
+/// accepted later. The socket is bound in a folder only the owner may enter
+/// (`NAME.b`, beside it, held under the owner lock), made `0600` there and
+/// renamed into place, as the bots' own sockets live in a private folder.
+/// No umask is set: it is the whole process's, and a folder another thread
+/// made while it was `177` could not be entered. The staged path is 4 bytes
+/// longer than `path`, within the platform's socket path limit like `path`.
+fn bind_owner_only(path: &Path) -> Result<UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let mut staging = path.as_os_str().to_os_string();
+    staging.push(".b");
+    let staging = PathBuf::from(staging);
+    // One a daemon that died here left behind; never a symlink followed.
+    match std::fs::symlink_metadata(&staging) {
+        Ok(found) if found.is_dir() => std::fs::remove_dir_all(&staging)?,
+        Ok(_) => std::fs::remove_file(&staging)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-}
-impl Drop for Umask {
-    fn drop(&mut self) {
-        // SAFETY: as above, restoring what was taken.
-        unsafe { libc::umask(self.0) };
-    }
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    // The mode as asked, whatever the umask took from it.
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
+    let staged = staging.join("s");
+    let bound = UnixListener::bind(&staged)
+        .map_err(|_| Error::new("socket_bind_failed"))
+        .and_then(|listener| {
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::rename(&staged, path)?;
+            Ok(listener)
+        });
+    let _ = std::fs::remove_dir_all(&staging);
+    bound
 }
 
 /// `lock` once its holder lets it go, by `until`. The wait is the kernel's,
@@ -330,18 +348,7 @@ impl Owner {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        // Owner-only from the moment the name exists. Whoever can connect
-        // has every bot, so the mode is set with the umask around the
-        // bind, not with a chmod after it: a chmod would leave an instant
-        // in which another user's connect lands in the backlog and is
-        // accepted later. The umask is the process's, but the daemon
-        // binds before it accepts a session or starts a companion, so no
-        // child is spawned in that instant, and a file another thread
-        // makes then is only tighter than it would be.
-        let listener = {
-            let _owner_only = Umask::owner_only();
-            UnixListener::bind(&path).map_err(|_| Error::new("socket_bind_failed"))?
-        };
+        let listener = bind_owner_only(&path)?;
         let metadata = std::fs::symlink_metadata(&path)?;
         Ok((
             Self {
@@ -368,14 +375,9 @@ impl Drop for Owner {
 mod tests {
     use super::*;
 
-    /// The umask is the process's: tests that bind take turns, so one
-    /// does not see another's mask.
-    static BINDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[tokio::test]
-    async fn the_socket_is_its_owner_s_alone_and_the_umask_is_given_back() {
+    async fn the_socket_is_its_owner_s_alone_and_the_umask_is_untouched() {
         use std::os::unix::fs::PermissionsExt;
-        let _turn = BINDING.lock().await;
         let mode = |path: &Path| {
             std::fs::symlink_metadata(path)
                 .unwrap()
@@ -392,6 +394,8 @@ mod tests {
         let (owner, listener) = Owner::bind(&path, None).await.unwrap();
         assert_eq!(mode(&path) & 0o777, 0o600);
         assert_eq!(mode(&directory.join("endpoint.owner-lock")) & 0o777, 0o600);
+        assert!(!directory.join("endpoint.b").exists());
+        assert!(UnixStream::connect(&path).await.is_ok());
         // What the process makes afterwards takes the umask it had.
         let after = directory.join("after");
         File::create(&after).unwrap();
@@ -448,7 +452,6 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_does_not_unlink_a_replacement_socket() {
-        let _turn = BINDING.lock().await;
         let directory =
             std::env::temp_dir().join(format!("agent-socket-owner-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -460,6 +463,48 @@ mod tests {
         drop(owner);
         assert!(UnixStream::connect(&path).await.is_ok());
         drop((listener, replacement));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Binding never sets the process's umask, which every thread shares:
+    /// a folder another test made while it was `177` was `0600` and could
+    /// not be entered (main, 11-21). Linux shows the mask without setting it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn binding_leaves_the_process_umask_alone() {
+        let umask = || {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("Umask:").map(|m| m.trim().to_owned()))
+                .unwrap()
+        };
+        let directory =
+            std::env::temp_dir().join(format!("agent-socket-umask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let before = umask();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (done, before) = (done.clone(), before.clone());
+            std::thread::spawn(move || {
+                let mut seen = std::collections::BTreeSet::new();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    seen.insert(umask());
+                }
+                seen.remove(&before);
+                seen
+            })
+        };
+        for n in 0..500 {
+            drop(
+                Owner::bind(&directory.join(format!("e{n}")), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(watcher.join().unwrap(), Default::default());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
