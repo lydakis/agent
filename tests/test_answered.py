@@ -56,7 +56,7 @@ class AnsweredToolTests(ModelFixture):
                              (dict(START, answered_by='a b'), 'tag'),
                              (dict(START, answered_by=''), 'empty'),
                              (dict(START, expire_ms=0), 'zero'),
-                             (dict(START, expire_ms=3_600_001), 'long'),
+                             (dict(START, expire_ms=365 * 86_400_000 + 1), 'long'),
                              ({k: v for k, v in START.items() if k != 'answered_by'} | {'expire_ms': 5}, 'alone'),
                              ({k: v for k, v in START.items() if k != 'answered_by'} | {'yields': True}, 'yields')]:
             refused = client.request('create', bot='Bad', workspace=str(self.path), declare=[tool])
@@ -95,6 +95,20 @@ class AnsweredToolTests(ModelFixture):
         [answered] = [i for i in requests[-1]['input'] if i.get('call_id') == 'script-0' and 'output' in i]
         self.assertEqual((answered['type'], answered['output']), ('function_call_output', 'hi'))
 
+    def test_a_long_answer_reaches_the_model_as_its_head_and_tail(self):
+        # Nothing bounds an answer but its line; the model reads it cut to
+        # the preview, as Codex shows a tool's output.
+        client = self.lead()
+        turn = self.submit(client)
+        self.started(client, turn)
+        long = 'a' * 100_000 + 'z' * 100_000
+        self.assertIn('result', self.answer(client, turn, output=long))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        output = self.output(client)
+        self.assertTrue(output.startswith('a' * 1000) and output.endswith('z' * 1000), output[:80])
+        self.assertIn('bytes omitted', output)
+        self.assertLess(len(output), 70_000)
+
     def test_an_answer_within_the_hold_is_the_result_and_the_turn_never_parks(self):
         client = self.lead()
         turn = self.submit(client)
@@ -108,7 +122,6 @@ class AnsweredToolTests(ModelFixture):
         self.assertEqual(client.request('tool_calls', tag='other')['result'], {'calls': [], 'next_after': None})
         self.assertEqual(self.answer(client, turn, output='a', error={'code': 'x'})['error'], 'invalid_tool_result')
         self.assertEqual(self.answer(client, turn, error={'code': 'Not Ok'})['error'], 'invalid_tool_result')
-        self.assertEqual(self.answer(client, turn, output='x' * 65537)['error'], 'tool_output_limit')
         self.assertEqual(self.answer(client, turn, call_id='nope', output='a')['error'], 'no_pending_call')
         self.assertEqual(self.answer(client, turn, bot='Other', output='a')['error'], 'turn_not_found')
         self.assertEqual(self.answer(client, turn, output='started fix')['result'],
@@ -233,8 +246,6 @@ class AnsweredToolTests(ModelFixture):
         self.assertEqual(self.answer(client, turn, output=[dict(image(b'nope'), type='image')])['error'],
                          'invalid_image')
         self.assertEqual(self.answer(client, turn, output=[part] * 21)['error'], 'image_limit')
-        self.assertEqual(self.answer(client, turn, output=[{'type': 'text', 'text': 'x' * 65537}])['error'],
-                         'tool_output_limit')
         self.assertEqual(self.answer(client, turn, output=[{'type': 'video'}])['error'], 'invalid_request')
         # Words and pictures reach the model in the order given.
         self.assertIn('result', self.answer(client, turn, output=[
@@ -617,7 +628,7 @@ class StepTests(ModelFixture):
         ask = dict(bot='Lead', turn=turn, call_id='script-0', step='1', name='mcp__chat__send', arguments={})
         for change, error in [({'step': 'a b'}, 'invalid_step'), ({'name': ''}, 'invalid_step'), ({'name': 'x' * 513}, 'invalid_step'),
                               ({'arguments': []}, 'invalid_step'),
-                              ({'arguments': {'text': 'x' * 65537}}, 'step_arguments_limit'),
+                              ({'arguments': {'text': 'x' * (768 * 1024)}}, 'step_arguments_limit'),
                               ({'call_id': 'nope'}, 'no_pending_call'), ({'bot': 'Other'}, 'turn_not_found')]:
             self.assertEqual(client.request('approve_step', **(ask | change))['error'], error, change)
         self.answer(client, turn, output='ok')

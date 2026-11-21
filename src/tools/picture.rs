@@ -18,9 +18,6 @@ const MOST_BYTES: usize = 1024 * 1024;
 /// four bytes a pixel, and a small file can hold a large picture.
 const MOST_PIXELS: u64 = 64 << 20;
 
-/// The bytes [`kind`] needs to tell a picture.
-pub const HEAD: u64 = 12;
-
 /// `read` of the file `load` reads, in a blocking worker and one picture at
 /// a time: decoding and scaling are CPU work that would hold up every bot on
 /// the daemon's thread, and each one can take hundreds of megabytes while it
@@ -45,7 +42,7 @@ pub async fn read_apart(
 }
 
 /// The format, media type and name of a picture of one of the four kinds
-/// providers take, from its first [`HEAD`] bytes.
+/// providers take, from its first bytes.
 pub fn kind(bytes: &[u8]) -> Option<(ImageFormat, &'static str, &'static str)> {
     Some(match bytes {
         [0x89, b'P', b'N', b'G', ..] => (ImageFormat::Png, "image/png", "PNG"),

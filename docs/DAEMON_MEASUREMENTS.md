@@ -12665,3 +12665,63 @@ Store work per turn matched on every run. The first two rounds of the
 first screen read the change 6% slower on completion p99 and 10% on burst
 submit p99; over all five rounds those read -4% and +0.6%, and every
 range overlaps main's.
+
+## Tools without caps Codex and Pi don't share
+
+2026-11-21, Linux x86_64 cloud VM, 4 CPUs. Main is `0bd642d`, built
+beside the change; each binary's page cache is dropped before each run,
+and the sides alternate.
+
+### Matched screen (perf gate's benches, alternating, five rounds)
+
+| Bench | Measure | Main | Change |
+| --- | --- | ---: | ---: |
+| lifecycle, 32-bot socket echo | CPU, s | 0.75 | 0.75 |
+| lifecycle | p95 turn, ms | 590 | 588 |
+| lifecycle | peak RSS, MiB | 28.3 | 28.7 |
+| completion_burst | release to terminal p99, ms | 14.4 | 14.3 |
+| admission_burst | lone submit CPU, ms | 44.3 | 44.6 |
+| admission_burst | burst submit p99, ms | 6.04 | 5.89 |
+| footprint (13 rounds) | idle RSS, MiB | 20.3 | 20.6 |
+| footprint | RSS after a turn each, MiB | 34.7 (32.3 to 42.0) | 36.2 (33.6 to 40.1) |
+| footprint | CPU per turn, ms | 1.09 | 1.12 |
+
+None of these benches calls a tool this change touches. Footprint's
+reading after a turn each moves with the allocator from run to run, so it
+was run again with anonymous PSS from `smaps_rollup` (8 rounds each,
+alternating which side ran first), and against an A/A of two copies of
+main's binary:
+
+| Pair | Anonymous PSS after a turn each, MiB | PSS after a turn each, MiB |
+| --- | ---: | ---: |
+| main, main's copy (A/A) | 16.1 / 16.6 | 33.0 / 33.9 |
+| main, change | 15.5 / 16.5 | 32.7 / 34.1 |
+
+Two identical binaries differ by as much as main and the change do. At
+10,000 bots (2 runs each) the change read PSS after a turn each of 37.9
+and 39.7 MiB against main's 38.9 and 39.9, and 1.08 to 1.24 ms CPU per
+turn against 1.12 to 1.13.
+
+### The tools themselves (`Registry::execute`, release build, five rounds)
+
+Files of 100, 25,000 and 95,000 lines (4 KiB, 1 MiB, 3.8 MiB, under
+main's 4 MiB bound); `read` asks for 200 lines, and `edit` makes one
+replacement.
+
+| Call | Main, µs | Change, µs |
+| --- | ---: | ---: |
+| read, small | 541 | 158 |
+| read, medium, first page | 2,129 | 1,109 |
+| read, medium, last page | 2,383 | 1,080 |
+| read, large, first page | 6,121 | 3,245 |
+| read, large, last page | 7,671 | 2,752 |
+| edit, small | 970 | 676 |
+| edit, medium | 2,938 | 2,268 |
+| edit, large | 14,950 | 7,058 |
+
+`read` pages the file on one blocking job instead of reading it whole
+through Tokio's file, which takes a trip to the blocking pool for each
+piece; `edit` reads, matches and replaces in one blocking job. A first
+revision of `edit` read the file through Tokio and matched on a job of
+its own: 10% slower than main on small and medium files, so it was
+changed to this one.
