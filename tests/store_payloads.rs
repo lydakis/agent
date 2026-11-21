@@ -123,6 +123,9 @@ fn shared_prompts_survive_queue_steer_restart_and_source_deletion() {
         }
         {
             let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            // The restart ends the turn it cut off, as a daemon with a
+            // limit of one restart does.
+            db.continue_cut_off(Some(1), |_| 0).unwrap();
             assert!(
                 !db.begin("bot", "first", &prompt, true, &plain, |_, _| Ok(()))
                     .unwrap()
