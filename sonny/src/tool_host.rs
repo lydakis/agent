@@ -206,18 +206,18 @@ async fn inspect(client: &Client, bot: &Value) -> Option<Value> {
 /// one opens after an upgrade, such as a task out of sight, gets a tool
 /// added since. Whether it was at work, to ask again.
 async fn refresh(client: &Client, bot: &Value, record: &Value) -> bool {
-    let Some(fields) = crate::declared::refresh(record) else {
+    let fields = match crate::declared::refresh(record) {
+        Ok(Some(fields)) => fields,
+        Ok(None) => return false,
         // Said, not skipped in silence: the agent goes on without the
         // tools added since.
-        let declared = record["declared"].as_array().cloned().unwrap_or_default();
-        let role = crate::declared::declared_role(&declared);
-        if let Some(why) = crate::declared::too_many(record, role) {
+        Err(why) => {
             println!(
                 "{}",
                 json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": "tools_too_large", "why": why})
             );
+            return false;
         }
-        return false;
     };
     match client.request("configure", Value::Object(fields)).await {
         Ok(_) => println!(
