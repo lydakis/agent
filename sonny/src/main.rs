@@ -2589,10 +2589,38 @@ pub(crate) async fn answer_once(
     submitted: Value,
 ) -> Result<Value, String> {
     let bot = submitted["bot"].as_str().unwrap_or_default().to_owned();
+    let reply = submit_once(client, ask, submitted).await;
+    // Answered, it has nothing left to remind of: its deadline goes
+    // now, beside the window, rather than wait in `/background` for a
+    // gate that would say no. Only once the answer opened a turn,
+    // which nothing takes back: one waiting in line, or for the
+    // running turn's next round, may yet be withdrawn or bounce and
+    // leave the question open, so its deadline stays for the gate.
+    if reply.as_ref().is_ok_and(|reply| reply["turn"].is_i64()) {
+        let (bot, ask) = (bot.clone(), ask.to_owned());
+        tokio::task::spawn_blocking(move || asks::let_deadline_go(&bot, &ask));
+    }
+    reply.map_err(|error| match error.code.as_str() {
+        "idempotency_conflict" => "that question was answered already".to_owned(),
+        _ => error.to_string(),
+    })
+}
+
+/// Submit `submitted` once under the request ids [`asks::request_id`]
+/// gives `key`: a resend, from here or anywhere sending under the same
+/// key, is refused or answered with the first. One taken back from the
+/// queue before the agent read it delivered nothing, so the next goes as
+/// the next attempt.
+pub(crate) async fn submit_once(
+    client: &Client,
+    key: &str,
+    submitted: Value,
+) -> agent_client::Result<Value> {
+    let bot = submitted["bot"].as_str().unwrap_or_default().to_owned();
     let mut attempt = 0;
     loop {
         let mut submitted = submitted.clone();
-        submitted["request_id"] = json!(asks::request_id(ask, attempt));
+        submitted["request_id"] = json!(asks::request_id(key, attempt));
         let reply = client.request("submit", submitted).await;
         // The message this attempt's answer sent already, if one went.
         let before = match &reply {
@@ -2612,20 +2640,7 @@ pub(crate) async fn answer_once(
             attempt += 1;
             continue;
         }
-        // Answered, it has nothing left to remind of: its deadline goes
-        // now, beside the window, rather than wait in `/background` for a
-        // gate that would say no. Only once the answer opened a turn,
-        // which nothing takes back: one waiting in line, or for the
-        // running turn's next round, may yet be withdrawn or bounce and
-        // leave the question open, so its deadline stays for the gate.
-        if reply.as_ref().is_ok_and(|reply| reply["turn"].is_i64()) {
-            let (bot, ask) = (bot.clone(), ask.to_owned());
-            tokio::task::spawn_blocking(move || asks::let_deadline_go(&bot, &ask));
-        }
-        return reply.map_err(|error| match error.code.as_str() {
-            "idempotency_conflict" => "that question was answered already".to_owned(),
-            _ => error.to_string(),
-        });
+        return reply;
     }
 }
 

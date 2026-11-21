@@ -57,7 +57,7 @@ pub async fn check(client: &Client, bot: &str, ask: &asks::Ask) -> Verdict {
         .and_then(|(turn, call)| Some((turn.parse::<i64>().ok()?, call)));
     let read = match named {
         Some((turn, call)) => asks::standing(client, bot, turn, call, None).await,
-        None => by_call(client, bot, &ask.id).await,
+        None => by_call(client, bot, ask).await,
     };
     match (read, named.is_some()) {
         (Ok(Some((_, asks::State::Answered(answer)))), _) => Verdict::Answered(answer),
@@ -71,22 +71,37 @@ pub async fn check(client: &Client, bot: &str, ask: &asks::Ask) -> Verdict {
     }
 }
 
-/// The ask `bot`'s call `call` put, whole, and where it stands, read back
-/// from its newest history to that call: a card drawn with no turn names
-/// its ask by the call alone.
+/// The ask `bot`'s history holds that `card`, drawn with no turn, shows,
+/// and where it stands, read back from its newest history: the newest put
+/// by the card's call that asks what the card asks, word for word. A
+/// provider's call ids are unique only within a turn, so another turn's
+/// call of the same id asking anything else is another question, read
+/// past, and never answered for this card.
 async fn by_call(
     client: &Client,
     bot: &str,
-    call: &str,
+    card: &asks::Ask,
 ) -> agent_client::Result<Option<(asks::Ask, asks::State)>> {
     let (mut asked, mut found) = (asks::Asked::default(), None);
     crate::said::walk(client, bot, 0, |at, entry: &Value| {
-        found = (asked.entry(at, entry).into_iter())
-            .find(|(ask, _)| ask.id.rsplit_once('/').is_some_and(|(_, of)| of == call));
+        found = (asked.entry(at, entry).into_iter()).find(|(ask, _)| {
+            ask.id.rsplit_once('/').is_some_and(|(_, of)| of == card.id) && same(ask, card)
+        });
         found.is_some()
     })
     .await?;
     Ok(found)
+}
+
+/// Whether two asks put the same question to the person: its words, why,
+/// options, recommendation, what a yes covers and any step to run.
+fn same(one: &asks::Ask, other: &asks::Ask) -> bool {
+    (one.question == other.question)
+        && (one.why == other.why)
+        && (one.options == other.options)
+        && (one.recommended == other.recommended)
+        && (one.covers == other.covers)
+        && (one.command == other.command)
 }
 
 /// `prompt`, an answer [`asks::answer`] wrote to ask `was`, naming ask
@@ -129,6 +144,51 @@ mod tests {
         assert!(!held_open(&needs, "shop.lead", "ask:4/c1"), "unsure since");
         needs.asked("shop.lead", None);
         assert!(!held_open(&needs, "shop.lead", "ask:4/c1"), "answered");
+    }
+
+    /// A card named by its call alone is the question it shows: another
+    /// turn's call of the same id asking something else is never answered
+    /// for it, nor is that question's state taken for the card's.
+    #[tokio::test]
+    async fn a_card_with_no_turn_is_matched_by_what_it_asks_too() {
+        let call = |question: &str| {
+            let arguments = json!({"question": question,
+                "options": [{"label": "Now"}, {"label": "Later"}]});
+            json!({"type": "function_call", "name": asks::TOOL, "call_id": "c1",
+                "arguments": arguments.to_string()})
+        };
+        let taken = json!({"type": "function_call_output", "call_id": "c1", "output": "{}"});
+        let said = json!({"type": "message", "role": "user", "content": [{"type": "input_text",
+            "text": "You asked (ask:4/c1): Ship it?\n\nNow"}]});
+        // Newest first: turn 6 asks "Tag it?" under the same call id.
+        let history = vec![
+            (21, 6, taken.clone()),
+            (20, 6, call("Tag it?")),
+            (18, 5, said),
+            (17, 4, taken),
+            (16, 4, call("Ship it?")),
+        ];
+        let client = crate::tests::daemon_answering(move |request| {
+            crate::tests::history_read(&history, request).unwrap_or_default()
+        })
+        .await;
+        let card = |question: &str| {
+            let arguments = json!({"question": question,
+                "options": [{"label": "Now"}, {"label": "Later"}]});
+            asks::call("c1", &arguments).unwrap()
+        };
+        assert_eq!(
+            check(&client, "shop.lead", &card("Ship it?")).await,
+            Verdict::Answered("Now".into())
+        );
+        match check(&client, "shop.lead", &card("Tag it?")).await {
+            Verdict::Send(ask) => assert_eq!(ask.id, "ask:6/c1"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            check(&client, "shop.lead", &card("Merge it?")).await,
+            Verdict::Unknown(_)
+        ));
     }
 
     #[test]

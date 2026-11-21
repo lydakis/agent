@@ -2376,8 +2376,8 @@ async fn send_pick(
     match person {
         Some(person) => {
             submitted["person"] = json!(person);
-            submitted["request_id"] = json!(asks::request_id(&format!("{} {person}", ask.id), 0));
-            (client.request("submit", submitted).await).map_err(|e| e.to_string())?;
+            let key = format!("{} {person}", ask.id);
+            (crate::submit_once(client, &key, submitted).await).map_err(|e| e.to_string())?;
         }
         None => {
             crate::answer_once(client, &ask.id, submitted).await?;
@@ -3034,6 +3034,57 @@ mod tests {
             assert_ne!(ids[2], ids[0]);
             assert_eq!(ids[3], ids[2]);
         }
+    }
+
+    /// A named person's pick withdrawn from the queue before the agent
+    /// read it delivered nothing: their next goes as the next attempt,
+    /// as the person's own does.
+    #[tokio::test]
+    async fn a_named_pick_taken_back_unread_goes_again() {
+        let ask = asks::call(
+            "ask:4/c1",
+            &json!({"question": "Ship it?", "why": "w",
+            "options": [{"label": "Now"}, {"label": "Later"}]}),
+        )
+        .unwrap();
+        let submitted = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = submitted.clone();
+        let history = crate::tests::asked_history(false, false);
+        let client = crate::tests::daemon_answering(move |request| {
+            if let Some(read) = crate::tests::history_read(&history, request) {
+                return read;
+            }
+            match request["op"].as_str().unwrap_or("") {
+                "messages" => json!({"messages": [{"message": 9, "status": "withdrawn",
+                    "turn": null}]}),
+                _ => {
+                    let mut seen = seen.lock().unwrap();
+                    let again = (seen.iter()).any(|was| was["request_id"] == request["request_id"]);
+                    seen.push(request.clone());
+                    match again {
+                        true => json!({"duplicate": true, "message": 9}),
+                        false => json!({"message": 9}),
+                    }
+                }
+            }
+        })
+        .await;
+        for _ in 0..2 {
+            let went = send_pick(&client, ("shop.lead", Some(1)), &ask, "1", Some("ana")).await;
+            assert_eq!(went, Ok(true));
+        }
+        let ids: Vec<Value> = (submitted.lock().unwrap().iter())
+            .map(|request| request["request_id"].clone())
+            .collect();
+        let key = "ask:4/c1 ana";
+        assert_eq!(
+            ids,
+            [
+                json!(asks::request_id(key, 0)),
+                json!(asks::request_id(key, 0)),
+                json!(asks::request_id(key, 1)),
+            ]
+        );
     }
 
     #[test]
