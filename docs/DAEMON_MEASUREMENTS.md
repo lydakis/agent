@@ -12810,5 +12810,9 @@ The socket is now bound in `NAME.b`, a `0700` folder beside it held under
 the owner lock, made `0600` there and renamed into place, so the name is
 still owner-only from its first instant. That is a `mkdir`, a `chmod`, the
 `bind`, a `chmod`, a `rename` and a `rmdir`: once, at start, before any
-session is accepted. Nothing is added per bot or per turn, and no store
+session is accepted. A `NAME.b` left by a daemon that died mid-bind is
+cleared only when it is the owner's private folder holding nothing but
+its socket; anything else there refuses the bind and stays. The staged
+address is 4 bytes longer, so `default_socket` takes the short `/tmp`
+rendezvous for a store whose adjacent socket leaves no such room. Nothing is added per bot or per turn, and no store
 job. The pull request's Perf screen is the matched comparison.
