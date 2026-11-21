@@ -3805,13 +3805,12 @@ turn's end, at most
 reads, or with `"error":{"code","detail"?}` in place of `output`, a refusal
 the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
 lowercase letters, digits or `_`; output and detail are bounded only by
-the request line, redacted as command output is, and past 64 KiB the model
-reads each as its first and last 32 KiB with the omission stated, as Codex
-bounds a tool's output only by what the model is shown; anything else is
+the request line, redacted as command output is, and the model reads them
+whole: what to keep is the client's to decide; anything else is
 `invalid_tool_result`). `output` may instead be a list of parts the model
 reads in that order, as providers' own tool results and MCP's take them:
 `{"type":"text","text"}` and `{"type":"image","media_type","data"}`. Each
-text is redacted and cut the same way, and its pictures
+text is redacted the same way and taken whole, and its pictures
 are a prompt's: up to 20 of PNG, JPEG, GIF or WebP, 5 MiB together once
 decoded, else `invalid_image` or `image_limit`. A picture counts at its
 token cost, and a result with pictures elides to its text as a read
@@ -4921,7 +4920,7 @@ but has more than 64 megapixels is `image_limit`, refused before it is
 decoded; scaling runs off the daemon's thread, one picture at a time. `write` creates parent
 directories. `edit` replaces an exact string that must occur once unless `replace_all`
 is set. Neither they nor `apply_patch` bound a file or its content, as Codex's
-`apply_patch` and Pi's `edit` do not; matching runs on a blocking thread. `apply_patch` takes Codex's patch format: one patch adds, deletes,
+`apply_patch` and Pi's `edit` do not; reading and matching run on a blocking thread. `apply_patch` takes Codex's patch format: one patch adds, deletes,
 updates and moves any number of files, every change checked before any file is
 written, so a patch that does not apply changes nothing. Its context lines
 match exactly, then ignoring trailing and surrounding whitespace, then with

@@ -335,7 +335,7 @@ fn print_flags(flags: &str) {
             ),
             "--expires" => (
                 "DURATION",
-                "Delete the fork once it has been idle this long, from 1s to 168h",
+                "Delete the fork once it has been idle this long, from 1s to 365d",
             ),
             "--detach" => (
                 "",
@@ -727,7 +727,13 @@ const DURATIONS: &[(&str, u64, u64, bool, &str)] = &[
         "up to 1h; 0 parks at once",
     ),
     ("--grace", 0, 86_400_000, false, "up to 24h"),
-    ("--expires", 1000, 604_800_000, false, "from 1s to 168h"),
+    (
+        "--expires",
+        1000,
+        agent_runtime::store::HOLD_MAX_MS,
+        false,
+        "from 1s to 365d",
+    ),
     ("--stall-timeout", 1000, 86_400_000, true, "from 1s to 24h"),
     (
         "--idle-exit",

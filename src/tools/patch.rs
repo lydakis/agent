@@ -301,21 +301,19 @@ impl Patch {
                     chunks,
                 } => {
                     let source = workspace.join(path);
-                    let bytes = files::read_whole(&source, hidden).await?;
-                    let text = String::from_utf8(bytes)
-                        .map_err(|_| Error::with("file_not_utf8", path.clone()))?;
-                    // Matching can take a while on a long file: off the
-                    // runtime's thread.
+                    let mut opened = files::open_std(&source, hidden).await?;
+                    // Reading, checking and matching grow with the file: in
+                    // one job off the runtime's thread.
                     let (chunks, name) = (chunks.clone(), path.clone());
-                    let updated =
-                        tokio::task::spawn_blocking(move || update(&text, &chunks, &name))
-                            .await
-                            .map_err(|_| {
-                                Error::with(
-                                    "invalid_patch",
-                                    format!("{path}: could not be matched"),
-                                )
-                            })??;
+                    let updated = tokio::task::spawn_blocking(move || {
+                        let text = String::from_utf8(files::read_std(&mut opened)?)
+                            .map_err(|_| Error::with("file_not_utf8", name.clone()))?;
+                        update(&text, &chunks, &name)
+                    })
+                    .await
+                    .map_err(|_| {
+                        Error::with("invalid_patch", format!("{path}: could not be matched"))
+                    })??;
                     match move_to {
                         Some(to) => {
                             writable(workspace, to).await?;

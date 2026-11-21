@@ -95,19 +95,16 @@ class AnsweredToolTests(ModelFixture):
         [answered] = [i for i in requests[-1]['input'] if i.get('call_id') == 'script-0' and 'output' in i]
         self.assertEqual((answered['type'], answered['output']), ('function_call_output', 'hi'))
 
-    def test_a_long_answer_reaches_the_model_as_its_head_and_tail(self):
-        # Nothing bounds an answer but its line; the model reads it cut to
-        # the preview, as Codex shows a tool's output.
+    def test_a_long_answer_reaches_the_model_whole(self):
+        # Nothing bounds an answer but its line, and nothing of it is cut:
+        # what to keep is the client's to decide.
         client = self.lead()
         turn = self.submit(client)
         self.started(client, turn)
         long = 'a' * 100_000 + 'z' * 100_000
         self.assertIn('result', self.answer(client, turn, output=long))
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        output = self.output(client)
-        self.assertTrue(output.startswith('a' * 1000) and output.endswith('z' * 1000), output[:80])
-        self.assertIn('bytes omitted', output)
-        self.assertLess(len(output), 70_000)
+        self.assertEqual(self.output(client), long)
 
     def test_an_answer_within_the_hold_is_the_result_and_the_turn_never_parks(self):
         client = self.lead()

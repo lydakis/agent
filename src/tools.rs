@@ -297,7 +297,7 @@ impl Tool {
                 "fork":{"type":"boolean"},
                 "checkpoint":{"type":"integer","minimum":1,"description":"With fork: copy the conversation up to this node, not all of it"},
                 "allow":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"With fork: the tools the copy may call, within this agent's; [] allows none"},
-                "expire_ms":{"type":"integer","minimum":1000,"maximum":604800000,"description":"With fork: delete the copy once idle this long"},
+                "expire_ms":{"type":"integer","minimum":1000,"maximum":crate::store::HOLD_MAX_MS,"description":"With fork: delete the copy once idle this long"},
                 "workspace":{"type":"string","minLength":1,"description":"Its folder, within what this agent may reach; default this turn's folder"},
                 "tools":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Its tools, within this agent's; default this agent's, or the profile's"},
                 "settings":{"type":"object","description":"Its settings over this agent's own, never looser: sandbox, writable, network, unix_sockets, approval_policy, speed, cache_ttl, context_bytes, context_items, note_turns, compact_at, compact_keep, compact_tokens, post_turn_compact_percent, keep_turns, max_rounds, max_drops, max_output_tokens, approval_hold_ms, hold_ms, outputs, trailer, quiet_background, rules, env"},
@@ -2978,15 +2978,14 @@ impl Registry {
     }
 
     /// A client's answer to a call, as the model reads it: each text (the
-    /// output, an error's detail, or a later text part) redacted and, past
-    /// the preview, cut to its head and tail, as Codex bounds a tool's
-    /// output only by what the model is shown; off the runtime's thread
-    /// when large. The client keeps what it sent, so nothing more is kept.
+    /// output, an error's detail, or a later text part) redacted, and whole:
+    /// what it keeps is the client's to decide, within the request line
+    /// that carries it. Off the runtime's thread when large.
     pub async fn answered(&self, texts: Vec<String>) -> Result<Vec<String>> {
         let bytes = texts.iter().map(String::len).sum();
         self.off_runtime(bytes, move |registry| {
             (texts.into_iter())
-                .map(|text| cut(registry.redact(text)))
+                .map(|text| registry.redact(text))
                 .collect()
         })
         .await
@@ -4114,19 +4113,6 @@ fn truncate(text: &str, dropped: u64) -> String {
     truncated(text, &retained)
 }
 
-/// A text part's head and tail past the preview, the omission stated;
-/// nothing of it is kept beyond what is shown.
-fn cut(text: String) -> String {
-    if text.len() <= PREVIEW_BYTES {
-        return text;
-    }
-    let half = PREVIEW_BYTES / 2;
-    let head = &text[..boundary(&text, half)];
-    let tail = &text[boundary(&text, text.len() - half)..];
-    let omitted = text.len() - head.len() - tail.len();
-    format!("{head}\n[... {omitted} bytes omitted ...]\n{tail}")
-}
-
 /// Head and tail of an oversized output, saying what is `retained`. One
 /// that redaction left within a preview is shown whole, with the same word.
 fn truncated(text: &str, retained: &str) -> String {
@@ -4652,7 +4638,7 @@ pub(crate) fn not_started(error: std::io::Error, folder: &Path) -> Error {
     if error.raw_os_error() == Some(libc::E2BIG) {
         return Error::with(
             "command_too_long",
-            "the system refused to start a command this long (E2BIG); write it to a file and run that",
+            "the system refused to start a command this long (E2BIG)",
         );
     }
     if error.kind() == std::io::ErrorKind::NotFound && !folder.is_dir() {

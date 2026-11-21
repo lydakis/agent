@@ -849,7 +849,7 @@ class SocketAndCliTests(ModelFixture):
                            (('--bot', 'Bob', '--allow=', 'q'), 'is for a copy made with --fork'),
                            (('--fork', 'Bob', '--bot', 'C', '--new', 'q'), 'conflicts with'),
                            (('--fork', 'Bob', '--bot', 'C', '--instructions', 'x', 'q'), 'is for a new bot'),
-                           (('--fork', 'Bob', '--bot', 'C', '--expires', '500ms', 'q'), 'from 1s to 168h')):
+                           (('--fork', 'Bob', '--bot', 'C', '--expires', '500ms', 'q'), 'from 1s to 365d')):
             refused = self.agent('run', *store, *args, check=False)
             self.assertEqual(refused.returncode, 2, refused.stderr)
             self.assertIn(says, refused.stderr)
