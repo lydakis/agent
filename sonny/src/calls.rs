@@ -1222,9 +1222,6 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                     .collect();
                 said.under.push(dim(numbered.join(" · ")));
             }
-            if let Some(command) = ask.command {
-                said.under.push(dim(command));
-            }
             Some(said)
         }
         crate::resolved::TOOL => Some(Said {

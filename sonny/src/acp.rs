@@ -2289,10 +2289,7 @@ fn form(session: &str, ask: &asks::Ask, call: Option<&str>) -> Value {
         message = format!("{message}\n\n{}", ask.why);
     }
     if let Some(choice) = ask.recommended.and_then(|at| ask.options.get(at)) {
-        message = match ask.reason.is_empty() {
-            true => format!("{message}\n\nRecommended: {}.", choice.label),
-            false => format!("{message}\n\nRecommended: {}. {}", choice.label, ask.reason),
-        };
+        message = format!("{message}\n\nRecommended: {}.", choice.label);
     }
     let options: Vec<Value> = (ask.options.iter().enumerate())
         .map(|(at, choice)| {
@@ -2349,26 +2346,41 @@ async fn elicit(
     let Some(client) = (session.state.lock().await.bound.as_ref()).map(|b| b.client.clone()) else {
         return;
     };
-    let words = asks::answer(ask, picked);
-    let mut submitted = json!({"bot": bot, "bot_id": bot_id, "delivery": "steer"});
-    let _ = match person {
+    let _ = send_pick(&client, (&bot, bot_id), ask, picked, person).await;
+}
+
+/// The pick `picked` of `person` (the person when none) on `bot`'s
+/// question `ask`, sent as their answer: whether it went. A form may wait
+/// in the client for days, and the person may have answered the question
+/// since, in a window or another client: read as it goes, nothing goes to
+/// one answered already ([`crate::repick`]). Each goes once, under one
+/// request id however often a client sends it: the person's the one every
+/// window sends theirs under, anyone else's their own, so another's pick
+/// never takes the person's place.
+async fn send_pick(
+    client: &Client,
+    (bot, bot_id): (&str, Option<i64>),
+    ask: &asks::Ask,
+    picked: &str,
+    person: Option<&str>,
+) -> Result<bool, String> {
+    let ask = match crate::repick::check(client, bot, ask).await {
+        crate::repick::Verdict::Send(ask) => *ask,
+        _ => return Ok(false),
+    };
+    let mut submitted = json!({"bot": bot, "bot_id": bot_id, "delivery": "steer",
+        "prompt": asks::answer(&ask, picked)});
+    match person {
         Some(person) => {
-            submitted["prompt"] = json!(words);
             submitted["person"] = json!(person);
-            submitted["request_id"] = json!(crate::unique("acp"));
-            client
-                .request("submit", submitted)
-                .await
-                .map(drop)
-                .map_err(|e| e.to_string())
+            let key = format!("{} {person}", ask.id);
+            (crate::submit_once(client, &key, submitted).await).map_err(|e| e.to_string())?;
         }
         None => {
-            submitted["prompt"] = json!(words);
-            crate::answer_once(&client, &ask.id, submitted)
-                .await
-                .map(drop)
+            crate::answer_once(client, &ask.id, submitted).await?;
         }
-    };
+    }
+    Ok(true)
 }
 
 /// Whether `call`, as the daemon lists or announces it, waits on the
@@ -2967,6 +2979,111 @@ fn asked_key(turn: Option<i64>, call: &str, request: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A pick from a client goes once, and never to a question the person
+    /// answered already: read as it goes, one answered sends nothing; one
+    /// open goes under the id every window sends the person's answer
+    /// under, so a second from any surface is refused; someone the client
+    /// names goes under one of their own, never taking the person's place.
+    #[tokio::test]
+    async fn a_pick_goes_once_and_never_to_a_question_answered_already() {
+        let ask = asks::call(
+            "ask:4/c1",
+            &json!({"question": "Ship it?", "why": "w",
+            "options": [{"label": "Now"}, {"label": "Later"}]}),
+        )
+        .unwrap();
+        for answered in [true, false] {
+            let submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = submitted.clone();
+            let history = crate::tests::asked_history(answered, false);
+            let client = crate::tests::daemon_answering(move |request| {
+                if let Some(read) = crate::tests::history_read(&history, request) {
+                    return read;
+                }
+                let mut seen = seen.lock().unwrap();
+                let again =
+                    (seen.iter()).any(|was: &Value| was["request_id"] == request["request_id"]);
+                seen.push(request.clone());
+                match again {
+                    true => json!({"error": "idempotency_conflict", "message": "taken"}),
+                    false => json!({"message": 9, "turn": 9}),
+                }
+            })
+            .await;
+            let went = send_pick(&client, ("shop.lead", Some(1)), &ask, "2", None).await;
+            if answered {
+                assert_eq!(went, Ok(false));
+                assert!(submitted.lock().unwrap().is_empty());
+                continue;
+            }
+            assert_eq!(went, Ok(true));
+            let again = send_pick(&client, ("shop.lead", Some(1)), &ask, "1", None).await;
+            assert_eq!(again, Err("that question was answered already".to_owned()));
+            let named = send_pick(&client, ("shop.lead", Some(1)), &ask, "1", Some("ana")).await;
+            assert_eq!(named, Ok(true));
+            let twice = send_pick(&client, ("shop.lead", Some(1)), &ask, "1", Some("ana")).await;
+            assert!(twice.is_err());
+            let ids: Vec<Value> = (submitted.lock().unwrap().iter())
+                .map(|request| request["request_id"].clone())
+                .collect();
+            let person = json!(asks::request_id("ask:4/c1", 0));
+            assert_eq!(ids[..2], [person.clone(), person]);
+            assert_ne!(ids[2], ids[0]);
+            assert_eq!(ids[3], ids[2]);
+        }
+    }
+
+    /// A named person's pick withdrawn from the queue before the agent
+    /// read it delivered nothing: their next goes as the next attempt,
+    /// as the person's own does.
+    #[tokio::test]
+    async fn a_named_pick_taken_back_unread_goes_again() {
+        let ask = asks::call(
+            "ask:4/c1",
+            &json!({"question": "Ship it?", "why": "w",
+            "options": [{"label": "Now"}, {"label": "Later"}]}),
+        )
+        .unwrap();
+        let submitted = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = submitted.clone();
+        let history = crate::tests::asked_history(false, false);
+        let client = crate::tests::daemon_answering(move |request| {
+            if let Some(read) = crate::tests::history_read(&history, request) {
+                return read;
+            }
+            match request["op"].as_str().unwrap_or("") {
+                "messages" => json!({"messages": [{"message": 9, "status": "withdrawn",
+                    "turn": null}]}),
+                _ => {
+                    let mut seen = seen.lock().unwrap();
+                    let again = (seen.iter()).any(|was| was["request_id"] == request["request_id"]);
+                    seen.push(request.clone());
+                    match again {
+                        true => json!({"duplicate": true, "message": 9}),
+                        false => json!({"message": 9}),
+                    }
+                }
+            }
+        })
+        .await;
+        for _ in 0..2 {
+            let went = send_pick(&client, ("shop.lead", Some(1)), &ask, "1", Some("ana")).await;
+            assert_eq!(went, Ok(true));
+        }
+        let ids: Vec<Value> = (submitted.lock().unwrap().iter())
+            .map(|request| request["request_id"].clone())
+            .collect();
+        let key = "ask:4/c1 ana";
+        assert_eq!(
+            ids,
+            [
+                json!(asks::request_id(key, 0)),
+                json!(asks::request_id(key, 0)),
+                json!(asks::request_id(key, 1)),
+            ]
+        );
+    }
+
     #[test]
     fn a_later_turns_call_of_the_same_id_is_asked_afresh() {
         let older = asked_key(Some(3), "c1", "1");
@@ -3078,13 +3195,13 @@ mod tests {
             "ask:3/c1",
             &json!({"question": "Which database?", "why": "It decides the schema.",
                 "options": [{"label": "SQLite", "explanation": "One file."}, {"label": "Postgres"}],
-                "recommended": 2, "reason": "It scales.", "if_unanswered": "wait"}),
+                "recommended": 2, "one_way": true}),
         )
         .unwrap();
         let form = form("s1", &ask, Some("c1"));
         assert_eq!(
             form["message"],
-            "Which database?\n\nIt decides the schema.\n\nRecommended: Postgres. It scales."
+            "Which database?\n\nIt decides the schema.\n\nRecommended: Postgres."
         );
         assert_eq!(
             (&form["sessionId"], &form["toolCallId"]),
@@ -3104,7 +3221,7 @@ mod tests {
             "ask:3/c2",
             &json!({"question": "Publish the site?", "options": [{"label": "Yes"}, {"label": "No"}],
                 "covers": {"action": "publish", "target": "site", "revision": "3f2a9c1"},
-                "if_unanswered": "wait"}),
+                "one_way": true}),
         )
         .unwrap();
         let message = super::form("s1", &approving, None)["message"].clone();

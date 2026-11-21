@@ -518,9 +518,10 @@ fn question(
             false => format!("{} {label}", at + 1),
         })
         .collect();
-    let text = match &asked.command {
-        Some(command) => format!("{}\n{command}", asked.question),
-        None => format!("{}\n{}", asked.question, numbered.join(" · ")),
+    // A step of the person's has nothing to pick: its why says how.
+    let text = match asked.options.is_empty() {
+        true => format!("{}\n{}", asked.question, asked.why),
+        false => format!("{}\n{}", asked.question, numbered.join(" · ")),
     };
     let mut made = event(
         task,
@@ -530,7 +531,7 @@ fn question(
         format!("{task}/{turn}/question/{call}"),
         format!("{task} asked the person"),
         text,
-        json!({"options": options, "recommended": asked.recommended, "command": asked.command}),
+        json!({"options": options, "recommended": asked.recommended}),
     );
     made.steer = true;
     made

@@ -1189,8 +1189,6 @@ def asks(home, out):
         lines += [f"### {bot}: {asked.get('question', '?')}", '', f"Why: {asked.get('why', '')}", '']
         for n, option in enumerate(asked.get('options') or [], 1):
             lines.append(f"{n}. **{option.get('label', '')}**: {option.get('explanation', '')}")
-        if asked.get('command'):
-            lines.append(f"Command: `{asked['command']}`")
         lines.append('')
     (out / 'asks.md').write_text('\n'.join(lines) if lines else '(no ask)\n')
 

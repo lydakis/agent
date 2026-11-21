@@ -82,6 +82,7 @@ mod projects;
 mod prompt;
 mod reactions;
 mod recall;
+mod repick;
 mod resolved;
 mod responsible;
 mod reviewer;
@@ -2588,10 +2589,38 @@ pub(crate) async fn answer_once(
     submitted: Value,
 ) -> Result<Value, String> {
     let bot = submitted["bot"].as_str().unwrap_or_default().to_owned();
+    let reply = submit_once(client, ask, submitted).await;
+    // Answered, it has nothing left to remind of: its deadline goes
+    // now, beside the window, rather than wait in `/background` for a
+    // gate that would say no. Only once the answer opened a turn,
+    // which nothing takes back: one waiting in line, or for the
+    // running turn's next round, may yet be withdrawn or bounce and
+    // leave the question open, so its deadline stays for the gate.
+    if reply.as_ref().is_ok_and(|reply| reply["turn"].is_i64()) {
+        let (bot, ask) = (bot.clone(), ask.to_owned());
+        tokio::task::spawn_blocking(move || asks::let_deadline_go(&bot, &ask));
+    }
+    reply.map_err(|error| match error.code.as_str() {
+        "idempotency_conflict" => "that question was answered already".to_owned(),
+        _ => error.to_string(),
+    })
+}
+
+/// Submit `submitted` once under the request ids [`asks::request_id`]
+/// gives `key`: a resend, from here or anywhere sending under the same
+/// key, is refused or answered with the first. One taken back from the
+/// queue before the agent read it delivered nothing, so the next goes as
+/// the next attempt.
+pub(crate) async fn submit_once(
+    client: &Client,
+    key: &str,
+    submitted: Value,
+) -> agent_client::Result<Value> {
+    let bot = submitted["bot"].as_str().unwrap_or_default().to_owned();
     let mut attempt = 0;
     loop {
         let mut submitted = submitted.clone();
-        submitted["request_id"] = json!(asks::request_id(ask, attempt));
+        submitted["request_id"] = json!(asks::request_id(key, attempt));
         let reply = client.request("submit", submitted).await;
         // The message this attempt's answer sent already, if one went.
         let before = match &reply {
@@ -2611,20 +2640,7 @@ pub(crate) async fn answer_once(
             attempt += 1;
             continue;
         }
-        // Answered, it has nothing left to remind of: its deadline goes
-        // now, beside the window, rather than wait in `/background` for a
-        // gate that would say no. Only once the answer opened a turn,
-        // which nothing takes back: one waiting in line, or for the
-        // running turn's next round, may yet be withdrawn or bounce and
-        // leave the question open, so its deadline stays for the gate.
-        if reply.as_ref().is_ok_and(|reply| reply["turn"].is_i64()) {
-            let (bot, ask) = (bot.clone(), ask.to_owned());
-            tokio::task::spawn_blocking(move || asks::let_deadline_go(&bot, &ask));
-        }
-        return reply.map_err(|error| match error.code.as_str() {
-            "idempotency_conflict" => "that question was answered already".to_owned(),
-            _ => error.to_string(),
-        });
+        return reply;
     }
 }
 
@@ -6401,9 +6417,6 @@ struct App {
     /// message of their own after them: out of the composer and the
     /// count, their options still answering them.
     aside: Vec<asks::Ask>,
-    /// The line each ask for a step of the person's gave them to run, by
-    /// its call: a click on its card copies it.
-    commands: HashMap<String, String>,
     /// The questions' cards drawn here, by [`asks::Ask::key`]: the number
     /// their rows are tagged with, the ask, and whether a settled one is
     /// open whole.
@@ -8647,7 +8660,6 @@ impl App {
             asks: Vec::new(),
             focus: None,
             aside: Vec::new(),
-            commands: HashMap::new(),
             cards: HashMap::new(),
             card_count: 0,
             cards_kept: 0,
@@ -11660,10 +11672,6 @@ impl App {
                 written.open = !written.open;
             }
             self.draw_written(&key);
-        }
-        if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
-            term::copy(command);
-            self.notice = Some("copied".into());
         }
         if let Some((at, id)) = button
             .strip_prefix("answer/")
@@ -19530,7 +19538,20 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = (!steer).then(|| self.move_to.take()).flatten();
-        // An answer goes once, whichever window sends it ([`answer_once`]).
+        // An answer goes once, whichever window sends it ([`answer_once`]),
+        // and never to a question already answered ([`repick`]).
+        let pick = match &then {
+            Then::Closes(ask)
+            | Then::Composed {
+                answering: Some(ask),
+                ..
+            } => Some(Pick {
+                held: self.held_open(ask),
+                ask: ask.clone(),
+                verdict: None,
+            }),
+            _ => None,
+        };
         let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
@@ -19548,6 +19569,7 @@ impl App {
             sending,
             submitted,
             then,
+            pick,
         }
     }
 
@@ -19565,9 +19587,9 @@ impl App {
             answering: None,
             quotes: Vec::new(),
         };
-        let message = self.message(prompt, None, (join, queue), &[], then);
+        let mut message = self.message(prompt, None, (join, queue), &[], then);
         self.sending += 1;
-        let reply = submit_message(&self.client, &message).await;
+        let reply = submit_message(&self.client, &mut message).await;
         let refused = reply.as_ref().err().cloned();
         self.sent(message, reply);
         refused.map_or(Ok(()), Err)
@@ -19584,10 +19606,10 @@ impl App {
         self.write(async move {
             let mut sent = Vec::new();
             let mut refused = false;
-            for message in messages {
+            for mut message in messages {
                 let reply = match refused {
                     true => Err(String::new()),
-                    false => submit_message(&client, &message).await,
+                    false => submit_message(&client, &mut message).await,
                 };
                 refused |= reply.is_err();
                 sent.push((message, reply));
@@ -19609,6 +19631,7 @@ impl App {
             workspace,
             sending,
             then,
+            pick,
             ..
         } = message;
         self.sending = self.sending.saturating_sub(1);
@@ -19618,6 +19641,9 @@ impl App {
             Err(error) => {
                 if let Some(at) = at {
                     self.staged.remove(at);
+                }
+                if let Some(pick) = &pick {
+                    self.pick_refused(pick);
                 }
                 self.boost = self.boost.take().or(effort);
                 self.move_to = self.move_to.take().or(workspace);
@@ -19663,7 +19689,17 @@ impl App {
                 }
             }
         }
+        // Its card named the ask by its call alone; it went named whole,
+        // and that answer closes the question too when it lands.
+        let renamed = match pick.and_then(|pick| pick.verdict) {
+            Some(repick::Verdict::Send(ask)) => Some(*ask),
+            _ => None,
+        };
+        let closes = renamed.is_some().then(|| prompt.clone());
         self.landed(prompt, then);
+        if let (Some(ask), Some(prompt)) = (renamed, closes) {
+            self.close_ask(&ask, &prompt);
+        }
     }
 
     /// What follows a message the daemon took.
@@ -19791,23 +19827,63 @@ impl App {
             self.notice = Some("that question is not a task's".into());
             return;
         };
-        let submitted = json!({"bot": task.bot, "prompt": prompt,
+        let mut submitted = json!({"bot": task.bot, "prompt": prompt,
             "delivery": "steer", "images": attach::submitted(pictures)});
-        let (client, ask, prompt) = (self.client.clone(), ask.clone(), prompt.to_owned());
+        let held = self.held_open(ask);
+        let (client, ask, mut prompt) = (self.client.clone(), ask.clone(), prompt.to_owned());
         self.write(async move {
-            let reply = answer_once(&client, &ask.id, submitted).await;
-            Wrote::TaskAnswered(Box::new(TaskAnswering { ask, prompt, back }), reply)
+            // Not held open here: read from the task before it goes.
+            let verdict = match held {
+                true => None,
+                false => Some(repick::check(&client, &task.bot, &ask).await),
+            };
+            let (reply, sent_as) = match &verdict {
+                Some(verdict @ (repick::Verdict::Answered(_) | repick::Verdict::Unknown(_))) => {
+                    (Err(verdict.why().unwrap_or_default()), None)
+                }
+                Some(repick::Verdict::Send(whole)) if whole.id != ask.id => {
+                    prompt = repick::renamed(&prompt, &ask.id, &whole.id);
+                    submitted["prompt"] = json!(prompt);
+                    (
+                        answer_once(&client, &whole.id, submitted).await,
+                        Some((**whole).clone()),
+                    )
+                }
+                _ => (answer_once(&client, &ask.id, submitted).await, None),
+            };
+            let answered = match verdict {
+                Some(repick::Verdict::Answered(answer)) => Some(answer),
+                _ => None,
+            };
+            let answering = TaskAnswering {
+                ask,
+                prompt,
+                back,
+                answered,
+                sent_as,
+            };
+            Wrote::TaskAnswered(Box::new(answering), reply)
         });
     }
 
     /// What came of an answer [`App::answer_task`] sent: kept until the
     /// task takes it, or, refused, the person's words given back.
     fn task_answered(&mut self, answering: TaskAnswering, reply: Result<Value, String>) {
-        let TaskAnswering { ask, prompt, back } = answering;
+        let TaskAnswering {
+            ask,
+            prompt,
+            back,
+            answered,
+            sent_as,
+        } = answering;
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
                 self.notice = Some(error);
+                // Answered already in its task: its card says so.
+                if let Some(answer) = answered {
+                    self.settle(&ask.key(), asks::State::Answered(answer.trim().to_owned()));
+                }
                 if let Some((typed, pictures, quotes)) = back {
                     self.give_back(&typed, pictures);
                     self.quotes_back(quotes);
@@ -19825,6 +19901,9 @@ impl App {
             checked: Instant::now(),
         });
         self.close_ask(&ask, &prompt);
+        if let Some(whole) = sent_as {
+            self.close_ask(&whole, &prompt);
+        }
         self.fleet_said(format!("your answer went to {}", task.name));
     }
 
@@ -20141,13 +20220,6 @@ impl App {
             );
         }
         marks.extend((card.question).map(|row| (from + row, link(format!("card/{key}")))));
-        // The line to run, a click on it copies.
-        if let Some(command) = &ask.command {
-            marks.extend(
-                (card.command.clone()).map(|row| (from + row, link(format!("copy/{key}")))),
-            );
-            self.commands.insert(key.clone(), command.clone());
-        }
         // Drawn narrower later, as when the margin opens, its bar goes on
         // down every row.
         marks.extend(
@@ -20454,6 +20526,35 @@ impl App {
         (self.asks.iter())
             .position(|ask| Some(ask.key().as_str()) == picked)
             .unwrap_or(0)
+    }
+
+    /// Whether the needs this window's events keep hold `ask` open, under
+    /// the id its card names ([`repick::held_open`]): the fleet's for its
+    /// lineage and the leads it follows, else the tasks it tracks. A pick
+    /// on one goes at once; on any other, its agent is read first.
+    fn held_open(&self, ask: &asks::Ask) -> bool {
+        let bot = ask
+            .task
+            .as_ref()
+            .map_or(self.bot.as_str(), |task| task.bot.as_str());
+        let needs = match &self.fleet {
+            Some(fleet) if fleet.below(bot) => &fleet.needs,
+            Some(_) => return false,
+            None if ask.task.is_some() => &self.task_needs,
+            None => return false,
+        };
+        repick::held_open(needs, bot, &ask.id)
+    }
+
+    /// A pick that did not go, its question answered already or not to
+    /// be found: the card says where it stands, the notice why.
+    fn pick_refused(&mut self, pick: &Pick) {
+        if let Some(repick::Verdict::Answered(answer)) = &pick.verdict {
+            self.settle(
+                &pick.ask.key(),
+                asks::State::Answered(answer.trim().to_owned()),
+            );
+        }
     }
 
     /// `ask` answered from here with `answer`, as [`asks::answer`] wrote
@@ -24504,6 +24605,17 @@ struct Sent {
     sending: i64,
     submitted: Value,
     then: Then,
+    /// The question it answers, checked as it goes ([`repick`]).
+    pick: Option<Pick>,
+}
+
+/// A message answering a question, as it goes: the ask its card names,
+/// whether this window's needs hold it open so it goes unread
+/// ([`repick::held_open`]), and what the read found where they did not.
+struct Pick {
+    ask: asks::Ask,
+    held: bool,
+    verdict: Option<repick::Verdict>,
 }
 
 /// What is being written, as a window keeps it for the one it becomes
@@ -24597,8 +24709,28 @@ enum Then {
     Retried(Vec<Denial>),
 }
 
-/// `message` sent: once, when it answers a question ([`answer_once`]).
-async fn submit_message(client: &Client, message: &Sent) -> Result<Value, String> {
+/// `message` sent: once, when it answers a question ([`answer_once`]),
+/// and not at all when the person answered that question already
+/// ([`repick`]): one its window's needs do not hold open is read first,
+/// and goes naming its ask whole.
+async fn submit_message(client: &Client, message: &mut Sent) -> Result<Value, String> {
+    if let Some(pick) = message.pick.as_mut()
+        && !pick.held
+    {
+        let bot = message.submitted["bot"].as_str().unwrap_or_default();
+        let verdict = repick::check(client, bot, &pick.ask).await;
+        let why = verdict.why();
+        if let repick::Verdict::Send(ask) = &verdict
+            && ask.id != pick.ask.id
+        {
+            message.prompt = repick::renamed(&message.prompt, &pick.ask.id, &ask.id);
+            message.submitted["prompt"] = json!(message.prompt);
+        }
+        pick.verdict = Some(verdict);
+        if let Some(why) = why {
+            return Err(why);
+        }
+    }
     let submitted = message.submitted.clone();
     match asks::answer_of(&message.prompt, message.origin) {
         Some(ask) => answer_once(client, ask, submitted).await,
@@ -24656,6 +24788,12 @@ struct TaskAnswering {
     prompt: String,
     /// What the person typed, its pictures and quotes, should it not go.
     back: Option<(String, Vec<Option<attach::Picture>>, Vec<Quote>)>,
+    /// The person's answer read from the task, which they gave already:
+    /// nothing went ([`repick`]).
+    answered: Option<String>,
+    /// The ask named whole, as the answer went, when its card named it by
+    /// its call alone.
+    sent_as: Option<asks::Ask>,
 }
 
 /// The picks a `configure` sent ([`App::configure`]): the bot's once the
@@ -29853,7 +29991,6 @@ mod tests {
             .position(|r| r == "? Tag 0.4.1?")
             .expect("asked");
         assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
-        assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         let at = rows
             .iter()
             .position(|r| r == "✓ Write notes?")
@@ -30191,7 +30328,7 @@ mod tests {
         let step = asks::call(
             "ask:1/c1",
             &json!({"question": "Sign in to the registry?", "why": "Publishing needs it.",
-                "command": "npm login", "if_unanswered": "wait"}),
+                "one_way": true}),
         )
         .unwrap();
         let pick = asks::call(
@@ -30266,7 +30403,7 @@ mod tests {
         app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
         let step = asks::call(
             "ask:1/c1",
-            &json!({"question": "Sign in?", "why": "w", "command": "npm login"}),
+            &json!({"question": "Sign in?", "why": "w", "one_way": true}),
         )
         .unwrap();
         let mut tasks = step.clone();
@@ -36674,6 +36811,212 @@ mod tests {
             panic!("kept");
         };
         assert!(why.len() < 400 && why.ends_with('…'), "{why}");
+    }
+
+    /// What a stand-in daemon holding one agent's `history`, each
+    /// `(node, turn, item)` newest first, answers a read of it; none for
+    /// any other request.
+    pub(crate) fn history_read(history: &[(i64, i64, Value)], asked: &Value) -> Option<Value> {
+        match asked["op"].as_str()? {
+            "history_nodes" => {
+                let min = asked["min_node"].as_i64().unwrap_or(i64::MIN);
+                let nodes: Vec<Value> = (history.iter())
+                    .filter(|(node, ..)| *node >= min)
+                    .map(|(node, turn, _)| json!({"node": node, "turn": turn}))
+                    .collect();
+                Some(json!({"nodes": nodes, "next_from": null}))
+            }
+            "history_items" => {
+                let items: Vec<Value> = (asked["nodes"].as_array()?.iter())
+                    .filter_map(|wanted| history.iter().find(|(node, ..)| wanted == node))
+                    .map(|(node, _, item)| json!({"node": node, "item": item}))
+                    .collect();
+                Some(json!({"items": items}))
+            }
+            _ => None,
+        }
+    }
+
+    /// An agent's history, newest first: it asked "Ship it?" as call `c1`
+    /// of turn 4 and, when `answered`, the person picked "Now" in turn 5;
+    /// then, from `later` on, it asked "Tag it?" as call `c2` of turn 6.
+    pub(crate) fn asked_history(answered: bool, later: bool) -> Vec<(i64, i64, Value)> {
+        let call = |id: &str, question: &str| {
+            let arguments = json!({"question": question, "why": "w",
+                "options": [{"label": "Now", "explanation": "e"},
+                            {"label": "Later", "explanation": "e"}]});
+            json!({"type": "function_call", "name": asks::TOOL, "call_id": id,
+                "arguments": arguments.to_string()})
+        };
+        let taken = |id: &str| {
+            json!({"type": "function_call_output", "call_id": id,
+            "output": "{\"asked\": true}"})
+        };
+        let said = |text: &str| {
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]})
+        };
+        let mut history = Vec::new();
+        if later {
+            history.extend([(21, 6, taken("c2")), (20, 6, call("c2", "Tag it?"))]);
+        }
+        if answered {
+            history.push((18, 5, said("You asked (ask:4/c1): Ship it?\n\nNow")));
+        }
+        history.extend([(17, 4, taken("c1")), (16, 4, call("c1", "Ship it?"))]);
+        history
+    }
+
+    /// The question's arguments [`asked_history`] asks, for a card.
+    fn ship_it() -> Value {
+        json!({"question": "Ship it?", "why": "w",
+            "options": [{"label": "Now", "explanation": "e"},
+                        {"label": "Later", "explanation": "e"}]})
+    }
+
+    /// A card drawn from a page read with no turn names its ask by the
+    /// call alone, as no answer does, so the person's earlier answer did
+    /// not settle it. A pick on it reads where the question stands first:
+    /// answered, nothing goes and the card says so; still open, the pick
+    /// goes naming the ask whole, under the id every window sends it.
+    #[tokio::test]
+    async fn a_pick_on_a_card_with_no_turn_never_answers_twice() {
+        for answered in [true, false] {
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = asked.clone();
+            let history = asked_history(answered, false);
+            let client = daemon_answering(move |request| {
+                seen.lock().unwrap().push(request.clone());
+                (history_read(&history, request))
+                    .unwrap_or_else(|| json!({"message": 9, "turn": 9}))
+            })
+            .await;
+            let mut app = app(client);
+            app.bot = "shop.lead".into();
+            app.width = 80;
+            app.commit_call("c1", None, asks::TOOL, &ship_it(), "{}", false);
+            app.asked("c1", None, &ship_it());
+            assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("c1"));
+            // Typed, as words, or picked on the card: the same.
+            match answered {
+                true => app.press("answer/1/c1").await,
+                false => {
+                    app.input.set("2");
+                    app.submit().await;
+                }
+            }
+            app.beside_done().await;
+            let submitted: Vec<Value> = (asked.lock().unwrap().iter())
+                .filter(|request| request["op"] == "submit")
+                .cloned()
+                .collect();
+            let rows = drawn(&mut app);
+            if answered {
+                assert!(submitted.is_empty(), "{submitted:?}");
+                assert_eq!(
+                    app.notice.as_deref(),
+                    Some("that question was answered already")
+                );
+                assert!(rows.contains(&"┃ Answered · Now".to_owned()), "{rows:?}");
+                assert!(app.input.trim().is_empty());
+            } else {
+                assert_eq!(submitted.len(), 1, "{submitted:?}");
+                let to = &submitted[0];
+                assert_eq!(
+                    to["prompt"], "You asked (ask:4/c1): Ship it?\n\nLater",
+                    "named whole, it answers the ask"
+                );
+                assert_eq!(to["request_id"], json!(asks::request_id("ask:4/c1", 0)));
+                assert!(rows.contains(&"┃ Answered · Later".to_owned()), "{rows:?}");
+            }
+            assert!(app.asks.is_empty());
+        }
+    }
+
+    /// A pick checks its question only as it goes. One the fleet's needs
+    /// hold open, read back from the daemon as after a restart, goes with
+    /// nothing read; one they no longer hold, answered before the restart,
+    /// is read once and goes nowhere; and one whose agent an event left
+    /// unsure is read once, that agent alone, and goes.
+    #[tokio::test]
+    async fn a_pick_reads_its_question_only_when_the_needs_do_not_hold_it_open() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let history = asked_history(true, true);
+        let (client, events) = daemon_with_events(json!({}), move |request| {
+            seen.lock().unwrap().push(request.clone());
+            if let Some(read) = history_read(&history, request) {
+                return read;
+            }
+            match request["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [{"name": "shop.lead", "bot_id": 1, "head": 21}]}),
+                "turns" => json!({"turns": [{"turn": 6, "status": "completed"}]}),
+                "submit" => json!({"message": 22, "turn": 22}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "shop", "shop.lead");
+        fleet.reconcile().await;
+        while !fleet.unread.is_empty() {
+            fleet.rescan_through().await;
+        }
+        let open: Vec<String> = (fleet.needs.asks())
+            .map(|(_, ask)| ask.id.clone())
+            .collect();
+        assert_eq!(open, ["ask:6/c2"], "read whole from the daemon");
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.width = 80;
+        app.fleet = Some(fleet);
+        // Both cards drawn from the conversation, the first not yet seen
+        // answered: its answer is on a page not read.
+        app.asked("c1", Some(4), &ship_it());
+        app.commit_ask(&app.asks[0].clone());
+        let tag = json!({"question": "Tag it?", "why": "w",
+            "options": [{"label": "Now", "explanation": "e"},
+                        {"label": "Later", "explanation": "e"}]});
+        app.asked("c2", Some(6), &tag);
+        app.commit_ask(&app.asks[1].clone());
+        let reads = |asked: &Arc<std::sync::Mutex<Vec<Value>>>| {
+            let asked = asked.lock().unwrap();
+            let ops = |op: &str| asked.iter().filter(|r| r["op"] == op).count();
+            (ops("history_nodes"), ops("submit"))
+        };
+        let before = reads(&asked);
+        // Held open: goes at once, nothing read.
+        app.press("answer/0/ask:6/c2").await;
+        app.beside_done().await;
+        assert_eq!(reads(&asked), (before.0, before.1 + 1));
+        // Not held, answered before: read once, nothing sent.
+        app.press("answer/1/ask:4/c1").await;
+        app.beside_done().await;
+        assert_eq!(reads(&asked), (before.0 + 1, before.1 + 1));
+        assert_eq!(
+            app.card_state(&app.cards["ask:4/c1"].1),
+            asks::State::Answered("Now".into())
+        );
+        // An event left the agent unsure: one read of it, and it goes.
+        let fleet = app.fleet.as_mut().unwrap();
+        let ask = (fleet.needs.asks())
+            .map(|(_, ask)| ask.clone())
+            .next()
+            .unwrap();
+        fleet.needs.read_at_end("shop.lead");
+        app.asks = vec![ask.clone()];
+        app.settled.remove(&ask.key());
+        let before = reads(&asked);
+        app.press("answer/1/ask:6/c2").await;
+        app.beside_done().await;
+        assert_eq!(reads(&asked), (before.0 + 1, before.1 + 1));
+        let bots: std::collections::HashSet<String> = (asked.lock().unwrap().iter())
+            .filter(|r| r["op"] == "history_nodes")
+            .filter_map(|r| r["bot"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            bots,
+            std::collections::HashSet::from(["shop.lead".to_owned()])
+        );
     }
 
     /// A task's question set aside in its own window comes back to the

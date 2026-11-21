@@ -382,9 +382,6 @@ fn text(found: &[Found], next: Option<i64>, all: bool) -> String {
                 recommended.unwrap_or_default()
             );
         }
-        if let Some(command) = &found.ask.command {
-            out += &format!("  run: {command}\n");
-        }
         // A yes covers that action, target and revision alone.
         if let Some(covers) = &found.ask.covers {
             out += &format!("  covers: {}\n", covers.line());
@@ -419,7 +416,6 @@ fn to_json(found: &Found) -> Value {
             .map(|choice| json!({"label": choice.label, "explanation": choice.explanation}))
             .collect::<Vec<_>>(),
         "recommended": found.ask.recommended.map(|r| r + 1),
-        "command": found.ask.command,
         "covers": found.ask.covers.as_ref().map(|covers| json!({"action": covers.action,
             "target": covers.target, "revision": covers.revision})),
         "state": state,
@@ -451,8 +447,6 @@ mod tests {
                 options: vec![choice("Bump it"), choice("Keep 0.x")],
                 recommended: Some(0),
                 why: String::new(),
-                command: None,
-                reason: String::new(),
                 unanswered: None,
                 deadline: None,
                 covers: None,
@@ -589,7 +583,7 @@ mod tests {
     }
 
     fn arguments() -> Value {
-        json!({"question": "Bump it?", "why": "w", "if_unanswered": "wait",
+        json!({"question": "Bump it?", "why": "w", "one_way": true,
             "options": [{"label": "Bump it", "explanation": "e"},
                         {"label": "Keep 0.x", "explanation": "e"}]})
     }
