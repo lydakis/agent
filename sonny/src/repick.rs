@@ -94,14 +94,13 @@ async fn by_call(
 }
 
 /// Whether two asks put the same question to the person: its words, why,
-/// options, recommendation, what a yes covers and any step to run.
+/// options, recommendation and what a yes covers.
 fn same(one: &asks::Ask, other: &asks::Ask) -> bool {
     (one.question == other.question)
         && (one.why == other.why)
         && (one.options == other.options)
         && (one.recommended == other.recommended)
         && (one.covers == other.covers)
-        && (one.command == other.command)
 }
 
 /// `prompt`, an answer [`asks::answer`] wrote to ask `was`, naming ask

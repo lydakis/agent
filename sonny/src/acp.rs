@@ -2289,10 +2289,7 @@ fn form(session: &str, ask: &asks::Ask, call: Option<&str>) -> Value {
         message = format!("{message}\n\n{}", ask.why);
     }
     if let Some(choice) = ask.recommended.and_then(|at| ask.options.get(at)) {
-        message = match ask.reason.is_empty() {
-            true => format!("{message}\n\nRecommended: {}.", choice.label),
-            false => format!("{message}\n\nRecommended: {}. {}", choice.label, ask.reason),
-        };
+        message = format!("{message}\n\nRecommended: {}.", choice.label);
     }
     let options: Vec<Value> = (ask.options.iter().enumerate())
         .map(|(at, choice)| {
@@ -3198,13 +3195,13 @@ mod tests {
             "ask:3/c1",
             &json!({"question": "Which database?", "why": "It decides the schema.",
                 "options": [{"label": "SQLite", "explanation": "One file."}, {"label": "Postgres"}],
-                "recommended": 2, "reason": "It scales.", "if_unanswered": "wait"}),
+                "recommended": 2, "one_way": true}),
         )
         .unwrap();
         let form = form("s1", &ask, Some("c1"));
         assert_eq!(
             form["message"],
-            "Which database?\n\nIt decides the schema.\n\nRecommended: Postgres. It scales."
+            "Which database?\n\nIt decides the schema.\n\nRecommended: Postgres."
         );
         assert_eq!(
             (&form["sessionId"], &form["toolCallId"]),
@@ -3224,7 +3221,7 @@ mod tests {
             "ask:3/c2",
             &json!({"question": "Publish the site?", "options": [{"label": "Yes"}, {"label": "No"}],
                 "covers": {"action": "publish", "target": "site", "revision": "3f2a9c1"},
-                "if_unanswered": "wait"}),
+                "one_way": true}),
         )
         .unwrap();
         let message = super::form("s1", &approving, None)["message"].clone();
