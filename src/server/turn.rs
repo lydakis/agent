@@ -504,6 +504,16 @@ struct Accounting {
     since: Option<(tokio::time::Instant, std::time::Duration, u64)>,
 }
 impl Accounting {
+    /// Where a refusal's recovery was as the turn parked: a refusal still
+    /// waiting on its summary, and whether the call already went once more.
+    fn resume_refusal(&mut self, waiting: &agent_runtime::store::Waiting) {
+        self.refilled = waiting.refilled;
+        self.full = waiting.refused.clone().map(|detail| {
+            let mut error = Error::new(agent_runtime::provider::CONTEXT_FULL);
+            error.detail = Some(detail).filter(|detail| !detail.is_empty());
+            (error, false)
+        });
+    }
     /// Park on a cause a person can fix: the call is tried again after the
     /// hold's wait, no later than the bot's `hold_ms` allows, with a fresh
     /// retry budget. Returns when.
@@ -3092,6 +3102,7 @@ impl Turn {
             accounting.call_fallback = waiting.fallback.clone();
             accounting.compaction = waiting.compaction;
             accounting.copied = waiting.copied.clone().filter(|_| waiting.compaction);
+            accounting.resume_refusal(waiting);
             accounting.hold(&error, record.settings.hold_ms());
             return Ok(Round::Paced(accounting.parked_until));
         };
@@ -3146,12 +3157,7 @@ impl Turn {
                 accounting.call_attempts = waiting.call_attempts;
                 accounting.call_spent_ms = waiting.call_spent_ms;
                 accounting.call_fallback = waiting.fallback.clone();
-                accounting.refilled = waiting.refilled;
-                accounting.full = waiting.refused.clone().map(|detail| {
-                    let mut error = Error::new(agent_runtime::provider::CONTEXT_FULL);
-                    error.detail = Some(detail).filter(|detail| !detail.is_empty());
-                    (error, false)
-                });
+                accounting.resume_refusal(waiting);
                 resume_window = !waiting.compaction;
                 copied = waiting.copied.clone().filter(|_| waiting.compaction);
             } else {

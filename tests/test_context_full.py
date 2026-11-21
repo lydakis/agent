@@ -126,6 +126,41 @@ class ResponsesContextFullTests(Overflow, ModelFixture):
         retries = self.events(client, 'Bob', turn, 'retry')
         self.assertEqual([r['error'] for r in retries if r.get('compact')], ['provider_context_full'])
 
+    def test_a_refusal_waiting_on_its_summary_outlasts_a_start_without_its_provider(self):
+        # Parked on the summary's rate limit; a start without the bot's
+        # provider holds the turn and parks it again; the next start with
+        # it still summarizes first, and the call goes only once more.
+        provider = ('--provider', f'changed=responses,{self.url}')
+        client = self.client(extra=provider, settings={'compact_tokens': 0})
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               model='changed/synthetic-model',
+                                               compaction_instructions='Summarize.'))
+        for n in range(6):
+            turn = client.request('submit', bot='Bob', request_id=str(n),
+                                  prompt=f'{n}:' + 'x' * 2000)['result']['message']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.drain()
+        calls = []
+
+        def refuse(request, user):
+            calls.append(request)
+            return 'http' if len(calls) <= 2 else None
+        self.model.context_full = refuse
+        self.model.compaction_refusals, self.model.compaction_retry_after = 1, '1'
+        turn = client.request('submit', bot='Bob', request_id='go', prompt='go')['result']['message']
+        client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        client.close(kill=True)
+        client = self.client()
+        client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn
+                       and (e['data'].get('blocked') or {}).get('code') == 'provider_unavailable')
+        client.close(kill=True)
+        client = self.client(extra=provider)
+        end = client.finished(turn, timeout=30)['data']
+        self.assertEqual((end['status'], end['error']), ('failed', 'provider_context_full'), end)
+        self.assertEqual([is_summary(r) for r in self.drain()], [False, True, True, False])
+        retries = self.events(client, 'Bob', turn, 'retry')
+        self.assertEqual([r['error'] for r in retries if r.get('compact')], ['provider_context_full'])
+
     def test_a_bot_with_its_token_threshold_off_still_summarizes_a_refused_view(self):
         # Its byte budget alone would keep the whole view; the summary keeps
         # shares of the view the provider refused instead.
