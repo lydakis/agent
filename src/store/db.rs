@@ -15033,6 +15033,8 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: false,
+            refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         tx.execute(
