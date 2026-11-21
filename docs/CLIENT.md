@@ -1,147 +1,77 @@
 # Client policy
 
-The daemon composes no text. A bot's instructions are whatever the creating
-client sent. The bot keeps that text until a client replaces it with the socket
-protocol's `configure` operation. `agent-client`
-(`client/`) is where the human-facing clients agree on what that text is, so a
-bot created from Sonny or the CLI with `--agents` reads the same way. The
-crate also holds the socket protocol client Sonny uses.
+The daemon never composes system instructions—it stores whatever text the creating client sends and keeps it until updated via `configure`.
 
-Implemented 2026-09-19.
+`agent-client` (`client/`) defines the shared instruction composition used by **Sonny** and `agent run --agents`, so bots created from either client see the same rules, skills, profiles, and memory.
+
+## Folder layout
+
+Everything lives under `.agents` (project-local and user-global):
+
+```text
+~/.agents/
+├── AGENTS.md                 # global standing rules
+├── skills/<name>/SKILL.md    # reusable skills (indexed on demand)
+├── agents/<role>.md          # reusable agent profiles
+└── memory/
+    ├── MEMORY.md             # user memory index
+    └── projects/<name>/MEMORY.md
+
+<workspace>/.agents/
+├── AGENTS.md                 # workspace rules (plus AGENTS.md at root or parent folders)
+├── project.toml              # project name & Sonny overrides
+├── skills/<name>/SKILL.md    # workspace skills (override ~/.agents/skills)
+└── agents/<role>.md          # workspace profiles (override ~/.agents/agents)
+```
+
+> Claude Code's `.claude/skills` and `.claude/agents` use the same Markdown format and can be copied or linked into `.agents`.
 
 ## Layers
 
-1. **The harness preamble.** That other agents are reached through the
-   bot's tools: `list_agents` finds them, `send_message` gives one a message
-   and returns a handle, `wait` on it returns the reply, and `history` reads
-   an agent's turns; that `AGENT_BOT` names the bot and `AGENT_PARENT` its
-   creator, which `send_message` reaches; and that its final reply reaches
-   whoever waits on its turn. No command line or program path is taught:
-   the tool descriptions the daemon sends carry the rest. It gives the bot no role and no way of
-   working; a caller that wants one passes it. This is the CLI's default and
-   only instruction text.
-2. **AGENTS.md files.** `~/.agents/AGENTS.md` first, then, in each folder
-   from the filesystem root down to the workspace, its `AGENTS.md` and then
-   its `.agents/AGENTS.md`, so the nearest file is read last and wins where
-   they disagree. A file reached twice, such as the home folder's
-   `.agents/AGENTS.md` (that first file) or a link to its folder's
-   `AGENTS.md`, is read once. Each is appended under a heading naming its
-   path. Empty files are skipped.
-3. **Skills.** Folders `<name>/SKILL.md` in `<workspace>/.agents/skills` and
-   `~/.agents/skills` (the workspace's winning on a name clash), the layout
-   of [agentskills.io](https://agentskills.io/specification), become an
-   index: name, the front matter's `description` (else the first line),
-   path. The bot opens a skill with its `read` tool when the subject comes
-   up; nothing else is sent, so an unused skill costs one line.
-4. **Profiles.** Files `<role>.md` in `<workspace>/.agents/agents` and
-   `~/.agents/agents` become a second index of the roles a new agent can be
-   started in (Sonny's `start_task` takes one by name). A profile is markdown with optional YAML front matter:
-   `description`, `model`, `tools` (a list of this runtime's tool
-   names) and `sandbox` are read, any other key is ignored, so an agent file written for
-   another harness loads as it is. The body is the role. `sandbox` is
-   `read-only`, `workspace-write` or `danger-full-access`, as a Codex
-   role's `config_file` sets `sandbox_mode`: an agent started in the
-   profile (`--profile`, `spawn_agent`'s `profile`, Sonny's `start_task`
-   and workflow workers) starts in it unless the call names its own
-   sandbox. It never loosens what the agent would get from its maker: a
-   stricter one replaces that (`read-only` with no writable folders,
-   network or sockets), and a looser one is refused as `invalid_setting`
-   rather than tightened. Any other value is `profile_invalid`. Sonny's own
-   roles (`lead` and `task`, the client roles in `policy.rs`) are left
-   out of the index: a file of either name replaces Sonny's text for it,
-   not a role to start a peer in, so no agent is offered a nested lead.
-   A profile that `extends` one of them is left out too: it is a variant
-   a lead or its tasks are set to run as.
+Instructions are assembled in a fixed, cache-friendly order (stable layers first, frequently changing memory near the end):
 
-   Two more keys compose a profile from others. `extends: NAME` builds on
-   another profile: its body comes first, then this one's, and its
-   `model`, `tools` and `sandbox` stand where this one names none; chains are
-   followed up to 8 deep, and a circle is `profile_invalid`. Extending
-   its own name builds on the file of that name it shadows, so a folder's
-   `lead.md` with `extends: lead` adds to the person's, and the person's
-   to the one Sonny ships, which keeps Sonny's updates coming.
-   `skills: [a, b]` is Claude Code's subagent key: each skill's whole
-   `SKILL.md` body follows the role under `## Skill: NAME`, rather than
-   only its index line. A name either key gives that is in neither
-   folder is `profile_not_found` or `skill_not_found`. No harness has a
-   key for one agent file building on another (Claude Code's and Codex's
-   subagent files each stand alone, checked 2026-10-28), so `extends`
-   takes the name tsconfig and ESLint use. Skills have no such key: the
-   agent opens a skill itself, so a skill that builds on another says so
-   in its text, which names the other's line in the index.
-5. **Memory.** The person's `~/.agents/memory/MEMORY.md` and, when the
-   workspace is in a project, `~/.agents/memory/projects/NAME/MEMORY.md`,
-   each as it is (an index carries its own `# Memory in DIR` heading); one
-   not written yet adds nothing. The project is the `name` in the nearest
-   `.agents/project.toml`; from a git worktree it is looked up first at the
-   same place in the main checkout, read from the worktree's `.git` and
-   `commondir` files rather than by running git. Sonny's memory script
-   keeps the indexes ([SONNY.md](SONNY.md#memory)). They come after the indexes
-   because they change more often than the files above, and they are a
-   snapshot: a bot's instructions are fixed when it is made, until a client
-   sends them recomposed with `configure`.
-6. **Role.** A bot started in a profile (`--profile ROLE`, or Sonny's
-   lead) gets that body last, under `# Role: ROLE`. Sonny ships a
-   `lead` profile ([sonny/agents/lead.md](../sonny/agents/lead.md)) and a
-   `task` one ([sonny/agents/task.md](../sonny/agents/task.md)), whose
-   body follows the rest for every agent Sonny starts but a lead, and
-   writes both to `~/.agents/agents` until the person edits them; a
-   folder's file of the same name comes first. Either can be set to
-   another profile, as Claude Code's `agent` setting picks the profile its
-   main session runs as ([Sonny profile reference](../sonny/REFERENCE.md#profiles-for-leads-and-tasks)).
+1. **Harness preamble.** Teaches the bot how to coordinate via built-in tools (`list_agents`, `send_message`, `wait`, `history`) and its environment variables (`AGENT_BOT`, `AGENT_PARENT`). Imposes no persona or workflow. This is the CLI's default when `--agents` is not passed.
+2. **`AGENTS.md` files.** Loaded in order from `~/.agents/AGENTS.md`, then walking from the filesystem root down to `<workspace>` (`AGENTS.md`, then `.agents/AGENTS.md` in each directory). Nearest files come last and take precedence. Duplicate paths (via symlinks or overlapping home/workspace) are included once; empty files are skipped.
+3. **Skills index.** Discovers `<name>/SKILL.md` under `<workspace>/.agents/skills` and `~/.agents/skills` (workspace wins on name clash), following the [agentskills.io](https://agentskills.io/specification) layout. Only a one-line index (`name`, `description` or first line, `path`) is injected; the bot reads the full `SKILL.md` with `read` when needed.
+4. **Profiles index.** Discovers `<role>.md` under `<workspace>/.agents/agents` and `~/.agents/agents` (workspace wins). Sonny's client roles (`lead`, `task`, and any profile extending them) are omitted from the peer index so agents are not offered nested leads.
+5. **Memory indexes.** Includes `~/.agents/memory/MEMORY.md` and, inside a project, `~/.agents/memory/projects/<name>/MEMORY.md` (resolved via `.agents/project.toml`, following git worktrees back to the main checkout). Placed after skills and profiles because memory updates more often. Snapshot taken at bot creation ([memory details](SONNY.md#memory)).
+6. **Role body.** When started with a profile (`--profile ROLE`, or Sonny's lead/task roles), appends the resolved role body last under `# Role: ROLE`.
 
-Everything a client reads lives under `.agents`, the folder Codex, OpenCode
-and Pi already read skills from (sources read 2026-09-27: Codex 9db8162,
-OpenCode b471c2b, Pi 2b0a123). Claude Code keeps `.claude/skills` and
-`.claude/agents`; their files use the same format and can be copied or
-linked into `.agents` (George, 2026-09-27: one folder, and an agent can port
-other harnesses' files when asked).
+### Profile format
 
-The text is a stable prefix on purpose: after the first turn it rides the
-provider's prompt cache, and it changes only when a file changes. The whole
-composition is bounded at 60 KiB, under the daemon's 64 KiB limit. A workspace
-whose files exceed it fails to compose rather than being silently cut. The CLI,
-and Sonny for the agents it starts other than a lead, report `instructions_limit`
-with the file that tipped it, or `instructions_unreadable` with the file that
-could not be read, and create nothing. A lead is composed with
-`instructions_leaving_out`: each such file is left out whole, never cut, and
-listed with why, so the window opens, says what is missing, and tells the
-lead with its next model call (George, 11-08: a broken skill link is no
-reason for Sonny not to open). A lead whose own role file cannot be used runs
-as Sonny's role of that name, and says so.
-Only regular files are read, each opened without waiting: a FIFO, socket or
-device named like an instructions file, memory index or worktree's `.git` is
-`instructions_unreadable` ("it is not a regular file") rather than a read that
-waits until another program writes to it. A caller may run the composition
-under `noting`, which keeps the path each read waits on its file system for
-until it answers, so a wait that never ends (a mount whose server is gone) can
-say where it is held.
-Skill discovery visits workspace overrides first and accounts each index row
-against the remaining byte budget before reading more paths or file heads.
-It fails as soon as the index cannot fit, then sorts only the bounded result. It also stops at
-4096 folder entries, indexed or not, so a folder of other files cannot slow
-every new bot; past that, composition fails with `instructions_limit`.
-A skill, profile or AGENTS.md file that exists but cannot be read, a link to
-a missing file included, is an error; only an absent one falls back to the
-user's.
+A profile (`<role>.md`) is Markdown with optional YAML front matter (unknown keys are ignored so files from other harnesses load cleanly):
+
+| Key | Purpose |
+| --- | --- |
+| `description` | One-line summary shown in the profiles index and `/new` |
+| `model` | Default `PROVIDER/MODEL` when the caller doesn't specify one |
+| `tools` | Default tool list for this runtime |
+| `sandbox` | `read-only`, `workspace-write`, or `danger-full-access` (can only tighten, never loosen, the maker's sandbox; looser values fail with `invalid_setting`) |
+| `extends` | Inherit body and unset keys from another profile (chains up to 8 deep; cycles fail with `profile_invalid`). Extending your own name builds on the shadowed file (e.g., project `lead.md` extending user `lead.md` extending Sonny's shipped `lead.md`) |
+| `skills` | List of skill names whose full `SKILL.md` bodies are inlined under `## Skill: NAME` instead of indexed |
+
+Example:
+
+```markdown
+---
+extends: lead
+description: Lead that reviews changes before merging
+skills: [triage]
+---
+Review every task's diff before marking work ready to land.
+```
+
+Missing referenced profiles or skills fail with `profile_not_found` or `skill_not_found`. See [Sonny's lead and task profiles](../sonny/REFERENCE.md#profiles-for-leads-and-tasks) for project overrides.
+
+## Size bounds and error handling
+
+- **60 KiB cap:** Composed instructions stay under 60 KiB (within the daemon's 64 KiB limit) so the prefix rides the provider's prompt cache cleanly.
+- **No silent truncation:** If files exceed the budget or cannot be read (including broken symlinks or non-regular files like FIFOs/sockets), composition fails with `instructions_limit` or `instructions_unreadable` naming the offending file.
+- **Lead resilience:** Sonny composes leads with `instructions_leaving_out`—unreadable or over-budget files are omitted whole and reported so a broken skill link never prevents Sonny from opening.
+- **Bounded directory scans:** Skill discovery stops after 4,096 directory entries (`instructions_limit`) so large folders cannot stall bot creation.
 
 ## Who uses it
 
-- **CLI**: plumbing by default, the preamble alone. `--agents` on `run`
-  composes the policy for the workspace; exclusive with `--instructions`.
-- **Sonny**: a lead and the tasks it starts get the policy, the lead with
-  its role after it.
-- A **fork** takes no instructions: it copies its source's, so its first call
-  can read the source's prompt cache. New bots created with `--agents` read the
-  current AGENTS.md. To refresh an existing bot, a client recomposes the
-  instructions and sends the new text with `configure`.
-
-## Verified
-
-Unit tests in `client/src/policy.rs` cover discovery order (nearest file
-last), the skills index, the size bound failing instead of truncating, and a
-bare workspace. A CLI behavior test creates one bot without and one with
-`--agents` against the synthetic model and checks what the daemon sent:
-preamble only, then preamble plus the workspace's AGENTS.md and skill index,
-and that `--agents` with `--instructions` or on an existing bot is a usage
-error.
+- **`agent` CLI:** Uses the harness preamble alone by default. Pass `--agents` (or `--profile ROLE`) on `run --new` to compose full workspace policy (mutually exclusive with `--instructions`).
+- **Sonny:** Composes full policy automatically for leads (with the `lead` role) and tasks (with `task` appended after any task profile).
+- **Forks:** Always inherit their source bot's exact instructions so their first call hits the source's prompt cache. Use `configure` to push recomposed instructions to an existing bot.
