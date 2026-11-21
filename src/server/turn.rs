@@ -1376,7 +1376,9 @@ impl Turn {
     /// as it is; the round installs it once the call is recorded, before
     /// its tools run. Its plan and the view it copies are read here, as a
     /// summary before the call reads them. The time either way holds the
-    /// turn counts toward its `summary_ms`.
+    /// turn counts toward its `summary_ms`. After the provider refused the
+    /// view as past the model's window (`full`), it summarizes before the
+    /// call whatever the view measures.
     #[allow(clippy::too_many_arguments)]
     async fn compact_if_due<'a>(
         &'a self,
@@ -1389,7 +1391,7 @@ impl Turn {
         (last, inherited, model): (Option<&LastCall>, bool, &str),
         output_bytes: Option<usize>,
         beside: Option<&mut Option<Beside<'a>>>,
-        requested: bool,
+        (requested, full): (bool, bool),
     ) -> Result<Compaction> {
         let Some(Due {
             keeps: (keep, keep_items),
@@ -1402,7 +1404,7 @@ impl Turn {
             tools,
             (context.pressure(), context.prefix_usage()),
             output_bytes,
-            (requested, false),
+            (requested, false, full),
         )
         else {
             return Ok(Compaction::Skipped);
@@ -1546,14 +1548,16 @@ impl Turn {
     /// limit where there is one; elsewhere it is the hard one. The summary
     /// keeps the same share of whichever was used, so one written at the
     /// soft limit leaves the view as far under it as one at the hard limit
-    /// leaves it under that.
+    /// leaves it under that. A view the provider refused as past the
+    /// model's window (`full`) is past the threshold whatever it measures,
+    /// and does not fit.
     fn due(
         &self,
         record: &agent_runtime::store::Bot,
         tools: &serde_json::value::RawValue,
         (pressure, ahead): (ContextUsage, ContextUsage),
         output_bytes: Option<usize>,
-        (requested, post_turn): (bool, bool),
+        (requested, post_turn, full): (bool, bool, bool),
     ) -> Option<Due> {
         record.compaction_instructions.as_ref()?;
         let limit = self.input_limit();
@@ -1570,6 +1574,7 @@ impl Turn {
         };
         let at = limit_at.min(limit.bytes - reserve);
         if !requested
+            && !full
             && pressure.bytes < at
             && pressure.items
                 < (self.settings().context_items() * self.settings().compact_at() / 100)
@@ -1597,15 +1602,32 @@ impl Turn {
         };
         let reason = match () {
             _ if requested => "requested",
+            _ if full => "context_full",
             _ if pressure.bytes >= at => "bytes",
             _ => "items",
         };
+        // A view the bot's last call puts at the model's window or past
+        // it cannot go beside its summary: as Codex compacts before such a
+        // call, it is summarized first. A refusal records its view as the
+        // whole window, so the next view that size is one.
+        let window = u128::from(self.window.get().copied().unwrap_or(200_000));
+        let past_window =
+            record
+                .sent
+                .filter(|(_, counted)| *counted > 0)
+                .is_some_and(|(bytes, counted)| {
+                    (pressure.bytes + overhead) as u128 * u128::from(counted)
+                        >= window * u128::from(bytes)
+                });
         Some(Due {
             keeps,
             at,
             reason,
             reserve,
-            fits: pressure.bytes + reserve < limit.bytes && pressure.items < limit.items,
+            fits: !full
+                && !past_window
+                && pressure.bytes + reserve < limit.bytes
+                && pressure.items < limit.items,
         })
     }
 
@@ -1646,7 +1668,13 @@ impl Turn {
         };
         let ahead = sent.prefix_usage();
         if self
-            .due(record, tools, (grown, ahead), output_bytes, (false, true))
+            .due(
+                record,
+                tools,
+                (grown, ahead),
+                output_bytes,
+                (false, true, false),
+            )
             .is_none()
         {
             return Ok(());
@@ -1675,7 +1703,7 @@ impl Turn {
             tools,
             (now.pressure(), now.prefix_usage()),
             output_bytes,
-            (false, true),
+            (false, true, false),
         )
         else {
             return Ok(());
@@ -3296,6 +3324,12 @@ impl Turn {
         // Whether this task has made a call, whose cache a summary beside
         // the next one reads.
         let mut sent_here = false;
+        // A call the provider refused as past the model's window, and
+        // whether a summary installed since made room: the next boundary
+        // summarizes, and the call goes once more only if it made room.
+        // A second refusal (`refilled`) ends the turn on it.
+        let mut full: Option<(Error, bool)> = None;
+        let mut refilled = false;
         // A summary planned at this boundary to run beside its call.
         let mut beside: Option<Beside<'_>>;
         // Until this task calls or changes the view, the view is taken as
@@ -3398,6 +3432,7 @@ impl Turn {
             // runs, this task starts no summary of its own.
             if !resuming && self.ahead.is_some() {
                 let requested = record.compaction_requested || self.compact.load(Relaxed);
+                let pending = full.as_ref().is_some_and(|(_, room)| !room);
                 let wait = self.ahead_pending()
                     && (requested
                         || self
@@ -3406,10 +3441,13 @@ impl Turn {
                                 &tools,
                                 (context.pressure(), context.prefix_usage()),
                                 output_bytes,
-                                (false, false),
+                                (false, false, pending),
                             )
                             .is_some_and(|due| !due.fits));
                 if self.settle_ahead(&mut record, wait).await? {
+                    if let Some((_, room)) = &mut full {
+                        *room = true;
+                    }
                     if requested {
                         self.take_request(&mut record).await?;
                     }
@@ -3477,6 +3515,7 @@ impl Turn {
                 // one that parks finds it again as the turn resumes.
                 let requested = std::mem::take(&mut record.compaction_requested)
                     | self.compact.swap(false, Relaxed);
+                let pending = full.as_ref().is_some_and(|(_, room)| !room);
                 // Only behind a call this task made, whose cache the next
                 // call reads: at a turn's start, or as a turn resumes, the
                 // cache may have lapsed, and a summary first keeps that call
@@ -3492,7 +3531,7 @@ impl Turn {
                         (last.as_ref(), inherited, called),
                         output_bytes,
                         sent_here.then_some(&mut beside),
-                        requested,
+                        (requested, pending),
                     )
                     .await?
                 {
@@ -3512,6 +3551,15 @@ impl Turn {
                         }
                     }
                 }
+            }
+            // A view the provider refused as past the window goes once more
+            // only when this boundary made it room; with none to make, the
+            // turn ends on the refusal.
+            if let Some((error, room)) = full.take() {
+                if !(room || made_room) {
+                    return Err(error);
+                }
+                refilled = true;
             }
             // A steer the turn had no room for is tried again once elision
             // or a summary makes some, and so is one that arrived while this
@@ -3668,10 +3716,54 @@ impl Turn {
             if context.window.as_ref().is_some_and(|w| !w.ids.is_empty()) {
                 context.thinking = record.thinking;
             }
+            // A view the provider refused as past the model's window counts
+            // as one that fills it, as Codex marks the window full: the
+            // bot's token estimate takes this view's bytes for the whole
+            // window, so this turn's next boundary and the bot's next
+            // turn summarize before calling.
+            if let Err(error) = &called
+                && error.code == agent_runtime::provider::CONTEXT_FULL
+            {
+                let bytes = context.usage().bytes + record.instructions.len() + tools.get().len();
+                let window = self.window.get().copied().unwrap_or(200_000);
+                record.sent = Some((bytes as u64, window));
+                // Said as a retry when the turn goes on to make room.
+                let retry = (!refilled).then(|| {
+                    json!({"attempt":1,"error":error.code,"detail":error.detail,
+                        "delay_ms":0,"parked":false,"compact":true})
+                });
+                let name = self.bot.clone();
+                self.store
+                    .op("context_full", move |db| {
+                        db.record_sent(&name, bytes as u64, window)?;
+                        match retry {
+                            Some(retry) => db.retried(turn, retry),
+                            None => Ok(()),
+                        }
+                    })
+                    .await?;
+            }
             let mut response = match called {
                 Ok(Some(response)) => {
                     drops = 0;
+                    // Each call may go once more after a refusal.
+                    refilled = false;
                     response
+                }
+                // The view did not fit the model's window: summarized at the
+                // next boundary, as Pi Durable compacts and asks once more.
+                Err(error) if error.code == agent_runtime::provider::CONTEXT_FULL && !refilled => {
+                    let installed = self
+                        .join_summary(
+                            running,
+                            landed,
+                            Some(&mut record),
+                            &mut model_rounds,
+                            accounting,
+                        )
+                        .await?;
+                    full = Some((error, installed));
+                    continue;
                 }
                 // The model's own output cap cut its reply short. The reply
                 // is dropped, nothing of it recorded, so no partial call can
@@ -8325,7 +8417,8 @@ pub struct After {
 
 /// A view past the compaction threshold: the bytes and items its summary
 /// keeps, the threshold in bytes and why it was passed, the room kept for
-/// the reply, and whether the view and the reply still fit the input limit.
+/// the reply, and whether the view and the reply still fit the input limit
+/// and the view the model's window, as the bot's last call puts it.
 struct Due {
     keeps: (i64, i64),
     at: usize,

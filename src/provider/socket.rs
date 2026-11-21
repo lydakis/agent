@@ -449,6 +449,11 @@ impl Failure {
                 failure.error = Error::new("provider_previous_response_not_found");
                 return failure;
             }
+            // Past the window whatever status wraps it, as on HTTP.
+            Some(code) if super::context_full(code) => {
+                failure.error.code = super::CONTEXT_FULL.into();
+                return failure;
+            }
             Some("websocket_connection_limit_reached") => {
                 failure.error = Error::new("provider_socket_expired");
                 failure.dead = true;
@@ -581,6 +586,13 @@ mod tests {
         );
         assert_eq!(quota.error.code, "provider_quota_exhausted");
         assert!(quota.status.is_none());
+        // Past the window, not the 400 that wraps it.
+        let full = Failure::event(
+            Error::new("provider_incomplete"),
+            r#"{"type":"error","status":400,"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#,
+        );
+        assert_eq!(full.error.code, super::super::CONTEXT_FULL);
+        assert!((full.refused, full.dead) == (true, false));
         // A failure mid-response leaves events in flight on the connection.
         let midway = Failure::event(
             Error::new("output_limit"),
