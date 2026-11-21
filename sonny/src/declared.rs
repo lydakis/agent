@@ -15,6 +15,10 @@ use serde_json::{Map, Value, json};
 const MAX_DECLARED: usize = 32;
 const DECLARED_BYTES: usize = 64 * 1024;
 
+/// The result the daemon keeps for a declared tool that names none, and
+/// `inspect` reads back.
+const RESULT: &str = "ok";
+
 /// Sonny's tools, as it declares them on a bot in `role`: a workflow's
 /// worker, which no one talks to, goes without those that reach the
 /// person.
@@ -50,6 +54,18 @@ fn kinded(mut tool: Value) -> Value {
         _ => "agents",
     };
     tool["kind"] = json!(kind);
+    tool
+}
+
+/// `tool` as the daemon keeps it, and `inspect` reads it back: with the
+/// result it gives a tool that names none. What a bot has is compared
+/// with this, so one read back after its tools were declared has nothing
+/// to declare again.
+fn kept(tool: &Value) -> Value {
+    let mut tool = tool.clone();
+    if let Some(fields) = tool.as_object_mut() {
+        fields.entry("result").or_insert(json!(RESULT));
+    }
     tool
 }
 
@@ -129,7 +145,7 @@ pub fn held(declared: &Value, settings: &Value) -> Option<Value> {
         tool["name"] == crate::served::EXEC && tool["answered_by"] == crate::served::TAG
     })?;
     let exec = kinded(crate::exec::tool(Role::TASK.within(settings).escalates)?);
-    (tools[at] != exec).then(|| {
+    (kept(&tools[at]) != kept(&exec)).then(|| {
         let mut tools = tools.clone();
         tools[at] = exec;
         Value::Array(tools)
@@ -175,10 +191,15 @@ fn wanted(record: &Value, role: Role) -> Option<Vec<Value>> {
         other["answered_by"] == crate::served::TAG
             || names.iter().any(|tool| tool["name"] == other["name"])
     };
-    if ours.iter().all(|tool| declared.contains(tool))
-        && declared
+    // Each side as the daemon keeps it.
+    let (have, kept_ours): (Vec<Value>, Vec<Value>) = (
+        declared.iter().map(kept).collect(),
+        ours.iter().map(kept).collect(),
+    );
+    if kept_ours.iter().all(|tool| have.contains(tool))
+        && have
             .iter()
-            .all(|other| ours.contains(other) || !sonnys(other))
+            .all(|other| kept_ours.contains(other) || !sonnys(other))
     {
         return None;
     }
@@ -318,6 +339,28 @@ mod tests {
         // Opened under a row that lets it out, it is declared that way.
         let record = json!({"declared": declared, "settings": free});
         assert!(!exec(&declare(&record, Role::TASK).unwrap()).contains("sandbox_permissions"));
+    }
+
+    /// Sonny's tools as the daemon keeps them, every field it fills in
+    /// named, are the ones Sonny declares: a bot read back after they were
+    /// declared has nothing to declare again.
+    #[test]
+    fn tools_read_back_from_the_daemon_are_not_declared_again() {
+        for role in [Role::LEAD, Role::TASK, Role::WORKER] {
+            let declared = declare(&json!({}), role).unwrap();
+            // The daemon gives a tool that names no result its own.
+            let read: Vec<Value> = (declared.as_array().unwrap().iter())
+                .map(|tool| {
+                    let mut tool = tool.clone();
+                    let fields = tool.as_object_mut().unwrap();
+                    fields.entry("result").or_insert(json!("ok"));
+                    tool
+                })
+                .collect();
+            assert_ne!(json!(read), declared);
+            let again = declare(&json!({"declared": read}), role);
+            assert_eq!(again, None);
+        }
     }
 
     #[test]

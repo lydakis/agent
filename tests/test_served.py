@@ -1218,6 +1218,29 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         # Long enough for a second pass, which once came apart from the first.
         time.sleep(2)
         self.assertEqual(inspected() - before, len(bots))
+    def test_a_tool_host_declares_again_no_tools_an_agent_has(self):
+        """Tools read back as the daemon keeps them, with the result it gives
+        one that names none, are the tools declared: a second start
+        configures no agent."""
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), instructions='Lead.',
+                            declare=[declared('memory')])
+        first = self.host()
+        seen = set()
+        while seen != {'tools_refreshed', 'config_applied'}:
+            seen.add(json.loads(first.stdout.readline())['event'])
+        first.kill()
+        first.wait(timeout=10)
+
+        def counts():
+            ops = self.daemon.request('stats')['result']['commands']['ops']
+            return [ops.get(op, {}).get('count', 0) for op in ('inspect', 'configure')]
+
+        inspected, configured = counts()
+        self.host()
+        while counts()[0] == inspected:
+            time.sleep(.05)
+        time.sleep(1)
+        self.assertEqual(counts(), [inspected + 1, configured])
 
     def test_one_tool_host_a_store_and_the_next_starts_where_it_stopped(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
