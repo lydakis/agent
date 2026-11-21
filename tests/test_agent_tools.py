@@ -58,6 +58,15 @@ class AgentToolsTests(ModelFixture):
                                prompt='hi', delivery='steer', **{'from': {'bot': 'shop.lead', 'turn': turn}})
         self.assertTrue(again['result']['duplicate'], again)
 
+    def test_a_message_always_steers_and_names_no_delivery(self):
+        client = self.client(TOOLS)
+        for bot in ('shop.lead', 'shop.fix'):
+            client.request('create', bot=bot, workspace=str(self.path), settings=grouped(bot))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('send_message', {'to': 'shop.fix', 'message': 'later', 'delivery': 'queue'}))
+        self.assertIn('invalid_tool_arguments', self.output(client, 'shop.lead', 'send_message-1'))
+        self.assertEqual(client.request('messages', bot='shop.fix', after=0)['result']['messages'], [])
+
     def test_a_message_may_not_interrupt_an_agent_the_caller_did_not_make(self):
         client = self.client(TOOLS)
         for bot in ('shop.lead', 'shop.other'):
@@ -99,12 +108,12 @@ class AgentToolsTests(ModelFixture):
         busy = client.request('submit', bot='shop.fix', request_id='busy', prompt='gate')['result']['message']
         self.model.requests.get(timeout=3)
         self.run_calls(client, 'shop.lead', 'first',
-                       ('send_message', {'to': 'shop.fix', 'message': 'upload as picked', 'delivery': 'queue'}))
+                       ('send_message', {'to': 'shop.fix', 'message': 'upload as picked'}))
         first = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
         self.assertEqual(first['status'], 'queued', first)
         self.run_calls(client, 'shop.lead', 'second',
                        ('send_message', {'to': 'shop.fix', 'message': 'reversed order',
-                                         'delivery': 'queue', 'replaces': first['handle']}))
+                                         'replaces': first['handle']}))
         second = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
         self.assertEqual(second['replaced'], first['handle'], second)
         old, new = (int(sent['handle'].rsplit('/', 1)[1]) for sent in (first, second))
@@ -120,15 +129,16 @@ class AgentToolsTests(ModelFixture):
         listed = {m['message']: m for m in client.request('messages', bot='shop.fix', after=0)['result']['messages']}
         self.assertEqual(listed[old]['status'], 'withdrawn')
         self.assertEqual(len(listed), 3, listed)
-        # Once taken in, it stays, and the new one follows it.
+        # Once taken in, by the running turn it steered, it stays, and the
+        # new one follows it.
         self.model.release_headers.set()
         client.finished(busy)
-        self.assertEqual(client.finished(new)['data']['status'], 'completed')
+        self.assertEqual(client.finished(new)['data']['status'], 'taken')
         self.run_calls(client, 'shop.lead', 'third',
                        ('send_message', {'to': 'shop.fix', 'message': 'one more thing',
                                          'replaces': second['handle']}))
         third = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
-        self.assertEqual((third['taken'], third['taken_turn']), (second['handle'], new), third)
+        self.assertEqual((third['taken'], third['taken_turn']), (second['handle'], busy), third)
         client.finished(int(third['handle'].rsplit('/', 1)[1]))
 
     def test_agents_are_listed_by_project_and_the_calls_waiting_on_approval(self):

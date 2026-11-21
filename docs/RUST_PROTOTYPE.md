@@ -3057,7 +3057,9 @@ the daemon about other agents, as Codex's `send_message`, `list_agents` and
 call is a request on a session of its own, answered as the calling bot, as
 its own socket answers the `agent` in a sandboxed bot's shell (see the
 request table under [sandbox](#sandbox)), for every bot, sandboxed or not: a
-message reads as that turn's (`from`), never another's; `interrupt` stops a
+message reads as that turn's (`from`), never another's; it steers, joining
+the running turn at its next step or starting one, as Codex's agent mail
+joins the running turn, and takes no `delivery`; `interrupt` stops a
 running turn only of the caller or a bot it made, and the message then
 waits for a turn of its own (`queue`); and `pause_agents` names the caller
 as who pulled the cord. A message's `request_id` is the call's own unless
