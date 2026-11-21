@@ -12626,3 +12626,53 @@ keeps the daemon at speed, where full spends each commit waiting on the
 drive. The cost: a crash of the machine or a power loss can lose the
 commits made since the last checkpoint. A crash of the daemon loses
 nothing in either mode, and the store is never corrupted.
+
+## Continuing turns after a crash
+
+2026-11-21, Linux x86_64 cloud VM, 4 CPUs. Base is main at db1ec0b, head the
+crash-continuation change; both built `--release --locked --bin agent` in
+their own worktree and target folder, copied together, with each binary's
+page cache dropped before each run.
+
+Low end, the Perf workflow's daemon screens, two alternating rounds (Sonny's
+screen left to CI). Store work per turn is the same on both sides.
+
+| Bench | Measure | Base | Head |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 44.9 | 46.5 |
+| admission | burst submit p99, ms | 5.20 | 5.11 |
+| completion | release to terminal p99, ms | 12.6 | 13.6 |
+| footprint | idle RSS, MiB | 20.8 | 20.6 |
+| footprint | per idle bot, KiB | 1.33 | 1.28 |
+| footprint | RSS after a turn each, MiB | 35.8 | 37.9 |
+| footprint | CPU per turn, ms | 0.94 | 0.95 |
+| lifecycle, 32 bots | CPU, s | 0.67 | 0.68 |
+| lifecycle | p95 turn, ms | 588 | 585 |
+| lifecycle | peak RSS, MiB | 28.1 | 28.4 |
+
+High end, `bench.fleet_screen --bots 10000 --max-active 1024`, two runs a
+side (base, head, head, base). The restart phase kills the daemon with 1,024
+turns held in their model call.
+
+| Phase | Measure | Base | Head |
+| --- | --- | ---: | ---: |
+| create | 10,000 bots, s | 12.3 / 11.4 | 12.0 / 14.3 |
+| burst | 10,000 turns, s | 22.1 / 22.7 | 22.8 / 24.2 |
+| burst | p95, ms | 515 / 515 | 516 / 517 |
+| park | 5,000 parked RSS, MiB | 45.0 / 45.5 | 43.3 / 43.2 |
+| park | drain, s | 5.2 / 5.2 | 5.4 / 5.2 |
+| restart | ready, s | 0.49 / 0.64 | 0.04 / 0.04 |
+| restart | the 1,024 cut-off turns | ended interrupted | continued, completed |
+| restart | until all settled, s | 0.74 / 0.99 | 2.4 / 3.5 |
+| restart | RSS once settled, MiB | 20.0 / 20.1 | 39.9 / 45.6 |
+
+Ready comes sooner because the continuation runs after the daemon greets
+its clients and before it serves them, where main ended the turns before
+the greeting. Settling takes longer and ends with more memory because head
+does more: each of the 1,024 turns parks, waits its first backoff, asks the
+model again and finishes, where main only marks them ended. That RSS is the
+same order as after any 1,024-turn wave (the park phase's drain).
+
+The first high-end run found a hang, fixed before these numbers: the
+store's publication channel holds 1,024 entries, its reader started after
+the startup call, and continuing more than about 500 turns there filled it.
