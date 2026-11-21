@@ -2595,7 +2595,8 @@ the request from the store: within 5 minutes, up to 8 attempts for capacity
 (any 5xx, as `_should_retry` in anthropic-sdk-python 4421d56 treats it,
 observed 2026-09-26), transport failures, or a stalled stream and up to 64 for refusals for pace, which the pool
 spaces and which are not the request's fault; never for a response the model
-could not finish (`provider_incomplete`) or a client error. The providers'
+could not finish (`provider_incomplete`) or a client error. A view past the
+model's window is sent once more after a summary instead (see below). The providers'
 reset headers are only how long a full refill takes; the pool learns the level
 and refills continuously, so it never idles waiting for a reset. Rate limits wait on
 the pool; other transient failures back off from 250 ms doubling to 30 s with
@@ -2652,6 +2653,35 @@ it back to none. The daemon puts
 no bound of its own on a reply: events carry
 previews of calls (2 KiB of arguments), text streams live in pieces of at most
 128 KiB, and a history read answers `item_too_large` for one item past a line.
+
+### Views past the model's window
+
+A provider's refusal of a request as past the model's context window ends in
+one code, `provider_context_full`, read only from typed signals, never from a
+message's words: OpenAI's `context_length_exceeded` (a 400, a failed stream
+or a socket `error` event, as Codex reads it), Anthropic's
+`model_context_window_exceeded` stop, whose reply is dropped, and any HTTP
+413, a request past the endpoint's size limit (Anthropic's
+`request_too_large`). Anthropic's and Bedrock's refusal of an input past the
+window names no code, only words, so it stays `provider_http_400`.
+
+The refused view then counts as one that fills the window, as Codex marks
+the window full: the bot's token estimate takes its bytes for the model's
+whole window, so the threshold falls under it. The turn says so in a `retry`
+event (`error: "provider_context_full"`, `compact: true`), and its next
+boundary summarizes before the call, whatever the view measures, with
+`trigger.reason` `context_full`; the call then goes once more, as Pi Durable
+compacts and asks again. A boundary that makes no room (nothing to summarize
+or elide, or no compaction instructions) ends the turn on the refusal, and so
+does a second refusal of the same call. A park between the refusal and that
+second call, on a rate limit for the summary or the call, a pause or a
+stop, keeps where the turn was. That summary keeps its shares of the
+refused view, also for a bot whose token threshold is off. The estimate
+stays, so a bot with a token threshold summarizes before its next turn's
+first call; the next answered call sets it from what the provider counted. A
+view the estimate puts at the window or past it never goes beside its
+summary, as Codex compacts before such a call. Neither step adds work to a
+call the provider answers.
 
 ### Held turns
 
@@ -4826,7 +4856,8 @@ include `context_before`, `context_after`, `input_limit`, `reclaimed_bytes`,
 complete logical view since the cut; headroom can be negative during catch-up,
 while the actual request still uses a bounded window. `trigger` says what
 started it: its `reason` (`bytes` or `items` past the threshold, `requested`
-by a client, or `overflow`, a view that could not be sent), the model's context
+by a client, `overflow`, a view that could not be sent, or `context_full`, a
+view the provider refused as past the model's window), the model's context
 `window` and the `compact_tokens` threshold it gives, what the last call `sent`
 in bytes and the tokens counted for it, the view's threshold in bytes
 (`at_bytes`), the instructions and tools sent beside the view

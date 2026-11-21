@@ -398,6 +398,11 @@ impl State {
                 let tokens = self.usage.output_tokens;
                 return Err(super::cut_short("max_tokens", tokens, writing));
             }
+            // The reply reached the context window: what it wrote is
+            // dropped and the turn compacts to make it room.
+            Some("model_context_window_exceeded") => {
+                return fail_with(super::CONTEXT_FULL, "model_context_window_exceeded");
+            }
             // With a fallback requested, the whole chain declined.
             Some("refusal") => {
                 // The models already switched to ran and are billed too, so
@@ -917,6 +922,22 @@ mod tests {
         assert_eq!(state.usage().unwrap().input_tokens, 12);
         assert_eq!(state.usage().unwrap().output_tokens, 1);
         assert_eq!(state.finish().unwrap_err().code, "provider_incomplete");
+        // A reply that reached the context window, billed as any.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":199990}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{"output_tokens":10}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert_eq!(state.usage().unwrap().output_tokens, 10);
+        assert_eq!(
+            state.finish().unwrap_err().code,
+            crate::provider::CONTEXT_FULL
+        );
         assert_eq!(
             State::default().finish().unwrap_err().code,
             "missing_completion"

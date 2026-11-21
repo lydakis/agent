@@ -3808,6 +3808,7 @@ fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
             Some(blocked),
             None,
             None,
+            (false, None),
         )
         .unwrap();
     assert_eq!(entry["event"], "turn_paced");
@@ -3861,6 +3862,7 @@ fn an_ordinary_retry_between_holds_keeps_when_they_began() {
             None,
             Some("provider_stream_failed".into()),
             Some(5),
+            (false, None),
         )
         .unwrap();
     // A retry the provider asked for, not a hold: nothing says held, and
@@ -13330,6 +13332,33 @@ fn a_store_from_before_skip_pointers_places_every_node() {
 }
 
 #[test]
+fn a_halt_keeps_where_a_refusal_s_recovery_was() {
+    let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+    for (bot, full) in [
+        ("Bob", (false, Some("past the window".to_owned()))),
+        ("Ann", (true, None)),
+    ] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                bot,
+                "first",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.suspend_halted(turn, Halt::Pause, (0, 0, 0), None, full.clone())
+            .unwrap();
+        let parked = db.waiting_turns().unwrap();
+        let parked = parked.iter().find(|w| w.turn == turn).unwrap();
+        assert_eq!((parked.refilled, parked.refused.clone()), full);
+    }
+}
+
+#[test]
 fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_pause() {
     let path = std::env::temp_dir().join(format!("agent-halt-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -13346,7 +13375,7 @@ fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_p
         )
         .unwrap()
         .turn;
-    db.suspend_halted(turn, Halt::Shutdown, 0, 0, 0, None)
+    db.suspend_halted(turn, Halt::Shutdown, (0, 0, 0), None, (false, None))
         .unwrap();
     // A stop leaves no deadline: the next start wakes it at once.
     let parked = db.waiting_turns().unwrap();
@@ -13416,7 +13445,10 @@ fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started
             .collect();
         db.append(turn, items, &calls, None).unwrap();
         db.tool_start(turn, &calls[0], false, false).unwrap();
-        let Halted::Parked(events) = db.suspend_halted(turn, halt, 0, 0, 0, None).unwrap() else {
+        let Halted::Parked(events) = db
+            .suspend_halted(turn, halt, (0, 0, 0), None, (false, None))
+            .unwrap()
+        else {
             panic!("a running turn parks");
         };
         let completed: Vec<_> = events
@@ -21901,6 +21933,7 @@ fn paced(db: &mut Database, turn: i64) {
         Some(blocked),
         None,
         None,
+        (false, None),
     )
     .unwrap();
 }
@@ -23617,7 +23650,7 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
         vec![(turn, "c2".to_owned()), (turn, "c3".to_owned())]
     );
     // A pause that parks a turn ends the answered calls it leaves.
-    db.suspend_halted(halted, Halt::Pause, 0, 0, 0, None)
+    db.suspend_halted(halted, Halt::Pause, (0, 0, 0), None, (false, None))
         .unwrap();
     assert_eq!(heard(&mut db), vec![(halted, "c1".to_owned())]);
 }

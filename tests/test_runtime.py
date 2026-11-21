@@ -153,6 +153,23 @@ class Model(http.server.BaseHTTPRequestHandler):
             # An automation's message comes after its one-line header.
             if user.startswith('[automation ') and '\n' in user:
                 user = user.split('\n', 1)[1]
+            # Past the model's window, as `context_full` says for a work
+            # call: a 400 naming OpenAI's code, or (`stream`) a failed
+            # response with it.
+            full = getattr(self.server, 'context_full', None)
+            full = full(request, user) if full and not is_summary(request) else None
+            if full == 'http':
+                body = json.dumps({'error': {
+                    'message': 'Your input exceeds the context window of this model.',
+                    'type': 'invalid_request_error', 'param': 'input',
+                    'code': 'context_length_exceeded'}}).encode()
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if user in getattr(self.server, 'unauthorized_prompts', ()):
                 # A key the provider refuses: the person's to fix.
                 body = b'{"error":{"message":"synthetic bad key"}}'
@@ -576,6 +593,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # A rate limit the provider reports inside the stream.
                 events = [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {
                     'code': 'rate_limit_exceeded', 'message': 'Rate limit reached. Please try again in 300ms.'}}}]
+            if full == 'stream':
+                events = [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {
+                    'code': 'context_length_exceeded',
+                    'message': 'Your input exceeds the context window of this model.'}}}]
             if user.startswith('streamlimit-flat:') and attempt == 1:
                 events = [{'type': 'error', 'code': 'rate_limit_exceeded',
                            'message': 'Please try again in 300ms.', 'param': None, 'sequence_number': 1}]
@@ -923,6 +944,24 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 else:
                     blocks.append({'type': 'text', 'text': 'reply:' + user})
                     stop = 'max_tokens' if user == 'incomplete' else 'end_turn'
+            # Past the model's window, as `context_full` says for a work
+            # call: a reply cut at the window (`stop`), or a request past
+            # the endpoint's size limit (`413`).
+            full = getattr(self.server, 'context_full', None)
+            full = full(request) if full and not summary else None
+            if full == '413':
+                body = (b'{"type":"error","error":{"type":"request_too_large",'
+                        b'"message":"Request exceeds the maximum allowed number of bytes."}}')
+                self.send_response(413)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
+            if full == 'stop':
+                blocks = blocks[:1] + [{'type': 'text', 'text': 'Partial '}]
+                stop = 'model_context_window_exceeded'
             start = {'model': request['model'] + '-20260926',
                      'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2,
                                **getattr(self.server, 'start_usage', {})}}

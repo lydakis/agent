@@ -1880,6 +1880,15 @@ pub struct Waiting {
     /// next reading that lets it start wakes the turn, which runs it then.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub load: bool,
+    /// The unfinished call went once more after the provider refused its
+    /// view as past the model's window: a second refusal ends the turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refilled: bool,
+    /// The provider refused the unfinished call's view as past the model's
+    /// window, with the refusal's detail, and no summary has made room
+    /// yet: the turn summarizes first as it resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
     /// What the command rules made of the calls still to run, as their
     /// round was announced, by call id: read from them as the park resumes.
     #[serde(skip)]
@@ -11088,6 +11097,8 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: false,
+            refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -11157,6 +11168,8 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: true,
+            refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -11369,6 +11382,8 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: false,
+            refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14598,6 +14613,8 @@ impl Database {
             held_since_ms: None,
             poll,
             load: false,
+            refilled: false,
+            refused: None,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14637,6 +14654,7 @@ impl Database {
         blocked: Option<Blocked>,
         retrying: Option<String>,
         held_since_ms: Option<u64>,
+        (refilled, refused): (bool, Option<String>),
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -14675,6 +14693,8 @@ impl Database {
             blocked,
             poll: false,
             load: false,
+            refilled,
+            refused,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -14709,10 +14729,9 @@ impl Database {
         &mut self,
         turn: i64,
         stop: Halt,
-        retries: u64,
-        paced_ms: u64,
-        summary_ms: u64,
+        (retries, paced_ms, summary_ms): (u64, u64, u64),
         route: Option<&str>,
+        (refilled, refused): (bool, Option<String>),
     ) -> Result<Halted> {
         let bot = self.active(turn)?;
         match bot.status.as_str() {
@@ -14770,6 +14789,8 @@ impl Database {
             held_since_ms: None,
             poll: false,
             load: false,
+            refilled,
+            refused,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
