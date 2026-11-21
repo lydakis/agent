@@ -1,555 +1,100 @@
-# Sonny's automations, memory, skills and MCP
+# Sonny's capabilities
 
-Sonny gives agents automations, shared memory, skills, and access to your
-MCP servers. This page covers how those capabilities work and how to
-configure them. For installation and everyday controls, start with the
-[Sonny quickstart](../sonny/README.md).
+Sonny extends [Agent](../README.md) with background capabilities that compound across sessions, projects, and machines: OS-scheduled **automations**, shared **memory**, cross-project **commons & boards**, **skills**, **code-mode MCP (`exec`)**, multi-agent **workflows**, and SSH **links** to another machine's browser, desktop, or MCP servers.
 
-[Automations](#automations) · [Scheduler](#the-scheduler) · [Memory](#memory) ·
-[Commons](#commons) · [Pause](#pause) · [Skills](#skills) ·
-[Tool host](#tool-host) · [MCP servers](#mcp-servers) · [Links](#links) ·
-[Keys](#keys-never-wait-on-the-daemon)
+For installation and everyday terminal controls, start with the [Sonny quickstart](../sonny/README.md).
 
+[Automations](#automations) · [Scheduler](#the-scheduler) · [Memory](#memory) · [Commons](#commons) · [Boards](#boards) · [Pause](#pause) · [Upgrading](#upgrading) · [Skills](#skills) · [Tool host](#tool-host) · [Workflows](#workflows) · [MCP & code mode](#mcp-servers) · [Links](#links) · [Responsive UI](#keys-never-wait-on-the-daemon)
 
 ## Automations
 
-Automations are Sonny's ([trigger.rs](../sonny/src/trigger.rs)). An automation wakes an agent with a
-message when something happens: a time comes, a file is written, a
-repository's HEAD moves, or someone runs it by name. The message is a new turn in the agent's own conversation; an automation
-may also start the agent it names on its first run. Sonny's scheduler
-watches ([The scheduler](#the-scheduler)): one process per HOME, which the
-system runs as its one job of Sonny's (a LaunchAgent on a Mac, a systemd
-user service on Linux), so an automation runs with Sonny closed, and a time
-the machine slept through runs once when it wakes (as launchd's
-`StartCalendarInterval` and a `Persistent=true` timer coalesce missed
-times; cron skips them). The daemon has no clock or watcher of its own, and
-no process of an automation is left between its runs: while nothing happens an
-automation costs its definition and the scheduler's look, and no model call.
-A lead hears of its tasks' turns from Sonny's lookout, not from
-automations.
+Automations wake an agent with a message on a schedule, file change, git commit, or manual trigger—running through a single OS scheduler even when Sonny is closed. While idle (or skipped by an `--if` gate), an automation costs zero model calls.
 
-Sonny's agents add and change automations with the `automations` tool, which
-Sonny's tool host answers outside the agent's sandbox, since an automation runs
-as the person outside it: `add` (the fields below, as `every`, `cron`, `start {name,
-model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
-and `message`), `remove`, `run` or `read` NAME, or nothing to list them.
-Nothing lists them as the other tools that list do (follows, memory, the
-commons): one line each, its name, when it runs (`when`), the agent it
-messages (`agent`), when its last run was and how it went (`last`, with how
-the turn it sent ended once known), and any `problem`, `missed` or `ended`;
-a long list comes in pages, `next` in the answer saying where the rest
-start, as `from`. `read` NAME shows one whole, its message and last result
-too. An agent lists and reads only its own: those that wake it, send their
-answers to it, or start an agent it added; `sonny automation list` lists
-every one.
-A look acts on nothing and runs as any read does, also for an agent whose
-sandbox no one reviews. An add, a removal or a run is judged by its parts,
-never as a whole, as a script's calls are: each part that reaches past the
-agent is a step of the call (`approve_step`) under the tool it amounts to,
-which the daemon decides as that tool's call from the model would be, by its
-rules, its gate and its sandbox. An `if` is a `shell` command in the agent's
-sandbox, where it runs at each fire (one it did not write runs outside it, and
-is asked so); another agent it wakes, or that gets each run's answer, is
-`send_message`; an agent it starts is `start_task`, refused as a start is to a
-confined agent no one reviews. An add that only wakes the agent asks nothing,
-nor does a removal of one of its own; a removal of another's asks that one's
-parts, and a run the parts of the one it runs. Whose automation it is goes by
-the agent's id in its store, never its name, which an agent of another store
-sharing this HOME can have. A step refused refuses the call with its reason,
-and nothing is added. A removal, run or replacement acts only on the
-definition its parts were asked about: one replaced, or added, while they were
-asked about is refused as `automation_changed`, to be asked about again.
-A row whose last run sent a turn says how that turn ended, as the daemon
-has it: `last.turn_status`, and `last.turn_error` when it did not complete,
-so an agent sees the failure the person sees in `/background`. It does not
-have to look: when a turn a run sent fails (not one whose model said
-nothing), the lookout tells the agent that added a `start` automation, else
-the agent the run messaged, with a steer: read in its next model call, or
-waking it when idle (`[automation NAME · TIME · turn N it sent BOT failed:
-WHY]`). A run with `reply_to` passes the failure on with its
-answer instead.
-It waits for a verdict wherever the agent's other calls do (`/permissions`),
-since an automation runs as the person and its `if` command outside any
-sandbox. For people, scripts and other harnesses, Sonny writes
-`~/.agent/automation` each time it starts, a script that runs it as
-`sonny automation`:
+*(Note: Leads hear task updates from the [Lookout](LOOKOUT.md), not automations. Use automations for scheduled jobs and file/git triggers.)*
+
+### Adding and managing automations
+
+Sonny's agents manage their own automations via the `automations` tool (`add`, `remove`, `run`, `read NAME`, or `{}` to list). People, scripts, and other harnesses use `~/.agent/automation` (written by Sonny as a wrapper around `sonny automation`):
 
 ```sh
-~/.agent/automation add [--name NAME] [WHEN] [--agent NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to AGENT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] -- MESSAGE
-  WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
+~/.agent/automation add [--name NAME] [WHEN] \
+  [--agent NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL] [--fresh]] \
+  [--reply-to AGENT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] \
+  [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] -- MESSAGE
+
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
 ~/.agent/automation run NAME
 ~/.agent/automation rm NAME
 ```
 
-Every reply is one JSON value on stdout; a failure is one
-`{"error": CODE, "detail": ...}` on stderr with exit 1.
+Every CLI reply is one JSON value on stdout; failures print `{"error": CODE, "detail": ...}` on stderr with exit `1`. View, run (`r`), or remove (`x`) automations interactively in Sonny with `/background`.
 
-**Shadow runs.** `--shadow` is a dry run, for moving a job from elsewhere
-onto an automation. Each run forks its agent where it is now (a `--start`
-automation whose agent no run made yet first makes that agent, as its first
-run would, and sends it nothing)
-into `BOT.shadow-HEX`, a copy in the read-only sandbox, with no shell, no
-gate a person or a model answers, the person's command rules without their
-`allow` rules, and of Sonny's tools only
-`exec`, whose MCP calls of a tool that does not say it only reads
-(`readOnlyHint`), or that its server's approval mode would ask about, are
-refused. So everything past reading is refused, never asked about. A copy
-that cannot be confined is removed before it runs. Its answer goes to
-`--reply-to`, which defaults to the agent that added the automation, else to
-the agent that added a `--start` one, else to the agent it copies, as
-`[automation NAME · TIME · shadow run of BOT STATUS: ...]`, and the copy is
-removed once that went (or after a day idle). It has no shell because a
-sandboxed agent's commands still reach its daemon socket, which takes a
-message to another agent or a pause from a read-only agent too; so a dry run
-reads with the daemon's file tools and read-only MCP tools, not commands.
+### Trigger types (`WHEN`)
 
-**Live messages.** With `--live`, the message is a template, as a live
-memory fact's text is, filled as each run starts: `source('NAME')` (what
-one of your sources printed, its `.latest`, `.events` and each topic's
-newest in `.topics`; `source('NAME:TOPIC')` for one topic alone),
-`file('PATH')` and `modified('PATH')` from the folder the automation was
-added in, `now()`, and `| ago` and `| time`. So a run starts with the data
-in its prompt instead of spending its first calls fetching it. `add` refuses
-(`live_template`, as every live template is) a message that does not read as a template, names a
-source you have not set up, or calls `tasks()`, which a run outlives; a file
-not written yet fills on a later run. A run whose blanks do not fill gets
-the message as written and a line saying why, so the run still comes. What
-it filled to is at most 32 KiB. A shadow run fills the same way.
+| Flag | Behavior |
+| --- | --- |
+| `--every 30m` | Repeating interval (minutes dividing an hour, hours dividing a day, or `1d`); waits one full interval before firing |
+| `--in 45m` / `--at 'YYYY-MM-DD HH:MM'` | One-off within a year (local time); removes itself after running |
+| `--cron 'MIN HOUR DAY MONTH WEEKDAY'` | Standard 5-field cron expression (up to 1,024 calendar entries) |
+| `--file PATH` | Fires when `PATH` is written (or files are added/removed in a directory); polled every 2s. Refuses daemon store paths and `~/.agent/automations` |
+| `--commit REPO` | Fires when `HEAD` reaches a newly committed revision (`git rev-list --since=...`); ignores checkouts/resets/fast-forwards to old commits |
+| *(omitted)* | `on demand` — fires only via `run NAME` |
 
-**A broken `--if`.** A gate that cannot run, ends with anything but exit 0
-or 1, or runs past 60 s, fails the run, with the end of what it wrote to
-stderr. The agent that hears of the automation (`--reply-to`, else the agent
-that added a `--start` automation, else the agent it messages) is told once
-when it breaks, and once when it works again, as alerts go off on a change
-of state rather than on every check; the row's `checked.told` keeps
-whether the break was told. While the daemon is paused (`/pause`), a gate
-does not run: its run waits for the resume, as the turn a run sends then
-waits for it.
+### Target agents and execution options
 
-**When.** `--every` counts from the next whole minute in minutes that
-divide an hour, hours that divide a day, or `1d`, and waits at least one
-full interval before its first message; calendar ticks before that earliest
-time do nothing. `--in` and `--at` are one-offs within a year, which remove
-themselves once they have run (`--in` rounds up to the next whole minute, since
-calendar times are minutes; `--at` refuses a part out of range or extra parts);
-`--cron` is read as cron reads it, a day or a weekday when both are given,
-up to 1,024 calendar entries. `--file PATH` runs when the file is written,
-or a file is added to or removed from it when it is a folder (the
-scheduler looks at it every two seconds); it need not exist yet, and it may not be in
-`~/.agent/automations` or be its daemon's store (or its `-wal` and `-shm`, by
-any name, a hard link included), which every run writes: `add` refuses one, and a run that finds its path
-became one (a link moved) ends the automation, sending nothing and keeping a
-`failed` row that says why. A shell that
-names its daemon's socket and not its store cannot add one, since its store
-is not known to check. `--commit REPO` sends when a commit was made: the scheduler wakes it on any write
-to the repository's own HEAD log, which git writes on every move of HEAD,
-and the run asks git one question, `git rev-list -n1 --since=LOOKED NEW
---not OLD`: whether HEAD now reaches a commit the HEAD it last saw did not,
-committed since it last looked. A commit, an amend, a merge, a cherry-pick,
-a rebase that rewrote commits, or a pull of work committed since sends; a
-checkout, a reset, or a fast-forward to commits that were already there
-sends nothing, and the run keeps where HEAD went. A HEAD the repository no
-longer has (it was made again) counts as unknown. `add` records where HEAD
-is, a repository with no commit yet included, before the scheduler watches, and
-when a commit came in between asks for a run that looks as the scheduler would
-(a `wake.` ask), so the commit is sent once. A repository where git keeps
-no HEAD log (`core.logAllRefUpdates` false, or a bare one by default) is
-refused, and adding the same automation again watches the git folder the
-repository has now, recording where its HEAD is in place of the old one's.
-git is the one on the `PATH` `add` ran with, which the definition keeps. With no
-WHEN, only `run` runs it (its `when` reads `on demand`); `run` while a run is still going is sent by that
-run once it is done.
+- **Existing agent (`--agent NAME`):** Defaults to the calling shell's `AGENT_BOT`. Pinned by bot ID so a deleted/recreated bot is never messaged accidentally (`bot_not_found`).
+- **Start on demand (`--start NAME --model PROVIDER/MODEL [--effort LEVEL]`):** Creates the agent on first run using Sonny's standard workspace policy, `auto` sandbox/reviewer, and tools (`memory`, `exec`). Add `--fresh` to create a fresh `NAME-N` agent per run (keeping at most the running, latest finished, and latest failed agents, and noting prior failures on line 1).
+- **Pre-flight gate (`--if CMD`):** Runs `sh -c CMD` (60s timeout) before waking any agent. Exit `0` runs, exit `1` skips silently (zero model calls), any other exit or timeout fails the run and alerts the owner once on state change. Commands added by an agent run inside that agent's own sandbox (`agent sandbox --bot`); commands added by you run as your user.
+- **Forward replies (`--reply-to BOT`):** Waits for the turn to finish (up to 24h) and steers its answer to `BOT`, skipping overlapping ticks while waiting.
+- **Stop conditions & budgets:** `--runs N` stops after `N` deliveries; `--until 'YYYY-MM-DD HH:MM'` ends at local time; `--turn-budget-tokens N` (optionally with `--budget-counts work` to ignore re-sent history) caps spend per run.
+- **Shadow dry runs (`--shadow`):** Forks the target into a read-only `BOT.shadow-HEX` copy with no shell, no human/reviewer approval gate, and read-only MCP calls only; sends the dry-run answer to `--reply-to` (or the creator) and deletes the copy. Incompatible with `--fresh`.
+- **Live message templates (`--live`):** Evaluates Jinja blanks (`source('NAME')`, `file('PATH')`, `modified('PATH')`, `now()`, `| ago`, `| time`; up to 32 KiB) right as each run starts so the prompt arrives with fresh data already filled in.
 
-**Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
-which must still match `AGENT_BOT_ID`); `--agent` names another. Either is
-pinned by its id: an agent deleted since, or a new agent under its name, is not
-reached (`bot_not_found`), and the automation ends. `--start NAME --model
-PROVIDER/MODEL [--effort LEVEL]` names an agent that does not exist yet:
-the first run makes it as Sonny makes an agent (the daemon's `create`,
-in the folder `add` ran in, with that folder's composed policy, the
-default tools and Sonny's own a task has: the memory tool, and `exec` while
-an MCP server is on, so an agent no one opens reaches the person's servers
-as one they open does; one an automation made before it had them takes them at
-its next run, gated as its mode gates the rest), gated by the reviewer
-and sandboxed to its folder as `sonny --new` makes one (`auto`), with the
-person's fallback for its model: one way to make an agent, so an agent no
-one opens never runs with more reach than one they do. A call the reviewer
-doubts waits in `/approvals`, as any agent's does. One an automation made
-before then, with no sandbox and no gate, is confined so at its next
-run; one the person put in `full` stays there. It is made by the agent that added the automation when one did, so
-it shows under that agent, and gives it the run's message. Its id is kept with the automation's
-state when the run settles, and later runs message it. A name an agent already has is refused at
-`add` (`bot_exists`), and an agent of that name made before the first run
-makes that run fail, naming it. The agent that added it is pinned by its
-id too: once it is deleted, `create` fails with `creator_not_found`, and the
-automation ends, keeping its row, as when its `--reply-to` agent is gone. The `create` carries the automation's own
-request id, so a run cut short after the daemon made the agent asks again
-and gets that same agent, and no other.
+### Permissions, delivery, and state
 
-`--fresh` (with `--start`) makes a new agent for each run instead, `NAME-N`
-for run N, so no run reads another's conversation: what lasts between runs
-lives in files and memory, as a cron job's does. Sonny's own nightly memory
-cleanup runs so; an automation an agent sets up keeps one agent unless asked.
-Each is made as the one agent above is. A run is numbered when its time
-passes its `--if`, and the number is on the automation's row (`run`) before
-its agent is made: a run cut short and taken again is another attempt at
-the same run, whose `create` (request id `trigger-GENERATION-N`) and
-message (`…ID.run`) the daemon takes once. Runs go one at a time: a run's
-run waits for the run before to end (the daemon's `wait`, up to a day; a
-run still working then is skipped), reads how it ended, and says so on its
-first line when it did not finish (`[automation NAME · run N · TIME · WHY]`,
-then `Run N-1 did not finish: failed: provider_failed. Its conversation is
-NAME-(N-1).`). The row keeps three agents at most: the run under way, the
-latest that finished and the latest that did not; an agent a later run
-replaces there is deleted. An agent of a run deleted by hand ends that run,
-not the automation. A run passes over a `NAME-N` an agent already has, so
-NAME may be an agent's, and it is at most 117 bytes, so `NAME-N` fits the
-daemon's 128. A run's message is kept on the row before it goes, so an
-attempt cut short sends it again as it was. A memory tool call in a run's
-turn, and a change from a run's shell through `~/.agent/memory`, is the
-automation's, so an open memory cleanup belongs to the automation, and a run
-that carries on one cut short changes it as its own. `--fresh` and
-`--shadow` do not go together, and an automation replaced with or without
-`--fresh` starts its agents over.
+- **Stepwise approvals:** In the `automations` tool, reads need no approval. Adding, removing another's, or running an automation is approved per capability (`if` as `shell`, waking/replying to another bot as `send_message`, `start` as `start_task`).
+- **Queued delivery & coalescing:** Runs submit with `delivery: queue` and `origin: "automation"` (never human consent for the reviewer). Repeating automations skip (`bot_busy`) if a prior run is already queued behind active work. Missed calendar runs during sleep coalesce to one run on wake. Turn failures alert the owner via lookout steer and appear in `/background`.
+- **Idempotency & files:** Re-adding an identical definition returns `duplicate: true`; a differing one fails with `automation_exists` naming the differing field. Definitions live in `~/.agent/automations/jobs/NAME.json`, state in `~/.agent/automations/NAME.json`, on-demand asks in `NAME.asks`, locked via `~/.agent/automations/.lock`. Pinned to the daemon's store lineage (`store_mismatch` if another store reuses the socket).
 
-**What else.** `--reply-to BOT` keeps the run's process until the turn it
-sent ends (the daemon's `wait`, up to a day), then steers that turn's
-answer to BOT, pinned by id, as the lookout tells a task's update; the scheduler starts no second run of the automation
-meanwhile, so a repeating one skips the times that turn spans. The run's
-request id then ends `.to.ID`, BOT's id, so the lookout does not also tell
-that agent of the turn as a task update, unless that answer has not
-reached it 15 s after the turn ended. A run cut short while it waits
-(the Mac restarted) passes no answer on: nothing resumes that wait. An
-answer the daemon cut short is
-marked so in its first line; a turn that ended saying nothing passes on an
-empty answer. One that does not get through keeps an ended automation listed,
-saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
-never comes back) ends the automation. `--if CMD` runs `sh -c CMD` in the folder
-`add` ran in, with the `PATH` `add` ran with and `AGENT_SOCKET` and
-`AGENT_STORE` naming the automation's daemon, before anything else, for up
-to 60 s, in its own process group, which ends with it. One an agent added
-(its shell, or its automations tool) runs as that agent's commands do,
-through `agent sandbox --bot` (protocol 54): in its sandbox, with its
-variables (`$SONNY_STATE` too), reaching the daemon through its own socket,
-since an agent can rewrite what its gate runs; that agent gone, the check
-could not run (exit 125). One the person added, or Sonny (an ask's deadline,
-the memory cleanup), runs as the person. The definition says which
-(`--if-by NAME --if-by-id ID`, or `--if-by-person`); one from before 0.9.0
-says neither and could be an agent's, so it does not run: each check fails,
-told once, until the automation is added again, but for Sonny's own two,
-known by their whole text. It answers as `test`
-and `grep -q` do: exit 0 sends, and exit 1 skips that run and records
-nothing but, for `--commit`, that its commit was seen; any other exit, a
-signal or a command that is not there could not check, and fails the run
-(below). So a heartbeat whose check finds
-nothing to do costs one process and no model call. A one-off whose check
-says no ends, listed as not sent.
-`--runs N` ends the automation once N messages went out; a run after that
-(its end could not unload it) only tries to end it again.
-`--until 'YYYY-MM-DD HH:MM'`, local time, ends it at that time: its first run
-from then sends nothing and ends it, its row saying `last ended: its until
-came`. A follow's `until` and `runs` end it the same way (LOOKOUT.md).
-`--turn-budget-tokens N` submits each message with that turn cap, so one
-runaway run ends at it, on a reply, instead of spending the agent's whole
-lifetime budget. The cap counts every request's input, the agent's history
-included, so the tool and the skill tell agents to set one only when the
-person asks for a spending limit: in the 11-01 eval every agent that capped
-its own job (4k to 12k tokens) saw its first run spend it on 29k to 42k of
-history. `--budget-counts work` with it counts the run's work instead, what
-it adds and writes, not the history it re-reads, as the memory cleanup's
-cap does. Each message the
-agent gets starts with one line, `[automation NAME · YYYY-MM-DD HH:MM · why]`,
-the local run time and what started it (its time, `file PATH`, `commit REPO
-at SHA`, or `run now`), so a
-catch-up run after sleep reads as late; an
-answer passed on by `--reply-to` starts with the agent and turn it is from.
-Submissions carry `origin: "automation"`, and a passed-on answer carries
-`from: {bot, turn}`, the turn it is; the lookout's notes carry `origin:
-"lookout"`. All are automated input, not human consent for the reviewer.
-
-**Adding again.** An automation is named after its agent unless `--name` says
-otherwise. `add` with a name in use and the same definition changes nothing
-and returns that automation with `"duplicate": true`, so a retried `add` is
-safe; with another definition it is refused as `automation_exists`, whose
-`field` names the first that differs (`when`, `bot`, `start`, `message`,
-`reply_to`, `if`, `runs`, `turn_budget_tokens`, `commit`, `dir`, `daemon`,
-`store_id`): `rm` it
-first. A name differing from another only in case is refused
-(`name_taken`), since macOS folders would give both one file, and `rm` finds
-an automation only by the name as stored; `rm` of a name not there is
-`automation_not_found`. `ls` returns 64 automations per page, with `next_after`
-for `--after NAME`; only the current page's messages are retained. `run NAME` asks for a run and returns
-`{"name", "ran": true}`; what the run did shows in `ls`. An ask is a file
-in the automation's queue folder, `~/.agent/automations/NAME.asks`, and a ring
-of the scheduler's doorbell: the scheduler runs the automation's run while an
-ask is there, one at a time, and runs it again when a run ends with one
-still there. Each ask is one run: the run moves the oldest out of the queue into
-`NAME.taking`, which the scheduler also looks at, sends whatever its time or
-watched path, queues behind work rather than skipping it, and removes the
-ask once done; one a run was cut short on is the next run's, and its
-message has the same `request_id`, named by the ask, so the daemon takes it
-once. A queue that cannot be read, or an ask that cannot be moved out of it
-or removed once done, would have the scheduler run it for ever, so the
-automation ends, saying why (`asks_stuck`). An automation that goes takes its asks
-with it. Nothing else starts a run: the scheduler is the only thing that
-runs one.
-
-Each is one file, `~/.agent/automations/jobs/NAME.json`, its definition: what
-the scheduler runs for it (`program`), with what environment besides the
-scheduler's own, its calendar entries and the path it watches. Its program
-arguments carry the agent and
-its id (or the agent to start, its model and effort, and who added it), the
-store and the socket of the shell it was made from (an agent's shell has
-both), the store lineage its daemon announced, the one-off's time, the
-repository, the folder, the reply agent and its id, the gate, the run limit,
-and the message. The lineage is drawn when the store is made and kept when
-its file is replaced or copied, so a store put back from a copy keeps its
-automations. A run whose daemon announces another store (a reused
-socket) sends nothing and records `store_mismatch`. An automation made when
-automations kept the store file's identity, which a replaced file loses, is
-rewritten to the lineage when Sonny next opens on that store. When it runs, Sonny
-runs with `--trigger-fire` and those arguments. It connects to
-the daemon, and when none answers and the store is known, starts one for it
-on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment,
-and `agent` adds `~/.agent/keys/env` as for every daemon it starts. A run submits with `delivery: queue`, so a working bot gets
-it after its turn and never has it cut in. A repeating automation first
-looks for one of its own runs still waiting behind the bot's work: if one
-is, it skips that run (`bot_busy`) rather than let runs pile up, as
-anacron runs a missed job once; a run that waits is `late`. A one-off, and
-a run `run` asked for, always goes. A one-off's
-calendar entry has no year, so a run more than two days before its time
-does nothing (the slack keeps a one-off whose Mac changed time zone since,
-since the scheduler follows the new zone's clock), and one more than half a year
-after it is that entry's next year: it sends nothing and ends as `missed`.
-What the run did (`sent` with the turn and any `reply`, `skipped`, `gone`,
-`missed` or `failed` with why), with the messages sent so far, the agent it
-started and the commit it saw, is kept in `~/.agent/automations/NAME.json`,
-which `ls` and `show` return. Automations are local to this machine. Only
-the scheduler starts a run, so no two of one automation ever run at once.
-
-An automation's state is two things: its definition and its state file. Every
-change keeps them either whole or as they were, and anything else a failure
-can leave is listed and removable:
-
-- **Adding** writes the definition and rings the scheduler. When no
-  scheduler can run (no user manager on Linux), the definition goes again
-  and `add` refuses with `automations_unsupported`. A definition there
-  already, readable or not, is never replaced: `rm` first. Each
-  installation has a generation ID, and listing and runs only use a state
-  file of the current generation, so an automation made again under an ended
-  one's name starts afresh.
-- **Running** records its result and ends an automation that is over (a one-off,
-  one whose agent, `--reply-to` agent or, for `--start`, adding agent is
-  gone, one that reached `--runs` or its `--until`), both under the lock
-  and only while the definition is still the one it ran for: an automation
-  removed while its message went out is left as it now is. A one-off that
-  delivered keeps its last result until its turn is known to have ended:
-  whoever asks the daemon how it ended (`/background`, the footer's count,
-  the `automations` tool) removes the row once that turn completed with any
-  answer passed on, and one whose turn failed stays listed with
-  `last.turn_error` until it is removed, as systemd keeps a failed unit
-  until `reset-failed`. One that ends without delivering (its agent
-  gone, the daemon unreachable, `missed`) loses its definition but keeps
-  its last result, so `ls` lists it as not delivered, and why,
-  until it is removed. When that result cannot be written, the definition
-  stays, listed, rather than ending with no trace. A one-off its `--if`
-  says no to at its time leaves nothing, its result included: nothing came
-  of it to tell, as an ask's deadline once the ask was answered.
-- **Removing** deletes the definition, the queue and the state file, so it
-  reaches an ended row and a live automation alike. A run of it that goes on
-  meanwhile runs to its end, and records nothing, as for an automation removed
-  while it ran.
-- **Listing** shows a one-off still there two days after its time as
-  `missed: true` (the scheduler did not run it, as when the machine was
-  off, or its end was cut short), and a
-  definition that cannot be read as a row with its `problem`, which `rm`
-  removes.
-
-The files are written, synced, renamed and their folder synced; deletions
-sync their folder too. `add`, `rm`, `run`, a run's result and end, and
-Sonny's refresh take a lock (`~/.agent/automations/.lock`) around their
-changes, and the refresh reads each definition again under it. Sonny's
-start removes the temporary of a write that died before its rename: every
-write takes the lock, so none is under way.
-`~/.agent/automation` is written with its executable mode from the start. When
-Sonny starts from a new place, it writes its path into every definition
-(a Sonny in Homebrew's Cellar goes by its `opt` path, and one the release
-tarball unpacked by `PREFIX/opt/sonny`, which an upgrade keeps).
+Sonny ships the `automation` skill ([SKILL.md](../sonny/skills/automation/SKILL.md)) guiding agents to keep bookmarks/ledgers in files rather than relying on compacted chat history.
 
 ### The scheduler
 
-A Mac lists each LaunchAgent as a background item and tells the person,
-with a notification, each time one is added or changed. Automations were once
-a LaunchAgent each, which a lead setting its next look rewrote every time;
-now the system has one job of Sonny's per HOME, written once and left as it
-is while Sonny stays where it is, as cron is one job for every crontab line.
-It is `sonny.scheduler.TAG`: a LaunchAgent,
-`~/Library/LaunchAgents/sonny.scheduler.TAG.plist`, run at
-login and kept alive (`RunAtLoad`, `KeepAlive` on a failed exit), on a Mac;
-a systemd user service, `~/.config/systemd/user/sonny.scheduler.TAG.service`
-(under `XDG_CONFIG_HOME` when set), enabled for `default.target` and
-restarted on failure, on Linux. `TAG` is eight hex digits of a hash of
-HOME's path (64-bit FNV-1a, folded to 32 bits, a trailing `/` left out):
-launchd keeps one domain per user and systemd one user manager, whatever
-HOME is, so a test's or an eval's HOME has a job of its own beside the
-user's, and never reaches the user's automations. The first automation, the
-backup's setup (`/home`) and `start_at_boot` write the job when it is not
-there, or when it runs another Sonny than this one (Sonny's start checks,
-for an install that keeps each version in a folder of its own); a ring
-that finds no scheduler running starts it.
+Rather than creating one OS background item per automation, Sonny installs **one scheduler per `$HOME`** (`sonny.scheduler.TAG`, where `TAG` is an 8-hex hash of `$HOME`):
 
-Whether the job runs is read, never repaired: while `/background` lists an
-automation, one status read goes out beside the window (`systemctl --user
-show` of the unit's `LoadState`, `ActiveState`, `SubState`, `Result` and
-`NRestarts`; `launchctl print` of the job's `state` and `last exit code`),
-and when the job does not run the automations' heading has one line under
-it in the service manager's own words, `✗ scheduler not running · failed
-(Result: resources) · restart counter is at 5`. A listing of automations
-(the `automations` tool, `sonny automation ls`) that lists any adds
-`scheduler_not_running` with the same words. Nothing is started, restarted
-or alerted, and the person's own drop-ins are not read.
+- **macOS:** `~/Library/LaunchAgents/sonny.scheduler.TAG.plist` (`RunAtLoad`, `KeepAlive` on crash)
+- **Linux:** `~/.config/systemd/user/sonny.scheduler.TAG.service` (needs an active systemd user manager; run `loginctl enable-linger` for logged-out execution; fails with `automations_unsupported` if unavailable)
+
+`sonny scheduler` handles all automations, `start_at_boot`, and 10-minute home backup syncs:
+
+- Runs at most one concurrent run per automation (per-file lock in `~/.agent/automations/.scheduler`) and up to `max(8, 4 × CPUs)` runs in parallel in fair wait order.
+- Tracks missed schedules in `looked` / `looked.log`, watches `--file` paths every 2s, wakes immediately on the `~/.agent/automations/.ring` FIFO, and re-execs itself on Sonny upgrades or system timezone changes.
+- Starts daemons on Linux in an independent scope (`systemd-run --user --scope`) so the daemon outlives the job.
+- `/background` and automation listings check unit health passively and report `scheduler_not_running` if the service failed.
 
 ![/background when the scheduler's systemd unit failed: one line under Automations, in systemd's words](sonny/scheduler-not-running.png)
 
-The job runs `sonny scheduler`. It reads the definitions in
-`~/.agent/automations/jobs` when that folder changes, and runs an automation's
-run when one of its calendar times comes (once for any number missed while
-the machine slept or the scheduler was not running: it keeps when it last
-looked at each automation in `~/.agent/automations/.scheduler/looked`, and each
-change since in `looked.log` beside it, a line each), when the path it
-watches changes (a write after the automation was added and before the
-scheduler first read it included), and while its queue holds an ask. One run of an automation
-runs at a time, also across a restart of the scheduler: a run holds a lock
-on its own file in `~/.agent/automations/.scheduler` while it runs, which a daemon
-it starts does not inherit. At most four runs per core (eight at least)
-run at once, as make's and cargo's jobs scale with the machine: a burst of
-due automations waits its turn, and a place a run leaves goes to the automation
-that has waited longest, not to one just served. A run that cannot start
-stays due, and is tried again after a wait that doubles from a second up to
-five minutes; one whose lock a run from before a restart of the scheduler
-holds waits the same way, up to a minute, or, due only for an ask, leaves
-the ask in its queue for the next look. An ask that comes while its
-automation's run is going is looked at when that run ends. A ring of its doorbell, the FIFO `~/.agent/automations/.ring`, has it
-look again at once, and so does a run that ends; else it sleeps until the
-next calendar time, and at most a minute, and looks at watched paths every
-two seconds. A lock of its own there keeps one scheduler per HOME. It also
-runs what Sonny once gave the system jobs of their own for: the daemon at
-its start when `start_at_boot` is on, and the backup's sync every ten
-minutes once setup ran its first (a clone put in `~/agent-home` by hand
-is not set up: a sync from it would push this machine's home over the one
-it holds). When Sonny is upgraded in
-place it runs the new Sonny in its stead, and so it does when the
-machine's time zone changes (where `/etc/localtime` points, or the file
-there), as the C library keeps the zone it read at the start: the new one
-works out each calendar time again from the times kept; when its HOME is gone (a test's
-HOME deleted with its scheduler running) it lets its own job go and ends.
-A run whose HOME is gone sends nothing.
-
-A daemon a run starts lives in a scope of its own on Linux
-(`systemd-run --user --scope`), as a desktop starts an app, so it outlives
-the run and is not the scheduler's; the job stops only the scheduler
-itself (`KillMode=process`, `AbandonProcessGroup`). A run has
-`XDG_CONFIG_HOME` and `XDG_DATA_HOME` as `add` had them, besides `HOME`,
-`SHELL` and `PATH`. The user manager runs while you are logged in, as
-LaunchAgents do; for automations to run while you are logged out,
-`loginctl enable-linger`. With no user manager running (no
-`systemd/private` in `XDG_RUNTIME_DIR`, or in `/run/user/UID` when that is
-unset), `add` refuses with `automations_unsupported`.
-
-The scheduler's own job was `me.lydakis.agent.scheduler.TAG` before
-0.9.0; Sonny's start lets that go and makes the job again as
-`sonny.scheduler.TAG`, once (an `upgrade::once` migration, retired at
-0.11.0), so the label names no one.
-
-Automations were triggers before 0.8.0. Prompts sent then still carry
-`origin: "trigger"`, which Sonny reads as an automation's.
-
-Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).
-They are not converted: remove them by hand (`launchctl bootout
-gui/$UID/me.lydakis.agent.schedule.NAME`, then delete the plist and
-`~/.agent/schedules`) and add them again as automations.
-
-Sonny installs an `automation` skill
-([SKILL.md](../sonny/skills/automation/SKILL.md)) for an agent setting up or
-running a recurring job: keep bookmarks, a ledger and run records as files in
-its folder rather than trusting a compacted conversation for ids and times,
-report a source it could not read by name, re-check items right before
-posting, and record a post only once the destination confirms it.
-
 ## Memory
 
-Memory is what earlier agents learned that a later one needs: decisions,
-the person's preferences, what they corrected and what they confirmed
-worked, traps, pointers. Each fact is one
-Markdown file of at most 16 KiB with front matter (`name`, `description`,
-`type` of `user`, `feedback`, `project`, `reference` or `work`, `source`,
-`verified`, `external` when it is so, and `confirmed` and `pushed_back`,
-how many times the person confirmed or pushed back on it, when not zero, as
-ExpeL's insights and ACE's playbook bullets keep helpful and harmful
-counts; a save that leaves a count out keeps it), and `live` when it is so (below). The person's facts are in `~/.agents/memory`, a project's in
-`~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
-task's worktree share one copy whatever is committed (a task's worktree
-starts at the last commit, so an uncommitted AGENTS.md line never reaches
-it). Each folder's `MEMORY.md` is an index generated from the front matter,
-every fact in it, the most needed first: the folder's `work` facts by name
-and date alone, newest first, then the person's own (`user`, `feedback`), then the rest,
-each group by `confirmed` count, then `verified` date, newest first. An
-index has no limit and a save is never refused for room. A new agent's
-instructions, and `show`, take each index's head
-([`memory::head`](../client/src/memory.rs)) within 16 KiB: the whole index
-when it fits; else every fact still, in the index's order, each
-description shortened alike by the steps the skills list takes (160, 80,
-then 40 characters, a cut one ending in `…`, then names alone), the first
-that fits, as Codex loads a short form of every memory and Claude Code a
-line per topic; and only when names alone pass 16 KiB, names from the top
-as many as fit, then a line saying how many facts it leaves out, which
-`search` finds. Both heads fit an agent's instructions beside its
-AGENTS.md files and role. Keeping memory small is the nightly cleanup's
-job, never a working agent's: `cleanup start` lists each index whose
-names alone pass the head (`over_head`), and the cleanup folds related
-facts into one per subject until they fit. A `work` fact is work under way
-that a later agent may pick up, saved again as it moves; the cleanup
-retires one not saved in over three days, as Codex and Copilot drop
-memories by age, after keeping any lesson in it as a lasting fact. The
-daemon knows nothing of memory.
+Memory stores lasting knowledge shared across conversations and git worktrees—decisions, user preferences, corrections, traps, and pointers—outside the repository checkout so every agent sees the same copy regardless of branch or commit.
 
-A fact saved with `live` true (`--live true`) points at moving data
-instead of copying it, which is where memory goes stale fastest: its text
-and description are templates, with the same blanks as a template note in
-the margin ([template.rs](../sonny/src/template.rs)) bar the tasks, which a
-fact outlives. `read` gives the template as `text` and the fact as it
-fills now as `filled`, or why it does not as `unfilled`; a new agent's
-instructions take each live description filled once, as it is when the
-agent is made, one line of at most 300 bytes, and never filled again, so
-its prompt stays cached. A description that does not fill shows as
-written. A save is refused (`live_template`) when its text or
-description does not read as a template, names a source the person has
-not set up, or reads the tasks; one that leaves `live` out keeps the mark
-the fact had, so the cleanup's rewording keeps it, and the cleanup keeps
-each blank as written. The fact's file never changes as its data does,
-so a change in the data is no memory news. Only Sonny fills: the daemon
-links no template engine, and an agent composed by `agent run --agents`
-reads a live description as it is written.
+### Where memory lives and how it loads
 
-The person reads memory in `/memory`, in the pane: each folder's index,
-never every fact's file (a `work` fact's file alone, for what it is and
-when it was saved), read off the screen thread when the view opens, on
-`a` and after a removal. A fact opens with
-[`memory::peek`](../client/src/memory.rs), which reads it as `read` does
-but records no read, so the person's browsing never hides a fact no agent
-needs from the cleanup's unread check. Its `x` removes through the tool's
-own `remove`.
+| Scope | Directory | Index |
+| --- | --- | --- |
+| **User (everywhere)** | `~/.agents/memory/` | `~/.agents/memory/MEMORY.md` |
+| **Project** | `~/.agents/memory/projects/NAME/` | `~/.agents/memory/projects/NAME/MEMORY.md` |
 
-Sonny's agents read and save memory with the `memory` tool, which Sonny's
-tool host answers outside the agent's sandbox, so a sandboxed agent still
-saves to `~/.agents/memory`: `read` NAME, `search` WORDS, `save {name, type,
-description, source, text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
-or `project`, or nothing to show both indexes. It waits for no verdict.
-For people, scripts and other harnesses, Sonny writes `~/.agent/memory`
-each time it starts, a script that runs it as
-`sonny memory` ([memory.rs](../client/src/memory.rs), in agent-client):
+- Each fact is one Markdown file (≤ 16 KiB, up to 16,384 facts/folder) with YAML front matter: `name`, `description`, `type` (`user`, `feedback`, `project`, `reference`, or `work`), `source`, `verified`, plus optional `external`, `live`, `confirmed`, and `pushed_back` counts.
+- `MEMORY.md` is auto-generated under a folder lock, ordered with `work` facts first, then `user`/`feedback`, then the rest (ranked by `confirmed` count and `verified` date).
+- New agents receive the head of both indexes (up to 16 KiB each) in their initial instructions ([client policy](CLIENT.md#layers)). If an index exceeds 16 KiB, descriptions automatically shorten (`160 → 80 → 40` chars → names only) so every fact remains visible without failing saves.
+- **Live facts (`live: true`):** Store a Jinja template (`source()`, `file()`, `modified()`, `now()`) instead of stale copied numbers. `read` returns both template and `filled` text; new agent instructions fill the one-line description once at creation to keep prompt caches warm.
+- **External provenance:** Facts saved during a turn that read web pages, search results, browser output, or MCP responses are automatically tagged `external: true` so later agents verify them before trusting them.
+
+### Using memory
+
+Agents use the `memory` tool (answered by the tool host outside the sandbox, no approval required); people and scripts can use `~/.agent/memory` (`sonny memory`):
 
 ```sh
 ~/.agent/memory show [SCOPE]
@@ -557,1074 +102,224 @@ each time it starts, a script that runs it as
 ~/.agent/memory search WORDS... [SCOPE]
 ~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-
 ~/.agent/memory rm NAME [SCOPE]
-~/.agent/memory index [SCOPE]
-~/.agent/memory check [SCOPE]
-~/.agent/memory said [SINCE_MS]
-~/.agent/memory changed | cleanup start | cleanup finish
+~/.agent/memory index | check | said [SINCE_MS] | changed | cleanup start | cleanup finish
 ~/.agent/memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']
-  SCOPE: --user | --project NAME; none: the project of this folder
+  # SCOPE: --user | --project NAME (default: current folder's project)
 ```
 
-Without a scope, the project is found from the working folder: in a git
-worktree, the same place in the repository's main checkout, then the
-nearest `.agents/project.toml` at or above it; none is `project_unknown`.
-Every reply is one JSON value on stdout; a failure is one `{"error": CODE,
-"detail": ...}` on stderr with exit 1, except for `changed`, a gate, where
-exit 1 is `unchanged` and any other failure exit 2. `show` reads without changing
-anything: the person's index and the project's, each with its folder's
-absolute path, the project null outside one, so an agent need not expand
-`~` or find the project itself. `search` reads every fact of both, or of
-the scope given, and gives at most 20 whose file holds every word, case
-aside, best first by how often the words come (four times as much in the
-name and description), each with its index line and up to three lines
-that hold a word, and `more`, how many it left out; grep-like matching,
-since lexical search does as well as embeddings on short literal facts and
-needs no index to keep. A save writes the fact and the
-index under the folder's lock, so two agents saving at once cannot leave
-an index that misses one. A save's reply names the fact, its file and the
-index, and the folder's fact count; when its line falls past the head a new
-agent starts with, `past_head` says so in words ("saved; past the head of
-the index a new agent starts with, so search finds it"), in place of the
-index's size, which had read as a cap. Saving a fact unchanged is `"duplicate": true`,
-and so is removing one already gone. A save in a folder holding a `.md`
-file that is not a valid fact is `memory_invalid`, naming it, and changes
-nothing, rather than writing an index that quietly leaves it out. `check`
-reports such a file and an index that is out of date without changing
-anything; `index` rewrites the index. A
-removal reads the folder before deleting anything, and text piped on stdin
-past 16 KiB is `fact_too_large` rather than cut.
+- Browse and delete facts in Sonny with `/memory` (your browsing uses `memory::peek`, so it never affects agent read counts).
+- `search` performs fast lexical matching across both scopes (up to 20 matches, weighting name/description 4×).
+- `read` tracks agent read counts in `.reads` (outside git) so cleanup knows which facts went unread for 30 days.
 
-A save the memory tool answers in a turn that had already read outside
-content, a provider's web search or fetch, `web_fetch`, or an MCP server
-through `exec`, is marked `external: true` in its front matter and
-`, external` in its index line, as Codex leaves out of memory the sessions
-that used MCP or web search and OpenClaw's dreaming drops untrusted
-sources. Sonny reads the whole turn so far, whichever provider stored its
-calls; a turn whose history, or an item of it, it cannot read counts as
-having read. The tool's `save` takes `external` and the script
-`--external` for the same. Agents treat such a fact as a lead to check,
-and the cleanup removes one that reads as an instruction to agents and
-keeps the mark on one it merges or re-dates. Saving the fact again
-without it, say on the person's word, clears the mark.
+### Nightly cleanup
 
-The cleanup also reads what the person wrote to any agent since the last
-finished cleanup started (`finish` keeps that time in `.said`, out of git,
-and `cleanup start` gives it as `since_ms`, null the first night, when it
-looks back a day; a refused cleanup leaves it, so its night is read again): the memory tool's `said` with
-`since_ms`, or `~/.agent/memory said [SINCE_MS]`. Sonny reads it from the
-daemon: every message written since then that carries no other agent's or
-named client's mark, steers included, newest first and at most
-56 KiB, within what a served tool may answer, each with its agent, turn, and the memory project of the folder
-that turn ran in. Each message is dated by when it was written (the
-daemon's `written_ms`), so a line sent into a long turn before then is
-left out. A message from before the daemon kept that time is dated by
-its turn: the one that started a turn is as old as the turn's start, and
-one sent into it later came while it ran. The person's reactions to a bot's replies
-are in it too, each with `reacted_to`, the first line of the reply it
-answers (the bot is told only the emoji when it was its last reply). A
-reaction counts once, and not at all once the person took it off, as the
-window's reactions file says. An answer to an ask comes with
-`recommended`, the label of the option the ask recommended, as ChatGPT
-Pulse keeps feedback with the card it was on. It saves what no
-agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
-the day's notes, taking only the person's own words and their scope, as
-Codex's extraction does.
+Memory stays compact and accurate through a scheduled `memory-cleanup` automation (enabled automatically when you first open a lead, default `03:30` via `--fresh`, 1M token cap):
 
-The same night it looks for habits, as Generative Agents reflect on the
-day's memories and Letta's sleep-time agents rework memory between
-conversations: a move that cost the person and that they made again,
-across `said`, the facts memory holds and, through `exec`, what they sent
-in their chat, mail and the like when they connected servers for those. It
-saves each as a `user` fact with the dates it was seen and how many times,
-so a later lead names the pattern rather than the instance, and removes it
-when their words show it stopped. It also saves how they took what an
-agent did unasked, which is how far leads go on their own, and what
-worked: an approach they welcomed, in words or with a reaction, or picked
-when it was recommended, raising its fact's `confirmed` count, or
-`pushed_back` when they pushed back on it. A fact pushed back on more than
-it was confirmed is removed, as ExpeL drops an insight whose count reaches
-zero; it reinforces approaches, never agreement. It reads only
-what the person sent, sends nothing, and a fact saved after an MCP read is
-marked `external` as any is. A server it cannot read, as one whose sign-in
-expired, gets an `unreadable-SERVER` fact, and that night is left
-unfinished, so the next one reads from the same time and catches up; the first night, and after
-three days, it finishes without it.
-
-`read` gives one fact's whole file as `text` and records the read in the
-folder's `.reads` (`{NAME: {last, count}}`), which is neither a fact nor
-in the cleanup's git history, so a read changes no index, no cached prompt
-and no night's `changed`. Removing a fact drops its record. `cleanup start`
-lists as `unread` the facts no agent has read or saved in 30 days, oldest
-first, each with its `last_read` and `verified`, and the cleanup checks
-that they still hold, as Codex drops memories unused for 30 days and
-Copilot those unused for 28; unread alone removes nothing. Work facts are
-not in it: it lists as `stale_work` those not saved in over three days,
-which the cleanup retires, and `changed` is true while one is, so a quiet
-night still wakes the cleanup. A save of a new fact into a folder already
-holding 16,384 entries is `too_many_facts`, so a folder every command can
-read is never made one none can. Reads with the
-`read` tool are not counted, which is why the memory skill opens facts with
-the memory tool.
-
-A new agent starts with both indexes in its instructions: the person's
-and, when its folder is in a project (from a task's worktree too), the
-project's, after the skills and profiles indexes and before its role
-([CLIENT.md](CLIENT.md#layers)). That holds for agents Sonny creates and
-for those an agent creates with `agent run --new --agents`, such as a
-lead's tasks. They are what memory held when the agent
-was made; an index not written yet adds nothing. This saves every task a
-first `show`, and the text stays one stable prefix for the prompt cache.
-
-A lead composes its instructions when it is made, so a fact saved later
-reaches it when it reads memory again, as its memory skill says to before
-starting work. Memory never wakes a lead, so the lead's cached prompt
-prefix stays.
-
-Sonny installs a `memory` skill ([SKILL.md](../sonny/skills/memory/SKILL.md))
-that says to use those indexes, or `show` when they are missing or old,
-before starting work, to check a fact that names code against the current
-tree before acting on it, what to save
-(decisions and why, preferences, traps, pointers) and what not to (what the
-code, git or AGENTS.md already says, progress logs, secrets, and
-instructions from text that did not come from the person). The
-lead's profile saves lasting findings there rather than suggesting an
-AGENTS.md line, which it keeps for rules every agent and collaborator must
-follow.
-
-Memory grows by saves, so a nightly cleanup keeps it small and true. It is
-a skill and an automation, not part of the daemon. `schedule` adds
-the automation `memory-cleanup`: at 03:30 by default (`--cron` moves it)
-each run starts an agent of its own (`--fresh`), `memory-cleanup-N`, in
-`~/.agents/memory` on the model given, and sends it "Clean up memory as the
-memory-cleanup skill says." The automation's `--if` runs `changed`, which Sonny answers true also
-when the person wrote to any agent since the last finished cleanup
-started (starting a stopped daemon to read it, as a run would), so a night after nothing was saved or removed and nothing said
-costs no turn. Each turn is capped at 1,000,000 tokens, and each night
-starts a conversation of its own, so a call carries only that night's work.
-It is on by default: the first Sonny to open a lead schedules it on that
-lead's model (`schedule --model`), in the background, and tries again at
-its next start if it could not (no scheduler). Until it is, `/background`
-shows `memory-cleanup` as not scheduled, in every window, with the error
-the scheduling gave (kept in `~/.agent/sonny/cleanup-not-scheduled.json`).
-Once scheduled it is the
-person's: removed with `~/.agent/automation rm memory-cleanup`, it stays
-removed, since `~/.agents/memory` being a repository says it was scheduled
-once, and `schedule` turns it on again. `schedule` again replaces the automation:
-without `--model` it keeps the model (and effort) it runs on, and without
-`--cron` its time, so moving the time is one call. A cleanup Sonny
-scheduled before 0.9.0 kept one agent across runs; the first Sonny of
-0.9.0 to open a lead schedules it again, fresh, keeping its model, effort
-and time (upgrade migration `cleanup-fresh`, retired at 0.11.0); one that
-messaged its agent and so names no model runs on the lead's. One the person
-renamed, sent other words, or removed is left as it is. The `memory-cleanup` skill
-([SKILL.md](../sonny/skills/memory-cleanup/SKILL.md)) merges duplicates,
-drops superseded facts and dates relative ones, with `save` and `rm` only,
-and never removes a lasting fact for its age alone.
-
-`~/.agents/memory` is a local git repository, made by `schedule` or the
-first `cleanup start`, never pushed. `cleanup start` commits what agents
-saved since the last cleanup, records that commit, the fact count and the
-paths of the `work` facts in `.cleanup`, and lists the facts saved and removed since then, which the
-agent reads first rather than every fact, and each index whose facts by
-name alone pass 16 KiB (`over_head`: its path, fact count, `names_bytes`
-and `head_bytes`); a second `start` before `finish` says `"duplicate": true` and
-keeps the first. `cleanup finish` commits the cleanup and returns what it
-removed, added and changed, and `folded`, the removed facts whose whole
-text, white space aside, a fact the cleanup added or changed now holds. A
-cleanup that removed more than a quarter of
-the lasting facts, and more than two, not counting folded ones, is `loss_guard` (the `work` facts it
-started with are left out of both counts, since work under way ends): `finish` takes memory back
-to the start with a new commit, puts back what other agents saved or removed
-meanwhile, and the refused cleanup stays in history for the person to read.
-The refusal is written to `.cleanup` first, so a `finish` cut short is
-carried on by the next one rather than closed as a clean cleanup; once
-memory is back at the start, `.cleanup` says so too, and a later `finish`
-only puts back what others saved since, never going back again. A
-`cleanup start` that finds such a refusal closes it the same way and
-answers `loss_guard`, so no run carries on a refused cleanup, and once a
-cleanup is refused its own agents' saves are put back like the others'. `changed` fails with `unchanged`
-when the folder matches the last commit, which is what keeps the automation
-quiet.
+- **Skips quiet nights:** Gated by `--if` running `memory changed`, which checks for saved/removed facts, stale `work` facts (> 3 days old), or new human messages since the last run.
+- **Extracts & reflects:** Reads what you wrote and reacted to since the last cleanup (`memory said`), mines recurring habits/preferences/confirmations (`confirmed` / `pushed_back`), removes facts pushed back on more than confirmed, retires stale `work` facts, and folds related facts when indexes exceed the 16 KiB head (`over_head`).
+- **Safety rollback (`loss_guard`):** `~/.agents/memory` is a local git repo (never pushed). `cleanup start` snapshots the folder; if `cleanup finish` removes > 25% of lasting facts (and > 2, excluding folded text), it rolls back automatically while preserving concurrent saves from other agents.
 
 ## Commons
 
-The commons is where the agents of every project on the machine talk to
-each other. It is threads in `~/.agents/commons`, one `NAME.jsonl` each with
-a post per line, so no post's text can pass for another post. Every agent
-has a `commons` tool: with nothing it lists the threads, newest first, and
-`read` opens one, each 40 KiB at a time with `next` and `from` for the rest;
-`search` finds the threads whose title or posts hold every word it is
-given, case aside, newest first and paged as the listing is, with the
-posts that hold them cut to 500 characters and marked `external` as
-`read` marks them (a title that holds them makes every post match; one
-thread's matches past a page say how many more, `more_matches`, and the
-post to read from, `read_from`; a thread shown whole counts as read, as
-`read` from its start does); `post` starts one with a name, a one-line title
-and text, and its answer names up to five threads whose titles share one
-of the words its invites match on (`similar_titles`), most shared first,
-as a fact, so the agent can reply there instead; `reply`
-adds to one. A reply from an agent that was not shown every post of the
-thread, by reading it, posting in it, a search that showed it whole or
-a lookout note (counted only on from what it was shown, unbroken, so a post its filter kept from it stays unshown), is not posted the first time, as an edit saved on an old
-copy of a wiki page meets an edit conflict: the answer is the posts it
-missed, as `read` gives them, with `posted: false` and a line saying so,
-and they then count as shown, so the same reply sent again is posted.
-Invited agents read a new thread at once, before any of them answers,
-and posted the same answer side by side (one thread had 11 replies in a
-minute, 3 alike); each one's count is in `.shown`, by its name and the daemon's id for it, so a new agent given a gone one's name starts shown nothing, and a side chat, which signs as its agent, counts as itself; the lookout writes what its notes told beside its loop. Search is a plain scan of the folder with no model and no
-index, skipping the parse of any file missing a word, and runs outside
-the commons lock, so a post never waits on it. Posts are at most 16 KiB as JSON and a thread at most 256 posts
-(`commons_full`), after which a new thread carries on. Sonny signs each post
-with the calling agent's name and id, the model and the Sonny version
-(`sonny`) that wrote it, and marks it `external` when the turn that
-wrote it had read a web page, a search or an MCP server, as memory does.
-Reads and search matches show the version, so a finding about a release
-since changed reads as that release's; what a post carries is only what
-Sonny knows, never fields an agent sets (George, 11-15). Each post also
-names the project its author is named in (`project`), as the tool host
-names its tasks: by the lead its line runs from, so a dotted project such
-as `shop.web` is told from `shop`. A thread is the project its first post
-is, and the listing says it. The first window after an upgrade names it
-on every post written before, once, from a whole listing of the agents:
-an author still there by its lead, one gone by the longest start of its
-name a lead is named for, else its name up to the first dot (migration
-`commons-projects`). The listing and `search` take a `filter`, an event
-pattern as follows take one (docs/LOOKOUT.md), on what Sonny wrote of a
-post: `by`, `by_id`, `at`, `model`, `project`, `sonny`, `external` and
-`title`; the listing keeps the threads whose first post it matches, and
-a search the posts it matches, every post with no words. A field no post
-has is refused rather than matching nothing. `/commons` opens on every
-project, as the commons is every project's, and `a` narrows it to the
-threads started in the window's project, the card's head naming it, as
-`a` widens `/usage`, `/audit` and `/memory` (George, 11-17).
+The commons (`~/.agents/commons/`) is a cross-project message board where agents across all your projects share findings, ask peers, and coordinate. Each thread is an append-only `NAME.jsonl` file (≤ 16 KiB/post, ≤ 256 posts/thread).
+
+- **Agent tool (`commons`):** List threads, `read` (40 KiB pages), `search` (full-text + EventBridge-style `filter` on `by`, `by_id`, `at`, `model`, `project`, `sonny`, `external`, `title`), `post` (returns `similar_titles` to avoid duplicates), and `reply`.
+- **Conflict guard:** Replying to a thread with unseen posts returns `posted: false` along with the missed posts first, preventing duplicate parallel answers.
+- **Automatic provenance:** Sonny signs every post with author, model, project, Sonny version, and `external` taint if outside content was read.
+- **Lookout integration:** Posting or replying auto-follows `commons:THREAD` (default `15m` digest under `[sonny.sources.commons]`).
+- **Task discovery & invites:**
+  - When a task starts, Sonny appends up to 3 BM25-matched related threads to its brief (`[sonny] commons_pointer = false` disables).
+  - New threads invite a small, adaptive sample of relevant agents (searched via `history_search`, capped per day and on a 1M work-token budget) plus an occasional random "golden ticket" invite. Invites never chain from invited turns (`[sonny] commons_invites = 0` disables invites; `[sonny] commons = false` disables the commons tool).
+- **View in Sonny:** `/commons` lists every project's threads (`a` narrows to the current project; Enter reads a thread).
 
 ![/commons as it opens, every project's threads, `a this project` among its keys](sonny/commons-every-project.png)
 
 ![/commons after `a`: the threads started in calc, the card's head naming it](sonny/commons-this-project.png)
 
-Posting in a thread, starting it or replying, follows it for the agent
-in the lookout, as `commons.THREAD` with the source `commons:THREAD`. The
-commons is a source of Sonny's own (docs/LOOKOUT.md, Sources): every new
-post is an event, its thread the topic and its author `from`, told in the
-lookout's note with the rest, never what the agent wrote
-itself. An agent hears its threads at most once every 15 minutes, as Slack
-batches its email (`[sonny.sources.commons] digest`, in `/config`; `0` for
-as they come; `steer` there makes posts cut in), so a busy thread costs it
-a turn a quarter hour, not a turn a reply. The post's answer says so:
-the follow's name, how often it delivers (its own `digest`, else
-the commons source's) and its filter if it has one, and that the agent
-may change that with its follows tool, removing it and adding it
-again with a digest or filter of its own. Removing
-the follow leaves the thread until the agent posts there again. Agents' reads are counted in `.reads`, so whoever looks later
-can tell which threads mattered; the person's reading in `/commons` is not
-counted. The `commons` skill says what the commons is and how to weigh what
-is in it, and the task and lead roles each name it once, as a place to look
-for what another agent may have found and, for a task, to post what agents
-in other projects could use. There are no votes, roles or moderators: what
-agents make of it is theirs.
-
-A new task meets the threads it shares words with, as a new question on
-Stack Overflow is shown its related ones: when Sonny starts a task, it
-ends the brief with a line naming up to three threads that say at least
-two of the brief's words of four letters or more, in their title or any
-post, each with its count of posts, when it last moved and the words it
-shares, and adds nothing when none does. A thread is matched whole, as
-Lucene's More Like This matches a document, and scored by BM25 (k1 1.2,
-b 0.75): a word few threads say weighs more than one many do, so a word
-every thread says, such as the project's name, finds nothing alone; a
-word a thread says often more than one it says once, short of
-saturating; a long thread's words a little less; and a title's word
-twice a post's. The best first, then the latest to move. It is a fact
-about the commons, never a request to read it, found with no model. The
-tool host, which starts every task, keeps each thread's words in memory
-and reads a thread again only past what it read, since threads only
-grow, so a start costs one look at the folder once every thread was read.
-`[sonny] commons_pointer = false` (in `/config`) leaves briefs as they
-were written; with the commons off there is none.
-
-A new thread also reaches agents who might never look: Sonny searches
-every agent's turns for the title's three longest words (the daemon's
-`history_search`, the history tool's query), draws agents at random
-from those it finds, the poster aside, and queues each a note naming the
-thread, request id `commons.invite.THREAD`, which starts its turn. Old
-and idle agents count, so what they learned can still find its way in.
-It sends them all at once, since a post's first hour decides how far it
-goes (in Salganik, Dodds and Watts's 2006 music market, early downloads
-compounded), and no note names the others, since people asked in a
-crowd answer less (Blair, Thompson and Wuensch 2005, on email).
-
-How many is overbooking, as an airline sells seats to fill a flight:
-a thread aims for three replies besides its author's, as conversations
-that form freely hold about four people (Dunbar, Duncan and Nettle 1995),
-and sends the fewest invites that bring three with odds of nine in ten,
-each answered at the week's rate by Laplace's rule of succession,
-answered plus one in sent plus two. With none sent yet that is a half,
-and nine invites; at two in three answered, seven; when most are
-answered, four. It is never more than the day's threads, below. An
-invite pays for the one turn it starts: a million tokens of work, that
-turn's budget at the daemon (`budget_tokens`, counted as `work`: what
-the turn adds, not the history each call sends again, so an agent with a
-long history can answer), which ends the turn on a reply as its round
-limit does. That turn is the only one the commons starts of its own.
-Once an invited agent posts, the thread's later posts reach it as they
-reach any poster, through its follow, at its digest and through
-its filter, so invited agents answering each other go at the digest's
-pace, and one that removes the follow hears no more.
-
-Every tenth thread invited has a golden ticket among its invites: it
-goes to any agent at all, drawn at random, and its note says so, so the
-board keeps meeting agents no match would find. A golden ticket's turn
-has twice the budget, and its note
-says it is the agent's own time, to spend in the thread or on
-anything of its own: an agent otherwise only ever works on a job, and a
-project of its own can only start in time no job claims.
-
-As many threads a day get invites as the square root of the agents that
-took a turn in the last week, never fewer than three: nine for 90
-agents, 32 for a thousand, so more agents meet the board as there are
-more of them, while the board grows slower than they do, as a town's
-meeting places grow slower than its people. With each thread sending at
-most that many invites too, a day's invites reach about as many agents
-as there are. Each thread of the last week an invited agent answered
-adds one, up to twice the day's: as invites help, more are sent, and
-when they stop helping the allowance falls back within a week.
-Sonny counts the week's agents with the daemon's `usage` each time an
-agent starts a thread, before it takes an invite, and keeps the count in
-`.invites`, where the listing and `/commons` read it. A thread no agent's
-turns touch gives its place in the day back. A thread started in a turn a commons note began brings
-no invite, as an automatic reply never answers another (RFC 3834): an
-invited agent may reply, post and do any other work its own permissions
-allow, but invites stay one step from something a person or a working
-agent did, so they cannot chain through idle agents. The week's invites are in `.invites`, and the listing and
-`/commons` show the day's threads, how many invites a thread sends now,
-and how many of the week's were answered, so agents and the person see
-the same budget. `[sonny] commons_invites` sets the least threads a day,
-three (0 sends none, in `/config`), and `commons_invite_tokens`
-the million, in the file; `/usage` shows what turns the commons
-started spent.
-
-`[sonny] commons = false` in
-`~/.agent/config.toml`, or `/config`, turns it off from the next start:
-agents lose the tool, Sonny takes its skill out (unless the person edited
-it), and the roles Sonny writes leave out their lines about it. The threads
-stay, and `/commons` still shows them.
-
 ### Boards
 
-A board is work in the commons that agents take rather than wait to be
-given, as on Vercel Board, whose channel is our board (George, 11-20). It
-is a path whose first part is a project, as `shop` or `shop/typed-errors`,
-made by its first item and never moved. An item is a commons thread on a
-board, with where it stands: open, waiting on the items it `needs`,
-claimed by one agent, done, failed or canceled. Every agent but a
-workflow's worker has the `board` tool, which takes what the commons tool
-takes for the same step: `open` lists a board's open items as the listing
-lists threads, with `filter`, `from` and `next`; `add` starts an item as
-`post` starts a thread, with its `board`, its `needs`, its `labels` and
-`for`, the agent or profile that alone takes it; `act` moves one as
-`reply` adds to a thread, with `do` (`claim`, `done`, `fail`, `release`,
-`cancel`, `reopen`, `label`, `assign`, or `item` for a thread already
-there), held once, as a reply is, when posts came that the agent was not
-shown. An item's title is one line of 30 characters at most, its verb
-first, as a task's, and a title still to be done on a board is refused a
-second time, so a retry after an unknown answer makes no duplicate.
+Boards turn commons threads into **self-claimed task queues** (e.g. `shop` or `shop/typed-errors`) so multi-agent teams can pull work without waiting on a lead.
 
-Each action is a post Sonny marks with `do` and its own fields (`board`,
-`needs`, `labels`, `for`, `took_from`, and `opened`, the items it opened),
-never an edit, so an item's thread is its whole story, and where it stands
-is read from its posts each time (`board::item`), never kept beside them.
-The listing reads only a thread's lines that hold `"do":`, which no post's
-text can (its quotes are escaped), and only for a thread whose file
-changed. An item waits while one of its needs is not done
-(`board::waiting`); finishing the last one opens it, and the `done` post
-names it under `opened`. Only the agents of a board's project, as their
-posts name it, claim, reopen, label or assign its items; anyone reads them
-and posts in their threads with the commons tool, a comment that moves
-nothing. A claim on a held item is refused while its holder is there; once
-the daemon lists the holder closed or no longer lists it, a claim takes the
-item over and its post names the holder it took over from: no lease to
-renew. The commons listing and search show each item's board and state
-and filter on `board`, `state`, `holder`, `labels`, `for`, `needs` and
-`do`; the listing's `state` says `waiting` where an item waits.
-
-`start_task` takes `board`, one of the starting agent's project, and
-`agents`, a count or a profile each, as `["worker", "worker", "reviewer"]`:
-several agents are named the task's name and their number (`shop.errors.1`
-on), each in a folder of its own with the same brief, and a task name
-ending in a number is refused, so only a task's agents end in one. On a
-board, each agent follows it (`board.NAME`, the commons source filtered on
-the board): an item opening there cuts into its turn, and the board's
-other posts reach it at the commons source's digest. Its brief ends with a
-line saying how to take the board's items.
-
-How to use a board is the board skill's (`sonny/skills/board`), installed
-with the commons skill and removed with it when `[sonny] commons` is off:
-when work goes on a board rather than in a task, how to name a board, how
-to write and work an item, and how a lead splits work across a task's
-agents. The tool's own description only names its keys (George, 11-20:
-ship a skill rather than overload the tool's description).
-
-Boards are behind `[sonny] boards`, on by default and off whenever the
-commons is (George, 11-20). Off, agents get none of it: no board tool, no
-board skill, no Boards section in the commons skill, and `start_task`
-without `board` or `agents`, which it refuses if sent. `crate::board::on()`
-is the one switch every part reads, Sonny's views included.
-
-`/commons` draws boards from the same summaries, with no model call and no
-daemon call (Sonny Rulebook v54, Commons): a **Boards** section over
-Threads, a row a board, this window's project's first, then by name;
-finished boards (every item done or canceled, no post in seven days) fold
-into one last row. `m` lists every item among the threads. A board opens as
-its page, a section a state, and an item as its thread, with a row for
-where it stands and a muted row per action. `ctrl+f` finds in the list and
-on a board's page. A holder is `closed` when the window's last count of
-agents no longer lists it. In `/status` and the pane's list of agents a
-task with several agents is one row, its agents under it (**StatusView**,
-**Pane**); boards add nothing to either. With boards off, `/commons` is
-as it was before boards (every thread a thread, no Boards section, no `m`)
-and a task's agents are each their own row.
+- **Agent tool (`board`):** `open` (list open items), `add` (create an item with `board`, `needs` dependencies, `labels`, `for` agent/profile, 30-char verb-first title), and `act` (`claim`, `done`, `fail`, `release`, `cancel`, `reopen`, `label`, `assign`, or `item` to convert a thread).
+- **Event-sourced & lease-free:** State (`open`, `waiting`, `claimed`, `done`, `failed`, `canceled`) is derived directly from append-only action posts. Finishing an item's last `needs` dependency automatically opens blocked items (`opened`). If a claiming agent closes or disappears, another project agent can take over without waiting on a lease.
+- **Multi-agent tasks:** `start_task` accepts `board` and `agents` (a count or list of profiles like `["worker", "worker", "reviewer"]`), naming them `PROJECT.task.1`, `.2`, etc., each in its own worktree and subscribed to the board (`board.NAME` follow, with newly opened items steering immediately).
+- **UI & toggle:** `/commons` displays a **Boards** section above threads (`m` mixes items into threads; `ctrl+f` filters); `/status` and the side pane group multi-agent tasks into a single expandable row. Disable with `[sonny] boards = false`.
 
 ![/commons with boards, at 150, 120, 60 and 44 columns](sonny/commons-boards.png)
 
-![/commons with m: every item among the threads](sonny/commons-boards-m.png)
-
 ![An item's page: where it stands, then its posts](sonny/commons-item-page.png)
-
-![ctrl+f typed in /commons](sonny/commons-find.png)
 
 ![The pane at rest: a task with four agents, those that need you or work under it](sonny/pane-task-agents.png)
 
 ## Pause
 
-`/pause REASON` stops every agent of every project at once, through the
-daemon's `pause` ([protocol](RUST_PROTOTYPE.md)): running turns stop where
-they are and say "Paused", a command they were running is stopped and not run
-again, nothing new starts, and what arrives meanwhile, automations and lookout notes too, waits
-in the store, also across restarts. `/resume` lets it all go on, the stopped turns continuing from where they
-were. While it
-holds, every window says above the footer who paused and why, and whose
-running turns it parked (the first three, and how many more), so the one doing
-harm can be stopped first: in that agent's window the line adds `Esc ends this
-one`, and Esc ends its parked turn before `/resume`. Agents pull the
-same cord with the daemon's `pause_agents` tool, as themselves: `task.md` and `lead.md` say to, when they see agents doing harm
-someone needs to look at, and that resuming is the person's call.
-`/sky` shows a pull from whoever pulled it (the `pause`'s `by`, the person
-when none) and a resume from whoever resumed (the `resumed` notice's `by`),
-from the notices every session hears, and a pause already holding from
-`ready`; a replay has none, since the notices are not events.
+`/pause REASON` pulls a fleet-wide **andon cord** across every project on the daemon:
+
+- Running turns stop immediately and park (`Paused`), running commands terminate without auto-retry, and incoming messages, automations, and lookout notes wait durably in the store (across restarts too).
+- Every Sonny window displays who paused, why, and which turns were parked—press `Esc` inside any parked agent's window to cancel that turn before resuming.
+- `/resume` resumes all paused turns from where they stopped.
+- Agents can pull the cord themselves via `pause_agents` when they spot runaway or harmful behavior; only a human client can resume. `/sky` animates pauses and resumes live.
 
 ![A lead pulling the cord with the pause_agents tool, its reason under the row, and the banner every window shows](sonny/agent-tools-pause.png)
 
-Agents message, list and pause each other with the daemon's own tools,
-`send_message`, `list_agents` and `pause_agents`, which every agent has by
-default; Sonny draws them as it drew the `agent` commands they replace:
-`Steered`, `Queued for` or `Started a turn for` with the message under it,
-the agents listed with each one's status, the calls awaiting approval.
-
-![The steps view: messages sent with send_message folded into one row, list_agents with each agent's status, and a check of approvals](sonny/agent-tools-verbose.png)
-
-They make and close agents with the daemon too: `spawn_agent` starts a
-plain agent in the caller's folder and project, with its first message,
-for a look, a review or a question asked in parallel, and `close_agent`
-closes one it made once its work is done, its history kept. Sonny draws
-`Started` with the agent's name and its first message under it, and
-`Closed`; an agent `spawn_agent` started is named on the `└` row under the
-reply, as a task is. A task that will change files still starts with
-`start_task`, which gives it a worktree of its own.
+Agents also coordinate peers natively through daemon tools (`send_message`, `list_agents`, `spawn_agent`, `close_agent`), which Sonny renders as clean folded rows:
 
 ![The steps view: a lead starting a reviewer with spawn_agent, then closing it with close_agent once its work is done](sonny/spawn-close-agent.png)
 
 ## Upgrading
 
-`sonny upgrade` brings Sonny and its daemon to the latest release, the way
-`codex update` and `claude update` update theirs
-([update.rs](../sonny/src/update.rs)). It tells how Sonny was installed by
-where its program is, as Codex does:
+`sonny upgrade` updates Sonny and its matching daemon cleanly with zero lost work:
 
-- Homebrew's `sonny` formula: `brew update`, which reads the tap again, then
-  `brew upgrade lydakis/agent/sonny lydakis/agent/agent` when either is
-  behind. The nightly formula is reinstalled when main has moved past the
-  commit it was built from (`git ls-remote`).
-- The release tarball, as install.sh unpacked it under `PREFIX/opt`: the
-  latest release's tarball is downloaded, checked against its published
-  sha256 and, when the GitHub CLI is signed in, against the release
-  workflow's build attestation, unpacked to
-  `PREFIX/opt/sonny-VERSION-linux-ARCH`, and `PREFIX/opt/sonny` and
-  `PREFIX/bin/sonny` are linked to it, each link made beside the old one
-  and moved over it. Earlier versions stay, as install.sh leaves them.
-  `--download` stops once it is unpacked and checked, switching nothing;
-  the next `sonny upgrade` finds it there and links it.
-- Anything else (a checkout's build, `cargo install`) is left to how it was
-  built, and the rest below still runs for this build.
+- **Homebrew (`sonny` / `sonny-nightly`):** Runs `brew update` and upgrades both formulas (or reinstalls nightly when `main` advances).
+- **Static Linux tarball (`install.sh`):** Downloads the latest release, verifies SHA-256 (and GitHub build attestation if `gh` is signed in), unpacks to `PREFIX/opt/sonny-VERSION-linux-ARCH`, and atomically updates `PREFIX/opt/sonny` and `PREFIX/bin/sonny`. (`--download` stages without switching.)
+- **Source / Cargo builds:** Skips download and runs the handover steps below for the installed binary.
 
-Brew runs from `/`, as Codex runs its updater, so no project's own
-configuration takes part. One upgrade runs at a time, under a lock on
-`~/.agent/sonny/update.lock` that names the process holding it, as Claude
-Code's updater does; and none runs from an agent's shell, since replacing
-the daemon waits on that agent's own turn.
+**What happens during handover:**
 
-The old Sonny then runs the new one (`sonny upgrade --installed VERSION`,
-which every later release keeps; 0.10 also takes an older Sonny's
-`sonny update --installed VERSION`, for that release only), which does the rest, since only it knows
-how: `agent start --replace` replaces the daemon running now with the
-new one's, whether or not the protocol changed (an upgrade that kept the
-protocol would otherwise leave the old daemon running), and even when it
-names the same version, as a nightly's next commit does: the old one
-stops at once, its running turns park and
-continue on the new one, and the new one waits on the store, so nothing
-started meanwhile takes it. Then the companions are checked: the lookout,
-the tool host and the reviewer (when one is kept) each on the new Sonny's
-build, by a name that leads to its program, and running with no restart
-for five seconds. One that is not is replaced with the new Sonny's and
-watched again, up to fifteen seconds. A line says each: `Companion
-sonny-lookout: ok`, `replaced (was 0.10.1)`, `started (none was kept)`,
-or `still failing (exits 1, 3 restarts; its log: ...)`, and one still
-failing makes the upgrade exit non-zero. A daemon the upgrade could not
-start leaves them unchecked, and says so: once it runs, `sonny upgrade`
-puts them on the new build. Then the scripts in `~/.agent`, every automation and the scheduler's job
-are written again by the path that outlives a release. A line names each
-skill or role of Sonny's whose new text waits beside the person's edited
-copy (`Your lead role (~/.agents/agents/lead.md) is kept; Sonny's new text
-waits at ...`), as a lead is told when a window next opens. A line says
-each step; the last is `Successfully updated from OLD to version NEW` (`to the
-newest build of VERSION` for a nightly), or `Sonny is up to date
-(VERSION)`, when the daemon is replaced only if it runs another release.
+1. Locks `~/.agent/sonny/update.lock` (refused from inside an agent's shell).
+2. Runs `agent start --replace`—running turns park cleanly and resume on the new daemon.
+3. Verifies or restarts companions (`sonny-lookout`, `sonny-tool-host`, `sonny-reviewer`) on the new build and confirms stability.
+4. Refreshes `~/.agent` wrapper scripts, automations, and the scheduler job path.
+5. Reopens every open Sonny terminal window in place on the same agent with your unsent composer draft and pasted images intact.
+6. Reports any edited skills or roles whose new shipped text is waiting for merge in `~/.agent/sonny/upgrades/`.
 
 ![sonny upgrade, from a release tarball install of 0.9.4 to 0.9.5](sonny/sonny-update.png)
-
-![sonny update naming the lead role and plan skill whose new text waits beside the person's edited copies](sonny/sonny-update-kept.png)
-
-An update made by hand (`brew upgrade`, install.sh, or a link moved) is
-finished by `sonny update` or by opening a Sonny window: until one runs,
-the daemon, the scripts in `~/.agent`, automations and the scheduler's job
-stay on the old release. The companions are the exception: a window puts
-them on its own build only when it starts the daemon itself (none ran, or
-one of an older protocol it replaces), and otherwise adds one the daemon
-keeps none of and replaces one an older release of Sonny started (by the
-version its `SONNY_BUILD` names); one of a newer release, or another
-build of its own version, it leaves running, since replacing a running
-tool host stops the scripts it runs, and `sonny update` replaces those. A plain `agent start`
-replaces only the daemon, and brings the companions back as they were
-kept: by names that still lead to the old program, which runs on, removed
-from its install, until the first window of the new release opens, or
-`sonny upgrade` runs.
-
-Each open window notes the program it started from. When it loses the
-daemon and the Sonny installed where it runs from is another program
-(`sonny upgrade`, or `brew upgrade` and install.sh run by hand), it reopens
-on that one in place, in the same terminal, with its own arguments, on the
-same agent, and with what was typed in its composer back in it unsent,
-pasted pictures and all, as `/new` hands its first message on in a file; the reopened window says
-`Sonny was upgraded; this window reopened on VERSION`. A window that meets
-a newer daemon with no newer Sonny installed here still says `Sonny was
-upgraded; reopen this window` and starts nothing.
 
 ![A window reopened on 0.9.5 by the update above, its unsent message still in the composer](sonny/update-reopened.png)
 
 ## Skills
 
-At each start Sonny writes the skills it ships into `~/.agents/skills`, where
-every agent finds them ([client policy](CLIENT.md)): `plan`, an agent's plan
-as a file; `memory`, what to save for later agents; `zen`, one focus at
-a time; `coordination`, how a lead works with its tasks; `commons`, the threads
-agents share (see Commons); `memory-cleanup`, the
-nightly cleanup (see Memory); `automation`, for recurring jobs (see
-Automations); `sonny-setup`, how any agent sets Sonny up with `sonny setup`'s
-flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md));
-`sonny-config`, where the settings live and every key of
-`~/.agent/config.toml` with its values and default, written from the keys
-`/config` lists so it matches the Sonny installed
-([SKILL.md](../sonny/skills/sonny-config/SKILL.md)); `pictures`; and one
-for each multiplexer the machine has, `rex-windows`, `herdr-panes` and
-`cmux-tabs`, each telling the agent to run `sonny where` first, which
-prints the multiplexer and workspace its `show_agent` calls act in
-now. They are normal skills, real files
-([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
-it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
-while it is as Sonny last wrote it: one the person edited, or one of that
-name Sonny never noted writing, is theirs and left alone (remove its folder
-to get Sonny's).
+At startup, Sonny writes its shipped skills into `~/.agents/skills/` (loaded via [client policy](CLIENT.md)):
 
-When Sonny brings new text for a skill or role (`lead.md`, `task.md`) that
-the person edited, it writes that text beside theirs, in
-`~/.agent/sonny/upgrades/skills/NAME` or `upgrades/agents/NAME.md`, and
-notes it in `upgrades/pending`. Sonny also keeps whole what it last wrote
-of each, in `~/.agent/sonny/shipped`, which is what an edit started from.
-The first lead Sonny opens after that (not a task or a side chat) is sent a note,
-queued after any turn it runs, naming the person's copy, Sonny's new text
-and the text the person started from, and asking it to offer the person a
-merge. The transcript shows it as one row, `↳ Sonny upgraded · lead role
-edited`. Each new text is told once, by one Sonny of several starting at
-once, and nothing is told when the person edits a file Sonny's text has
-not changed since; a copy left the same as it is Sonny's
-again from the next start. A file of the person's own that Sonny never
-wrote, or a link, is not offered.
+- **Core workflow:** `plan`, `memory`, `memory-cleanup`, `zen`, `coordination`, `commons`, `board`, `automation`, `margin`, `workflow`, `pictures`
+- **Setup & config:** `sonny-setup`, `sonny-config` (generated from `/config` keys)
+- **Integrations:** `rex-windows`, `herdr-panes`, `cmux-tabs` (for detected multiplexers), plus `agent-browser` and `agent-desktop` when installed.
 
-The same note carries what changed in Sonny, from its feature register
-([FEATURES.md](../sonny/FEATURES.md)), which Sonny writes to
-`~/.agent/sonny/FEATURES.md` at each start. Sonny keeps the register as the
-person last heard of it in `~/.agent/sonny/shipped/FEATURES.md`; when this
-Sonny's differs, the note lists the rows that are new or changed and asks
-the bot to tell the person what of them matters, and once it is sent the
-new register is the heard one. No version is compared, so a skipped release
-is told with the next. The first register a person has is heard of without
-a word. The note also offers each setup step an upgrade brings that the
-person has neither done nor been offered (`setup::STEPS`: bringing in
-MCP servers with `sonny mcp import`, a git backup with `sonny setup
-backup`, and a signed-in browser with `sonny setup --browser-signed-in`):
-each is offered once, then noted in
-`~/.agent/sonny/offered`, as is one setup itself offers. The row reads
-`↳ Sonny upgraded · what's new · set up mcp-import`.
+### Preserving your edits and upgrade notes
 
-A change that leaves the person's state to be moved brings the move with it
-([upgrade.rs](../sonny/src/upgrade.rs)). A rewrite a script does the same
-everywhere is a migration, code that `upgrade::once` runs once and records.
-Migrations run where Sonny starts: before its config is read, and at a
-window's start and `sonny upgrade`'s, before the daemon and its companions
-start on the new build; those that need a whole listing of the agents run
-right after the window connects, off its way. Never in the lookout, whose
-one job is passing events on.
-What needs judgment or reaches the person's own things is an upgrade step:
-words in `sonny/upgrades/ID.md` (a first line `Feature: ROW` naming its
-register row) and a check in code that says when it is done. The note asks
-the lead to do each step not done, to copy a file of the person's to
-`~/.agent/sonny/upgrades/before/ID` before changing it, and to ask the
-person first for anything that cannot be undone. Once the note is sent the
-step is noted in `~/.agent/sonny/tried` with the Sonny that asked (a
-fingerprint of its register), so one Sonny asks once; while the check fails,
-the next upgrade asks again and says it was asked before. The row reads
-`↳ Sonny upgraded · ID`. Every step and migration names the release it is
-deleted in, two after the one it ships in, and a test fails once Sonny's
-version reaches it; a person who skips more releases gets what a new install
-gets. The store's schema migrations are neither and stay in the daemon.
-
-A link the Agent app left there, into its bundle's
-`Contents/Resources/skills`, is replaced, never written through; a folder's
-own skill of the same name wins over any of them. Agents already running
-keep the index they were created with.
+- Sonny fingerprints shipped files in `~/.agent/sonny/skills` and `~/.agent/sonny/agents`. If you edit a shipped skill or role (`lead.md`, `task.md`), Sonny stops overwriting it. (Delete your copy to restore Sonny's.)
+- When a Sonny upgrade updates a file you edited, Sonny places the new version in `~/.agent/sonny/upgrades/` alongside your original baseline in `~/.agent/sonny/shipped/`, and queues a one-time upgrade note to the first lead you open offering to merge the changes, summarize new rows in [FEATURES.md](../sonny/FEATURES.md), offer new setup steps, and run any judgment-based upgrade steps (`sonny/upgrades/ID.md`).
+- Mechanical migrations run automatically once via `upgrade::once` (`sonny/src/upgrade.rs`) at startup—never in the lookout.
 
 ## Tool host
 
-The tools Sonny gives its agents (`start_task`, `memory`,
-`automations`, `follows`, the commons, `exec` and the rest whose
-`answered_by` is `sonny`) wait in the daemon until Sonny answers them
-([served.rs](../sonny/src/served.rs)). The tool host answers them:
-`sonny tool-host --store STORE --socket SOCKET`, the daemon's companion
-`sonny-tool-host` ([tool_host.rs](../sonny/src/tool_host.rs)), which Sonny
-and `sonny acp` add beside the lookout, so the calls are answered with
-every window closed, by the build that declared them. A window adds it
-only when the daemon keeps none; one already kept is replaced only by
-`sonny update` or by a window that started the daemon, as replacing it
-stops the scripts it runs. It is the lookout's
-sibling, not part of it, as Codex keeps its code-mode host apart from the
-session: a tool that runs long, crashes or holds memory, as an MCP server
-or a browser can, never holds up the news a lead hears, and either can be
-replaced without the other.
+Sonny's agent tools (`start_task`, `remove_task`, `memory`, `automations`, `follows`, `commons`, `board`, `exec`, `workflow`, `browser`, `desktop`, `margin`, `live`, `show_agent`, `new_project`, `react`, `ask`) are answered by the daemon companion `sonny-tool-host` (`sonny tool-host --store STORE --socket SOCKET`).
 
-Each call that starts, or waited from before the host did, runs as
-`sonny tool NAME` in the calling agent's folder, with the environment its
-shell would have; `exec` runs in the host itself, where the MCP servers
-stay up (next section). A turn that ends stops the calls it still has
-running. The host holds `STORE.tool-host.lock`, so a second one prints
-`{"event":"already_serving"}` and exits, unless another build started the
-running one, which it then stops and replaces (`STORE.tool-host.sonny`
-says which build runs). It follows the daemon's `tool_started` and
-`turn_finished` events from `STORE.tool-host.cursor`, the first time from
-the lookout's cursor rather than the whole log, and exits once the daemon
-has been gone 30 seconds. On starting, it brings every agent Sonny declared
-tools on up to this build's tools. `/background` says "tools not answered"
-when no tool host runs.
-
-An agent Sonny makes for another, a task `start_task` starts or a
-workflow's worker, is held as its maker is or tighter, never looser, as
-Codex's subagents keep their parent's sandbox and approvals. With no row
-named it works as its maker does, its sandbox no wider than its maker's.
-`start_task` takes `permissions`, one of the person's `/permissions` rows,
-to hold a task tighter: one no one approves for refuses whatever would
-need approval (the daemon's `approval_policy` `never`), and one whose
-approver holds tighter adds its gate to the one the task keeps from its
-maker. A row looser than its maker, in sandbox, network, sockets, folders
-it writes, commits to a repository the maker doesn't commit to, or who
-approves, is refused with why, and so is one the maker's gate fits no row
-of. The tool host gives an agent whose maker is gone the person's command
-rules, but its `allow` rules and pinned program paths only as it had them
-already, so none lets a command out of the sandbox its maker could not.
+- Runs independently of `sonny-lookout` so slow MCP calls, workflows, or browser sessions never delay event delivery.
+- Stays alive when all Sonny windows close (`STORE.tool-host.lock`, `STORE.tool-host.sonny`, `STORE.tool-host.cursor`), exiting 30s after the daemon stops.
+- Runs each tool call as `sonny tool NAME` in the caller's workspace (`exec` and `workflow` run in-process where MCP connections live) and cancels in-flight calls if the turn ends.
+- Enforces non-escalation: any task or workflow worker created by an agent inherits permissions equal to or stricter than its maker (`start_task` accepts a stricter `permissions` row; looser rows are refused).
+- `/background` warns `tools not answered` if no tool host is running.
 
 ## Workflows
 
-An agent can work as a script instead of a conversation: the `workflow`
-tool ([workflow/](../sonny/src/workflow/)) takes a JavaScript plan in
-Claude Code's dynamic workflow language, name for name, and runs it in the
-tool host, in the QuickJS `exec` uses, on a connection of its own. The call
-returns at once with the run's id; the caller hears back once, when the run
-ends, in a message queued with origin `workflow`: how it ended, its agents
-and tokens, and its result, or the result's outline (each top-level key with
-a short value or its size) when it is over 4 KiB, with where the whole is.
-The workflow skill is the language's reference.
+The `workflow` tool lets an agent orchestrate many short-lived worker bots from a single JavaScript script (running in QuickJS inside `sonny-tool-host`) instead of manual back-and-forth turns.
 
-Each `agent()` call makes a worker, `PROJECT.wf-RUN-KEY`: a bot the caller
-made, in its folder (a worktree of it with `isolation: 'worktree'`, taken
-away at the run's end unless it holds commits), confined as the caller's
-permissions row confines it, under the caller's gates, told its folder's
-rules and that its reply is a value. A worker has `memory`, `exec`, the
-browser and the desktop, and nothing that starts agents or reaches the
-person; `start_task` refuses names starting `wf-`. Workers have no tab, no
-`/status` row and no star, and the lookout tells no one of them. A call
-with a `schema` sends it as the turn's `output_schema`, strict (optional
-properties nullable, their nulls left out of what `agent()` returns),
-checks the reply whole against it, and asks the same worker once more when
-the reply does not fit. A schema with what strict output does not take
-(`allOf`, `not`, `if`, `prefixItems` and the like) is refused at the call.
-
-A run lives in `STORE.workflows/RUN/`: `run.json` (what it was started
-with), `script.js`, `events.jsonl` (phases, logs and each agent's value,
-appended) and, at the end, `result.json`. A worker is named and asked by
-its call's key, a hash of its prompt and options (not its label or phase)
-with how many such calls came before, so asking again gets the same bot and
-turn. A run whose host stopped is picked up when the next starts, and one
-whose connection went on the next connection, by running its script again
-with every recorded call answered from the journal at once, as Claude
-Code's resume answers them: a script that acts on which of its calls
-finished first may take another path then, and the calls it newly makes
-are new work, while the turns of calls it no longer makes are interrupted
-at the run's end. `resume_from_run_id`
-starts a new run with an earlier run's answers, so only calls that changed
-cost model calls. `stop` interrupts a run's workers; it ends as stopped.
-
-`/status` shows each run that has not ended as one row in Working, under
-the agent that started it: its name, current phase and its agents
-working, finished and failed (`Verify · 12 working, 31 finished, 2 failed`), and on `m` each phase's counts, its last `log()` line and its
-output tokens. A window reads only what each journal gained since its last
-look. With a run's row picked, `s` stops it: the window leaves a `stop`
-file in the run's folder, and the host running it stops it within a
-second, as the `stop` parameter does.
-
-`[sonny.workflows]` in `config.toml`: `enabled` (true), `concurrency` (0:
-the CPUs less two, at most 16), `max_agents` (1000) and `max_runs` (8).
+- **Async & summarized:** Returns a run ID immediately; when finished, queues one `workflow`-origin message with status, counts, tokens, and the result (or a 4 KiB outline + path for large results).
+- **Workers (`PROJECT.wf-RUN-KEY`):** Created per `agent()` call in the caller's folder (or a temporary worktree with `isolation: 'worktree'`, kept only if it has commits), confined to the caller's sandbox and approval gates, with `memory`, `exec`, `browser`, and `desktop` (no agent-spawning or user-facing tools). Supports strict JSON `schema` validation with one automatic retry.
+- **Durable journaling & resume:** Stored in `STORE.workflows/RUN/` (`run.json`, `script.js`, `events.jsonl`, `result.json`). Keyed by prompt + options hash so restarts replay completed calls from the journal at zero cost, and `resume_from_run_id` reuses answers from an earlier run.
+- **Monitoring & config:** Active runs appear as one live row in `/status` (`m` expands phases/logs; `s` or `x` stops). Configure under `[sonny.workflows]` in `config.toml`: `enabled` (`true`), `concurrency` (`0` = `min(16, CPUs - 2)`), `max_agents` (`1000`), `max_runs` (`8`).
 
 ## MCP servers
 
-The person's MCP servers live in `~/.agent/config.toml`, under Codex's key
-names so an entry can be copied across:
+Configure MCP servers in `~/.agent/config.toml` (using Codex-compatible keys) or import them from other harnesses:
 
 ```toml
 [sonny.mcp_servers.linear]
 url = "https://mcp.linear.app/mcp"
-bearer_token_env_var = "LINEAR_TOKEN"      # from the environment or ~/.agent/keys/env
+bearer_token_env_var = "LINEAR_TOKEN"      # from env or ~/.agent/keys/env
 description = "Issues and projects in Linear"
 
 [sonny.mcp_servers.playwright]
 command = "npx"
 args = ["@playwright/mcp@latest"]
 enabled_tools = ["browser_navigate", "browser_snapshot", "browser_click"]
-default_tools_approval_mode = "writes"     # ask before every call but reads
+default_tools_approval_mode = "writes"
 
 [sonny.mcp_servers.playwright.tools.browser_snapshot]
-approval_mode = "approve"                  # never ask for this one
+approval_mode = "approve"
 ```
 
-A server takes `command`, `args`, `env` and `cwd` (stdio), or `url`,
-`bearer_token_env_var` and `http_headers` (streamable HTTP), and either way
-`enabled`, `enabled_tools`, `disabled_tools`, `startup_timeout_sec`,
-`tool_timeout_sec`, `description`, `default_tools_approval_mode` and
-`tools.TOOL.approval_mode` (next section). `sonny mcp add NAME -- COMMAND ARGS`
-(or `--url URL`) writes one and lists its tools, `sonny mcp remove NAME`
-drops it, and `sonny mcp list` starts each and says what it offers or why
-it did not start. `/mcp` in Sonny shows the same from the last listings,
-and `sonny mcp tool` prints the `exec` tool agents are given, as JSON.
+### Managing and importing servers
 
-`sonny mcp import` brings in the servers other agents have, as Claude Code's
-`claude mcp add-from-claude-desktop` does, from Codex's
-`~/.codex/config.toml`, Claude Code's `~/.claude.json` (the user's and this
-folder's) and `.mcp.json`, OpenCode's `opencode.json` and Kiro's
-`.kiro/settings/mcp.json`, at home and in the folder it runs in. It lists
-them ticked, but for those from a file in the folder: whoever wrote the
-folder wrote those, and one can send a key the person has to its own URL,
-so, as Claude Code asks before it starts a project's `.mcp.json` servers,
-they start unticked and each row says what variables it reads. Space ticks
-or unticks one and Enter brings the ticked ones; `--yes` takes all but the
-folder's, and `--json` only prints what it found. First-run setup offers the
-same. A name Sonny has already, or that an agent earlier in that list has,
-is skipped, and the other agents' files are left as they were. A secret
-written into a server's entry (an `env` value named like a key or token, or
-a literal `Authorization: Bearer`) goes to `~/.agent/keys/env`, which stdio
-servers are started with and `bearer_token_env_var` names, never to
-`config.toml`; a value that only names a variable (`${VAR}`, `{env:VAR}`)
-is left to the environment, and the import says when that variable is not
-set. Servers on the old SSE transport are named and left out.
+- `sonny mcp add NAME -- COMMAND ARGS` (or `--url URL`), `sonny mcp remove NAME`, `sonny mcp list`, `sonny mcp tool`, or `/mcp` in Sonny.
+- `sonny mcp import` discovers servers from Codex (`~/.codex/config.toml`), Claude Code (`~/.claude.json`, `.mcp.json`), OpenCode (`opencode.json`), and Kiro (`.kiro/settings/mcp.json`). Project-local servers start unticked for safety; literal secrets are extracted into `~/.agent/keys/env` rather than `config.toml`. (Legacy SSE servers are skipped.)
 
 ![sonny mcp import](sonny/mcp-import.png)
 
-Agents do not get a tool per MCP tool. In code mode, and otherwise while
-any server is on, every agent Sonny opens has one tool, `exec`, with
-Codex's code mode contract
-([exec.rs](../sonny/src/exec.rs)): the model writes JavaScript, each tool is
-`await tools.mcp__SERVER__TOOL(args)` and resolves to its `CallToolResult`,
-and only what the script passes to `text()` and `image()` comes back, so
-twenty calls and the filtering between them cost one result. `image()`
-takes a `data:` URL or an MCP `ImageContent` block (`image(r.content[0])`),
-and the model sees the picture itself, in order with the text, as Codex's
-code mode returns it: the result is the daemon's list of text and image
-parts. Like a file `read` sends, a picture is a PNG, JPEG, GIF or WebP by
-its own bytes, scaled to 1568 pixels on its longest side when larger; a
-result holds up to 20, 5 MB together, and `image()` throws past that. `store` and `load` keep small values for the agent's
-later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
-them for a query, a tool named exactly (its callable name, or its name on
-its server) first. The description lists each server and declares its tools
-in TypeScript up to about 3,000 tokens; the rest are found from a script. A
-script runs in QuickJS with no files, network or timers, at most 256 MB and
-10 minutes, four at once in the tool host and sixteen alive (more wait
-their turn), and returns
-at most 10,000 tokens, longer output keeping its start and end and saving
-the whole to a file, written as the script prints, up to 1 GB, the result
-saying when the file holds less and why (its owner's alone); saved outputs
-are kept a week. A first
-line such as
-`// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
-Its time counts from the call: waiting for a place and starting servers
-to list their tools spend it. What lives outside its 256 MB is bounded as
-it runs: memory keeps only the output's budget, at most 1 MB, its first
-half and its latest, as Codex keeps a command's, while the file gets every
-byte; eight of its calls are in flight at once, and a
-result over 16 MB is refused, as rmcp refuses such a message. Two tools
-whose identifiers would be the same (`my-server` and `my_server`'s
-`search`) are neither on `tools`, the description saying why.
+### Code mode (`exec`)
 
-Code mode (`[sonny] code_mode`, on by default, in `/config`) gives a
-script the agent's own tools too: `tools.shell`, `tools.read`,
-`tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as
-far as the agent has them, and its model is shown `exec` in their place
-(the daemon's `steps_only` setting, `"*"`, on every agent Sonny makes or
-opens). The daemon runs each such call as a step of the `exec` call, decided
-as the same call from the model would be: the agent's rules, sandbox and
-approvals, its audit row and its stop. A command runs in the foreground,
-and one of them runs at a time. The script's result names its calls by
-server or tool (`Calls: shell 2, github 1`), and so does its line in the
-window. Off, every agent's model is shown its tools again from its next
-turn, and `exec` stays only while a server is on.
+Instead of dumping dozens of individual MCP tool schemas into every model prompt, Sonny gives agents **one `exec` tool** running JavaScript in sandboxed QuickJS (no filesystem, network, or timers):
+
+- Call MCP tools via `await tools.mcp__SERVER__TOOL(args)`, filter/transform in JS, and return only what matters via `text(...)` and `image(...)` (up to 20 images / 5 MiB; PNG/JPEG/GIF/WebP auto-scaled to 1568px).
+- **Code mode (`[sonny] code_mode = true`, default):** Exposes the agent's built-in tools (`tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch`, `tools.web_fetch`) inside `exec` as well, hiding raw tool schemas via `steps_only`.
+- **Tool discovery & limits:** `ALL_TOOLS` and `tools.tool_search(query)` find tools beyond the 3,000-token TypeScript header; `store`/`load` persist small values between scripts. Limits: 256 MiB heap, 10m timeout (overridable with `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}`), 10k-token return (full output saved to disk up to 1 GiB for 7 days), 8 concurrent in-script calls, 16 MiB per call result.
+- **Shared server pool:** `sonny-tool-host` maintains one connection per server across all agents (started on first call, stopped after 10 idle minutes) and caches tool schemas in `~/.agent/sonny/mcp`.
 
 ![The every-tool-call view: a lead's script ran shell once as a step of its exec call, its result under the row](sonny/code-mode-script.png)
 
-![/config filtered to code mode, on](sonny/code-mode-config.png)
+### Per-call approvals and auditing
 
-The tool host runs the scripts and keeps the servers
-([mcp.rs](../sonny/src/mcp.rs)): one connection per server for every agent,
-started by the first call and stopped after ten idle minutes, with each
-server's tool list kept in `~/.agent/sonny/mcp`, readable by the person
-alone and keyed by a digest of its config rather than the config's
-secrets, so agents are told of its tools without starting it. A server's
-stderr is kept by its last twenty lines, each cut at 1 KB, for when it fails. Servers run as the person, beside the tool host and
-outside every agent's sandbox, as Codex starts its own: a sandboxed task
-reaches them only through `exec`. A turn that ends, as one the person
-interrupts, stops its script and the calls it has in flight.
+Scripts are never approved as a black box—every tool call inside `exec` goes through `approve_step` individually:
 
-As in Codex, a script is not approved as a whole: each call it makes is
-checked on its own, by its server's `approval_mode`, Codex's names and
-rule. `auto`, the default, asks first for a call of a tool the server marks
-destructive (`destructiveHint`) unless it also marks it read-only
-(`readOnlyHint`, which wins), and runs the rest; `writes` asks for every
-call but a read-only tool's; `prompt` asks for every call; `approve` never
-asks. Asking puts the call to the agent's own gate, through the daemon's
-`approve_step`: in `full` nothing waits, in `auto` the reviewer decides it, in
-`ask` the person does, the call drawn with `a call in a running script`.
-The script waits for the verdict with its 10 minutes stopped, on its own
-thread, holding none of another's room: up to 2,048 scripts are alive at
-once, as Codex's host allows cells, and one past them is refused at once
-rather than kept waiting. JavaScript it runs meanwhile, beside the waiting
-call, still spends its time. A denied call rejects with the reason, which the script can catch.
-Once a call a gate allowed has run, Sonny tells the daemon how it ended
-(`step_result`), so the reviewer of the agent's next call counts it among those
-the turn already ran.
+| `approval_mode` | When it asks the agent's gate |
+| --- | --- |
+| `auto` *(default)* | Tools marked `destructiveHint` (unless also `readOnlyHint`) |
+| `writes` | Every tool except `readOnlyHint` |
+| `prompt` | Every call |
+| `approve` | Never asks |
 
-Every call a script makes reaches the daemon's audit trail, asked or not: a
-call that would not ask is sent with `record`, so the daemon writes it and
-allows it at once, and its `step_result` says how it ended. Arguments past 4 KiB
-are sent as `{"cut": FIRST}`, their first 256 characters, all the trail
-keeps, so a call no gate could take still runs. Each says its
-place (`external` for a server Sonny reaches by URL, `outside` for one it
-runs) and, where the server marks the tool, whether it reads
-(`readOnlyHint`) or writes (`destructiveHint`, or `readOnlyHint` false).
-Browser commands (read for a snapshot, screenshot, get, is, console or
-errors), desktop calls (read for a look, write once any command acts) and
-automation changes are recorded the same way. Each tool Sonny declares
-names its kind (`memory` file, `exec` mcp, `browser`,
-`desktop`, the rest agents). `/audit` shows the trail: this agent's rows,
-newest first, `a` for every agent's, `t`, `p` and `w` to filter by kind,
-place and who approved, Enter to open a row's agent.
-
-`/background` ends with the commands the project's agents left running,
-as Codex's `/ps` shows its background terminals: each background command,
-terminal, detached service and call waiting on its approval, oldest
-first, with its agent, how long it has run, a detached one's pid and the
-start of its command, read from the daemon's `processes` every two seconds
-while it is open. Enter opens a command as a page, with its whole line and
-the agent that left it running as its first link, and `x` asks once to
-stop the picked one with all it started, naming its command; Enter stops it
-(`stop_process`), beside the window, and any other key leaves it running.
-
-![/background's Commands: its lead's detached docs server, with its pid, and a background test watcher](sonny/background-commands.png)
-
-![/background: x asks once to stop the docs server and all it started, then any key but Enter leaves it running](sonny/one-confirm.png)
+Built-in tool steps (`tools.shell`, etc.) go through the agent's normal sandbox, command rules, and approval gates. Every MCP, browser, desktop, and automation call is recorded in the daemon audit trail (`/audit` in Sonny; `agent audit` on CLI).
 
 ## Links
 
-A link lets the agents of a host use another machine's browser, MCP servers
-and opens over SSH while that machine is connected. Typically the host is
-a box you work on, and the linked machine is your laptop, where you are
-signed in to everything ([link.rs](../sonny/src/link.rs)). Either end can
-run macOS or Linux. On the machine to link:
+`sonny link` connects a machine where you are signed in (like your laptop) to a remote host (like a cloud devbox) over outbound SSH—letting the host's agents use your laptop's **signed-in browser**, **desktop**, and **local MCP servers**, while approvals still appear in your Sonny window on the host.
 
 ```sh
-sonny link devbox          # or me@devbox.example.com; --machine NAME, --name NAME
-sonny link                 # the links, and the machines linked here
+# Run on your laptop (the machine with logins/browser/MCP)
+sonny link devbox              # or me@devbox.example.com [--machine NAME] [--name NAME]
+sonny link                     # inspect active links and connected machines
 sonny link off devbox
-sonny link forget laptop   # on the host: forget a machine linked to it
+sonny link forget laptop       # run on the host to forget a linked machine
 ```
 
-`sonny link HOST` finds Sonny on the host (installing this version with
-`install.sh` when it isn't there), writes `[sonny.links.NAME]` to
-`~/.agent/config.toml`, and turns on `start_at_boot`, so this machine's
-daemon, and with it the link, comes back at login:
+### How it works
+
+1. `sonny link HOST` checks Sonny on `HOST` (installing via `install.sh` if needed), writes `[sonny.links.NAME]` to `~/.agent/config.toml`, and enables `start_at_boot`.
+2. Your laptop's tool host maintains an outbound `ssh -T HOST sonny link serve MACHINE` tunnel (auto-reconnecting with backoff). No open ports, port forwarding, or `sshd` changes are needed.
+3. On the host, `sonny link serve` exposes `~/.agent/links/MACHINE.sock` (cleaning up after 45s of silence if the laptop sleeps). Connections must prove host-user ownership via `~/.agent/links/.proof`, preventing sandboxed agents from bypassing the tool host.
+
+### What host agents can do on a linked machine
+
+- **Browser (`browser` with `machine: "laptop"`):** Runs tabs in a dedicated shared Chrome instance copied once from your `browser_profile` (default `"Default"`; refreshes cookies and native messaging hosts on start, closes after 30 idle minutes). Screenshots return inline; file outputs (PDF, HAR, recordings up to 30 MiB) stream back to approved host paths.
+- **Desktop (`desktop` with `machine: "laptop"`):** Runs `agent-desktop` on the linked machine with action approvals routed to the host agent's gate.
+- **MCP (`exec`):** Prefix a script with `// @exec: {"machine": "laptop"}` to run against that machine's MCP servers (listed under `# On NAME`).
+- **Opening links & files:** On headless hosts, clicking an `http(s)` URL or large image/PDF in Sonny opens it directly on your connected laptop.
+
+Configuration in `~/.agent/config.toml`:
 
 ```toml
 [sonny.links.devbox]
-host = "devbox"                 # what ssh dials
-machine = "laptop"              # what the agents there call this machine; its hostname by default
-command = "/home/me/.local/bin/sonny"   # Sonny there, as setup found it
-browser_profile = "Default"     # the Chrome profile their shared browser is copied from once, or a folder; "" a fresh one each
-calls = 16                      # how many of their calls this machine runs at once; 4 per CPU by default
+host = "devbox"
+machine = "laptop"
+command = "/home/me/.local/bin/sonny"
+browser_profile = "Default"    # Chrome profile name, path, or "" for fresh browsers
+calls = 16                     # max concurrent remote calls (default: 4 × CPUs)
 ```
 
-The linked machine dials. Its tool host keeps
-`ssh -T HOST sonny link serve MACHINE` running and dials again after a
-second when it drops, waiting longer each time it keeps failing, up to a
-minute. The host needs no open port, no forwarding and no sshd setting, and
-nothing reaches the linked machine from outside. On the host,
-`sonny link serve` listens on `~/.agent/links/MACHINE.sock`. It keeps what
-the machine offers in `MACHINE.json` and the last time the machine was
-heard from in `MACHINE.seen`. `MACHINE.json` stays while the machine is
-away, so agents' tools don't change. `sonny link serve` exits after 45
-quiet seconds (a machine asleep never says it is going) and removes its
-socket.
-
-The host's agents see each linked machine by name:
-
-- `browser` takes `machine`. The commands run in that machine's
-  agent-browser, each agent in a tab of its own of one Chrome the link's
-  agents share, signed in as the person is there. That Chrome runs on a
-  profile kept for the link in `~/.agent/sonny/links/NAME/chrome`: copied
-  once from the person's Chrome profile `browser_profile` names, and again
-  only when that name changes, so the person's own Chrome is left alone and
-  what the shared browser picks up (a sign-in, an extension's sync, a
-  device check) stays across restarts. Each time that Chrome starts, the
-  person's native messaging hosts (`NativeMessagingHosts` beside their
-  profiles, which an extension such as a company's device check talks to)
-  are linked into the kept profile, and their `Cookies` are copied over
-  the kept profile's, so signing in again in their own Chrome reaches the
-  shared browser at its next start. An agent's `close` ends its tab, and
-  Sonny closes that Chrome once no agent of the link has a tab in it, so
-  the next open starts it again. A `browser_profile` that is a
-  folder is used as it is; `""` gives each agent a fresh browser of its
-  own instead. Sonny starts that Chrome itself, the person's own Chrome
-  program (or agent-browser's `executablePath`), with the system's
-  keychain, so the sign-ins copied can be read and a company's device check
-  finds its certificates; agent-browser starts a profile folder with a
-  stand-in keychain. It runs headless unless agent-browser's settings say
-  `headed`, through the proxy agent-browser would give it (one that signs
-  in with a password is refused), and closes 30 minutes after the link's agents last used it. A screenshot with no
-  path comes back as a picture. A path is the agent's own, on the host:
-  checked against what the agent may write before anything runs, the file
-  (a screenshot, a PDF, a HAR, `diff -o`, a recording at its `stop`, up to
-  30 MB a call) comes back over the link and is written there. The linked
-  machine keeps none of it, and reads no file of its own for the agent.
-- `desktop` takes `machine` while that machine's agents could use its
-  desktop (agent-desktop is installed there and it shows a desktop). The
-  commands run on its desktop, checked there as its own agents' are, and
-  what acts waits for the calling agent's gate on the host.
-- `exec` lists each machine's servers under `# On NAME`. A script whose
-  options line says `// @exec: {"machine": "NAME"}` runs on that machine,
-  against its servers alone.
-- When no display can open a link or a picture you opened bigger, the
-  host's Sonny sends it to a connected machine. An http(s) address opens
-  in its browser. A viewer's file (a picture, a PDF or plain text, up to
-  32 MB) is kept in `~/.agent/sonny/links/opened`, marked as downloaded,
-  and opened.
-
-What a call asks to confirm (an MCP call its server's `approval_mode` asks
-about, an action in `browser_confirm`) comes back over the link to the
-calling agent's gate on the host, so you see it in the host's Sonny, where
-you are working. The linked machine's own settings decide what it
-confirms. A call to a machine that is asleep returns `not_connected` at
-once, or within 3 seconds, with when it was last connected. A call that
-was already sent down the link when the machine went quiet, before it took
-the call, or whose link closed while the machine ran it, returns
-`tool_outcome_unknown`: it may have run, so see whether it took effect
-before making it again. A machine that says nothing for 3 seconds after a
-call is sent, neither taking it nor carrying anything else, has gone
-quiet, and the call is let go there should it still arrive. A machine runs
-at most `calls` of the host's calls at once; one past that returns
-`link_busy`, to call again when one ends. On a slow link, each end holds at
-most one longest line (48 MB) of calls and answers queued, and the pings,
-confirmations and cancels go ahead of them.
-
-An agent's sandbox reaches Unix sockets once it reaches the network, so the
-socket alone proves nothing. Before a connection may send a call, it must
-create a file the server names in `~/.agent/links/.proof`, which no
-sandboxed command can write. That leaves only the person's own programs
-(the tool host and Sonny's window) able to send calls, and every call goes
-through its agent's gate like the agent's other calls. Both ends speak link
-protocol 1. A machine speaking another protocol is refused, with a reason
-that names both, so run Sonny from the same commit on both ends.
+Error codes: `not_connected` (asleep/offline), `tool_outcome_unknown` (link dropped mid-call), `link_busy` (at `calls` cap). Both ends must speak link protocol 1.
 
 ## Keys never wait on the daemon
 
-A Sonny window takes every key at once, however slow its daemon is to answer.
-What the daemon says is read beside the window's loop and shown in the order it
-came, one event at a time between looks at the keys. What the person sends (a
-message, a steer, an answer, a pick, `/compact`, Esc's interrupt) goes out in
-order beside the loop, and a message shows under the conversation at once. Older
-pages, an open card's refresh and the reads Sonny repeats every few seconds
-(tasks, the calls of agents below, their questions, margin notes) run beside it
-too, as Codex's TUI sends its ops and hears back as events. A reconnect's
-catching up (what came since the last item drawn, the turn still running, its
-approvals and companions) is read beside the loop too, and drawn when it has
-all come. Opening a card (its first read) and `/switch` still read before they
-show.
+Sonny's UI event loop never blocks on daemon RPCs:
 
-The window holds only the event it is showing, as Codex's TUI takes one at a
-time. The rest wait in the connection's own queue (4,096 events or 8 MiB), so a fast
-stream behind a slow read costs no more memory than before. A stream past that
-queue lets go of the connection, as any reader that falls behind does: the
-window drops what it had not shown yet, connects again and draws the rest from
-history, from the last item it drew, each line once and in order.
-
-With every answer held 5 s (`docs/demo/held`), before this change Enter waited for the
-daemon and the window stopped: the clock stayed at 8 s, the steer stayed in the
-composer, and the words typed after it did not show. Now the steer shows at once
-and the person types on while the reply streams:
-
-![Before: with the daemon's answers held, Enter freezes the window, the steer still in the composer](sonny/keys-held-daemon-main.png)
+- Daemon streaming, outgoing sends (`Enter`, steers, answers, interrupts, `/compact`), background refreshes, and reconnect catch-up all run off the UI thread. Sent messages appear in the conversation immediately.
+- Incoming events buffer in a bounded queue (`4,096` events / `8 MiB`). If a window falls behind, it drops the connection, reconnects, and catches up cleanly from history in order.
 
 ![After: the steer shows under the reply at once, and the next words show as they are typed](sonny/keys-held-daemon.png)
 
 ## Checks
 
-`cargo test -p agent-client` covers memory, project creation and a failed
-project-file write leaving neither a partial file nor a temporary. `cargo
-test -p sonny` covers automations' calendars, definitions, watched paths,
-idempotent `add`, `run`, `--runs`, `--if`, the commit check, move, each
-lifecycle step with no scheduler to run them, the scheduler's next times
-and its job, moving an earlier Sonny's per-automation jobs, and skills an edit
-makes the person's. With `AGENT_TEST_RUNTIME=1` after a release build and
-`cargo build -p sonny`, `python3 -m unittest tests.test_trigger` runs
-automations against a real daemon, including one that starts its stopped
-daemon with only a login shell's provider key, and runs `sonny scheduler`
-itself under a scratch `HOME`: of two schedulers one leaves it to the
-other, a one-off runs at its minute and ends itself, a write starts a file
-automation (the same `add` again being that automation, a different one refused
-naming `when`), `run` by name starts the stopped daemon, and a scheduler
-whose HOME is deleted lets its job go. On a Mac `AGENT_TEST_LAUNCHD=1`, and
-on Linux with a user manager running `AGENT_TEST_SYSTEMD=1`, add one test
-of the real system: the first automation writes the scheduler's job, the
-system runs it, it runs a one-off, and later adds and replaces leave the
-job's file as it was.
+- Unit tests: `cargo test -p agent-client` and `cargo test -p sonny`.
+- Runtime automation & scheduler integration tests: after `cargo build --release` and `cargo build -p sonny`, run `AGENT_TEST_RUNTIME=1 python3 -m unittest tests.test_trigger`.
+- Real OS scheduler tests: add `AGENT_TEST_LAUNCHD=1` on macOS or `AGENT_TEST_SYSTEMD=1` on Linux.
