@@ -1218,6 +1218,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         # Long enough for a second pass, which once came apart from the first.
         time.sleep(2)
         self.assertEqual(inspected() - before, len(bots))
+
     def test_a_tool_host_declares_again_no_tools_an_agent_has(self):
         """Tools read back as the daemon keeps them, with the result it gives
         one that names none, are the tools declared: a second start
