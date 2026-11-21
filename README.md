@@ -109,7 +109,7 @@ agent run --bot scout --delivery queue -- "Then update the changelog"
 agent interrupt --bot scout
 ```
 
-Messaging a busy bot defaults to `steer` (or `queue` when changing `--workspace` or setting `--turn-budget-tokens`; configurable via `AGENT_DELIVERY`). Use `agent ls --pretty` to see every bot's state and `agent follow --all` to stream all bots at once.
+Messaging a busy bot defaults to `steer` (or `queue` when changing `--workspace` or setting `--turn-budget-tokens`; configurable via `AGENT_DELIVERY`). Use `--delivery reject` to refuse busy bots instead, and cancel a queued message with `agent interrupt --bot scout --turn N`. Use `agent ls --pretty` to see every bot's state and `agent follow --all` to stream all bots at once.
 
 ### 4. Fork from any checkpoint
 
@@ -124,7 +124,7 @@ Pass `--checkpoint ID` (reported by `agent wait scout/N`) to branch from an earl
 
 ### 5. Let bots delegate and follow project policy
 
-Bots can coordinate peers natively using built-in tools: `spawn_agent`, `send_message`, `wait`, `list_agents`, and `close_agent`. A waiting bot parks durably and holds zero execution capacity.
+Bots can coordinate peers natively using built-in tools: `spawn_agent` starts a peer, `send_message` gives an existing peer work, `wait` collects a result while the bot keeps working, `list_agents` finds them, and `close_agent` closes a peer it started. You can talk to any of them directly, and a new message reopens a closed bot. The demo above shows the equivalent shell command, `agent run --detach --new --bot NAME -- TASK`. A waiting bot holds no execution capacity: while it waits, it costs a row in the store and an entry in the daemon's registry, not a process.
 
 Pass `--agents` when creating a bot to compose your project's `AGENTS.md` files (from workspace up to root plus `~/.agents/AGENTS.md`), skill indexes (`.agents/skills/`), profile indexes (`.agents/agents/`), and memory indexes (`~/.agents/memory`). Pass `--profile ROLE` to start a bot in a specific role. See [client policy](docs/CLIENT.md).
 

@@ -1,6 +1,6 @@
 # Sonny's reviewer
 
-When an agent runs in **Auto** mode (`/permissions`), commands and edits inside its sandbox run freely. Any call that **leaves the sandbox** (escalated shell commands, writes outside allowed folders, or Sonny tools acting outside the workspace) is reviewed automatically by a model via the daemon companion `sonny-reviewer` (`sonny reviewer`, serving the `auto` gate tag).
+When an agent runs in **Auto** mode (`/permissions`), commands and edits inside its sandbox run freely. Any call that **leaves the sandbox** (escalated shell commands, writes outside allowed folders, or Sonny tools acting outside the workspace) is reviewed automatically by a model via the daemon companion `sonny-reviewer` (`sonny reviewer`, serving the `auto` gate tag, so to the daemon it is that tag's approver: [the daemon's words](../src/AGENTS.md#words)).
 
 [Quick overview](#how-auto-works-today) · [Configuration](#configuration) · [How it reviews](#how-it-reviews) · [Measured](#measured) · [Built so far](#built-so-far)
 
@@ -31,7 +31,9 @@ effort = "low"                        # defaults to the model's own effort
 timeout_ms = 90000                    # 90s default; 0 = unlimited
 ```
 
-- Pass `--model`, `--effort`, or `--note FILE` (or `AGENT_REVIEWER_NOTE`) to `sonny reviewer` to override.
+- `timeout_ms` covers a round's every attempt, as Codex's `auto_review.timeout_ms`. A check that gives up on a turn still running logs where that turn was (`review_failed` with `hung`: its status, rounds, retries, time held back, and how long since it last wrote) before its fork is removed.
+- Pass `--model`, `--effort`, or `--note FILE` (or `AGENT_REVIEWER_NOTE`, a file it always sees) to `sonny reviewer` to override.
+- Each round asks a fork of one base bot, `.reviewer.TAG`, whose leading dot marks it as one of Sonny's own: no folder's agents share the name, and the sky and the agent picker leave it out. Before 0.9.1 these were `[judge]`, `sonny approver --judge`, `AGENT_APPROVER_NOTE`, the companion `approver-auto`, and the base `approver.TAG`; the upgrade renames each.
 - Put standing permissions or boundaries (e.g., "never push to main") in `~/.agents/AGENTS.md` or your project's `AGENTS.md`—the reviewer trusts unmodified `AGENTS.md` files as your standing instructions.
 - To allow a denied call once in Sonny, run `/retry` and confirm; your reply authorizes that exact retry.
 

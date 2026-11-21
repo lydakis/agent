@@ -54,7 +54,7 @@ brew unlink sonny  # if stable Sonny is installed
 brew install lydakis/agent/sonny-nightly
 ```
 
-Update anytime with `brew update && brew reinstall lydakis/agent/sonny-nightly`. Check built commits with `sonny --version` and `sonny agent --version`.
+Update anytime with `brew update && brew reinstall lydakis/agent/sonny-nightly`: reinstall fetches current `main` even when the formula's version has not changed, so no `--HEAD` is needed. Check built commits with `sonny --version` and `sonny agent --version`.
 
 ### Build from source
 
