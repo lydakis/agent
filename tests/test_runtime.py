@@ -3252,7 +3252,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(client.request('inspect', bot='Nomad')['result']['workspace'], str(other.resolve()))
 
-    def test_interrupt_and_crash_recovery_are_explicit(self):
+    def test_interrupts_end_turns_and_crashes_continue_them_up_to_the_restart_limit(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='wait-1', prompt='wait')['result']['message']
@@ -3262,14 +3262,34 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
         pending = client.request('submit', bot='Bob', request_id='wait-2', prompt='wait')['result']['message']
         self.model.requests.get(timeout=3)
+        # Killed while the model answered: the next start continues the turn,
+        # the cut-off call charged as one failed attempt and asked again.
         client.close(kill=True)
         client = self.client()
+        self.assertEqual(client.finished(pending, timeout=15)['data']['status'], 'completed')
+        self.model.requests.get(timeout=3)
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        retry = next(e for e in events if e['event'] == 'retry' and e.get('turn') == pending)
+        self.assertEqual((retry['data']['attempt'], retry['data']['error'], retry['data']['restarts']),
+                         (1, 'process_interrupted', 1))
+        paced = next(e for e in events if e['event'] == 'turn_paced' and e.get('turn') == pending)
+        self.assertEqual(paced['data']['retrying'], 'process_interrupted')
+        client.close()
+        # With a restart limit of one, the first cut-off ends it, and the
+        # restart launches no paid or repeated request.
+        client = self.client(extra=('--max-restarts', '1'))
+        self.assertEqual(client.ready['limits']['restarts'], 1)
+        ended = client.request('submit', bot='Bob', request_id='wait-3', prompt='wait')['result']['message']
+        self.model.requests.get(timeout=3)
+        client.close(kill=True)
+        client = self.client(extra=('--max-restarts', '1'))
         self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'interrupted')
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
-        self.assertTrue(any(e.get('turn') == pending and e['data'].get('error') == 'process_interrupted' for e in events))
-        self.assertTrue(self.model.requests.empty())  # Restart did not launch a paid/repeated request.
+        finished = next(e for e in events if e['event'] == 'turn_finished' and e.get('turn') == ended)
+        self.assertEqual((finished['data']['error'], finished['data']['restarts']), ('process_interrupted', 1))
+        self.assertTrue(self.model.requests.empty())
 
-    def test_crash_during_a_tool_keeps_the_same_bot_usable(self):
+    def test_a_crash_during_a_tool_answers_it_and_continues_the_turn(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='crash',
@@ -3280,20 +3300,27 @@ class RuntimeTests(ModelFixture):
         self.assertTrue((self.path / 'crash-marker').exists())
         client.close(kill=True)
         self.model.requests.get(timeout=1)
+        # The next start answers the cut-off call, never runs it again, and
+        # continues the turn: the model reads the answer at once.
+        (self.path / 'crash-marker').unlink()
         client = self.client('echo,shell')
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'interrupted')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertFalse((self.path / 'crash-marker').exists())
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         results = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0]['data']['outcome_unknown'])
-        self.assertTrue(self.model.requests.empty())  # Recovery never replays the tool.
-        again = client.request('submit', bot='Bob', request_id='continue', prompt='hi')['result']['message']
-        self.assertEqual(client.finished(again)['data']['status'], 'completed')
+        # No model call was cut off, so none is charged.
+        self.assertFalse(any(e['event'] == 'retry' and e['turn'] == turn for e in events))
         history = self.model.requests.get(timeout=1)['input']
         call = next(i for i in history if i.get('type') == 'function_call')
         result = next(i for i in history if i.get('type') == 'function_call_output')
         self.assertEqual(result['call_id'], call['call_id'])
-        self.assertEqual(json.loads(result['output'])['error'], 'tool_outcome_unknown')
+        answered = json.loads(result['output'])
+        self.assertEqual(answered['error'], 'process_interrupted')
+        self.assertIn('may have had effects', answered['detail'])
+        again = client.request('submit', bot='Bob', request_id='continue', prompt='hi')['result']['message']
+        self.assertEqual(client.finished(again)['data']['status'], 'completed')
 
     def test_shell_workspace_result_and_cancelled_descendants(self):
         import psutil

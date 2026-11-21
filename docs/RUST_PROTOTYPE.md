@@ -668,6 +668,7 @@ keeps what it started with; the next start takes a change.
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count; a connection that sends no bytes at all, keepalives included, fails sooner, after 2 minutes. Whole seconds, `1s` to `24h`. `[daemon] stall_timeout` in `~/.agent/config.toml` sets it, as a duration such as `"15m"`. | `10m` |
 | `--max-depth` | How many generations below the bot that starts its line `create` and `fork` may make a bot (Codex's `agents.max_depth`). A bot made with no creator, or with `starts_line`, is at 0; one another bot creates is one below its creator; a fork its source makes stands where its source does, and one another bot makes is one below that bot. Each bot keeps its `depth`, so the check reads only its creator's row. Past the bound, `depth_limit`, with `depth` and `max_depth`, and nothing made; a resend of a keyed creation still answers with the bot it made. Zero is unbounded. Reported in `ready` as `limits.depth`, `null` for none (protocol 52). | none (the agent CLI passes `[daemon] depth`, 2 by default) |
+| `--max-restarts` | How many times in a row the daemon's process may end unplanned while a turn runs, with nothing recorded for it between, before the next start ends that turn `process_interrupted` rather than continuing it ([Durable state and recovery](#durable-state-and-recovery)); Pi Durable's `restartLimit`. Zero continues it always. `[daemon] restarts` sets it. Reported in `ready` as `limits.restarts`, `null` for none. | 5 |
 | `--durability` | How far each commit is on the disk when it is answered: `full` syncs it first, `normal` syncs at checkpoints, faster on a busy disk, and a crash of the machine or its power can lose the last commits ([Durable state and recovery](#durable-state-and-recovery)). `[daemon] durability` sets it. Reported in `ready` as `durability`. | `full` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
@@ -1373,9 +1374,9 @@ the turn parks, and its retry count starts over when it continues. The time the 
 was down is not counted in `paced_ms`. A client's `wait` still open is
 answered as its deadline would answer it, the parked turn reported pending
 as it stands. Background commands and terminals end with the daemon as
-before. Only a planned stop parks: a daemon that exits on a fatal error ends
-its running turns `interrupted` with `process_interrupted`, as a crash would,
-and leaves its waits unanswered. A panic inside one turn is not fatal: that
+before. A daemon that exits on a fatal error writes nothing more for its
+running turns and leaves its waits unanswered, as a crash would: the next
+start continues them ([Durable state and recovery](#durable-state-and-recovery)). A panic inside one turn is not fatal: that
 turn alone fails with `turn_panicked` and the panic's words, and the daemon
 and its other turns go on. A park says which halt held it in the
 turn's `waiting` record (`halt`: `pause` or `shutdown`); schema 74 moves a
@@ -2472,24 +2473,39 @@ committed before execution and the result before continuing the model loop. A
 completed checkpoint and terminal event are committed together before emitting
 completion.
 
-On recovery, unfinished active turns are marked interrupted and their bots
-accept new work. Every unanswered tool call receives a durable result: a
-planned call is cancelled before execution; an executing call with no committed
-result receives `tool_outcome_unknown`. Its effects may already have happened,
-and execution may still be running. The model sees this in history and can
-inspect current state before deciding what to do. The same rule applies to
-explicit cancellation and other terminal failures. Uncertainty never blocks the
-named bot, and no external request or tool is automatically repeated. Existing
-queued work remains eligible to start. Explicitly stopped turns stay stopped.
+On recovery, a turn the daemon was running when its process ended unplanned
+(a crash, a kill, a fatal error) goes on, as Pi Durable continues a task its
+host was cut off in (schema 112). It parks at a model-call boundary as a
+planned stop parks it, and the daemon resumes it as capacity allows. Every
+unanswered tool call receives a durable result, `{error:
+"process_interrupted", detail}`: a planned call did not run (its
+`tool_completed` says `cancelled`); an executing call's effects may already
+have happened, and execution may still be running (`outcome_unknown`). The
+model sees this in history and can inspect current state before deciding what
+to do. No tool is run again. A turn with no call open was waiting on its
+model, or about to ask it: that call counts as a failed attempt, announced as
+a `retry` (`attempt: 1`, `error: "process_interrupted"`, its `delay_ms`), and
+is asked again after the first backoff, the turn's `turn_paced` and
+`waiting_on` saying `{"resume_at_ms": AT, "retrying": "process_interrupted"}`.
+Both events carry `restarts`, the times in a row the process ended under the
+turn with nothing recorded for it between (its bot's history where the last
+one left it). At `--max-restarts` (5 by default, `[daemon] restarts`; 0 never)
+the next start ends the turn instead, `interrupted` with
+`process_interrupted`, its detail saying so and `restarts` beside it: a turn
+whose request kills the daemon ends rather than looping. Its calls are then
+answered as terminal failures answer them: a planned call is cancelled; an
+executing one receives `tool_outcome_unknown`. Uncertainty never blocks the
+named bot. Queued work behind a continued turn waits for it, as it would
+have; behind an ended one it is eligible to start. Explicitly stopped turns
+stay stopped.
 
 An interrupted turn's `turn_finished` error names the cause, so a client can
-decide whether to resubmit: `cancelled` for a client's `interrupt`
-and `process_interrupted` when the daemon died with it running and the next
-open ended it, or stopped on a fatal error, such as a store that refuses
-writes, and ended it on the way out. The daemon never continues such a turn on its own. A turn the
-daemon was asked to stop around (`shutdown` or a signal) is not interrupted:
-it parks as a pause parks it, each call still open answered `daemon_shutdown`,
-and continues at the next start; the time down is not pacing.
+decide whether to resubmit: `cancelled` for a client's `interrupt`, and
+`process_interrupted` when the daemon's process ended under it
+`--max-restarts` times in a row. A turn the daemon was asked to stop around
+(`shutdown` or a signal) is not counted: it parks as a pause parks it, each
+call still open answered `daemon_shutdown`, and continues at the next start;
+the time down is not pacing.
 
 `inspect` reports the identity's state and changes nothing; no operation
 automatically continues an interrupted network request. A new submission is an

@@ -10,7 +10,9 @@ with daemon RSS, threads, and open files sampled from outside:
 3. park: P bots wait on one anchor turn the synthetic model holds open, then
    the anchor is released and the parked turns drain through the bound;
 4. restart: submit a bounded wave held open by the synthetic provider, kill
-   the daemon, confirm its exit, and time recovery on the same store.
+   the daemon, confirm its exit, and time recovery on the same store: until
+   it is ready, and until every turn the kill cut off has settled (continued
+   to its end, or ended at once by a daemon that does not continue them).
 
 Synthetic by default (no spend). With --model PROVIDER/MODEL it runs phase 2
 against a real provider with the key from the environment; the shell-tool
@@ -221,15 +223,35 @@ class Screen:
         started = time.monotonic()
         client = self.daemon()
         ready_seconds = time.monotonic() - started
+        after_ready = self.sample('after restart')
+        # The turns the kill cut off settle: a daemon that continues them (as
+        # Pi Durable does) asks the model again and completes them; one that
+        # ends them has them interrupted already.
+        unsettled, deadline = set(range(active)), time.monotonic() + 600
+        while unsettled:
+            for index in sorted(unsettled):
+                if client.request('inspect', bot=f'b{index}')['result']['status'] not in ('running', 'paced'):
+                    unsettled.discard(index)
+            if unsettled:
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f'{len(unsettled)} turns the kill cut off never settled')
+                time.sleep(.05)
+        settled_seconds = time.monotonic() - started
         statuses = {}
         for index in range(self.bots):
             state = client.request('inspect', bot=f'b{index}')['result']
             statuses[state['status']] = statuses.get(state['status'], 0) + 1
-        if statuses.get('interrupted', 0) != active:
-            raise RuntimeError(f'restart recovered {statuses}, expected {active} interrupted bots')
+        cut_off = {}
+        for index in range(active):
+            status = client.request('turns', bot=f'b{index}')['result']['turns'][-1]['status']
+            cut_off[status] = cut_off.get(status, 0) + 1
+        if set(cut_off) - {'completed', 'interrupted'}:
+            raise RuntimeError(f'restart left the turns it cut off {cut_off}')
         self.phases['restart'] = dict(in_flight_at_kill=active,
                                       before_kill=before_kill, ready_seconds=round(ready_seconds, 3),
-                                      bot_statuses=statuses, sample=self.sample('after restart'))
+                                      settled_seconds=round(settled_seconds, 3), cut_off=cut_off,
+                                      bot_statuses=statuses, sample=after_ready,
+                                      settled_sample=self.sample('settled'))
 
     def run(self):
         self.daemon()
@@ -246,7 +268,7 @@ class Screen:
             if self.with_restart:
                 self.restart()
                 print('restart', self.phases['restart'], file=sys.stderr)
-        result = dict(schema='fleet_screen_v4', created_at=datetime.now(timezone.utc).isoformat(),
+        result = dict(schema='fleet_screen_v5', created_at=datetime.now(timezone.utc).isoformat(),
                       binary_sha256=file_hash(self.binary), bots=self.bots, max_active=self.max_active,
                       model=self.model or 'synthetic', parked=self.parked if not self.model else 0,
                       delay_ms=self.delay_ms if not self.model else None,

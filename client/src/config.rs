@@ -20,6 +20,7 @@
 //! stall_timeout = "10m"         # a provider stream with no content this long is retried, the default
 //! depth = 3                     # generations a new agent may be below the one that starts its line, 2 by default; 0 no end
 //! durability = "normal"         # commits sync at checkpoints, faster on a busy disk; a machine crash can lose the last ones; "full", the default, syncs each
+//! restarts = 3                  # times in a row the daemon may stop unplanned under a turn, nothing recorded between, before it ends that turn rather than going on; 5 by default, 0 no end
 //!
 //! [fallbacks]                   # the model a declined request goes to, for every agent that names none; restart the daemon to apply
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"  # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
@@ -292,7 +293,7 @@ pub fn duration_ms(value: &str) -> Option<u64> {
 /// the agent CLI starts a daemon with when the file gives none: none is
 /// the daemon's own default. A count rounds down; `load` keeps its
 /// fraction.
-pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 10] = [
+pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 11] = [
     ("processes", "--max-processes", None),
     ("lasting", "--max-lasting", None),
     ("active", "--max-active", None),
@@ -306,6 +307,8 @@ pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 10] = [
     // As Codex's agents.max_depth: an agent's helpers may start their own,
     // which start none.
     ("depth", "--max-depth", Some("2")),
+    // As Pi Durable's restartLimit, the daemon's own default.
+    ("restarts", "--max-restarts", None),
 ];
 
 /// The machine a formula is worked out for: its logical CPUs and its

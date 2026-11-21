@@ -50,9 +50,6 @@ pub const INTERRUPTED: &str = "cancelled";
 /// The daemon stopping around a running turn, which parks it for the next
 /// start rather than ending it.
 pub const SHUTDOWN: &str = "daemon_shutdown";
-/// The daemon stopping on a fatal error around a running turn, which ends
-/// it as a crash would: only a planned stop parks a turn.
-pub const DIED: &str = "process_interrupted";
 /// A running turn's end when the daemon is paused.
 pub const PAUSED: &str = "daemon_paused";
 /// Attempts per model call before its failure is the turn's failure, and the
@@ -7748,7 +7745,7 @@ const BACKOFF_PARK: std::time::Duration = std::time::Duration::from_secs(1);
 /// 250 ms doubling to 30 s, spread by up to a fifth either way so several
 /// daemons on one key do not retry in step. Deterministic per turn and
 /// attempt, so it costs a few integer operations.
-fn backoff(attempt: u32, seed: u64) -> std::time::Duration {
+pub(super) fn backoff(attempt: u32, seed: u64) -> std::time::Duration {
     let base = 250u64.saturating_mul(1u64 << (attempt.saturating_sub(1)).min(7));
     let base = base.min(30_000);
     let mut x = seed ^ (u64::from(attempt) << 32) ^ 0x9E37_79B9_7F4A_7C15;

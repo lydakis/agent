@@ -1784,6 +1784,11 @@ impl Blocked {
             .min(left)
     }
 }
+/// The times in a row the daemon's process may end while a turn runs, with
+/// nothing recorded between, before the next start ends it rather than
+/// continuing it, unless the daemon is told otherwise: Pi Durable's
+/// `restartLimit` (packages/durable/src/harness/agent.ts at 31b407d).
+pub const RESTART_LIMIT: u32 = 5;
 /// The first and the longest wait between tries of a held turn.
 pub const HOLD_FIRST_MS: u64 = 60_000;
 /// How long a turn is held unless its bot says otherwise.
@@ -3786,7 +3791,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 111;
+    pub const SCHEMA: i32 = 112;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -4184,7 +4189,8 @@ impl Database {
                 tool_calls INTEGER NOT NULL DEFAULT 0, tool_ms INTEGER NOT NULL DEFAULT 0,
                 tools_until_ms INTEGER, timed_rounds INTEGER NOT NULL DEFAULT 0,
                 timed_output_tokens INTEGER NOT NULL DEFAULT 0, model_ms INTEGER NOT NULL DEFAULT 0,
-                first_token_ms INTEGER NOT NULL DEFAULT 0);
+                first_token_ms INTEGER NOT NULL DEFAULT 0,
+                restarts INTEGER NOT NULL DEFAULT 0, restart_head INTEGER);
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started_ms ON turns(started_ms);
             CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
@@ -4343,18 +4349,23 @@ impl Database {
         for name in deleting {
             db.delete_bot(&name)?;
         }
-        // A committed tool intent without a result is never automatically
-        // retried. Turns parked on handles keep their state and resume.
-        let pending: Vec<i64> = db
-            .conn
-            .prepare("SELECT id FROM turns WHERE status='running'")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for turn in pending {
-            db.finish(turn, Some(&Error::new("process_interrupted")))?;
+        // Turns parked on handles keep their state and resume. Those still
+        // running when the process ended wait for the daemon, which
+        // continues them (`continue_cut_off`), but for those a store from
+        // before 112 holds: an older daemon left them, or a migration staged
+        // them to end, so they end as that daemon would have ended them.
+        if version != 0 && version < 112 {
+            let pending: Vec<i64> = db
+                .conn
+                .prepare("SELECT id FROM turns WHERE status='running'")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for turn in pending {
+                db.finish(turn, Some(&Error::new("process_interrupted")))?;
+            }
         }
         // Queued messages outlive a restart. The oldest one of each idle bot
-        // waits only for a slot; those behind a parked turn stay queued.
+        // waits only for a slot; those behind a turn stay queued.
         db.conn.execute(
             "UPDATE messages SET status='ready' WHERE id IN (
                 SELECT MIN(m.id) FROM messages m JOIN bots b ON b.name=m.bot
@@ -14726,13 +14737,6 @@ impl Database {
             }
             _ => return fail("invalid_tool_state"),
         }
-        let unanswered: Vec<String> = self
-            .conn
-            .prepare(
-                "SELECT call_id FROM tools WHERE turn=? AND status IN ('planned','executing')",
-            )?
-            .query_map([turn], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
         // Why, who and when; not whose turns it parked.
         let pause = match stop {
             Halt::Pause => self
@@ -14778,8 +14782,16 @@ impl Database {
         // resume or the next start, so they say the halt is over; read as
         // a halt still holding, they made models report and stop. Facts
         // only: what to do about a cut call is the client's to say.
-        let (head, mut entries) = close_unanswered(&tx, &bot, turn, bot.head, |executing| {
-            let result = match (stop, executing) {
+        let reason = match stop {
+            Halt::Pause => "the pause stopped the call",
+            Halt::Shutdown => "the daemon stopped the call",
+        };
+        let (mut entries, released) = release_unanswered(
+            &tx,
+            &bot,
+            turn,
+            reason,
+            |executing| match (stop, executing) {
                 (Halt::Pause, true) => json!({"error":"daemon_paused","detail":
                     "the pause stopped this call before its result was recorded, so it may have had effects; nothing has run it again. Work has since resumed and this turn goes on",
                     "pause":pause}),
@@ -14789,54 +14801,8 @@ impl Database {
                     "the daemon stopped this call before its result was recorded, so it may have had effects; nothing has run it again. The daemon has since started again and this turn goes on"}),
                 (Halt::Shutdown, false) => json!({"error":"daemon_shutdown","detail":
                     "the daemon stopped before this call ran, so it did not run. The daemon has since started again and this turn goes on"}),
-            };
-            // A call cut off while it ran may have had effects: its event
-            // says the outcome is unknown, as its result does.
-            (result, executing)
-        })?;
-        if head != bot.head {
-            // Every call of the round is answered, so the round is closed.
-            tx.execute(
-                "UPDATE bots SET head=?1,closed=?1,open_calls=0 WHERE name=?2",
-                params![head, bot.name],
-            )?;
-        }
-        // What waited on those calls went with them: their requests, what a
-        // client was to answer, and each step a call asked about, denied as
-        // an answered call's are.
-        let (mut requests, mut steps, mut ended) = (0, Vec::new(), Vec::new());
-        for call_id in &unanswered {
-            let asked: Vec<(i64, String, String)> = tx
-                .prepare_cached(
-                    "DELETE FROM approvals WHERE turn=? AND step_of=? RETURNING id,call_id,name",
-                )?
-                .query_map(params![turn, call_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            for (approval, id, name) in asked {
-                let reason = match stop {
-                    Halt::Pause => "the pause stopped the call",
-                    Halt::Shutdown => "the daemon stopped the call",
-                };
-                let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
-                    "reason":reason,"approvals":[]});
-                event(&tx, &bot.name, Some(turn), "step_decided", data)?;
-                steps.push(approval);
-            }
-            requests += tx
-                .prepare_cached(
-                    "DELETE FROM approvals WHERE turn=? AND call_id=? AND step_of IS NULL",
-                )?
-                .execute(params![turn, call_id])? as i64;
-            if tx
-                .prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
-                .execute(params![turn, call_id])?
-                > 0
-            {
-                ended.push(call_id);
-            }
-        }
+            },
+        )?;
         tx.execute(
             "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
                 summary_ms=summary_ms+? WHERE id=?",
@@ -14856,16 +14822,144 @@ impl Database {
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
-        self.approvals -= requests + steps.len() as i64;
-        for approval in steps {
-            self.unstep(approval, true);
-        }
-        // Its answered calls end with the halt: their daemon steps are told.
-        for call_id in ended {
-            self.call_ended(turn, call_id);
-        }
+        self.released(turn, released);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
         Ok(Halted::Parked(entries))
+    }
+    /// What a park that answered its turn's open calls let go of, once it
+    /// commits: their requests and the steps they asked about leave the
+    /// counts, and the daemon steps of its answered calls are told.
+    fn released(&mut self, turn: i64, released: Released) {
+        self.approvals -= released.requests + released.steps.len() as i64;
+        for approval in released.steps {
+            self.unstep(approval, true);
+        }
+        for call_id in released.ended {
+            self.call_ended(turn, &call_id);
+        }
+    }
+    /// Continue each turn the daemon's process left running when it ended
+    /// unplanned, a crash, a kill or a fatal error, rather than end it, as
+    /// Pi Durable continues a task its host was cut off in. It parks as a
+    /// planned stop leaves it, at a model-call boundary: each call it had
+    /// not answered gets a result saying the daemon's process ended before
+    /// the call ran, or while it ran so it may have had effects, and none
+    /// is run again. A turn that had no call open was waiting on its model,
+    /// or about to ask it: that call counts as a failed attempt and is
+    /// asked again after its backoff, `delay_ms` of the turn. Its
+    /// cut-offs are counted, and a turn cut off `limit` times in a row
+    /// with nothing recorded between (its bot's history where the last
+    /// cut-off left it) ends `process_interrupted` instead, so a turn that
+    /// kills the daemon does not do so forever; no limit continues it
+    /// always. Called once, as the daemon starts.
+    pub fn continue_cut_off(
+        &mut self,
+        limit: Option<u32>,
+        delay_ms: impl Fn(i64) -> u64,
+    ) -> Result<()> {
+        let running: Vec<(i64, i64, Option<i64>)> = self
+            .conn
+            .prepare("SELECT id,restarts,restart_head FROM turns WHERE status='running'")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (turn, restarts, mark) in running {
+            let bot = self.active(turn)?;
+            let restarts = match restarts > 0 && mark == bot.head {
+                true => restarts + 1,
+                false => 1,
+            };
+            if limit.is_some_and(|limit| restarts >= i64::from(limit)) {
+                let ended = Error::with(
+                    "process_interrupted",
+                    format!(
+                        "the daemon's process ended during this turn {restarts} times in a row with nothing recorded between, so it was not continued again"
+                    ),
+                )
+                .facts(json!({"restarts":restarts}));
+                self.finish(turn, Some(&ended))?;
+                continue;
+            }
+            self.park_cut_off(turn, bot, restarts, delay_ms(turn))?;
+        }
+        Ok(())
+    }
+    /// Park `turn`, cut off for the `restarts`th time in a row, for
+    /// `continue_cut_off`.
+    fn park_cut_off(&mut self, turn: i64, bot: Bot, restarts: i64, delay_ms: u64) -> Result<()> {
+        let tx = self.conn.savepoint()?;
+        let calling: bool = tx.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status IN ('planned','executing'))",
+            [turn],
+            |r| r.get(0),
+        )?;
+        let (_, released) = release_unanswered(
+            &tx,
+            &bot,
+            turn,
+            "the daemon's process ended",
+            |executing| match executing {
+                true => json!({"error":"process_interrupted","detail":
+                    "the daemon's process ended while this call ran, before its result was recorded, so it may have had effects; nothing has run it again. The daemon has since started again and this turn goes on"}),
+                false => json!({"error":"process_interrupted","detail":
+                    "the daemon's process ended before this call ran, so it did not run. The daemon has since started again and this turn goes on"}),
+            },
+        )?;
+        let head: Option<i64> = tx
+            .prepare_cached("SELECT head FROM bots WHERE name=?")?
+            .query_row([&bot.name], |r| r.get(0))?;
+        let now = epoch_ms();
+        // Only a model call that was asked and not answered is charged.
+        let delay_ms = if calling { delay_ms } else { 0 };
+        let resume_at_ms = (now.max(0) as u64).saturating_add(delay_ms);
+        if calling {
+            let data = json!({"attempt":1,"error":"process_interrupted","detail":
+                "the daemon's process ended while this call was asked or answered",
+                "delay_ms":delay_ms,"parked":true,"restarts":restarts});
+            event(&tx, &bot.name, Some(turn), "retry", data)?;
+        }
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: String::new(),
+            handles: Vec::new(),
+            deadline_ms: Some(resume_at_ms),
+            any: false,
+            pending: Vec::new(),
+            paced_since_ms: Some(now),
+            call_attempts: u32::from(calling),
+            call_spent_ms: delay_ms,
+            // It continues from the whole boundary, compaction included: the
+            // results just written may have filled the window, and the call
+            // cut off may have been a summary.
+            compaction: true,
+            route: None,
+            approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
+            answer: None,
+            copied: None,
+            summary_retry_ms: None,
+            fallback: None,
+            halt: None,
+            blocked: None,
+            retrying: Some("process_interrupted".into()),
+            held_since_ms: None,
+            poll: false,
+            load: false,
+            rulings: BTreeMap::new(),
+        };
+        tx.execute(
+            "UPDATE turns SET status='paced',waiting=?,restarts=?,restart_head=? WHERE id=?",
+            params![serde_json::to_string(&waiting)?, restarts, head, turn],
+        )?;
+        let data = json!({"resume_at_ms":resume_at_ms,"retrying":"process_interrupted",
+            "restarts":restarts});
+        parked(&tx, &bot.name, "paced", &data)?;
+        event(&tx, &bot.name, Some(turn), "turn_paced", data)?;
+        tx.commit()?;
+        self.released(turn, released);
+        Ok(())
     }
     /// Every parked turn, on handles or on a pool, for re-registration after
     /// a restart.
@@ -19225,6 +19319,76 @@ fn announcements(calls: Vec<Value>) -> Result<Vec<Vec<Value>>> {
     }
     Ok(events)
 }
+/// What a park that answered its turn's open calls let go of: their
+/// requests, the steps they asked about, and the answered calls that end.
+struct Released {
+    requests: i64,
+    steps: Vec<i64>,
+    ended: Vec<String>,
+}
+/// Answer every call of `turn` that has no result with what `result` says
+/// of it (`executing`: it had started, so its outcome is unknown), close
+/// the round they were in, and let go of what waited on them: their
+/// requests, what a client was to answer, and each step a call asked
+/// about, denied for `reason` as an answered call's are.
+fn release_unanswered(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    reason: &str,
+    result: impl Fn(bool) -> Value,
+) -> Result<(Vec<Value>, Released)> {
+    let unanswered: Vec<String> = tx
+        .prepare_cached(
+            "SELECT call_id FROM tools WHERE turn=? AND status IN ('planned','executing')",
+        )?
+        .query_map([turn], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    // A call cut off while it ran may have had effects: its event says the
+    // outcome is unknown, as its result does.
+    let (head, entries) = close_unanswered(tx, bot, turn, bot.head, |executing| {
+        (result(executing), executing)
+    })?;
+    if head != bot.head {
+        // Every call of the round is answered, so the round is closed.
+        tx.execute(
+            "UPDATE bots SET head=?1,closed=?1,open_calls=0 WHERE name=?2",
+            params![head, bot.name],
+        )?;
+    }
+    let mut released = Released {
+        requests: 0,
+        steps: Vec::new(),
+        ended: Vec::new(),
+    };
+    for call_id in unanswered {
+        let asked: Vec<(i64, String, String)> = tx
+            .prepare_cached(
+                "DELETE FROM approvals WHERE turn=? AND step_of=? RETURNING id,call_id,name",
+            )?
+            .query_map(params![turn, call_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (approval, id, name) in asked {
+            let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
+                "reason":reason,"approvals":[]});
+            event(tx, &bot.name, Some(turn), "step_decided", data)?;
+            released.steps.push(approval);
+        }
+        released.requests += tx
+            .prepare_cached("DELETE FROM approvals WHERE turn=? AND call_id=? AND step_of IS NULL")?
+            .execute(params![turn, call_id])? as i64;
+        if tx
+            .prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
+            .execute(params![turn, call_id])?
+            > 0
+        {
+            released.ended.push(call_id);
+        }
+    }
+    Ok((entries, released))
+}
 /// Answer each call of `turn` that has no result yet, in the order they
 /// were made, with what `output` says of it (given whether it had started),
 /// on from `head`. `output` also says whether its outcome is unknown rather
@@ -20475,7 +20639,8 @@ fn migrate_by_columns(conn: &Connection, from: i32) -> Result<()> {
         // result delivered a background process. A parked turn's closed
         // node cannot be read back without a transcript scan, so the
         // upgrade ends it rather than guess: it joins the running turns
-        // that every open interrupts, and its history is kept. A process
+        // that the open of a store from before 112 ends, and its history is
+        // kept. A process
         // finished before it is readable by the bot that started it alone.
         conn.execute_batch(
             "ALTER TABLE bots ADD COLUMN closed INTEGER;
@@ -21538,6 +21703,24 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
             |r| r.get::<_, bool>(0),
         )? {
             conn.execute("ALTER TABLE bots ADD COLUMN family_start INTEGER", [])?;
+        }
+    }
+
+    // Schema 112: a turn counts the times in a row the daemon's process
+    // ended while it ran, and where its bot's history stood the last time,
+    // so the daemon continues it and a turn that keeps ending the process
+    // ends. A turn from before has none yet.
+    if from < 112 {
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='restarts')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(
+                "ALTER TABLE turns ADD COLUMN restarts INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE turns ADD COLUMN restart_head INTEGER;",
+            )?;
         }
     }
 

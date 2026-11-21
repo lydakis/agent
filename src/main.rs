@@ -400,6 +400,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_readers = None;
     let mut max_load = None;
     let mut max_depth = None;
+    let mut max_restarts = Some(agent_runtime::store::RESTART_LIMIT);
     let mut idle_exit = None;
     let mut await_owner = None;
     let mut stall_timeout = None;
@@ -489,6 +490,12 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
                 max_depth = (depth > 0).then_some(depth);
             }
+            "--max-restarts" => {
+                let restarts: u32 = value
+                    .parse()
+                    .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
+                max_restarts = (restarts > 0).then_some(restarts);
+            }
             // `prepare` has checked each range.
             "--stall-timeout" => stall_timeout = Some(cli::duration_secs(flag, value)?),
             "--idle-exit" => {
@@ -534,6 +541,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         models,
         provider_config,
         max_depth,
+        max_restarts,
         durability,
     })
 }

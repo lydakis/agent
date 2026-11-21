@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --stall-timeout --idle-exit --durability";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --max-restarts --stall-timeout --idle-exit --durability";
 
 struct Command {
     name: &'static str,
@@ -454,6 +454,10 @@ fn print_flags(flags: &str) {
             "--max-depth" => (
                 "N",
                 "Most generations a new bot may be below the bot that starts its line; 0 is unbounded",
+            ),
+            "--max-restarts" => (
+                "N",
+                "The times in a row the daemon's process may end while a turn runs, with nothing recorded between, before the next start ends that turn rather than continuing it; 0 continues it always; default 5",
             ),
             "--max-output-tokens" => (
                 "N",
