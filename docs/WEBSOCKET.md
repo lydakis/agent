@@ -191,8 +191,10 @@ a client attaching to a daemon compares it like the family and URL, and
   the request as well as each read, so a provider that stops reading cannot
   hold a turn or its permit.
 - A socket message is whole, so the input is assembled in memory before it
-  is sent, unlike the streamed HTTP body. Incoming messages and frames are
-  bounded at 16 MiB, the HTTP path's response bound. A continuation is small; a full
+  is sent, unlike the streamed HTTP body. An incoming message is bounded at
+  64 MiB and a frame at 16 MiB, tungstenite's defaults, which Codex keeps;
+  an SSE frame has the same 64 MiB bound, and a whole response has none.
+  A continuation is small; a full
   send holds one copy of the window.
 - Not built: warmup with `generate: false`, lanes, and HTTP after a failed
   upgrade; a failed connection is retried like an HTTP connection failure.

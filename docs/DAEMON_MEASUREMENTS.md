@@ -12626,3 +12626,42 @@ keeps the daemon at speed, where full spends each commit waiting on the
 drive. The cost: a crash of the machine or a power loss can lose the
 commits made since the last checkpoint. A crash of the daemon loses
 nothing in either mode, and the store is never corrupted.
+
+## No bound on a whole provider reply (#1269)
+
+2026-11-21, Linux x86_64 cloud VM, 4 CPUs. Main is `db1ec0b`, copied when
+the change was built; each binary's page cache is dropped before each run,
+and the sides alternate. The change drops the running total that read_body
+and the socket loop kept and checked per chunk, and raises the bound on one
+event (an SSE frame or a WebSocket message) from 16 to 64 MiB. Neither
+bound allocates up front: a buffer grows only as an event arrives.
+
+### Matched screen (perf gate's benches, alternating, five rounds)
+
+| Bench | Measure | Main | Change |
+| --- | --- | ---: | ---: |
+| lifecycle, 32-bot socket echo | CPU, s | 0.78 | 0.76 |
+| lifecycle | p95 turn, ms | 591 | 594 |
+| lifecycle | peak RSS, MiB | 28.6 | 28.4 |
+| completion_burst | release to terminal p99, ms | 15.0 (12.2 to 17.2) | 14.5 (11.5 to 22.0) |
+| admission_burst | lone submit CPU, ms | 48.0 | 47.3 |
+| admission_burst | burst submit p99, ms | 6.16 | 6.20 |
+| footprint | idle RSS, MiB | 20.8 | 20.2 |
+| footprint | per idle bot, KiB | 1.21 | 1.21 |
+| footprint | RSS after a turn each, MiB | 36.2 | 35.1 |
+| footprint | CPU per turn, ms | 1.09 (0.99 to 1.34) | 1.08 (0.99 to 1.25) |
+
+### High end: 10,000 bots, one turn each (medians)
+
+| Measure | Main | Change |
+| --- | ---: | ---: |
+| idle PSS, MiB (5 runs) | 18.6 | 18.7 |
+| PSS after 10,000 bots (5 runs) | 20.9 | 20.9 |
+| PSS after a turn each (5 runs) | 40.2 (34.1 to 42.2) | 39.8 (38.1 to 41.0) |
+| RSS after a turn each, MiB (7 runs) | 41.9 (35.9 to 44.0) | 41.5 (39.9 to 43.0) |
+| CPU per turn, ms (7 runs) | 1.15 | 1.15 |
+
+Store work per turn matched on every run. The first two rounds of the
+first screen read the change 6% slower on completion p99 and 10% on burst
+submit p99; over all five rounds those read -4% and +0.6%, and every
+range overlaps main's.
