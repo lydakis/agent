@@ -1,34 +1,47 @@
 # Sonny's reviewer
 
-Sonny's reviewer is the model that decides each gated call of an agent in
-Auto (`/permissions`), and `sonny reviewer`, the program that asks it. Sonny
-keeps the program running as the daemon's companion `sonny-reviewer`,
-serving the daemon's `auto` gate tag, so to the daemon it is that tag's
-approver ([the daemon's words](../src/AGENTS.md#words)). Its model is
-`[reviewer] model` in `~/.agent/config.toml` (`effort` beside it), else the
-agent's own; `sonny reviewer --model PROVIDER/MODEL` and `--effort` override
-them, and `AGENT_REVIEWER_NOTE` or `--note` names a file it always sees.
-A round has `[reviewer] timeout_ms` for its verdict, every attempt
-included: 90 s unset, as Codex's `auto_review.timeout_ms`, and 0 for as
-long as it takes. A check that gives up on a turn still running logs where
-that turn was (`review_failed` with `hung`: its status, rounds, retries,
-time held back, and how long since it last wrote) before its fork is
-removed.
+When an agent runs in **Auto** mode (`/permissions`), commands and edits inside its sandbox run freely. Any call that **leaves the sandbox** (escalated shell commands, writes outside allowed folders, or Sonny tools acting outside the workspace) is reviewed automatically by a model via the daemon companion `sonny-reviewer` (`sonny reviewer`, serving the `auto` gate tag, so to the daemon it is that tag's approver: [the daemon's words](../src/AGENTS.md#words)).
+
+[Quick overview](#how-auto-works-today) · [Configuration](#configuration) · [How it reviews](#how-it-reviews) · [Measured](#measured) · [Built so far](#built-so-far)
+
+## How Auto works today
+
+- **What gets reviewed:** Only calls that escape the sandbox (or Sonny tools acting outside it). Confined workspace reads, edits, builds, and branch git operations run without asking.
+- **How decisions are made:** Since 2026-10-27, `sonny reviewer` follows **Codex's guardian reviewer policy** (read at `openai/codex` `cf2c04b`) using strict JSON Schema output (`output_schema`). Each call is scored on `risk_level` (`low`, `medium`, `high`, `critical`) and `user_authorization` (`unknown`, `low`, `medium`, `high`):
+  - **Low / medium risk:** Allowed automatically.
+  - **High risk:** Allowed only with at least medium user authorization on a narrow action; otherwise denied immediately with the rationale so the agent can take a safer route or ask you.
+  - **Critical risk** (e.g., tampering with approval channels): Always denied.
+- **What the reviewer sees:**
+  - **Trusted:** Your own messages (`request`, `earlier_prompts`, `persons_words`, including words from delegating turns), your answered `ask` decisions (strictly scoped to `covers`), unmodified `AGENTS.md` standing instructions, and any optional `--note` file.
+  - **Untrusted evidence:** The agent's recent transcript (messages, tool calls, tool outputs) and its escalation justification. Memory is never shown to the reviewer (since agents write memory).
+  - **Read-only inspection:** When sandboxing is available, the reviewer runs as a forked read-only bot (`.reviewer.TAG`) with `read` and read-only `shell` (no writes, no network) so it can inspect targets before deciding.
+  - **Secret redaction:** Known API keys, tokens, headers, PEM blocks, and high-entropy secrets are replaced with typed placeholders (`[secret: bearer token]`) before leaving the machine.
+- **Failures, timeouts, and circuit breaker:**
+  - Review rounds retry up to 3 times within `timeout_ms` (default 90s). Unassessed or timed-out calls fail closed and are returned to the agent labeled `unreviewed` (not counted toward the breaker) rather than hanging overnight. Only calls too large to fit the reviewer's input budget fall back to asking you directly.
+  - **Circuit breaker:** **3 denials in a row** or **10 among the last 50** decided calls in a turn interrupt the turn so a looping agent stops and reports back.
+
+## Configuration
+
+Set reviewer options in `~/.agent/config.toml` (or via `/config`):
+
+```toml
+[reviewer]
+model = "anthropic/claude-sonnet-5"   # defaults to the agent's own model
+effort = "low"                        # defaults to the model's own effort
+timeout_ms = 90000                    # 90s default; 0 = unlimited
+```
+
+- `timeout_ms` covers a round's every attempt, as Codex's `auto_review.timeout_ms`. A check that gives up on a turn still running logs where that turn was (`review_failed` with `hung`: its status, rounds, retries, time held back, and how long since it last wrote) before its fork is removed.
+- Pass `--model`, `--effort`, or `--note FILE` (or `AGENT_REVIEWER_NOTE`, a file it always sees) to `sonny reviewer` to override.
+- Each round asks a fork of one base bot, `.reviewer.TAG`, whose leading dot marks it as one of Sonny's own: no folder's agents share the name, and the sky and the agent picker leave it out. Before 0.9.1 these were `[judge]`, `sonny approver --judge`, `AGENT_APPROVER_NOTE`, the companion `approver-auto`, and the base `approver.TAG`; the upgrade renames each.
+- Put standing permissions or boundaries (e.g., "never push to main") in `~/.agents/AGENTS.md` or your project's `AGENTS.md`—the reviewer trusts unmodified `AGENTS.md` files as your standing instructions.
+- To allow a denied call once in Sonny, run `/retry` and confirm; your reply authorizes that exact retry.
 
 ![/config with the reviewer's timeout_ms picked: 90000 unset, and what it sets](../docs/sonny/config-reviewer-timeout.png)
 
-Each round asks a fork of one base bot, `.reviewer.TAG`, whose leading dot
-marks it as one of Sonny's own: no folder's agents share the name, and the
-sky and the agent picker leave it out. Before 0.9.1 these were `[judge]`,
-`sonny approver --judge`, `AGENT_APPROVER_NOTE`, the companion
-`approver-auto` and the base `approver.TAG`; the upgrade renames each.
+---
 
-This note is the reviewer's design, measurements and build record, moved
-out of [APPROVALS.md](../docs/APPROVALS.md) on 2026-11-08, which keeps the
-daemon's mechanism in the daemon's words. Dated facts are as recorded then.
-The record called the reviewer "the automatic approver" and its model "the
-judge"; older command names (`agent approver`) are kept where they are
-history.
+*Everything below is the detailed design, history, and measurement record (moved from [APPROVALS.md](../docs/APPROVALS.md) on 2026-11-08). Dated facts and older terminology ("the automatic approver", "the judge", `agent approver`, Jev, Decisions API) are preserved as recorded for historical evidence.*
 
 ## How it reviews
 
