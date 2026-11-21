@@ -150,7 +150,7 @@ loaded, so keep the source's read-only token in a file both `quiet` and the
 job read, such as `token` in the job folder with mode 600.
 
 The job posts to the lead (step 8) with its send_message tool: `to` LEAD,
-`delivery` `queue`, `request_id` KEY and the text as `message`. A request id
+`request_id` KEY and the text as `message`. A request id
 takes only letters, digits, `.`, `_` and `-`, so KEY is the post's key with
 every other character turned into `_`, for example
 `brief_2026-01-05_07_30_-0500`.
