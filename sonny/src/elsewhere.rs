@@ -224,11 +224,13 @@ impl Shared {
     }
 
     /// Whether `bot`, one of `agents`, is below `window`: `window` is
-    /// above it, or a lead `window` follows is.
+    /// above it, or it is a lead `window` follows, or one is above it.
     pub fn is_below(&self, bot: &str, window: &str, follows: &[String]) -> bool {
+        let followed = |over: &str| follows.iter().any(|lead| lead == over);
         bot != window
-            && (self.above.get(bot).into_iter().flatten())
-                .any(|over| over == window || follows.iter().any(|lead| lead == over))
+            && (followed(bot)
+                || (self.above.get(bot).into_iter().flatten())
+                    .any(|over| over == window || followed(over)))
     }
 
     /// What needs the person outside `project`.
@@ -891,6 +893,9 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         let mut read = false;
         let mut forked = false;
         if ours && event["event"] == "forked" {
+            // Who made it, as a made agent's: a name made again is another's.
+            let by = event["data"]["created_by"].as_str().unwrap_or_default();
+            made_by.made(&bot, by, &order);
             let stirred = needs.stirred(&bot);
             if let Some(seen) = needs::scan(&client, &bot, None).await
                 && needs.stirred(&bot) == stirred
@@ -923,12 +928,16 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         let again = ours
             && event["event"] == "turn_finished"
             && (event["turn"].as_i64()).is_some_and(|turn| needs.ends_steps_of_unseen(&bot, turn));
+        // Whether it waits changed, or which of its calls are held, or its
+        // question: each is told.
+        let (held, asked) = (needs.held_by(&bot), needs.version());
         let mut changed = ours && needs.event(&event);
-        if again && let Ok(held) = needs::listing(&client, Some(&bot)).await {
+        if again && let Ok(listed) = needs::listing(&client, Some(&bot)).await {
             let was = needs.waits(&bot);
-            needs.held(held, |of| of == bot);
+            needs.held(listed, |of| of == bot);
             changed |= was != needs.waits(&bot);
         }
+        changed |= ours && (held != needs.held_by(&bot) || asked != needs.version());
         // Closed, it needs no one, as `/status` lists it no more.
         if ours && event["event"] == "closed" {
             changed |= needs.waits(&bot);
@@ -1581,6 +1590,7 @@ mod tests {
                 ),
                 ("shop.fix".to_owned(), chain(&["shop.lead", "top.lead"])),
                 ("calc.add".to_owned(), chain(&["calc.lead"])),
+                ("calc.lead".to_owned(), Vec::new()),
                 ("top.lead".to_owned(), Vec::new()),
             ]
             .into(),
@@ -1588,6 +1598,7 @@ mod tests {
                 ("shop.fix.tests".to_owned(), ask("Which suite?")),
                 ("shop.fix".to_owned(), ask("Which fix?")),
                 ("calc.add".to_owned(), ask("Round?")),
+                ("calc.lead".to_owned(), ask("Which release?")),
                 ("top.lead".to_owned(), ask("Own?")),
             ]
             .into(),
@@ -1602,10 +1613,12 @@ mod tests {
         assert_eq!(below("shop.lead", &[]), ["shop.fix", "shop.fix.tests"]);
         assert_eq!(below("shop.fix", &[]), ["shop.fix.tests"]);
         assert!(below("shop.fix.tests", &[]).is_empty());
+        // A lead followed: its own question too, and its tasks'.
         assert_eq!(
             below("top.lead", &["calc.lead".to_owned()]),
-            ["calc.add", "shop.fix", "shop.fix.tests"]
+            ["calc.add", "calc.lead", "shop.fix", "shop.fix.tests"]
         );
+        assert_eq!(below("calc.lead", &[]), ["calc.add"]);
         assert!(shared.is_below("calc.add", "top.lead", &["calc.lead".to_owned()]));
         assert!(!shared.is_below("top.lead", "top.lead", &[]));
     }
@@ -2030,9 +2043,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(names(&heard.borrow().outside("site")), ["tally.readme"]);
+        // Another call held by one that waits already, and one let go
+        // while another waits on: each told, for the windows above.
+        go.send(held("tally.readme", "c3b", 12)).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| shared.calls.len() == 2))
+            .await
+            .unwrap()
+            .unwrap();
+        go.send(started("tally.readme", "c3", 13)).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| shared.calls.len() == 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            heard.borrow().calls,
+            [("tally.readme".to_owned(), 1, "c3b".to_owned())].into()
+        );
         // Closed while its turn runs, it needs no one, and what that turn
         // asks after needs no one either, till a message opens it again.
-        let closed = json!({"cursor": 12, "bot": "tally.readme", "event": "closed",
+        let closed = json!({"cursor": 14, "bot": "tally.readme", "event": "closed",
             "data": {"closed_ms": 1}});
         go.send(closed).unwrap();
         tokio::time::timeout(wait, heard.wait_for(|shared| shared.agents.is_empty()))
@@ -2049,9 +2078,9 @@ mod tests {
                 break;
             }
         }
-        go.send(held("tally.readme", "c4", 13)).unwrap();
-        go.send(held("site.shut", "c6", 13)).unwrap();
-        go.send(held("site.fix", "c5", 14)).unwrap();
+        go.send(held("tally.readme", "c4", 15)).unwrap();
+        go.send(held("site.shut", "c6", 15)).unwrap();
+        go.send(held("site.fix", "c5", 16)).unwrap();
         tokio::time::timeout(wait, heard.wait_for(|shared| !shared.agents.is_empty()))
             .await
             .unwrap()

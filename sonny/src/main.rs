@@ -746,6 +746,13 @@ impl App {
         self.zen.is_none() && self.options.side.is_none() && !self.options.embedded
     }
 
+    /// Whether the questions below this window's agent are followed here,
+    /// from the store's one follow: where **Projects** shows, and in an
+    /// agent shown beside, whose helpers ask it too.
+    fn questions_here(&self) -> bool {
+        self.projects_here() || (self.options.embedded && self.zen.is_none())
+    }
+
     /// **Projects** in the conversation's place, the pick on the project
     /// the window is in: `←` with nothing typed, `/projects`, or a click
     /// on the footer's `← ? N`. Every agent's row is asked of the store's
@@ -827,12 +834,13 @@ impl App {
     }
 
     /// What needs the person in every project, followed for as long as
-    /// the window is open where **Projects** shows, by one window of the
-    /// store for all ([`elsewhere`]): started once the window's own footer
-    /// is counted, so the window's start comes first, and again a few
-    /// seconds after it stopped, as when the daemon went.
+    /// the window is open where **Projects** shows or its questions are
+    /// ([`App::questions_here`]), by one window of the store for all
+    /// ([`elsewhere`]): started once the window's own footer is counted,
+    /// so the window's start comes first, and again a few seconds after it
+    /// stopped, as when the daemon went.
     fn elsewhere_tick(&mut self) {
-        if !self.projects_here() {
+        if !self.questions_here() {
             self.other_projects = None;
             return;
         }
@@ -863,9 +871,11 @@ impl App {
 
     /// The agents of other projects that need the person and that the
     /// footer's `?` does not count already (a superlead's `/status` lists
-    /// the projects it holds), in the order **Projects** lists them.
+    /// the projects it holds), in the order **Projects** lists them: none
+    /// where **Projects** does not show.
     fn elsewhere_waiting(&self) -> elsewhere::Waiting {
-        let Some((open, _)) = &self.other_projects else {
+        let Some((open, _)) = (self.other_projects.as_ref()).filter(|_| self.projects_here())
+        else {
             return elsewhere::Waiting::default();
         };
         let mut waiting = open.waiting.borrow().outside(&self.scope().project);
@@ -36757,6 +36767,48 @@ mod tests {
     /// from the store's one follow: a task's helper's too, and a task's
     /// under a lead it follows; never another's. Answered anywhere, it
     /// goes.
+    /// A task shown beside its lead, which **Projects** never shows in,
+    /// still pins its helpers' questions from the store's one follow, and
+    /// counts no other project's.
+    #[tokio::test]
+    async fn a_task_shown_beside_pins_its_helpers_questions() {
+        let (client, _events) = daemon_with_events(json!({}), |_| json!({})).await;
+        let mut app = app(client);
+        app.options.embedded = true;
+        app.options.store = std::env::temp_dir().join("sonny-beside-none.sqlite");
+        app.bot = "calc.release".into();
+        app.project = Some("calc".into());
+        assert!(app.questions_here() && !app.projects_here());
+        let (open, tell) = elsewhere::Elsewhere::told("calc");
+        app.other_projects = Some((open, Instant::now()));
+        let ask = asks::call("q1", &json!({"question": "Tag 3.0.0?", "why": "w",
+            "options": [{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}))
+        .unwrap();
+        tell.send_modify(|shared| {
+            shared.agents = vec![
+                (0, "calc".to_owned(), "calc.changelog".to_owned()),
+                (1, "shop".to_owned(), "shop.fix".to_owned()),
+            ];
+            shared.above = [
+                (
+                    "calc.changelog".to_owned(),
+                    vec!["calc.release".to_owned(), "calc.lead".to_owned()],
+                ),
+                ("shop.fix".to_owned(), vec!["shop.lead".to_owned()]),
+            ]
+            .into();
+            shared.asks = [("calc.changelog".to_owned(), ask)].into();
+        });
+        app.elsewhere_tick();
+        assert!(app.other_projects.is_some());
+        app.pin_task_asks();
+        let pinned: Vec<String> = (app.asks.iter())
+            .map(|ask| ask.task.clone().unwrap().bot)
+            .collect();
+        assert_eq!(pinned, ["calc.changelog"]);
+        assert!(app.elsewhere_waiting().agents.is_empty());
+    }
+
     #[tokio::test]
     async fn every_question_below_pins_from_the_store_with_nothing_tracked() {
         let store = std::env::temp_dir()

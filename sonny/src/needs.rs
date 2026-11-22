@@ -486,6 +486,15 @@ impl Needs {
         self.calls.retain(|_, calls| !calls.is_empty());
     }
 
+    /// Which of `bot`'s calls wait on the person's approval, by turn and
+    /// id: none for most, so a copy to compare costs nothing then.
+    pub fn held_by(&self, bot: &str) -> Option<BTreeSet<(i64, String)>> {
+        self.calls
+            .get(bot)
+            .filter(|calls| !calls.is_empty())
+            .cloned()
+    }
+
     /// Every call waiting on the person's approval: its agent, turn and id.
     pub fn calls(&self) -> impl Iterator<Item = (&str, i64, &str)> {
         (self.calls.iter()).flat_map(|(bot, calls)| {
