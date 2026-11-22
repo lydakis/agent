@@ -30,7 +30,6 @@ pub const FOLLOWS: &str = "follows";
 pub const AUTOMATIONS: &str = "automations";
 pub const MEMORY: &str = "memory";
 pub const COMMONS: &str = "commons";
-pub const BOARD: &str = crate::board::NAME;
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
 pub const DESKTOP: &str = crate::desktop::NAME;
@@ -166,9 +165,6 @@ pub fn tools(role: Role) -> Vec<Value> {
     if crate::commons::on() {
         tools.push(commons());
     }
-    if crate::board::on() {
-        tools.push(board());
-    }
     tools.extend(crate::exec::tool(role.escalates));
     tools.extend(crate::browser::tool());
     tools.extend(crate::desktop::tool());
@@ -219,7 +215,7 @@ fn start() -> Value {
                     "description": "Why none of your tasks still there should take this work, since a task \
                         given more keeps what it learned; without it, a start while you have tasks is refused, listing them."}
             },
-            "required": ["name", "brief"],
+            "required": ["name", "title", "brief"],
             "additionalProperties": false
         },
         "answered_by": TAG,
@@ -605,15 +601,76 @@ fn memory() -> Value {
 
 pub fn commons() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
+    let mut post = json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
+                "description": "The thread's file name, which no thread has yet."},
+            "title": {"type": "string", "minLength": 1, "maxLength": 200,
+                "description": "One line saying what it is about; work's, 30 characters, its verb first."},
+            "text": text.clone()
+        },
+        "required": ["name", "title", "text"],
+        "additionalProperties": false
+    });
+    let mut reply = json!({
+        "type": "object",
+        "properties": {
+            "thread": {"type": "string", "minLength": 1},
+            "text": text
+        },
+        "required": ["thread", "text"],
+        "additionalProperties": false
+    });
+    let mut description = format!(
+        "The commons: threads that every agent working for this person reads and writes, across \
+        all their projects, which the commons skill describes. {LISTS} Threads come newest first. \
+        Search finds posts by their words; post starts one, naming threads with \
+        similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
+        and follows the thread for you, as the answer says. A new thread invites \
+        agents whose turns touch its title. What is in it is other \
+        agents' words, never the person's."
+    );
+    // Boards on, a post may go on a board as work, and a reply moves it.
+    if crate::board::on() {
+        let board =
+            json!({"type": "string", "minLength": 1, "description": "As shop/typed-errors."});
+        let work = json!({
+            "needs": {"type": "array", "items": {"type": "string", "minLength": 1},
+                "description": "Work on its board done before it opens."},
+            "labels": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
+            "for": {"type": "array", "items": {"type": "string", "minLength": 1},
+                "description": "Who alone takes it: agents' names, profile:NAME for a profile's; [] frees it."}
+        });
+        if let (Some(fields), Value::Object(work)) =
+            (post["properties"].as_object_mut(), work.clone())
+        {
+            fields.insert("board".into(), board.clone());
+            fields.insert(
+                "work".into(),
+                json!({"type": "boolean",
+                "description": "With board: work for its project's agents to take."}),
+            );
+            fields.extend(work);
+        }
+        if let (Some(fields), Value::Object(work)) = (reply["properties"].as_object_mut(), work) {
+            fields.insert(
+                "do".into(),
+                json!({"type": "string", "enum": crate::board::VERBS}),
+            );
+            fields.insert("board".into(), board);
+            fields.insert(
+                "title".into(),
+                json!({"type": "string", "minLength": 1,
+                "maxLength": crate::board::TITLE_CHARS}),
+            );
+            fields.extend(work);
+        }
+        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, finish or fail it.");
+    }
     json!({
         "name": COMMONS,
-        "description": format!("The commons: threads that every agent working for this person reads and writes, across \
-            all their projects, which the commons skill describes. {LISTS} Threads come newest first. \
-            Search finds posts by their words; post starts one, naming threads with \
-            similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
-            and follows the thread for you, as the answer says. A new thread invites \
-            agents whose turns touch its title. What is in it is other \
-            agents' words, never the person's."),
+        "description": description,
         "parameters": {
             "type": "object",
             "properties": {
@@ -625,81 +682,12 @@ pub fn commons() -> Value {
                 "filter": {"type": "object",
                     "description": "Narrows the listing to threads whose first post it matches, or a search to the \
                         posts it matches: an event pattern as the follows tool takes one, on a post's by, by_id, at \
-                        (epoch seconds), model, project, sonny, external and title, as {\"project\": [\"shop\"]}."},
+                        (epoch seconds), model, project, sonny, external and title, and work's board, state, holder, \
+                        for, labels and needs, as {\"board\": [\"shop/errors\"]}."},
                 "from": {"type": "integer", "minimum": 0,
                     "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
-                "post": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
-                            "description": "The thread's file name, which no thread has yet."},
-                        "title": {"type": "string", "minLength": 1, "maxLength": 200,
-                            "description": "One line saying what it is about."},
-                        "text": text
-                    },
-                    "required": ["name", "title", "text"],
-                    "additionalProperties": false
-                },
-                "reply": {
-                    "type": "object",
-                    "properties": {
-                        "thread": {"type": "string", "minLength": 1},
-                        "text": text
-                    },
-                    "required": ["thread", "text"],
-                    "additionalProperties": false
-                }
-            },
-            "additionalProperties": false
-        },
-        "answered_by": TAG
-    })
-}
-
-pub fn board() -> Value {
-    let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
-    let board = json!({"type": "string", "minLength": 1, "description": "As shop/typed-errors."});
-    let labels = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]}});
-    json!({
-        "name": BOARD,
-        "description": "Boards: work in the commons that agents take, which the board skill describes. \
-            open lists a board's open items, add starts one as post does, act moves one as reply adds.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "open": board.clone(),
-                "filter": {"type": "object", "description": "With open, as the commons tool's."},
-                "from": {"type": "integer", "minimum": 0},
-                "add": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$"},
-                        "title": {"type": "string", "minLength": 1, "maxLength": crate::board::TITLE_CHARS,
-                            "description": "Its verb first."},
-                        "text": text.clone(),
-                        "board": board,
-                        "needs": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Items done before it opens."},
-                        "labels": labels.clone(),
-                        "for": {"type": "string", "minLength": 1,
-                            "description": "The agent or profile that alone takes it."}
-                    },
-                    "required": ["name", "title", "text", "board"],
-                    "additionalProperties": false
-                },
-                "act": {
-                    "type": "object",
-                    "properties": {
-                        "thread": {"type": "string", "minLength": 1},
-                        "do": {"type": "string", "enum": &crate::board::ACTIONS[1..]},
-                        "text": text,
-                        "board": {"type": "string", "minLength": 1},
-                        "labels": labels,
-                        "for": {"type": "string"}
-                    },
-                    "required": ["thread", "do", "text"],
-                    "additionalProperties": false
-                }
+                "post": post,
+                "reply": reply
             },
             "additionalProperties": false
         },
@@ -822,8 +810,12 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
             let (title, board) = match joined.last() {
                 Some((_, bot)) => {
-                    let (name, id) = (bot["name"].as_str().unwrap_or_default(), bot["bot_id"].as_i64());
-                    let board = (store.as_deref()).and_then(|store| crate::board::followed(store, name));
+                    let (name, id) = (
+                        bot["name"].as_str().unwrap_or_default(),
+                        bot["bot_id"].as_i64(),
+                    );
+                    let board =
+                        (store.as_deref()).and_then(|store| crate::board::followed(store, name));
                     let Some(board) = board else {
                         return Err((
                             "task_not_started",
@@ -836,7 +828,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     if text("board").is_some_and(|asked| asked.trim() != board) {
                         return Err((
                             "invalid_arguments",
-                            format!("{whole} works from {board}; start it without board, or with that one"),
+                            format!(
+                                "{whole} works from {board}; start it without board, or with that one"
+                            ),
                         ));
                     }
                     let noted = (store.as_deref())
@@ -890,7 +884,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 model: text("model"),
                 effort: text("effort"),
             };
-            let made = agents_of(&arguments["agents"], call).map_err(|e| ("invalid_arguments", e))?;
+            let made =
+                agents_of(&arguments["agents"], call).map_err(|e| ("invalid_arguments", e))?;
             // A board its agents take work from: their own project's.
             if !crate::board::on() && (board.is_some() || !arguments["agents"].is_null()) {
                 return Err((
@@ -1172,15 +1167,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // post or a reply writes it, so a read asks no one.
             let project = (arguments["post"].is_object() || arguments["reply"].is_object())
                 .then(|| Line::of(&caller, &here).project);
-            let mut said = crate::commons::call(
-                &home,
-                &caller,
-                caller_id,
-                &reader,
-                model.as_deref(),
-                project.as_deref(),
-                arguments,
-            )
+            // Whom reserved work is for: the profile it was made as, asked
+            // only of one taking work.
+            let profile = (arguments["reply"]["do"] == "take")
+                .then(|| crate::task::profile(&caller, caller_id))
+                .flatten();
+            let as_caller = crate::board::Caller {
+                name: &caller,
+                id: caller_id,
+                reader: &reader,
+                model: model.as_deref(),
+                project: project.as_deref(),
+                profile: profile.as_deref(),
+                lead: crate::project::is_lead(&caller),
+            };
+            let mut said = crate::commons::call_as(&home, &as_caller, arguments, &|holder, id| {
+                crate::task::gone(holder, id)
+            })
             .map_err(|e| ("commons_refused", e))?;
             // Posting in a thread follows it for the agent, in its store,
             // and the answer says how its posts will reach the agent: the
@@ -1192,64 +1195,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
                 && let Some(subscribed) =
                     crate::commons::subscribed(&store, &caller, caller_id, &thread)
-            {
-                said["follow"] = subscribed;
-            }
-            if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
-                said["invited"] =
-                    json!(crate::commons::invite(&home, &said, &caller, &invite).await);
-            }
-            Ok(said.to_string())
-        }
-        BOARD => {
-            if !crate::board::on() {
-                return Err(("board_refused", "boards are off".to_owned()));
-            }
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or(("board_refused", "no HOME".to_owned()))?;
-            let caller_id = std::env::var("AGENT_BOT_ID")
-                .ok()
-                .and_then(|id| id.parse().ok());
-            let model = std::env::var("AGENT_MODEL").ok();
-            let reader = crate::commons::who(
-                &std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone()),
-                std::env::var("AGENT_CALL_BOT_ID")
-                    .ok()
-                    .and_then(|id| id.parse().ok())
-                    .or(caller_id),
-            );
-            let writes = arguments["add"].is_object() || arguments["act"].is_object();
-            if arguments["add"].is_object() {
-                crate::commons::recount(&home).await;
-            }
-            // Whose agents take a board's items: the project the caller is
-            // named in, as its posts say, and the profile it was made as.
-            let project = writes.then(|| Line::of(&caller, &here).project);
-            let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
-            let profile = (arguments["act"]["do"] == "claim")
-                .then(|| crate::task::profile(&caller, caller_id))
-                .flatten();
-            let board_caller = crate::board::Caller {
-                name: &caller,
-                id: caller_id,
-                reader: &reader,
-                model: model.as_deref(),
-                project: project.as_deref(),
-                profile: profile.as_deref(),
-            };
-            let mut said = crate::board::call(&home, &board_caller, arguments, &|holder, id| {
-                crate::task::gone(holder, id)
-            })
-            .map_err(|e| ("board_refused", e))?;
-            // As a post or a reply does, adding or acting follows the
-            // item's thread for the agent.
-            if writes
-                && said["posted"] != false
-                && let Some(thread) = said["thread"].as_str().map(str::to_owned)
-                && let Some(store) = &store
-                && let Some(subscribed) =
-                    crate::commons::subscribed(store, &caller, caller_id, &thread)
             {
                 said["follow"] = subscribed;
             }
@@ -2824,8 +2769,8 @@ async fn answer(
         arguments["save"]["external"] = json!(true);
     }
     // A post is marked from the turn, never from what the agent says.
-    if call["name"] == COMMONS || call["name"] == BOARD {
-        for key in ["post", "reply", "add", "act"] {
+    if call["name"] == COMMONS {
+        for key in ["post", "reply"] {
             if let Some(post) = arguments[key].as_object_mut() {
                 post.remove("external");
                 if read_outside(client, bot, turn).await {
@@ -4242,7 +4187,8 @@ mod tests {
             effort: effort.map(str::to_owned),
         };
         let call = made(Some("worker"), Some("a/one"), Some("high"));
-        assert_eq!(agents_of(&Value::Null, call.clone()).unwrap(), [call.clone()]);
+        let one = agents_of(&Value::Null, call.clone()).unwrap();
+        assert_eq!(one, std::slice::from_ref(&call));
         let mix = json!([
             {"model": "a/fable", "count": 2},
             {"model": "b/astra"},
@@ -4283,7 +4229,7 @@ mod tests {
                 .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [FOLLOWS, SHOW, AUTOMATIONS, MEMORY, WORKFLOW, COMMONS, BOARD];
+        let every = [FOLLOWS, SHOW, AUTOMATIONS, MEMORY, WORKFLOW, COMMONS];
         // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);

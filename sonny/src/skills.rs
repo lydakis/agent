@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// What every agent of Sonny's leans on: the lead's and tasks' roles (and
 /// the superlead's, which a project opts into), the memory, plan, margin, zen,
-/// coordination, commons, board, workflow and automation skills, the nightly cleanup's,
+/// coordination, commons (with boards), workflow and automation skills, the nightly cleanup's,
 /// agent-browser's and agent-desktop's own when they are installed, and `~/.agent/memory` and
 /// `~/.agent/automation`, which run this Sonny. Written at each start, so they
 /// lead to this copy.
@@ -29,12 +29,6 @@ pub fn install_own() {
         install("commons", &commons_skill(crate::board::on()));
     } else {
         remove("commons");
-    }
-    // `[sonny] boards = false`, or the commons off: agents go without it.
-    if crate::board::on() {
-        install("board", include_str!("../skills/board/SKILL.md"));
-    } else {
-        remove("board");
     }
     // `[sonny.workflows] enabled = false`: agents go without it.
     if crate::workflow::on() {
@@ -977,7 +971,7 @@ pub fn remove(name: &str) {
     }
 }
 
-fn remove_in(home: &Path, name: &str) {
+pub(crate) fn remove_in(home: &Path, name: &str) {
     let dir = home.join(".agents/skills").join(name);
     if std::fs::read_link(&dir).is_ok() || !sonnys(home, name, &dir) {
         return;
@@ -993,8 +987,8 @@ mod tests {
     fn the_commons_skill_names_boards_only_while_agents_have_them() {
         let on = commons_skill(true);
         let off = commons_skill(false);
-        assert!(on.contains("## Boards\n") && on.contains("board skill"));
-        assert!(!off.contains("## Boards") && !off.contains("board skill"));
+        assert!(on.contains("## Boards\n") && on.contains("work: true"));
+        assert!(!off.contains("## Boards") && !off.contains("work: true"));
         assert!(off.contains("## Reading what others wrote"));
     }
 

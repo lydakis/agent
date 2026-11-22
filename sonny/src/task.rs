@@ -1339,9 +1339,10 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
 /// The line a task working from `board` finds under its brief.
 pub fn board_line(board: &str) -> String {
     format!(
-        "\n\nYou work from the board {board}: board with open \"{board}\" lists its open items. \
-         Take one with act claim, close it with act done and what you made, then take the next; \
-         you hear of items opening there. The board skill says more."
+        "\n\nYou work from the board {board}: the commons tool with filter \
+         {{\"board\": [\"{board}\"], \"state\": [\"open\"]}} lists its open work. Take one with a \
+         reply doing take, close it with done and what you made, then take the next; you hear \
+         of work opening there. The commons skill's Boards section says more."
     )
 }
 
@@ -2664,8 +2665,8 @@ mod tests {
     #[test]
     fn a_task_on_a_board_is_told_how_to_take_its_items() {
         let line = board_line("shop/errors");
-        assert!(line.contains(r#"board with open "shop/errors""#));
-        assert!(line.contains("act claim"));
+        assert!(line.contains(r#"{"board": ["shop/errors"], "state": ["open"]}"#));
+        assert!(line.contains("doing take"));
     }
 
     #[test]

@@ -191,11 +191,8 @@ pub fn dir(home: &Path) -> PathBuf {
 
 /// The commons tool's answer, for `author`, the agent the daemon knows
 /// as `author_id`, writing with `model` for `project`, the one its name is
-/// made in.
-///
-/// `reader` is whom `.shown` counts what the answer shows for: the
-/// conversation it reaches, as `who` names it. That is the author but for a
-/// side chat, which signs as its agent and reads on its own.
+/// made in, as [`call_as`] gives it with no profile and no holder gone.
+#[cfg(test)]
 pub fn call(
     home: &Path,
     author: &str,
@@ -205,6 +202,34 @@ pub fn call(
     project: Option<&str>,
     arguments: &Value,
 ) -> Result<Value, String> {
+    let caller = crate::board::Caller {
+        name: author,
+        id: author_id,
+        reader,
+        model,
+        project,
+        profile: None,
+        lead: crate::project::is_lead(author),
+    };
+    call_as(home, &caller, arguments, &|_, _| false)
+}
+
+/// The commons tool's answer for `caller`.
+///
+/// Its `reader` is whom `.shown` counts what the answer shows for: the
+/// conversation it reaches, as `who` names it. That is the author but for a
+/// side chat, which signs as its agent and reads on its own. A post or a
+/// reply that does something to work on a board goes to [`crate::board`],
+/// with `gone` saying whether a holder, by name and id, is closed or no
+/// longer there.
+pub fn call_as(
+    home: &Path,
+    caller: &crate::board::Caller,
+    arguments: &Value,
+    gone: &dyn Fn(&str, Option<i64>) -> bool,
+) -> Result<Value, String> {
+    let (author, author_id, reader) = (caller.name, caller.id, caller.reader);
+    let (model, project) = (caller.model, caller.project);
     let dir = dir(home);
     let from = arguments["from"].as_u64().unwrap_or(0) as usize;
     let filter = filter(arguments)?;
@@ -214,8 +239,15 @@ pub fn call(
     if let Some(words) = arguments["search"].as_str() {
         return search(&dir, words, filter, author, reader, from, LIST_BYTES);
     }
+    let boards = crate::board::on();
     if arguments["post"].is_object() {
         let post = &arguments["post"];
+        if crate::board::posts_work(post) {
+            return match boards {
+                true => crate::board::post(&dir, caller, post),
+                false => Err("commons_invalid: boards are off".into()),
+            };
+        }
         let (name, title, text) = (
             post["name"].as_str().unwrap_or_default(),
             post["title"].as_str().unwrap_or_default(),
@@ -231,6 +263,12 @@ pub fn call(
     }
     if arguments["reply"].is_object() {
         let reply = &arguments["reply"];
+        if crate::board::replies_work(reply) {
+            return match boards {
+                true => crate::board::reply(&dir, caller, reply, gone),
+                false => Err("commons_invalid: boards are off".into()),
+            };
+        }
         let thread = reply["thread"].as_str().unwrap_or_default();
         let text = reply["text"].as_str().unwrap_or_default();
         return add(
@@ -251,7 +289,7 @@ pub fn call(
 }
 
 /// What a post holds that a filter matches: all Sonny wrote of it, and
-/// of an item on a board, where it stands (`crate::board::item`).
+/// of work on a board, where it stands (`crate::board::item`).
 const FIELDS: [&str; 15] = [
     "by", "by_id", "at", "model", "project", "sonny", "external", "title", "board", "do", "needs",
     "labels", "for", "state", "holder",
@@ -415,7 +453,13 @@ fn append(path: &Path, post: &Value) -> Result<(), String> {
         .map_err(failed)
 }
 
-fn start(dir: &Path, name: &str, title: &str, post: &Value, reader: &str) -> Result<Value, String> {
+pub(crate) fn start(
+    dir: &Path,
+    name: &str,
+    title: &str,
+    post: &Value,
+    reader: &str,
+) -> Result<Value, String> {
     valid_name(name)?;
     if title.trim().is_empty() || title.contains('\n') || title.chars().count() > 200 {
         return Err(
@@ -1009,7 +1053,7 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
                     shown[key] = post[key].clone();
                 }
             }
-            // What a board's post did, as the item's history.
+            // What a board's post did, as the work's history.
             for key in ["do", "board", "needs", "labels", "for", "took_from"] {
                 if !post[key].is_null() {
                     shown[key] = post[key].clone();
@@ -1020,7 +1064,7 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
         .collect();
     let mut shown = json!({"thread": name, "title": title, "posts": shown});
     if let Some(item) = crate::board::item(&posts) {
-        shown["item"] = item;
+        shown["work"] = item;
     }
     Ok(shown)
 }
@@ -1147,7 +1191,7 @@ pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
         summary["project"] = first["project"].clone();
     }
     if let Some(item) = crate::board::item(&actions) {
-        summary["item"] = item;
+        summary["work"] = item;
     }
     // Its first post but its text, which a filter on the listing matches
     // and the listing leaves out.
@@ -1205,20 +1249,20 @@ pub(crate) fn list(
     // An item waits while one of its needs is not done, which only the
     // other items say.
     let done: std::collections::HashSet<String> = (all.iter())
-        .filter(|(_, thread)| thread["item"]["state"] == "done")
+        .filter(|(_, thread)| thread["work"]["state"] == "done")
         .map(|(name, _)| name.clone())
         .collect();
     let mut threads = Vec::new();
     for (name, mut thread) in all {
-        if crate::board::waiting(&thread["item"], &|need| done.contains(need)) {
-            thread["item"]["state"] = json!("waiting");
+        if crate::board::waiting(&thread["work"], &|need| done.contains(need)) {
+            thread["work"]["state"] = json!("waiting");
         }
         let mut opening = (thread.as_object_mut())
             .and_then(|t| t.remove(OPENING))
             .unwrap_or(Value::Null);
         // A filter sees where an item stands as its first post's own: what
         // the item has since cleared is gone from it too.
-        if let (Some(fields), Some(item)) = (opening.as_object_mut(), thread["item"].as_object()) {
+        if let (Some(fields), Some(item)) = (opening.as_object_mut(), thread["work"].as_object()) {
             for key in crate::board::CHANGING {
                 fields.remove(key);
             }
@@ -1412,7 +1456,7 @@ fn search(
             "posts": posts.len(), "last_by": last["by"], "last_when": when(at),
             "matches": matches});
         if let Some(item) = &item {
-            thread["item"] = item.clone();
+            thread["work"] = item.clone();
         }
         if let Some((count, from)) = more {
             thread["more_matches"] = json!(count);
@@ -1809,16 +1853,18 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             .first()
             .and_then(|p| p["title"].as_str())
             .unwrap_or_default();
-        // An item's board, which a follow of the board hears it by.
+        // Its board, which a follow of the board hears it by: work's, or
+        // a plain thread's on a board.
         let board = (posts.iter().any(|post| post["do"].is_string()))
             .then(|| crate::board::item(&posts))
             .flatten()
-            .and_then(|item| item["board"].as_str().map(str::to_owned));
+            .and_then(|item| item["board"].as_str().map(str::to_owned))
+            .or_else(|| (posts.first()?["board"].as_str()).map(str::to_owned));
         for (n, post) in posts.iter().enumerate().skip(had).filter(|_| !first) {
             let text = post["text"].as_str().unwrap_or_default();
             let text = match (n, post["do"].as_str()) {
                 (0, Some(_)) => format!(
-                    "new item {thread} on {}, \"{title}\": {text}",
+                    "new work {thread} on {}, \"{title}\": {text}",
                     board.as_deref().unwrap_or_default()
                 ),
                 (0, None) => format!("new thread {thread}, \"{title}\": {text}"),
@@ -3214,15 +3260,15 @@ impl View {
             }
             out.extend(rows);
         }
-        for post in posts {
+        for (at, post) in posts.iter().enumerate() {
             out.push(Line::default());
             let by = post["by"].as_str().unwrap_or_default();
             let when = when(post["at"].as_i64().unwrap_or(0));
-            // What an agent did to the item: who, what, when, one muted
+            // What an agent did to the work: who, what, when, one muted
             // row; a closing one has its text under it, as any post.
-            if let Some(did) = crate::board_view::action_words(post, &self.project) {
+            if let Some(did) = crate::board_view::action_words(post, at == 0, &self.project) {
                 out.push(Line::from(format!("{by} · {did} · {when}")).dim());
-                let closes = matches!(post["do"].as_str(), Some("done" | "fail" | "cancel"));
+                let closes = matches!(post["do"].as_str(), Some("done" | "fail"));
                 let text = post["text"].as_str().unwrap_or_default();
                 if closes && !text.trim().is_empty() {
                     let mut markdown = crate::transcript::Markdown::default();

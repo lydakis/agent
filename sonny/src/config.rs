@@ -352,7 +352,7 @@ pub const SETTINGS: &[Setting] = &[
         group: "Commons and sky",
         name: "boards",
         label: "whether agents have boards; read when Sonny starts",
-        about: "whether agents have boards, work in the commons they take: the board tool, its skill, and start_task's board and agents; only with the commons; read when Sonny starts",
+        about: "whether agents have boards, work in the commons they take: the commons tool's work fields, the commons skill's Boards section, and start_task's board and agents; only with the commons; read when Sonny starts",
         values: SWITCH,
         default: "true",
     },

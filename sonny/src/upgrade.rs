@@ -242,6 +242,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::task::PROFILES_ON_AGENTS,
         retire: "0.12.0",
     },
+    // Work's steps take today's verbs, the board tool folded into the
+    // commons tool, and the board skill goes (after 0.10.3).
+    Migration {
+        id: crate::board::STEPS_RENAMED,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -252,6 +258,7 @@ pub fn at_start(store: &Path) {
     store_files(store);
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
         crate::commons::woken_gone(&home);
+        crate::board::steps_renamed(&home);
     }
 }
 
