@@ -1047,14 +1047,14 @@ pub fn prompt(
         None => (None, text),
     };
     // A long paste shows its start, and a row a click opens to the rest.
-    let (rows, more) = prompt_rows(text, width, folder);
+    let (rows, more) = prompt_rows(text, width, folder, false);
     // On its band with a row of it above and below, as the composer it
     // was written in: the words sit in the middle, not on an edge.
     let band = crate::look::BAND;
     out.push(Line::default().bg(band));
     out.extend(answering.map(|row| row.bg(band)));
     if let Some(quote) = quote {
-        let (shown, hidden) = quote_rows_of(quote, width, folder);
+        let (shown, hidden) = quote_rows_of(quote, width, folder, false);
         out.extend(shown);
         if !hidden.is_empty() {
             folds.quoted = Some(out.len());
@@ -1111,11 +1111,13 @@ pub fn opening_quote(text: &str) -> (&str, &str) {
 const QUOTE_LINES: usize = 2;
 
 /// A reply's quote on its band, drawn as Markdown draws a quote: the rows
-/// of the lines it shows folded, and those of the rest.
+/// of the lines it shows folded, and those of the rest, in color when
+/// `open` shows them, else only to count.
 fn quote_rows_of(
     quote: &str,
     width: usize,
     folder: Option<&std::path::Path>,
+    open: bool,
 ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let band = crate::look::BAND;
     let mut reader = match folder {
@@ -1133,6 +1135,10 @@ fn quote_rows_of(
         false => count,
     };
     let leads = (Line::from("  "), Line::from("  "));
+    // Past its first lines, counted only while it is folded.
+    if !open {
+        reader.colored = Some(shown);
+    }
     let (rows, more) = markdown_at(&mut reader, quote, width, leads, shown);
     let band = |rows: Vec<Line<'static>>| rows.into_iter().map(|row| row.dim().bg(band)).collect();
     (band(rows), band(more))
@@ -1161,7 +1167,7 @@ pub fn prompt_quoted(
     let width = on_band(width);
     let (_, body) = crate::asks::split(text).unwrap_or(("", text));
     let (_, more) = match replying(body) {
-        Some((quote, _)) => quote_rows_of(quote, width, folder),
+        Some((quote, _)) => quote_rows_of(quote, width, folder, open),
         None => (Vec::new(), Vec::new()),
     };
     let count = more.len();
@@ -1184,11 +1190,12 @@ fn shown_lines(count: usize) -> usize {
 
 /// A prompt's words on its band, drawn as every surface draws Markdown,
 /// after the person's `›`: the rows of the lines it shows folded, and
-/// those of the rest.
+/// those of the rest, in color when `open` shows them, else only to count.
 fn prompt_rows(
     text: &str,
     width: usize,
     folder: Option<&std::path::Path>,
+    open: bool,
 ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let band = crate::look::BAND;
     let mut reader = match folder {
@@ -1197,6 +1204,10 @@ fn prompt_rows(
     };
     let first = Line::from(Span::raw("› ").bold().fg(Color::Magenta));
     let shown = shown_lines(text.lines().count());
+    // Past its first lines, counted only while it is folded.
+    if !open {
+        reader.colored = Some(shown);
+    }
     let leads = (first, Line::from("  "));
     let (rows, more) = markdown_at(&mut reader, text, width, leads, shown);
     let band = |rows: Vec<Line<'static>>| rows.into_iter().map(|row| row.bg(band)).collect();
@@ -1224,7 +1235,7 @@ pub fn prompt_more(
     let width = on_band(width);
     let (_, body) = crate::asks::split(text).unwrap_or(("", text));
     let body = replying(body).map_or(body, |(_, words)| words);
-    let (_, more) = prompt_rows(body, width, folder);
+    let (_, more) = prompt_rows(body, width, folder, open);
     let count = more.len();
     let mut out = match open {
         true => more,

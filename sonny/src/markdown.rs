@@ -23,6 +23,9 @@ use unicode_width::UnicodeWidthStr;
 /// its tables' cells, its tables drawn and its code colored.
 #[derive(Default, Clone)]
 pub(crate) struct Cells {
+    /// Where in the text code stops being colored: what comes after is
+    /// only counted ([`Markdown::colored`]).
+    plain_from: Option<usize>,
     read: crate::table::Cells,
     tables: std::collections::HashMap<(String, usize, usize), Vec<Line<'static>>>,
     code: std::collections::HashMap<(String, String), Vec<Vec<Span<'static>>>>,
@@ -240,8 +243,18 @@ enum Leaf {
 /// The text's blocks drawn at `width`: each top-level block's rows, every
 /// row starting with the two columns a reply's lead takes. `end` says the
 /// text is all there is: a fence it leaves open shows as code.
-fn draw(source: &str, width: usize, at: &Where, notes: &mut Notes, end: bool) -> Vec<Block> {
-    let mut cells = Cells::default();
+fn draw(
+    source: &str,
+    width: usize,
+    at: &Where,
+    notes: &mut Notes,
+    plain_from: Option<usize>,
+) -> Vec<Block> {
+    let end = true;
+    let mut cells = Cells {
+        plain_from,
+        ..Cells::default()
+    };
     draw_after(source, 0, width, at, notes, &mut cells, end).0
 }
 
@@ -1019,10 +1032,7 @@ impl Draw<'_> {
         let lines = match self.cells.code.get(&key) {
             Some(lines) => lines.clone(),
             None => {
-                let mut code = crate::highlight::Code::language(lang);
-                let lines: Vec<_> = (text.lines())
-                    .map(|line| code_line(&mut code, line))
-                    .collect();
+                let lines = self.colored(crate::highlight::Code::language(lang), text);
                 self.cells.code.insert(key, lines.clone());
                 lines
             }
@@ -1030,12 +1040,28 @@ impl Draw<'_> {
         self.colored_lines(lines);
     }
 
-    fn code_lines(&mut self, mut code: Option<crate::highlight::Code>, text: &str) {
-        let lines = text
-            .lines()
-            .map(|line| code_line(&mut code, line))
-            .collect();
+    fn code_lines(&mut self, code: Option<crate::highlight::Code>, text: &str) {
+        let lines = self.colored(code, text);
         self.colored_lines(lines);
+    }
+
+    /// The lines of code `text`, starting here, in `code`'s colors up to
+    /// where the text is only counted and plain from there.
+    fn colored(
+        &self,
+        mut code: Option<crate::highlight::Code>,
+        text: &str,
+    ) -> Vec<Vec<Span<'static>>> {
+        let mut at = self.here;
+        (text.lines())
+            .map(|line| {
+                if self.cells.plain_from.is_some_and(|from| at >= from) {
+                    code = None;
+                }
+                at = (self.source[at..].find('\n')).map_or(self.source.len(), |n| at + n + 1);
+                code_line(&mut code, line)
+            })
+            .collect()
     }
 
     fn colored_lines(&mut self, lines: Vec<Vec<Span<'static>>>) {
@@ -1555,6 +1581,10 @@ pub struct Markdown {
     /// Its line still coming, colored beside the loop once longer than the
     /// rows shown hold.
     coloring: Coloring,
+    /// How many of the text's lines [`rows`] draws code in color, the rest
+    /// plain, the same rows: those past a fold, only counted, or colored
+    /// beside the loop. All when none.
+    pub colored: Option<usize>,
 }
 
 /// A line of code still coming that is longer than the rows shown hold,
@@ -2857,7 +2887,9 @@ pub(crate) fn rows(markdown: &Markdown, text: &str, width: usize) -> Vec<(usize,
         rewrite.line(line, &mut source);
     }
     let mut notes = markdown.notes.clone();
-    let blocks = draw(&source, width, &markdown.at, &mut notes, true);
+    let plain_from =
+        (markdown.colored).map(|lines| starts.get(lines).copied().unwrap_or(source.len()));
+    let blocks = draw(&source, width, &markdown.at, &mut notes, plain_from);
     let mut out = Vec::new();
     let line = |offset: usize| {
         starts
@@ -3200,6 +3232,56 @@ mod tests {
                 .style
                 .add_modifier
                 .contains(Modifier::BOLD)
+        );
+    }
+
+    /// Code past the lines drawn in color is the same rows, plain: what a
+    /// fold only counts, or what is colored beside the loop.
+    #[test]
+    fn code_past_the_colored_lines_is_the_same_rows_plain() {
+        let mut text = String::from("Some words\n\n```rust\n");
+        for n in 0..40 {
+            text.push_str(&format!(
+                "fn f{n}(x: u32) -> u32 {{ x * {n} + 1 }} // a long line to wrap\n"
+            ));
+        }
+        text.push_str("```\n\n> ```rust\n> let quoted = 1;\n> ```\n");
+        let colored = rows(&Markdown::default(), &text, 40);
+        for lines in [0, 5, 12, 1000] {
+            let markdown = Markdown {
+                colored: Some(lines),
+                ..Markdown::default()
+            };
+            let plain = rows(&markdown, &text, 40);
+            assert_eq!(plain.len(), colored.len());
+            for ((line, row), (_, colored)) in plain.iter().zip(&colored) {
+                assert_eq!(row.to_string(), colored.to_string());
+                if *line < lines {
+                    assert_eq!(row, colored, "line {line} is colored");
+                }
+            }
+        }
+        // None colored: every row of code plain, as an unknown language.
+        let markdown = Markdown {
+            colored: Some(0),
+            ..Markdown::default()
+        };
+        let plain = rows(&markdown, &text, 40);
+        assert_ne!(plain, colored);
+        let code = |rows: &[(usize, Line<'static>)]| {
+            (rows.iter())
+                .filter(|(_, row)| row.to_string().contains("fn f3("))
+                .map(|(_, row)| row.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            code(&plain)
+                .iter()
+                .flat_map(|row| &row.spans)
+                .skip(1)
+                .all(|span| span.content.trim().is_empty() || span.style.fg == Some(Color::Cyan)),
+            "{:?}",
+            code(&plain)
         );
     }
 
