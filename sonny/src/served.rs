@@ -950,8 +950,42 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     providers: providers.clone(),
                     board: board.clone(),
                 };
+                let profile = start.profile.clone();
                 match crate::task::start(&line.folder, &line.project, &caller, &start) {
-                    Ok(started) => said.push(started),
+                    Ok(started) => {
+                        // Open work kept for it, by name or profile, asks
+                        // it at once, as if it had been there as it opened.
+                        if crate::board::on()
+                            && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+                            && let Ok((store, _)) = crate::daemon_paths(None, None)
+                        {
+                            let whole = match start.name.starts_with(&format!("{}.", line.project))
+                            {
+                                true => start.name.clone(),
+                                false => format!("{}.{}", line.project, start.name),
+                            };
+                            let kept = crate::commons::kept_for(
+                                &home,
+                                &line.project,
+                                &whole,
+                                profile.as_deref(),
+                            );
+                            if !kept.is_empty() {
+                                let id = (started.split_once(": "))
+                                    .and_then(|(_, made)| {
+                                        let mut values = serde_json::Deserializer::from_str(made)
+                                            .into_iter::<Value>();
+                                        values.next()?.ok()
+                                    })
+                                    .and_then(|made| made["bot_id"].as_i64());
+                                crate::commons::ask_started(
+                                    &home, &store, &kept, &whole, id, &caller,
+                                )
+                                .await;
+                            }
+                        }
+                        said.push(started)
+                    }
                     Err(e) if said.is_empty() => return Err(("task_not_started", e)),
                     // Those started work on; the rest is said, not undone.
                     Err(e) => {
@@ -1222,6 +1256,15 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     said["follow"] = subscribed;
                 }
                 said.as_object_mut().map(|said| said.remove("dropped_from"));
+                // Work that opened, or was given whom it is for, asks them.
+                let ask_for: Vec<String> = (said.as_object_mut())
+                    .and_then(|said| said.remove(crate::board::ASK_FOR))
+                    .and_then(|threads| serde_json::from_value(threads).ok())
+                    .unwrap_or_default();
+                if !ask_for.is_empty() {
+                    said["asked"] =
+                        json!(crate::commons::ask_for(&home, &store, &ask_for, &caller).await);
+                }
                 // Each live agent a post names as @NAME hears it once.
                 let mentioned = crate::board::mentioned(arguments, &caller);
                 if !mentioned.is_empty() {

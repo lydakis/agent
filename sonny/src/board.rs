@@ -103,6 +103,11 @@ pub fn follow(board: &str, owner: Option<i64>) -> Sub {
     }
 }
 
+/// Where a call's answer names the work that opened or was given whom it
+/// is for, which its tool host asks them to take: taken out of the answer
+/// before the agent sees it.
+pub const ASK_FOR: &str = "ask_for";
+
 /// Why a thread on a board reaches an agent that holds its work.
 pub const HOLDS: &str =
     "you hold this work: once it goes quiet, say where it stands, finish it or drop it";
@@ -595,11 +600,16 @@ pub fn post(dir: &Path, caller: &Caller, given: &Value) -> Result<Value, String>
             title.trim()
         ));
     }
-    if needs_met(&items, board, &needs)? {
+    let opens = needs_met(&items, board, &needs)?;
+    if opens {
         post["opened"] = json!([name]);
     }
     let mut said = commons::start_locked(dir, name, title.trim(), &post, caller.reader)?;
     said["work"] = item(std::slice::from_ref(&post)).unwrap_or_default();
+    // Open work kept for some asks them to take it.
+    if opens && post["for"].is_array() {
+        said[ASK_FOR] = json!([name]);
+    }
     Ok(said)
 }
 
@@ -859,6 +869,17 @@ pub fn reply(
     {
         post["emptied"] = json!(board);
     }
+    // Work that opens, or open work given whom it is for, asks them.
+    let mut ask_for = opened.clone();
+    let reserves = (post["for"].as_array()).is_some_and(|named| !named.is_empty());
+    if reserves
+        && !ask_for.iter().any(|t| t == thread)
+        && current.as_ref().is_some_and(|it| {
+            it["state"] == "open" && !waiting(it, &|need: &str| need_done(dir, need))
+        })
+    {
+        ask_for.push(thread.to_owned());
+    }
     // A live holder another drops it from hears of it.
     let dropped_from = match (action, &current) {
         (Some("drop"), Some(it)) if it["holder"] != caller.name => {
@@ -891,6 +912,9 @@ pub fn reply(
         said["work"] = work;
         if let Some(from) = dropped_from {
             said["dropped_from"] = from;
+        }
+        if !ask_for.is_empty() {
+            said[ASK_FOR] = json!(ask_for);
         }
     }
     Ok(said)
@@ -1077,6 +1101,29 @@ mod tests {
 
     fn open_names(home: &Path) -> Vec<String> {
         listed(home, json!({"state": ["open"]}))
+    }
+
+    #[test]
+    fn work_that_opens_or_is_kept_for_someone_asks_them_to_take_it() {
+        let home = home("ask-for");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        let api = lead(work(
+            "api",
+            "Type the api errors",
+            json!({"needs": ["store"], "for": ["profile:worker"]}),
+        ))
+        .unwrap();
+        assert!(
+            api.get(ASK_FOR).is_none(),
+            "waiting work asks nobody: {api}"
+        );
+        let kept = lead(set("store", json!({"for": ["shop.w.1"]}))).unwrap();
+        assert_eq!(kept[ASK_FOR], json!(["store"]));
+        send(&home, "shop.w.1", "shop", None, false, act("store", "take")).unwrap();
+        let done = send(&home, "shop.w.1", "shop", None, false, act("store", "done")).unwrap();
+        assert_eq!(done[ASK_FOR], json!(["api"]), "{done}");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

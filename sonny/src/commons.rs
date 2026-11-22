@@ -38,6 +38,11 @@ const READS: &str = ".reads";
 /// invites are still being sent holds one entry with no `bot`, its `reach`
 /// how many it may send.
 const INVITES: &str = ".invites";
+/// Each board that had its one round of invites, and the thread that
+/// drew it, its first: `{"BOARD": "THREAD"}`. Later threads on a board
+/// draw none, so work posted one piece at a time costs no more than a
+/// plan posted whole.
+const BOARDS: &str = ".boards";
 /// The origin of the notes the commons sends agents.
 const ORIGIN: &str = "commons";
 /// The threads a day the commons sends invites for, whatever came of
@@ -499,11 +504,27 @@ pub(crate) fn start_locked(
         started["similar_titles"] = json!(similar);
     }
     // Agents whose turns touch it are invited, while the day has threads
-    // left; now and then one of them is any agent at all.
-    if let Some((reach, golden)) = reserve(dir, name) {
-        started["invite"] = json!({"title": title, "golden": golden, "reach": reach});
+    // left; now and then one of them is any agent at all. A board draws
+    // one round, on its first thread.
+    let first = (post["board"].as_str()).is_none_or(|board| first_on(dir, board, name));
+    if first && let Some((reach, golden)) = reserve(dir, name) {
+        let words = invite_words(dir, title, post["text"].as_str().unwrap_or_default());
+        started["invite"] =
+            json!({"title": title, "golden": golden, "reach": reach, "words": words});
     }
     Ok(started)
+}
+
+/// Whether `thread` is the first on `board`, which draws the board's one
+/// round of invites: noted so, under the lock the caller holds.
+fn first_on(dir: &Path, board: &str, thread: &str) -> bool {
+    let mut boards = json_file(&dir.join(BOARDS));
+    if boards.contains_key(board) {
+        return false;
+    }
+    boards.insert(board.to_owned(), json!(thread));
+    let text = Value::Object(boards).to_string();
+    agent_client::files::replace_mode(&dir.join(BOARDS), text.as_bytes(), 0o600).is_ok()
 }
 
 /// The day an invite counts in, UTC.
@@ -685,13 +706,51 @@ fn answered(dir: &Path, thread: &str, bot: &str) {
 /// How many pages of a word's matches an invite looks through at most.
 const SEARCH_PAGES: usize = 4;
 
-/// What of a title is searched for in agents' turns: its three longest
+/// What of a title a similar title is matched on: its three longest
 /// words of four letters or more.
 fn words(title: &str) -> Vec<String> {
     let mut words = match_words(title);
     words.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then(a.cmp(b)));
     words.truncate(3);
     words
+}
+
+/// What of a thread's title and first post is searched for in agents'
+/// turns, rarest first: each word of four letters or more, scored as the
+/// pointer scores a thread's (BM25 over the commons' threads), a word few
+/// threads say above one many do, the title's twice the text's. A word
+/// with a digit in it is a hash, a number or an id, which names no
+/// subject, and is left out.
+fn invite_words(dir: &Path, title: &str, text: &str) -> Vec<String> {
+    let mut said: HashMap<String, (u32, u32)> = HashMap::new();
+    for word in counted_words(title) {
+        said.entry(word).or_default().0 += 1;
+    }
+    for word in counted_words(text) {
+        said.entry(word).or_default().1 += 1;
+    }
+    said.retain(|word, _| !word.chars().any(|c| c.is_ascii_digit()));
+    let mut held = INDEX.lock().unwrap_or_else(|p| p.into_inner());
+    let held = held.get_or_insert_with(HashMap::new);
+    index(dir, held);
+    let threads: Vec<&Indexed> = (held.iter())
+        .filter(|(path, thread)| path.starts_with(dir) && thread.posts > 0)
+        .map(|(_, thread)| thread)
+        .collect();
+    let count = threads.len() as f64;
+    let mut scored: Vec<(f64, String)> = (said.into_iter())
+        .map(|(word, (title, text))| {
+            let holding = threads
+                .iter()
+                .filter(|t| t.words.contains_key(&word))
+                .count() as f64;
+            let weight = (1.0 + (count - holding + 0.5) / (holding + 0.5)).ln();
+            let tf = TITLE_BOOST * f64::from(title) + f64::from(text);
+            (weight * tf * (BM25_K1 + 1.0) / (tf + BM25_K1), word)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, word)| word).collect()
 }
 
 /// The note an invited agent gets: why it, from whom, and the budget of
@@ -715,10 +774,21 @@ fn draw() -> usize {
         .map_or(0, |d| d.subsec_nanos() as usize)
 }
 
-/// The agents whose turns mention a title's words, besides its author.
-async fn touched(client: &agent_client::Client, title: &str, author: &str) -> Vec<String> {
+/// The live agents whose turns mention a thread's words, besides its
+/// author, `words` rarest first: down the list until `reach` are found,
+/// so a word that matches no one costs no seat.
+async fn touched(
+    client: &agent_client::Client,
+    words: &[String],
+    author: &str,
+    live: &[String],
+    reach: usize,
+) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    for word in words(title) {
+    for word in words {
+        if found.len() >= reach {
+            break;
+        }
         // Older pages too, while a word's matches are all the poster's or
         // agents already found, so a busy poster crowds out no one.
         let mut before = Value::Null;
@@ -731,7 +801,10 @@ async fn touched(client: &agent_client::Client, title: &str, author: &str) -> Ve
             for bot in (said["matches"].as_array().into_iter().flatten())
                 .filter_map(|found| found["bot"].as_str())
             {
-                if bot != author && !found.iter().any(|one| one == bot) {
+                if bot != author
+                    && live.iter().any(|one| one == bot)
+                    && !found.iter().any(|one| one == bot)
+                {
                     found.push(bot.to_owned());
                     new = true;
                 }
@@ -745,12 +818,12 @@ async fn touched(client: &agent_client::Client, title: &str, author: &str) -> Ve
     found
 }
 
-/// Every agent besides `author`.
+/// Every live agent besides `author`: one closed is no one to invite.
 async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
     let mut bots = Vec::new();
     let mut after = json!("");
     while let Ok(page) = client
-        .request("bots", json!({"after": after, "limit": 256}))
+        .request("bots", json!({"after": after, "limit": 256, "open": true}))
         .await
     {
         bots.extend(
@@ -816,6 +889,9 @@ async fn in_zen(client: &agent_client::Client, home: &Path) -> Vec<String> {
 pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) -> Vec<String> {
     let thread = started["thread"].as_str().unwrap_or_default();
     let title = invite["title"].as_str().unwrap_or_default();
+    let words: Vec<String> = (invite["words"].as_array().into_iter().flatten())
+        .filter_map(|word| word.as_str().map(str::to_owned))
+        .collect();
     let golden = invite["golden"] == true;
     let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
     let mut invited: Vec<(String, bool)> = Vec::new();
@@ -846,10 +922,11 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
             true => in_zen(&client, home).await,
             false => Vec::new(),
         };
-        let mut matched = touched(&client, title, author).await;
+        let live = everyone(&client, author).await;
+        let mut matched = touched(&client, &words, author, &live, reach).await;
         matched.retain(|bot| !zen.contains(bot));
         let mut anyone = match golden {
-            true => everyone(&client, author).await,
+            true => live.clone(),
             false => Vec::new(),
         };
         anyone.retain(|bot| !zen.contains(bot));
@@ -920,6 +997,176 @@ pub async fn mention(home: &Path, said: &Value, author: &str, named: &[String]) 
         }
     }
     told
+}
+
+/// The live agents of a board's project that `work`'s `for` names, by
+/// name or by the profile each was made as, `but` aside: each name, its
+/// id. From `live`, the project's live agents as the daemon lists them.
+pub fn eligible(work: &Value, live: &[Value], but: &str) -> Vec<(String, Option<i64>)> {
+    (live.iter())
+        .filter_map(|bot| {
+            let name = bot["name"].as_str()?;
+            let profile = bot["profile"].as_str();
+            let named = (work["for"].as_array().into_iter().flatten()).any(|one| {
+                one == name
+                    || (one.as_str())
+                        .and_then(|one| one.strip_prefix(crate::board::PROFILE))
+                        .is_some_and(|p| Some(p) == profile)
+            });
+            (named && name != but).then(|| (name.to_owned(), bot["bot_id"].as_i64()))
+        })
+        .collect()
+}
+
+/// The live agents of `project`, as the daemon lists them: name, id and
+/// profile.
+async fn live_in(client: &agent_client::Client, project: &str) -> Vec<Value> {
+    let mut bots = Vec::new();
+    let mut after = json!("");
+    while let Ok(page) = client
+        .request(
+            "bots",
+            json!({"name": format!("{project}.*"), "after": after, "limit": 256, "open": true}),
+        )
+        .await
+    {
+        bots.extend((page["bots"].as_array().into_iter().flatten()).map(
+            |bot| json!({"name": bot["name"], "bot_id": bot["bot_id"], "profile": bot["profile"]}),
+        ));
+        match &page["next_after"] {
+            Value::Null => break,
+            next => after = next.clone(),
+        }
+    }
+    bots
+}
+
+/// The note that asks an agent to take work kept for it.
+fn asked_note(author: &str, thread: &str, title: &str, board: &str) -> String {
+    format!(
+        "[{author} asks you to take the work {thread}, \"{title}\", on {board}: it is kept for \
+         you. Reply there with do take to hold it, or say why you can't. Its posts reach you as \
+         they come.]"
+    )
+}
+
+/// Asks the live agents each of `threads`' open work is for to take it,
+/// as `for` does, outside the day's invites: a note that cuts into each
+/// one's turn, with no budget of its own since it starts real work, and
+/// a follow of the thread in `store` saying why. What came of each:
+/// `{"thread", "asked": [names]}`, or `nobody_eligible` naming whom it is
+/// for when no live agent is.
+pub async fn ask_for(home: &Path, store: &Path, threads: &[String], author: &str) -> Vec<Value> {
+    let Ok((_, socket)) = crate::daemon_paths(None, None) else {
+        return Vec::new();
+    };
+    let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
+        return Vec::new();
+    };
+    let mut projects: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut said = Vec::new();
+    for thread in threads {
+        let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
+            continue;
+        };
+        let Some(work) = crate::board::item(&posts) else {
+            continue;
+        };
+        if work["state"] != "open" || !work["for"].is_array() {
+            continue;
+        }
+        let board = work["board"].as_str().unwrap_or_default();
+        let project = crate::board::project_of(board).to_owned();
+        if !projects.contains_key(&project) {
+            let live = live_in(&client, &project).await;
+            projects.insert(project.clone(), live);
+        }
+        let named = eligible(&work, &projects[&project], author);
+        if named.is_empty() {
+            said.push(json!({"thread": thread, "nobody_eligible": work["for"]}));
+            continue;
+        }
+        let title = (work["title"].as_str())
+            .or(posts[0]["title"].as_str())
+            .unwrap_or_default();
+        let note = asked_note(author, thread, title, board);
+        let mut asked = Vec::new();
+        for (name, id) in named {
+            let follow = crate::board::post_follow(thread, id, crate::board::ASKED, None);
+            let _ = crate::lookout::subs::put(store, &name, follow);
+            let submit = json!({"bot": name, "prompt": note, "delivery": "steer",
+                "origin": ORIGIN, "request_id": format!("commons.asked.{thread}.{}.{name}", posts.len())});
+            if client.request("submit", submit).await.is_ok() {
+                asked.push(name);
+            }
+        }
+        said.push(json!({"thread": thread, "asked": asked}));
+    }
+    said
+}
+
+/// The open work of `project`'s boards that is for `name`, made as
+/// `profile`, and that nobody holds: what an agent just started is asked
+/// to take, as it would have been had it been there when the work opened.
+/// Each thread's name.
+pub fn kept_for(home: &Path, project: &str, name: &str, profile: Option<&str>) -> Vec<String> {
+    let threads = summaries(&dir(home));
+    let done: Vec<&str> = (threads.iter())
+        .filter(|(_, thread)| thread["work"]["state"] == "done")
+        .map(|(name, _)| name.as_str())
+        .collect();
+    (threads.iter())
+        .filter(|(_, thread)| {
+            let work = &thread["work"];
+            work["state"] == "open"
+                && work["board"].as_str().map(crate::board::project_of) == Some(project)
+                && (work["for"].as_array()).is_some_and(|named| !named.is_empty())
+                && crate::board::is_for(work, name, profile)
+                && !crate::board::waiting(work, &|need| done.contains(&need))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Asks the agent `name`, known as `id`, just started, to take each of
+/// `threads`, as [`ask_for`] asks those there when work opens.
+pub async fn ask_started(
+    home: &Path,
+    store: &Path,
+    threads: &[String],
+    name: &str,
+    id: Option<i64>,
+    starter: &str,
+) {
+    let Ok((_, socket)) = crate::daemon_paths(None, None) else {
+        return;
+    };
+    let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
+        return;
+    };
+    for thread in threads {
+        let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
+            continue;
+        };
+        let Some(work) = crate::board::item(&posts) else {
+            continue;
+        };
+        let title = (work["title"].as_str())
+            .or(posts[0]["title"].as_str())
+            .unwrap_or_default();
+        let by = work["by"].as_str().unwrap_or(starter);
+        let note = asked_note(
+            by,
+            thread,
+            title,
+            work["board"].as_str().unwrap_or_default(),
+        );
+        let follow = crate::board::post_follow(thread, id, crate::board::ASKED, None);
+        let _ = crate::lookout::subs::put(store, name, follow);
+        let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
+            "request_id": format!("commons.asked.{thread}.{}.{name}", posts.len())});
+        let _ = client.request("submit", submit).await;
+    }
 }
 
 /// The submit that brings `bot` an invite to `thread`: the note, queued
@@ -1556,8 +1803,8 @@ fn snippet(text: &str) -> String {
     }
 }
 
-/// The threads besides `name` whose titles share a word with `title`, as
-/// invites match agents (`words`): those sharing the most first, then the
+/// The threads besides `name` whose titles share a word with `title`
+/// (`words`): those sharing the most first, then the
 /// newest started, at most `SIMILAR`. Each thread's first line alone.
 fn similar(dir: &Path, name: &str, title: &str) -> Vec<Value> {
     let words = words(title);
@@ -4203,7 +4450,8 @@ mod tests {
         assert_eq!(
             post("first")["invite"],
             json!({"title": "SQLite checkpoint stalls", "golden": false,
-                "reach": reach(0, 0, base as usize)})
+                "reach": reach(0, 0, base as usize),
+                "words": ["checkpoint", "sqlite", "stalls", "seen"]})
         );
         // A thread no agent's invite reached is given back.
         settle(&dir, "first", &[]);
@@ -4261,6 +4509,115 @@ mod tests {
             words("SQLite WAL: checkpoint stalls, sqlite"),
             ["checkpoint", "sqlite", "stalls"]
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn invites_aim_by_the_rarest_words_and_a_board_draws_one_round() {
+        let home = home("rarest");
+        let dir = dir(&home);
+        let post = |name: &str, title: &str, text: &str, board: Option<&str>| {
+            let mut post = json!({"name": name, "title": title, "text": text});
+            if let Some(board) = board {
+                post["board"] = json!(board);
+            }
+            call(
+                &home,
+                "a.x",
+                None,
+                "a.x",
+                None,
+                Some("a"),
+                &json!({"post": post}),
+            )
+            .unwrap()
+        };
+        for n in 0..6 {
+            post(
+                &format!("t{n}"),
+                "Fix the error handling",
+                "error error",
+                None,
+            );
+        }
+        // A word few threads say leads; one with a digit is no subject.
+        let words = invite_words(
+            &dir,
+            "Fix the checkpoint error",
+            "wal stalls on 0x1f2e3d sha256",
+        );
+        assert_eq!(words.first().map(String::as_str), Some("checkpoint"));
+        assert!(
+            words.iter().all(|w| !w.chars().any(|c| c.is_ascii_digit())),
+            "{words:?}"
+        );
+        assert!(words.iter().position(|w| w == "error") > words.iter().position(|w| w == "stalls"));
+        // The board's first thread draws its round; later ones none.
+        let _ = std::fs::remove_dir_all(&home);
+        let first = post("plan", "Type the errors", "the plan", Some("a/errors"));
+        assert!(first["invite"]["words"].is_array(), "{first}");
+        let later = post("more", "Type the cli errors", "more", Some("a/errors"));
+        assert!(later["invite"].is_null(), "{later}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn work_for_names_and_profiles_asks_the_live_agents_they_name() {
+        let live = [
+            json!({"name": "shop.review.1", "bot_id": 4, "profile": "reviewer"}),
+            json!({"name": "shop.fix.1", "bot_id": 5, "profile": "worker"}),
+            json!({"name": "shop.w9", "bot_id": 6}),
+        ];
+        let work = json!({"for": ["profile:reviewer", "shop.w9"]});
+        let named = eligible(&work, &live, "shop.lead");
+        assert_eq!(
+            named,
+            [
+                ("shop.review.1".to_owned(), Some(4)),
+                ("shop.w9".to_owned(), Some(6))
+            ]
+        );
+        assert!(
+            eligible(&work, &live, "shop.w9")
+                .iter()
+                .all(|(n, _)| n != "shop.w9")
+        );
+        assert!(eligible(&json!({"for": ["profile:docs"]}), &live, "x").is_empty());
+    }
+
+    #[test]
+    fn an_agent_started_later_is_asked_to_take_open_work_kept_for_it() {
+        let home = home("kept-for");
+        let caller = crate::board::Caller {
+            name: "shop.lead",
+            id: None,
+            reader: "shop.lead",
+            model: None,
+            project: Some("shop"),
+            profile: None,
+            lead: true,
+        };
+        let post = |name: &str, extra: Value| {
+            let mut post = json!({"name": name, "title": format!("Do {name}"), "text": "x",
+                "board": "shop/errors", "work": true});
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                post[key] = value.clone();
+            }
+            call_as(&home, &caller, &json!({"post": post}), &|_, _| false).unwrap()
+        };
+        let said = post("review", json!({"for": ["profile:reviewer"]}));
+        assert_eq!(said[crate::board::ASK_FOR], json!(["review"]));
+        post(
+            "waits",
+            json!({"for": ["profile:reviewer"], "needs": ["review"]}),
+        );
+        post("anyone", json!({}));
+        assert_eq!(
+            kept_for(&home, "shop", "shop.r.1", Some("reviewer")),
+            ["review"]
+        );
+        assert!(kept_for(&home, "shop", "shop.w.1", Some("worker")).is_empty());
+        assert!(kept_for(&home, "docs", "docs.r.1", Some("reviewer")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
