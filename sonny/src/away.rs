@@ -21,8 +21,9 @@
 //! request IDs, so a note sent twice, as by two windows at once, is one.
 //!
 //! Both notes say what happened and nothing about what to do: the lead's
-//! role says that. Leads of the store Sonny reaches by default
-//! (`AGENT_STORE`, else `~/.agent/state.sqlite`) are told.
+//! role says that. Leads of the daemon Sonny reaches by default
+//! (`AGENT_SOCKET`, else that of `AGENT_STORE` or `~/.agent/state.sqlite`)
+//! are told.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -122,10 +123,14 @@ pub fn due() -> bool {
     is_due(present, told, minutes(), ms(SystemTime::now())) || is_back(present, told)
 }
 
+/// How the away note opens, and the back note.
+const AWAY_OPENS: &str = "The person has not used Sonny since ";
+const BACK_OPENS: &str = "The person is back.";
+
 /// The away note: the absence's start, as the daemon's trailer names times.
 fn away_note(since_ms: i64) -> String {
     format!(
-        "The person has not used Sonny since {}, so they are away. You will be told when they are back.",
+        "{AWAY_OPENS}{}, so they are away. You will be told when they are back.",
         agent_client::clock::when(since_ms / 1000)
     )
 }
@@ -133,21 +138,35 @@ fn away_note(since_ms: i64) -> String {
 /// The back note, naming when they went.
 fn back_note(since_ms: i64) -> String {
     format!(
-        "The person is back. They were away from {}.",
+        "{BACK_OPENS} They were away from {}.",
         agent_client::clock::when(since_ms / 1000)
     )
 }
 
-/// The daemon of the store Sonny reaches by default, if it runs: none is
-/// started for this.
+/// The note's few words for the person's window: what it told the lead.
+pub fn glance(text: &str) -> Option<&'static str> {
+    if text.starts_with(AWAY_OPENS) {
+        return Some("You are away");
+    }
+    text.starts_with(BACK_OPENS).then_some("You are back")
+}
+
+/// The daemon Sonny reaches by default (`AGENT_SOCKET`, else the socket of
+/// `AGENT_STORE` or `~/.agent/state.sqlite`), if it runs: none is started
+/// for this.
 async fn connect() -> Result<std::sync::Arc<Client>, String> {
-    let store = match std::env::var_os("AGENT_STORE") {
-        Some(store) => PathBuf::from(store),
-        None => folder()
-            .and_then(|sonny| Some(sonny.parent()?.join("state.sqlite")))
-            .ok_or("no HOME")?,
+    let socket = match std::env::var_os("AGENT_SOCKET") {
+        Some(socket) => PathBuf::from(socket),
+        None => {
+            let store = match std::env::var_os("AGENT_STORE") {
+                Some(store) => PathBuf::from(store),
+                None => folder()
+                    .and_then(|sonny| Some(sonny.parent()?.join("state.sqlite")))
+                    .ok_or("no HOME")?,
+            };
+            agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?
+        }
     };
-    let socket = agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?;
     let (client, _events) = Client::connect(&socket).await.map_err(|e| e.to_string())?;
     Ok(client)
 }
@@ -376,6 +395,9 @@ mod tests {
     fn the_notes_name_when_the_person_went_and_say_nothing_of_what_to_do() {
         let away = away_note(AT);
         let back = back_note(AT);
+        assert_eq!(glance(&away), Some("You are away"));
+        assert_eq!(glance(&back), Some("You are back"));
+        assert_eq!(glance("The person wrote in calc.fix"), None);
         let when = agent_client::clock::when(AT / 1000);
         assert!(away.contains(&when), "{away}");
         assert!(back.contains(&when), "{back}");

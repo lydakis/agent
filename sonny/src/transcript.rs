@@ -1917,6 +1917,9 @@ fn task_news(task: &str, from: &str) -> String {
 
 /// Sonny's own word that it upgraded, as its kind and what changed.
 fn news(text: &str) -> Option<Vec<String>> {
+    if let Some(what) = crate::away::glance(text) {
+        return Some(vec![what.to_owned()]);
+    }
     // "- the lead role: theirs at …" is the lead role, "- set up backup: …"
     // the backup, "- do move; …" the step it asks, and a register's rows
     // are what's new.
