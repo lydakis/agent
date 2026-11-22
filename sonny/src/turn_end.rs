@@ -49,11 +49,7 @@ fn ends() -> &'static Mutex<Ends> {
 impl Ends {
     /// The work as the commons in `home` holds it, read the first time.
     fn work(&mut self, home: &Path) -> &mut HashMap<String, Value> {
-        self.work.get_or_insert_with(|| {
-            (crate::commons::summaries(&crate::commons::dir(home)).into_iter())
-                .filter(|(_, thread)| thread["work"].is_object())
-                .collect()
-        })
+        self.work.get_or_insert_with(|| all_work(home))
     }
 
     /// `bot`'s turn `turn` wrote in `thread`, which the commons in `home`
@@ -220,6 +216,28 @@ fn title(thread: &Value) -> String {
 
 /// The host's commons call by `bot`, in its turn `turn`, wrote in
 /// `thread`.
+/// Held while the commons is read for the turn ends, one read at a time.
+static READING: Mutex<()> = Mutex::new(());
+
+/// Every thread's work in the commons in `home`.
+fn all_work(home: &Path) -> HashMap<String, Value> {
+    (crate::commons::summaries(&crate::commons::dir(home)).into_iter())
+        .filter(|(_, thread)| thread["work"].is_object())
+        .collect()
+}
+
+/// The turn ends' work read the first time, with the turn ends free, so
+/// what waits on them meanwhile, as an ask noted on the host's runtime,
+/// never waits on the read.
+fn seed(home: &Path) {
+    let _reading = READING.lock().unwrap();
+    if ends().lock().unwrap().work.is_some() {
+        return;
+    }
+    let work = all_work(home);
+    ends().lock().unwrap().work.get_or_insert(work);
+}
+
 /// The work `thread` in the commons in `home` holds, if any.
 fn read(home: &Path, thread: &str) -> Option<Value> {
     let path = crate::commons::dir(home).join(format!("{thread}.jsonl"));
@@ -231,7 +249,6 @@ fn read(home: &Path, thread: &str) -> Option<Value> {
 /// as it reads a file. One read at a time, so an
 /// older read never lands after a newer one.
 pub fn wrote(home: &Path, bot: &str, turn: Option<i64>, thread: &str) {
-    static READING: Mutex<()> = Mutex::new(());
     let _reading = READING.lock().unwrap();
     if ends().lock().unwrap().writes(bot, turn, thread) {
         let summary = read(home, thread);
@@ -288,7 +305,10 @@ pub fn finished(
         let (named, at) = (bot.clone(), home.clone());
         let found = tokio::task::spawn_blocking(move || {
             let boards = match completed {
-                true => boards(&store, &named),
+                true => {
+                    seed(&at);
+                    boards(&store, &named)
+                }
                 false => Vec::new(),
             };
             ends()
