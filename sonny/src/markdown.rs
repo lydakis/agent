@@ -1563,8 +1563,18 @@ pub struct Markdown {
 /// length, and the frames of one long line their length squared. Until
 /// the newest is colored, the line shows colored as far as it was last,
 /// what came since plain; the line once ended is colored whole, once.
+///
+/// One thread colors for the fence, from its first such line until it
+/// closes: it reads the fence's lines before once, then each line as it
+/// ends, so what those lines leave open (a comment, a string) colors the
+/// line still coming, each line read beside the loop once.
 #[derive(Default)]
-struct Coloring(std::sync::Arc<std::sync::Mutex<Colored>>);
+struct Coloring {
+    slot: std::sync::Arc<std::sync::Mutex<Colored>>,
+    /// The thread's lines, while it colors: let go when the fence closes,
+    /// it ends.
+    feed: std::cell::RefCell<Option<std::sync::mpsc::Sender<Fed>>>,
+}
 
 /// A copy colors its own lines.
 impl Clone for Coloring {
@@ -1575,21 +1585,42 @@ impl Clone for Coloring {
 
 #[derive(Default)]
 struct Colored {
-    /// The last line colored, and its spans. A line read whole starts
-    /// another coloring ([`Markdown::read`]).
+    /// The last line colored, and its spans.
     done: Option<(String, Vec<Span<'static>>)>,
     running: bool,
     /// How many colorings landed: a frame after one shows it.
     landed: u64,
+    /// How many of the fence's lines ended since the thread began: a
+    /// coloring of a line that ended since is let go.
+    ended: u64,
+}
+
+/// To the thread that colors a fence.
+enum Fed {
+    /// A line of the fence that ended.
+    Ended(String),
+    /// The line still coming, to color, after the lines that ended by
+    /// then ([`Colored::ended`]).
+    Coming(String, u64),
 }
 
 impl Coloring {
     fn colored(&self) -> std::sync::MutexGuard<'_, Colored> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn landed(&self) -> u64 {
         self.colored().landed
+    }
+
+    /// A line of the fence ended: the thread, if one colors, reads it.
+    fn ended(&self, line: &str) {
+        if let Some(feed) = &*self.feed.borrow() {
+            let mut colored = self.colored();
+            colored.done = None;
+            colored.ended += 1;
+            let _ = feed.send(Fed::Ended(line.to_owned()));
+        }
     }
 
     /// `line`, the code in `lang` still coming after the lines `read`,
@@ -1602,29 +1633,16 @@ impl Coloring {
             return spans.clone();
         }
         if !colored.running {
-            colored.running = true;
-            let (slot, text) = (self.0.clone(), line.to_owned());
-            let (lang, read) = (lang.to_owned(), read.to_owned());
-            let started = std::thread::Builder::new()
-                .name("sonny-coloring".into())
-                .spawn(move || {
-                    // Colors are read from the fence's first line on: what
-                    // its lines leave open (a comment, a string) colors
-                    // this one.
-                    let mut code = crate::highlight::Code::language(&lang);
-                    for line in read.lines() {
-                        code_line(&mut code, line);
-                    }
-                    let spans = code_line(&mut code, &text);
-                    let mut colored = slot.lock().unwrap_or_else(|e| e.into_inner());
-                    colored.done = Some((text, spans));
-                    colored.running = false;
-                    colored.landed += 1;
-                    drop(colored);
-                    crate::drawing::ring();
-                });
-            if started.is_err() {
-                colored.running = false;
+            let mut feed = self.feed.borrow_mut();
+            if feed.is_none() {
+                *feed = self.start(lang, read);
+            }
+            if let Some(sent) = feed.as_ref()
+                && sent
+                    .send(Fed::Coming(line.to_owned(), colored.ended))
+                    .is_ok()
+            {
+                colored.running = true;
             }
         }
         match &colored.done {
@@ -1635,6 +1653,52 @@ impl Coloring {
             }
             _ => vec![Span::raw("  "), Span::raw(line.to_owned())],
         }
+    }
+
+    /// The fence's thread, the lines `read` read first.
+    fn start(&self, lang: &str, read: &str) -> Option<std::sync::mpsc::Sender<Fed>> {
+        let (feed, fed) = std::sync::mpsc::channel();
+        let slot = self.slot.clone();
+        let (lang, read) = (lang.to_owned(), read.to_owned());
+        std::thread::Builder::new()
+            .name("sonny-coloring".into())
+            .spawn(move || {
+                let mut code = crate::highlight::Code::language(&lang);
+                for line in read.lines() {
+                    code_line(&mut code, line);
+                }
+                drop(read);
+                while let Ok(first) = fed.recv() {
+                    // What came while it colored: each line that ended
+                    // read, only the newest of the line still coming.
+                    let mut coming = None;
+                    for got in std::iter::once(first).chain(fed.try_iter()) {
+                        match got {
+                            Fed::Ended(line) => {
+                                code_line(&mut code, &line);
+                                coming = None;
+                            }
+                            Fed::Coming(line, after) => coming = Some((line, after)),
+                        }
+                    }
+                    let done = coming.map(|(text, after)| {
+                        let spans = code_line(&mut code.clone(), &text);
+                        (text, spans, after)
+                    });
+                    let mut colored = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((text, spans, after)) = done
+                        && after == colored.ended
+                    {
+                        colored.done = Some((text, spans));
+                    }
+                    colored.running = false;
+                    colored.landed += 1;
+                    drop(colored);
+                    crate::drawing::ring();
+                }
+            })
+            .ok()
+            .map(|_| feed)
     }
 }
 
@@ -1723,9 +1787,9 @@ impl Markdown {
     fn read(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) {
         self.fed = width;
         if let Some(open) = &mut self.fence {
-            // The line still coming ended: a coloring of it is let go.
-            self.coloring = Coloring::default();
             if open.fence.closed_by(line) {
+                // Its coloring thread, if one, ends.
+                self.coloring = Coloring::default();
                 let open = self.fence.take().expect("open");
                 if let Some(source) = open.picture {
                     let rows = fence_picture(open.fence.lang, source, width);
@@ -1739,6 +1803,7 @@ impl Markdown {
                 None => {
                     if open.code.is_some() {
                         push_line(&mut open.read, line);
+                        self.coloring.ended(line);
                     }
                     let spans = code_line(&mut open.code, line);
                     let rows = wrap_lines(
@@ -1882,6 +1947,7 @@ impl Markdown {
                 Some(_) => body.clone(),
                 None => String::new(),
             };
+            self.coloring = Coloring::default();
             self.fence = Some(Open {
                 fence,
                 gap,
@@ -3506,6 +3572,34 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.trim_end().ends_with("tail"), "{text:?}");
+        // Lines that end after are read by the same coloring, once each:
+        // what they leave open colors the next long line.
+        reader.feed(&line, 40, false);
+        reader.feed("/* open", 40, false);
+        let later = "x".repeat(400);
+        let colored = loop {
+            let rows = reader.open_last(&later, 40, false, 5);
+            if rows
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.style.fg.is_some())
+            {
+                break rows;
+            }
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(20),
+                "never colored"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        code_line(&mut code, "/* open");
+        let whole = wrap_lines(
+            Line::from(code_line(&mut code, &later)),
+            40,
+            Line::from("  "),
+            Line::from("    "),
+        );
+        assert_eq!(colored, whole[whole.len() - 5..].to_vec());
         // A short line is colored on the loop, at once.
         let mut short = Markdown::default();
         short.feed("```rust", 40, false);

@@ -214,24 +214,36 @@ fn end_within(text: &str, room: usize) -> &str {
     // The letters from the end whose own widths fill the room: what shows,
     // or nearly, since letters together (an emoji and its selector, a
     // joined family) can draw wider or narrower than each alone.
-    let mut start = text.len();
+    let mut guess = text.len();
     let mut filled = 0;
     for (at, c) in text.char_indices().rev() {
         filled += c.width().unwrap_or(0);
         if filled > room {
             break;
         }
-        start = at;
+        guess = at;
     }
-    while text[start..].width() > room {
-        start += text[start..].chars().next().map_or(0, char::len_utf8);
+    let fits = |at: usize| text[at..].width() <= room;
+    let before = text[..guess].char_indices().next_back().map(|(at, _)| at);
+    if fits(guess) && before.is_some_and(|at| !fits(at)) {
+        return &text[guess..];
     }
-    while let Some((at, _)) = text[..start].char_indices().next_back()
-        && text[at..].width() <= room
-    {
-        start = at;
+    // Otherwise the first letter from which the rest fits, halving: a
+    // letter dropped from the front never widens what is left, and a
+    // long joined run measured a few times, not once per letter.
+    let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let at = |k: usize| starts.get(k).copied().unwrap_or(text.len());
+    // From `low` the rest is too wide; from `high` it fits.
+    let (mut low, mut high) = (0, starts.len());
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if fits(at(mid)) {
+            high = mid;
+        } else {
+            low = mid;
+        }
     }
-    &text[start..]
+    &text[at(high)..]
 }
 
 #[cfg(test)]
@@ -368,6 +380,7 @@ mod tests {
             "🇬🇷",
             "\u{200b}",
             "x",
+            "👩\u{200d}",
         ];
         for length in 0..60 {
             for room in [0, 1, 2, 3, 7, 20] {
@@ -394,6 +407,9 @@ mod tests {
             shown.width()
         );
         assert!(pasted.ends_with(shown));
+        // A joined run as long, two columns however long it gets.
+        let joined = format!("xx{}👩", "👩\u{200d}".repeat(100_000));
+        assert_eq!(end_within(&joined, 2), dropping(&joined, 2));
         assert!(
             began.elapsed() < std::time::Duration::from_secs(2),
             "{:?}",
