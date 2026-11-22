@@ -128,6 +128,10 @@ pub struct Machine {
     pub open: bool,
     /// Its MCP servers, by name.
     pub servers: BTreeMap<String, Lent>,
+    /// The Sonny it runs ([`build`]); null for one from before they said.
+    pub build: Value,
+    /// Whether it upgrades to match this machine, as its link says.
+    pub upgrade: bool,
 }
 
 /// An MCP server of another machine: what it says of itself, and its tools
@@ -157,6 +161,8 @@ impl Machine {
             desktop: said["desktop"] == true,
             open: said["open"] == true,
             servers,
+            build: said["build"].clone(),
+            upgrade: said["upgrade"] == true,
         }
     }
 }
@@ -930,6 +936,8 @@ async fn serve(machine: String) -> Result<(), String> {
     let dir = here().ok_or("HOME is not set")?;
     private(&dir).map_err(|e| e.to_string())?;
     private(&dir.join(".proof")).map_err(|e| e.to_string())?;
+    // The program this session runs, so one installed over it is seen.
+    crate::update::note_started();
     let path = dir.join(format!("{machine}.sock"));
     // One left by a session that ended unseen.
     let _ = std::fs::remove_file(&path);
@@ -937,7 +945,7 @@ async fn serve(machine: String) -> Result<(), String> {
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     let ours = std::fs::metadata(&path).map(|m| m.ino()).ok();
     let (out, _writing) = Out::to(tokio::io::stdout());
-    out.tell(&json!({"hello": {"protocol": PROTOCOL}}));
+    out.tell(&json!({"hello": {"protocol": PROTOCOL, "build": build()}}));
     // How many calls the machine takes at once, as it says.
     let calls = Arc::new(AtomicU64::new(u64::MAX));
     let waiting: Waiting = Arc::default();
@@ -1006,11 +1014,16 @@ async fn serve(machine: String) -> Result<(), String> {
                 }
             }
             _ = tick.tick() => {
-                // Quiet too long, as a lender asleep; or another session's
-                // socket in this one's place.
+                // Quiet too long, as a lender asleep; another session's
+                // socket in this one's place; or another Sonny installed
+                // here since, however (`brew upgrade` by hand too), which
+                // the machine dials again onto, saying the build it runs.
                 let replaced = std::fs::metadata(&path).map(|m| m.ino()).ok() != ours;
                 let quiet = now_ms().saturating_sub(heard.load(Ordering::Relaxed));
-                if quiet >= SILENT.as_millis() as u64 || replaced {
+                if quiet >= SILENT.as_millis() as u64
+                    || replaced
+                    || crate::update::installed_since().is_some()
+                {
                     break;
                 }
             }
@@ -1343,7 +1356,7 @@ async fn redial(key: String, link: agent_client::config::Link, hub: crate::mcp::
     loop {
         let started = Instant::now();
         let ended = dial(&key, &link, &hub).await;
-        stood(&key, &link, false, ended.err());
+        stood(&key, &link, false, ended.err(), None);
         if started.elapsed() >= HEALTHY {
             wait = BACKOFF;
         }
@@ -1352,17 +1365,298 @@ async fn redial(key: String, link: agent_client::config::Link, hub: crate::mcp::
     }
 }
 
-/// Say how `key` stands, for `sonny link`.
-fn stood(key: &str, link: &agent_client::config::Link, connected: bool, error: Option<String>) {
+/// Say how `key` stands, for `sonny link`: with the build the host last
+/// said it runs, `there`, or the one said before.
+fn stood(
+    key: &str,
+    link: &agent_client::config::Link,
+    connected: bool,
+    error: Option<String>,
+    there: Option<&Value>,
+) {
     let Some(dir) = mine() else {
         return;
     };
     if private(&dir).is_err() {
         return;
     }
+    let file = dir.join(format!("{key}.json"));
+    let there = there.cloned().unwrap_or_else(|| {
+        (std::fs::read(&file).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .map_or(Value::Null, |said| said["there"].clone())
+    });
     let said = json!({"host": link.host, "machine": machine_of(link), "connected": connected,
-        "at": now_ms(), "error": error});
-    let _ = replace(&dir.join(format!("{key}.json")), &said.to_string());
+        "at": now_ms(), "error": error, "there": there});
+    let _ = replace(&file, &said.to_string());
+}
+
+// ---- one release on both ends ----
+
+/// What each end of a link says of its build: its release, the commit it
+/// was built from when it knows, and how it was installed
+/// ([`crate::update::installed`]).
+pub(crate) fn build() -> Value {
+    static INSTALLED: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": option_env!("SONNY_COMMIT"),
+        "installed": INSTALLED.get_or_init(crate::update::installed),
+    })
+}
+
+/// A build as the person reads it: its release, and for a build from main,
+/// which all say 0.0.0, its commit.
+fn shown(build: &Value) -> String {
+    let version = build["version"].as_str().unwrap_or("an older Sonny");
+    match (version, build["commit"].as_str()) {
+        ("0.0.0", Some(commit)) => format!("{version} ({commit})"),
+        _ => version.to_owned(),
+    }
+}
+
+/// Which end of a link runs behind the other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Behind {
+    Neither,
+    Here,
+    There,
+    /// Two builds from main, told apart by their commits only: each brings
+    /// itself to the latest, which leaves the one there alone.
+    Both,
+}
+
+/// Which end runs behind, by the builds `here` and `there` say. A Sonny
+/// that says none is from before the ends said them, so older. A build
+/// `sonny upgrade` leaves to how it was built, at either end, leaves both
+/// as they are, as does a release it cannot read.
+fn behind(here: &Value, there: &Value) -> Behind {
+    let Some(theirs) = there["version"].as_str() else {
+        return match here["installed"] == "other" {
+            true => Behind::Neither,
+            false => Behind::There,
+        };
+    };
+    if here["installed"] == "other" || there["installed"] == "other" {
+        return Behind::Neither;
+    }
+    let ours = here["version"]
+        .as_str()
+        .and_then(crate::update::parse_version);
+    let (Some(ours), Some(theirs)) = (ours, crate::update::parse_version(theirs)) else {
+        return Behind::Neither;
+    };
+    match ours.cmp(&theirs) {
+        std::cmp::Ordering::Less => Behind::Here,
+        std::cmp::Ordering::Greater => Behind::There,
+        std::cmp::Ordering::Equal
+            if ours == (0, 0, 0)
+                && (here["commit"].is_null() || here["commit"] != there["commit"]) =>
+        {
+            Behind::Both
+        }
+        std::cmp::Ordering::Equal => Behind::Neither,
+    }
+}
+
+/// How long a pair of builds that are still apart after an upgrade waits
+/// to be tried again: a release the host has but Homebrew does not yet.
+const AGAIN: Duration = Duration::from_secs(60 * 60);
+
+/// Whether to upgrade for the builds `here` and `there` now, after what
+/// was `tried` last: always for another pair; for the same pair, never
+/// once it failed, as T3 Code never installs again on its own a version
+/// that did not apply, else an hour after the last try.
+fn due(tried: &Value, here: &Value, there: &Value, now: u64) -> bool {
+    if tried["here"] != *here || tried["there"] != *there {
+        return true;
+    }
+    let at = tried["at"].as_u64().unwrap_or(0);
+    tried["ended"] != "failed" && now.saturating_sub(at) >= AGAIN.as_millis() as u64
+}
+
+/// The links whose upgrade runs now, by key: one at a time each.
+static UPGRADING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The host of `link`, `key`, said it runs `there`: the end behind
+/// upgraded, unless the link says not to, its last try says to wait, or
+/// one runs already. What it does is kept in `KEY.upgrade.json` and its
+/// output in `KEY.upgrade.log`, which `sonny link` names.
+fn upgrade_behind(key: &str, link: &agent_client::config::Link, there: &Value) {
+    if !link.upgrade {
+        return;
+    }
+    let here = build();
+    let which = behind(&here, there);
+    if which == Behind::Neither {
+        return;
+    }
+    let Some(dir) = mine().filter(|dir| private(dir).is_ok()) else {
+        return;
+    };
+    let file = dir.join(format!("{key}.upgrade.json"));
+    let tried: Value = (std::fs::read(&file).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if !due(&tried, &here, there, now_ms()) {
+        return;
+    }
+    {
+        let mut upgrading = UPGRADING.lock().unwrap();
+        if upgrading.iter().any(|running| running == key) {
+            return;
+        }
+        upgrading.push(key.to_owned());
+    }
+    let side = match which {
+        Behind::Here => "here",
+        Behind::There => "there",
+        _ => "both",
+    };
+    let there = there.clone();
+    let state = move |ended: &str, detail: Option<String>| {
+        json!({"here": here, "there": there, "side": side, "at": now_ms(),
+            "ended": ended, "detail": detail})
+    };
+    let _ = replace(&file, &state("running", None).to_string());
+    let (key, link) = (key.to_owned(), link.clone());
+    let log = dir.join(format!("{key}.upgrade.log"));
+    // Apart from the dial: an upgrade there ends the session it was
+    // started from, which must not end the upgrade.
+    tokio::spawn(async move {
+        let ended = upgrading(&link, which, &log).await;
+        let state = match ended {
+            Ok(()) => state("ok", None),
+            Err(detail) => state("failed", Some(detail)),
+        };
+        let _ = replace(&file, &state.to_string());
+        UPGRADING.lock().unwrap().retain(|running| *running != key);
+    });
+}
+
+/// `sonny upgrade` where `which` says, there first, its output in `log`.
+/// This machine's runs in a process group of its own, since it replaces
+/// the daemon and its tool host, which this runs in, and must outlive
+/// them.
+async fn upgrading(
+    link: &agent_client::config::Link,
+    which: Behind,
+    log: &Path,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(log)
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    let pipe = |out: &std::fs::File| -> Result<std::process::Stdio, String> {
+        out.try_clone().map(Into::into).map_err(|e| e.to_string())
+    };
+    if matches!(which, Behind::There | Behind::Both) {
+        let _ = writeln!(out, "{}: sonny upgrade", link.host);
+        let sonny = link.command.as_deref().unwrap_or("sonny");
+        let status = (ssh(link).arg(format!("{} upgrade", quoted(sonny))))
+            .stdin(std::process::Stdio::null())
+            .stdout(pipe(&out)?)
+            .stderr(pipe(&out)?)
+            .status()
+            .await
+            .map_err(|e| format!("ssh could not start: {e}"))?;
+        if !status.success() {
+            return Err(last_line(log).unwrap_or_else(|| format!("exited with {status}")));
+        }
+    }
+    if matches!(which, Behind::Here | Behind::Both) {
+        let _ = writeln!(out, "this machine: sonny upgrade");
+        let me = (crate::skills::sonny_path())
+            .or_else(|| crate::named::me().ok())
+            .ok_or("this Sonny's program is not found")?;
+        let status = tokio::process::Command::new(me)
+            .arg("upgrade")
+            .current_dir("/")
+            .env_remove("AGENT_COMPANION")
+            .stdin(std::process::Stdio::null())
+            .stdout(pipe(&out)?)
+            .stderr(pipe(&out)?)
+            .process_group(0)
+            .status()
+            .await
+            .map_err(|e| format!("sonny upgrade could not start: {e}"))?;
+        if !status.success() {
+            return Err(last_line(log).unwrap_or_else(|| format!("exited with {status}")));
+        }
+    }
+    Ok(())
+}
+
+/// The last line `log` holds, as a reason.
+fn last_line(log: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(log).ok()?;
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(line.chars().take(300).collect())
+}
+
+/// After this machine's Sonny was upgraded: each machine linked here dials
+/// again, since a session started before runs the Sonny it started on, and
+/// each link of this machine's matches the host. A line for each.
+pub(crate) fn upgraded() -> Vec<String> {
+    let mut said = Vec::new();
+    if let Some(dir) = here() {
+        said.extend(reconnected_in(&dir, &build()));
+    }
+    let links = agent_client::config::load()
+        .map(|c| c.sonny.links)
+        .unwrap_or_default();
+    for (key, link) in links {
+        said.push(match link.upgrade {
+            true => format!(
+                "Link {key}: {} upgrades to match if it runs behind, as the link connects again (`sonny link` says how it went)",
+                link.host
+            ),
+            false => format!("Link {key}: {} keeps its release (upgrade = false)", link.host),
+        });
+    }
+    said
+}
+
+/// [`upgraded`] for the machines linked here, kept in `dir`, this machine
+/// now running `mine`: each session ended by taking its socket away,
+/// which it notices within seconds, and the machine dials again.
+fn reconnected_in(dir: &Path, mine: &Value) -> Vec<String> {
+    machines_in(dir)
+        .into_iter()
+        .map(|machine| {
+            let name = &machine.name;
+            let connected = up_in(dir, name);
+            let _ = std::fs::remove_file(dir.join(format!("{name}.sock")));
+            if machine.build.is_null() {
+                return format!(
+                    "Linked machine {name} runs a Sonny from before linked machines upgraded together: run `sonny upgrade` there once"
+                );
+            }
+            let theirs = shown(&machine.build);
+            match (behind(mine, &machine.build), machine.upgrade, connected) {
+                (Behind::There | Behind::Both, true, true) => {
+                    format!("Linked machine {name} ({theirs}) connects again and upgrades to match")
+                }
+                (Behind::There | Behind::Both, true, false) => {
+                    format!("Linked machine {name} ({theirs}) upgrades to match when it next connects")
+                }
+                (Behind::There | Behind::Both, false, _) => {
+                    format!("Linked machine {name} stays on {theirs}: its link says upgrade = false")
+                }
+                (_, _, true) => format!("Linked machine {name} ({theirs}) connects again"),
+                (_, _, false) => format!("Linked machine {name} runs {theirs}"),
+            }
+        })
+        .collect()
 }
 
 /// What the agents over `link` call this machine: its own `machine`, else
@@ -1462,6 +1756,8 @@ async fn dial(
     let mut stdout = lines(BufReader::new(stdout), LINE_BYTES, None);
     let mut ping = tokio::time::interval(PING);
     let mut refused = None;
+    // The build the host said it runs, once it has.
+    let mut there: Option<Value> = None;
     // What the host was last told this machine has, told again as it
     // changes: a server added or taken away, agent-browser installed. Read
     // apart from the calls, since a server starting holds what it knows.
@@ -1495,7 +1791,11 @@ async fn dial(
                     let lends = lends(link, hub, most).await;
                     out.tell(&json!({"hello": {"protocol": PROTOCOL, "lends": lends}}));
                     told = Some(lends);
-                    stood(key, link, refused.is_none(), refused.clone());
+                    stood(key, link, refused.is_none(), refused.clone(), Some(&hello["build"]));
+                    // Whatever the protocols: ends apart are what an
+                    // upgrade brings together.
+                    upgrade_behind(key, link, &hello["build"]);
+                    there = Some(hello["build"].clone());
                     continue;
                 }
                 let Some(id) = said["id"].as_u64() else { continue };
@@ -1541,7 +1841,12 @@ async fn dial(
                 // Said again while the session is up, so how the link
                 // stands follows the session whatever wrote it last.
                 if told.is_some() && refused.is_none() {
-                    stood(key, link, true, None);
+                    stood(key, link, true, None, None);
+                }
+                // Looked at again while the session lasts, which it may for
+                // days: a pair still apart is tried again when it is due.
+                if let Some(there) = &there {
+                    upgrade_behind(key, link, there);
                 }
             }
             Some(lends) = freshened.recv() => {
@@ -1605,6 +1910,8 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
         "desktop": crate::desktop::here(),
         "open": true,
         "servers": servers,
+        "build": build(),
+        "upgrade": link.upgrade,
     })
 }
 
@@ -1858,11 +2165,21 @@ fn setup(host: &str, rest: &[String]) -> Result<(), String> {
     table.insert("host".into(), toml::Value::String(host.to_owned()));
     table.insert("machine".into(), toml::Value::String(machine.clone()));
     table.insert("command".into(), toml::Value::String(command.clone()));
+    // Written, so the person sees what happens and where to turn it off.
+    let upgrade = (table.entry("upgrade"))
+        .or_insert(toml::Value::Boolean(true))
+        .as_bool()
+        .unwrap_or(true);
     agent_client::config::set_table(&path, &format!("sonny.links.{name}"), Some(&table))?;
     println!("{host} runs {there}");
     println!(
         "Linked. While this machine's daemon runs, {host}'s agents can use its browser, its MCP servers and opens, as the machine `{machine}`."
     );
+    if upgrade {
+        println!(
+            "Upgrading either machine upgrades the other: as the link connects, the one behind runs `sonny upgrade` (upgrade = false under [sonny.links.{name}] turns it off)."
+        );
+    }
     if !crate::boot::on() {
         agent_client::config::write(
             &path,
@@ -1955,6 +2272,46 @@ fn forget_in(dir: &Path, machine: &str) -> String {
     format!("{machine} is forgotten here, until it connects again.")
 }
 
+/// What `sonny link` says of the releases at the ends of `link`, `key`,
+/// whose host last said it runs `there`: nothing while they match, else
+/// both, and how the upgrade that brings them together went.
+fn releases(key: &str, link: &agent_client::config::Link, there: &Value) -> String {
+    let here = build();
+    if there.is_null() || behind(&here, there) == Behind::Neither {
+        return String::new();
+    }
+    let mut said = format!(
+        " · {} runs {}, this machine {}",
+        link.host,
+        shown(there),
+        shown(&here)
+    );
+    if !link.upgrade {
+        return said + " (upgrade = false)";
+    }
+    let Some(dir) = mine() else {
+        return said;
+    };
+    let tried: Value = (std::fs::read(dir.join(format!("{key}.upgrade.json"))).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    // What was tried for another pair of builds says nothing of these.
+    if tried["here"] != here || tried["there"] != *there {
+        return said;
+    }
+    let log = crate::tilde(&dir.join(format!("{key}.upgrade.log")).to_string_lossy());
+    let at = ago(tried["at"].as_u64().unwrap_or(0));
+    said += &match tried["ended"].as_str() {
+        Some("running") => format!(" · upgrading to match, started {at} (output: {log})"),
+        Some("failed") => format!(
+            " · the upgrade to match failed {at}: {}; `sonny upgrade` on the end behind tries again (output: {log})",
+            tried["detail"].as_str().unwrap_or("no reason given")
+        ),
+        _ => format!(" · upgraded {at}, still apart; tried again within the hour (output: {log})"),
+    };
+    said
+}
+
 /// `sonny link`: this machine's links, and the machines linked here.
 fn list() {
     let (config, loaded) = match agent_client::config::load() {
@@ -1984,8 +2341,9 @@ fn list() {
             _ => named,
         };
         println!(
-            "{key}  this machine, linked to {} as {name} · {how}",
-            link.host
+            "{key}  this machine, linked to {} as {name} · {how}{}",
+            link.host,
+            releases(key, link, &said["there"])
         );
     }
     for machine in machines() {
@@ -2007,8 +2365,12 @@ fn list() {
         if machine.open {
             lends.push("opens".to_owned());
         }
+        let runs = match machine.build.is_null() {
+            true => String::new(),
+            false => format!(" · runs {}", shown(&machine.build)),
+        };
         println!(
-            "{}  linked here · {how} · {}",
+            "{}  linked here · {how} · {}{runs}",
             machine.name,
             lends.join(", ")
         );
@@ -2438,5 +2800,120 @@ mod tests {
         assert_eq!(line(&mut short, 100, None).await.unwrap(), None);
         let mut long: &[u8] = b"{\"a\":\"0123456789\"}\n";
         assert!(line(&mut long, 8, None).await.is_err());
+    }
+
+    fn built(version: &str, commit: Option<&str>, installed: &str) -> Value {
+        json!({"version": version, "commit": commit, "installed": installed})
+    }
+
+    #[test]
+    fn the_end_behind_is_the_older_release_and_builds_from_main_both_upgrade() {
+        let old = built("0.10.4", None, "brew");
+        let new = built("0.10.5", Some("abc"), "tarball");
+        assert_eq!(behind(&old, &new), Behind::Here);
+        assert_eq!(behind(&new, &old), Behind::There);
+        // One release, built from an archive here and a checkout there.
+        assert_eq!(
+            behind(&built("0.10.5", None, "brew"), &new),
+            Behind::Neither
+        );
+        // A Sonny from before the ends said their builds is older.
+        assert_eq!(behind(&new, &Value::Null), Behind::There);
+        // Two builds from main: apart by commit, each to the latest.
+        let main = |commit| built("0.0.0", Some(commit), "nightly");
+        assert_eq!(behind(&main("a"), &main("a")), Behind::Neither);
+        assert_eq!(behind(&main("a"), &main("b")), Behind::Both);
+        assert_eq!(
+            behind(&built("0.0.0", None, "nightly"), &main("b")),
+            Behind::Both
+        );
+        // A build by hand at either end is upgraded the way it was built.
+        let by_hand = built("0.0.0", Some("c"), "other");
+        assert_eq!(behind(&by_hand, &old), Behind::Neither);
+        assert_eq!(behind(&old, &by_hand), Behind::Neither);
+        assert_eq!(behind(&by_hand, &Value::Null), Behind::Neither);
+        // A release it cannot read is left alone.
+        assert_eq!(
+            behind(&built("0.11.0-rc.1", None, "brew"), &old),
+            Behind::Neither
+        );
+    }
+
+    #[test]
+    fn an_upgrade_is_tried_once_for_a_pair_of_builds_and_again_an_hour_on_unless_it_failed() {
+        let (here, there) = (
+            built("0.10.4", None, "brew"),
+            built("0.10.5", None, "tarball"),
+        );
+        let hour = AGAIN.as_millis() as u64;
+        assert!(due(&Value::Null, &here, &there, 0));
+        let tried =
+            |ended: &str| json!({"here": here, "there": there, "at": 1_000, "ended": ended});
+        // Running, or done with the builds still apart (Homebrew without
+        // the release yet): the same pair again in an hour.
+        for ended in ["running", "ok"] {
+            assert!(!due(&tried(ended), &here, &there, 1_000 + hour - 1));
+            assert!(due(&tried(ended), &here, &there, 1_000 + hour));
+        }
+        // Failed: never again on its own for that pair.
+        assert!(!due(&tried("failed"), &here, &there, 1_000 + 100 * hour));
+        // Another build at either end is another pair.
+        assert!(due(
+            &tried("failed"),
+            &here,
+            &built("0.10.6", None, "tarball"),
+            2_000
+        ));
+        assert!(due(
+            &tried("failed"),
+            &built("0.10.5", None, "brew"),
+            &there,
+            2_000
+        ));
+    }
+
+    #[test]
+    fn an_upgrade_here_ends_each_link_session_and_says_what_each_machine_does() {
+        let dir = scratch("upgraded");
+        let mine = built("0.10.5", None, "tarball");
+        let lends =
+            |build: Value, upgrade: bool| json!({"build": build, "upgrade": upgrade}).to_string();
+        std::fs::write(
+            dir.join("laptop.json"),
+            lends(built("0.10.4", None, "brew"), true),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("desk.json"),
+            lends(built("0.10.4", None, "brew"), false),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("mini.json"),
+            lends(built("0.10.5", None, "brew"), true),
+        )
+        .unwrap();
+        std::fs::write(dir.join("old.json"), "{}").unwrap();
+        for up in ["laptop", "mini"] {
+            std::fs::write(dir.join(format!("{up}.sock")), "").unwrap();
+            std::fs::write(dir.join(format!("{up}.seen")), now_ms().to_string()).unwrap();
+        }
+        let said = reconnected_in(&dir, &mine);
+        assert_eq!(
+            said,
+            [
+                "Linked machine desk stays on 0.10.4: its link says upgrade = false",
+                "Linked machine laptop (0.10.4) connects again and upgrades to match",
+                "Linked machine mini (0.10.5) connects again",
+                "Linked machine old runs a Sonny from before linked machines upgraded together: run `sonny upgrade` there once",
+            ]
+        );
+        // Their sessions see their sockets gone and end, so each dials again.
+        assert!(!dir.join("laptop.sock").exists() && !dir.join("mini.sock").exists());
+        // Away, a machine behind upgrades when it next connects.
+        std::fs::write(dir.join("laptop.seen"), "0").unwrap();
+        assert!(reconnected_in(&dir, &mine).contains(
+            &"Linked machine laptop (0.10.4) upgrades to match when it next connects".to_owned()
+        ));
     }
 }
