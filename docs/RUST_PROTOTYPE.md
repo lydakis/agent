@@ -2413,9 +2413,15 @@ for a full disk say, is not migrated: opening fails with
 `store_backup_failed`, which says why, and the store stays as it was. To go
 back a release, stop the daemon and put the copy in the store's place, or
 keep what changed since with `release/store_down.py STORE N`: on a store no
-daemon holds, it copies the store beside itself and takes it back to schema
-N with each step's way back, newest first, in one transaction. Every step
-from 106 (0.10.1) on has one there, and each new step adds its own. Schema
+daemon holds, it copies the store beside itself, with the store's
+permissions as the daemon's copy has them, and takes it back to schema N
+with each step's way back, newest first, in one transaction. Every step
+from 106 (0.10.1) on has one there, and each new step adds its own. Every
+release installs it, with its helper `store_lift_yields.py`, in `libexec`:
+`PREFIX/opt/sonny/libexec/store_down.py` from the Linux tarball and
+`$(brew --prefix agent)/libexec/store_down.py` from Homebrew. Run the one of
+the release being left, before installing the older one: only it knows its
+own steps. Schema
 109 names a declared tool's `lift` `yields` (#1203) in every list the store
 keeps, in place, so the list moves to the digest of its new bytes and the
 bots, creation records and kept `configure`s that name it follow; its way
