@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, Write};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -96,8 +97,13 @@ pub struct Replay {
     pub start: Option<Value>,
     /// The calls it made, in order: tool and the hash of its arguments.
     pub calls: Vec<(String, String)>,
-    /// The results it was given, in the order it was given them.
-    pub results: VecDeque<Given>,
+    /// The results it was given, in the order it was given them: where
+    /// each is in the file, read only as it is given again, so a journal
+    /// of many large results is never held whole.
+    pub results: VecDeque<Recorded>,
+    /// What each `store()` said, in order: a script run again is told the
+    /// same without writing again what a later script may have changed.
+    pub stores: VecDeque<String>,
     /// The calls that have a result.
     pub answered: HashSet<u64>,
     pub loads: VecDeque<Option<String>>,
@@ -115,6 +121,14 @@ pub struct Given {
     pub counted: Option<String>,
 }
 
+/// Where a result is in its journal: the line's offset and length.
+#[derive(Debug, Clone, Copy)]
+pub struct Recorded {
+    pub call: u64,
+    at: u64,
+    len: usize,
+}
+
 /// Whether a journal could be picked up.
 pub enum Claim {
     /// Read, and locked for this host.
@@ -130,10 +144,16 @@ impl Journal {
     /// cannot be made: the script runs without one, as before journals.
     pub fn begin(path: PathBuf) -> Option<Journal> {
         let _sweeping = sweeping();
-        std::fs::create_dir_all(path.parent()?).ok()?;
+        // The person's alone, as the store is: it holds every result.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path.parent()?)
+            .ok()?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&path)
             .ok()?;
         if !lock(&file) {
@@ -218,6 +238,30 @@ impl Journal {
         ]);
     }
 
+    /// The next result recorded, read from the file, to give the script
+    /// again; `Some(None)` when it cannot be read back.
+    pub fn next_result(&self) -> Option<Option<Given>> {
+        let recorded = self.replay.lock().unwrap().results.pop_front()?;
+        let file = self.file.lock().unwrap();
+        let mut line = vec![0; recorded.len];
+        let read = (file.as_ref()).and_then(|file| file.read_exact_at(&mut line, recorded.at).ok());
+        let given = read
+            .and_then(|()| serde_json::from_slice::<Value>(&line).ok())
+            .and_then(|record| {
+                Some(Given {
+                    call: recorded.call,
+                    now_ms: record["now_ms"].as_u64()?,
+                    raw: record["raw"].as_str()?.to_owned(),
+                    counted: record["counted"].as_str().map(str::to_owned),
+                })
+            });
+        Some(given)
+    }
+
+    pub fn stored(&self, said: &str) {
+        self.write(&[json!({"t": "store", "said": said})]);
+    }
+
     pub fn load(&self, value: &Option<String>) {
         self.write(&[json!({"t": "load", "value": value})]);
     }
@@ -252,6 +296,7 @@ fn read(file: &std::fs::File) -> Option<(Replay, u64)> {
             break;
         }
         let record: Value = serde_json::from_slice(&line).ok()?;
+        let at = whole;
         whole += read as u64;
         match record["t"].as_str()? {
             "start" => replay.start = Some(record),
@@ -269,16 +314,18 @@ fn read(file: &std::fs::File) -> Option<(Replay, u64)> {
                 if call > replay.calls.len() as u64 || !replay.answered.insert(call) {
                     return None;
                 }
-                replay.results.push_back(Given {
+                record["now_ms"].as_u64()?;
+                record["raw"].as_str()?;
+                replay.results.push_back(Recorded {
                     call,
-                    now_ms: record["now_ms"].as_u64()?,
-                    raw: record["raw"].as_str()?.to_owned(),
-                    counted: record["counted"].as_str().map(str::to_owned),
+                    at,
+                    len: read,
                 });
             }
             "load" => replay
                 .loads
                 .push_back(record["value"].as_str().map(str::to_owned)),
+            "store" => replay.stores.push_back(record["said"].as_str()?.to_owned()),
             "yielded" => replay.yielded = true,
             "end" => replay.end = Some(record["answer"].clone()),
             _ => return None,
@@ -355,8 +402,19 @@ pub fn keep_tools(folder: &Path, hash: &str, tools: &str) -> bool {
         return true;
     }
     let partial = folder.join(format!(".tools-{hash}-{}", std::process::id()));
-    let written = std::fs::create_dir_all(folder)
-        .and_then(|()| std::fs::write(&partial, tools))
+    let written = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(folder)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&partial)
+        })
+        .and_then(|mut file| file.write_all(tools.as_bytes()))
         .and_then(|()| std::fs::rename(&partial, &path));
     if written.is_err() {
         let _ = std::fs::remove_file(&partial);
@@ -412,11 +470,14 @@ mod tests {
         };
         let replay = again.replay.lock().unwrap();
         assert_eq!(replay.calls.len(), 2);
-        assert_eq!(replay.results[0].call, 2);
-        assert_eq!(replay.results[0].counted.as_deref(), Some("test"));
         assert_eq!(replay.loads, [Some("7".to_owned())]);
         assert!(replay.yielded && replay.end.is_none());
         drop(replay);
+        let given = again.next_result().unwrap().unwrap();
+        assert_eq!((given.call, given.now_ms), (2, 5));
+        assert_eq!(given.raw, "{\"ok\":1}");
+        assert_eq!(given.counted.as_deref(), Some("test"));
+        assert!(again.next_result().is_none());
         // The record cut short is gone, so the next is a line of its own
         // and the journal reads back again after another stop.
         again.end(&json!("done"));

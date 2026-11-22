@@ -2468,12 +2468,16 @@ impl Run {
                     flying.insert(n, Abort(call));
                 }
             }
-            let replayed = self
-                .journal
-                .as_ref()
-                .and_then(|journal| journal.replay.lock().unwrap().results.pop_front());
+            let replayed = (self.journal.as_ref()).and_then(|journal| journal.next_result());
             let next = match replayed {
-                Some(given) => {
+                Some(None) => {
+                    return Ended::Terminated(
+                        "it ran again after Sonny's tool host restarted, and a result it was given \
+                         could not be read back from its journal; each call before that ran once"
+                            .into(),
+                    );
+                }
+                Some(Some(given)) => {
                     if given.call > self.shared.count.load(Ordering::SeqCst) {
                         return diverged(&format!("its call {}", given.call));
                     }
@@ -2610,16 +2614,31 @@ impl Run {
                 }))
             })?,
         )?;
-        let (store, halt) = (self.store.clone(), Arc::clone(&self.halt));
+        // What `store()` said is recorded, and a script run again is told
+        // it without writing again: a later script may have changed the key.
+        let (store, halt, journal) = (
+            self.store.clone(),
+            Arc::clone(&self.halt),
+            self.journal.clone(),
+        );
         globals.set(
             "__store",
             Function::new(ctx.clone(), move |key: String, value: String| {
-                said_of(
+                if let Some(journal) = &journal
+                    && let Some(said) = journal.replay.lock().unwrap().stores.pop_front()
+                {
+                    return said;
+                }
+                let said = said_of(
                     (halt.refuse("store()"))
                         .and_then(|()| store.as_deref().ok_or("no HOME".into()))
                         .and_then(|file| keep(file, &key, &value))
                         .map(|()| "stored".to_owned()),
-                )
+                );
+                if let Some(journal) = &journal {
+                    journal.stored(&said);
+                }
+                said
             })?,
         )?;
         let yielding = Arc::clone(&self.yielding);
@@ -4405,8 +4424,17 @@ text((await tools.tool_search({query: "echo"})).tools[0].name);"#;
         // It stopped before the script ended, with every call answered:
         // the script runs again, its servers down, and says the same.
         rewrite(&at, |line| (line["t"] != "end").then(|| line.clone()));
+        // A later script wrote the key since: running again does not
+        // write it back.
+        let kept_at = dir.join("store").join("shop.lead.json");
+        keep(&kept_at, "k", "\"newer\"").unwrap();
         let down = Hub::new(Some(dir.join("none")));
         let again = journaled(&down, &dir, script, &at, true).await;
+        assert_eq!(kept(&kept_at)["k"], "newer");
+        // The person's alone, as the store is.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&at), mode(at.parent().unwrap())), (0o600, 0o700));
         assert!(
             again.starts_with("Script completed") && again.contains("Calls: test 3"),
             "{again}"
