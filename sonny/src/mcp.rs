@@ -45,6 +45,8 @@ struct Inner {
     /// The tools `exec` last gave scripts, built from these servers'
     /// listings and reused while they hold.
     catalogs: Mutex<Vec<Arc<crate::exec::Catalog>>>,
+    /// Which write of the config file the servers were last read from.
+    config: Mutex<Option<Option<Stamp>>>,
 }
 
 struct Slot {
@@ -59,9 +61,16 @@ struct Slot {
     kept: Mutex<Option<(Stamp, Option<Known>)>>,
 }
 
-/// Which write of a listing's file was read: a write puts a new file in
-/// its place.
+/// Which write of a file was read: a write puts a new file in its place,
+/// or changes its time.
 type Stamp = (u64, i64, i64, u64);
+
+/// `path`'s stamp, or none while there is no file.
+fn stamp(path: &Path) -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.len()))
+}
 
 struct Live {
     client: RunningService<RoleClient, ClientConfig>,
@@ -90,6 +99,7 @@ impl Hub {
             slots: Mutex::default(),
             cache,
             catalogs: Mutex::default(),
+            config: Mutex::default(),
         }))
     }
 
@@ -128,6 +138,29 @@ impl Hub {
         for slot in gone {
             slot.stop().await;
         }
+    }
+
+    /// Serve the servers the person's config names now, its file read
+    /// again only once it was written again: every script asks.
+    pub async fn follow_config(&self) -> Result<(), String> {
+        match agent_client::config::path() {
+            Some(path) => self.follow(&path).await,
+            None => {
+                self.configure(&Servers::new()).await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn follow(&self, path: &Path) -> Result<(), String> {
+        let now = stamp(path);
+        if self.0.config.lock().unwrap().as_ref() == Some(&now) {
+            return Ok(());
+        }
+        let servers = agent_client::config::read(path)?.sonny.mcp_servers;
+        self.configure(&servers).await;
+        *self.0.config.lock().unwrap() = Some(now);
+        Ok(())
     }
 
     /// The servers served, by name.
@@ -289,17 +322,17 @@ impl Hub {
         use std::os::unix::fs::MetadataExt;
         let mut file = std::fs::File::open(self.file(slot)?).ok()?;
         let meta = file.metadata().ok()?;
-        let stamp = (meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.len());
+        let read = (meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.len());
         let mut kept = slot.kept.lock().unwrap();
-        if let Some((read, known)) = kept.as_ref()
-            && *read == stamp
+        if let Some((was, known)) = kept.as_ref()
+            && *was == read
         {
             return known.clone();
         }
         let mut bytes = Vec::with_capacity(meta.len() as usize);
         file.read_to_end(&mut bytes).ok()?;
         let known = parse_kept(&bytes, &slot.config);
-        *kept = Some((stamp, known.clone()));
+        *kept = Some((read, known.clone()));
         known
     }
 
@@ -956,6 +989,26 @@ mod tests {
             ..config
         };
         assert_eq!(kept(&dir.join("mcp"), "s", &changed), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_config_is_read_again_only_once_written_again() {
+        let dir = std::env::temp_dir().join(format!("sonny-mcp-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let hub = Hub::new(None);
+        std::fs::write(&path, "[sonny.mcp_servers.a]\ncommand = \"a\"\n").unwrap();
+        hub.follow(&path).await.unwrap();
+        assert_eq!(hub.servers().into_keys().collect::<Vec<_>>(), ["a"]);
+        // Unchanged, it is not read: one it could not read now still serves.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        hub.follow(&path).await.unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "[sonny.mcp_servers.b]\ncommand = \"b\"\n").unwrap();
+        hub.follow(&path).await.unwrap();
+        assert_eq!(hub.servers().into_keys().collect::<Vec<_>>(), ["b"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -961,8 +961,7 @@ pub async fn answer(
     steps: Option<Steps>,
     journal: Option<Journal>,
 ) -> Result<Value, String> {
-    let servers = agent_client::config::load()?.sonny.mcp_servers;
-    hub.configure(&servers).await;
+    hub.follow_config().await?;
     let dir = home_dir();
     let whole = Whole::Saved(dir.as_deref());
     run_keeping(
@@ -1001,8 +1000,7 @@ pub async fn lent(
     named: Option<&Path>,
     space: &Path,
 ) -> Result<Value, String> {
-    let servers = agent_client::config::load()?.sonny.mcp_servers;
-    hub.configure(&servers).await;
+    hub.follow_config().await?;
     let cut = Mutex::new(None);
     let whole = match named {
         Some(named) => Whole::Sent(named, &cut),
