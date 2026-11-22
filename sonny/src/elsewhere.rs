@@ -1,5 +1,8 @@
 //! What needs the person in the other projects: the footer's `← ? 1`,
-//! and where `alt+n` goes once this project has no one.
+//! and where `alt+n` goes once this project has no one. And every
+//! question open, with the agents above the one that asked it, so the
+//! window of each of them shows it, whatever window started it and
+//! whichever were opened, closed or restarted since.
 //!
 //! One follow for every window of a store: the first window to open takes
 //! a lock beside the store and follows; the others hear what it found on
@@ -18,8 +21,10 @@
 //!
 //! Every agent is followed only for the events that can start a wait on
 //! the person ([`WIDE`]): a call held for a verdict, a call starting (a
-//! question is the ask tool's call; `mark_done` marks a task done), and a
-//! fork made (it keeps its source's history, and any question open in it). The
+//! question is the ask tool's call; `mark_done` marks a task done), a fork
+//! made (it keeps its source's history, and any question open in it), and
+//! an agent made (the event names who made it, so who is above whom is
+//! known with nothing read). The
 //! rest of an agent's events, its calls ending and its turn's end, are
 //! followed only while it waits, runs a turn begun before the follow, or
 //! marks a task done ([`NARROW`]), from that event on, so nothing is missed
@@ -33,7 +38,7 @@
 //! The events are applied in the order of their cursors ([`Lanes`]), so
 //! what needs the person comes out as the daemon's history says.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,15 +55,16 @@ use crate::standing;
 /// The kinds of event every agent is followed for: those that can start
 /// a wait on the person, a call lifted out of its turn and its end (a
 /// step of it held for the person waits past the turn), a fork made (it
-/// keeps any question open in its source's history), and an agent's
-/// closing or deletion.
-pub const WIDE: [&str; 8] = [
+/// keeps any question open in its source's history), an agent made (who
+/// made it), and an agent's closing or deletion.
+pub const WIDE: [&str; 9] = [
     "approval_requested",
     "approval_asked",
     "tool_started",
     "call_lifted",
     "lifted_ended",
     "forked",
+    "created",
     "closed",
     "deleted",
 ];
@@ -160,13 +166,21 @@ struct Asked {
 }
 
 /// What the window that follows tells the others: every project's agents
-/// that need the person, in the order **Projects** lists their projects.
+/// that need the person, in the order **Projects** lists their projects,
+/// each with the agents above it, and the questions open.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Shared {
     /// Each project's place in **Projects**, by name.
     pub order: HashMap<String, usize>,
     /// Each agent with its project's place and its project.
     pub agents: Vec<(usize, String, String)>,
+    /// Each agent of `agents`, with the agents above it ([`above`]).
+    pub above: BTreeMap<String, Vec<String>>,
+    /// Each agent of `agents` with a question open, and the question
+    /// whole, as the window that answers it shows it.
+    pub asks: BTreeMap<String, crate::asks::Ask>,
+    /// The calls held for the person: each agent's, its turn and the call.
+    pub calls: BTreeSet<(String, i64, String)>,
 }
 
 /// The agents of other projects that need the person, in the order
@@ -195,6 +209,30 @@ impl Shared {
         Some(self.agents.iter().any(|(_, _, waiting)| waiting == bot))
     }
 
+    /// The questions open that show in the window of `window`: those of
+    /// the agents it is above, or one of the leads it follows (`follows`)
+    /// is, as a question goes up to every agent above the one that asked
+    /// it. Its own are its own.
+    pub fn below<'a>(
+        &'a self,
+        window: &'a str,
+        follows: &'a [String],
+    ) -> impl Iterator<Item = (&'a str, &'a crate::asks::Ask)> {
+        (self.asks.iter())
+            .filter(move |(bot, _)| self.is_below(bot, window, follows))
+            .map(|(bot, ask)| (bot.as_str(), ask))
+    }
+
+    /// Whether `bot`, one of `agents`, is below `window`: `window` is
+    /// above it, or it is a lead `window` follows, or one is above it.
+    pub fn is_below(&self, bot: &str, window: &str, follows: &[String]) -> bool {
+        let followed = |over: &str| follows.iter().any(|lead| lead == over);
+        bot != window
+            && (followed(bot)
+                || (self.above.get(bot).into_iter().flatten())
+                    .any(|over| over == window || followed(over)))
+    }
+
     /// What needs the person outside `project`.
     pub fn outside(&self, project: &str) -> Waiting {
         Waiting {
@@ -216,7 +254,8 @@ impl Drop for Elsewhere {
 impl Elsewhere {
     /// Follows what needs the person in every project, or hears it from
     /// the window that does, waking the window (`woken`) only when what
-    /// needs the person outside `project` changes: what its footer draws.
+    /// needs the person outside `project` changes, what its footer draws,
+    /// or the questions open or calls held do, which it may show.
     pub fn start(socket: PathBuf, store: PathBuf, project: String, woken: Arc<Notify>) -> Self {
         let (tell, waiting) = watch::channel(Shared::default());
         let mut seen = waiting.clone();
@@ -231,9 +270,21 @@ impl Elsewhere {
         let task = tokio::spawn(async move {
             let wake = async {
                 let mut was = Waiting::default();
+                let mut asked = (BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
                 while seen.changed().await.is_ok() {
-                    let now = seen.borrow_and_update().outside(&outside);
-                    if now != was {
+                    let shared = seen.borrow_and_update();
+                    let now = shared.outside(&outside);
+                    let moved = shared.asks != asked.0
+                        || shared.above != asked.1
+                        || shared.calls != asked.2;
+                    if moved {
+                        asked = (
+                            shared.asks.clone(),
+                            shared.above.clone(),
+                            shared.calls.clone(),
+                        );
+                    }
+                    if now != was || moved {
                         was = now;
                         woken.notify_one();
                     }
@@ -284,6 +335,20 @@ impl Elsewhere {
     pub fn ended(&self) -> bool {
         self.task.is_finished()
     }
+
+    /// One that tells what `told` sends, for tests.
+    #[cfg(test)]
+    pub fn told(project: &str) -> (Self, watch::Sender<Shared>) {
+        let (tell, waiting) = watch::channel(Shared::default());
+        let open = Elsewhere {
+            waiting,
+            project: project.to_owned(),
+            rows: Default::default(),
+            want: watch::channel(Wish::default()).0,
+            task: tokio::spawn(std::future::pending()),
+        };
+        (open, tell)
+    }
 }
 
 /// The lock the window that follows holds, and the socket it tells the
@@ -299,9 +364,9 @@ fn beside(store: &Path) -> (PathBuf, PathBuf) {
         path.push(end);
         PathBuf::from(path)
     };
-    let lock = at(".hub.lock");
+    let lock = at(".asks.lock");
     let told =
-        agent_client::socket::default_socket(&at(".hub")).unwrap_or_else(|_| at(".hub.sock"));
+        agent_client::socket::default_socket(&at(".asks")).unwrap_or_else(|_| at(".asks.sock"));
     (lock, told)
 }
 
@@ -738,6 +803,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         mut seen_of,
         running,
         mut closed,
+        mut made_by,
     } = seeded;
     let theirs = |bot: &str| other(bot, &named_as_sides);
     // The agents followed narrowly, and whether each has waited since:
@@ -762,7 +828,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
     // The agents closed (those holding a call when the follow started,
     // then those it hears close): a turn still running in one can ask,
     // and needs no one until a message opens it again.
-    tell_waiting(&needs, &order, tell);
+    tell_waiting(&needs, &order, &made_by, tell);
     loop {
         // The next event in the order of the cursors, once every follow
         // that still replays has passed it.
@@ -783,8 +849,18 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         let bot = bot.to_owned();
         let mut ours = theirs(&bot);
         match event["event"].as_str() {
+            // Who made it, as it was made: a name made again is another's.
+            Some("created") => {
+                let by = event["data"]["created_by"].as_str().unwrap_or_default();
+                made_by.made(&bot, by, &order);
+                continue;
+            }
             Some("closed") => _ = closed.insert(bot.clone()),
-            Some("deleted") => _ = closed.remove(&bot),
+            // Gone for good: what it made is its first lead's ([`above`]).
+            Some("deleted") => {
+                closed.remove(&bot);
+                made_by.gone(&bot);
+            }
             // A wait from an agent closed: only if a message opened it
             // again since, as `/status` lists it only then.
             _ if ours && closed.contains(&bot) && waits_from(&event) => {
@@ -817,6 +893,9 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         let mut read = false;
         let mut forked = false;
         if ours && event["event"] == "forked" {
+            // Who made it, as a made agent's: a name made again is another's.
+            let by = event["data"]["created_by"].as_str().unwrap_or_default();
+            made_by.made(&bot, by, &order);
             let stirred = needs.stirred(&bot);
             if let Some(seen) = needs::scan(&client, &bot, None).await
                 && needs.stirred(&bot) == stirred
@@ -849,12 +928,16 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         let again = ours
             && event["event"] == "turn_finished"
             && (event["turn"].as_i64()).is_some_and(|turn| needs.ends_steps_of_unseen(&bot, turn));
+        // Whether it waits changed, or which of its calls are held, or its
+        // question: each is told.
+        let (held, asked) = (needs.held_by(&bot), needs.version());
         let mut changed = ours && needs.event(&event);
-        if again && let Ok(held) = needs::listing(&client, Some(&bot)).await {
+        if again && let Ok(listed) = needs::listing(&client, Some(&bot)).await {
             let was = needs.waits(&bot);
-            needs.held(held, |of| of == bot);
+            needs.held(listed, |of| of == bot);
             changed |= was != needs.waits(&bot);
         }
+        changed |= ours && (held != needs.held_by(&bot) || asked != needs.version());
         // Closed, it needs no one, as `/status` lists it no more.
         if ours && event["event"] == "closed" {
             changed |= needs.waits(&bot);
@@ -890,7 +973,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             }
         }
         if changed || read {
-            tell_waiting(&needs, &order, tell);
+            tell_waiting(&needs, &order, &made_by, tell);
         }
         if let Some(waited) = narrow.get_mut(&bot) {
             *waited |= needs.waits(&bot) || event["event"] == "turn_finished";
@@ -1041,6 +1124,8 @@ struct Seeded {
     running: Vec<String>,
     /// The agents closed that hold a call for the person.
     closed: HashSet<String>,
+    /// Who made each agent listed.
+    made_by: Makers,
 }
 
 /// The calls held for the person, and each idle agent's question as of
@@ -1121,6 +1206,10 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     if !read.is_empty() {
         crate::keep_seen(store, ".elsewhere", identity.as_deref(), &read);
     }
+    let mut made_by = Makers::default();
+    for bot in &listed {
+        made_by.made(&bot.name, bot.maker(), &order);
+    }
     Some(Seeded {
         needs,
         order,
@@ -1128,6 +1217,7 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
         seen_of,
         running,
         closed,
+        made_by,
     })
 }
 
@@ -1217,11 +1307,13 @@ fn in_order(store: &std::path::Path, listed: &[standing::Agent]) -> HashMap<Stri
 }
 
 /// Every project's agents waiting on the person, in the order
-/// **Projects** lists their projects (one made since, after), told to the
-/// windows when they changed.
+/// **Projects** lists their projects (one made since, after), each with
+/// the agents above it, and the questions open, told to the windows when
+/// they changed.
 fn tell_waiting(
     needs: &needs::Needs,
     order: &HashMap<String, usize>,
+    made_by: &Makers,
     tell: &watch::Sender<Shared>,
 ) {
     let mut agents: Vec<(usize, String, String)> = (needs.waiting())
@@ -1232,13 +1324,100 @@ fn tell_waiting(
         })
         .collect();
     agents.sort();
-    if tell.borrow().agents == agents && tell.borrow().order == *order {
-        return;
-    }
-    tell.send_replace(Shared {
+    let above = (agents.iter())
+        .map(|(_, _, bot)| (bot.clone(), above(bot, made_by, order)))
+        .collect();
+    let asks = (needs.asks())
+        .map(|(bot, ask)| (bot.to_owned(), ask.clone()))
+        .collect();
+    let calls = (needs.calls())
+        .map(|(bot, turn, call)| (bot.to_owned(), turn, call.to_owned()))
+        .collect();
+    let shared = Shared {
         order: order.clone(),
         agents,
-    });
+        above,
+        asks,
+        calls,
+    };
+    if *tell.borrow() == shared {
+        return;
+    }
+    tell.send_replace(shared);
+}
+
+/// Who made each agent an agent made, kept small for a store of
+/// thousands: each agent by a hash of its name, and each maker's name
+/// once, shared by all it made. One no agent made is not kept, nor one its
+/// project's first lead made, which [`above`] finds without it.
+#[derive(Default)]
+struct Makers {
+    by: HashMap<u64, Arc<str>>,
+    names: HashSet<Arc<str>>,
+}
+
+impl Makers {
+    fn key(bot: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        bot.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// `bot` was made by `by`, or by no agent where it is empty.
+    fn made(&mut self, bot: &str, by: &str, projects: &HashMap<String, usize>) {
+        let first_lead = !crate::project::is_lead(bot)
+            && by.strip_suffix(".lead") == Some(project_in(bot, projects));
+        if by.is_empty() || first_lead {
+            self.gone(bot);
+            return;
+        }
+        let by = match self.names.get(by) {
+            Some(name) => name.clone(),
+            None => {
+                let name: Arc<str> = by.into();
+                self.names.insert(name.clone());
+                name
+            }
+        };
+        self.by.insert(Self::key(bot), by);
+    }
+
+    fn gone(&mut self, bot: &str) {
+        self.by.remove(&Self::key(bot));
+    }
+
+    /// The agent that made `bot`, when one did.
+    fn of(&self, bot: &str) -> Option<&str> {
+        self.by.get(&Self::key(bot)).map(|by| &**by)
+    }
+}
+
+/// How many agents above one are walked at most: a chain of makers is
+/// short, and this only stops a ring.
+const MOST_ABOVE: usize = 64;
+
+/// The agents above `bot`, nearest first: the agent that made it, the one
+/// that made that, and so on, through leads, to a lead no agent made. One
+/// no agent made that is no lead is its project's first lead's, as
+/// `/status` counts it (and so is one whose maker is gone): that lead is
+/// above it, and whatever is above that lead.
+fn above(bot: &str, made_by: &Makers, projects: &HashMap<String, usize>) -> Vec<String> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut at = bot.to_owned();
+    while chain.len() < MOST_ABOVE {
+        let next = match made_by.of(&at) {
+            Some(by) => by.to_owned(),
+            None if !crate::project::is_lead(&at) => format!("{}.lead", project_in(&at, projects)),
+            None => break,
+        };
+        if next == bot || chain.contains(&next) {
+            break;
+        }
+        chain.push(next.clone());
+        at = next;
+    }
+    chain
 }
 
 /// Every agent that needs the person, in the order `alt+n` goes round
@@ -1308,6 +1487,7 @@ mod tests {
                     (projects[project], project.to_owned(), (*bot).to_owned())
                 })
                 .collect(),
+            ..Default::default()
         };
         let outside = |project: &str| -> Vec<String> {
             (shared.outside(project).agents.into_iter())
@@ -1331,19 +1511,131 @@ mod tests {
         assert_eq!(project_in("new.lead", &projects), "new");
     }
 
+    /// A question goes up the makers to a lead no agent made: through
+    /// leads, through one gone, and from one no agent made to its project's
+    /// first lead; a ring stops where it closes.
+    #[test]
+    fn the_agents_above_one_are_its_makers_up_to_the_top() {
+        let projects: HashMap<String, usize> = [("shop", 0), ("shop.web", 1), ("top", 2)]
+            .map(|(name, at)| (name.to_owned(), at))
+            .into();
+        let mut made_by = Makers::default();
+        for (bot, by) in [
+            ("top.lead", ""),
+            ("shop.lead", "top.lead"),
+            ("shop.fix", "shop.lead"),
+            ("shop.fix.tests", "shop.fix"),
+            ("shop.own", ""),
+            ("shop.orphan", "shop.gone"),
+            ("shop.web.page", ""),
+            ("shop.ring", "shop.loop"),
+            ("shop.loop", "shop.ring"),
+        ] {
+            made_by.made(bot, by, &projects);
+        }
+        // Made again by no agent, and one gone for good: its first lead's.
+        made_by.made("shop.again", "shop.fix", &projects);
+        made_by.made("shop.again", "", &projects);
+        made_by.made("shop.deleted", "shop.fix", &projects);
+        made_by.gone("shop.deleted");
+        // Made by its project's first lead, as most are: found without
+        // being kept.
+        made_by.made("shop.plain", "shop.lead", &projects);
+        made_by.made("shop.web.page", "shop.web.lead", &projects);
+        assert_eq!(made_by.by.len(), 5);
+        assert_eq!(made_by.names.len(), 5);
+        assert_eq!(
+            above("shop.plain", &made_by, &projects),
+            ["shop.lead", "top.lead"]
+        );
+        let above = |bot| above(bot, &made_by, &projects);
+        assert_eq!(above("shop.again"), ["shop.lead", "top.lead"]);
+        assert_eq!(above("shop.deleted"), ["shop.lead", "top.lead"]);
+        assert_eq!(
+            above("shop.fix.tests"),
+            ["shop.fix", "shop.lead", "top.lead"]
+        );
+        assert_eq!(above("shop.lead"), ["top.lead"]);
+        assert!(above("top.lead").is_empty());
+        // Made by no agent: its project's first lead's, and what is above it.
+        assert_eq!(above("shop.own"), ["shop.lead", "top.lead"]);
+        assert_eq!(above("shop.web.page"), ["shop.web.lead"]);
+        // Its maker gone, and one made since the follow listed (none).
+        assert_eq!(above("shop.orphan"), ["shop.gone", "shop.lead", "top.lead"]);
+        assert_eq!(above("shop.new"), ["shop.lead", "top.lead"]);
+        assert_eq!(above("shop.ring"), ["shop.loop"]);
+    }
+
+    /// A window shows the questions of every agent below its own, and of
+    /// every agent below the leads it follows, never its own.
+    #[test]
+    fn a_window_shows_every_question_below_it() {
+        let ask = |question: &str| crate::asks::Ask {
+            id: format!("ask:1/{question}"),
+            question: question.into(),
+            why: String::new(),
+            options: Vec::new(),
+            recommended: None,
+            unanswered: None,
+            deadline: None,
+            covers: None,
+            task: None,
+        };
+        let chain = |bots: &[&str]| bots.iter().map(|bot| (*bot).to_owned()).collect();
+        let shared = Shared {
+            above: [
+                (
+                    "shop.fix.tests".to_owned(),
+                    chain(&["shop.fix", "shop.lead", "top.lead"]),
+                ),
+                ("shop.fix".to_owned(), chain(&["shop.lead", "top.lead"])),
+                ("calc.add".to_owned(), chain(&["calc.lead"])),
+                ("calc.lead".to_owned(), Vec::new()),
+                ("top.lead".to_owned(), Vec::new()),
+            ]
+            .into(),
+            asks: [
+                ("shop.fix.tests".to_owned(), ask("Which suite?")),
+                ("shop.fix".to_owned(), ask("Which fix?")),
+                ("calc.add".to_owned(), ask("Round?")),
+                ("calc.lead".to_owned(), ask("Which release?")),
+                ("top.lead".to_owned(), ask("Own?")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let below = |window: &str, follows: &[String]| -> Vec<String> {
+            (shared.below(window, follows))
+                .map(|(bot, _)| bot.to_owned())
+                .collect()
+        };
+        assert_eq!(below("top.lead", &[]), ["shop.fix", "shop.fix.tests"]);
+        assert_eq!(below("shop.lead", &[]), ["shop.fix", "shop.fix.tests"]);
+        assert_eq!(below("shop.fix", &[]), ["shop.fix.tests"]);
+        assert!(below("shop.fix.tests", &[]).is_empty());
+        // A lead followed: its own question too, and its tasks'.
+        assert_eq!(
+            below("top.lead", &["calc.lead".to_owned()]),
+            ["calc.add", "calc.lead", "shop.fix", "shop.fix.tests"]
+        );
+        assert_eq!(below("calc.lead", &[]), ["calc.add"]);
+        assert!(shared.is_below("calc.add", "top.lead", &["calc.lead".to_owned()]));
+        assert!(!shared.is_below("top.lead", "top.lead", &[]));
+    }
+
     /// The socket the others hear on fits a Unix socket's address, however
     /// long the store's path.
     #[test]
     fn the_shared_socket_fits_beside_a_long_store() {
         let short = std::env::temp_dir().join("s/state.sqlite");
         let (lock, told) = beside(&short);
-        assert!(lock.to_string_lossy().ends_with("state.sqlite.hub.lock"));
-        assert!(told.to_string_lossy().ends_with("state.sqlite.hub.sock"));
+        assert!(lock.to_string_lossy().ends_with("state.sqlite.asks.lock"));
+        assert!(told.to_string_lossy().ends_with("state.sqlite.asks.sock"));
         let long = std::env::temp_dir()
             .join("a".repeat(120))
             .join("state.sqlite");
         let (lock, told) = beside(&long);
-        assert!(lock.to_string_lossy().ends_with("state.sqlite.hub.lock"));
+        assert!(lock.to_string_lossy().ends_with("state.sqlite.asks.lock"));
         assert!(
             std::os::unix::net::SocketAddr::from_pathname(&told).is_ok(),
             "{told:?}"
@@ -1578,6 +1870,7 @@ mod tests {
         let shared = Shared {
             order: HashMap::from([("shop".to_owned(), 0)]),
             agents: vec![(0, "shop".to_owned(), "shop.fix".to_owned())],
+            ..Default::default()
         };
         assert_eq!(shared.waits("shop.fix", false), Some(true));
         assert_eq!(shared.waits("shop.lead", false), Some(false));
@@ -1750,9 +2043,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(names(&heard.borrow().outside("site")), ["tally.readme"]);
+        // Another call held by one that waits already, and one let go
+        // while another waits on: each told, for the windows above.
+        go.send(held("tally.readme", "c3b", 12)).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| shared.calls.len() == 2))
+            .await
+            .unwrap()
+            .unwrap();
+        go.send(started("tally.readme", "c3", 13)).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| shared.calls.len() == 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            heard.borrow().calls,
+            [("tally.readme".to_owned(), 1, "c3b".to_owned())].into()
+        );
         // Closed while its turn runs, it needs no one, and what that turn
         // asks after needs no one either, till a message opens it again.
-        let closed = json!({"cursor": 12, "bot": "tally.readme", "event": "closed",
+        let closed = json!({"cursor": 14, "bot": "tally.readme", "event": "closed",
             "data": {"closed_ms": 1}});
         go.send(closed).unwrap();
         tokio::time::timeout(wait, heard.wait_for(|shared| shared.agents.is_empty()))
@@ -1769,9 +2078,9 @@ mod tests {
                 break;
             }
         }
-        go.send(held("tally.readme", "c4", 13)).unwrap();
-        go.send(held("site.shut", "c6", 13)).unwrap();
-        go.send(held("site.fix", "c5", 14)).unwrap();
+        go.send(held("tally.readme", "c4", 15)).unwrap();
+        go.send(held("site.shut", "c6", 15)).unwrap();
+        go.send(held("site.fix", "c5", 16)).unwrap();
         tokio::time::timeout(wait, heard.wait_for(|shared| !shared.agents.is_empty()))
             .await
             .unwrap()

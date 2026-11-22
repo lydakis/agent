@@ -746,6 +746,13 @@ impl App {
         self.zen.is_none() && self.options.side.is_none() && !self.options.embedded
     }
 
+    /// Whether the questions below this window's agent are followed here,
+    /// from the store's one follow: where **Projects** shows, and in an
+    /// agent shown beside, whose helpers ask it too.
+    fn questions_here(&self) -> bool {
+        self.projects_here() || (self.options.embedded && self.zen.is_none())
+    }
+
     /// **Projects** in the conversation's place, the pick on the project
     /// the window is in: `←` with nothing typed, `/projects`, or a click
     /// on the footer's `← ? N`. Every agent's row is asked of the store's
@@ -827,12 +834,13 @@ impl App {
     }
 
     /// What needs the person in every project, followed for as long as
-    /// the window is open where **Projects** shows, by one window of the
-    /// store for all ([`elsewhere`]): started once the window's own footer
-    /// is counted, so the window's start comes first, and again a few
-    /// seconds after it stopped, as when the daemon went.
+    /// the window is open where **Projects** shows or its questions are
+    /// ([`App::questions_here`]), by one window of the store for all
+    /// ([`elsewhere`]): started once the window's own footer is counted,
+    /// so the window's start comes first, and again a few seconds after it
+    /// stopped, as when the daemon went.
     fn elsewhere_tick(&mut self) {
-        if !self.projects_here() {
+        if !self.questions_here() {
             self.other_projects = None;
             return;
         }
@@ -863,18 +871,43 @@ impl App {
 
     /// The agents of other projects that need the person and that the
     /// footer's `?` does not count already (a superlead's `/status` lists
-    /// the projects it holds), in the order **Projects** lists them.
+    /// the projects it holds), in the order **Projects** lists them: none
+    /// where **Projects** does not show.
     fn elsewhere_waiting(&self) -> elsewhere::Waiting {
-        let Some((open, _)) = &self.other_projects else {
+        let Some((open, _)) = (self.other_projects.as_ref()).filter(|_| self.projects_here())
+        else {
             return elsewhere::Waiting::default();
         };
         let mut waiting = open.waiting.borrow().outside(&self.scope().project);
-        waiting.agents.retain(|(_, bot)| {
-            !self.status_bots.contains(bot)
-                && !(self.fleet.as_ref())
-                    .is_some_and(|fleet| fleet.past_status(bot, &self.status_bots))
-        });
+        let past = self.waiting_past_status_of();
         waiting
+            .agents
+            .retain(|(_, bot)| !self.status_bots.contains(bot) && !past.contains(bot));
+        waiting
+    }
+
+    /// The agents waiting on the person below this window's agent that
+    /// `/status` lists no row for (the leads it follows and theirs, of
+    /// other projects, and a workflow's workers): what waits in them waits
+    /// here, so the footer counts them beside `/status`'s own. The fleet's,
+    /// and those the store's one follow has below it ([`elsewhere::Shared::is_below`]).
+    fn waiting_past_status_of(&self) -> Vec<String> {
+        let mut past = (self.fleet.as_ref())
+            .map(|fleet| fleet.waiting_past_status_of(&self.status_bots))
+            .unwrap_or_default();
+        if let Some((open, _)) = &self.other_projects {
+            let shared = open.waiting.borrow();
+            past.extend(
+                (shared.agents.iter())
+                    .map(|(_, _, bot)| bot)
+                    .filter(|bot| !self.status_bots.contains(*bot))
+                    .filter(|bot| shared.is_below(bot, &self.bot, &self.follows.leads))
+                    .cloned(),
+            );
+        }
+        past.sort();
+        past.dedup();
+        past
     }
 
     /// `alt+n`: the next agent that needs the person, this project's first
@@ -887,9 +920,7 @@ impl App {
             .filter(|agent| agent.group == status::Group::NeedsYou)
             .map(|agent| agent.bot.clone())
             .collect();
-        if let Some(fleet) = &self.fleet {
-            local.extend(fleet.waiting_past_status_of(&self.status_bots));
-        }
+        local.extend(self.waiting_past_status_of());
         // Each in its own project's place, as a superlead's list or a
         // followed lead's question may be another project's; and every
         // agent the shared follow knows waits, this project's too (a
@@ -6469,9 +6500,16 @@ struct App {
     /// The tasks' questions read again, beside the loop.
     settling: Option<tokio::task::JoinHandle<Settled>>,
     /// What the tasks' questions were last pinned from: the fleet's and
-    /// the rosters' versions of them, the lineage and the tasks tracked.
+    /// the rosters' versions of them, the lineage and the tasks tracked,
+    /// the store's one follow ([`App::hub_asks`]) and the leads followed.
     /// Pinned again only once one changes, not every pass of the loop.
-    task_asks_read: Option<(u64, u64, usize, usize)>,
+    task_asks_read: Option<(u64, u64, usize, usize, u64, u64)>,
+    /// How many times what the store's one follow tells changed, as the
+    /// questions pinned from it were read: the window's own count.
+    hub_asks: u64,
+    /// The leads this window's agent follows: what waits below them waits
+    /// here too.
+    follows: Follows,
     /// When a lead's window last read whether another window marked it
     /// done, which sets its own questions aside here too.
     done_read: Option<Instant>,
@@ -7654,6 +7692,23 @@ const FLEET_KINDS: [&str; 14] = [
     "lifted_ended",
 ];
 
+/// A file as it was when read: when it was changed and its length, none
+/// when there was none.
+type Stamp = Option<(Option<std::time::SystemTime>, u64)>;
+
+/// The leads a window's agent follows by name, and those they follow
+/// ([`followed_leads`]).
+#[derive(Default)]
+struct Follows {
+    leads: Vec<String>,
+    /// When they were last looked at.
+    at: Option<Instant>,
+    /// How many times they changed.
+    changes: u64,
+    /// Each file read for them, as it was.
+    read: Vec<(String, Stamp)>,
+}
+
 /// How often a lead's window reads again which leads it follows.
 const FOLLOWED_EVERY: Duration = Duration::from_secs(5);
 
@@ -7905,18 +7960,12 @@ impl Fleet {
             })
     }
 
-    /// How many agents wait on the person here that `/status` lists no
-    /// row for (`listed`): the leads followed and theirs, of other
-    /// projects, and a workflow's workers. Their questions are pinned in
-    /// this window, so its footer counts them beside `/status`'s own. A
-    /// lead followed in the same folder has its own row, counted there.
-    fn waiting_past_status(&self, listed: &std::collections::HashSet<String>) -> usize {
-        (self.needs.waiting())
-            .filter(|bot| self.past_status(bot, listed))
-            .count()
-    }
-
-    /// Those [`Fleet::waiting_past_status`] counts, by name, in order.
+    /// The agents that wait on the person here that `/status` lists no
+    /// row for (`listed`), by name, in order: the leads followed and
+    /// theirs, of other projects, and a workflow's workers. Their
+    /// questions are pinned in this window, so its footer counts them
+    /// beside `/status`'s own. A lead followed in the same folder has its
+    /// own row, counted there.
     fn waiting_past_status_of(&self, listed: &std::collections::HashSet<String>) -> Vec<String> {
         let mut waiting: Vec<String> = (self.needs.waiting())
             .filter(|bot| self.past_status(bot, listed))
@@ -7926,8 +7975,8 @@ impl Fleet {
         waiting
     }
 
-    /// Whether `bot` is one [`Fleet::waiting_past_status`] counts, were it
-    /// waiting.
+    /// Whether `bot` is one [`Fleet::waiting_past_status_of`] names, were
+    /// it waiting.
     fn past_status(&self, bot: &str, listed: &std::collections::HashSet<String>) -> bool {
         !listed.contains(bot)
             && (self.raised.contains(bot)
@@ -8691,6 +8740,8 @@ impl App {
             rechecking: None,
             settling: None,
             task_asks_read: None,
+            hub_asks: 0,
+            follows: Follows::default(),
             done_read: None,
             kept: Kept::default(),
             task_needs: Default::default(),
@@ -16310,7 +16361,7 @@ impl App {
             .map(|task| task.bot.as_str())
             .collect();
         let me = self.bot.as_str();
-        let wanted: std::collections::BTreeSet<CallKey> = match &self.fleet {
+        let mut wanted: std::collections::BTreeSet<CallKey> = match &self.fleet {
             Some(fleet) => (fleet.needs.calls())
                 .filter(|(bot, ..)| *bot != me && fleet.below(bot))
                 .map(|(bot, turn, call)| (bot.to_owned(), turn, call.to_owned()))
@@ -16320,6 +16371,16 @@ impl App {
                 .map(|(bot, turn, call)| (bot.to_owned(), turn, call.to_owned()))
                 .collect(),
         };
+        // Every call held below this window's agent, as the store's one
+        // follow keeps them, as its questions are ([`App::pin_task_asks`]).
+        if let Some((hub, _)) = &self.other_projects {
+            let shared = hub.waiting.borrow();
+            wanted.extend(
+                (shared.calls.iter())
+                    .filter(|(bot, ..)| shared.is_below(bot, me, &self.follows.leads))
+                    .cloned(),
+            );
+        }
         // Answered where no event of theirs reaches this window: what came
         // of each written out here is read from the audit trail.
         let mut gone: Vec<CallKey> = (self.raised.iter())
@@ -20406,11 +20467,20 @@ impl App {
     /// elsewhere, answered in the task's window or by words past it, is
     /// let go.
     fn pin_task_asks(&mut self) {
+        if let Some((open, _)) = &mut self.other_projects
+            && open.waiting.has_changed().unwrap_or(false)
+        {
+            open.waiting.mark_unchanged();
+            self.hub_asks += 1;
+        }
+        self.read_follows();
         let read = (
             self.fleet.as_ref().map_or(0, |fleet| fleet.needs.version()),
             self.task_needs.version(),
             (self.fleet.as_ref()).map_or(0, |fleet| fleet.lineage.len() + fleet.raised.len()),
             self.tasks.values().map(Vec::len).sum(),
+            self.hub_asks,
+            self.follows.changes,
         );
         if self.task_asks_read.replace(read) == Some(read) {
             return;
@@ -20436,13 +20506,22 @@ impl App {
                 .collect(),
             None => (self.task_needs.asks())
                 .filter(|(bot, _)| *bot != self.bot && tracked.contains(bot))
-                .map(|(bot, ask)| {
-                    let name = (self.project.as_deref())
-                        .map_or_else(|| bot.to_owned(), |project| short(bot, project, &self.bot));
-                    pinned(bot, ask, name)
-                })
+                .map(|(bot, ask)| pinned(bot, ask, self.asker_name(bot)))
                 .collect(),
         };
+        // Every question below this window's agent, as the store's one
+        // follow keeps them, whichever window started the one asking and
+        // whatever was opened, closed or restarted since: those the
+        // window's own events keep stand over theirs.
+        if let Some((hub, _)) = &self.other_projects {
+            let shared = hub.waiting.borrow();
+            let had: std::collections::HashSet<String> = open.iter().map(asks::Ask::key).collect();
+            let below: Vec<asks::Ask> = (shared.below(&self.bot, &self.follows.leads))
+                .map(|(bot, ask)| pinned(bot, ask, self.asker_name(bot)))
+                .filter(|ask| !had.contains(&ask.key()))
+                .collect();
+            open.extend(below);
+        }
         open.sort_by_key(asks::Ask::key);
         let keys: std::collections::HashSet<String> = open.iter().map(asks::Ask::key).collect();
         // The question being answered stays the one in focus, whatever
@@ -20490,6 +20569,60 @@ impl App {
         }
         if self.asks.len() < before {
             self.settle_asks();
+        }
+    }
+
+    /// The leads this window's agent follows, read again at most every
+    /// [`FOLLOWED_EVERY`]: the fleet's, where it reads them; else from the
+    /// files beside the store, nothing asked of the daemon.
+    fn read_follows(&mut self) {
+        let followed = match &self.fleet {
+            Some(fleet) if fleet.followed == self.follows.leads => return,
+            Some(fleet) => fleet.followed.clone(),
+            None if self.other_projects.is_none() => return,
+            None if (self.follows.at).is_some_and(|at| at.elapsed() < FOLLOWED_EVERY) => return,
+            None => {
+                self.follows.at = Some(Instant::now());
+                let store = self.store();
+                let dir = lookout::subs::dir(&store);
+                let stamp = |bot: &str| -> Stamp {
+                    let file = std::fs::metadata(dir.join(format!("{bot}.json"))).ok()?;
+                    Some((file.modified().ok(), file.len()))
+                };
+                // No file changed since they were read: nothing to read.
+                let read = &self.follows.read;
+                if !read.is_empty() && read.iter().all(|(bot, was)| stamp(bot) == *was) {
+                    return;
+                }
+                let read = std::cell::RefCell::new(Vec::new());
+                let followed = followed_leads(&self.bot, |bot| {
+                    read.borrow_mut().push((bot.to_owned(), stamp(bot)));
+                    lookout::subs::read(&store, bot)
+                });
+                self.follows.read = read.into_inner();
+                followed
+            }
+        };
+        if followed != self.follows.leads {
+            self.follows.leads = followed;
+            self.follows.changes += 1;
+        }
+    }
+
+    /// How a question's card names the agent below that asked it: a task
+    /// of the fleet as the fleet names it, one of this project by its
+    /// short name, another project's lead by its project, any other by
+    /// its own name.
+    fn asker_name(&self, bot: &str) -> String {
+        if let Some(fleet) = &self.fleet {
+            return fleet.who(bot);
+        }
+        match self.project.as_deref() {
+            Some(project) if bot.starts_with(&format!("{project}.")) => {
+                short(bot, project, &self.bot)
+            }
+            Some(_) => spoken(bot),
+            None => bot.to_owned(),
         }
     }
 
@@ -23749,8 +23882,7 @@ impl App {
         let counts = self.counts.unwrap_or_default();
         // And those whose questions this window shows that `/status` has
         // no row for: other projects' agents under the leads it follows.
-        let past =
-            (self.fleet.as_ref()).map_or(0, |fleet| fleet.waiting_past_status(&self.status_bots));
+        let past = self.waiting_past_status_of().len();
         let (working, waiting) = (counts.working, counts.needs_you + past);
         // Something new to answer beats the count a few times, reversed,
         // then it holds still (F12).
@@ -36626,6 +36758,179 @@ mod tests {
             &json!({"event": "step_decided", "bot": "shop.fix", "turn": 4,
             "data": {"call_id": "c3"}}),
         );
+        app.raise_approvals_through().await;
+        assert!(app.raised.is_empty());
+    }
+
+    /// With no multiplexer and none of its tasks tracked, as in a window
+    /// opened again, every question below the window's agent pins here
+    /// from the store's one follow: a task's helper's too, and a task's
+    /// under a lead it follows; never another's. Answered anywhere, it
+    /// goes.
+    /// A task shown beside its lead, which **Projects** never shows in,
+    /// still pins its helpers' questions from the store's one follow, and
+    /// counts no other project's.
+    #[tokio::test]
+    async fn a_task_shown_beside_pins_its_helpers_questions() {
+        let (client, _events) = daemon_with_events(json!({}), |_| json!({})).await;
+        let mut app = app(client);
+        app.options.embedded = true;
+        app.options.store = std::env::temp_dir().join("sonny-beside-none.sqlite");
+        app.bot = "calc.release".into();
+        app.project = Some("calc".into());
+        assert!(app.questions_here() && !app.projects_here());
+        let (open, tell) = elsewhere::Elsewhere::told("calc");
+        app.other_projects = Some((open, Instant::now()));
+        let ask = asks::call("q1", &json!({"question": "Tag 3.0.0?", "why": "w",
+            "options": [{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}))
+        .unwrap();
+        tell.send_modify(|shared| {
+            shared.agents = vec![
+                (0, "calc".to_owned(), "calc.changelog".to_owned()),
+                (1, "shop".to_owned(), "shop.fix".to_owned()),
+            ];
+            shared.above = [
+                (
+                    "calc.changelog".to_owned(),
+                    vec!["calc.release".to_owned(), "calc.lead".to_owned()],
+                ),
+                ("shop.fix".to_owned(), vec!["shop.lead".to_owned()]),
+            ]
+            .into();
+            shared.asks = [("calc.changelog".to_owned(), ask)].into();
+        });
+        app.elsewhere_tick();
+        assert!(app.other_projects.is_some());
+        app.pin_task_asks();
+        let pinned: Vec<String> = (app.asks.iter())
+            .map(|ask| ask.task.clone().unwrap().bot)
+            .collect();
+        assert_eq!(pinned, ["calc.changelog"]);
+        assert!(app.elsewhere_waiting().agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_question_below_pins_from_the_store_with_nothing_tracked() {
+        let store = std::env::temp_dir()
+            .join(format!("sonny-hoist-below-{}", std::process::id()))
+            .join("store.sqlite");
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        let (client, _events) = daemon_with_events(json!({}), |_| json!({})).await;
+        let mut app = app(client);
+        app.options.store = store.clone();
+        app.bot = "calc.lead".into();
+        app.project = Some("calc".into());
+        let (open, tell) = elsewhere::Elsewhere::told("calc");
+        app.other_projects = Some((open, Instant::now()));
+        let ask = |id: &str, question: &str| {
+            asks::call(id, &json!({"question": question, "why": "w",
+                "options": [{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}))
+            .unwrap()
+        };
+        let chain = |bots: &[&str]| bots.iter().map(|bot| (*bot).to_owned()).collect::<Vec<_>>();
+        tell.send_modify(|shared| {
+            shared.above = [
+                (
+                    "calc.changelog".to_owned(),
+                    chain(&["calc.release", "calc.lead"]),
+                ),
+                ("shop.fix".to_owned(), chain(&["shop.lead"])),
+            ]
+            .into();
+            shared.asks = [
+                ("calc.changelog".to_owned(), ask("q1", "Tag 3.0.0?")),
+                ("shop.fix".to_owned(), ask("q2", "Ship it?")),
+            ]
+            .into();
+        });
+        app.pin_task_asks();
+        let pinned = |app: &App| -> Vec<(String, String)> {
+            (app.asks.iter())
+                .map(|ask| {
+                    let task = ask.task.clone().unwrap();
+                    (task.bot, task.name)
+                })
+                .collect()
+        };
+        assert_eq!(
+            pinned(&app),
+            [("calc.changelog".to_owned(), "changelog".to_owned())]
+        );
+        // The lead follows shop's: its task's question pins here too, by
+        // its whole name.
+        let subs = crate::lookout::subs::dir(&store);
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(
+            subs.join("calc.lead.json"),
+            json!({"subscriptions": [{"name": "shop", "agents": ["shop.lead"]}]}).to_string(),
+        )
+        .unwrap();
+        app.follows.at = None;
+        app.pin_task_asks();
+        assert_eq!(
+            pinned(&app),
+            [
+                ("calc.changelog".to_owned(), "changelog".to_owned()),
+                ("shop.fix".to_owned(), "shop.fix".to_owned())
+            ]
+        );
+        // Answered elsewhere: the follow tells it no more, and it goes.
+        tell.send_modify(|shared| {
+            shared.asks.remove("calc.changelog");
+            shared.above.remove("calc.changelog");
+        });
+        app.pin_task_asks();
+        assert_eq!(
+            pinned(&app),
+            [("shop.fix".to_owned(), "shop.fix".to_owned())]
+        );
+        // Its file as it was: not read again. Following shop's no more,
+        // its question goes from here.
+        app.follows.at = None;
+        app.read_follows();
+        assert_eq!(app.follows.leads, ["shop.lead"]);
+        std::fs::write(
+            subs.join("calc.lead.json"),
+            json!({"subscriptions": []}).to_string(),
+        )
+        .unwrap();
+        app.follows.at = None;
+        app.pin_task_asks();
+        assert_eq!(pinned(&app), []);
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    /// With no multiplexer and nothing tracked, a call a task's helper
+    /// holds for the person is raised in the lead's window from the store's
+    /// one follow, and let go once it no longer waits.
+    #[tokio::test]
+    async fn a_call_held_below_is_raised_from_the_store_with_nothing_tracked() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("approvals") if asked["bot"] == "calc.changelog" => json!({"approvals": [
+                {"bot": "calc.changelog", "turn": 4, "call_id": "c1", "request": 1,
+                    "name": "shell", "gates": ["manual"],
+                    "arguments": {"command": "git tag v3.0.0"}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.project = Some("calc".into());
+        app.width = 80;
+        let (open, tell) = elsewhere::Elsewhere::told("calc");
+        app.other_projects = Some((open, Instant::now()));
+        tell.send_modify(|shared| {
+            shared.above = [(
+                "calc.changelog".to_owned(),
+                vec!["calc.release".to_owned(), "calc.lead".to_owned()],
+            )]
+            .into();
+            shared.calls = [("calc.changelog".to_owned(), 4, "c1".to_owned())].into();
+        });
+        app.raise_approvals_through().await;
+        assert_eq!(app.raised.len(), 1);
+        assert_eq!(app.raised[0]["bot"], "calc.changelog");
+        tell.send_modify(|shared| shared.calls.clear());
         app.raise_approvals_through().await;
         assert!(app.raised.is_empty());
     }
