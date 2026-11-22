@@ -3780,6 +3780,19 @@ narrows them as it does the daemon's. Changing them changes the request's
 tool definitions, so a fork keys its own prompt cache from then on, as for
 instructions.
 
+Protocol version 100 gives `create` the `allow` a fork takes, naming every
+tool the new bot may call: the daemon's, declared ones, and the step names
+(`mcp__SERVER__TOOL`) its scripts may reach through a declared tool named
+that takes steps. Its `tools` and declared tools are kept to those named, so
+its model is shown only them, and `[]` leaves it nothing to call. A name it
+would not have, or one its creator is kept from, is `unsupported_tool_set`.
+Left out, a bot made by one kept to a list is kept to that list, of what it
+has. A bot kept to a list, made so or a fork, reaches through a script only
+the steps the list names: `approve_step` for any other is
+`tool_not_available`, as `run_step` is for a tool it may not call. A fork's
+`allow` takes step names the same way. `spawn_agent`'s `tools` is this list,
+by the names its caller sees, and the CLI's `run --new --allow` sends it.
+
 Protocol version 20 adds `inherit` to a declared tool, default `true` and
 reported only when `false`: a tool declared with `"inherit": false` stays
 the declaring bot's own, so a bot it creates does not take it with the

@@ -2198,6 +2198,16 @@ fn run(options: &Options) -> Result<i32> {
                 .map(str::to_owned)
                 .collect(),
         };
+        // --allow: every tool it may call, its own among them.
+        let allow: Option<Vec<String>> = (options.allow.as_deref()).map(|allow| {
+            (allow.split(',').filter(|t| !t.is_empty()))
+                .map(str::to_owned)
+                .collect()
+        });
+        let tools: Vec<String> = match &allow {
+            Some(allow) => tools.into_iter().filter(|t| allow.contains(t)).collect(),
+            None => tools,
+        };
         let mut settings = options.settings.clone();
         // The role's sandbox, unless --sandbox names one; the daemon keeps
         // it no looser than its creator's.
@@ -2239,6 +2249,9 @@ fn run(options: &Options) -> Result<i32> {
             // The role it is composed in, or the one its client composed
             // it in, kept on the bot.
             "profile":options.profile.as_ref().or(options.profile_name.as_ref())});
+        if let Some(allow) = &allow {
+            create["allow"] = json!(allow);
+        }
         if let Value::Object(mut gate) = requested_gate(options, &tools)? {
             // The tools its creator declared, which it inherits, held by
             // its own gate too where its creator's gates hold them, so a
@@ -2251,7 +2264,9 @@ fn run(options: &Options) -> Result<i32> {
                     connection.request("inspect", json!({"bot": by, "bot_id": created_by_id}))?;
                 if let Some(Value::Array(approve)) = gate.get_mut("approve") {
                     for name in held_declared(&maker) {
-                        if !approve.iter().any(|have| have == name) {
+                        let kept =
+                            (allow.as_ref()).is_none_or(|allow| allow.iter().any(|a| a == name));
+                        if kept && !approve.iter().any(|have| have == name) {
                             approve.push(json!(name));
                         }
                     }

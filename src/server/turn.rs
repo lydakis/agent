@@ -671,6 +671,64 @@ fn shaped_other<'p>(
     )
 }
 
+/// Of the list `named`, every tool an agent `me` makes may call, as the
+/// call or its profile names them: the daemon's tools it is given, and the
+/// whole list, its `allow`. Each name is one `me` may give: a daemon tool
+/// it may call, a declared one it may call and passes on, or, beside a
+/// declared tool that takes steps, a step name (`mcp__SERVER__TOOL`) it
+/// may reach. Any other is refused, naming those it may give.
+fn given_tools(named: &[String], me: &Value) -> Result<(Vec<String>, Vec<String>)> {
+    let allowed: Option<Vec<&str>> = (me["allowed"].as_array())
+        .map(|allowed| allowed.iter().filter_map(Value::as_str).collect());
+    let callable = |name: &str| {
+        allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(&name))
+    };
+    let own: Vec<&str> = (me["tools"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .filter(|tool| callable(tool))
+        .collect();
+    let declared: Vec<agent_runtime::tools::Declared> =
+        serde_json::from_value(me["declared"].clone()).unwrap_or_default();
+    let passed: Vec<&agent_runtime::tools::Declared> = (declared.iter())
+        .filter(|tool| tool.inherit.passes() && callable(&tool.name))
+        .collect();
+    let stepping = (passed.iter())
+        .find(|tool| tool.steps)
+        .map(|tool| tool.name.as_str());
+    let mut tools = Vec::new();
+    let mut all: Vec<String> = Vec::with_capacity(named.len());
+    for name in named {
+        if all.contains(name) {
+            continue;
+        }
+        if own.contains(&name.as_str()) {
+            tools.push(name.clone());
+        } else if !passed.iter().any(|tool| &tool.name == name)
+            && !(stepping.is_some() && agent_runtime::tools::is_step_name(name) && callable(name))
+        {
+            let mut may: Vec<&str> = own.clone();
+            may.extend(passed.iter().map(|tool| tool.name.as_str()));
+            let mut why = format!(
+                "{name} is not a tool this agent may give; it may give {}",
+                match may.is_empty() {
+                    true => "none".to_owned(),
+                    false => may.join(", "),
+                }
+            );
+            if let Some(stepping) = stepping {
+                why.push_str(&format!(
+                    ", and the mcp__SERVER__TOOL names its {stepping} lists"
+                ));
+            }
+            return Err(Error::with("unsupported_tool_set", why));
+        }
+        all.push(name.clone());
+    }
+    Ok((tools, all))
+}
+
 /// Of `asked`, the tools an agent `me` makes is given: those `me` has, and
 /// of them, those it may call.
 fn kept_tools(asked: &Value, me: &Value) -> Vec<Value> {
@@ -6315,6 +6373,10 @@ impl Turn {
                     // What the call set itself, which a resend must match;
                     // the rest the daemon derives, from files that may change.
                     let mut asked: Vec<String> = made.keys().cloned().collect();
+                    // The list it may call, from the tools the call names.
+                    if made.contains_key("tools") {
+                        asked.push("allow".to_owned());
+                    }
                     for (field, given) in [
                         ("instructions", instructions.is_some()),
                         ("model", model.is_some()),
@@ -6330,7 +6392,7 @@ impl Turn {
                     let folder = (made.get("workspace"))
                         .and_then(Value::as_str)
                         .map_or_else(|| workspace.to_path_buf(), std::path::PathBuf::from);
-                    let (mut create, looser) = self
+                    let (mut create, looser, named) = self
                         .spawned(
                             &me,
                             &folder,
@@ -6341,6 +6403,7 @@ impl Turn {
                             settings.as_ref().is_some_and(|s| s.contains_key("sandbox")),
                         )
                         .await?;
+                    let named = named || made.contains_key("tools");
                     // What it asked for over what it would inherit: the
                     // daemon keeps each no looser than this agent's.
                     for (key, value) in made {
@@ -6357,13 +6420,26 @@ impl Turn {
                     {
                         own.extend(over);
                     }
-                    // Its tools are this agent's at most, whatever a role or
-                    // the call names, so every gate it inherits names them
-                    // as this one's do. A caller kept to some of its tools
-                    // (a fork's `allow`) makes agents kept to them too:
-                    // `create` takes no `allow`, so their tools are those
-                    // it may call.
-                    create["tools"] = json!(kept_tools(&create["tools"], &me));
+                    // The tools the call or its profile names are all it
+                    // may call, the declared ones and its scripts' steps
+                    // too, each one this agent may give: an unknown name
+                    // is refused. Named none, it has this agent's, those it
+                    // may call; one kept to a list keeps it kept to that.
+                    match named {
+                        true => {
+                            let named: Vec<String> = serde_json::from_value(create["tools"].take())
+                                .map_err(|_| {
+                                    Error::with(
+                                        "invalid_tool_arguments",
+                                        "tools is a list of names",
+                                    )
+                                })?;
+                            let (tools, all) = given_tools(&named, &me)?;
+                            create["tools"] = json!(tools);
+                            create["allow"] = json!(all);
+                        }
+                        false => create["tools"] = json!(kept_tools(&create["tools"], &me)),
+                    }
                     // Its folder and those it may write, found by their real
                     // paths as `create` finds them on its way in, here where
                     // a steer ends a wait on a file system that never answers.
@@ -6511,7 +6587,7 @@ impl Turn {
         model: Option<String>,
         effort: Option<String>,
         sandbox_asked: bool,
-    ) -> Result<(Value, Option<String>)> {
+    ) -> Result<(Value, Option<String>, bool)> {
         // The folder this turn works in, which may be its own for the turn.
         let Some(workspace) = workspace.to_str().map(str::to_owned) else {
             return Err(Error::with(
@@ -6588,6 +6664,7 @@ impl Turn {
             let sandbox = role.sandbox.clone()?;
             Some((role.name.clone(), sandbox))
         });
+        let named = role.as_ref().is_some_and(|role| role.tools.is_some());
         let tools: Vec<String> = match role.and_then(|role| role.tools) {
             Some(tools) => tools,
             None => {
@@ -6628,6 +6705,7 @@ impl Turn {
             "compaction_instructions":me["compaction_instructions"],
             "compaction_model":compaction_model,"profile":profile}),
             looser,
+            named,
         ))
     }
 
@@ -8948,6 +9026,60 @@ fn priced_at(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_tools_an_agent_names_for_another_are_all_it_may_call() {
+        use super::{given_tools, json};
+        let names =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|n| (*n).to_owned()).collect() };
+        let me = json!({"tools": ["read", "shell", "history"], "declared": [
+            {"name": "ask", "description": "", "parameters": {"type": "object"}, "answered_by": "sonny"},
+            {"name": "memory", "description": "", "parameters": {"type": "object"}, "answered_by": "sonny"},
+            {"name": "exec", "description": "", "parameters": {"type": "object"}, "answered_by": "sonny", "steps": true},
+            {"name": "resolve", "description": "", "parameters": {"type": "object"}, "inherit": false}]});
+        let given = |list: &[&str]| given_tools(&names(list), &me);
+        assert_eq!(
+            given(&["read"]).unwrap(),
+            (names(&["read"]), names(&["read"]))
+        );
+        assert_eq!(given(&[]).unwrap(), (vec![], vec![]));
+        assert_eq!(
+            given(&["exec", "history", "memory"]).unwrap(),
+            (names(&["history"]), names(&["exec", "history", "memory"]))
+        );
+        assert_eq!(
+            given(&["exec", "mcp__github__search", "read", "read"]).unwrap(),
+            (
+                names(&["read"]),
+                names(&["exec", "mcp__github__search", "read"])
+            )
+        );
+        // An unknown name, one it does not pass on, or a step name without
+        // a tool that takes steps, is refused, naming those it may give.
+        for wrong in ["nope", "resolve", "write"] {
+            let refused = given(&["read", wrong]).unwrap_err();
+            assert_eq!(refused.code, "unsupported_tool_set");
+            assert_eq!(
+                refused.detail.as_deref(),
+                Some(&*format!(
+                    "{wrong} is not a tool this agent may give; it may give read, shell, history, ask, memory, exec, and the mcp__SERVER__TOOL names its exec lists"
+                ))
+            );
+        }
+        let plain = json!({"tools": ["read"]});
+        let refused = given_tools(&names(&["mcp__github__search"]), &plain).unwrap_err();
+        assert_eq!(
+            refused.detail.as_deref(),
+            Some("mcp__github__search is not a tool this agent may give; it may give read")
+        );
+        // Kept to a list itself, it gives only what the list names.
+        let kept = json!({"tools": me["tools"], "declared": me["declared"],
+            "allowed": ["read", "exec", "mcp__github__search"]});
+        assert!(given_tools(&names(&["exec", "mcp__github__search"]), &kept).is_ok());
+        for wrong in ["shell", "memory", "mcp__mail__send"] {
+            assert!(given_tools(&names(&[wrong]), &kept).is_err(), "{wrong}");
+        }
+    }
+
+    #[test]
     fn an_agent_makes_agents_with_at_most_its_own_tools() {
         use super::{json, kept_tools};
         let asked = json!(["read", "shell", "apply_patch"]);
@@ -9228,6 +9360,7 @@ mod tests {
                             request_id: None,
                             starts_line: false,
                             profile: None,
+                            allow: None,
                         },
                     )?;
                     let turn = db
@@ -9455,6 +9588,7 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
+                        allow: None,
                     },
                 )?;
                 Ok(db
@@ -9600,6 +9734,7 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
+                        allow: None,
                     },
                 )?;
                 let turn = (db.begin(

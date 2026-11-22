@@ -293,10 +293,66 @@ class AgentToolsTests(ModelFixture):
         client.request('fork', source='shop.lead', bot='shop.narrow', allow=['echo', 'spawn_agent'])
         self.run_calls(client, 'shop.narrow', 'go',
                        ('spawn_agent', {'name': 'helper', 'message': 'q'}),
-                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'tools': ['echo', 'send_message']}))
+                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'tools': ['echo']}),
+                       ('spawn_agent', {'name': 'past', 'message': 'q', 'tools': ['echo', 'send_message']}))
         helper = client.request('inspect', bot='shop.helper')['result']
         asked = client.request('inspect', bot='shop.asked')['result']
-        self.assertEqual((helper['tools'], asked['tools']), (['echo', 'spawn_agent'], ['echo']))
+        self.assertEqual((helper['tools'], helper['allowed']), (['echo', 'spawn_agent'], ['echo', 'spawn_agent']))
+        self.assertEqual((asked['tools'], asked['allowed']), (['echo'], ['echo']))
+        # A tool past its own is refused, never dropped in silence.
+        refused = self.output(client, 'shop.narrow', 'spawn_agent-3')
+        self.assertIn('unsupported_tool_set', refused)
+        self.assertIn('send_message is not a tool this agent may give; it may give echo, spawn_agent', refused)
+        self.assertEqual(client.request('inspect', bot='shop.past')['error'], 'bot_not_found')
+
+    def test_the_tools_named_are_every_tool_the_new_agent_may_call(self):
+        client = self.client(TOOLS + ',history')
+        # A code-mode lead's tools, as Sonny declares them: one with a fixed
+        # result, one its client answers, and a script tool that takes steps.
+        declare = [{'name': 'ask', 'description': 'Ask.', 'parameters': {'type': 'object'}},
+                   {'name': 'memory', 'description': 'Notes.', 'parameters': {'type': 'object'},
+                    'answered_by': 'sonny'},
+                   {'name': 'exec', 'description': 'Run a script.', 'parameters': {'type': 'object'},
+                    'answered_by': 'sonny', 'steps': True}]
+        made = client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'),
+                              declare=declare)
+        self.assertIn('result', made, made)
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'reader', 'message': 'as reader', 'tools': ['echo']}),
+                       ('spawn_agent', {'name': 'quiet', 'message': 'as quiet', 'tools': []}),
+                       ('spawn_agent', {'name': 'coder', 'message': 'as coder',
+                                        'tools': ['exec', 'history', 'memory', 'mcp__github__search']}),
+                       ('spawn_agent', {'name': 'nope', 'message': 'q', 'tools': ['echo', 'nope']}),
+                       ('spawn_agent', {'name': 'all', 'message': 'as all'}))
+        record = lambda name: client.request('inspect', bot=f'shop.{name}')['result']
+        declared = lambda bot: [tool['name'] for tool in bot.get('declared') or []]
+        reader, quiet, coder, everything = (record(name) for name in ('reader', 'quiet', 'coder', 'all'))
+        self.assertEqual((reader['tools'], declared(reader), reader['allowed']), (['echo'], [], ['echo']))
+        self.assertEqual((quiet['tools'], declared(quiet), quiet['allowed']), ([], [], []))
+        self.assertEqual((coder['tools'], declared(coder)), (['history'], ['memory', 'exec']))
+        self.assertEqual(coder['allowed'], ['exec', 'history', 'memory', 'mcp__github__search'])
+        # Named none, it takes its maker's, as before, kept to no list.
+        lead = record('lead')
+        self.assertEqual((everything['tools'], declared(everything)), (lead['tools'], ['ask', 'memory', 'exec']))
+        self.assertNotIn('allowed', everything)
+        refused = self.output(client, 'shop.lead', 'spawn_agent-4')
+        self.assertIn('nope is not a tool this agent may give; it may give', refused)
+        self.assertIn('ask, memory, exec, and the mcp__SERVER__TOOL names its exec lists', refused)
+        self.assertEqual(client.request('inspect', bot='shop.nope')['error'], 'bot_not_found')
+        # What each model is shown is the list it was given.
+        for call in (1, 2, 3, 5):
+            handle = json.loads(self.output(client, 'shop.lead', f'spawn_agent-{call}'))['handle']
+            client.finished(int(handle.rsplit('/', 1)[1]))
+        shown = {}
+        while not self.model.requests.empty():
+            request = self.model.requests.get_nowait()
+            texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
+            if texts and texts[-1].startswith('as '):
+                shown[texts[-1][3:]] = sorted(tool.get('name', tool.get('type')) for tool in request.get('tools') or [])
+        self.assertEqual(shown['reader'], ['echo'])
+        self.assertEqual(shown['quiet'], [])
+        self.assertEqual(shown['coder'], ['exec', 'history', 'memory'])
+        self.assertEqual(shown['all'], sorted(lead['tools'] + ['ask', 'memory', 'exec']))
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_profile_starts_its_agent_in_its_sandbox_and_never_looser(self):

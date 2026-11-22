@@ -581,6 +581,13 @@ class SocketAndCliTests(ModelFixture):
                          '--tools', 'nothing', '--new', '--bot', 'Odd', '--detach', 'hi', check=False)
         self.assertEqual(bad.returncode, 1)
         self.assertIn('unsupported_tool_set', bad.stderr + bad.stdout)
+        # --allow names every tool it may call: its tools are those named.
+        kept = json.loads(self.agent('run', '--store', str(self.store), '--model', 'openai/synthetic-model',
+                                     '--tools', 'echo,shell', '--allow', 'echo', '--new', '--bot', 'Kept',
+                                     '--detach', 'hi').stdout)
+        self.agent('wait', '--store', str(self.store), kept['handle'])
+        record = json.loads(self.agent('inspect', '--store', str(self.store), '--bot', 'Kept').stdout)
+        self.assertEqual((record['tools'], record['allowed']), (['echo'], ['echo']))
 
     def test_a_new_bot_needs_a_model_from_the_client(self):
         without = self.agent('run', '--store', str(self.store), '--provider', f'openai=responses,{self.url}',
@@ -846,7 +853,7 @@ class SocketAndCliTests(ModelFixture):
         # A copy is named, made fresh, and keeps its source's choices.
         for args, says in ((('--fork', 'Bob', 'q'), 'needs --bot'),
                            (('--bot', 'Bob', '--expires', '15m', 'q'), 'is for a copy made with --fork'),
-                           (('--bot', 'Bob', '--allow=', 'q'), 'is for a copy made with --fork'),
+                           (('--bot', 'Bob', '--allow=', 'q'), 'is for a new bot or a copy made with --fork'),
                            (('--fork', 'Bob', '--bot', 'C', '--new', 'q'), 'conflicts with'),
                            (('--fork', 'Bob', '--bot', 'C', '--instructions', 'x', 'q'), 'is for a new bot'),
                            (('--fork', 'Bob', '--bot', 'C', '--expires', '500ms', 'q'), 'from 1s to 365d')):

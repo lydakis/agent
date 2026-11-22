@@ -25,9 +25,9 @@ pub use db::{
     Identity, Joined, Kept, Lapsed, Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS,
     PROCESSES_PAGE, ParkedFallback, Plan, Planning, ProcessKind, ProcessesPage, Publication,
     QuoteRef, RESTART_LIMIT, RULES_JSON, Reclaim, Replaced, Resumed, Room, SANDBOX, SETTINGS,
-    Served, Settings, Shared, Spend, Started, Step, StepAsk, StepOpened, Stepped, Strip, Switch,
-    TRAILER, TURN_VIEW_ACCOUNTING, Trailer, Translation, TurnBudget, TurnOptions, UsageQuery,
-    Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
+    STEPS_ONLY_NAMES, Served, Settings, Shared, Spend, Started, Step, StepAsk, StepOpened, Stepped,
+    Strip, Switch, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, Translation, TurnBudget, TurnOptions,
+    UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
@@ -1450,6 +1450,7 @@ mod tests {
                             request_id: None,
                             starts_line: false,
                             profile: None,
+                            allow: None,
                         },
                     )?;
                 }
@@ -1625,6 +1626,7 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
+                        allow: None,
                     },
                 )?;
                 db.connection().execute("DELETE FROM events", [])?;
@@ -1842,6 +1844,7 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
+                        allow: None,
                     },
                 )?;
                 let options = TurnOptions {

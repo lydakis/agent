@@ -428,7 +428,7 @@ fn print_flags(flags: &str) {
             ),
             "--allow" => (
                 "LIST",
-                "The tools a fork may call, within its source's; '' allows none; default: the source's",
+                "Every tool a fork or a new bot may call, within its source's or maker's: its own, declared ones and the mcp__SERVER__TOOL names its scripts may call; '' allows none; default: the source's or maker's list",
             ),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
             "--max-lasting" => (
@@ -1012,10 +1012,13 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 format!("a fork keeps its source's choices; {flag} is for a new bot"),
             );
         }
-    } else if c.name == "run"
-        && let Some(flag) = ["--allow", "--expires"].into_iter().find(|f| has(f))
-    {
-        return fail_with("usage", format!("{flag} is for a copy made with --fork"));
+    } else if c.name == "run" && has("--expires") {
+        return fail_with("usage", "--expires is for a copy made with --fork");
+    } else if c.name == "run" && has("--allow") && !has("--new") {
+        return fail_with(
+            "usage",
+            "--allow is for a new bot or a copy made with --fork",
+        );
     }
     if c.name == "run"
         && has("--bot")

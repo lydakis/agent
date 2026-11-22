@@ -47,6 +47,7 @@ fn binding(family: Family) -> Binding<'static> {
         request_id: None,
         starts_line: false,
         profile: None,
+        allow: None,
     }
 }
 
