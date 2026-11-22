@@ -12399,7 +12399,9 @@ impl App {
         for entry in &entries {
             if let Gathered::Call { verb, what, lines } = entry {
                 whats.push(what.clone());
-                calls.push(lines.clone());
+                // Borrowed: shut, only the row that says what they did is
+                // drawn, and a long run of calls copies none of their rows.
+                calls.push(lines);
                 did.push((verb.clone(), what.clone()));
             }
         }
@@ -41863,5 +41865,44 @@ mod tests {
             start.elapsed()
         );
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_long_run_of_sends_folds_to_one_row_and_opens_to_each_in_order() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.any_history = true;
+        app.width = 120;
+        app.project = Some("calc".into());
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        for at in 0..200 {
+            let send = json!({"to": format!("calc.t{at}"), "message": format!("Check {at}.")});
+            app.commit_call(
+                &format!("m{at}"),
+                Some(1),
+                "send_message",
+                &send,
+                "{}",
+                false,
+            );
+        }
+        let shut: Vec<String> = (drawn(&mut app).into_iter())
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        assert_eq!(shut.len(), 1, "{shut:?}");
+        assert!(shut[0].ends_with('▸'), "{shut:?}");
+        let at = *app.clusters.keys().next().unwrap();
+        app.clusters.get_mut(&at).unwrap().open = true;
+        assert!(app.draw_cluster(at));
+        // Under the row that says what they did, each call's own row, in
+        // the order they came.
+        let open = drawn(&mut app);
+        let calls: Vec<String> = (open[2..].iter())
+            .map(|row| row.trim().to_owned())
+            .filter(|row| !row.is_empty())
+            .collect();
+        let want: Vec<String> = (0..200)
+            .flat_map(|at| [format!("• Steered calc.t{at}"), format!("└ Check {at}.")])
+            .collect();
+        assert_eq!(calls, want);
     }
 }
