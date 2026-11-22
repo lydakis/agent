@@ -23,9 +23,9 @@
 //! request IDs, so a note sent twice, as by two windows at once, is one.
 //!
 //! Both notes say what happened and nothing about what to do: the lead's
-//! role says that. Leads of the daemon Sonny reaches by default
+//! role says that. Leads of the daemon the scheduler reaches by default
 //! (`AGENT_SOCKET`, else that of `AGENT_STORE` or `~/.agent/state.sqlite`)
-//! are told.
+//! are told, and that daemon, kept in the file, hears they are back.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -61,6 +61,8 @@ struct Away {
     leads: Vec<String>,
     /// Whether every one of them answered for the away note.
     told: bool,
+    /// The socket of the daemon they are on, which hears they are back too.
+    socket: PathBuf,
 }
 
 fn read_away() -> Option<Away> {
@@ -69,6 +71,7 @@ fn read_away() -> Option<Away> {
     Some(Away {
         since_ms: kept["since_ms"].as_i64()?,
         told: kept["told"].as_bool()?,
+        socket: PathBuf::from(kept["socket"].as_str()?),
         leads: (kept["leads"].as_array().into_iter().flatten())
             .filter_map(|lead| lead.as_str().map(str::to_owned))
             .collect(),
@@ -77,8 +80,9 @@ fn read_away() -> Option<Away> {
 
 fn write_away(away: &Away) -> Result<(), String> {
     let file = away_file().ok_or("no HOME")?;
-    let text =
-        json!({"since_ms": away.since_ms, "leads": away.leads, "told": away.told}).to_string();
+    let text = json!({"since_ms": away.since_ms, "leads": away.leads, "told": away.told,
+        "socket": away.socket})
+    .to_string();
     let part = file.with_extension(format!("{}.part", std::process::id()));
     std::fs::write(&part, text).map_err(|e| e.to_string())?;
     std::fs::rename(&part, &file).map_err(|e| e.to_string())
@@ -172,11 +176,10 @@ pub fn glance(text: &str) -> Option<&'static str> {
     text.starts_with(BACK_OPENS).then_some("You are back")
 }
 
-/// The daemon Sonny reaches by default (`AGENT_SOCKET`, else the socket of
-/// `AGENT_STORE` or `~/.agent/state.sqlite`), if it runs: none is started
-/// for this.
-async fn connect() -> Result<std::sync::Arc<Client>, String> {
-    let socket = match std::env::var_os("AGENT_SOCKET") {
+/// The socket of the daemon Sonny reaches by default (`AGENT_SOCKET`, else
+/// that of `AGENT_STORE` or `~/.agent/state.sqlite`).
+fn socket() -> Result<PathBuf, String> {
+    Ok(match std::env::var_os("AGENT_SOCKET") {
         Some(socket) => PathBuf::from(socket),
         None => {
             let store = match std::env::var_os("AGENT_STORE") {
@@ -187,8 +190,12 @@ async fn connect() -> Result<std::sync::Arc<Client>, String> {
             };
             agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?
         }
-    };
-    let (client, _events) = Client::connect(&socket).await.map_err(|e| e.to_string())?;
+    })
+}
+
+/// The daemon at `socket`, if it runs: none is started for this.
+async fn connect(socket: &std::path::Path) -> Result<std::sync::Arc<Client>, String> {
+    let (client, _events) = Client::connect(socket).await.map_err(|e| e.to_string())?;
     Ok(client)
 }
 
@@ -251,11 +258,12 @@ async fn tell_away() -> Result<(), String> {
     if let Some(away) = read_away()
         && is_back(present_ms(), Some(away.since_ms))
     {
-        let client = connect().await?;
+        let client = connect(&away.socket).await?;
         return tell_back(&client, &away).await;
     }
     let since_ms = present_ms().ok_or("the person never used Sonny")?;
-    let client = connect().await?;
+    let socket = socket()?;
+    let client = connect(&socket).await?;
     let note = away_note(since_ms);
     let id = format!("sonny-away-{since_ms}");
     let leads = every_lead(&client).await?;
@@ -267,6 +275,7 @@ async fn tell_away() -> Result<(), String> {
         since_ms,
         leads: names.clone().map(str::to_owned).collect(),
         told: false,
+        socket,
     };
     // Told before of this absence, in part: those leads stay in it.
     if let Some(before) = read_away().filter(|before| before.since_ms == since_ms) {
@@ -351,7 +360,7 @@ pub fn here() {
         let Ok(Some(away)) = tokio::task::spawn_blocking(touch).await else {
             return;
         };
-        if let Ok(client) = connect().await {
+        if let Ok(client) = connect(&away.socket).await {
             let _ = tell_back(&client, &away).await;
         }
     });
@@ -415,6 +424,7 @@ mod tests {
             since_ms: AT,
             leads: vec!["shop.lead".into()],
             told,
+            socket: PathBuf::from("/tmp/agent.sock"),
         };
         // Still away, some leads not answered for: again.
         assert!(is_unfinished(Some(AT), Some(&away(false))));
