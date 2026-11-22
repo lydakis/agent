@@ -75,9 +75,12 @@ impl Ends {
         let Some(work) = self.work.as_mut() else {
             return;
         };
-        // A take let go is no longer the one its holder was told of.
+        // A take let go is no longer the one its holder was told of, nor
+        // one taken over by another agent of its name.
         let holder = summary.as_ref().and_then(|t| t["work"]["holder"].as_str());
-        (self.held).retain(|(one, at)| at != thread || Some(one.as_str()) == holder);
+        let id = |t: Option<&Value>| t.map(|t| t["work"]["holder_id"].clone());
+        let same = id(work.get(thread)) == id(summary.as_ref());
+        (self.held).retain(|(one, at)| at != thread || (same && Some(one.as_str()) == holder));
         match summary {
             Some(summary) => _ = work.insert(thread.to_owned(), summary),
             None => _ = work.remove(thread),
@@ -438,6 +441,43 @@ mod tests {
         );
         // A new take is news again.
         let found = ends.ended(&home, "shop.w.1", None, 7, true, &boards);
+        assert_eq!(found.holding.len(), 1, "{found:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Another agent given a told holder's name, taking its work over, is
+    /// told of its own take.
+    #[test]
+    fn a_take_over_by_another_of_the_holders_name_is_news() {
+        let home = home("same-name");
+        let mut ends = Ends::default();
+        let boards = ["shop/errors".to_owned()];
+        send(&home, &mut ends, "shop.lead", 1, work("store", json!({})));
+        let take = |id: i64, ends: &mut Ends| {
+            let caller = Caller {
+                name: "shop.w.1",
+                id: Some(id),
+                reader: "shop.w.1",
+                model: None,
+                project: Some("shop"),
+                profile: None,
+                lead: false,
+            };
+            let gone = |_: &str, at: Option<i64>| at != Some(id);
+            let path = crate::commons::dir(&home).join("store.jsonl");
+            let seen = crate::commons::posts(&path).unwrap().len();
+            crate::commons::told(&home, "shop.w.1", "store", &(0..seen).collect::<Vec<_>>());
+            let said = crate::commons::call_as(&home, &caller, &act("store", "take"), &gone);
+            let said = said.unwrap();
+            assert_ne!(said["posted"], false, "{said}");
+            ends.wrote(&home, "shop.w.1", None, said["thread"].as_str().unwrap());
+        };
+        take(2, &mut ends);
+        let found = ends.ended(&home, "shop.w.1", Some(2), 2, true, &boards);
+        assert_eq!(found.holding.len(), 1, "{found:?}");
+        assert!(ends.told("shop.w.1", None, found).is_some());
+        take(9, &mut ends);
+        let found = ends.ended(&home, "shop.w.1", Some(9), 1, true, &boards);
         assert_eq!(found.holding.len(), 1, "{found:?}");
         let _ = std::fs::remove_dir_all(&home);
     }

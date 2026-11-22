@@ -785,8 +785,10 @@ async fn touched(
     reach: usize,
 ) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
+    // Past every live agent but its author, no search finds another.
+    let could = live.iter().filter(|one| *one != author).count();
     for word in words {
-        if found.len() >= reach {
+        if found.len() >= reach.min(could) {
             break;
         }
         // Older pages too, while a word's matches are all the poster's or
@@ -4763,6 +4765,36 @@ mod tests {
         assert!(kept_for(&home, "shop", "shop.w.1", Some("worker")).is_empty());
         assert!(kept_for(&home, "docs", "docs.r.1", Some("reviewer")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The walk down a post's words stops once no live agent is left to
+    /// find: none live costs no search, and every one found ends it.
+    #[tokio::test]
+    async fn the_words_are_searched_only_while_someone_is_left_to_find() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let searched = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = searched.clone();
+        let client = crate::tests::daemon_answering(move |request| match request["op"].as_str() {
+            Some("history_search") => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                json!({"matches": [{"bot": "shop.w1"}], "next_before": null})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let words: Vec<String> = (0..50).map(|n| format!("word{n}")).collect();
+        assert!(
+            touched(&client, &words, "shop.lead", &[], 8)
+                .await
+                .is_empty()
+        );
+        assert_eq!(searched.load(Ordering::SeqCst), 0);
+        let live = ["shop.lead".to_owned(), "shop.w1".to_owned()];
+        assert_eq!(
+            touched(&client, &words, "shop.lead", &live, 8).await,
+            ["shop.w1"]
+        );
+        assert_eq!(searched.load(Ordering::SeqCst), 1);
     }
 
     /// An agent's project is its lead's, not its name's first part: a
