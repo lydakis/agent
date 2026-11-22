@@ -74,7 +74,11 @@ impl Embedded {
         let (writer, written) = std::sync::mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
             while let Ok(bytes) = written.recv() {
-                if input.write_all(&bytes).and_then(|()| input.flush()).is_err() {
+                if input
+                    .write_all(&bytes)
+                    .and_then(|()| input.flush())
+                    .is_err()
+                {
                     break;
                 }
             }

@@ -9523,7 +9523,10 @@ mod scale {
             view.centre = Some("p.lead".to_owned());
             let start = Instant::now();
             view.card(200, 56);
-            eprintln!("{count:>6} agents round one lead: first frame {:?}", start.elapsed());
+            eprintln!(
+                "{count:>6} agents round one lead: first frame {:?}",
+                start.elapsed()
+            );
         }
     }
 
