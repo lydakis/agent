@@ -6387,16 +6387,9 @@ impl Search {
 /// A picture being read, decoded and scaled beside the loop.
 type Preparing = tokio::task::JoinHandle<Result<Option<attach::Picture>, String>>;
 
-/// A file dropped from another machine, being fetched over its link.
-type Fetching = tokio::task::JoinHandle<Result<Fetched, String>>;
-
-/// A file dropped from another machine, here.
-enum Fetched {
-    /// A picture, to go behind a placeholder.
-    Picture(attach::Picture),
-    /// Another file, copied here at this path for the agent to read.
-    File(std::path::PathBuf),
-}
+/// A file dropped from another machine, being copied here over its link:
+/// the path of the copy, for the agent to read.
+type Fetching = tokio::task::JoinHandle<Result<std::path::PathBuf, String>>;
 
 struct App {
     client: Arc<Client>,
@@ -20368,8 +20361,20 @@ impl App {
                 }
                 attach::Dropped::Elsewhere(path) => {
                     let words = attach::shell_quoted(&path);
+                    let handing = link::handing();
+                    // A picture goes behind its placeholder at once, as
+                    // one read here does; another file's path stands until
+                    // the copy is here.
+                    if handing && attach::is_picture(std::path::Path::new(&path)) {
+                        self.prepare(move || {
+                            let got = link::picture(&path);
+                            got.map(Some)
+                                .map_err(|why| format!("{}: {why}", file_name(&path)))
+                        });
+                        continue;
+                    }
                     self.input.insert(&format!("{words} "));
-                    if !link::handing() {
+                    if !handing {
                         // A path pasted as words is words; dropped over
                         // SSH, it names a file on the person's machine.
                         if attach::over_ssh() {
@@ -20383,13 +20388,8 @@ impl App {
                     }
                     let woken = self.woken.clone();
                     let job = tokio::task::spawn_blocking(move || {
-                        let got = match attach::is_picture(std::path::Path::new(&path)) {
-                            true => link::picture(&path).map(Fetched::Picture),
-                            false => {
-                                let to = link::kept_as(&path).ok_or("HOME is not set")?;
-                                link::copy(&path, &to).map(|()| Fetched::File(to))
-                            }
-                        };
+                        let to = link::kept_as(&path).ok_or("HOME is not set")?;
+                        let got = link::copy(&path, &to).map(|()| to);
                         woken.notify_one();
                         got.map_err(|why| format!("{}: {why}", file_name(&path)))
                     });
@@ -20400,25 +20400,17 @@ impl App {
         self.notice = said.or(self.notice.take());
     }
 
-    /// A file dropped from another machine, here: its path's words in the
-    /// composer become a picture's placeholder or the path of this
-    /// machine's copy; or, not had, they stay and why is said. Words the
-    /// person deleted meanwhile take nothing with them.
-    fn fetched(&mut self, words: &str, got: Result<Fetched, String>) {
+    /// A file dropped from another machine, copied here: its path's words
+    /// in the composer become the copy's path, where they stand alone and
+    /// once; words the person changed or repeated meanwhile stay, and where
+    /// the copy is is said. Not had, why is said.
+    fn fetched(&mut self, words: &str, got: Result<std::path::PathBuf, String>) {
         match got {
-            Ok(Fetched::Picture(picture)) => {
-                if !self.input.contains(words) {
-                    return;
-                }
-                self.forget_pictures();
-                self.pictures.push(None);
-                let number = self.pictures.len();
-                self.input.replace(words, &attach::placeholder(number));
-                self.ready(number, Ok(Some(picture)));
-            }
-            Ok(Fetched::File(path)) => {
+            Ok(path) => {
                 let path = attach::shell_quoted(&path.to_string_lossy());
-                self.input.replace(words, &path);
+                if !self.input.replace_word(words, &path) {
+                    self.notice = Some(format!("{} is copied here as {path}", file_name(words)));
+                }
             }
             Err(why) => self.notice = Some(why),
         }
@@ -40647,49 +40639,49 @@ mod tests {
         let notes = attach::shell_quoted(&dir.join("notes.txt").to_string_lossy());
         assert_eq!(*app.input, format!("[Image #1] {notes} "));
         assert_eq!(app.placed(&app.input).len(), 1);
-        // From another machine: its path stands until it is here.
+        // Another file from another machine is this machine's copy, put
+        // where its path alone stands; one not had stays its path.
         app.input.clear();
-        let shot = "/Users/someone/Desktop/Screenshot 1.png";
-        let words = attach::shell_quoted(shot);
-        let picture = attach::Picture {
-            media_type: "image/png",
-            data: png.clone(),
-        };
-        let (go, wait) = std::sync::mpsc::channel::<()>();
-        app.input.insert(&format!("look {words} "));
-        app.fetching.push((
-            words.clone(),
-            tokio::task::spawn_blocking(move || {
-                let _ = wait.recv();
-                Ok(Fetched::Picture(picture))
-            }),
-        ));
-        assert!(!app.prepared().await);
-        assert_eq!(*app.input, format!("look {words} "));
-        go.send(()).unwrap();
-        app.all_ready().await;
-        assert_eq!(&*app.input, "look [Image #2] ");
-        assert_eq!(app.placed(&app.input).len(), 1);
-        // Another file is this machine's copy; one not had stays its path.
         let report = "/Users/someone/report.pdf";
         let copy = dir.join("dropped").join("ab12cd34-report.pdf");
-        app.input
-            .insert(&format!("{report} /Users/someone/gone.txt"));
+        app.input.insert(&format!(
+            "see {report}.bak and {report} /Users/someone/gone.txt"
+        ));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
         let kept = copy.clone();
         app.fetching.push((
             report.into(),
-            tokio::task::spawn_blocking(move || Ok(Fetched::File(kept))),
+            tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+                Ok(kept)
+            }),
         ));
         app.fetching.push((
             "/Users/someone/gone.txt".into(),
             tokio::task::spawn_blocking(|| Err("gone.txt: not on mac".into())),
         ));
+        assert!(!app.prepared().await);
+        go.send(()).unwrap();
         app.all_ready().await;
         assert_eq!(
             *app.input,
-            format!("look [Image #2] {} /Users/someone/gone.txt", copy.display())
+            format!(
+                "see {report}.bak and {} /Users/someone/gone.txt",
+                copy.display()
+            )
         );
         assert_eq!(app.notice.as_deref(), Some("gone.txt: not on mac"));
+        // Changed while it was fetched, the words stay, and the copy is said.
+        app.input.set("/Users/someone/report2.pdf");
+        let kept = copy.clone();
+        app.fetching
+            .push((report.into(), tokio::task::spawn_blocking(move || Ok(kept))));
+        app.all_ready().await;
+        assert_eq!(&*app.input, "/Users/someone/report2.pdf");
+        assert_eq!(
+            app.notice,
+            Some(format!("report.pdf is copied here as {}", copy.display()))
+        );
         // A path from another machine with none linked is words.
         app.input.clear();
         app.key(Event::Paste("/Users/someone/elsewhere.pdf".into()))

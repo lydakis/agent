@@ -106,19 +106,25 @@ impl Prompt {
         true
     }
 
-    /// `piece` swapped for `with` where it first is, the cursor kept on the
-    /// words it was at, or after `with` when it was in `piece`; whether
-    /// `piece` was there.
-    pub fn replace(&mut self, piece: &str, with: &str) -> bool {
-        let Some(start) = self.text.find(piece) else {
+    /// `piece` swapped for `with` where it stands as words of its own, with
+    /// nothing but whitespace or the text's ends beside it, the cursor kept
+    /// on the words it was at, or after `with` when it was in `piece`;
+    /// whether it stood so exactly once, and was swapped.
+    pub fn replace_word(&mut self, piece: &str, with: &str) -> bool {
+        let alone = |&(start, _): &(usize, &str)| {
+            let end = start + piece.len();
+            !self.text[..start].ends_with(|c: char| !c.is_whitespace())
+                && !self.text[end..].starts_with(|c: char| !c.is_whitespace())
+        };
+        let mut found = self.text.match_indices(piece).filter(alone);
+        let (Some((start, _)), None) = (found.next(), found.next()) else {
             return false;
         };
-        let end = start + piece.len();
-        let swapped = start..end;
+        let swapped = start..start + piece.len();
         self.at = replaced(self.at, &swapped, with.len());
         self.anchor = (self.anchor).map(|at| replaced(at, &swapped, with.len()));
         self.goal = None;
-        self.splice(start..end, with);
+        self.splice(swapped, with);
         self.laid.take();
         true
     }
@@ -944,6 +950,19 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn a_word_is_replaced_only_where_it_stands_alone_and_once() {
+        let mut prompt = Prompt::default();
+        prompt.set("see /a/report.pdf.bak and /a/report.pdf now");
+        assert!(prompt.replace_word("/a/report.pdf", "/b/copy.pdf"));
+        assert_eq!(&*prompt, "see /a/report.pdf.bak and /b/copy.pdf now");
+        prompt.set("/a/x.pdf then /a/x.pdf");
+        assert!(!prompt.replace_word("/a/x.pdf", "/b"));
+        prompt.set("/a/x.pdf2");
+        assert!(!prompt.replace_word("/a/x.pdf", "/b"));
+        assert_eq!(&*prompt, "/a/x.pdf2");
     }
 
     #[test]
