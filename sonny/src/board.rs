@@ -468,7 +468,17 @@ pub fn checkout(folder: &Path) -> serde_json::Map<String, Value> {
         made.insert("branch".into(), json!(branch));
     }
     made.insert("commit".into(), json!(commit));
-    if git(&["status", "--porcelain"]).is_some_and(|changed| !changed.is_empty()) {
+    // Reading its files can run what the repository's config names (a
+    // clean filter), so as an agent's git runs, as a task's removal reads
+    // it; untracked files count whatever the config shows.
+    let status = [
+        "--no-optional-locks",
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ];
+    if crate::task::confined(folder, &status, &[]).is_ok_and(|changed| !changed.is_empty()) {
         made.insert("uncommitted".into(), json!(true));
     }
     made
@@ -2269,6 +2279,8 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
         };
         git(&["init", "-q", "-b", "agent/b.1"]);
+        // Untracked files count even where the config hides them.
+        git(&["config", "status.showUntrackedFiles", "no"]);
         std::fs::write(repo.join("store.rs"), "typed").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "store"]);
