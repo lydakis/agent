@@ -12856,3 +12856,114 @@ unchanged: 5 commits and the same time.
 Both sides ran the same synthetic model and the same scripts, alternating
 binaries within each round. The matched perf gate screen is the pull
 request's Perf screen.
+
+## Release 0.10.4 against 0.10.3
+
+This measures every change since 0.10.3 together: v0.10.3 (32b91fa) against
+the release commit 2056365. Each side runs its own daemon with its own Sonny,
+since the protocol moved from 99 to 100. Release builds (glibc) on one 4-core
+Linux container; base and head alternated, and both binaries were copied
+together and had their page cache dropped before every run.
+
+The benchmark is `bench/ends.py` at the low end (10 agents, one window; three
+rounds) and the high end (10,000 stored agents, 30 busy, 8 scripts, 20 s; two
+rounds each), then `bench/projects_open.py` at 100 projects of 100 agents and
+the Perf workflow's screens.
+
+### Low end
+
+| Measure | 0.10.3 | 0.10.4 |
+| --- | ---: | ---: |
+| window start, s | 0.09 / 0.091 / 0.083 | 0.082 / 0.083 / 0.086 |
+| key p99, ms | 2.1 / 2.4 / 1.57 | 1.47 / 3.21 / 1.83 |
+| turn p50, ms | 47.88 / 48.08 / 48.08 | 48.03 / 48.02 / 47.97 |
+| turn p99, ms | 101.76 / 49.56 / 50.65 | 50.23 / 49.17 / 51.33 |
+| idle daemon PSS, MiB | 17.5 / 18.5 / 18.9 | 18.1 / 18.3 / 18.5 |
+| idle window PSS, MiB | 16 / 15.5 / 15.7 | 16.2 / 16.3 / 16 |
+| idle window wakeups, /s | 4.5 / 4.6 / 4.6 | 4.5 / 4.5 / 4.5 |
+
+- **Everything holds.** The window's PSS is 0.3 to 0.5 MiB higher at one
+  window: Sonny's binary is 0.6 MB larger, so more of its own code pages are
+  in. At 200 windows they are shared and the difference is 0.01 MiB a window.
+- A quiet window's CPU, measured over 120 s, is 0.06 to 0.07% on both.
+
+### High end
+
+| Measure | 0.10.3 | 0.10.4 |
+| --- | ---: | ---: |
+| 32 windows, one project: windows CPU, % | 4.93 / 5.02 | 4.73 / 4.68 |
+| windows PSS, MiB | 187.7 / 186.5 | 186.8 / 185.6 |
+| daemon CPU, % | 141.12 / 139.3 | 136.74 / 137.48 |
+| key p99, ms | 13.57 / 15.59 | 8.62 / 14.28 |
+| worst key, ms | 20.68 / 20.52 | 14.92 / 17.13 |
+| turns finished | 8336 / 8174 | 8296 / 8546 |
+| scripts finished | 1022 / 999 | 1016 / 1061 |
+| 100 windows, spread: windows CPU, % | 11.26 / 11.79 | 12.54 / 12.36 |
+| windows PSS, MiB | 497.7 / 498.8 | 498.7 / 498.9 |
+| daemon CPU, % | 138.8 / 137.87 | 136.42 / 137.86 |
+| key p99, ms | 12.63 / 12.88 | 15.62 / 12.45 |
+| worst key, ms | 19.34 / 28.6 | 24.94 / 28.79 |
+| turns finished | 8455 / 8397 | 8315 / 8461 |
+| scripts finished | 1011 / 1032 | 999 / 1022 |
+| 200 windows, one project: windows CPU, % | 19.08 / 18.15 | 18.72 / 18.41 |
+| windows PSS, MiB | 952.9 / 951.7 | 955.2 / 956 |
+| daemon CPU, % | 135.45 / 135.67 | 134.78 / 133.2 |
+| key p99, ms | 11.48 / 11.73 | 12.61 / 13.91 |
+| worst key, ms | 20.05 / 21.58 | 18.43 / 39.74 |
+| turns finished | 8574 / 8851 | 8474 / 8557 |
+| scripts finished | 1030 / 1095 | 1027 / 1042 |
+
+- **Even at every size.** Every row overlaps between rounds; no key took
+  100 ms on either side.
+
+### Projects at 10,000 agents
+
+Three rounds each on the release commit, and six more each on 6ec9e9f
+(daemon unchanged since): the first open shows in 0.32 to 0.43 s on both,
+and the window's RSS after five opens lands anywhere from 55 to 66 MiB on
+both. Its anonymous memory (`RssAnon`) after the opens is 35 to 46 MiB on
+0.10.3 and 39 to 46 MiB on 0.10.4, over four rounds each.
+
+### Daemon and Sonny screens
+
+Three alternating rounds of the Perf workflow's screens. Two rows the gate
+flags are not the code's work:
+
+- **Per idle bot, KiB: 1.26 to 1.78.** The screen reads total RSS, which
+  counts the binary's own code pages faulted in while creating the bots. Read
+  as `RssAnon`, an idle bot costs 1.10 to 1.14 KiB on 0.10.3 and 1.07 to
+  1.13 on 0.10.4. The total-RSS step appears between d3b306c and 2a7a750,
+  where the daemon's code changed only by one line (#1292) and two removed
+  fields (#1290): a layout change, not memory held.
+- **Lookout CPU at 10 leads of one task.** 800 deltas cost 30 to 50 ms on
+  either side, one or two clock ticks; four more rounds read 37.5 ms a
+  thousand on 0.10.4 every time against 37.5 to 50 on 0.10.3. At 10x100 and
+  100x10 they are even.
+- **Burst submit p99** over 50 runs each: median 6.6 ms on 0.10.3, 5.65 ms on
+  0.10.4.
+
+
+| Bench | Measure | 0.10.3 | 0.10.4 | Change |
+| admission | lone submit CPU, ms | 39.552 | 39.461 | -0.2% |
+| admission | burst submit p99, ms | 6.587 | 5.178 | -21.4% |
+| completion | release to terminal p99, ms | 13.615 | 14.124 | +3.7% |
+| footprint | idle RSS, MiB | 20.775 | 20.74 | -0.2% |
+| footprint | per idle bot, KiB | 1.258 | 1.78 | +41.5% |
+| footprint | RSS after a turn each, MiB | 34.639 | 37.727 | +8.9% |
+| footprint | CPU per turn, ms | 1.058 | 1.059 | +0.1% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 37.5 | 50.0 | +33.3% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 7.5 | 8.75 | +16.7% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 5.0 | 4.75 | -5.0% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 7.5 | 7.25 | -3.3% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2172 | 2165 | -0.3% |
+| sonny | lookout note p95 at 100x10, ms | 2371 | 2392 | +0.9% |
+| sonny | quiet window CPU, ms/s | 0.78 | 0.79 | +1.3% |
+| sonny | quiet window reads, KiB/s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window RSS, MiB | 26.8 | 27.5 | +2.6% |
+| sonny | sky replay CPU per 1k lines, ms | 13.85 | 12.89 | -6.9% |
+| sonny | sky replay RSS, MiB | 66.9 | 66.7 | -0.3% |
+| lifecycle | CPU, s | 0.65 | 0.64 | -1.5% |
+| lifecycle | p95 turn, ms | 582.873 | 587.353 | +0.8% |
+| lifecycle | peak RSS, MiB | 28.93 | 29.414 | +1.7% |
