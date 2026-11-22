@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -149,6 +150,71 @@ class StoreDownTest(unittest.TestCase):
         self.assertEqual(self.read("SELECT * FROM tool_lists"), lists)
         self.assertNotIn("profile", {row[1] for row in self.read("PRAGMA table_info(bots)")})
         self.assertEqual(self.read("SELECT count(*) FROM bot_instructions"), [(4,)])
+
+    def test_the_copy_has_the_stores_permissions_whatever_the_umask(self):
+        # As the daemon's own copy before it migrates: a private store's
+        # copy is private, and at no point readable by anyone else.
+        umask = os.umask(0o022)
+        self.addCleanup(os.umask, umask)
+        for mode in (0o600, 0o640):
+            with self.subTest(mode=oct(mode)):
+                for old in glob.glob(self.store + ".*.backup"):
+                    os.unlink(old)
+                os.chmod(self.store, mode)
+                made = []
+                vacuum = store_down.back_up
+
+                def watched(conn, store, copy):
+                    real = conn.execute
+
+                    class Conn:
+                        def execute(self, sql, *args):
+                            if sql.startswith("VACUUM INTO"):
+                                made.append(stat.S_IMODE(os.stat(copy).st_mode))
+                            return real(sql, *args)
+                    return vacuum(Conn(), store, copy)
+
+                store_down.back_up = watched
+                try:
+                    self.down("111")
+                finally:
+                    store_down.back_up = vacuum
+                [copy] = glob.glob(self.store + ".schema-112.*.backup")
+                self.assertEqual(stat.S_IMODE(os.stat(copy).st_mode), mode)
+                # Already the store's before the copy is written.
+                self.assertEqual(made, [mode])
+                self.assertEqual(stat.S_IMODE(os.stat(self.store + ".owner-lock").st_mode), 0o600)
+                with sqlite3.connect(copy) as conn:
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone(), (112,))
+                # The next pass starts from 112 again.
+                conn = sqlite3.connect(self.store)
+                conn.executescript(UP_112)
+                conn.close()
+
+    def test_a_copy_that_fails_is_removed(self):
+        os.chmod(self.store, 0o600)
+
+        def vacuum(conn, store, copy):
+            class Conn:
+                def execute(self, sql, *args):
+                    raise sqlite3.OperationalError("disk full")
+            return back_up(Conn(), store, copy)
+
+        back_up = store_down.back_up
+        store_down.back_up = vacuum
+        try:
+            with self.assertRaisesRegex(sqlite3.OperationalError, "disk full"):
+                self.down("111")
+        finally:
+            store_down.back_up = back_up
+        self.assertEqual(glob.glob(self.store + ".*.backup"), [])
+        self.assertEqual(self.read("PRAGMA user_version"), [(112,)])
+
+    def test_help_says_how_to_use_it(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            store_down.main(["--help"])
+        self.assertIn("store_down.py STORE SCHEMA [--dry-run]", out.getvalue())
 
     def test_a_dry_run_writes_nothing(self):
         before = Path(self.store).read_bytes()

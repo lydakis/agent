@@ -1352,7 +1352,8 @@ answers, then drains: no turn starts, and each running turn starts no further
 model call or tool call. A turn whose model is answering finishes when that
 answer ends it; otherwise it parks at its next boundary, once the model's
 answer and every call already running have committed. Calls the answer made
-that had not started are answered `daemon_shutdown`, saying they did not run.
+that had not started stay open, and run when the next start continues the
+turn ([what a stop keeps](#what-a-stop-keeps)).
 A `reject` submission answers `daemon_draining`; `queue` and `steer`
 submissions are recorded as usual, and queued work starts on the next daemon
 start. Parked and paced turns stay parked, as on any shutdown. `stats` reports
@@ -1366,12 +1367,13 @@ given, or a signal came) parks as a pull parks it, and the next start
 continues it, as capacity allows and with no `resume`: `turn_paced` says
 `{"resume_at_ms": null, "stopped": true}`, and so does the turn view's
 `waiting_on`. The reply it was writing is dropped and asked for again then.
-Each call it had not answered gets `{error: "daemon_shutdown", detail}`,
-saying the stop cut it off before its result was recorded (it may have had
-effects) or came before it ran, that nothing has run it again, and that the
-daemon has since started again and the turn goes on; the first's
-`tool_completed` says `outcome_unknown`, the second's `cancelled`, as a pause
-says them. A call waiting for its verdict as the drain begins does not
+A call the daemon was running gets `{error: "daemon_shutdown", detail}`,
+saying the stop cut it off before its result was recorded, so it may have
+had effects, that nothing has run it again, and that the daemon has since
+started again and the turn goes on; its `tool_completed` says
+`outcome_unknown`, as a pause says it. A call a wide batch had not reached
+yet (it started with the batch) gets the same error saying it did not run,
+`cancelled`. A call waiting for its verdict as the drain begins does not
 start, even if allowed then, and a model call that failed sends no retry:
 the turn parks, and its retry count starts over when it continues. The time the daemon
 was down is not counted in `paced_ms`. A client's `wait` still open is
@@ -1387,6 +1389,19 @@ pull's park from its own flag to that. Protocol 36 parks turns on a stop; before
 `interrupted` with `daemon_shutdown`. A daemon older than 36 still ends them
 that way when an upgrade replaces it.
 
+### What a stop keeps
+
+A stop, a pause or a crash cuts off only what the daemon was running, as Pi
+Durable recovers a task its host stopped under. The calls of the round that
+had not started stay open, their verdict requests with them: the turn's park
+keeps them (`waiting.pending`), and when it continues they run first, as
+their round was announced, each asking for its verdict again only if it had
+none. The call a client was answering (a declared tool, a script) waits on
+for its answer: the turn parks on it as it would once it waited past its
+hold (`turn_waiting` with `answer`), so the client's answer, given before
+or after the restart, is taken, and the calls after it then run. Schema
+unchanged; before this, both were answered as cut off.
+
 Protocol 24 also adds the pull cord: `pause` stops every agent until
 `resume`, and holds across restarts, since the store keeps it (schema 64;
 since schema 72 the `pauses` table keeps every pause, held or lifted). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
@@ -1395,10 +1410,11 @@ request answers `invalid_by`; on a bot's own socket it is that bot, whatever
 the request says. It parks every running turn at once,
 as a closed pool parks it (`turn_paced` with `paused: true`; status `paced`),
 to continue on `resume`. The reply it was writing is dropped and asked for
-again then. Each call the turn had not answered gets a result, `{error:
+again then. A call the daemon was running gets a result, `{error:
 "daemon_paused", detail, pause}` (`pause` is `{reason, by, at_ms}`), saying the pause stopped it before its result
-was recorded (it may have had effects; nothing has run it again) or came
-before it ran. The model reads it only once the turn continues, so it also
+was recorded (it may have had effects; nothing has run it again); calls not
+started, and one a client was answering, are kept
+([what a stop keeps](#what-a-stop-keeps)). The model reads it only once the turn continues, so it also
 says that work has since resumed and the turn goes on: read as a pause still
 holding, the older wording made resumed models report and stop. The daemon
 reruns none, and the model decides what to redo, as Codex answers the calls an
@@ -2397,9 +2413,15 @@ for a full disk say, is not migrated: opening fails with
 `store_backup_failed`, which says why, and the store stays as it was. To go
 back a release, stop the daemon and put the copy in the store's place, or
 keep what changed since with `release/store_down.py STORE N`: on a store no
-daemon holds, it copies the store beside itself and takes it back to schema
-N with each step's way back, newest first, in one transaction. Every step
-from 106 (0.10.1) on has one there, and each new step adds its own. Schema
+daemon holds, it copies the store beside itself, with the store's
+permissions as the daemon's copy has them, and takes it back to schema N
+with each step's way back, newest first, in one transaction. Every step
+from 106 (0.10.1) on has one there, and each new step adds its own. Every
+release installs it, with its helper `store_lift_yields.py`, in `libexec`:
+`PREFIX/opt/sonny/libexec/store_down.py` from the Linux tarball and
+`$(brew --prefix agent)/libexec/store_down.py` from Homebrew. Run the one of
+the release being left, before installing the older one: only it knows its
+own steps. Schema
 109 names a declared tool's `lift` `yields` (#1203) in every list the store
 keeps, in place, so the list moves to the digest of its new bytes and the
 bots, creation records and kept `configure`s that name it follow; its way
@@ -2478,14 +2500,14 @@ completion.
 
 On recovery, a turn the daemon was running when its process ended unplanned
 (a crash, a kill, a fatal error) goes on, as Pi Durable continues a task its
-host was cut off in (schema 112). It parks at a model-call boundary as a
-planned stop parks it, and the daemon resumes it as capacity allows. Every
-unanswered tool call receives a durable result, `{error:
-"process_interrupted", detail}`: a planned call did not run (its
-`tool_completed` says `cancelled`); an executing call's effects may already
-have happened, and execution may still be running (`outcome_unknown`). The
-model sees this in history and can inspect current state before deciding what
-to do. No tool is run again. A turn cut off after its final reply was
+host was cut off in (schema 112). It parks as a planned stop parks it, and
+the daemon resumes it as capacity allows. A call the daemon was running
+receives a durable result, `{error: "process_interrupted", detail}`: its
+effects may already have happened, and execution may still be running
+(`outcome_unknown`). The model sees this in history and can inspect current
+state before deciding what to do. No tool is run again. Calls not started,
+and one a client was answering, are kept, as a stop keeps them
+([what a stop keeps](#what-a-stop-keeps)). A turn cut off after its final reply was
 recorded, before its end was, ends `completed` as it would have, its model not
 asked again. A turn with no call open was waiting on its
 model, or about to ask it: that call counts as a failed attempt, announced as

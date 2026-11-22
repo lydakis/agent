@@ -212,7 +212,7 @@ fn start() -> Value {
                         that will change files."},
                 "model": {"type": "string", "minLength": 1,
                     "description": format!("PROVIDER/MODEL, when the work suits another model than yours; \
-                        without one, the project's task_model, else yours.{}", noted_models())},
+                        without one, its profile's model, else the project's task_model, else yours.{}", noted_models())},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
                 "reason": {"type": "string", "minLength": 1,
