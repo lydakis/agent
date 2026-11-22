@@ -20377,7 +20377,7 @@ impl App {
         if !self.input.swap(&format!("{placeholder} "), &replaced) {
             self.input.swap(&placeholder, &replaced);
         }
-        self.input.unkill(&placeholder);
+        self.input.unkill(&placeholder, &replaced);
         // Its number goes to the next picture, when none came after it.
         if self.pictures.len() == number {
             self.pictures.pop();
@@ -40728,6 +40728,23 @@ mod tests {
         go.send(()).unwrap();
         app.all_ready().await;
         assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
+        // Cut with Ctrl-U while one that never comes is read: Ctrl-Y brings
+        // back the words it went in place of.
+        app.discard();
+        app.input.set("keep these words");
+        app.input.select(5, 10);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(None)
+        });
+        app.key(press(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        go.send(()).unwrap();
+        app.all_ready().await;
+        app.key(press(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(&*app.input, "keep these words");
     }
 
     #[tokio::test]
