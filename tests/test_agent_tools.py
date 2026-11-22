@@ -234,11 +234,11 @@ class AgentToolsTests(ModelFixture):
                        ('spawn_agent', {'name': 'plain', 'message': 'q'}),
                        ('spawn_agent', {'name': 'told', 'message': 'q', 'agents': True}),
                        ('spawn_agent', {'name': 'set', 'message': 'q', 'instructions': 'Only this.',
-                                        'tools': ['echo', 'wait'], 'settings': {'max_rounds': 3},
-                                        'budget_tokens': 50000}),
+                                        'settings': {'max_rounds': 3}, 'budget_tokens': 50000}),
                        ('spawn_agent', {'name': 'both', 'message': 'q', 'instructions': 'x', 'agents': True}),
-                       ('spawn_agent', {'name': 'copy', 'message': 'q', 'fork': True, 'tools': ['echo']}),
-                       ('spawn_agent', {'name': 'copy', 'message': 'q', 'fork': True, 'allow': ['echo']}))
+                       ('spawn_agent', {'name': 'narrow', 'message': 'q', 'tools': ['echo']}),
+                       ('spawn_agent', {'name': 'copy', 'message': 'q', 'fork': True, 'allow': ['echo']}),
+                       ('spawn_agent', {'name': 'copy', 'message': 'q', 'fork': True}))
         plain = client.request('inspect', bot='shop.plain')['result']
         told = client.request('inspect', bot='shop.told')['result']
         self.assertNotIn('Folder rule', plain['instructions'])
@@ -246,11 +246,15 @@ class AgentToolsTests(ModelFixture):
         self.assertTrue(told['instructions'].startswith(plain['instructions'][:40]), told['instructions'][:200])
         kept = client.request('inspect', bot='shop.set')['result']
         self.assertEqual((kept['instructions'], kept['tools'], kept['settings']['max_rounds'], kept['budget_tokens']),
-                         ('Only this.', ['echo', 'wait'], 3, 50000))
+                         ('Only this.', TOOLS.split(','), 3, 50000))
         self.assertIn('instructions sets them', self.output(client, 'shop.lead', 'spawn_agent-4'))
-        self.assertIn('give it allow', self.output(client, 'shop.lead', 'spawn_agent-5'))
+        # A model names no tools for the agent it makes, as Codex's names
+        # none: it has the caller's, and only a profile narrows them.
+        self.assertIn('invalid_tool_arguments', self.output(client, 'shop.lead', 'spawn_agent-5'))
+        self.assertIn('invalid_tool_arguments', self.output(client, 'shop.lead', 'spawn_agent-6'))
+        self.assertEqual(client.request('inspect', bot='shop.narrow')['error'], 'bot_not_found')
         copy = client.request('inspect', bot='shop.copy')['result']
-        self.assertEqual(copy['allowed'], ['echo'], copy)
+        self.assertEqual((copy['tools'], copy.get('allowed')), (TOOLS.split(','), None), copy)
 
     def test_a_spawn_sent_again_after_its_folder_changed_keeps_the_agent_it_made(self):
         (self.path / 'AGENTS.md').write_text('First rule.\n')
@@ -288,12 +292,15 @@ class AgentToolsTests(ModelFixture):
         self.assertEqual(look.get('effort'), 'high', look)
 
     def test_a_caller_kept_to_some_tools_makes_agents_kept_to_them(self):
+        agents = self.path / '.agents' / 'agents'
+        agents.mkdir(parents=True)
+        (agents / 'pair.md').write_text('---\ntools: [echo, send_message]\n---\nPair up.\n')
         client = self.client(TOOLS)
         client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
         client.request('fork', source='shop.lead', bot='shop.narrow', allow=['echo', 'spawn_agent'])
         self.run_calls(client, 'shop.narrow', 'go',
                        ('spawn_agent', {'name': 'helper', 'message': 'q'}),
-                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'tools': ['echo', 'send_message']}))
+                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'profile': 'pair'}))
         helper = client.request('inspect', bot='shop.helper')['result']
         asked = client.request('inspect', bot='shop.asked')['result']
         self.assertEqual((helper['tools'], asked['tools']), (['echo', 'spawn_agent'], ['echo']))

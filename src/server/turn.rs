@@ -6381,9 +6381,9 @@ impl Turn {
                     {
                         own.extend(over);
                     }
-                    // Its tools are this agent's at most, whatever a role or
-                    // the call names, so every gate it inherits names them
-                    // as this one's do. A caller kept to some of its tools
+                    // Its tools are this agent's at most, whatever a role
+                    // names, so every gate it inherits names them as this
+                    // one's do. A caller kept to some of its tools
                     // (a fork's `allow`) makes agents kept to them too:
                     // `create` takes no `allow`, so their tools are those
                     // it may call.
