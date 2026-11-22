@@ -4342,7 +4342,14 @@ impl Service {
         if !self.admissions.is_empty()
             || !matches!(
                 command,
-                Some(Command::Create { .. } | Command::Submit { .. })
+                Some(
+                    Command::Create { .. }
+                        | Command::Submit { .. }
+                        | Command::Fork {
+                            submit: Some(_),
+                            ..
+                        }
+                )
             )
         {
             return None;
@@ -8271,7 +8278,19 @@ impl Service {
                     None => submitted(db, None),
                     Some(forking) => db.atomic(|db| {
                         let fork = forking.fork(db)?;
-                        submitted(db, Some(fork))
+                        let duplicate = fork["duplicate"] == true;
+                        let submitted = submitted(db, Some(fork))?;
+                        // A fork made before came with its first message,
+                        // or with none: a resend whose message is new is
+                        // another request under the fork's key.
+                        if duplicate && submitted.1.fresh {
+                            return Err(Error::with(
+                                "idempotency_conflict",
+                                "submit differs from the request that made the fork",
+                            )
+                            .facts(json!({"field":"submit"})));
+                        }
+                        Ok(submitted)
                     }),
                 }
             })
@@ -12377,6 +12396,16 @@ mod tests {
         }
         let newest = service.awaits_publication(Some(&next), 1, &output, bound);
         assert_eq!(newest, Some(window as i64), "the next admission waits");
+        // So does a fork that carries its first message.
+        let fork: Command = serde_json::from_value(json!({"op": "fork", "source": "B0",
+            "bot": "B0.ask", "submit": {"request_id": "q", "prompt": "p", "delivery": "steer"}}))
+        .unwrap();
+        let forked = service.admission_sends(&fork, &json!("fork"), 1);
+        assert_eq!(
+            service.awaits_publication(Some(&fork), 1, &output, forked),
+            newest,
+            "a fork with a message waits too"
+        );
         assert_eq!(
             service.awaits_publication(Some(&Command::Stats), 1, &output, Bound::default()),
             None,

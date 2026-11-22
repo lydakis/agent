@@ -3272,6 +3272,16 @@ class RuntimeTests(ModelFixture):
         again = client.request('fork', **ask)['result']
         self.assertEqual((again['duplicate'], again['submitted']['duplicate']), (True, True))
         self.assertEqual((again['bot_id'], again['submitted']['message']), (made['bot_id'], sent['message']))
+        # A resend under the fork's key with another message is another request.
+        changed = client.request('fork', **{**ask, 'submit': {**ask['submit'], 'request_id': 'ask.2'}})
+        self.assertEqual((changed['error'], changed['field']), ('idempotency_conflict', 'submit'))
+        self.assertEqual(len(client.request('messages', bot='Bob.ask')['result']['messages']), 1)
+        plain = client.request('fork', source='Bob', bot='Bob.plain', request_id='plain')['result']
+        late = client.request('fork', source='Bob', bot='Bob.plain', request_id='plain',
+                              submit=dict(request_id='plain.1', prompt='p', delivery='steer'))
+        self.assertEqual(late['error'], 'idempotency_conflict')
+        self.assertEqual(client.request('messages', bot='Bob.plain')['result']['messages'], [])
+        client.request('delete', bot='Bob.plain', bot_id=plain['bot_id'])
         # A message the store refuses leaves no fork.
         refused = client.request('fork', source='Bob', bot='Bob.none', request_id='none',
                                  submit=dict(request_id='none.1', prompt='p', delivery='reject',
