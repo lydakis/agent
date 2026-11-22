@@ -10,7 +10,7 @@ Sonny is a terminal workspace built on [Agent](../README.md) for supervising **s
 - **Calm, uncluttered terminal UI.** The default **words-only** view hides noisy tool churn (toggle `/verbose` whenever you want details). Structured **decision cards** show options, recommendations, and optional deadlines; `/zen` focuses on one topic; `/side` forks a quick side question mid-turn without interrupting work.
 - **Safe autonomy out of the box.** Leads and tasks start in **Auto** mode: sandboxed to their folder, with a model reviewer evaluating escalations and handing uncertain calls to you. `/pause` stops every agent across every project immediately.
 - **Event-driven, not polled.** The [Lookout](../docs/LOOKOUT.md) streams task updates and external sources (CI, PRs, chat, commons, memory) into leads via filters, digests, and instant steers—zero polling loops.
-- **Compounds across sessions and machines.** Built-in [shared memory, skills, commons & self-claimed boards, OS-scheduled automations, code-mode MCP (`exec`), JS workflows, browser/desktop tools, and `sonny link`](../docs/SONNY.md) to borrow your laptop's signed-in browser or MCP servers from a remote devbox.
+- **Compounds across sessions and machines.** Built-in [shared memory, skills, commons & boards agents take work from, OS-scheduled automations, code-mode MCP (`exec`), JS workflows, browser/desktop tools, and `sonny link`](../docs/SONNY.md) to borrow your laptop's signed-in browser or MCP servers from a remote devbox.
 - **Works where you work.** Standalone terminal, multiplexer layouts (Rex, Herdr, cmux), or inside T3 Code and any ACP client (`sonny acp`).
 
 <p align="center">
@@ -109,7 +109,7 @@ Sonny extends Agent with background companions and shared tools—read [docs/SON
 
 - **Lookout:** Event-driven pipe delivering task updates and external sources (chat, CI, PRs, email pollers, commons, memory, linked machines) with EventBridge-style filters, digests, and instant steers.
 - **Shared memory & skills:** Facts saved in `~/.agents/memory` are shared across worktrees and maintained by nightly cleanup; shipped skills live in `~/.agents/skills` and preserve your edits across upgrades.
-- **Commons & boards:** Cross-project discussion threads (`/commons`) and self-claimed task boards where multiple agents coordinate work.
+- **Commons & boards:** Cross-project discussion threads (`/commons`) and boards in the commons where a task's agents take work, and are told when they hold it quietly or leave it open.
 - **Automations:** Cron, interval, file-watch, and git-commit triggers run by one OS scheduler (`launchd` / `systemd`), costing zero model calls when idle or skipped by an `--if` gate.
 - **Code-mode MCP (`exec`) & workflows:** Agents call your MCP servers (and built-in tools) inside a sandboxed QuickJS script (`exec`) with per-call approvals, or orchestrate multi-agent JS pipelines (`workflow`).
 - **Browser, desktop, and remote links:** Pinned `agent-browser` and `agent-desktop` tools, plus `sonny link HOST` so remote devbox agents can use your laptop's signed-in browser, desktop, or local MCP servers over SSH.
