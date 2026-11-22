@@ -99,14 +99,16 @@ pub struct Item {
     /// The agent that took it, by its own name.
     pub holder: Option<String>,
     pub labels: Vec<(String, String)>,
-    /// The agent or profile it is kept for.
-    pub kept_for: Option<String>,
+    /// The agents and profiles it is kept for, as `for` names them.
+    pub kept_for: Vec<String>,
     /// The threads of the items it needs.
     pub needs: Vec<String>,
     /// The closing post's text: a done one's result, a failed one's why.
     pub result: Option<String>,
     /// When its last post was written, in seconds.
     pub at: i64,
+    /// When its holder last wrote in it, in seconds.
+    pub holder_at: Option<i64>,
 }
 
 /// The item a thread's listing line says, if it is one: `summary` as the
@@ -129,17 +131,15 @@ pub fn item_of(summary: &Value, at: i64) -> Option<Item> {
         state: State::parse(item["state"].as_str()?)?,
         holder: text(&item["holder"]),
         labels,
-        kept_for: (item["for"].as_array())
-            .map(|named| {
-                let named: Vec<&str> = named.iter().filter_map(Value::as_str).collect();
-                named.join(", ")
-            })
-            .filter(|named| !named.is_empty()),
+        kept_for: (item["for"].as_array().into_iter().flatten())
+            .filter_map(|one| one.as_str().map(str::to_owned))
+            .collect(),
         needs: (item["needs"].as_array().into_iter().flatten())
             .filter_map(|need| need.as_str().map(str::to_owned))
             .collect(),
         result: text(&item["result"]),
         at,
+        holder_at: item["holder_at"].as_i64(),
     })
 }
 
@@ -247,6 +247,8 @@ pub fn named(bot: &str, here: &str) -> String {
 pub struct Present {
     pub project: String,
     pub bots: std::collections::HashSet<String>,
+    /// The profiles they were made as.
+    pub profiles: std::collections::HashSet<String>,
 }
 
 impl Present {
@@ -259,6 +261,33 @@ impl Present {
                 .is_some_and(|rest| rest.starts_with('.'))
             && !self.bots.contains(bot)
     }
+
+    /// Whether no agent the window lists may take `item`, open or waiting
+    /// on this project's board and kept for agents or profiles none of
+    /// them is: the lead starts one, or the work waits.
+    pub fn nobody_for(&self, item: &Item) -> bool {
+        matches!(item.state, State::Open | State::Waiting)
+            && !item.kept_for.is_empty()
+            && !self.bots.is_empty()
+            && project_of(&item.board) == self.project
+            && !(item.kept_for.iter()).any(|one| match one.strip_prefix(crate::board::PROFILE) {
+                Some(profile) => self.profiles.contains(profile),
+                None => self.bots.contains(one),
+            })
+    }
+}
+
+/// Whom `item` is kept for, in words: `for profile:reviewer`, and
+/// `nobody eligible` after it when no agent the window lists is.
+fn kept_words(item: &Item, present: &Present) -> Option<String> {
+    if item.kept_for.is_empty() {
+        return None;
+    }
+    let mut said = format!("for {}", item.kept_for.join(", "));
+    if present.nobody_for(item) {
+        said.push_str(", nobody eligible");
+    }
+    Some(said)
 }
 
 /// An item's state in words, with its holder where it has one: `open`,
@@ -389,14 +418,19 @@ pub fn page_row(
             vec![Span::raw(named(holder, here)).fg(Color::Blue)],
             Some(holder.clone()),
         ),
-        _ => match &item.kept_for {
+        _ => match kept_words(item, present) {
             Some(kept) if matches!(item.state, State::Open | State::Waiting) => {
-                (vec![Span::raw(format!("for {kept}")).dim()], None)
+                (vec![Span::raw(kept).dim()], None)
             }
             _ => (Vec::new(), None),
         },
     };
-    let age = age(now - item.at);
+    // Taken work shows when its holder last wrote there.
+    let at = match item.state {
+        State::Taken => item.holder_at.unwrap_or(item.at),
+        _ => item.at,
+    };
+    let age = age(now - at);
     let labels: String = (item.labels.iter())
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
@@ -450,6 +484,24 @@ pub fn page_row(
         }
     }
     (Line::from(spans), named_at)
+}
+
+/// A plain thread's row on its board's page, `width` wide: its title in
+/// the columns an item's mark leaves, and at the right who last wrote and
+/// when, `at`, which stay.
+pub fn plain_row(thread: &Value, at: i64, width: usize, now: i64, here: &str) -> Line<'static> {
+    let by = named(thread["last_by"].as_str().unwrap_or_default(), here);
+    let right = format!("{by} · {}", age(now - at));
+    let room = width.saturating_sub(3 + 2 + right.chars().count());
+    let title = crate::title::cut(thread["title"].as_str().unwrap_or_default(), room);
+    let used = 3 + crate::title::width(&title);
+    let pad = width.saturating_sub(used + right.chars().count()).max(2);
+    Line::from(vec![
+        Span::raw("   "),
+        Span::raw(title),
+        Span::raw(" ".repeat(pad)),
+        Span::raw(right).dim(),
+    ])
 }
 
 /// What hangs under an item's row on its board's page, if anything: what
@@ -609,8 +661,8 @@ pub fn item_head(
         ]),
         (_, state) => parts.push(vec![(Span::raw(state.word()).dim(), None)]),
     }
-    if let Some(kept) = &item.kept_for {
-        parts.push(vec![(Span::raw(format!("for {kept}")).dim(), None)]);
+    if let Some(kept) = kept_words(item, present) {
+        parts.push(vec![(Span::raw(kept).dim(), None)]);
     }
     if !item.needs.is_empty() {
         let mut part = vec![(Span::raw("needs ").dim(), None)];
@@ -1341,6 +1393,7 @@ pub(crate) mod tests {
         view.set_present(Present {
             project: "shop".into(),
             bots: ["shop.lead", "shop.errors-3"].map(str::to_owned).into(),
+            ..Present::default()
         });
         press(&mut view, KeyCode::Down);
         press(&mut view, KeyCode::Enter);
@@ -1360,7 +1413,8 @@ pub(crate) mod tests {
         assert!(
             !Present {
                 project: "shop".into(),
-                bots: ["shop.lead".into()].into()
+                bots: ["shop.lead".into()].into(),
+                ..Present::default()
             }
             .closed("docs.pager")
         );
@@ -1368,10 +1422,83 @@ pub(crate) mod tests {
         assert!(
             !Present {
                 project: "shop".into(),
-                bots: Default::default()
+                ..Present::default()
             }
             .closed("shop.errors-2")
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn work_kept_for_a_profile_nobody_listed_has_says_nobody_is_eligible() {
+        let home = &commons("nobody");
+        let review = (crate::commons::summaries(&crate::commons::dir(home)).into_iter())
+            .find(|(name, _)| name == "review")
+            .and_then(|(_, summary)| item_of(&summary, 0))
+            .unwrap();
+        let mut present = Present {
+            project: "shop".into(),
+            bots: ["shop.lead", "shop.errors-3"].map(str::to_owned).into(),
+            profiles: ["lead", "worker"].map(str::to_owned).into(),
+        };
+        assert!(present.nobody_for(&review));
+        let (row, _) = page_row(&review, 100, 0, "shop", &present);
+        assert!(
+            text(&row).contains("for profile:reviewer, nobody eligible"),
+            "{row:?}"
+        );
+        present.profiles.insert("reviewer".into());
+        assert!(!present.nobody_for(&review));
+        let (row, _) = page_row(&review, 100, 0, "shop", &present);
+        assert!(!text(&row).contains("nobody"), "{row:?}");
+        // Before the window has counted anyone, it says nothing.
+        assert!(!Present::default().nobody_for(&review));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn taken_work_shows_when_its_holder_last_wrote_and_plain_threads_sit_beside_it() {
+        let home = &home("holder-at");
+        add(
+            home,
+            "shop.lead",
+            "shop/x",
+            "store",
+            "Type the store",
+            json!({}),
+        );
+        act(home, "shop.w", "store", "take", "mine");
+        age_by(home, "store", 7200);
+        // Another's post later is not the holder's.
+        send(
+            home,
+            "shop.lead",
+            json!({"reply": {"thread": "store", "text": "how goes?"}}),
+        );
+        send(
+            home,
+            "shop.lead",
+            json!({"post": {"name": "plan", "title": "The plan",
+            "text": "x", "board": "shop/x"}}),
+        );
+        let summary = (crate::commons::summaries(&crate::commons::dir(home)).into_iter())
+            .find(|(name, _)| name == "store")
+            .map(|(_, summary)| summary)
+            .unwrap();
+        let item = item_of(&summary, summary["at"].as_i64().unwrap()).unwrap();
+        let now = item.at;
+        let (row, _) = page_row(&item, 80, now, "shop", &Present::default());
+        assert!(text(&row).ends_with("w · 2h"), "{row:?}");
+        let mut view = View::open(home, "shop".into());
+        assert!(picked(&mut view, 80).contains("shop/x"));
+        press(&mut view, KeyCode::Enter);
+        let lines = card(&mut view, 80);
+        let at = lines.iter().position(|l| l.starts_with("Threads · 1"));
+        let at = at.unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(lines[at + 1].contains("The plan"), "{lines:#?}");
+        // The plain thread is picked and opened as any thread.
+        press(&mut view, KeyCode::Down);
+        assert!(picked(&mut view, 80).contains("The plan"));
         let _ = std::fs::remove_dir_all(home);
     }
 

@@ -1466,6 +1466,8 @@ struct Built {
     counted: u64,
     /// The agents the last count listed, as `status::bots` gives them.
     bots: std::collections::HashSet<String>,
+    /// The profiles they were made as.
+    profiles: std::collections::HashSet<String>,
     /// A mark of each agent's calls waiting on someone, as that count
     /// listed them: an agent whose calls changed is built again.
     held: Option<HashMap<String, u64>>,
@@ -13166,6 +13168,7 @@ impl App {
             };
             if let Some(bots) = &bots {
                 kept_rows.bots = bots.clone();
+                kept_rows.profiles = status::profiles(&all);
             }
             let agents = status::agents(read.title.as_ref().unwrap_or(&read.project), &all);
             // Its counts are the footer's, as `status::counts` gives them.
@@ -15468,6 +15471,7 @@ impl App {
                 view.set_present(board_view::Present {
                     project: project.clone(),
                     bots: self.kept_rows.bots.clone(),
+                    profiles: self.kept_rows.profiles.clone(),
                 });
                 view
             }),
@@ -15601,6 +15605,7 @@ impl App {
             view.set_present(board_view::Present {
                 project: watch.project.clone(),
                 bots: self.kept_rows.bots.clone(),
+                profiles: self.kept_rows.profiles.clone(),
             });
             view.reload();
             watch.read = Instant::now();

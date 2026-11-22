@@ -1454,8 +1454,10 @@ const OPENING: &str = "opening";
 /// an item's, under `item`, as [`crate::board::item`] reads its posts.
 pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
     let text = std::fs::read(path).ok()?;
-    let mut lines =
-        (text.split(|b| *b == b'\n')).filter(|line| !line.iter().all(u8::is_ascii_whitespace));
+    let all: Vec<&[u8]> = (text.split(|b| *b == b'\n'))
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .collect();
+    let mut lines = all.iter().copied();
     let first: Value = serde_json::from_slice(lines.next()?).ok()?;
     let (mut count, mut last) = (1, None);
     // Only a line holding `"do":` can be an action: in a post's text the
@@ -1490,7 +1492,22 @@ pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
     if first["project"].is_string() {
         summary["project"] = first["project"].clone();
     }
-    if let Some(item) = crate::board::item(&actions) {
+    // A plain thread on a board is listed beside its work.
+    if first["board"].is_string() && first["do"].is_null() {
+        summary["board"] = first["board"].clone();
+    }
+    if let Some(mut item) = crate::board::item(&actions) {
+        // When its holder last wrote there, which its board shows: a key
+        // in a post's text has its quotes escaped, so none passes for it.
+        if let Some(holder) = item["holder"].as_str() {
+            let by = format!("\"by\":{}", json!(holder));
+            let wrote = (all.iter().rev())
+                .find(|line| line.windows(by.len()).any(|w| w == by.as_bytes()))
+                .and_then(|line| serde_json::from_slice::<Value>(line).ok());
+            if let Some(at) = wrote.as_ref().and_then(|post| post["at"].as_i64()) {
+                item["holder_at"] = json!(at);
+            }
+        }
         summary["work"] = item;
     }
     // Its first post but its text, which a filter on the listing matches
@@ -2510,6 +2527,8 @@ enum Row {
     Heading(crate::board_view::State),
     /// An item on a board's page, by its place in `items`.
     Item(usize),
+    /// A plain thread on a board's page, by its place in `threads`.
+    Plain(usize),
 }
 
 /// A page over the list: a board, or a thread.
@@ -2757,7 +2776,7 @@ impl View {
             Row::Board(at) => Pick::Board(self.boards[at].name.clone()),
             Row::Fold(_) => Pick::Fold,
             Row::Hung(at) | Row::Item(at) => Pick::Thread(self.items[at].thread.clone()),
-            Row::Thread(at) => Pick::Thread(
+            Row::Thread(at) | Row::Plain(at) => Pick::Thread(
                 self.threads[at]["thread"]
                     .as_str()
                     .unwrap_or_default()
@@ -2834,6 +2853,17 @@ impl View {
                 rows.extend(items.into_iter().map(Row::Item));
             }
         }
+        // Its plain threads beside its work, newest first as listed.
+        rows.extend(
+            (self.threads.iter().enumerate())
+                .filter(|(_, thread)| thread["board"] == name && !self.is_item(thread))
+                .filter(|(_, thread)| {
+                    (finding.as_deref()).is_none_or(|q| {
+                        crate::find::says(q, thread["title"].as_str().unwrap_or(""))
+                    })
+                })
+                .map(|(at, _)| Row::Plain(at)),
+        );
         rows
     }
 
@@ -2995,7 +3025,7 @@ impl View {
         .unwrap_or_default();
         let matches = |row: &Row| match row {
             Row::Board(at) => crate::find::says(&query, &self.boards[*at].name),
-            Row::Hung(_) | Row::Thread(_) | Row::Item(_) => true,
+            Row::Hung(_) | Row::Thread(_) | Row::Item(_) | Row::Plain(_) => true,
             Row::Fold(_) | Row::Heading(_) => false,
         };
         // The pick to the first match, as every find has it.
@@ -3058,7 +3088,7 @@ impl View {
                 let name = self.items[at].thread.clone();
                 self.open_thread_page(name);
             }
-            Row::Thread(at) => {
+            Row::Thread(at) | Row::Plain(at) => {
                 let name = self.threads[at]["thread"]
                     .as_str()
                     .unwrap_or_default()
@@ -3428,7 +3458,7 @@ impl View {
                     card.starts.push(out.len());
                     self.thread_row(&self.threads[*at], pick, width, &mut out);
                 }
-                Row::Heading(_) | Row::Item(_) => {}
+                Row::Heading(_) | Row::Item(_) | Row::Plain(_) => {}
             }
         }
         card.lines = out;
@@ -3539,6 +3569,7 @@ impl View {
             out.push(Line::default());
             out.push(Line::from(format!("no item matches {}", find.query)).dim());
         }
+        let mut plain_heading = false;
         for row in &rows {
             match row {
                 Row::Heading(state) => {
@@ -3582,6 +3613,31 @@ impl View {
                     if let Some(detail) = crate::board_view::page_detail(item, &others, width) {
                         out.push(detail);
                     }
+                }
+                Row::Plain(at) => {
+                    let thread = &self.threads[*at];
+                    if !plain_heading {
+                        plain_heading = true;
+                        let n = rows.iter().filter(|r| matches!(r, Row::Plain(_))).count();
+                        out.push(Line::default());
+                        out.push(Line::from(vec![
+                            Span::raw("Threads").bold(),
+                            Span::raw(format!(" · {n}")).dim(),
+                        ]));
+                    }
+                    if picked == Some(*row) {
+                        card.at = out.len();
+                    }
+                    card.starts.push(out.len());
+                    let at = (thread["thread"].as_str())
+                        .and_then(|name| self.known.get(name))
+                        .map_or(0, |(_, kept)| kept["at"].as_i64().unwrap_or(0));
+                    let mut line =
+                        crate::board_view::plain_row(thread, at, width, now, &self.project);
+                    if picked == Some(*row) {
+                        crate::list::pick(&mut line);
+                    }
+                    out.push(line);
                 }
                 _ => {}
             }
