@@ -87,6 +87,20 @@ fn install_of(exe: &Path) -> Install {
     Install::Other
 }
 
+/// How this Sonny was installed, as a word another machine reads: `brew`,
+/// `nightly`, `tarball`, or `other` for one `sonny upgrade` leaves to how
+/// it was built.
+pub(crate) fn installed() -> &'static str {
+    let me = crate::named::me().ok();
+    let real = me.map(|me| std::fs::canonicalize(&me).unwrap_or(me));
+    match real.as_deref().map(install_of) {
+        Some(Install::Brew { .. }) => "brew",
+        Some(Install::Nightly { .. }) => "nightly",
+        Some(Install::Tarball { .. }) => "tarball",
+        _ => "other",
+    }
+}
+
 /// The version and architecture a release tarball's folder names:
 /// `sonny-VERSION-linux-ARCH`, as install.sh unpacks it.
 pub(crate) fn release_of(name: &str) -> Option<(&str, &str)> {
@@ -544,6 +558,12 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
         println!(
             "Open Sonny windows reopen on {VERSION} as they reconnect, keeping what you typed"
         );
+    }
+    // Linked machines: each brought to this release with this one.
+    if installed {
+        for line in crate::link::upgraded() {
+            println!("{line}");
+        }
     }
     // Sonny's new text set beside the person's edits, which a lead is told
     // of when a window next opens: said here too, by name.

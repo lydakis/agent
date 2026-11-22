@@ -103,6 +103,7 @@
 //! machine = "laptop"            # what the agents there call this machine, its hostname by default
 //! browser_profile = "Default"   # the Chrome profile their shared browser is copied from once, Default by default, or a folder; "" a fresh one each
 //! calls = 16                    # how many of their calls this machine runs at once, 4 per CPU by default
+//! upgrade = true                # the end behind upgrades when the link connects, so both run one release; on by default
 //! [sonny.workflows]             # the workflow tool: a script an agent writes that runs many fresh agents
 //! enabled = false               # agents go without it, on by default
 //! concurrency = 8               # workers one run has going at once; 0, the default, the CPUs less two, at most 16
@@ -910,6 +911,10 @@ pub struct Link {
     /// How many calls of that host's agents this machine runs at once;
     /// unset, four for each of its CPUs.
     pub calls: Option<usize>,
+    /// Whether the two ends keep one release: when the link connects and
+    /// one runs behind the other, it runs `sonny upgrade`. On unless set
+    /// to false.
+    pub upgrade: bool,
 }
 
 /// The Chrome profile a link's browsers start from unless it says.
@@ -1314,6 +1319,7 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
         .ok_or_else(|| format!("{at} must be a table"))?;
     let mut link = Link {
         browser_profile: LINK_BROWSER_PROFILE.to_owned(),
+        upgrade: true,
         ..Link::default()
     };
     for (key, value) in table {
@@ -1329,6 +1335,10 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
                         .ok_or_else(|| format!("{key_at} is a whole number, 1 or more"))?
                         as usize,
                 );
+            }
+            "upgrade" => {
+                link.upgrade =
+                    (value.as_bool()).ok_or_else(|| format!("{key_at} must be true or false"))?
             }
             // "" is a fresh browser, with no profile to start from.
             "browser_profile" => {
@@ -2768,6 +2778,11 @@ mod tests {
         let config = parse("[sonny.links.box]\nhost = \"box\"\ncalls = 2\n").unwrap();
         assert_eq!(config.sonny.links["box"].calls, Some(2));
         assert!(parse("[sonny.links.box]\nhost = \"box\"\ncalls = 0\n").is_err());
+        // Both ends keep one release unless the link says not to.
+        assert!(config.sonny.links["box"].upgrade);
+        let config = parse("[sonny.links.box]\nhost = \"box\"\nupgrade = false\n").unwrap();
+        assert!(!config.sonny.links["box"].upgrade);
+        assert!(parse("[sonny.links.box]\nhost = \"box\"\nupgrade = \"no\"\n").is_err());
     }
 
     #[test]
