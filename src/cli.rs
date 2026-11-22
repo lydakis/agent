@@ -468,8 +468,8 @@ fn print_flags(flags: &str) {
                 "Retry a provider stream with no content this long; default 10m",
             ),
             "--cache-ttl" => (
-                "5m|1h",
-                "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input; default 5m",
+                "5m|1h|12h",
+                "A new bot's prompt-cache lifetime: 1h on Claude bills writes at 2x input, 12h on OpenAI's API (GPT-5.6 and later) at 2.5x; default the provider's own (5m on Claude, 30m on OpenAI)",
             ),
             "--speed" => (
                 "standard|fast|ultrafast",

@@ -51,6 +51,15 @@ def read_body(handler):
         return None
     return body
 
+def lift_instructions(request):
+    """A Responses request sends its bot's instructions as the input's
+    first, developer, message; tests read them as `instructions`, and the
+    input as the history after them."""
+    items = request.get('input')
+    if isinstance(items, list) and items and items[0].get('role') == 'developer':
+        request['instructions'] = items.pop(0)['content'][0]['text']
+    return request
+
 class Model(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -81,7 +90,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             body = read_body(self)
             if body is None:
                 return
-            request = json.loads(body)
+            request = lift_instructions(json.loads(body))
             self.server.requests.put(request)
             if hasattr(self.server, 'bodies'):
                 self.server.bodies.append(body)

@@ -170,7 +170,7 @@ class ResponsesSocketTests(unittest.TestCase):
                             f'http://127.0.0.1:{server.server_address[1]}/v1', family='responses-ws',
                             extra=['--max-connecting', '1'])
             self.addCleanup(client.close)
-            client.request('create', bot='Bob', workspace=directory)
+            client.request('create', bot='Bob', workspace=directory, instructions='Be brief.')
             for prompt in ('hello', 'again'):
                 turn = client.request('submit', bot='Bob', request_id=prompt, prompt=prompt)['result']['message']
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -186,6 +186,13 @@ class ResponsesSocketTests(unittest.TestCase):
             self.assertTrue(all(b['type'] == 'response.create' and 'stream' not in b for b in bodies))
             self.assertEqual([b.get('previous_response_id') for b in bodies],
                              [None, 'resp_1', 'resp_2', 'resp_3', None])
+            # The instructions open the input as a developer message, never
+            # the top-level field, and only a full send carries them.
+            self.assertTrue(all('instructions' not in b for b in bodies))
+            developer = {'role': 'developer', 'content': [{'type': 'input_text', 'text': 'Be brief.'}]}
+            self.assertEqual([b['input'][0] == developer for b in bodies], [True, False, False, False, True])
+            for body in (bodies[0], bodies[4]):
+                body['input'] = body['input'][1:]
             # The first call carries the prompt; each continuation only what is new.
             self.assertEqual(len(bodies[0]['input']), 1)
             self.assertEqual([i.get('type') for i in bodies[1]['input']], ['function_call_output'])

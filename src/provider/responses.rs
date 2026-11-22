@@ -370,22 +370,30 @@ fn parse_completion_with_usage(
 }
 
 /// The speed a response's `service_tier` names: `priority` is fast, as
-/// the request names it; any other tier, `default` among them, standard.
+/// the request names it, and so is `fast`, the name OpenAI gave the tier on
+/// 2026-07-30 (its fast mode guide: GPT-5.6 and earlier still answer
+/// `priority`); any other tier, `default` among them, standard.
 fn served_tier(tier: &str) -> Speed {
     match tier {
-        "priority" => Speed::Fast,
+        "priority" | "fast" => Speed::Fast,
         "ultrafast" => Speed::Ultrafast,
         _ => Speed::Standard,
     }
 }
 
+/// A response's usage. `input_tokens` counts cache reads and writes too;
+/// GPT-5.6 and later bill writes, and report them apart from the reads,
+/// with the part written for twelve hours in its own count (OpenAI's prompt
+/// caching guide, read 2026-11-22; Bedrock reports the same fields).
 fn parse_usage(usage: &Value) -> Usage {
+    let details = &usage["input_tokens_details"];
+    let count = |value: &Value| value.as_u64().unwrap_or(0);
     Usage {
-        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-        cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or(0),
+        input_tokens: count(&usage["input_tokens"]),
+        output_tokens: count(&usage["output_tokens"]),
+        cached_input_tokens: count(&details["cached_tokens"]),
+        cache_write_tokens: count(&details["cache_write_tokens"]),
+        cache_write_1h_tokens: count(&details["cache_write_tokens_details"]["ttl_12h_tokens"]),
         ..Usage::default()
     }
 }
@@ -395,6 +403,29 @@ mod tests {
     use super::*;
     use crate::provider::MAX_CALL_ID;
     use serde_json::json;
+    #[test]
+    fn a_tier_is_read_by_either_name_fast_has_had() {
+        assert_eq!(served_tier("priority"), Speed::Fast);
+        assert_eq!(served_tier("fast"), Speed::Fast);
+        assert_eq!(served_tier("ultrafast"), Speed::Ultrafast);
+        assert_eq!(served_tier("default"), Speed::Standard);
+    }
+    #[test]
+    fn usage_reads_cache_writes_and_their_twelve_hour_part() {
+        let usage = parse_usage(&serde_json::json!({"input_tokens":100,"output_tokens":2,
+            "input_tokens_details":{"cached_tokens":60,"cache_write_tokens":30,
+                "cache_write_tokens_details":{"ttl_30m_tokens":10,"ttl_12h_tokens":20}}}));
+        assert_eq!((usage.input_tokens, usage.cached_input_tokens), (100, 60));
+        assert_eq!(
+            (usage.cache_write_tokens, usage.cache_write_1h_tokens),
+            (30, 20)
+        );
+        let older = parse_usage(&serde_json::json!({"input_tokens":10,"output_tokens":2}));
+        assert_eq!(
+            (older.cache_write_tokens, older.cache_write_1h_tokens),
+            (0, 0)
+        );
+    }
     #[test]
     fn inconsistent_terminal_text_and_duplicate_tool_ids_fail() {
         let text = RawValue::from_string(r#"{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"wrong"}]}]}"#.into()).unwrap();
