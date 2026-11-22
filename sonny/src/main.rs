@@ -20343,16 +20343,18 @@ impl App {
         let placeholder = attach::placeholder(number);
         let replaced = (self.replaced.iter().position(|(at, _)| *at == number))
             .map(|at| self.replaced.remove(at).1);
-        if !(self.input.contains(&placeholder) || self.input.killed().contains(&placeholder))
+        if !self.may_come_back(&placeholder)
             || !(self.pictures.get(number - 1)).is_some_and(Option::is_none)
         {
             return;
         }
         // The daemon takes a message's pictures up to a size together: those
         // of the draft it is in, or of the one Ctrl-Y brings back.
-        let draft = match self.input.contains(&placeholder) {
-            true => &*self.input,
-            false => self.input.killed(),
+        let draft = match self.input.killed().contains(&placeholder)
+            && !self.input.contains(&placeholder)
+        {
+            true => self.input.killed(),
+            false => &*self.input,
         };
         let placed: usize = (self.placed(draft).iter())
             .map(|placed| placed.data.len())
@@ -20386,12 +20388,19 @@ impl App {
     /// Pictures whose placeholders neither the draft nor Ctrl-Y can bring
     /// back, let go.
     fn forget_pictures(&mut self) {
-        for (at, picture) in self.pictures.iter_mut().enumerate() {
-            let placeholder = attach::placeholder(at + 1);
-            if !self.input.contains(&placeholder) && !self.input.killed().contains(&placeholder) {
-                *picture = None;
+        for at in 0..self.pictures.len() {
+            if !self.may_come_back(&attach::placeholder(at + 1)) {
+                self.pictures[at] = None;
             }
         }
+    }
+
+    /// Whether `placeholder` is in the draft, or the draft can get it back:
+    /// with Ctrl-Y, or as words a picture still being read went in place of.
+    fn may_come_back(&self, placeholder: &str) -> bool {
+        self.input.contains(placeholder)
+            || self.input.killed().contains(placeholder)
+            || (self.replaced.iter()).any(|(_, words)| words.contains(placeholder))
     }
 
     /// A reply the bot gave, which `/react` offers until newer ones push
@@ -40703,6 +40712,22 @@ mod tests {
         app.prepare(|| Ok(None));
         app.all_ready().await;
         assert_eq!(&*app.input, "next");
+        // A picture still being read, selected and replaced by one that
+        // never comes: it comes back with its picture.
+        app.discard();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(Some(attach::Picture {
+                media_type: "image/png",
+                data: vec![11],
+            }))
+        });
+        app.input.select(0, app.input.len());
+        app.prepare(|| Ok(None));
+        go.send(()).unwrap();
+        app.all_ready().await;
+        assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
     }
 
     #[tokio::test]
