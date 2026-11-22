@@ -582,7 +582,7 @@ Settings live in `~/.agent/config.toml` (editable via `/config`) and can be over
 | Task tab policy | `[sonny] task_tabs`, `most_task_tabs` | — | `"asked"` (`every`); `32` tabs (`0` = unlimited) |
 | Task worktree retention | `[sonny] task_worktrees` | — | `15` (min `1`; oldest idle clean worktrees pruned) |
 | Decision deadline | `[sonny] ask_wait_minutes` | — | `60` (`0` = always wait) |
-| Away, and back | `[sonny] away_minutes` | — | `30` (`0` = never): minutes without your use of any window or a message through `sonny acp` before every lead is told you are away; it raises only decisions until you are back, then gives the rest in one message |
+| Away, and back | `[sonny] away_minutes` | — | `30` (`0` = never): minutes without your use of any window or a message through `sonny acp` before every lead is told you are away; it raises only decisions until you are back, then gives the rest in one message. On, Sonny starts its scheduler, which tells them, with no automation; a lead the daemon did not answer for is told again each minute |
 | Start daemon at boot | `[sonny] start_at_boot` | — | `false` |
 | External lookout sources | `[sonny.sources.NAME]` | — | `command`, `every`, `digest`, `steer`, `watch`, `wants`, `icon` |
 | Lookout note trailer | `[sonny] lookout_trailer` | — | Default quiet-unless-urgent rule (`""` for none) |

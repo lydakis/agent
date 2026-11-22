@@ -13,8 +13,10 @@
 //! that file once a minute ([`due`]). Once `[sonny] away_minutes` (30 by
 //! default, 0 never) have passed since it was touched, it runs `sonny away`,
 //! which attaches a note to every lead, starting no turn: the person is
-//! away since then. It keeps which leads it told, and since when, in
-//! `~/.agent/sonny/away`. The next use reads that file ([`here`]) and tells
+//! away since then. It keeps which leads it tells, and since when, in
+//! `~/.agent/sonny/away`, written before the first note: a lead the daemon
+//! did not answer for is told again the next minute, under the same request
+//! ID, until every lead answered. The next use reads that file ([`here`]) and tells
 //! those leads the person is back: as a steer to each lead that heard
 //! anything while they were away, which answers with what it kept, and
 //! attached to the rest. Both notes name the absence's start in their
@@ -55,8 +57,10 @@ fn away_file() -> Option<PathBuf> {
 struct Away {
     /// When the person last used Sonny before they went, in ms.
     since_ms: i64,
-    /// The leads told.
+    /// The leads told, or being told.
     leads: Vec<String>,
+    /// Whether every one of them answered for the away note.
+    told: bool,
 }
 
 fn read_away() -> Option<Away> {
@@ -64,6 +68,7 @@ fn read_away() -> Option<Away> {
     let kept: Value = serde_json::from_str(&text).ok()?;
     Some(Away {
         since_ms: kept["since_ms"].as_i64()?,
+        told: kept["told"].as_bool()?,
         leads: (kept["leads"].as_array().into_iter().flatten())
             .filter_map(|lead| lead.as_str().map(str::to_owned))
             .collect(),
@@ -72,7 +77,8 @@ fn read_away() -> Option<Away> {
 
 fn write_away(away: &Away) -> Result<(), String> {
     let file = away_file().ok_or("no HOME")?;
-    let text = json!({"since_ms": away.since_ms, "leads": away.leads}).to_string();
+    let text =
+        json!({"since_ms": away.since_ms, "leads": away.leads, "told": away.told}).to_string();
     let part = file.with_extension(format!("{}.part", std::process::id()));
     std::fs::write(&part, text).map_err(|e| e.to_string())?;
     std::fs::rename(&part, &file).map_err(|e| e.to_string())
@@ -116,11 +122,26 @@ fn is_back(present: Option<i64>, told: Option<i64>) -> bool {
     matches!((present, told), (Some(present), Some(since)) if present > since)
 }
 
+/// Whether some leads are yet to answer for the away note of the absence
+/// the person is still on.
+fn is_unfinished(present: Option<i64>, away: Option<&Away>) -> bool {
+    away.is_some_and(|away| !away.told && present == Some(away.since_ms))
+}
+
+/// Whether `[sonny] away_minutes` is on, as config.toml says now: then
+/// Sonny's scheduler runs, for this, with no automation.
+pub fn on() -> bool {
+    minutes() > 0
+}
+
 /// Whether the scheduler should run `sonny away` now: a stat of two small
 /// files and a read of the config, once a minute.
 pub fn due() -> bool {
-    let (present, told) = (present_ms(), read_away().map(|away| away.since_ms));
-    is_due(present, told, minutes(), ms(SystemTime::now())) || is_back(present, told)
+    let (present, away) = (present_ms(), read_away());
+    let told = away.as_ref().map(|away| away.since_ms);
+    is_due(present, told, minutes(), ms(SystemTime::now()))
+        || is_back(present, told)
+        || is_unfinished(present, away.as_ref())
 }
 
 /// How the away note opens, and the back note.
@@ -204,7 +225,7 @@ async fn send(
 }
 
 /// `sonny away`, run by the scheduler once [`due`]: tell every lead the
-/// person is away, and keep whom it told; or, back since and the leads not
+/// person is away, and keep whom it tells; or, back since and the leads not
 /// told so yet, as when no daemon answered the use that brought them back,
 /// tell them now. A use while the leads are told is a return, told at once.
 pub fn cli() -> i32 {
@@ -237,34 +258,52 @@ async fn tell_away() -> Result<(), String> {
     let client = connect().await?;
     let note = away_note(since_ms);
     let id = format!("sonny-away-{since_ms}");
-    let mut told = Vec::new();
-    for lead in every_lead(&client).await? {
-        let Some(name) = lead["name"].as_str() else {
-            continue;
-        };
-        if send(&client, name, &note, &id, "attach").await.is_ok() {
-            told.push(name.to_owned());
+    let leads = every_lead(&client).await?;
+    let names = leads.iter().filter_map(|lead| lead["name"].as_str());
+    // Kept before the first note, with every lead in it: one the daemon
+    // took but did not answer for still hears the person is back, and one
+    // not told yet is told again next minute.
+    let mut away = Away {
+        since_ms,
+        leads: names.clone().map(str::to_owned).collect(),
+        told: false,
+    };
+    // Told before of this absence, in part: those leads stay in it.
+    if let Some(before) = read_away().filter(|before| before.since_ms == since_ms) {
+        for lead in before.leads {
+            if !away.leads.contains(&lead) {
+                away.leads.push(lead);
+            }
         }
     }
-    let away = Away {
-        since_ms,
-        leads: told,
-    };
     write_away(&away)?;
+    let mut failed = None;
+    for name in names {
+        if let Err(error) = send(&client, name, &note, &id, "attach").await {
+            failed = Some(format!("{name}: {error}"));
+        }
+    }
     // Back while the leads were being told: they hear so now.
     if present_ms().is_some_and(|present| present > since_ms) {
-        tell_back(&client, &away).await?;
+        return tell_back(&client, &away).await;
+    }
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    away.told = true;
+    if read_away().is_some_and(|now| now.since_ms == since_ms) {
+        write_away(&away)?;
     }
     Ok(())
 }
 
 /// Whether `lead` heard anything since `since_ms`: a turn runs, or its
-/// last one began since.
+/// last one began or ended since.
 fn heard_since(lead: &Value, since_ms: i64) -> bool {
     !lead["running_turn"].is_null()
-        || lead["last"]["started_ms"]
-            .as_i64()
-            .is_some_and(|started| started > since_ms)
+        || ["started_ms", "finished_ms"]
+            .iter()
+            .any(|at| lead["last"][at].as_i64().is_some_and(|at| at > since_ms))
 }
 
 /// Tell the leads told of `away` that the person is back: a steer to each
@@ -371,6 +410,23 @@ mod tests {
     }
 
     #[test]
+    fn leads_yet_to_answer_for_the_away_note_are_told_again_until_all_did() {
+        let away = |told| Away {
+            since_ms: AT,
+            leads: vec!["shop.lead".into()],
+            told,
+        };
+        // Still away, some leads not answered for: again.
+        assert!(is_unfinished(Some(AT), Some(&away(false))));
+        // All answered for.
+        assert!(!is_unfinished(Some(AT), Some(&away(true))));
+        // Back: the back note goes instead, to every lead in it.
+        assert!(!is_unfinished(Some(AT + 1), Some(&away(false))));
+        assert!(is_back(Some(AT + 1), Some(AT)));
+        assert!(!is_unfinished(Some(AT), None));
+    }
+
+    #[test]
     fn a_lead_that_heard_anything_while_away_is_steered_the_rest_only_told() {
         let since = AT;
         assert!(heard_since(
@@ -381,8 +437,15 @@ mod tests {
             &json!({"running_turn": null, "last": {"started_ms": since + 1}}),
             since
         ));
+        // Began before they went, and ended while they were away.
+        assert!(heard_since(
+            &json!({"running_turn": null,
+                "last": {"started_ms": since - 1, "finished_ms": since + 1}}),
+            since
+        ));
         assert!(!heard_since(
-            &json!({"running_turn": null, "last": {"started_ms": since - 1}}),
+            &json!({"running_turn": null,
+                "last": {"started_ms": since - 2, "finished_ms": since - 1}}),
             since
         ));
         assert!(!heard_since(

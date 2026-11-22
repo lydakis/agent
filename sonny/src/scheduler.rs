@@ -497,7 +497,8 @@ fn relabel(home: &Path, scheduler: Scheduler, make: impl FnOnce() -> Result<(), 
 /// At Sonny's start: the job under its own label, runs this Sonny, when
 /// it ran one from elsewhere (an install that keeps each version in its
 /// own folder), even while the old one still answers its doorbell; and
-/// the scheduler running, when any trigger is there.
+/// the scheduler running, when any trigger is there or leads are told the
+/// person is away (`[sonny] away_minutes`), which it looks after.
 pub fn at_start() {
     let Ok(places) = Places::home() else {
         return;
@@ -518,7 +519,9 @@ pub fn at_start() {
         .flatten()
         .flatten()
         .any(|e| e.file_name().to_string_lossy().ends_with(".json"));
-    if any && let Err(error) = ring() {
+    if (any || crate::away::on())
+        && let Err(error) = ring()
+    {
         eprintln!("{}", trigger::error_json(&error));
     }
 }
