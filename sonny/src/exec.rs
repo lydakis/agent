@@ -1137,16 +1137,19 @@ async fn run_keeping(
         }
         None => {
             let listed = Value::Array(listed).to_string();
-            let seed = (now_ms() as u32)
+            // Read once: the time recorded is the time the script sees.
+            let now = now_ms();
+            let seed = (now as u32)
                 ^ std::process::id()
                 ^ (ANSWERINGS.fetch_add(1, Ordering::Relaxed) as u32);
             if let Some(journal) = &journal {
+                let _sweeping = journal::sweeping();
                 let kept = kept_shown(journal, &nested, &listed);
                 journal.start(json!({"t": "start", "v": journal::VERSION, "input": input,
-                    "now_ms": now_ms(), "seed": seed, "tools": kept}));
+                    "now_ms": now, "seed": seed, "tools": kept}));
             }
             let shown = Arc::new(nested.clone());
-            (listed, shown, now_ms(), seed, false)
+            (listed, shown, now, seed, false)
         }
     };
     let run = Run {

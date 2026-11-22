@@ -129,6 +129,7 @@ impl Journal {
     /// A journal for a script that starts afresh, or none when the file
     /// cannot be made: the script runs without one, as before journals.
     pub fn begin(path: PathBuf) -> Option<Journal> {
+        let _sweeping = sweeping();
         std::fs::create_dir_all(path.parent()?).ok()?;
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -158,9 +159,14 @@ impl Journal {
         if !lock(&file) {
             return Claim::Held;
         }
-        let Some(replay) = read(&file) else {
+        let Some((replay, whole)) = read(&file) else {
             return Claim::None;
         };
+        // A record cut short goes, so the next is written on a line of its
+        // own.
+        if file.set_len(whole).is_err() {
+            return Claim::None;
+        }
         if replay
             .start
             .as_ref()
@@ -229,19 +235,24 @@ impl Journal {
     }
 }
 
-/// Read a journal. A last line cut short, as a process that died while
-/// writing it leaves, is no record; any other line that does not read
-/// makes the journal unreadable.
-fn read(file: &std::fs::File) -> Option<Replay> {
+/// Read a journal, and how many of its bytes are whole records. A last
+/// line cut short, as a process that died while writing it leaves, is no
+/// record; any other line that does not read makes the journal
+/// unreadable.
+fn read(file: &std::fs::File) -> Option<(Replay, u64)> {
     let mut replay = Replay::default();
-    let mut lines = std::io::BufReader::new(file).lines().peekable();
-    while let Some(line) = lines.next() {
-        let line = line.ok()?;
-        let record: Value = match serde_json::from_str(&line) {
-            Ok(record) => record,
-            Err(_) if lines.peek().is_none() => break,
-            Err(_) => return None,
-        };
+    let mut reader = std::io::BufReader::new(file);
+    let (mut whole, mut line) = (0u64, Vec::new());
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).ok()?;
+        // Every record is written whole with its newline: a line without
+        // one is the last, cut short.
+        if read == 0 || line.last() != Some(&b'\n') {
+            break;
+        }
+        let record: Value = serde_json::from_slice(&line).ok()?;
+        whole += read as u64;
         match record["t"].as_str()? {
             "start" => replay.start = Some(record),
             "call" => {
@@ -273,7 +284,7 @@ fn read(file: &std::fs::File) -> Option<Replay> {
             _ => return None,
         }
     }
-    Some(replay)
+    Some((replay, whole))
 }
 
 /// Remove the journal of a call that is answered or let go.
@@ -281,10 +292,23 @@ pub fn forget(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Held while the folder is swept, and while a script's journal begins
+/// and records the tools it is shown, so a sweep never takes a journal
+/// just made or the tools a new one names.
+static SWEEPING: Mutex<()> = Mutex::new(());
+
+pub fn sweeping() -> std::sync::MutexGuard<'static, ()> {
+    SWEEPING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Remove from `folder` the journals of calls no longer waiting, those
 /// `waiting` does not hold, that no host has open; and the tools no
 /// journal left names.
 pub fn sweep(folder: &Path, waiting: &HashSet<(i64, String)>) {
+    // No script begins, nor keeps its tools, while the folder is swept.
+    let _sweeping = sweeping();
     let Ok(entries) = std::fs::read_dir(folder) else {
         return;
     };
@@ -392,6 +416,15 @@ mod tests {
         assert_eq!(replay.results[0].counted.as_deref(), Some("test"));
         assert_eq!(replay.loads, [Some("7".to_owned())]);
         assert!(replay.yielded && replay.end.is_none());
+        drop(replay);
+        // The record cut short is gone, so the next is a line of its own
+        // and the journal reads back again after another stop.
+        again.end(&json!("done"));
+        drop(again);
+        let Claim::Taken(third) = Journal::claim(&at) else {
+            panic!("not taken again");
+        };
+        assert_eq!(third.replay.lock().unwrap().end, Some(json!("done")));
     }
 
     #[test]
