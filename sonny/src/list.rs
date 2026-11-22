@@ -19,8 +19,8 @@ pub const INDENT: usize = 4;
 /// where in its name the letters typed are.
 pub struct Item {
     pub name: String,
-    /// What the row is, in the person's words, which it leads with before
-    /// its name; empty for none.
+    /// What the row is, in the person's words, which its muted
+    /// description leads with; empty for none.
     pub title: String,
     pub about: String,
     pub current: bool,
@@ -41,7 +41,7 @@ impl Item {
         }
     }
 
-    /// Its title, drawn before its name.
+    /// Its title, drawn first in its muted description.
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
         self
@@ -79,18 +79,6 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
         .max()
         .unwrap_or(0);
     let signed = items.iter().any(|item| item.sign.is_some());
-    // Rows with titles lead with them, in a column as wide as the widest
-    // as far as there is room; what a row is doing gives way first.
-    let lead = 4 + 2 * usize::from(signed);
-    let title_room = width.saturating_sub(lead + wide + 2);
-    let titles = (items.iter())
-        .map(|item| crate::title::cut(&item.title, title_room).width())
-        .max()
-        .unwrap_or(0);
-    let titled = match titles {
-        0 => 0,
-        n => n + 2,
-    };
     let mut out = vec![Line::default()];
     for (at, item) in items.iter().enumerate().skip(first).take(shown) {
         let mark = match item.current {
@@ -101,23 +89,16 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
         // takes two.
         let pad = " ".repeat(wide.saturating_sub(item.name.width()));
         let name = format!("{}{pad}", item.name);
-        let room = width.saturating_sub(mark.width() + titled + wide + 4 + 2 * usize::from(signed));
-        // No room for what it is doing: none of it, not a lone `…`.
-        let about = match item.about.is_empty() || room < 2 {
-            true => String::new(),
-            false => format!("  {}", crate::transcript::cut(&item.about, room)),
+        let room = width.saturating_sub(mark.width() + wide + 4 + 2 * usize::from(signed));
+        let about = match described(&item.title, &item.about, room) {
+            about if about.is_empty() => about,
+            about => format!("  {about}"),
         };
         let picked = at == pick;
         let mut row = vec![Span::raw(mark)];
         if signed {
             row.push(item.sign.clone().unwrap_or_else(|| Span::raw(" ")));
             row.push(Span::raw(" "));
-        }
-        if titled > 0 {
-            let title = crate::title::cut(&item.title, title_room);
-            let pad = " ".repeat(titled - title.width());
-            let title = Span::raw(format!("{title}{pad}"));
-            row.push(if picked { title.reversed() } else { title });
         }
         row.extend(marked(&name, &item.found, picked));
         row.push(match picked {
@@ -127,6 +108,36 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
         out.push(Line::from(row));
     }
     out
+}
+
+/// A row's muted description `room` wide: its title, then what it is
+/// doing. Narrow, the title is cut at a word, then goes, so what it is
+/// doing stays whole; then that is cut; with no room, none of it, not a
+/// lone `…`.
+fn described(title: &str, about: &str, room: usize) -> String {
+    let whole = match (title.is_empty(), about.is_empty()) {
+        (true, _) => about.to_owned(),
+        (false, true) => title.to_owned(),
+        (false, false) => format!("{title} · {about}"),
+    };
+    if whole.width() <= room {
+        return whole;
+    }
+    let after = match about.is_empty() {
+        true => String::new(),
+        false => format!(" · {about}"),
+    };
+    // Kept only while a whole word of it is.
+    let word = title.split(' ').next().unwrap_or("").width();
+    let title = room
+        .checked_sub(after.width())
+        .filter(|room| !title.is_empty() && *room > word)
+        .map(|room| crate::title::cut(title, room));
+    match title {
+        Some(title) => format!("{title}{after}"),
+        None if about.is_empty() || room < 2 => String::new(),
+        None => crate::transcript::cut(about, room),
+    }
 }
 
 /// `line`, a row of a list in the pane, drawn as the picker draws its
@@ -402,14 +413,15 @@ mod tests {
     use ratatui::style::{Color, Modifier, Stylize};
 
     #[test]
-    fn a_row_with_a_title_leads_with_it_and_what_it_does_gives_way_first() {
+    fn a_row_leads_with_its_name_its_title_muted_first_in_what_it_is() {
         let items = [
-            Item::new("tally.lead", "")
-                .title("Tally invoices")
-                .sign(Span::raw("○")),
+            Item::new("tally.lead", "").sign(Span::raw("○")),
             Item::new("tally.halves", "working")
                 .title("Round half cents to even")
                 .sign(Span::raw("●")),
+            Item::new("tally.sums", "")
+                .title("Check the totals")
+                .sign(Span::raw("○")),
             Item::new("notes", "interrupted · ~/notes").sign(Span::raw("■")),
         ];
         let text = |width: usize| -> Vec<String> {
@@ -418,19 +430,26 @@ mod tests {
                 .collect()
         };
         let wide = text(80);
-        assert_eq!(wide[1], "    ○ Tally invoices            tally.lead");
+        // No column of titles: every name starts where the others do.
+        assert_eq!(wide[1], "    ○ tally.lead");
         assert_eq!(
             wide[2],
-            "    ● Round half cents to even  tally.halves  working"
+            "    ● tally.halves  Round half cents to even · working"
         );
-        assert_eq!(
-            wide[3],
-            "    ■                           notes         interrupted · ~/notes"
-        );
-        // Narrow: what it does gives way, then the title is cut at a word.
-        assert_eq!(text(44)[2], "    ● Round half cents to even  tally.halves");
-        assert_eq!(text(36)[2], "    ● Round half…     tally.halves");
-        // No room for a word of it: no title, and the name whole.
+        assert_eq!(wide[3], "    ○ tally.sums    Check the totals");
+        assert_eq!(wide[4], "    ■ notes         interrupted · ~/notes");
+        // The title is muted, as what it is doing is.
+        let row = &lines(&items, 0, 80, 10)[2];
+        let muted = row.spans.last().unwrap();
+        assert_eq!(muted.content, "  Round half cents to even · working");
+        assert!(muted.style.add_modifier.contains(Modifier::DIM));
+        // Narrow: the title is cut at a word, what it is doing kept whole.
+        assert_eq!(text(48)[2], "    ● tally.halves  Round half… · working");
+        // No room for a word of it: no title, what it is doing kept.
+        assert_eq!(text(36)[2], "    ● tally.halves  working");
+        assert_eq!(text(36)[3], "    ○ tally.sums    Check the…");
+        // Then that gives way, and the name stays whole.
+        assert_eq!(text(28)[2], "    ● tally.halves  worki…");
         assert_eq!(text(21)[2], "    ● tally.halves");
     }
 

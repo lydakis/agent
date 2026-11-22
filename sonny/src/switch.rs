@@ -4,17 +4,19 @@
 //! other projects' leads, then the rest; the one this window is marked, and
 //! the one beside the conversation is picked to start. Like Claude Code's
 //! and Codex's `/resume`, one list to search rather than a command for each
-//! kind of agent; `/new` makes one.
+//! kind of agent; `/new` makes one. Each row leads with the agent's name,
+//! a task's title muted after it with what it is doing.
 use crate::fuzzy::Picks;
 use serde_json::Value;
 
 /// One agent, as listed.
 pub struct Agent {
     pub name: String,
-    /// What its work is, in the person's words, which its row leads with;
-    /// empty for one with none.
+    /// What its work is, in the person's words: a task's title, which its
+    /// muted description leads with, before what it is doing; empty for
+    /// one with none. Its row leads with its name.
     pub title: String,
-    /// What it is doing and where, muted beside its name.
+    /// What it is doing and where, muted beside its name after its title.
     pub about: String,
     /// Its state, as the state table names it.
     pub state: String,
@@ -341,6 +343,48 @@ mod tests {
         // Back to nothing typed, the agent beside again.
         picker.narrow(String::new());
         assert_eq!(picker.chosen().as_deref(), Some("shop.fix"));
+    }
+
+    #[test]
+    fn a_task_s_title_is_muted_after_its_name_and_never_found_by() {
+        let titled = |bot: &Value| {
+            (bot["name"] == "shop.fix").then(|| "Round half cents to even".to_owned())
+        };
+        let mut picker = Picker::new(
+            &bots(),
+            |_| false,
+            titled,
+            "shop.lead",
+            Some("shop"),
+            "/w/shop",
+            None,
+            Picks::default(),
+        );
+        let items: Vec<crate::list::Item> = (picker.rows().into_iter())
+            .map(|(agent, found)| {
+                crate::list::Item::new(agent.name.clone(), agent.about.clone())
+                    .title(agent.title.clone())
+                    .sign(crate::status::sign(&agent.state))
+                    .current(agent.name == picker.current)
+                    .found(&found)
+            })
+            .collect();
+        let rows: Vec<String> = (crate::list::lines(&items, 0, 80, 10).iter().skip(1))
+            .map(|line| line.to_string())
+            .collect();
+        // Every agent is listed, each row leading with its name: no blank
+        // column before the names of the lead and the helpers.
+        assert_eq!(rows.len(), 7);
+        for (row, (agent, _)) in rows.iter().zip(picker.rows()) {
+            let past_sign: String = row.chars().skip(6).collect();
+            assert_eq!(past_sign.split(' ').next(), Some(agent.name.as_str()));
+        }
+        assert!(rows[4].ends_with("shop.fix       Round half cents to even · working"));
+        // Typing finds by name only, never by a word of the title.
+        picker.narrow("halves".into());
+        assert!(names(&picker).is_empty());
+        picker.narrow("fix".into());
+        assert_eq!(names(&picker), ["shop.fix"]);
     }
 
     #[test]
