@@ -2713,6 +2713,16 @@ impl Lookout {
 
     /// The subscriptions whose rules hear `event`, whoever wrote it.
     fn hearers(&self, event: &sources::Event) -> Vec<&subs::Sub> {
+        // A follow's own word that it went quiet is its alone, whatever
+        // its filter, however often what is held is heard again.
+        if event.lookout
+            && let Some(follow) = event.fields["follow"].as_str()
+            && event.fields["quiet"].is_string()
+        {
+            return (self.subs.iter())
+                .filter(|sub| sub.name == follow && sub.quiet.is_some())
+                .collect();
+        }
         let task = match event.source == activity::SOURCE && !event.lookout {
             true => Some(event.topic.as_deref().unwrap_or_default()),
             false => None,
@@ -2789,7 +2799,8 @@ impl Lookout {
                 steer_by: None,
                 digest: None,
                 fields: Arc::new(fields),
-                lookout: false,
+                // The lookout's own word, which only this follow hears.
+                lookout: true,
                 at_ms,
                 seq: sources::next_seq(),
             };
@@ -5377,6 +5388,28 @@ mod tests {
             lookout.heard[2].event.details.as_deref(),
             Some("(you hold this)")
         );
+    }
+
+    /// A quiet alert is its follow's, through any filter, when what waits
+    /// is heard again, as a change of follows has it, and kept and read
+    /// back so.
+    #[test]
+    fn a_quiet_alert_stays_its_follows_when_heard_again() {
+        let mut lookout = lookout();
+        let mut held = hears("held");
+        held.sources = vec!["ci".into()];
+        held.filter = Some(json!({"branch": ["main"]}));
+        held.quiet = Some("15m".into());
+        let mut other = hears("other");
+        other.sources = vec!["ci".into()];
+        lookout.resubscribed(vec![held, other]);
+        lookout.quiet_check(Instant::now() + Duration::from_secs(15 * 60 + 1));
+        assert_eq!(lookout.heard.len(), 1);
+        let kept = lookout.heard[0].event.to_json();
+        lookout.heard[0].event = sources::Event::from_json(&kept).unwrap();
+        lookout.rehear();
+        assert_eq!(lookout.heard.len(), 1);
+        assert_eq!(lookout.heard[0].subs, ["held"]);
     }
 
     /// A bot first seated with a quiet follow watches for silence from

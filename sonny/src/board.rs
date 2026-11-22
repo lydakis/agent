@@ -903,10 +903,14 @@ pub fn reply(
     {
         ask_for.push(thread.to_owned());
     }
-    // A live holder another drops it from hears of it.
+    // A holder another drops it from, or takes it over from once closed,
+    // follows it as one that posted there, no longer as its holder.
     let dropped_from = match (action, &current) {
         (Some("drop"), Some(it)) if it["holder"] != caller.name => {
             Some(json!({"name": it["holder"], "id": it["holder_id"]}))
+        }
+        (Some("take"), _) if post["took_from"].is_string() => {
+            Some(json!({"name": post["took_from"], "id": post["took_from_id"]}))
         }
         _ => None,
     };
@@ -1293,6 +1297,8 @@ mod tests {
         assert_eq!(took["work"]["holder"], "shop.w2");
         let posts = commons::posts(&commons::dir(&home).join("store.jsonl")).unwrap();
         assert_eq!(posts.last().unwrap()["took_from"], "shop.w1");
+        // The closed holder follows it as one that posted there.
+        assert_eq!(took["dropped_from"]["name"], "shop.w1");
         let _ = std::fs::remove_dir_all(&home);
     }
 

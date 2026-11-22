@@ -1018,6 +1018,27 @@ pub fn eligible(work: &Value, live: &[Value], but: &str) -> Vec<(String, Option<
         .collect()
 }
 
+/// The project of `name`'s line: the one the lead it leads to leads, by
+/// who made each agent, as a call's line is read; else, led by no lead,
+/// its name up to the first dot.
+async fn project_by_line(client: &agent_client::Client, name: &str) -> String {
+    let mut at = name.to_owned();
+    for _ in 0..256 {
+        let Ok(mut record) = client.request("inspect", json!({"bot": at})).await else {
+            break;
+        };
+        record["name"] = json!(at);
+        if crate::project::is_lead_record(&record) {
+            return crate::served::project_of(&at);
+        }
+        match record["created_by"].as_str() {
+            Some(by) => at = by.to_owned(),
+            None => break,
+        }
+    }
+    crate::served::project_of(name)
+}
+
 /// The live agents of `project`, as the daemon lists them: name, id and
 /// profile.
 async fn live_in(client: &agent_client::Client, project: &str) -> Vec<Value> {
@@ -1094,7 +1115,14 @@ pub async fn ask_for(home: &Path, store: &Path, threads: &[String], author: &str
             let live = live_in(&client, &project).await;
             projects.insert(project.clone(), live);
         }
-        let named = eligible(&work, &projects[&project], author);
+        // Named like the project is not of it: shop.web.review is
+        // shop.web's, by the lead its line leads to.
+        let mut named = Vec::new();
+        for (name, id) in eligible(&work, &projects[&project], author) {
+            if project_by_line(&client, &name).await == project {
+                named.push((name, id));
+            }
+        }
         if named.is_empty() {
             said.push(json!({"thread": thread, "nobody_eligible": work["for"]}));
             continue;
@@ -4687,6 +4715,24 @@ mod tests {
         assert!(kept_for(&home, "shop", "shop.w.1", Some("worker")).is_empty());
         assert!(kept_for(&home, "docs", "docs.r.1", Some("reviewer")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An agent's project is its lead's, not its name's first part: a
+    /// project named inside another's name keeps its own agents.
+    #[tokio::test]
+    async fn an_agent_belongs_to_the_project_its_line_leads_to() {
+        let client = crate::tests::daemon_answering(|request| match request["bot"].as_str() {
+            Some("shop.web.review") => json!({"created_by": "shop.web.lead"}),
+            Some("shop.w1") => json!({"created_by": "shop.lead"}),
+            Some("shop.lead" | "shop.web.lead") => json!({}),
+            _ => json!({}),
+        })
+        .await;
+        assert_eq!(
+            project_by_line(&client, "shop.web.review").await,
+            "shop.web"
+        );
+        assert_eq!(project_by_line(&client, "shop.w1").await, "shop");
     }
 
     /// A task started with no profile is made as the default one: what
