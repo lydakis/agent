@@ -1849,7 +1849,7 @@ Error codes: `not_connected` (asleep/offline), `tool_outcome_unknown` (link drop
 
 ### Upgrading linked machines
 
-Upgrade either machine and the other follows. Each end says its build as the link connects, and the one behind runs `sonny upgrade`: the linked machine runs it on the host over SSH, or on itself. An upgrade on the host ends its link sessions, so the linked machine dials onto the new build within seconds and catches up; one asleep catches up when it next connects. `sonny link` shows both builds while they differ and how the upgrade went (its output is in `~/.agent/sonny/links/NAME.upgrade.log`). A failed upgrade is not retried for the same pair of builds; one that left them apart, such as a release Homebrew does not have yet, is retried within the hour. Builds made by hand are left alone. `upgrade = false` turns it off.
+Upgrade either machine and the other follows. Each end says its build as the link connects, and the one behind runs `sonny upgrade`: the linked machine runs it on the host over SSH, or on itself. A link session on the host ends once another Sonny is installed there, however it was installed (`sonny upgrade`, `brew upgrade`, install.sh), so the linked machine dials onto the new build within seconds and catches up; one asleep catches up when it next connects. `sonny link` shows both builds while they differ and how the upgrade went (its output is in `~/.agent/sonny/links/NAME.upgrade.log`). A failed upgrade is not retried for the same pair of builds; one that left them apart, such as a release Homebrew does not have yet, is retried within the hour. Builds made by hand are left alone. `upgrade = false` turns it off.
 
 <details>
 <summary><strong>Full details: links</strong></summary>

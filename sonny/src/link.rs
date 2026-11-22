@@ -936,6 +936,8 @@ async fn serve(machine: String) -> Result<(), String> {
     let dir = here().ok_or("HOME is not set")?;
     private(&dir).map_err(|e| e.to_string())?;
     private(&dir.join(".proof")).map_err(|e| e.to_string())?;
+    // The program this session runs, so one installed over it is seen.
+    crate::update::note_started();
     let path = dir.join(format!("{machine}.sock"));
     // One left by a session that ended unseen.
     let _ = std::fs::remove_file(&path);
@@ -1012,11 +1014,16 @@ async fn serve(machine: String) -> Result<(), String> {
                 }
             }
             _ = tick.tick() => {
-                // Quiet too long, as a lender asleep; or another session's
-                // socket in this one's place.
+                // Quiet too long, as a lender asleep; another session's
+                // socket in this one's place; or another Sonny installed
+                // here since, however (`brew upgrade` by hand too), which
+                // the machine dials again onto, saying the build it runs.
                 let replaced = std::fs::metadata(&path).map(|m| m.ino()).ok() != ours;
                 let quiet = now_ms().saturating_sub(heard.load(Ordering::Relaxed));
-                if quiet >= SILENT.as_millis() as u64 || replaced {
+                if quiet >= SILENT.as_millis() as u64
+                    || replaced
+                    || crate::update::installed_since().is_some()
+                {
                     break;
                 }
             }
