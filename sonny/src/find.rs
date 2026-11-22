@@ -224,17 +224,18 @@ fn end_within(text: &str, room: usize) -> &str {
         guess = at;
     }
     let fits = |at: usize| text[at..].width() <= room;
-    let before = text[..guess].char_indices().next_back().map(|(at, _)| at);
-    if fits(guess) && before.is_some_and(|at| !fits(at)) {
-        return &text[guess..];
-    }
-    // Otherwise the first letter from which the rest fits, halving: a
-    // letter dropped from the front never widens what is left, and a
-    // long joined run measured a few times, not once per letter.
     let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
     let at = |k: usize| starts.get(k).copied().unwrap_or(text.len());
+    let guess = starts.partition_point(|&at| at < guess);
     // From `low` the rest is too wide; from `high` it fits.
     let (mut low, mut high) = (0, starts.len());
+    if fits(at(guess)) && guess > 0 && !fits(at(guess - 1)) {
+        (low, high) = (guess - 1, guess);
+    }
+    // Otherwise the first letter from which the rest fits, halving: a
+    // letter dropped from the front mostly leaves the rest as wide or
+    // narrower, and a long joined run is measured a few times, not once
+    // per letter.
     while high - low > 1 {
         let mid = low + (high - low) / 2;
         if fits(at(mid)) {
@@ -243,7 +244,18 @@ fn end_within(text: &str, room: usize) -> &str {
             low = mid;
         }
     }
-    &text[at(high)..]
+    // A letter can draw narrower beside the next than alone (a Khmer
+    // coeng and the consonant under it take no column), so the rest from
+    // a letter or two further back may fit again: those are looked at.
+    let mut first = high;
+    let mut look = high;
+    while look > 0 && first - look < 3 {
+        look -= 1;
+        if fits(at(look)) {
+            first = look;
+        }
+    }
+    &text[at(first)..]
 }
 
 #[cfg(test)]
@@ -381,6 +393,8 @@ mod tests {
             "\u{200b}",
             "x",
             "👩\u{200d}",
+            "\u{1780}\u{17D2}\u{1780}",
+            "\u{17D2}",
         ];
         for length in 0..60 {
             for room in [0, 1, 2, 3, 7, 20] {
@@ -407,6 +421,10 @@ mod tests {
             shown.width()
         );
         assert!(pasted.ends_with(shown));
+        // Khmer: a coeng and the consonant under it take no column, so
+        // the rest from it fits where the rest from the consonant did not.
+        let khmer = "xx\u{17D2}\u{1780}a";
+        assert_eq!(end_within(khmer, 1), "\u{17D2}\u{1780}a");
         // A joined run as long, two columns however long it gets.
         let joined = format!("xx{}👩", "👩\u{200d}".repeat(100_000));
         assert_eq!(end_within(&joined, 2), dropping(&joined, 2));
