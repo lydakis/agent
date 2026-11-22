@@ -406,6 +406,16 @@ pub fn waiting(item: &Value, done: &dyn Fn(&str) -> bool) -> bool {
             .any(|need| !need.as_str().is_some_and(done))
 }
 
+/// Work as every answer and listing shows it: open work with a need not
+/// done says `waiting`, so what an agent is told of work is the same
+/// wherever it is told.
+pub fn shown(dir: &Path, mut item: Value) -> Value {
+    if waiting(&item, &|need: &str| need_done(dir, need)) {
+        item["state"] = json!("waiting");
+    }
+    item
+}
+
 /// Who calls the tool: the agent, the daemon's id for it, whom what it is
 /// shown counts for (as `commons::who` names it), the model it writes
 /// with, the project it is named in, the profile it was made as, and
@@ -657,7 +667,10 @@ pub fn post(dir: &Path, caller: &Caller, given: &Value) -> Result<Value, String>
         post["opened"] = json!([name]);
     }
     let mut said = commons::start_locked(dir, name, title.trim(), &post, caller.reader)?;
-    said["work"] = standing(std::slice::from_ref(&post)).unwrap_or_default();
+    said["work"] = shown(
+        dir,
+        standing(std::slice::from_ref(&post)).unwrap_or_default(),
+    );
     // Open work kept for some asks them to take it.
     if opens && post["for"].is_array() {
         said[ASK_FOR] = json!([name]);
@@ -988,7 +1001,7 @@ pub fn reply(
                 said["needs_made"] = json!(made);
             }
         }
-        said["work"] = work;
+        said["work"] = shown(dir, work);
         if let Some(from) = dropped_from {
             said["dropped_from"] = from;
         }
@@ -1214,7 +1227,7 @@ mod tests {
         // Waiting work canceled and opened again still waits: no one asked.
         lead(act("guide", "fail")).unwrap();
         let reopened = lead(act("guide", "open")).unwrap();
-        assert_eq!(reopened["work"]["state"], "open", "{reopened}");
+        assert_eq!(reopened["work"]["state"], "waiting", "{reopened}");
         assert!(reopened.get(ASK_FOR).is_none(), "{reopened}");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1226,13 +1239,19 @@ mod tests {
         lead(work("store", "Type the store errors", json!({}))).unwrap();
         let api = lead(work("api", "Type the api errors", json!({}))).unwrap();
         assert_eq!(api["work"]["state"], "open");
-        lead(work(
+        let made = lead(work(
             "enum",
             "Remove the old error enum",
             json!({"needs": ["store", "api"]}),
         ))
         .unwrap();
-        // Waiting on two: not open, and no take takes it.
+        // Waiting on two, as its answer, a read and the listing all say:
+        // not open, and no take takes it.
+        assert_eq!(made["work"]["state"], "waiting", "{made}");
+        let read = lead(json!({"read": "enum"})).unwrap();
+        assert_eq!(read["work"]["state"], "waiting", "{read}");
+        let talk = lead(json!({"reply": {"thread": "enum", "text": "Soon."}})).unwrap();
+        assert_eq!(talk["work"]["state"], "waiting", "{talk}");
         let mut open = open_names(&home);
         open.sort();
         assert_eq!(open, ["api", "store"]);
@@ -1800,17 +1819,28 @@ mod tests {
         for n in 0..1000 {
             let board = format!("shop/b{}", n % 50);
             let name = format!("i{n}");
-            let mut post = work(&name, &format!("Fix item {n}"), json!({}));
+            // A third need the work before them on their board, so
+            // answers read whether their needs are done.
+            let needs = match n % 3 == 1 && n >= 50 {
+                true => json!({"needs": [format!("i{}", n - 50)]}),
+                false => json!({}),
+            };
+            let mut post = work(&name, &format!("Fix item {n}"), needs);
             post["post"]["board"] = json!(board);
             lead(post).unwrap();
-            if n % 2 == 0 {
+            if n % 2 == 0 && !(n % 3 == 1 && n >= 50) {
                 lead(act(&name, "take")).unwrap();
             }
-            if n % 10 == 0 {
+            if n % 10 == 0 && !(n % 3 == 1 && n >= 50) {
                 lead(act(&name, "done")).unwrap();
             }
         }
         eprintln!("made 1,000 pieces of work in {:?}", made.elapsed());
+        let read = std::time::Instant::now();
+        for n in (51..1000).step_by(3) {
+            lead(json!({"read": format!("i{n}")})).unwrap();
+        }
+        eprintln!("read the 317 that need work in {:?}", read.elapsed());
         for round in 0..3 {
             let started = std::time::Instant::now();
             let open = lead(json!({"filter": {"board": ["shop/b7"], "state": ["open"]}})).unwrap();
@@ -1920,7 +1950,13 @@ mod tests {
             (news.lines.iter())
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .map(|line| {
-                    let event = line["event"].as_str().unwrap_or_default().to_owned();
+                    let event = match &line["event"] {
+                        Value::Array(events) => (events.iter())
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("+"),
+                        event => event.as_str().unwrap_or_default().to_owned(),
+                    };
                     let topic = line["topic"].as_str().unwrap_or("-").to_owned();
                     (topic, event)
                 })
@@ -1954,13 +1990,24 @@ mod tests {
             .unwrap();
         assert!(done.contains("It opened enum."), "{done}");
         let _ = news.mark_read();
-        // The last work settling empties the board: its own line, on no
-        // thread.
+        // The last work settling empties the board: said once, in the
+        // post that settled it, which a filter on either event hears.
         w1(act("enum", "done")).unwrap();
         let news = commons::news(&home, &cursor);
-        let mut said = events(&news);
-        said.sort();
-        assert_eq!(said, pairs(&[("enum", "done"), ("-", "emptied")]));
+        assert_eq!(events(&news), pairs(&[("enum", "done+emptied")]));
+        let line: Value = serde_json::from_str(&news.lines[0]).unwrap();
+        assert!(
+            (line["text"].as_str().unwrap())
+                .ends_with("\nshop/errors holds no open or taken work now."),
+            "{line}"
+        );
+        for event in ["done", "emptied"] {
+            let filter = json!({"board": ["shop/errors"], "event": [event]});
+            assert!(
+                crate::lookout::pattern::matches(&filter, &line),
+                "{event}: {line}"
+            );
+        }
         let _ = news.mark_read();
         // Held work with no post for hold_quiet goes quiet, once.
         lead(work("api", "Type the api errors", json!({}))).unwrap();

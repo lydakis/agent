@@ -1267,7 +1267,7 @@ pub(crate) fn add_locked(
     // Its work as it stands, which a reply moving nothing leaves as it was,
     // so its holder still follows it as its holder.
     if let Some(work) = crate::board::standing(&earlier) {
-        said["work"] = work;
+        said["work"] = crate::board::shown(dir, work);
     }
     Ok(said)
 }
@@ -1407,7 +1407,7 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
         .collect();
     let mut shown = json!({"thread": name, "title": title, "posts": shown});
     if let Some(item) = crate::board::standing(&posts) {
-        shown["work"] = item;
+        shown["work"] = crate::board::shown(dir, item);
     }
     Ok(shown)
 }
@@ -1761,17 +1761,7 @@ fn search(
         let mut whole = true;
         // An item's posts each show where it stands, as the listing's
         // first post does, waiting while a need is not done.
-        let mut item = crate::board::standing(&posts);
-        if let Some(item) = &mut item {
-            let done = |need: &str| {
-                (crate::commons::posts(&dir.join(format!("{need}.jsonl"))).ok())
-                    .and_then(|posts| crate::board::standing(&posts))
-                    .is_some_and(|it| it["state"] == "done")
-            };
-            if crate::board::waiting(item, &done) {
-                item["state"] = json!("waiting");
-            }
-        }
+        let item = crate::board::standing(&posts).map(|item| crate::board::shown(dir, item));
         let seen = |post: &Value| match (&item, post) {
             (Some(Value::Object(item)), Value::Object(fields)) => {
                 // The post's own fields stand, by being who wrote it, but
@@ -2257,15 +2247,27 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             if !others.is_empty() {
                 text.push_str(&format!("\nIt opened {}.", others.join(", ")));
             }
+            // The board's last work settling is said once, in the post that
+            // settled it: one note, not the post and then the board.
+            let emptied = post["emptied"].as_str();
+            if let Some(emptied) = emptied {
+                text.push_str(&format!("\n{emptied} holds no open or taken work now."));
+            }
             let mut line = json!({"id": format!("{thread}/{n}"), "topic": thread, "text": text});
             if let Some(by) = post["by"].as_str() {
                 line["from"] = json!(by);
             }
             // Where a board's follow hears it, what it did, and the items
             // it opened, which a worker's follow is steered by.
+            // Settling the board's last work, it is `emptied` as well, so
+            // a filter on either event hears it.
             if let Some(board) = &board {
+                let event = crate::board::event_of(&posts, n, &thread);
                 line["board"] = json!(board);
-                line["event"] = json!(crate::board::event_of(&posts, n, &thread));
+                line["event"] = match emptied {
+                    Some(_) => json!([event, "emptied"]),
+                    None => json!(event),
+                };
             }
             for key in ["do", "opened"] {
                 if !post[key].is_null() {
@@ -2273,17 +2275,6 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 }
             }
             lines.push(line.to_string());
-            // The board's last work settling: the board's own news, on no
-            // thread, so the thread's followers hear the post alone.
-            if let Some(emptied) = post["emptied"].as_str() {
-                let mut line = json!({"id": format!("{thread}/{n}/emptied"), "board": emptied,
-                    "event": "emptied",
-                    "text": format!("{emptied} holds no open or taken work now: {thread} settled last.")});
-                if let Some(by) = post["by"].as_str() {
-                    line["from"] = json!(by);
-                }
-                lines.push(line.to_string());
-            }
         }
         let mut kept = json!({"posts": posts.len(), "bytes": bytes});
         // Work held, kept to tell its board once it goes quiet.

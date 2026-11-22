@@ -1088,7 +1088,8 @@ never an edit, so a thread is the work's whole story, and where it stands
 is read from its posts each time (`board::standing`), never kept beside them.
 The listing reads only a thread's lines that hold `"do":`, which no post's
 text can (its quotes are escaped), and only for a thread whose file
-changed. Work waits while one of its needs is not done (`board::waiting`);
+changed. Work waits while one of its needs is not done (`board::waiting`),
+and every answer, read and listing says so (`board::shown`);
 finishing the last one opens it, and the `done` post names it under
 `opened`. Only the agents of a board's project open, take or change its
 work; anyone reads it and replies in its threads, talk that moves nothing.
@@ -1123,7 +1124,9 @@ take this work`, `you posted here`), and they end with the agent. Opening
 or taking work, or starting or working in a task on a board, follows the
 board (`board.NAME`, the commons source filtered on the board and on the
 events `opened`, `taken`, `dropped`, `done`, `failed`, `canceled`,
-`posted`, `emptied` and `quiet`). `subs::put` replaces a follow whose
+`posted`, `emptied` and `quiet`; the post that settles the board's last
+work is one line for both, its `event` `[done, emptied]` or the like).
+`subs::put` replaces a follow whose
 rules differ. `@NAME` of a live agent in a post or a reply tells that
 agent once and follows nothing.
 
