@@ -51,6 +51,10 @@ pub struct View {
     at: Option<Instant>,
     /// The row ↑ and ↓ picked, by its place in the list.
     pub pick: Option<usize>,
+    /// `ctrl+f`: what is typed narrows the rows read to those that say
+    /// it, and the pick as it was, which `esc` puts back. It reads
+    /// nothing: the rows are the last read's.
+    finding: Option<crate::find::Find<Option<usize>>>,
 }
 
 /// The value at `at` among `values`, none past them.
@@ -70,6 +74,7 @@ impl View {
             error: None,
             at: None,
             pick: None,
+            finding: None,
         }
     }
 
@@ -103,15 +108,84 @@ impl View {
             Ok(page) => {
                 self.error = None;
                 self.rows = page["rows"].as_array().cloned().unwrap_or_default();
-                // With rows, one is always picked: the first to start.
+                // With rows, one is always picked: the first to start; while
+                // finding, one that says what is typed.
                 self.pick = (!self.rows.is_empty())
                     .then(|| self.pick.unwrap_or(0).min(self.rows.len() - 1));
+                if self.pick.is_some_and(|at| !self.shown(at)) {
+                    self.pick = self.shown_rows().first().copied();
+                }
             }
             Err(error) => self.error = Some(error),
         }
     }
 
+    /// Whether the row at `at` says what is typed to find, in the words
+    /// it is drawn with: every row before anything is typed.
+    fn shown(&self, at: usize) -> bool {
+        let Some(find) = self.finding.as_ref().filter(|find| find.typed()) else {
+            return true;
+        };
+        let Some(row) = self.rows.get(at) else {
+            return false;
+        };
+        let name = self.name(row["bot"].as_str().unwrap_or("?"));
+        find.says(&line(row, &name, name.width(), usize::MAX / 2, false).to_string())
+    }
+
+    /// The rows shown, by their place in the list.
+    fn shown_rows(&self) -> Vec<usize> {
+        (0..self.rows.len()).filter(|at| self.shown(*at)).collect()
+    }
+
+    /// Whether a find is under way.
+    pub fn finding(&self) -> bool {
+        self.finding.is_some()
+    }
+
+    /// The find field, while finding: how many calls say what is typed,
+    /// of how many were read.
+    pub fn field(&self) -> Option<crate::find::Field> {
+        let find = self.finding.as_ref()?;
+        let left = self.shown_rows().len();
+        Some(crate::find::Field::rows(&find.query, left, self.rows.len()))
+    }
+
+    /// Words pasted while finding, as if typed: whether a find took them.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(find) = &mut self.finding else {
+            return false;
+        };
+        find.paste(text);
+        self.pick = self.shown_rows().first().copied();
+        true
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> Key {
+        // `ctrl+f`: what is typed narrows the rows, the pick on the first
+        // that says it; `esc` drops the find and puts the pick back. The
+        // arrows and `enter` stay the list's.
+        if let Some(find) = &mut self.finding {
+            match find.key(&key) {
+                crate::find::Typed::Dropped => {
+                    self.pick = (self.finding.take())
+                        .and_then(|find| find.before)
+                        .or(self.pick)
+                        .map(|at| at.min(self.rows.len().saturating_sub(1)))
+                        .filter(|_| !self.rows.is_empty());
+                    return Key::Stay;
+                }
+                crate::find::Typed::Changed => {
+                    self.pick = self.shown_rows().first().copied();
+                    return Key::Stay;
+                }
+                crate::find::Typed::Held => return Key::Stay,
+                crate::find::Typed::Other => {}
+            }
+        } else if crate::find::opens(&key) {
+            self.finding = Some(crate::find::Find::new(self.pick));
+            return Key::Stay;
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
@@ -125,18 +199,29 @@ impl View {
         match key.code {
             KeyCode::Esc => return Key::Close,
             KeyCode::Enter => {
-                return match self.pick.and_then(|at| self.rows.get(at)) {
+                let picked = self.pick.filter(|at| self.shown(*at));
+                return match picked.and_then(|at| self.rows.get(at)) {
                     Some(row) => Key::Open(row["bot"].as_str().unwrap_or_default().to_owned()),
+                    // A find that keeps nothing picks nothing to open.
+                    None if self.finding.is_some() => Key::Stay,
                     None => Key::Close,
                 };
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.pick = Some(self.pick.map_or(0, |at| at.saturating_sub(1)));
-                return Key::Stay;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let last = self.rows.len().saturating_sub(1);
-                self.pick = Some(self.pick.map_or(0, |at| (at + 1).min(last)));
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('k' | 'j') => {
+                // Among the rows shown.
+                let shown = self.shown_rows();
+                let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
+                let at = self
+                    .pick
+                    .and_then(|pick| shown.iter().position(|at| *at == pick));
+                let next = match (at, down) {
+                    (Some(at), true) => (at + 1).min(shown.len().saturating_sub(1)),
+                    (Some(at), false) => at.saturating_sub(1),
+                    (None, _) => 0,
+                };
+                if let Some(next) = shown.get(next) {
+                    self.pick = Some(*next);
+                }
                 return Key::Stay;
             }
             KeyCode::Char('a') => self.all = !self.all,
@@ -155,20 +240,22 @@ impl View {
     pub fn starts(&self) -> Vec<usize> {
         match self.error {
             Some(_) => Vec::new(),
-            None => (0..self.rows.len()).map(|at| at + 2).collect(),
+            None => (0..self.shown_rows().len()).map(|at| at + 2).collect(),
         }
     }
 
-    /// The row at `at` picked, as a click picks it.
+    /// The row at `at` among those shown picked, as a click picks it.
     pub fn pick_at(&mut self, at: usize) {
-        if at < self.rows.len() {
-            self.pick = Some(at);
+        if let Some(row) = self.shown_rows().get(at) {
+            self.pick = Some(*row);
         }
     }
 
     /// The row of the card the picked call is on, to keep it in view.
     pub fn picked_row(&self) -> Option<usize> {
-        self.pick.map(|at| at + 2)
+        let pick = self.pick?;
+        let at = self.shown_rows().iter().position(|at| *at == pick)?;
+        Some(at + 2)
     }
 
     /// The card at `width`.
@@ -219,12 +306,23 @@ impl View {
             out.push(Line::from("Each tool call an agent makes shows here as it ends.").dim());
             return out;
         }
+        let shown = self.shown_rows();
+        if let Some(find) = self.finding.as_ref().filter(|_| shown.is_empty()) {
+            out.push(Line::from(format!("nothing here matches {}", find.query)).dim());
+            return out;
+        }
         let names: Vec<String> = (self.rows.iter())
             .map(|row| self.name(row["bot"].as_str().unwrap_or("?")))
             .collect();
         let name_width = names.iter().map(|n| n.width()).max().unwrap_or(0).min(20);
-        for (at, (row, name)) in self.rows.iter().zip(&names).enumerate() {
-            out.push(line(row, name, name_width, width, self.pick == Some(at)));
+        for at in shown {
+            out.push(line(
+                &self.rows[at],
+                &names[at],
+                name_width,
+                width,
+                self.pick == Some(at),
+            ));
         }
         out
     }
@@ -239,11 +337,11 @@ impl View {
             .map(|row| self.name(row["bot"].as_str().unwrap_or("?")))
             .collect();
         let name_width = names.iter().map(|n| n.width()).max().unwrap_or(0).min(20);
-        (self.rows.iter().zip(&names).enumerate())
-            .filter_map(|(at, (row, name))| {
-                let bot = row["bot"].as_str()?;
-                let wide = name.width().min(name_width) as u16;
-                Some((2 + at, NAME_AT, NAME_AT + wide, bot.to_owned()))
+        (self.shown_rows().into_iter().enumerate())
+            .filter_map(|(drawn, at)| {
+                let bot = self.rows[at]["bot"].as_str()?;
+                let wide = names[at].width().min(name_width) as u16;
+                Some((2 + drawn, NAME_AT, NAME_AT + wide, bot.to_owned()))
             })
             .collect()
     }
@@ -258,6 +356,14 @@ impl View {
     }
 
     pub fn keys(&self) -> String {
+        // While finding, a letter is typed: the filters' letters are not
+        // listed, and `esc` drops the find first.
+        if self.finding.is_some() {
+            return (crate::hint::Keys::new().pick())
+                .enter(crate::hint::Enter::Open)
+                .esc(crate::hint::Esc::Cancel)
+                .text();
+        }
         let scope = match self.all {
             true => "a this project",
             false => "a every project",
@@ -266,6 +372,7 @@ impl View {
         (crate::hint::Keys::new()
             .pick()
             .enter(crate::hint::Enter::Open))
+        .find()
         .key("t", "kind")
         .key("p", "place")
         .key("w", "who")
