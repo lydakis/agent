@@ -32,7 +32,8 @@ Your final reply reaches whoever waits on your turn.";
 /// rests past five minutes would otherwise send its whole context again
 /// uncached. An hour's writes cost twice the input rate instead of 1.25 times,
 /// and a read a tenth. The daemon keeps five minutes for Bedrock models that
-/// take no hour; Responses providers have no such setting.
+/// take no hour. OpenAI's own longer lifetime, `12h`, is a bot's choice;
+/// clients give it none by default.
 pub fn cache_ttl(model: &str) -> Option<&'static str> {
     let claude = model.starts_with("anthropic/") || model.starts_with("bedrock/");
     claude.then_some("1h")

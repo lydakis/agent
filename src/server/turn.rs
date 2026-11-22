@@ -651,6 +651,7 @@ pub fn shaped<'p>(
     provider.shaped(
         settings.max_output_tokens,
         settings.cache_hour(),
+        settings.cache_half_day(),
         settings.speed(),
         &settings.speeds,
     )
@@ -666,6 +667,7 @@ fn shaped_other<'p>(
     provider.shaped(
         settings.max_output_tokens,
         settings.cache_hour(),
+        settings.cache_half_day(),
         None,
         &agent_runtime::provider::Speeds::default(),
     )

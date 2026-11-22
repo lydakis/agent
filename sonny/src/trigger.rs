@@ -3351,13 +3351,13 @@ pub fn cli(args: &[String]) -> i32 {
 /// An `automations` call: `add` one, or `remove`, `run` or `read` one by
 /// name; with none, a page of the caller's own from `from`, their rows
 /// whole until [`index`] makes each the line the listing shows.
-pub fn tool(arguments: &Value, caller: &Caller) -> Result<Value, String> {
+pub fn tool(arguments: &Value, caller: &Caller, shell: &Shell) -> Result<Value, String> {
     let places = Places::home()?;
     let named = |key: &str| arguments[key].as_str().filter(|name| !name.is_empty());
     let reviewed = Reviewed::of(arguments);
     let reviewed = reviewed.as_ref();
     if let Some(asked) = arguments.get("add") {
-        return add_as(&places, &add_args(asked), true, reviewed);
+        return add_as(&places, &add_args(asked), true, reviewed, shell);
     }
     if let Some(name) = named("remove") {
         return remove_as(&places, name, reviewed).map(|()| json!({"removed": name}));
@@ -3395,6 +3395,34 @@ fn with_scheduler(mut listed: Value) -> Value {
 pub struct Caller {
     pub id: Option<i64>,
     pub store: Option<String>,
+}
+
+/// The agent's shell an automation is added from: its agent, by name and
+/// id, and the folder it works in. A shell's own, from its variables, or
+/// the one a call of Sonny's tool names.
+#[derive(Debug, Clone, Default)]
+pub struct Shell {
+    pub agent: Option<(String, i64)>,
+    pub folder: Option<PathBuf>,
+}
+
+impl Shell {
+    /// This process's: an agent's shell has its agent's name and id.
+    pub fn this() -> Result<Self, String> {
+        let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        let agent = match (env("AGENT_BOT"), env("AGENT_BOT_ID")) {
+            (Some(bot), Some(id)) => Some((
+                bot,
+                id.parse::<i64>()
+                    .map_err(|_| "invalid_automation: AGENT_BOT_ID is not an id")?,
+            )),
+            _ => None,
+        };
+        Ok(Self {
+            agent,
+            folder: std::env::current_dir().ok(),
+        })
+    }
 }
 
 /// The row of the automation `name` when `caller` has a part in it: it
@@ -3752,12 +3780,19 @@ async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
 /// shell's agent with a gate Sonny wrote, as an ask's deadline is: its gate
 /// runs as the person, not in the agent's sandbox, since the agent wrote
 /// none of it.
-pub fn add_sonnys(name: &str, at: &str, gate: &str, message: &str) -> Result<Value, String> {
+pub fn add_sonnys(
+    name: &str,
+    at: &str,
+    gate: &str,
+    message: &str,
+    shell: &Shell,
+) -> Result<Value, String> {
     add_as(
         &Places::home()?,
         &sonnys_args(name, at, gate, message),
         false,
         None,
+        shell,
     )
 }
 
@@ -3769,7 +3804,7 @@ fn sonnys_args(name: &str, at: &str, gate: &str, message: &str) -> Vec<String> {
 }
 
 fn add(places: &Places, args: &[String]) -> Result<Value, String> {
-    add_as(places, args, true, None)
+    add_as(places, args, true, None, &Shell::this()?)
 }
 
 /// [`add`]; `agents_gate` says whether a gate the shell's agent gives is
@@ -3780,18 +3815,11 @@ fn add_as(
     args: &[String],
     agents_gate: bool,
     reviewed: Option<&Reviewed>,
+    from: &Shell,
 ) -> Result<Value, String> {
     let asked = parse_add(args, now())?;
-    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     // The shell's own agent, when it is an agent's shell.
-    let shell = match (env("AGENT_BOT"), env("AGENT_BOT_ID")) {
-        (Some(bot), Some(id)) => Some((
-            bot,
-            id.parse::<i64>()
-                .map_err(|_| "invalid_automation: AGENT_BOT_ID is not an id")?,
-        )),
-        _ => None,
-    };
+    let shell = from.agent.clone();
     // A gate an agent wrote runs in its sandbox, as Codex runs what an
     // agent wrote: one the person or Sonny wrote runs as the person.
     let gate_by = asked.gate.as_ref().map(|_| match (&shell, agents_gate) {
@@ -3802,8 +3830,8 @@ fn add_as(
     if asked.live {
         // Refused now, not at its first fire: one that names a source never
         // set up, or the tasks, would never fill.
-        let here = std::env::current_dir().map_err(|e| e.to_string())?;
-        crate::template::check_message(&asked.message, &here, daemon.store.as_deref())
+        let here = (from.folder.as_deref()).ok_or("live_template: no working folder")?;
+        crate::template::check_message(&asked.message, here, daemon.store.as_deref())
             .map_err(|why| format!("live_template: the message: {why}"))?;
     }
     if let Some(watch) = &asked.when.watch {

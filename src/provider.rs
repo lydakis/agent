@@ -271,7 +271,9 @@ impl Tiers {
 ///   2026-11-10). Bedrock serves Claude at standard speed only.
 /// - OpenAI on an API key: priority on every model Codex's bundled catalog
 ///   gives it (openai/codex 551fc71, models.json), ultrafast on GPT-6.1 Sol
-///   and GPT-6 Astra (OpenAI's pricing page).
+///   and GPT-6 Astra (OpenAI's pricing page), and both on GPT-6.2 Astra and
+///   Sol (OpenAI's fast and ultrafast mode guides, read 2026-11-22).
+///   `priority` still asks for fast, which OpenAI renamed `fast`.
 /// - The ChatGPT sign-in: what Codex's bundled catalog lists for it,
 ///   priority on those models and no ultrafast (openai/codex 5228d94,
 ///   models.json); Codex learns any more from the plan's own model listing.
@@ -288,7 +290,9 @@ const CLAUDE_API: [(&str, Tiers); 5] = [
     ("claude-opus-5", Tiers::FAST),
     ("claude-opus-4-8", Tiers::FAST),
 ];
-const OPENAI: [(&str, Tiers); 9] = [
+const OPENAI: [(&str, Tiers); 11] = [
+    ("gpt-6.2-astra", Tiers::BOTH),
+    ("gpt-6.2-sol", Tiers::BOTH),
     ("gpt-6.1-sol", Tiers::BOTH),
     ("gpt-6-astra", Tiers::BOTH),
     ("gpt-6.1-terra", Tiers::FAST),
@@ -452,6 +456,8 @@ pub struct Provider {
     stall_timeout: Duration,
     /// Ask Anthropic to cache for an hour instead of five minutes.
     cache_hour: bool,
+    /// Ask OpenAI to cache for twelve hours instead of thirty minutes.
+    cache_half_day: bool,
     /// A faster tier than standard, sent to the models that serve it.
     speed: Option<Speed>,
     /// The models this endpoint, in its region and on its sign-in, serves
@@ -512,12 +518,14 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     /// Input tokens written to the provider's prompt cache, which Anthropic
-    /// bills above the base input rate. Part of `input_tokens`, like cache
-    /// reads; zero for providers that do not bill writes.
+    /// and OpenAI (GPT-5.6 and later) bill above the base input rate. Part
+    /// of `input_tokens`, like cache reads; zero for providers that do not
+    /// bill writes.
     #[serde(skip_serializing_if = "is_zero")]
     pub cache_write_tokens: u64,
-    /// The part of `cache_write_tokens` cached for an hour rather than five
-    /// minutes, which Anthropic bills at twice the input rate.
+    /// The part of `cache_write_tokens` written for the longer lifetime a
+    /// bot's `cache_ttl` asks for: an hour on Claude, which Anthropic bills
+    /// at twice the input rate, or twelve hours on OpenAI, at 2.5 times.
     #[serde(skip_serializing_if = "is_zero")]
     pub cache_write_1h_tokens: u64,
     /// When the request was sent, in milliseconds since the Unix epoch, so
@@ -880,6 +888,7 @@ impl Provider {
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
             cache_hour: false,
+            cache_half_day: false,
             speed: None,
             catalog,
             sockets: None,
@@ -1172,26 +1181,58 @@ impl Provider {
         self.family == Family::Anthropic && !(self.bedrock && five_minute_cache(model))
     }
 
-    /// This provider with one bot's output bound, cache lifetime, speed
-    /// and the tiers its `speeds` say models serve; borrowed, with no
-    /// copy, when they are its own. The tiers count only with a speed.
+    /// Ask OpenAI to keep prompt caches for twelve hours: each write bills
+    /// 2.5 times the input rate instead of 1.25 times, and lasts across a
+    /// gap under twelve hours (its prompt caching guide, read 2026-11-22).
+    /// Only OpenAI's own API offers it, on a key: Bedrock caches for thirty
+    /// minutes only, and the ChatGPT plan is not documented to take it.
+    pub fn with_cache_half_day(mut self, half_day: bool) -> Self {
+        self.cache_half_day = half_day && self.takes_cache_half_day();
+        self
+    }
+
+    /// Whether this endpoint offers the twelve-hour cache at all.
+    fn takes_cache_half_day(&self) -> bool {
+        self.family == Family::Responses && !self.bedrock && self.login.is_none()
+    }
+
+    /// Whether a call to `model` asks for the twelve-hour cache: GPT-5.6
+    /// and later take `prompt_cache_options`; earlier models refuse it and
+    /// keep their own retention.
+    fn cache_half_day_for(&self, model: &str) -> bool {
+        self.cache_half_day && (model.starts_with("gpt-5.6") || model.starts_with("gpt-6"))
+    }
+
+    /// This provider with one bot's output bound, cache lifetime (an hour
+    /// on Claude, twelve hours on OpenAI), speed and the tiers its `speeds`
+    /// say models serve; borrowed, with no copy, when they are its own. The
+    /// tiers count only with a speed.
     pub fn shaped(
         &self,
         max_output_tokens: Option<u32>,
         cache_hour: bool,
+        cache_half_day: bool,
         speed: Option<Speed>,
         speeds: &Speeds,
     ) -> Result<std::borrow::Cow<'_, Self>> {
         let cache_hour = cache_hour && self.family == Family::Anthropic;
+        let cache_half_day = cache_half_day && self.takes_cache_half_day();
         let speed = speed.filter(|speed| *speed != Speed::Standard);
         let speeds = (speed.is_some() && !speeds.is_empty()).then_some(speeds);
-        if (max_output_tokens, cache_hour, speed)
-            == (self.max_output_tokens, self.cache_hour, self.speed)
+        if (max_output_tokens, cache_hour, cache_half_day, speed)
+            == (
+                self.max_output_tokens,
+                self.cache_hour,
+                self.cache_half_day,
+                self.speed,
+            )
             && speeds == self.speeds.as_ref()
         {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
-        let mut shaped = self.clone().with_cache_hour(cache_hour).with_speed(speed);
+        let mut shaped = (self.clone().with_cache_hour(cache_hour))
+            .with_cache_half_day(cache_half_day)
+            .with_speed(speed);
         shaped.speeds = speeds.cloned();
         shaped.max_output_tokens = None;
         if let Some(limit) = max_output_tokens {
@@ -1205,7 +1246,6 @@ impl Provider {
         #[derive(Serialize)]
         struct Responses<'a> {
             model: &'a str,
-            instructions: &'a str,
             /// Absent over a socket, where the create event takes no `stream`.
             #[serde(skip_serializing_if = "Option::is_none")]
             stream: Option<bool>,
@@ -1223,6 +1263,8 @@ impl Provider {
             text: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             prompt_cache_key: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prompt_cache_options: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             service_tier: Option<&'static str>,
         }
@@ -1293,7 +1335,6 @@ impl Provider {
             Family::Responses => (
                 serde_json::to_vec(&Responses {
                     model: request.model,
-                    instructions: request.instructions,
                     stream: self.sockets.is_none().then_some(true),
                     store: false,
                     // Request opaque reasoning for stateless continuation across endpoints.
@@ -1313,6 +1354,9 @@ impl Provider {
                             "schema":schema,"strict":true}})
                     }),
                     prompt_cache_key: request.cache_key,
+                    prompt_cache_options: self
+                        .cache_half_day_for(request.model)
+                        .then(|| json!({"ttl":"12h"})),
                     service_tier: self.speed_for(request.model).map(|speed| self.tier(speed)),
                 })?,
                 &b",\"input\":["[..],
@@ -1377,6 +1421,35 @@ impl Provider {
         Ok(bytes)
     }
 
+    /// The input's first item on Responses: the bot's instructions as a
+    /// developer message, with the comma before the items that follow.
+    /// OpenAI places the top-level `instructions` field after the input from
+    /// GPT-6.2 on, outside every cached prefix, and says to send stable
+    /// instructions as the first developer message instead (its latest-model
+    /// guide, read 2026-11-22), as Codex does on its GPT-5.6 path. One
+    /// convention for every Responses model and endpoint. A socket call that
+    /// continues a response sends it no more: the server holds it.
+    fn lead(&self, request: &Request<'_>) -> Result<Vec<u8>> {
+        if self.family != Family::Responses || request.instructions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut lead = serde_json::to_vec(&json!({"role":"developer",
+            "content":[{"type":"input_text","text":request.instructions}]}))?;
+        if request.items.bytes > 0 {
+            lead.push(b',');
+        }
+        Ok(lead)
+    }
+
+    /// Whether this endpoint's input limits count prompt-cache reads.
+    /// Anthropic counts only uncached input and cache writes for its current
+    /// models, and Bedrock leaves cache reads out of its input quota for
+    /// both families (its prompt caching guide and OpenAI caching post, read
+    /// 2026-11-22); OpenAI says cached input counts toward its limits.
+    fn counts_cache_reads(&self) -> bool {
+        self.family == Family::Responses && !self.bedrock
+    }
+
     /// Content-Length avoids requiring provider support for chunked uploads;
     /// the items stream through without a whole-body copy.
     fn body(&self, prefix: Bytes, items: &Items) -> (reqwest::Body, usize) {
@@ -1389,7 +1462,7 @@ impl Provider {
     /// of its limits, the share of that its model's calls have been counting.
     fn input_estimate(&self, pace: &pace::Pace, bytes: usize, output: u64) -> u64 {
         let input = (bytes / 4) as u64;
-        if self.family.counts_cache_reads() {
+        if self.counts_cache_reads() {
             input
         } else {
             pace.input_estimate(input, output)
@@ -1489,7 +1562,18 @@ impl Provider {
         }
         let pace = self.pools.get(&self.pool_key(request.model));
         let limits = self.limits(request.model);
-        let prefix = Bytes::from(self.prefix(&request)?);
+        // A socket call that continues a response leaves the lead out, so
+        // it travels apart there; over HTTP it is part of the prefix.
+        let (prefix, lead) = {
+            let (mut prefix, lead) = (self.prefix(&request)?, self.lead(&request)?);
+            match &self.sockets {
+                Some(_) => (Bytes::from(prefix), Bytes::from(lead)),
+                None => {
+                    prefix.extend_from_slice(&lead);
+                    (Bytes::from(prefix), Bytes::new())
+                }
+            }
+        };
         // Anthropic counts output as it is written, not the cap a request
         // asks for: reserve what this model's calls have been writing.
         // OpenAI counts the cap, so it is reserved whole.
@@ -1501,7 +1585,11 @@ impl Provider {
             Family::Responses => u64::from(self.max_output_tokens.unwrap_or(512)),
         };
         let estimate = pace::Cost {
-            input: self.input_estimate(&pace, prefix.len() + request.items.weight, output),
+            input: self.input_estimate(
+                &pace,
+                prefix.len() + lead.len() + request.items.weight,
+                output,
+            ),
             output,
         };
         let waiter = match (request.asker, self.transport.wake.get()) {
@@ -1547,7 +1635,7 @@ impl Provider {
                 .complete_socket(
                     sockets,
                     request,
-                    prefix,
+                    (prefix, lead),
                     delta,
                     report,
                     (&pace, reservation, estimate),
@@ -1761,7 +1849,7 @@ impl Provider {
         if let Some(sent) = sent {
             sent.began(parser.first_output());
         }
-        reservation.settle_usage(report.usage.as_ref(), estimate, self.family);
+        reservation.settle_usage(report.usage.as_ref(), estimate, self.counts_cache_reads());
         // An overload or rate limit inside the stream tells the pool what
         // the same refusal before it would.
         if let Err(error) = &result
@@ -1810,7 +1898,7 @@ impl Provider {
         &self,
         sockets: &Sockets,
         request: Request<'_>,
-        prefix: Bytes,
+        (prefix, lead): (Bytes, Bytes),
         mut delta: F,
         report: &mut Report,
         (pace, mut reservation, estimate): (&pace::Pace, pace::Reservation<'_>, pace::Cost),
@@ -1833,8 +1921,8 @@ impl Provider {
             None => (None, None, None),
         };
         let key = window.map_or_else(
-            || socket::key(&prefix, &[], 0),
-            |(head, elided, _)| socket::key(&prefix, head, elided),
+            || socket::key(&prefix, &lead, &[], 0),
+            |(head, elided, _)| socket::key(&prefix, &lead, head, elided),
         );
         let ids = window.map(|(_, _, ids)| ids);
         // A connection opened under an older login would present its token
@@ -1912,7 +2000,7 @@ impl Provider {
             };
             // Each send holds its own undispatched reservation, refunded if
             // the input cannot be assembled.
-            let text = create(&prefix, plan.previous.as_deref(), input).await?;
+            let text = create(&prefix, &lead, plan.previous.as_deref(), input).await?;
             reservation.dispatch();
             report.dispatched = true;
             if let Some(sent) = sent {
@@ -1959,7 +2047,11 @@ impl Provider {
         let completed = match outcome {
             Ok(()) => {
                 session.completed(parser.id(), key, ids);
-                reservation.settle_usage(report.usage.as_ref(), estimate, self.family);
+                reservation.settle_usage(
+                    report.usage.as_ref(),
+                    estimate,
+                    self.counts_cache_reads(),
+                );
                 parser.finish().inspect(|_| pace.accepted())
             }
             Err(failure) => {
@@ -1973,7 +2065,11 @@ impl Provider {
                 if failure.refused && report.usage.is_none() {
                     reservation.settle(0);
                 } else {
-                    reservation.settle_usage(report.usage.as_ref(), estimate, self.family);
+                    reservation.settle_usage(
+                        report.usage.as_ref(),
+                        estimate,
+                        self.counts_cache_reads(),
+                    );
                 }
                 match (failure.status, &self.login, login) {
                     // The connection presents the refused login; a retry
@@ -2128,9 +2224,16 @@ fn framed(
 }
 
 /// A `response.create` event: the request fields, the continuation if any,
-/// and the input. A socket message is whole, so the input is assembled here.
-async fn create(prefix: &[u8], previous: Option<&str>, items: Items) -> Result<String> {
-    let mut text = Vec::with_capacity(prefix.len() + items.bytes + 96);
+/// and the input: the lead, unless the call continues a response that
+/// already holds it, then the items. A socket message is whole, so the
+/// input is assembled here.
+async fn create(
+    prefix: &[u8],
+    lead: &[u8],
+    previous: Option<&str>,
+    items: Items,
+) -> Result<String> {
+    let mut text = Vec::with_capacity(prefix.len() + lead.len() + items.bytes + 96);
     text.extend_from_slice(br#"{"type":"response.create","#);
     if let Some(previous) = previous {
         text.extend_from_slice(br#""previous_response_id":"#);
@@ -2138,6 +2241,9 @@ async fn create(prefix: &[u8], previous: Option<&str>, items: Items) -> Result<S
         text.push(b',');
     }
     text.extend_from_slice(&prefix[1..]);
+    if previous.is_none() {
+        text.extend_from_slice(lead);
+    }
     let mut stream = items.stream();
     while let Some(chunk) = stream.next().await {
         text.extend_from_slice(&chunk.map_err(|error| Error::new(&error.to_string()))?);
@@ -3020,6 +3126,105 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "k");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], false);
+        // The instructions open the input as a developer message, never the
+        // top-level field GPT-6.2 sends after the input, uncached.
+        assert!(body.get("instructions").is_none());
+        let lead = |instructions, items: Items| {
+            let request = Request {
+                model: "m",
+                instructions,
+                reasoning: None,
+                tools: &none(),
+                allow_tool_calls: true,
+                output_schema: None,
+                web_search: false,
+                fallback_credit: None,
+                asker: Asker::Waits,
+                cache_key: None,
+                items,
+                chain: None,
+                route: None,
+                sent: None,
+            };
+            String::from_utf8(responses.lead(&request).unwrap()).unwrap()
+        };
+        let item = || Items::new(3, || stream::once(async { Ok(Bytes::from("{})")) }).boxed());
+        assert_eq!(
+            lead("i", item()),
+            r#"{"content":[{"text":"i","type":"input_text"}],"role":"developer"},"#
+        );
+        assert_eq!(
+            lead("i", Items::empty()),
+            r#"{"content":[{"text":"i","type":"input_text"}],"role":"developer"}"#
+        );
+        assert_eq!(lead("", item()), "");
+        assert_eq!(
+            String::from_utf8(
+                provider
+                    .lead(&Request {
+                        model: "m",
+                        instructions: "i",
+                        reasoning: None,
+                        tools: &none(),
+                        allow_tool_calls: true,
+                        output_schema: None,
+                        web_search: false,
+                        fallback_credit: None,
+                        asker: Asker::Waits,
+                        cache_key: None,
+                        items: item(),
+                        chain: None,
+                        route: None,
+                        sent: None,
+                    })
+                    .unwrap()
+            )
+            .unwrap(),
+            "",
+            "Anthropic keeps its instructions in `system`"
+        );
+        // The twelve-hour cache goes to GPT-5.6 and later on OpenAI's API.
+        let half_day = responses.clone().with_cache_half_day(true);
+        let options = |provider: &Provider, model| {
+            let mut prefix = provider
+                .prefix(&Request {
+                    model,
+                    instructions: "",
+                    reasoning: None,
+                    tools: &none(),
+                    allow_tool_calls: true,
+                    output_schema: None,
+                    web_search: false,
+                    fallback_credit: None,
+                    asker: Asker::Waits,
+                    cache_key: None,
+                    items: Items::empty(),
+                    chain: None,
+                    route: None,
+                    sent: None,
+                })
+                .unwrap();
+            prefix.extend_from_slice(b"]}");
+            serde_json::from_slice::<Value>(&prefix).unwrap()["prompt_cache_options"].clone()
+        };
+        assert_eq!(options(&half_day, "gpt-6.2-sol"), json!({"ttl":"12h"}));
+        assert_eq!(options(&half_day, "gpt-5.6-luna"), json!({"ttl":"12h"}));
+        assert_eq!(options(&half_day, "gpt-5.5"), Value::Null);
+        assert_eq!(options(&responses, "gpt-6.2-sol"), Value::Null);
+        let mantle = Provider::new(
+            Transport::new(64, 1).unwrap(),
+            Family::Responses,
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+            Some("k".into()),
+        )
+        .unwrap()
+        .with_cache_half_day(true);
+        assert_eq!(options(&mantle, "openai.gpt-6.1-sol"), Value::Null);
+        // Bedrock leaves cache reads out of its input quota; OpenAI counts them.
+        assert!(responses.counts_cache_reads());
+        assert!(!mantle.counts_cache_reads());
+        assert!(!provider.counts_cache_reads());
+        assert!(!provider.clone().with_cache_half_day(true).cache_half_day);
     }
 
     #[test]
@@ -3449,17 +3654,17 @@ mod tests {
         )
         .unwrap();
         let same = anthropic
-            .shaped(None, false, None, &Speeds::default())
+            .shaped(None, false, false, None, &Speeds::default())
             .unwrap();
         assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
-        let own = (anthropic.shaped(Some(4096), true, None, &Speeds::default())).unwrap();
+        let own = (anthropic.shaped(Some(4096), true, false, None, &Speeds::default())).unwrap();
         assert_eq!((own.max_output_tokens, own.cache_hour), (Some(4096), true));
         assert_eq!(anthropic.anthropic_max_tokens("claude-sonnet-5"), 128_000);
         assert_eq!(own.anthropic_max_tokens("claude-sonnet-5"), 4096);
         // Its family's own rules still hold.
         assert_eq!(
             anthropic
-                .shaped(Some(1024), false, None, &Speeds::default())
+                .shaped(Some(1024), false, false, None, &Speeds::default())
                 .err()
                 .unwrap()
                 .code,
@@ -3468,7 +3673,7 @@ mod tests {
         // Responses keeps no cache lifetime, so an hour asks for nothing.
         let responses = Provider::new(transport, Family::Responses, "https://h/v1", None).unwrap();
         let hour = responses
-            .shaped(None, true, None, &Speeds::default())
+            .shaped(None, true, false, None, &Speeds::default())
             .unwrap();
         assert!(matches!(hour, std::borrow::Cow::Borrowed(_)));
     }
@@ -4862,7 +5067,7 @@ mod tests {
         let at = |family, url: &str, speed| {
             Provider::new(transport.clone(), family, url, None)
                 .unwrap()
-                .shaped(None, false, speed, &Speeds::default())
+                .shaped(None, false, false, speed, &Speeds::default())
                 .unwrap()
                 .into_owned()
         };
@@ -4956,7 +5161,7 @@ mod tests {
         }))
         .unwrap();
         let set = (ultra.clone().with_name("work"))
-            .shaped(None, false, Some(Speed::Ultrafast), &speeds)
+            .shaped(None, false, false, Some(Speed::Ultrafast), &speeds)
             .unwrap()
             .into_owned();
         assert_eq!(
@@ -4971,7 +5176,7 @@ mod tests {
         assert_eq!(set.tiers("other"), Tiers::FAST);
         // A pattern under another provider's name leaves this one's catalog.
         let other = (ultra.with_name("home"))
-            .shaped(None, false, Some(Speed::Ultrafast), &speeds)
+            .shaped(None, false, false, Some(Speed::Ultrafast), &speeds)
             .unwrap()
             .into_owned();
         assert_eq!(
@@ -5027,23 +5232,23 @@ mod tests {
         assert_eq!(chatgpt.tiers("gpt-5.5"), Tiers::FAST);
         assert_eq!(chatgpt.speeds()["gpt-6.1-sol"], json!(["fast"]));
         let none = Speeds::default();
-        let ultra = (chatgpt.shaped(None, false, Some(Speed::Ultrafast), &none)).unwrap();
+        let ultra = (chatgpt.shaped(None, false, false, Some(Speed::Ultrafast), &none)).unwrap();
         assert_eq!(ultra.speed_for("gpt-6.1-sol"), None);
         let fast = chatgpt
-            .shaped(None, false, Some(Speed::Fast), &none)
+            .shaped(None, false, false, Some(Speed::Fast), &none)
             .unwrap();
         assert_eq!(fast.speed_for("gpt-6.1-sol"), Some(Speed::Fast));
         // A bot can still claim it for the person's plan.
         let speeds: Speeds =
             serde_json::from_value(json!({"chatgpt/gpt-6.1-sol": ["fast", "ultrafast"]})).unwrap();
         let set = (chatgpt.clone().with_name("chatgpt"))
-            .shaped(None, false, Some(Speed::Ultrafast), &speeds)
+            .shaped(None, false, false, Some(Speed::Ultrafast), &speeds)
             .unwrap()
             .into_owned();
         assert_eq!(set.speed_for("gpt-6.1-sol"), Some(Speed::Ultrafast));
         // Its speeds count only with a speed: standard borrows the provider.
         let named = chatgpt.with_name("chatgpt");
-        let standard = named.shaped(None, false, None, &speeds).unwrap();
+        let standard = named.shaped(None, false, false, None, &speeds).unwrap();
         assert!(matches!(standard, std::borrow::Cow::Borrowed(_)));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -5080,7 +5285,7 @@ mod tests {
         let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
             .unwrap()
             .with_name("gateway")
-            .shaped(None, false, Some(Speed::Ultrafast), &speeds)
+            .shaped(None, false, false, Some(Speed::Ultrafast), &speeds)
             .unwrap()
             .into_owned();
         let tools = none();

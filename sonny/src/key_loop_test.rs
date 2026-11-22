@@ -743,3 +743,63 @@ async fn typing_never_waits_on_a_page_the_browser_is_slow_to_draw() {
     assert!(before < picture && picture < after, "{screen}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Letters that came while the window was busy are typed before the next
+/// frame, not one frame each, and every key still lands in order: a key
+/// that is not a letter waits for the frame, then counts as it always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn letters_already_waiting_are_one_frame_and_land_in_order() {
+    let nodes = json!([{"node": 0, "turn": 0}]);
+    let (client, mut events, _tell, asked, socket) =
+        held_daemon(Duration::from_millis(10), kept("Done"), nodes).await;
+    let mut app = window(client, socket);
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let probe = Probe {
+        screen: ratatui::backend::TestBackend::new(400, 30),
+        frames: frames.clone(),
+    };
+    let mut terminal = Terminal::new(probe).unwrap();
+    let (keys, taken) = tokio::sync::mpsc::unbounded_channel();
+    // Every key is waiting before the window looks at one: 200 letters
+    // (some Shift-held, some wide), a step left, a backspace, more.
+    let burst: String = "Héllo 漢字 World ".chars().cycle().take(200).collect();
+    for c in burst.chars() {
+        let mut press = event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        if c.is_uppercase() {
+            press.modifiers = KeyModifiers::SHIFT;
+        }
+        keys.send(Event::Key(press)).unwrap();
+    }
+    keys.send(key(KeyCode::Left)).unwrap();
+    keys.send(key(KeyCode::Backspace)).unwrap();
+    for c in "ok".chars() {
+        keys.send(key(KeyCode::Char(c))).unwrap();
+    }
+    keys.send(key(KeyCode::Enter)).unwrap();
+    let mut expected: Vec<char> = burst.chars().collect();
+    let last = expected.pop().unwrap();
+    expected.pop();
+    expected.extend("ok".chars());
+    expected.push(last);
+    let expected: String = expected.into_iter().collect();
+    let drive = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for c in "/quit".chars() {
+            keys.send(key(KeyCode::Char(c))).unwrap();
+        }
+        keys.send(key(KeyCode::Enter)).unwrap();
+    };
+    let (ran, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(app.run(&mut terminal, &mut events, taken), drive)
+    })
+    .await
+    .expect("the window quit");
+    ran.unwrap();
+    let frames = frames.lock().unwrap().clone();
+    // One frame a key would be more than the 200 letters alone.
+    assert!(frames.len() < 50, "{} frames for 210 keys", frames.len());
+    let submitted = (asked.lock().unwrap().iter())
+        .find(|(_, asked)| asked["op"] == "submit")
+        .map(|(_, asked)| asked["prompt"].clone());
+    assert_eq!(submitted, Some(json!(expected)));
+}

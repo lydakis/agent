@@ -527,8 +527,8 @@ fn p90(samples: &std::collections::VecDeque<u32>) -> Option<u64> {
 
 /// The input a call's usage counts toward its provider's limits: all of
 /// it, or for a provider that leaves cache reads out, the rest.
-fn counted(usage: &Usage, family: super::Family) -> u64 {
-    match family.counts_cache_reads() {
+fn counted(usage: &Usage, counts_reads: bool) -> u64 {
+    match counts_reads {
         true => usage.input_tokens,
         false => usage.input_tokens.saturating_sub(usage.cached_input_tokens),
     }
@@ -714,14 +714,15 @@ impl Reservation<'_> {
     }
     /// Final accounting by what the provider reported billing, without the
     /// cache reads a provider leaves out of its limits.
-    pub fn settle_usage(self, usage: Option<&Usage>, estimate: Cost, family: super::Family) {
+    /// `counts_reads` says whether the provider's input limits count them.
+    pub fn settle_usage(self, usage: Option<&Usage>, estimate: Cost, counts_reads: bool) {
         let Some(usage) = usage else {
             return self.settle_cost(estimate);
         };
-        let input = counted(usage, family);
+        let input = counted(usage, counts_reads);
         let mut state = self.pace.state.lock().unwrap();
         sample(&mut state.outputs, usage.output_tokens);
-        if !family.counts_cache_reads() && usage.input_tokens > 0 {
+        if !counts_reads && usage.input_tokens > 0 {
             // Rounded up, so a few uncached tokens beside a long cached
             // prompt still reserve something.
             sample(
@@ -1498,11 +1499,10 @@ mod tests {
                     output_tokens: output,
                     ..Usage::default()
                 };
-                sent(pace, 2).await.unwrap().settle_usage(
-                    Some(&usage),
-                    Cost::default(),
-                    crate::codec::Family::Anthropic,
-                );
+                sent(pace, 2)
+                    .await
+                    .unwrap()
+                    .settle_usage(Some(&usage), Cost::default(), false);
             }
         }
         let pace = Pace::default();
@@ -1546,13 +1546,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_input_estimate_leaves_out_what_cache_reads_spared() {
-        async fn read(
-            pace: &Pace,
-            calls: usize,
-            input: u64,
-            cached: u64,
-            family: crate::codec::Family,
-        ) {
+        async fn read(pace: &Pace, calls: usize, input: u64, cached: u64, counts_reads: bool) {
             for _ in 0..calls {
                 let usage = Usage {
                     input_tokens: input,
@@ -1560,21 +1554,22 @@ mod tests {
                     output_tokens: 1,
                     ..Usage::default()
                 };
-                sent(pace, 2)
-                    .await
-                    .unwrap()
-                    .settle_usage(Some(&usage), Cost::default(), family);
+                sent(pace, 2).await.unwrap().settle_usage(
+                    Some(&usage),
+                    Cost::default(),
+                    counts_reads,
+                );
             }
         }
         let pace = Pace::default();
         // Until eight calls report, a call reserves all of its input.
-        read(&pace, 7, 10_000, 9_500, crate::codec::Family::Anthropic).await;
+        read(&pace, 7, 10_000, 9_500, false).await;
         assert_eq!(pace.input_estimate(100_000, 0), 100_000);
-        read(&pace, 1, 10_000, 9_500, crate::codec::Family::Anthropic).await;
+        read(&pace, 1, 10_000, 9_500, false).await;
         assert_eq!(pace.input_estimate(100_000, 0), 5_000);
         // Four misses in 32 move the 90th percentile to a whole prompt.
-        read(&pace, 20, 10_000, 9_500, crate::codec::Family::Anthropic).await;
-        read(&pace, 4, 10_000, 0, crate::codec::Family::Anthropic).await;
+        read(&pace, 20, 10_000, 9_500, false).await;
+        read(&pace, 4, 10_000, 0, false).await;
         assert_eq!(pace.input_estimate(100_000, 0), 100_000);
         // The input a cache read spared is not charged when the call settles.
         let pace = Pace::default();
@@ -1590,11 +1585,10 @@ mod tests {
             cached_input_tokens: 900,
             ..Usage::default()
         };
-        sent(&pace, 1).await.unwrap().settle_usage(
-            Some(&usage),
-            Cost::default(),
-            crate::codec::Family::Anthropic,
-        );
+        sent(&pace, 1)
+            .await
+            .unwrap()
+            .settle_usage(Some(&usage), Cost::default(), false);
         assert_eq!(pace.split_snapshot()[INPUT].1, 9_900.0);
         // A prompt larger than the limit waits for a full allowance: it may
         // be read from the cache.
@@ -1602,11 +1596,11 @@ mod tests {
         // A few uncached tokens beside a long cached prompt still reserve
         // their share.
         let pace = Pace::default();
-        read(&pace, 8, 200_050, 200_000, crate::codec::Family::Anthropic).await;
+        read(&pace, 8, 200_050, 200_000, false).await;
         assert_eq!(pace.input_estimate(200_050, 0), 51);
         // A provider that counts cache reads learns nothing to leave out.
         let pace = Pace::default();
-        read(&pace, 8, 10_000, 9_500, crate::codec::Family::Responses).await;
+        read(&pace, 8, 10_000, 9_500, true).await;
         assert_eq!(pace.input_estimate(100_000, 0), 100_000);
     }
 

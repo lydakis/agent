@@ -1045,7 +1045,13 @@ fn now() -> i64 {
 /// then, or at once with no wait set; a one-way door, or a step of the
 /// person's, waits for them and is reminded then, or never with no wait
 /// set. The result says when, for the card and the agent.
-pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<String, String> {
+pub fn served(
+    arguments: &Value,
+    bot: &str,
+    turn: i64,
+    call: &str,
+    shell: &crate::trigger::Shell,
+) -> Result<String, String> {
     let ask = self::call(&id(turn, call), arguments)
         .ok_or("invalid_arguments: a question to ask, in question")?;
     let one_way =
@@ -1074,7 +1080,7 @@ pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<Str
     // A deadline Sonny could not set leaves the ask waiting, and says why:
     // the card still shows, and nothing goes ahead unseen.
     let (plan, deadline, unset) =
-        match deadline.map(|at| set_deadline(&ask, plan, &label, at, bot, turn, call)) {
+        match deadline.map(|at| set_deadline(&ask, plan, &label, at, (bot, turn, call), shell)) {
             Some(Err(error)) => (Unanswered::Wait, None, Some(error)),
             _ => (plan, deadline, None),
         };
@@ -1127,9 +1133,8 @@ fn set_deadline(
     plan: Unanswered,
     label: &str,
     deadline: i64,
-    bot: &str,
-    turn: i64,
-    call: &str,
+    (bot, turn, call): (&str, i64, &str),
+    shell: &crate::trigger::Shell,
 ) -> Result<(), String> {
     let sonny = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
     let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
@@ -1156,6 +1161,7 @@ fn set_deadline(
             label,
             ask.options.is_empty(),
         ),
+        shell,
     )
     .map(|_| ())
 }
@@ -1175,7 +1181,11 @@ fn deadline(minutes: u64, now: i64) -> i64 {
 pub fn let_deadline_go(bot: &str, asked: &str) {
     if let Some((turn, call)) = named(asked) {
         let name = trigger_name(bot, turn, call);
-        let _ = crate::trigger::tool(&json!({"remove": name}), &crate::trigger::Caller::default());
+        let _ = crate::trigger::tool(
+            &json!({"remove": name}),
+            &crate::trigger::Caller::default(),
+            &crate::trigger::Shell::default(),
+        );
     }
 }
 
@@ -2826,12 +2836,26 @@ mod tests {
     #[test]
     fn an_ask_says_whether_it_is_a_one_way_door() {
         let mut unsaid = keep_api();
-        let refused = served(&unsaid, "shop.fix", 1, "c1").unwrap_err();
+        let refused = served(
+            &unsaid,
+            "shop.fix",
+            1,
+            "c1",
+            &crate::trigger::Shell::default(),
+        )
+        .unwrap_err();
         assert_eq!(refused, "invalid_arguments: one_way is true or false");
         // Going ahead goes ahead with the option recommended.
         unsaid["one_way"] = json!(false);
         unsaid.as_object_mut().unwrap().remove("recommended");
-        let refused = served(&unsaid, "shop.fix", 1, "c1").unwrap_err();
+        let refused = served(
+            &unsaid,
+            "shop.fix",
+            1,
+            "c1",
+            &crate::trigger::Shell::default(),
+        )
+        .unwrap_err();
         assert!(refused.contains("in recommended"), "{refused}");
     }
 
