@@ -1832,7 +1832,7 @@ sonny link forget laptop       # run on the host to forget a linked machine
 - **Desktop (`desktop` with `machine: "laptop"`):** Runs `agent-desktop` on the linked machine with action approvals routed to the host agent's gate.
 - **MCP (`exec`):** Prefix a script with `// @exec: {"machine": "laptop"}` to run against that machine's MCP servers (listed under `# On NAME`).
 - **Opening links & files:** On headless hosts, clicking an `http(s)` URL or large image/PDF in Sonny opens it directly on your connected laptop.
-- **Dropped files & clipboard:** Drop a file from your laptop on a Sonny window you reached over SSH and the host's Sonny fetches it over the link: a picture attaches as `[Image #n]` (HEIC and other Mac formats converted there), any other file is copied to `~/.agent/sonny/dropped` and the composer names the copy. Ctrl+V over SSH takes the picture on the laptop's clipboard.
+- **Dropped files & clipboard:** Drop a file from your laptop on a Sonny window you reached over SSH and the host's Sonny fetches it over the link: a picture attaches as `[Image #n]` (HEIC and other Mac formats converted there), any other file is copied to `~/.agent/sonny/dropped` and the composer names the copy. Ctrl+V over SSH takes the picture on the laptop's clipboard. With several machines linked, the one your SSH session comes from is asked first, and alone for its clipboard; a link that is busy is asked again for up to a minute.
 
 Configuration in `~/.agent/config.toml`:
 

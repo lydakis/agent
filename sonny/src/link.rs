@@ -130,6 +130,9 @@ pub struct Machine {
     /// Whether it hands over a file dropped from it and its clipboard's
     /// picture, for the person at it whose window is here.
     pub files: bool,
+    /// The address its link's SSH session comes from, as this machine sees
+    /// it.
+    pub from: Option<String>,
     /// Its MCP servers, by name.
     pub servers: BTreeMap<String, Lent>,
 }
@@ -161,6 +164,7 @@ impl Machine {
             desktop: said["desktop"] == true,
             open: said["open"] == true,
             files: said["files"] == true,
+            from: said["from"].as_str().map(str::to_owned),
             servers,
         }
     }
@@ -978,7 +982,14 @@ async fn serve(machine: String) -> Result<(), String> {
                         if let Some(most) = hello["lends"]["calls"].as_u64() {
                             calls.store(most, Ordering::Relaxed);
                         }
-                        let lent = hello["lends"].to_string();
+                        // Where its SSH session comes from, for a window
+                        // reached over SSH from the same place to know it
+                        // is the machine the person is at.
+                        let mut lent = hello["lends"].clone();
+                        if let (Some(lent), Some(from)) = (lent.as_object_mut(), ssh_client()) {
+                            lent.insert("from".into(), Value::String(from));
+                        }
+                        let lent = lent.to_string();
                         let file = dir.join(format!("{machine}.json"));
                         if std::fs::read_to_string(&file).ok().as_deref() != Some(lent.as_str()) {
                             let _ = replace(&file, &lent);
@@ -1728,14 +1739,45 @@ pub fn handing() -> bool {
         .any(|machine| machine.files && up(&machine.name))
 }
 
-/// What `payload` asks of the machines linked here that hand over files,
-/// each connected one asked in turn until one has it: its answer, or why
-/// none did. Blocks while it waits, on a thread of its own.
-fn hand(payload: Value) -> Result<Value, String> {
-    let asked: Vec<String> = (machines().into_iter())
-        .filter(|machine| machine.files && up(&machine.name))
+/// The address this process's SSH session comes from, when it has one.
+fn ssh_client() -> Option<String> {
+    let session = std::env::var("SSH_CONNECTION").ok()?;
+    session.split_whitespace().next().map(str::to_owned)
+}
+
+/// The connected machines that hand over files, in the order to ask them:
+/// those whose link comes from where this window's SSH session does, the
+/// machine the person is at, first; with `only_theirs`, them alone while
+/// any is.
+fn handers(only_theirs: bool) -> Vec<String> {
+    let lenders = (machines().into_iter()).filter(|machine| machine.files && up(&machine.name));
+    in_turn(lenders.collect(), ssh_client().as_deref(), only_theirs)
+}
+
+/// The names of `machines` in the order [`handers`] asks them, for a
+/// window whose SSH session comes from `client`.
+fn in_turn(machines: Vec<Machine>, client: Option<&str>, only_theirs: bool) -> Vec<String> {
+    let (theirs, others): (Vec<Machine>, Vec<Machine>) = (machines.into_iter())
+        .partition(|machine| client.is_some() && machine.from.as_deref() == client);
+    let others = match only_theirs && !theirs.is_empty() {
+        true => Vec::new(),
+        false => others,
+    };
+    (theirs.into_iter().chain(others))
         .map(|machine| machine.name)
-        .collect();
+        .collect()
+}
+
+/// How long a call waits for a machine whose calls are all taken
+/// (`link_busy`) to take it, asked again every [`BUSY_AGAIN`].
+const BUSY_WAIT: Duration = Duration::from_secs(60);
+const BUSY_AGAIN: Duration = Duration::from_millis(250);
+
+/// What `payload` asks of the machines in `asked`, each in turn until one
+/// has it: its answer, or why none did. A machine whose calls are all
+/// taken is asked again until one frees. Blocks while it waits, on a
+/// thread of its own.
+fn hand(payload: Value, asked: Vec<String>) -> Result<Value, String> {
     if asked.is_empty() {
         return Err("no machine linked here is connected".into());
     }
@@ -1745,11 +1787,17 @@ fn hand(payload: Value) -> Result<Value, String> {
             .build())
         .map_err(|e| e.to_string())?;
         for machine in &asked {
-            match runtime.block_on(call(machine, "file", payload.clone(), None)) {
-                Ok(answer) if answer["missing"] == true => {}
-                Ok(answer) => return Ok(answer),
-                Err(("not_connected", _)) => {}
-                Err((_, why)) => return Err(why),
+            let until = Instant::now() + BUSY_WAIT;
+            loop {
+                match runtime.block_on(call(machine, "file", payload.clone(), None)) {
+                    Ok(answer) if answer["missing"] == true => break,
+                    Ok(answer) => return Ok(answer),
+                    Err(("not_connected", _)) => break,
+                    Err(("link_busy", _)) if Instant::now() < until => {
+                        std::thread::sleep(BUSY_AGAIN)
+                    }
+                    Err((_, why)) => return Err(why),
+                }
             }
         }
         Err(format!("not on {}", asked.join(" or ")))
@@ -1762,13 +1810,15 @@ fn hand(payload: Value) -> Result<Value, String> {
 /// The picture in a file dropped from a machine linked here, at `path`
 /// there, converted there when it is one models do not take as it is.
 pub fn picture(path: &str) -> Result<crate::attach::Picture, String> {
-    let answer = hand(json!({"path": path, "picture": true}))?;
+    let answer = hand(json!({"path": path, "picture": true}), handers(false))?;
     crate::attach::from_json(&answer["picture"])
 }
 
 /// The picture on the clipboard of a machine linked here, if it holds one.
 pub fn clipboard() -> Result<Option<crate::attach::Picture>, String> {
-    let answer = hand(json!({"clipboard": true}))?;
+    // The clipboard of the machine the person is at: every machine has
+    // one, so another is asked only when none is known to be theirs.
+    let answer = hand(json!({"clipboard": true}), handers(true))?;
     match answer["none"] == true {
         true => Ok(None),
         false => crate::attach::from_json(&answer["picture"]).map(Some),
@@ -1779,7 +1829,7 @@ pub fn clipboard() -> Result<Option<crate::attach::Picture>, String> {
 /// `to` here for the agent to read.
 pub fn copy(path: &str, to: &Path) -> Result<(), String> {
     use base64::Engine;
-    let answer = hand(json!({"path": path}))?;
+    let answer = hand(json!({"path": path}), handers(false))?;
     let bytes = (base64::engine::general_purpose::STANDARD)
         .decode(answer["data"].as_str().unwrap_or_default())
         .map_err(|e| e.to_string())?;
@@ -2349,6 +2399,34 @@ mod tests {
         assert!(handed(&json!({"path": "report final.pdf"})).is_err());
         assert!(handed(&json!({"path": dir.to_str().unwrap()})).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_machine_a_window_is_reached_from_is_asked_first_and_alone_for_its_clipboard() {
+        let machine = |name: &str, from: Option<&str>| Machine {
+            name: name.into(),
+            from: from.map(str::to_owned),
+            ..Machine::default()
+        };
+        let linked = || {
+            vec![
+                machine("desk", Some("10.0.0.2")),
+                machine("laptop", Some("10.0.0.7")),
+                machine("old", None),
+            ]
+        };
+        assert_eq!(
+            in_turn(linked(), Some("10.0.0.7"), false),
+            ["laptop", "desk", "old"]
+        );
+        assert_eq!(in_turn(linked(), Some("10.0.0.7"), true), ["laptop"]);
+        // Reached from somewhere no machine links from, or not over SSH:
+        // every machine, in the order they are linked.
+        assert_eq!(
+            in_turn(linked(), Some("10.0.0.9"), true),
+            ["desk", "laptop", "old"]
+        );
+        assert_eq!(in_turn(linked(), None, true), ["desk", "laptop", "old"]);
     }
 
     #[test]
