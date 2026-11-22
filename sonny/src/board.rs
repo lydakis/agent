@@ -1950,13 +1950,7 @@ mod tests {
             (news.lines.iter())
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .map(|line| {
-                    let event = match &line["event"] {
-                        Value::Array(events) => (events.iter())
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join("+"),
-                        event => event.as_str().unwrap_or_default().to_owned(),
-                    };
+                    let event = line["event"].as_str().unwrap_or_default().to_owned();
                     let topic = line["topic"].as_str().unwrap_or("-").to_owned();
                     (topic, event)
                 })
@@ -1990,24 +1984,13 @@ mod tests {
             .unwrap();
         assert!(done.contains("It opened enum."), "{done}");
         let _ = news.mark_read();
-        // The last work settling empties the board: said once, in the
-        // post that settled it, which a filter on either event hears.
+        // The last work settling empties the board: its own line, on no
+        // thread.
         w1(act("enum", "done")).unwrap();
         let news = commons::news(&home, &cursor);
-        assert_eq!(events(&news), pairs(&[("enum", "done+emptied")]));
-        let line: Value = serde_json::from_str(&news.lines[0]).unwrap();
-        assert!(
-            (line["text"].as_str().unwrap())
-                .ends_with("\nshop/errors holds no open or taken work now."),
-            "{line}"
-        );
-        for event in ["done", "emptied"] {
-            let filter = json!({"board": ["shop/errors"], "event": [event]});
-            assert!(
-                crate::lookout::pattern::matches(&filter, &line),
-                "{event}: {line}"
-            );
-        }
+        let mut said = events(&news);
+        said.sort();
+        assert_eq!(said, pairs(&[("enum", "done"), ("-", "emptied")]));
         let _ = news.mark_read();
         // Held work with no post for hold_quiet goes quiet, once.
         lead(work("api", "Type the api errors", json!({}))).unwrap();

@@ -10,10 +10,8 @@
 //!
 //! It holds the logic of this source alone, as any source holds its own:
 //! who asked for each turn, whose words are whose, and two things it does
-//! not say: how a turn a note started ends, a lookout note's or the
-//! commons' (that turn answers the note, so telling it would only loop,
-//! and the commons and the board tell what came of it), and an
-//! automation's run that
+//! not say: how a turn a lookout note started ends (that turn answers the
+//! note, so telling it would only loop), and an automation's run that
 //! went well and said nothing (a schedule's quiet run is no event).
 //! Nothing else is judged here: the lookout delivers what this says.
 use super::sources::{Event, text_cut as cut};
@@ -187,12 +185,11 @@ impl Activity {
     }
 
     /// Who wrote a message, as its event names them; `None` for the
-    /// subscriber, whose words are no event to it, for a note (the
-    /// lookout's or the commons'), an automation's run and the daemon
-    /// telling a bot its background command ended: how their turns end
-    /// is the event, but a note's.
+    /// subscriber, whose words are no event to it, for a lookout note, an
+    /// automation's run and the daemon telling a bot its background
+    /// command ended: how their turns end is the event.
     fn author(&self, data: &Value) -> Option<String> {
-        if note(data)
+        if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
             || (data["origin"]
                 .as_str()
                 .is_some_and(|origin| crate::trigger::sent_it(origin) || origin == "background")
@@ -211,7 +208,7 @@ impl Activity {
 
     /// Who asked for a turn a message started, as its end names them.
     fn asker(&self, data: &Value) -> Asker {
-        if note(data) {
+        if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-")) {
             return Asker::Note;
         }
         let origin = (data["origin"].as_str()).or(data["person"].as_str());
@@ -393,7 +390,7 @@ impl Activity {
                 self.approvals.retain(|(t, _)| t != task);
                 let done = self.resolving.ended(task, turn) && data["status"] == "completed";
                 let asked_by = match self.asked.remove(&key) {
-                    // How a turn a note started ends answers it.
+                    // How a turn a lookout note started ends answers it.
                     Some(Asker::Note) => return out,
                     Some(Asker::By(by)) => Some(by),
                     None => None,
@@ -423,16 +420,6 @@ impl Activity {
         }
         self.approvals.insert((task.to_owned(), call.to_owned()))
     }
-}
-
-/// Whether a message is a note Sonny wrote the task: the lookout's, or
-/// the commons' (work it is asked to take, a mention, an invite, the
-/// check at its turn's end). The commons and the board tell what comes of
-/// it, so its words are no one's in the task and the turn it starts
-/// answers it, as a lookout note's does.
-fn note(data: &Value) -> bool {
-    (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
-        || (data["origin"] == crate::commons::ORIGIN && data["from"]["bot"].is_null())
 }
 
 /// Who asked for a turn, as its end names them: `you` for the subscriber,
@@ -796,38 +783,6 @@ mod tests {
             json!({"status": "completed"}),
         );
         assert!(activity.event(&ended, None, 2).is_empty());
-    }
-
-    #[test]
-    fn a_commons_note_is_no_one_s_words_and_its_turn_ends_without_an_event() {
-        let mut activity = Activity::new("calc.lead");
-        // The check at a turn's end, queued as a turn of its own.
-        let note = json!({"origin": "commons", "request_id": "commons.turn_end.x",
-            "delivery": "queue", "from": {"bot": null}});
-        assert!((activity.event(&ev("calc.w.1", 5, "queued", note.clone()), None, 1)).is_empty());
-        assert!((activity.event(&ev("calc.w.1", 5, "accepted", note), None, 2)).is_empty());
-        let ended = ev(
-            "calc.w.1",
-            5,
-            "turn_finished",
-            json!({"status": "completed"}),
-        );
-        assert!(activity.event(&ended, None, 3).is_empty());
-        // Work it is asked to take, joining a turn its lead's brief started,
-        // whose end is still told.
-        let brief = json!({"from": {"bot": "calc.lead"}});
-        activity.event(&ev("calc.w.1", 6, "accepted", brief), None, 4);
-        let asked = json!({"origin": "commons", "delivery": "steer", "from": {"bot": null}});
-        assert!((activity.event(&ev("calc.w.1", 7, "queued", asked), None, 5)).is_empty());
-        let steered = json!({"message": 7, "node": 3});
-        assert!((activity.event(&ev("calc.w.1", 6, "steered", steered), None, 6)).is_empty());
-        let ended = ev(
-            "calc.w.1",
-            6,
-            "turn_finished",
-            json!({"status": "completed"}),
-        );
-        assert_eq!(reads(activity.event(&ended, None, 7)).len(), 1);
     }
 
     #[test]

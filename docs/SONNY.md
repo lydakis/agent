@@ -1124,9 +1124,7 @@ take this work`, `you posted here`), and they end with the agent. Opening
 or taking work, or starting or working in a task on a board, follows the
 board (`board.NAME`, the commons source filtered on the board and on the
 events `opened`, `taken`, `dropped`, `done`, `failed`, `canceled`,
-`posted`, `emptied` and `quiet`; the post that settles the board's last
-work is one line for both, its `event` `[done, emptied]` or the like).
-`subs::put` replaces a follow whose
+`posted`, `emptied` and `quiet`). `subs::put` replaces a follow whose
 rules differ. `@NAME` of a live agent in a post or a reply tells that
 agent once and follows nothing.
 

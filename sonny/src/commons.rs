@@ -2247,27 +2247,15 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             if !others.is_empty() {
                 text.push_str(&format!("\nIt opened {}.", others.join(", ")));
             }
-            // The board's last work settling is said once, in the post that
-            // settled it: one note, not the post and then the board.
-            let emptied = post["emptied"].as_str();
-            if let Some(emptied) = emptied {
-                text.push_str(&format!("\n{emptied} holds no open or taken work now."));
-            }
             let mut line = json!({"id": format!("{thread}/{n}"), "topic": thread, "text": text});
             if let Some(by) = post["by"].as_str() {
                 line["from"] = json!(by);
             }
             // Where a board's follow hears it, what it did, and the items
             // it opened, which a worker's follow is steered by.
-            // Settling the board's last work, it is `emptied` as well, so
-            // a filter on either event hears it.
             if let Some(board) = &board {
-                let event = crate::board::event_of(&posts, n, &thread);
                 line["board"] = json!(board);
-                line["event"] = match emptied {
-                    Some(_) => json!([event, "emptied"]),
-                    None => json!(event),
-                };
+                line["event"] = json!(crate::board::event_of(&posts, n, &thread));
             }
             for key in ["do", "opened"] {
                 if !post[key].is_null() {
@@ -2275,6 +2263,17 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 }
             }
             lines.push(line.to_string());
+            // The board's last work settling: the board's own news, on no
+            // thread, so the thread's followers hear the post alone.
+            if let Some(emptied) = post["emptied"].as_str() {
+                let mut line = json!({"id": format!("{thread}/{n}/emptied"), "board": emptied,
+                    "event": "emptied",
+                    "text": format!("{emptied} holds no open or taken work now: {thread} settled last.")});
+                if let Some(by) = post["by"].as_str() {
+                    line["from"] = json!(by);
+                }
+                lines.push(line.to_string());
+            }
         }
         let mut kept = json!({"posts": posts.len(), "bytes": bytes});
         // Work held, kept to tell its board once it goes quiet.
