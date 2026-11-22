@@ -924,14 +924,14 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
             true => in_zen(&client, home).await,
             false => Vec::new(),
         };
-        let live = everyone(&client, author).await;
+        // Only those it may invite count toward who is found.
+        let mut live = everyone(&client, author).await;
+        live.retain(|bot| !zen.contains(bot));
         let mut matched = touched(&client, &words, author, &live, reach).await;
-        matched.retain(|bot| !zen.contains(bot));
         let mut anyone = match golden {
             true => live.clone(),
             false => Vec::new(),
         };
-        anyone.retain(|bot| !zen.contains(bot));
         for seat in 0..reach {
             // The golden ticket goes first, so a match can't take its agent.
             let ticket = golden && seat == 0;
@@ -993,7 +993,7 @@ pub async fn mention(home: &Path, said: &Value, author: &str, named: &[String]) 
             continue;
         }
         let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
-            "request_id": format!("commons.mention.{thread}.{n}.{name}")});
+            "request_id": request_id(&format!("commons.mention.{thread}.{n}.{name}"))});
         if client.request("submit", submit).await.is_ok() {
             told.push(name.clone());
         }
@@ -1138,7 +1138,7 @@ pub async fn ask_for(home: &Path, store: &Path, threads: &[String], author: &str
             let follow = crate::board::post_follow(thread, id, crate::board::ASKED, None);
             let _ = crate::lookout::subs::put(store, &name, follow);
             let submit = json!({"bot": name, "prompt": note, "delivery": "steer",
-                "origin": ORIGIN, "request_id": format!("commons.asked.{thread}.{}.{name}", posts.len())});
+                "origin": ORIGIN, "request_id": request_id(&format!("commons.asked.{thread}.{}.{name}", posts.len()))});
             if client.request("submit", submit).await.is_ok() {
                 asked.push(name);
             }
@@ -1202,7 +1202,7 @@ pub async fn ask_started(
         let follow = crate::board::post_follow(thread, id, crate::board::ASKED, None);
         let _ = crate::lookout::subs::put(store, name, follow);
         let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
-            "request_id": format!("commons.asked.{thread}.{}.{name}", posts.len())});
+            "request_id": request_id(&format!("commons.asked.{thread}.{}.{name}", posts.len()))});
         let _ = client.request("submit", submit).await;
     }
 }
@@ -1562,6 +1562,21 @@ pub(crate) fn summary_of(name: &str, text: &[u8]) -> Option<Value> {
     opening.as_object_mut().map(|post| post.remove("text"));
     summary[OPENING] = opening;
     Some(summary)
+}
+
+/// The daemon's longest request ID, in bytes.
+const REQUEST_ID_BYTES: usize = 128;
+
+/// `id` as a request ID the daemon takes: as it is when it fits, else
+/// named by its digest, as unique as it.
+pub(crate) fn request_id(id: &str) -> String {
+    if id.len() <= REQUEST_ID_BYTES {
+        return id.to_owned();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("commons.{hex}")
 }
 
 /// The threads from the `from`th newest, as many as `bytes` holds, with
@@ -4769,6 +4784,18 @@ mod tests {
         assert!(kept_for(&home, "shop", "shop.w.1", Some("worker")).is_empty());
         assert!(kept_for(&home, "docs", "docs.r.1", Some("reviewer")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_request_id_too_long_for_the_daemon_is_named_by_its_digest() {
+        let short = "commons.asked.store.3.shop.w1";
+        assert_eq!(request_id(short), short);
+        let name = "a".repeat(50);
+        let long = format!("commons.asked.{}.12.{name}", "t".repeat(64));
+        let id = request_id(&long);
+        assert!(id.len() <= REQUEST_ID_BYTES, "{id}");
+        assert_eq!(request_id(&long), id);
+        assert_ne!(request_id(&format!("{long}x")), id);
     }
 
     /// The walk down a post's words stops once no live agent is left to

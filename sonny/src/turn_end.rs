@@ -384,7 +384,7 @@ pub fn finished(
             return;
         };
         let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
-            "origin": crate::commons::ORIGIN, "request_id": format!("commons.turn_end.{bot}.{turn}")});
+            "origin": crate::commons::ORIGIN, "request_id": crate::commons::request_id(&format!("commons.turn_end.{bot}.{turn}"))});
         let _ = client.request("submit", submit).await;
     });
 }

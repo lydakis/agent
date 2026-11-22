@@ -1000,11 +1000,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 let caller_id = std::env::var("AGENT_BOT_ID")
                     .ok()
                     .and_then(|id| id.parse().ok());
-                let _ = crate::lookout::subs::put(
-                    &store,
-                    &caller,
-                    crate::board::follow(board, caller_id),
-                );
+                crate::board::follow_kept(&store, &caller, board, caller_id);
             }
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.lead {

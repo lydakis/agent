@@ -141,6 +141,17 @@ pub fn post_follow(thread: &str, owner: Option<i64>, about: &str, quiet: Option<
     sub
 }
 
+/// `caller`, known as `id`, follows `board`, unless it already works
+/// from it: its task's board stays marked as its task's.
+pub fn follow_kept(store: &Path, caller: &str, board: &str, id: Option<i64>) {
+    let named = follow(board, id);
+    let task = (crate::lookout::subs::read(store, caller).iter())
+        .any(|sub| sub.name == named.name && sub.about.as_deref().is_some_and(works));
+    if !task {
+        let _ = crate::lookout::subs::put(store, caller, named);
+    }
+}
+
 /// What a call to the commons tool that `said` this follows for the
 /// agents it touches, in `store`: the board for `caller`, known as `id`,
 /// when it opened or took work there, and for an agent another dropped
@@ -162,13 +173,7 @@ pub fn follows(
     if work.is_object()
         && (arguments["post"]["work"] == true || matches!(step, Some("open" | "take")))
     {
-        // Its task's board stays marked as its task's.
-        let named = follow(board, id);
-        let task = (crate::lookout::subs::read(store, caller).iter())
-            .any(|sub| sub.name == named.name && sub.about.as_deref().is_some_and(works));
-        if !task {
-            let _ = crate::lookout::subs::put(store, caller, named);
-        }
+        follow_kept(store, caller, board, id);
     }
     if let Some(name) = said["dropped_from"]["name"].as_str() {
         let held_by = said["dropped_from"]["id"].as_i64();
@@ -2012,6 +2017,9 @@ mod tests {
             follows(&store, "shop.w1", Some(2), &take, &said).unwrap();
             assert_eq!(followed(&store, "shop.w1").as_deref(), Some("shop/a"));
         }
+        // Starting a helper there keeps it marked too.
+        follow_kept(&store, "shop.w1", "shop/a", Some(2));
+        assert_eq!(followed(&store, "shop.w1").as_deref(), Some("shop/a"));
         let _ = std::fs::remove_dir_all(&home);
     }
 
