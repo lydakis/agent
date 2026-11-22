@@ -200,18 +200,22 @@ async fn guessed(
         .unwrap_or_default()
         .as_millis();
     let name = format!("{bot}.suggest-{:x}", stamp % 0x100_0000);
+    let ideas = ideas.as_deref();
+    // The copy and its question in one request, which the daemon commits
+    // together.
     let Ok(forked) = client
         .request(
             "fork",
             json!({"source": bot, "bot": name, "allow": [],
-                "expire_ms": EXPIRE.as_millis() as u64, "request_id": name}),
+                "expire_ms": EXPIRE.as_millis() as u64, "request_id": name,
+                "submit": {"request_id": format!("{name}.1"), "prompt": asked(ideas),
+                    "delivery": "steer", "model": model}}),
         )
         .await
     else {
         return (None, None);
     };
-    let ideas = ideas.as_deref();
-    let reply = ask(&client, &name, &forked["bot_id"], model, &asked(ideas)).await;
+    let reply = answer(&client, &name, &forked["submitted"]).await;
     let _ = client
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
@@ -336,21 +340,7 @@ async fn kept(client: &Client, names: Vec<String>) -> Option<String> {
 }
 
 /// The copy's reply, interrupting a turn that runs past `WAIT`.
-async fn ask(
-    client: &Client,
-    name: &str,
-    id: &serde_json::Value,
-    model: Option<String>,
-    prompt: &str,
-) -> Option<String> {
-    let submitted = client
-        .request(
-            "submit",
-            json!({"bot": name, "bot_id": id, "request_id": format!("{name}.1"),
-                "prompt": prompt, "delivery": "steer", "model": model}),
-        )
-        .await
-        .ok()?;
+async fn answer(client: &Client, name: &str, submitted: &serde_json::Value) -> Option<String> {
     let handle = submitted["handle"].as_str()?;
     let waited = client
         .request(

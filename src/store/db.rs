@@ -17126,8 +17126,11 @@ impl Database {
     /// idle and marks it `deleting`, after which it refuses new work; each
     /// later piece drops the records of up to `piece` turns, then the turn
     /// rows, then up to `piece` nodes of the exclusive suffix with `head`
-    /// moved back as they go, so an interruption resumes exactly. The last
-    /// piece removes the bot row and answers `done`.
+    /// moved back as they go, so an interruption resumes exactly. A stage
+    /// that found less than a piece goes on to the next in the same
+    /// transaction, so a small bot, as a throwaway copy is, goes in one.
+    /// The last piece removes the bot row, answers `done`, and says in
+    /// `reclaim` whether anything waits for `switch_reclaim`.
     pub fn delete_bot_piece(
         &mut self,
         name: &str,
@@ -17217,9 +17220,14 @@ impl Database {
                     .execute([turn])?;
             }
             out["events"] = json!(events);
-            tx.commit()?;
-            self.forget_files(files);
-            return Ok(out);
+            // A bot with fewer turns than a piece goes on to the next stage
+            // in this transaction, so a throwaway copy goes in one job; a
+            // turn's files are forgotten only once their rows are gone.
+            if turns.len() as i64 == piece || !files.is_empty() {
+                tx.commit()?;
+                self.forget_files(files);
+                return Ok(out);
+            }
         }
         // Then the turn rows, the messages they opened with, and what
         // remains keyed by the bot alone.
@@ -17227,11 +17235,16 @@ impl Database {
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM messages WHERE bot=?)")?
             .query_row([name], |r| r.get(0))?;
         if has_messages {
-            out["events"] = json!(tx.execute("DELETE FROM events WHERE bot=?", [name])?);
-            out["turns"] = json!(tx.execute("DELETE FROM turns WHERE bot=?", [name])?);
+            let events = tx.execute("DELETE FROM events WHERE bot=?", [name])? as i64;
+            out["events"] = json!(out["events"].as_i64().unwrap_or(0) + events);
+            let turns = tx.execute("DELETE FROM turns WHERE bot=?", [name])?;
+            out["turns"] = json!(turns);
             tx.execute("DELETE FROM messages WHERE bot=?", [name])?;
-            tx.commit()?;
-            return Ok(out);
+            // Its nodes in the same job only while it was small.
+            if turns as i64 >= piece {
+                tx.commit()?;
+                return Ok(out);
+            }
         }
 
         // Walk back from the head, freeing nodes until one is still reached
@@ -17309,6 +17322,15 @@ impl Database {
         drop_list(&tx, declared.as_deref())?;
         out["nodes"] = json!(freed);
         out["done"] = json!(true);
+        // Whether anything waits for `switch_reclaim`: what switches let go
+        // of, which this bot may have held. Both read off an index.
+        let reclaim: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM translating WHERE bot_id IS NULL)
+                 OR EXISTS(SELECT 1 FROM switches WHERE bot_id IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        out["reclaim"] = json!(reclaim);
         tx.commit()?;
         Ok(out)
     }

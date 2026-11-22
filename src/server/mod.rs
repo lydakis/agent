@@ -126,6 +126,23 @@ impl Bound {
 /// or creator, a workspace and a model.
 fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
     let (reply, named, reply_workspace, gates) = match command {
+        // A fork answers with the copy's record, which repeats its source's
+        // and so is bounded only as any reply is; its event and its first
+        // message's are each bounded as any event is.
+        Command::Fork {
+            submit: Some(_), ..
+        } => {
+            return Bound {
+                reply: Sends {
+                    bytes: output::MAX_EVENT,
+                    packets: 1,
+                },
+                events: Sends {
+                    bytes: 2 * deliveries * output::MAX_EVENT,
+                    packets: 2 * deliveries,
+                },
+            };
+        }
         Command::Create {
             bot,
             workspace,
@@ -478,6 +495,12 @@ enum Command {
         expire_ms: Option<u64>,
         /// An idempotency key, as on `create`.
         request_id: Option<String>,
+        /// The fork's first message, as `submit` takes it without `bot`,
+        /// `bot_id` or `workspace`: committed with the fork in one store
+        /// job, or neither is. The reply is the fork's, with the message's
+        /// answer under `submitted`.
+        #[serde(default, deserialize_with = "first_message")]
+        submit: Option<Box<Command>>,
     },
     /// Close bots, done with: each is listed only when closed bots are
     /// asked for, its history kept whole, until a turn of its starts, and a
@@ -2006,6 +2029,28 @@ where
 {
     T::deserialize(deserializer).map(Some)
 }
+/// A fork's first message: a `submit` that names no bot, identity or
+/// folder, since the fork it goes to gives them. The fork names its bot.
+fn first_message<'de, D>(deserializer: D) -> std::result::Result<Option<Box<Command>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let mut fields = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+    if let Some(key) = ["op", "bot", "bot_id", "workspace"]
+        .into_iter()
+        .find(|key| fields.contains_key(*key))
+    {
+        return Err(D::Error::custom(format!(
+            "submit takes no {key}: the fork gives its first message its bot and folder"
+        )));
+    }
+    fields.insert("op".into(), json!("submit"));
+    fields.insert("bot".into(), json!(""));
+    Command::deserialize(Value::Object(fields))
+        .map(|command| Some(Box::new(command)))
+        .map_err(D::Error::custom)
+}
 /// A client's own gate: tools whose calls wait for a verdict, the daemon's
 /// or declared ones, and the tag of the approver that answers. Both or
 /// neither; the daemon never reads the tag. A list longer than the `known`
@@ -2288,8 +2333,8 @@ enum Pending {
         reserved: bool,
         /// Why no turn may start, as the refusal names it.
         held: Option<&'static str>,
-        answer: Answer<(i64, Started, Option<Replaced>)>,
-        answered: Option<Result<(i64, Started, Option<Replaced>)>>,
+        answer: Answer<Submitted>,
+        answered: Option<Result<Submitted>>,
     },
     /// The bot's record, and the cursor of its `created` event.
     Create {
@@ -2301,6 +2346,61 @@ enum Pending {
     /// Settled before queueing (a refused request), kept in line so replies
     /// stay in request order.
     Settled(Result<Value>),
+}
+
+/// A submission's identity, message and replaced message, and the fork
+/// it came with, as `fork` answers it.
+type Submitted = (i64, Started, Option<Replaced>, Option<Value>);
+
+/// A fork made in the same store job as its first message.
+struct Forking {
+    source: String,
+    bot: String,
+    checkpoint: Option<i64>,
+    workspace: Option<String>,
+    budget_tokens: Option<u64>,
+    budget_counts: agent_runtime::store::Counts,
+    created_by: Option<String>,
+    created_by_id: Option<i64>,
+    gate: Option<agent_runtime::store::Gate>,
+    allow: Option<Vec<String>>,
+    expire_ms: Option<u64>,
+    request_id: Option<String>,
+}
+
+impl Forking {
+    /// Make the fork, answered as `fork` answers.
+    fn fork(&self, db: &mut agent_runtime::store::Database) -> Result<Value> {
+        let (created, event) = db.fork(
+            &self.source,
+            &self.bot,
+            Fork {
+                checkpoint: self.checkpoint,
+                workspace: self.workspace.as_deref(),
+                budget_tokens: self.budget_tokens,
+                budget_counts: self.budget_counts,
+                created_by: self.created_by.as_deref(),
+                created_by_id: self.created_by_id,
+                gate: self.gate.as_ref(),
+                allow: self.allow.as_deref(),
+                expire_ms: self.expire_ms,
+                request_id: self.request_id.as_deref(),
+            },
+        )?;
+        forked(created, event.is_none())
+    }
+}
+
+/// A fork as `fork` answers it: without its instructions, as Codex's
+/// thread/fork answers with a thread that carries none (`inspect` shows
+/// them), and whether it was made before.
+fn forked(created: agent_runtime::store::Bot, duplicate: bool) -> Result<Value> {
+    let mut created = serde_json::to_value(created)?;
+    created["duplicate"] = json!(duplicate);
+    if let Value::Object(fields) = &mut created {
+        fields.remove("instructions");
+    }
+    Ok(created)
 }
 
 /// Wait for the oldest admission's answer and keep it with the admission.
@@ -3902,6 +4002,22 @@ impl Service {
             *created_by_id = Some(me.bot_id);
             Ok(())
         };
+        // What it sends reads as the caller's, never a person's or another
+        // bot's. Named once, as the request names it, so a retry of the
+        // same request is the same request.
+        let own = |from: &Option<Author>, origin: &mut Option<String>, person: &Option<String>| {
+            if from.as_ref().is_some_and(|author| author.bot != me.name) {
+                return refuse("send a message as another bot");
+            }
+            if person.is_some() {
+                return refuse("send a message as a person");
+            }
+            *origin = match from {
+                Some(_) => None,
+                None => Some(me.name.clone()),
+            };
+            Ok(())
+        };
         // A tool a client answers is one the caller may pass on: one it has,
         // may call, and gives the bots it makes, answered by the same client,
         // gated as a whole unless the caller's is gated by its steps, and
@@ -3977,9 +4093,19 @@ impl Service {
                 created_by,
                 created_by_id,
                 allow,
+                submit,
                 ..
             } => {
                 claim(created_by, created_by_id)?;
+                if let Some(Command::Submit {
+                    from,
+                    origin,
+                    person,
+                    ..
+                }) = submit.as_deref_mut()
+                {
+                    own(from, origin, person)?;
+                }
                 // A fork that may call nothing touches nothing: an ask.
                 if !matches!(allow, Some(Some(tools)) if tools.is_empty()) {
                     // Read behind the writer's queue, never beside it: a
@@ -4028,20 +4154,7 @@ impl Service {
                 person,
                 ..
             } => {
-                // What it sends reads as the caller's, never a person's or
-                // another bot's.
-                if from.as_ref().is_some_and(|author| author.bot != me.name) {
-                    return refuse("send a message as another bot");
-                }
-                if person.is_some() {
-                    return refuse("send a message as a person");
-                }
-                // Named once, as the request names it, so a retry of the
-                // same request is the same request.
-                *origin = match from {
-                    Some(_) => None,
-                    None => Some(me.name.clone()),
-                };
+                own(from, origin, person)?;
                 // A turn's folder is the sandboxed bot's to write, and stays
                 // its folder: one the caller gives it must be the caller's.
                 if let Some(workspace) = workspace {
@@ -4132,9 +4245,13 @@ impl Service {
     /// for each way the session follows the bot.
     fn admission_sends(&self, command: &Command, id: &Value, session: u64) -> Bound {
         let deliveries = match command {
-            Command::Create { bot, .. } | Command::Submit { bot, .. } => {
-                self.hub.deliveries(bot, session)
-            }
+            Command::Create { bot, .. }
+            | Command::Submit { bot, .. }
+            | Command::Fork {
+                bot,
+                submit: Some(_),
+                ..
+            } => self.hub.deliveries(bot, session),
             _ => 0,
         };
         admission_bound(command, id, deliveries)
@@ -4268,10 +4385,23 @@ impl Service {
                 ..
             } => {
                 self.reserved -= usize::from(reserved);
-                let answered = answered.expect("the submission was answered");
+                let (answered, fork) = match answered.expect("the submission was answered") {
+                    Ok((identity, started, replaced, fork)) => {
+                        (Ok((identity, started, replaced)), fork)
+                    }
+                    Err(error) => (Err(error), None),
+                };
                 let name = followed.then(|| bot.clone());
                 let result = self.admitted(bot, request_id, delivery, held, answered);
                 let cursor = result.as_ref().ok().and_then(|r| r["cursor"].as_i64());
+                // A fork's first message is answered under the fork.
+                let result = match fork {
+                    Some(mut fork) => result.map(|submitted| {
+                        fork["submitted"] = submitted;
+                        fork
+                    }),
+                    None => result,
+                };
                 (result, cursor, name)
             }
             Pending::Create { bot, answered, .. } => {
@@ -6480,7 +6610,10 @@ impl Service {
             Command::Delete { bot, bot_id } => {
                 if let Some(id) = bot_id {
                     let name = bot.clone();
-                    if store.op("gone", move |db| db.gone(&name, id)).await? {
+                    // A read: what is committed says whether the identity
+                    // went, and the deletion checks it again as it starts.
+                    let gone = store.read("gone", move |db| db.gone(&name, id));
+                    if gone.await? {
                         return Ok(json!({"bot":bot,"bot_id":id,"duplicate":true,
                             "turns":0,"events":0,"nodes":0}));
                     }
@@ -7586,6 +7719,7 @@ impl Service {
                 allow,
                 expire_ms,
                 request_id,
+                submit,
             } => {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
@@ -7633,36 +7767,34 @@ impl Service {
                 if let Some(creator) = &created_by {
                     name("created_by", creator)?;
                 }
-                let path = workspace_error.map_or(Ok(path), Err)?;
-                let (created, event) = store
-                    .op("fork", move |db| {
-                        db.fork(
-                            &source,
-                            &bot,
-                            Fork {
-                                checkpoint,
-                                workspace: path.as_deref(),
-                                budget_tokens,
-                                budget_counts,
-                                created_by: created_by.as_deref(),
-                                created_by_id,
-                                gate: gate.as_ref(),
-                                allow: allow.as_deref(),
-                                expire_ms,
-                                request_id: request_id.as_deref(),
-                            },
-                        )
-                    })
-                    .await?;
+                let workspace = workspace_error.map_or(Ok(path), Err)?;
+                let forking = Forking {
+                    source,
+                    bot,
+                    checkpoint,
+                    workspace,
+                    budget_tokens,
+                    budget_counts,
+                    created_by,
+                    created_by_id,
+                    gate,
+                    allow,
+                    expire_ms,
+                    request_id,
+                };
+                // Its first message goes in the same store job, answered in
+                // request order as any submission is.
+                if let Some(mut first) = submit {
+                    if let Command::Submit { bot, .. } = first.as_mut() {
+                        bot.clone_from(&forking.bot);
+                    }
+                    return self
+                        .submit(*first, Some(forking), session, output, id, bound, None)
+                        .await;
+                }
+                let created = store.op("fork", move |db| forking.fork(db)).await?;
                 if let Some(ms) = expire_ms {
                     self.expire_by(tokio::time::Instant::now() + Duration::from_millis(ms));
-                }
-                let mut created = serde_json::to_value(created)?;
-                created["duplicate"] = json!(event.is_none());
-                // Without its instructions, as Codex's thread/fork answers
-                // with a thread that carries none: `inspect` shows them.
-                if let Value::Object(fields) = &mut created {
-                    fields.remove("instructions");
                 }
                 Ok(created)
             }
@@ -7863,277 +7995,9 @@ impl Service {
                 sub.lock().unwrap().set_replay(task);
                 Ok(json!({"following":bot,"after":after,"kinds":kinds}))
             }
-            Command::Submit {
-                bot,
-                bot_id,
-                request_id,
-                prompt,
-                workspace: path,
-                model,
-                effort,
-                delivery,
-                expected_turn,
-                from,
-                origin,
-                person,
-                quotes,
-                budget_tokens,
-                budget_counts,
-                images,
-                wait_ms,
-                output_schema,
-                replaces,
-            } => {
-                name("request_id", &request_id)?;
-                if replaces.is_some_and(|message| message < 1) {
-                    return fail_with("invalid_replaces", "replaces names a message, 1 or more");
-                }
-                let images = images_checked(
-                    images.unwrap_or_default(),
-                    |images| images.iter().collect(),
-                    "a prompt",
-                )
-                .await?;
-                if origin.is_some() && from.is_some() {
-                    return fail_with("invalid_origin", "from and origin are mutually exclusive");
-                }
-                if let Some(origin) = &origin {
-                    name("origin", origin).map_err(|e| Error {
-                        code: "invalid_origin".into(),
-                        ..e
-                    })?;
-                }
-                if let Some(person) = &person {
-                    if from.is_some() || origin.is_some() {
-                        return fail_with(
-                            "invalid_person",
-                            "person, from and origin are mutually exclusive",
-                        );
-                    }
-                    name("person", person).map_err(|e| Error {
-                        code: "invalid_person".into(),
-                        ..e
-                    })?;
-                }
-                let quotes = quotes.unwrap_or_default();
-                if quotes.len() > MAX_QUOTES {
-                    return fail_with(
-                        "invalid_quote",
-                        format!("a prompt may quote up to {MAX_QUOTES} messages"),
-                    );
-                }
-                if let Some(quote) = quotes.iter().find(|quote| quote.message < 1) {
-                    return Err(
-                        Error::with("invalid_quote", "a quoted message is 1 or more")
-                            .facts(json!({"bot":quote.bot,"message":quote.message})),
-                    );
-                }
-
-                if prompt.len() > agent_runtime::store::Database::PROMPT_BYTES {
-                    return fail_with(
-                        "prompt_limit",
-                        format!(
-                            "prompt may be up to {} bytes",
-                            agent_runtime::store::Database::PROMPT_BYTES
-                        ),
-                    );
-                }
-                // What a busy bot does with it is the client's to say.
-                let delivery = match delivery.as_deref() {
-                    None => {
-                        return Err(Error::with(
-                            "invalid_delivery",
-                            format!(
-                                "delivery is required: one of {}",
-                                Delivery::NAMES.join(", ")
-                            ),
-                        )
-                        .facts(json!({"deliveries":Delivery::NAMES})));
-                    }
-                    Some(mode) => Delivery::requested(mode)?,
-                };
-                if expected_turn.is_some() && delivery != Delivery::Steer {
-                    return fail_with("invalid_delivery", "expected_turn needs delivery steer");
-                }
-                // A steer joins a turn that already has its cap.
-                if budget_tokens.is_some() && delivery == Delivery::Steer {
-                    return fail_with(
-                        "invalid_delivery",
-                        "budget_tokens starts a turn; a steer joins one, so send it with reject or queue",
-                    );
-                }
-                // An attached message joins whatever call the bot makes next.
-                if delivery == Delivery::Attach
-                    && (budget_tokens.is_some()
-                        || path.is_some()
-                        || model.is_some()
-                        || effort.is_some())
-                {
-                    return fail_with(
-                        "invalid_delivery",
-                        "attach joins the bot's next model call, so it takes no workspace, model, effort or budget_tokens",
-                    );
-                }
-                // A steer or an attached message joins a turn whose reply
-                // was asked for already.
-                if output_schema.is_some() && matches!(delivery, Delivery::Steer | Delivery::Attach)
-                {
-                    return fail_with(
-                        "invalid_delivery",
-                        "output_schema shapes the reply of the turn it starts; a steer or an attached message joins one, so send it with reject or queue",
-                    );
-                }
-                let output_schema = match output_schema {
-                    None => None,
-                    Some(schema @ Value::Object(_)) => {
-                        let text = schema.to_string();
-                        if text.len() > MAX_OUTPUT_SCHEMA_BYTES {
-                            return fail_with(
-                                "invalid_output_schema",
-                                format!(
-                                    "output_schema may be up to {MAX_OUTPUT_SCHEMA_BYTES} bytes as JSON"
-                                ),
-                            );
-                        }
-                        Some(text)
-                    }
-                    Some(_) => {
-                        return fail_with(
-                            "invalid_output_schema",
-                            "output_schema is a JSON Schema object",
-                        );
-                    }
-                };
-                if wait_ms.is_some() && delivery != Delivery::Attach {
-                    return fail_with(
-                        "invalid_delivery",
-                        "wait_ms is how long an attached message waits, so it needs delivery attach",
-                    );
-                }
-                if wait_ms.is_some_and(|n| n == 0 || n > MAX_WAIT_MS) {
-                    return fail_with(
-                        "invalid_wait",
-                        format!("wait_ms must be from 1 to {MAX_WAIT_MS}"),
-                    );
-                }
-                if budget_tokens.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
-                    return fail_with(
-                        "invalid_budget",
-                        format!("budget_tokens must be from 1 to {}", i64::MAX),
-                    );
-                }
-                let budget_counts = counts(budget_tokens, budget_counts)?;
-                // A steer that may keep its model or effort for the turn's
-                // end is noted before its commit, so an end reaped before
-                // its answer still looks for what it kept.
-                if delivery == Delivery::Steer
-                    && (model.is_some() || effort.is_some())
-                    && self.active.contains_key(&bot)
-                {
-                    self.kept.insert(bot.clone());
-                }
-                // A turn may run in another checkout or on another model of
-                // the same family; the conversation encoding never changes.
-                let options = TurnOptions {
-                    workspace: workspace_error.map_or(Ok(path), Err)?,
-                    model,
-                    effort,
-                    delivery,
-                    expected_turn,
-                    from: from.map(|author| (author.bot, author.turn)),
-                    origin,
-                    person,
-                    quotes,
-                    kept: None,
-                    budget_tokens,
-                    budget_counts,
-                    images,
-                    wait_ms,
-                    output_schema,
-                    fact: false,
-                };
-                // A slot is promised before the commit that may take it, so
-                // admissions queued together cannot start more turns than
-                // the limit allows.
-                // A `configure` kept for a turn that has ended, its task not
-                // yet reaped, is taken before this turn can start; one still
-                // running keeps it.
-                self.take_configure(&bot).await?;
-                let capacity = self.has_capacity();
-                let reserved = capacity && self.limit_active != 0;
-                self.reserved += usize::from(reserved);
-                // A steer arms the running turn inside its committing job,
-                // as `end_queued` does, so no round boundary before the
-                // answer finds it waiting behind a cleared flag.
-                // Withdrawing a message in line may expose steers behind it,
-                // as `end_queued` does, whatever this one's delivery.
-                let steering = matches!(delivery, Delivery::Steer | Delivery::Attach);
-                let steers = self
-                    .active
-                    .get(&bot)
-                    .filter(|_| steering || replaces.is_some())
-                    .map(|active| active.steers.clone());
-                let (b, r) = (bot.clone(), request_id.clone());
-                let providers = self.providers.clone();
-                let queued = self
-                    .store
-                    .queue("begin", move |db| {
-                        let identity = db.identity(&b, bot_id)?;
-                        let begin = |db: &mut agent_runtime::store::Database| {
-                            db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
-                                validate_provider(&providers, bot, model)
-                            })
-                        };
-                        // The replaced message is withdrawn and this one
-                        // sent in one step: no turn takes it in between, and
-                        // a refused send leaves it in line.
-                        let (started, replaced) = match replaces {
-                            None => (begin(db)?, None),
-                            Some(message) => db.atomic(|db| {
-                                let replaced = db.replace(&b, message, &r, &options)?;
-                                Ok((begin(db)?, Some(replaced)))
-                            })?,
-                        };
-                        let withdrawn = replaced.as_ref().is_some_and(|r| r.status == "withdrawn");
-                        if (withdrawn
-                            || (steering
-                                && started.fresh
-                                && matches!(started.status, "queued" | "attached")))
-                            && let Some(steers) = &steers
-                        {
-                            steers.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        Ok((identity, started, replaced))
-                    })
-                    .await;
-                let answer = match queued {
-                    Ok(answer) => answer,
-                    Err(error) => {
-                        self.reserved -= usize::from(reserved);
-                        return Err(error);
-                    }
-                };
-                // Sooner than its due is harmless: a retry's look finds
-                // nothing and plans the next.
-                if let Some(wait) = wait_ms {
-                    self.lapse_by(tokio::time::Instant::now() + Duration::from_millis(wait));
-                }
-                self.admissions.push_back(Admission {
-                    session,
-                    output: output.clone(),
-                    id,
-                    bound,
-                    pending: Pending::Submit {
-                        bot,
-                        request_id,
-                        delivery,
-                        reserved,
-                        held: self.held(),
-                        answer,
-                        answered: None,
-                    },
-                });
-                Err(Error::new("deferred"))
+            command @ Command::Submit { .. } => {
+                self.submit(command, None, session, output, id, bound, workspace_error)
+                    .await
             }
             Command::Interrupt { bot, turn } => self.interrupt(bot, turn).await,
             Command::Shutdown { grace_ms } => {
@@ -8143,6 +8007,306 @@ impl Service {
                 Ok(json!({"shutting_down":true}))
             }
         }
+    }
+
+    /// A `submit`, or the first message of the fork `forking` makes in the
+    /// same store job, so a copy asked something at once costs one commit
+    /// for both. Answered once committed, in request order.
+    #[allow(clippy::too_many_arguments)]
+    async fn submit(
+        &mut self,
+        command: Command,
+        forking: Option<Forking>,
+        session: u64,
+        output: &Output,
+        id: Value,
+        bound: Bound,
+        workspace_error: Option<Error>,
+    ) -> Result<Value> {
+        let Command::Submit {
+            bot,
+            bot_id,
+            request_id,
+            prompt,
+            workspace: path,
+            model,
+            effort,
+            delivery,
+            expected_turn,
+            from,
+            origin,
+            person,
+            quotes,
+            budget_tokens,
+            budget_counts,
+            images,
+            wait_ms,
+            output_schema,
+            replaces,
+        } = command
+        else {
+            unreachable!("only a submit is submitted")
+        };
+        name("request_id", &request_id)?;
+        if replaces.is_some_and(|message| message < 1) {
+            return fail_with("invalid_replaces", "replaces names a message, 1 or more");
+        }
+        let images = images_checked(
+            images.unwrap_or_default(),
+            |images| images.iter().collect(),
+            "a prompt",
+        )
+        .await?;
+        if origin.is_some() && from.is_some() {
+            return fail_with("invalid_origin", "from and origin are mutually exclusive");
+        }
+        if let Some(origin) = &origin {
+            name("origin", origin).map_err(|e| Error {
+                code: "invalid_origin".into(),
+                ..e
+            })?;
+        }
+        if let Some(person) = &person {
+            if from.is_some() || origin.is_some() {
+                return fail_with(
+                    "invalid_person",
+                    "person, from and origin are mutually exclusive",
+                );
+            }
+            name("person", person).map_err(|e| Error {
+                code: "invalid_person".into(),
+                ..e
+            })?;
+        }
+        let quotes = quotes.unwrap_or_default();
+        if quotes.len() > MAX_QUOTES {
+            return fail_with(
+                "invalid_quote",
+                format!("a prompt may quote up to {MAX_QUOTES} messages"),
+            );
+        }
+        if let Some(quote) = quotes.iter().find(|quote| quote.message < 1) {
+            return Err(
+                Error::with("invalid_quote", "a quoted message is 1 or more")
+                    .facts(json!({"bot":quote.bot,"message":quote.message})),
+            );
+        }
+
+        if prompt.len() > agent_runtime::store::Database::PROMPT_BYTES {
+            return fail_with(
+                "prompt_limit",
+                format!(
+                    "prompt may be up to {} bytes",
+                    agent_runtime::store::Database::PROMPT_BYTES
+                ),
+            );
+        }
+        // What a busy bot does with it is the client's to say.
+        let delivery = match delivery.as_deref() {
+            None => {
+                return Err(Error::with(
+                    "invalid_delivery",
+                    format!(
+                        "delivery is required: one of {}",
+                        Delivery::NAMES.join(", ")
+                    ),
+                )
+                .facts(json!({"deliveries":Delivery::NAMES})));
+            }
+            Some(mode) => Delivery::requested(mode)?,
+        };
+        if expected_turn.is_some() && delivery != Delivery::Steer {
+            return fail_with("invalid_delivery", "expected_turn needs delivery steer");
+        }
+        // A steer joins a turn that already has its cap.
+        if budget_tokens.is_some() && delivery == Delivery::Steer {
+            return fail_with(
+                "invalid_delivery",
+                "budget_tokens starts a turn; a steer joins one, so send it with reject or queue",
+            );
+        }
+        // An attached message joins whatever call the bot makes next.
+        if delivery == Delivery::Attach
+            && (budget_tokens.is_some() || path.is_some() || model.is_some() || effort.is_some())
+        {
+            return fail_with(
+                "invalid_delivery",
+                "attach joins the bot's next model call, so it takes no workspace, model, effort or budget_tokens",
+            );
+        }
+        // A steer or an attached message joins a turn whose reply
+        // was asked for already.
+        if output_schema.is_some() && matches!(delivery, Delivery::Steer | Delivery::Attach) {
+            return fail_with(
+                "invalid_delivery",
+                "output_schema shapes the reply of the turn it starts; a steer or an attached message joins one, so send it with reject or queue",
+            );
+        }
+        let output_schema = match output_schema {
+            None => None,
+            Some(schema @ Value::Object(_)) => {
+                let text = schema.to_string();
+                if text.len() > MAX_OUTPUT_SCHEMA_BYTES {
+                    return fail_with(
+                        "invalid_output_schema",
+                        format!(
+                            "output_schema may be up to {MAX_OUTPUT_SCHEMA_BYTES} bytes as JSON"
+                        ),
+                    );
+                }
+                Some(text)
+            }
+            Some(_) => {
+                return fail_with(
+                    "invalid_output_schema",
+                    "output_schema is a JSON Schema object",
+                );
+            }
+        };
+        if wait_ms.is_some() && delivery != Delivery::Attach {
+            return fail_with(
+                "invalid_delivery",
+                "wait_ms is how long an attached message waits, so it needs delivery attach",
+            );
+        }
+        if wait_ms.is_some_and(|n| n == 0 || n > MAX_WAIT_MS) {
+            return fail_with(
+                "invalid_wait",
+                format!("wait_ms must be from 1 to {MAX_WAIT_MS}"),
+            );
+        }
+        if budget_tokens.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
+            return fail_with(
+                "invalid_budget",
+                format!("budget_tokens must be from 1 to {}", i64::MAX),
+            );
+        }
+        let budget_counts = counts(budget_tokens, budget_counts)?;
+        // A steer that may keep its model or effort for the turn's
+        // end is noted before its commit, so an end reaped before
+        // its answer still looks for what it kept.
+        if delivery == Delivery::Steer
+            && (model.is_some() || effort.is_some())
+            && self.active.contains_key(&bot)
+        {
+            self.kept.insert(bot.clone());
+        }
+        // A turn may run in another checkout or on another model of
+        // the same family; the conversation encoding never changes.
+        let options = TurnOptions {
+            workspace: workspace_error.map_or(Ok(path), Err)?,
+            model,
+            effort,
+            delivery,
+            expected_turn,
+            from: from.map(|author| (author.bot, author.turn)),
+            origin,
+            person,
+            quotes,
+            kept: None,
+            budget_tokens,
+            budget_counts,
+            images,
+            wait_ms,
+            output_schema,
+            fact: false,
+        };
+        // A slot is promised before the commit that may take it, so
+        // admissions queued together cannot start more turns than
+        // the limit allows.
+        // A `configure` kept for a turn that has ended, its task not
+        // yet reaped, is taken before this turn can start; one still
+        // running keeps it.
+        self.take_configure(&bot).await?;
+        let capacity = self.has_capacity();
+        let reserved = capacity && self.limit_active != 0;
+        self.reserved += usize::from(reserved);
+        // A steer arms the running turn inside its committing job,
+        // as `end_queued` does, so no round boundary before the
+        // answer finds it waiting behind a cleared flag.
+        // Withdrawing a message in line may expose steers behind it,
+        // as `end_queued` does, whatever this one's delivery.
+        let steering = matches!(delivery, Delivery::Steer | Delivery::Attach);
+        let steers = self
+            .active
+            .get(&bot)
+            .filter(|_| steering || replaces.is_some())
+            .map(|active| active.steers.clone());
+        let (b, r) = (bot.clone(), request_id.clone());
+        let providers = self.providers.clone();
+        let expire_ms = forking.as_ref().and_then(|forking| forking.expire_ms);
+        let queued = self
+            .store
+            .queue("begin", move |db| {
+                let submitted = |db: &mut agent_runtime::store::Database, fork| {
+                    let identity = db.identity(&b, bot_id)?;
+                    let begin = |db: &mut agent_runtime::store::Database| {
+                        db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
+                            validate_provider(&providers, bot, model)
+                        })
+                    };
+                    // The replaced message is withdrawn and this one
+                    // sent in one step: no turn takes it in between, and
+                    // a refused send leaves it in line.
+                    let (started, replaced) = match replaces {
+                        None => (begin(db)?, None),
+                        Some(message) => db.atomic(|db| {
+                            let replaced = db.replace(&b, message, &r, &options)?;
+                            Ok((begin(db)?, Some(replaced)))
+                        })?,
+                    };
+                    let withdrawn = replaced.as_ref().is_some_and(|r| r.status == "withdrawn");
+                    if (withdrawn
+                        || (steering
+                            && started.fresh
+                            && matches!(started.status, "queued" | "attached")))
+                        && let Some(steers) = &steers
+                    {
+                        steers.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok((identity, started, replaced, fork))
+                };
+                // A fork and its first message commit together, or neither.
+                match forking {
+                    None => submitted(db, None),
+                    Some(forking) => db.atomic(|db| {
+                        let fork = forking.fork(db)?;
+                        submitted(db, Some(fork))
+                    }),
+                }
+            })
+            .await;
+        if let Some(ms) = expire_ms {
+            self.expire_by(tokio::time::Instant::now() + Duration::from_millis(ms));
+        }
+        let answer = match queued {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.reserved -= usize::from(reserved);
+                return Err(error);
+            }
+        };
+        // Sooner than its due is harmless: a retry's look finds
+        // nothing and plans the next.
+        if let Some(wait) = wait_ms {
+            self.lapse_by(tokio::time::Instant::now() + Duration::from_millis(wait));
+        }
+        self.admissions.push_back(Admission {
+            session,
+            output: output.clone(),
+            id,
+            bound,
+            pending: Pending::Submit {
+                bot,
+                request_id,
+                delivery,
+                reserved,
+                held: self.held(),
+                answer,
+                answered: None,
+            },
+        });
+        Err(Error::new("deferred"))
     }
 }
 
@@ -8361,7 +8525,7 @@ async fn delete_pieces(
 ) -> Result<Value> {
     let mut deleted = json!({"bot":bot,"bot_id":bot_id,"duplicate":false,
             "turns":0,"events":0,"nodes":0});
-    loop {
+    let reclaim_waits = loop {
         let name = bot.clone();
         let piece = store
             .op_pruning("delete_bot", name.clone(), move |db| {
@@ -8392,11 +8556,14 @@ async fn delete_pieces(
                 json!(deleted[key].as_i64().unwrap_or(0) + piece[key].as_i64().unwrap_or(0));
         }
         if piece["done"] == true {
-            break;
+            break piece["reclaim"] != false;
         }
+    };
+    // What it left that nothing else holds now goes too, a page per job,
+    // when switches left anything at all.
+    if reclaim_waits {
+        reclaim(&store).await?;
     }
-    // What it left that nothing else holds now goes too, a page per job.
-    reclaim(&store).await?;
     // Its connections go with it, and a later bot of the
     // same name starts on a fresh one; so does its own socket.
     for provider in providers.values() {

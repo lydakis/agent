@@ -846,15 +846,19 @@ pub async fn write(socket: PathBuf, bot: String) -> Result<[String; 3], Failed> 
         .unwrap_or_default()
         .as_millis();
     let name = copy_name(&bot, stamp);
+    // The copy and its question in one request, which the daemon commits
+    // together.
     let forked = client
         .request(
             "fork",
             json!({"source": bot, "bot": name, "allow": [],
-                "expire_ms": EXPIRE.as_millis() as u64, "request_id": name}),
+                "expire_ms": EXPIRE.as_millis() as u64, "request_id": name,
+                "submit": {"request_id": format!("{name}.1"), "prompt": ASK,
+                    "delivery": "steer"}}),
         )
         .await
         .map_err(unreached)?;
-    let reply = ask(&client, &name, &forked["bot_id"]).await;
+    let reply = answer(&client, &name, &forked["submitted"]).await;
     let _ = client
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
@@ -874,18 +878,10 @@ fn copy_name(bot: &str, stamp: u128) -> String {
 }
 
 /// The copy's reply, interrupting a turn that runs past `WAIT`.
-async fn ask(client: &Client, name: &str, id: &Value) -> Result<String, Failed> {
+async fn answer(client: &Client, name: &str, submitted: &Value) -> Result<String, Failed> {
     let unreached = |e: agent_client::Error| Failed::Unreached(e.to_string());
-    let submitted = client
-        .request(
-            "submit",
-            json!({"bot": name, "bot_id": id, "request_id": format!("{name}.1"),
-                "prompt": ASK, "delivery": "steer"}),
-        )
-        .await
-        .map_err(unreached)?;
     let handle = (submitted["handle"].as_str())
-        .ok_or_else(|| Failed::Unreached(format!("submit answered no handle: {submitted}")))?;
+        .ok_or_else(|| Failed::Unreached(format!("fork answered no message: {submitted}")))?;
     let waited = client
         .request(
             "wait",

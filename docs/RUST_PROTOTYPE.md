@@ -1513,6 +1513,7 @@ own path from the turn. Example requests:
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
 {"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","request_id":"alt-1"}
 {"id":28,"op":"fork","source":"Bob","bot":"Bob.side","allow":[],"expire_ms":900000,"request_id":"side-1"}
+{"id":34,"op":"fork","source":"Bob","bot":"Bob.suggest-1","allow":[],"expire_ms":60000,"request_id":"suggest-1","submit":{"request_id":"suggest-1.1","prompt":"Guess the person's next message","delivery":"steer"}}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":11,"op":"bots","after":null,"limit":64}
 {"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
@@ -2125,6 +2126,16 @@ history scan and copies no transcript into Rust. The first fork
 inside an uncheckpointed turn still scans its suffix; this is not constant-time
 validation for arbitrary nodes. Forking references existing stored nodes and
 creates no workspace or historical side effects.
+
+Protocol 100 lets `fork` take `submit`, the fork's first message as `submit`
+takes it without `bot`, `bot_id` or `workspace` (the fork gives them; naming
+one fails to parse). The fork and the message commit in one store job, or
+neither does: a message the store refuses leaves no fork. The reply is the
+fork's, with the message's answer under `submitted`, and it is answered in
+request order as any submission is. A resend with the same keys answers both
+as duplicates. A copy asked one thing at once (Sonny's suggestion, reviewer
+and shadow runs) costs one commit and one round trip fewer than `fork` then
+`submit`.
 
 Submission is idempotent on `(bot, request_id)`. An identical retry returns the
 same turn without executing again, including after restart. Reusing that key

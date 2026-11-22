@@ -3247,6 +3247,54 @@ class RuntimeTests(ModelFixture):
         self.assertLess(len(refused['detail']), 8192)
         self.assertEqual(client.request('inspect', bot='other')['error'], 'bot_not_found')
 
+    def test_a_fork_takes_its_first_message_in_the_same_commit(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        first = client.request('submit', bot='Bob', request_id='t', prompt='shared')['result']['message']
+        self.assertEqual(client.finished(first)['data']['status'], 'completed')
+        ask = dict(source='Bob', bot='Bob.ask', allow=[], expire_ms=60000, request_id='ask',
+                   submit=dict(request_id='ask.1', prompt='guess', delivery='steer'))
+        made = client.request('fork', **ask)['result']
+        sent = made['submitted']
+        self.assertEqual((made['duplicate'], sent['duplicate']), (False, False))
+        self.assertEqual((sent['bot'], sent['bot_id']), ('Bob.ask', made['bot_id']))
+        self.assertEqual(made['allowed'], [])
+        self.assertNotIn('instructions', made)
+        handle = f"Bob.ask/{sent['message']}"
+        done = client.request('wait', handles=[handle], timeout_ms=5000)['result']['results'][handle]
+        self.assertEqual((done['status'], done['text']), ('completed', 'reply:guess'))
+        # The copy read its source's history, then its first message.
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+        self.assertEqual([item['content'][0]['text'] for item in request['input']],
+                         ['shared', 'reply:shared', 'guess'])
+        # A resend answers both as they were.
+        again = client.request('fork', **ask)['result']
+        self.assertEqual((again['duplicate'], again['submitted']['duplicate']), (True, True))
+        self.assertEqual((again['bot_id'], again['submitted']['message']), (made['bot_id'], sent['message']))
+        # A message the store refuses leaves no fork.
+        refused = client.request('fork', source='Bob', bot='Bob.none', request_id='none',
+                                 submit=dict(request_id='none.1', prompt='p', delivery='reject',
+                                             model='missing/synthetic-model'))
+        self.assertEqual(refused['error'], 'provider_unavailable')
+        self.assertEqual(client.request('inspect', bot='Bob.none')['error'], 'bot_not_found')
+        # The fork names the bot and its folder; its message names neither.
+        for key, value in (('bot', 'Other'), ('bot_id', 1), ('workspace', str(self.path)), ('op', 'submit')):
+            wrong = client.request('fork', source='Bob', bot='Bob.wrong',
+                                   submit={'request_id': 'w', 'prompt': 'p', 'delivery': 'reject', key: value})
+            self.assertEqual(wrong['error'], 'invalid_request', key)
+            self.assertIn(key, wrong['detail'])
+        self.assertEqual(client.request('inspect', bot='Bob.wrong')['error'], 'bot_not_found')
+        # Without a delivery the message is refused as a submit's is, and no fork is made.
+        bare = client.request('fork', source='Bob', bot='Bob.bare', submit=dict(request_id='b', prompt='p'))
+        self.assertEqual(bare['error'], 'invalid_delivery')
+        self.assertEqual(client.request('inspect', bot='Bob.bare')['error'], 'bot_not_found')
+        # Deleted, the copy goes whole; its source keeps the shared turn.
+        gone = client.request('delete', bot='Bob.ask', bot_id=made['bot_id'])['result']
+        self.assertEqual((gone['duplicate'], gone['turns']), (False, 1))
+        self.assertEqual(client.request('delete', bot='Bob.ask', bot_id=made['bot_id'])['result']['duplicate'], True)
+        self.assertEqual(poll(client, 'Bob', first)['result']['text'], 'reply:shared')
+
     def test_a_running_bot_forks_at_its_newest_finished_round(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
