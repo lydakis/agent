@@ -3643,6 +3643,8 @@ mod tests {
             runs: Some(3),
             made: Some(7),
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let now = now_ms();
         // The lookout's files: mail down, ci's newest word on main, one
@@ -3798,6 +3800,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let inbox = follow("inbox", &["mail", "ci:main"]);
         lookout::subs::ensure(&store, "calc.lead", inbox.clone()).unwrap();
@@ -4026,6 +4030,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let task = |name: &str, maker: &str, state: &str, group: &str| {
             Arc::new(
@@ -4142,6 +4148,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, false)]);
         view.key(
@@ -4355,6 +4363,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let task = |name: &str, maker: &str| {
             Arc::new(
@@ -4433,6 +4443,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         lookout::subs::ensure(&store, "calc.lead", follow("inbox", &["mail", "ci:main"])).unwrap();
         lookout::subs::ensure(&store, "calc.lead", follow("builds", &["ci"])).unwrap();

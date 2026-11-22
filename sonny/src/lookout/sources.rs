@@ -2275,6 +2275,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         assert!(sub(None).hears(&event));
         assert!(sub(Some(json!({"event": ["merged"]}))).hears(&event));
@@ -3127,6 +3129,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let subscribers = HashMap::from([(
             "shop.lead".to_owned(),
@@ -3189,6 +3193,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let wanted = |subs: &[super::super::subs::Sub], field: &str| {
             super::super::subs::wanted(subs, "cr", field)

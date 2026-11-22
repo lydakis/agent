@@ -83,6 +83,8 @@ pub fn follow(board: &str, owner: Option<i64>) -> Sub {
         runs: None,
         made: None,
         outlives_close: true,
+        quiet: None,
+        about: None,
     }
 }
 

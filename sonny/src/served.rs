@@ -434,6 +434,9 @@ fn follows() -> Value {
                             "description": "What it hears that this matches, a pattern as filter's, goes at once, \
                                 past any digest, as the person's words do. As \
                                 {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."},
+                        "quiet": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
+                            "description": "Tell you once when it has heard nothing this long, as 15m; \
+                                what it hears next watches afresh."},
                         "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N notes."}
                     },

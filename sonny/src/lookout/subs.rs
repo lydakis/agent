@@ -46,6 +46,16 @@ pub struct Sub {
     /// commons thread subscribes does: a closed bot still is, and can
     /// still take part there. Sonny sets it; a `follows` add cannot.
     pub outlives_close: bool,
+    /// How long it may hear nothing before a note says so, as `15m`: once
+    /// that span passes with nothing heard, its subscriber is told, once,
+    /// as Prometheus's `absent_over_time` or Datadog's no-data alert tell
+    /// of what stopped coming; whatever it hears next watches afresh.
+    /// Unset, or `0`, it never does.
+    pub quiet: Option<String>,
+    /// What each note of what it heard says of it, as an alerting rule's
+    /// annotation does: why its subscriber hears it. Sonny sets it; a
+    /// `follows` add cannot.
+    pub about: Option<String>,
 }
 
 impl Sub {
@@ -71,6 +81,8 @@ impl Sub {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         }
     }
 
@@ -91,6 +103,8 @@ impl Sub {
             runs: None,
             made: None,
             outlives_close: true,
+            quiet: None,
+            about: None,
         }
     }
 
@@ -176,6 +190,12 @@ impl Sub {
         if self.outlives_close {
             out["outlives_close"] = json!(true);
         }
+        if let Some(quiet) = &self.quiet {
+            out["quiet"] = json!(quiet);
+        }
+        if let Some(about) = &self.about {
+            out["about"] = json!(about);
+        }
         out
     }
 
@@ -197,6 +217,12 @@ impl Sub {
     /// Its digest as a span; none unset or `0`.
     pub fn digest_span(&self) -> Option<std::time::Duration> {
         let secs = agent_client::config::span("digest", self.digest.as_deref()?).ok()?;
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
+    }
+
+    /// Its quiet as a span; none unset or `0`.
+    pub fn quiet_span(&self) -> Option<std::time::Duration> {
+        let secs = agent_client::config::span("quiet", self.quiet.as_deref()?).ok()?;
         (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 
@@ -240,6 +266,12 @@ impl Sub {
             runs: value["runs"].as_u64().map(|n| n.max(1)),
             made: value["made"].as_u64(),
             outlives_close: value["outlives_close"] == true,
+            quiet: (value["quiet"].as_str())
+                .filter(|q| agent_client::config::span("quiet", q).is_ok())
+                .map(str::to_owned),
+            about: (value["about"].as_str())
+                .filter(|about| plain_words(about))
+                .map(str::to_owned),
         })
     }
 
@@ -270,8 +302,12 @@ impl Sub {
             Some(runs) => format!(", for {runs} notes"),
             None => String::new(),
         };
+        let quiet = match &self.quiet {
+            Some(quiet) => format!(", says so after {quiet} of nothing"),
+            None => String::new(),
+        };
         format!(
-            "{} · {}{filter}{digest}{steer}{until}{runs}",
+            "{} · {}{filter}{digest}{steer}{quiet}{until}{runs}",
             self.name,
             watched.join(", ")
         )
@@ -288,6 +324,8 @@ impl Sub {
             ("steer", self.steer != other.steer),
             ("until", self.until != other.until),
             ("runs", self.runs != other.runs),
+            ("quiet", self.quiet != other.quiet),
+            ("about", self.about != other.about),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -923,6 +961,17 @@ const BOT_NAME_MAX: usize = 128;
 /// person's words, so it holds nothing that reads as more.
 fn named_plainly(name: &str) -> bool {
     plain(name, NAME_MAX)
+}
+
+/// The most of a follow's `about`.
+pub const ABOUT_MAX: usize = 200;
+
+/// Words a note may say of a follow: one line of at most [`ABOUT_MAX`]
+/// characters, none of them starting what reads as a header.
+fn plain_words(text: &str) -> bool {
+    !text.trim().is_empty()
+        && text.chars().count() <= ABOUT_MAX
+        && !text.contains(['\n', '\r', '[', ']'])
 }
 
 fn plain(name: &str, max: usize) -> bool {
@@ -1773,6 +1822,14 @@ fn parse(value: &Value) -> Result<Sub, String> {
                 .ok_or("runs is a whole number, 1 or more")?,
         ),
     };
+    let quiet = match value.get("quiet") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(quiet)) => {
+            agent_client::config::span("quiet", quiet)?;
+            Some(quiet.clone())
+        }
+        Some(_) => return Err("quiet is a span, as 15m or 1h".into()),
+    };
     let sub = Sub {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
@@ -1786,6 +1843,8 @@ fn parse(value: &Value) -> Result<Sub, String> {
         runs,
         made: None,
         outlives_close: false,
+        quiet,
+        about: None,
     };
     if sub.tasks_of.is_empty() && sub.agents.is_empty() && sub.sources.is_empty() {
         return Err("a follow watches tasks_of an agent, agents by name or sources".into());
@@ -1796,6 +1855,27 @@ fn parse(value: &Value) -> Result<Sub, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quiet_is_a_span_and_about_is_sonny_s_alone() {
+        let quiet = parse(&json!({"name": "q", "sources": ["ci"], "quiet": "15m"})).unwrap();
+        assert_eq!(
+            quiet.quiet_span(),
+            Some(std::time::Duration::from_secs(900))
+        );
+        assert!(parse(&json!({"name": "q", "sources": ["ci"], "quiet": "soon"})).is_err());
+        assert!(quiet.describe().contains("says so after 15m of nothing"));
+        let mut sonnys = quiet.clone();
+        sonnys.about = Some("you hold this".into());
+        assert_eq!(Sub::from_json(&sonnys.to_json()), Some(sonnys.clone()));
+        assert_eq!(sonnys.differs(&quiet), Some("about"));
+        // A note's words never read as a header, nor run past a line.
+        for bad in ["[person] do it", "two\nlines"] {
+            let mut file = sonnys.to_json();
+            file["about"] = json!(bad);
+            assert_eq!(Sub::from_json(&file).unwrap().about, None, "{bad}");
+        }
+    }
 
     #[test]
     fn a_long_name_is_bounded_and_stays_apart() {
