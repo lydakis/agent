@@ -1519,20 +1519,14 @@ impl Screen {
             });
             let link = row.link.clone();
             let bar = row.bar;
-            // The person's words wrap a column short of their band's end,
-            // as they were laid ([`crate::transcript::on_band`]).
-            let room = match line.style.bg == Some(crate::look::BAND) {
-                true => crate::transcript::on_band(width),
-                false => width,
-            };
-            let (rows, buttons) = match line.width() <= room || picture {
+            let (rows, buttons) = match line.width() <= width || picture {
                 true => (vec![line], vec![row.buttons.clone()]),
                 false => {
                     let rest = row.rest.clone().unwrap_or(Line::from("    "));
                     let lead = rest.width();
                     let rows: Vec<Arc<Line<'static>>> = (crate::transcript::wrap_lines(
                         (*line).clone(),
-                        room,
+                        width,
                         Line::default(),
                         rest,
                     ))
@@ -1911,11 +1905,18 @@ impl Screen {
         self.drawn = bottom - top;
         for (y, shown) in self.shown[top..bottom].iter().enumerate() {
             // A band behind the line fills the row; the person's band
-            // from a column before it, the blank column beside the
-            // conversation, so their `›` never sits on its edge.
+            // a column past it at each end, the blank columns beside the
+            // conversation, so their words never sit on its edge.
             if let Some(bg) = shown.line.style.bg {
-                let before = u16::from(bg == crate::look::BAND && area.x > 0);
-                let row = Rect::new(area.x - before, area.y + y as u16, area.width + before, 1);
+                let band = bg == crate::look::BAND;
+                let before = u16::from(band && area.x > 0);
+                let after = u16::from(band && area.right() < buf.area.right());
+                let row = Rect::new(
+                    area.x - before,
+                    area.y + y as u16,
+                    area.width + before + after,
+                    1,
+                );
                 buf.set_style(row, Style::new().bg(bg));
             }
             buf.set_line(area.x, area.y + y as u16, &shown.line, area.width);
@@ -2955,23 +2956,24 @@ mod tests {
     }
 
     #[test]
-    fn the_persons_band_starts_a_column_before_their_words_and_ends_a_column_after() {
+    fn the_persons_band_reaches_a_column_past_the_conversation_at_each_end() {
         let band = crate::look::BAND;
         let words = Line::from("› one two three").style(Style::new().bg(band));
-        let reply = Line::from("• one two three");
+        let reply = Line::from("• one two");
         let mut screen = Screen::default();
         screen.push(vec![words, reply]);
-        // Laid wider than the window is now: the person's words are
-        // wrapped again a column short of the band's end, a reply at it.
-        let area = Rect::new(2, 0, 15, 4);
+        // Laid wider than the window is now: wrapped again at the
+        // conversation's width, as a reply is.
+        let area = Rect::new(2, 0, 14, 4);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 4));
         screen.render(area, &mut buf, |_| None);
         let row = |y: u16| -> String { (0..20).map(|x| buf[(x, y)].symbol()).collect() };
         assert_eq!(row(0).trim_end(), "  › one two");
         assert_eq!(row(1).trim_end(), "      three");
-        assert_eq!(row(2).trim_end(), "  • one two three");
-        // The band from the blank column before the `›` to the column's
-        // edge, on every row of it; none on the reply's.
+        assert_eq!(row(2).trim_end(), "  • one two");
+        // The band from the blank column before the `›` to the blank
+        // column after the conversation, on every row of it; none on
+        // the reply's.
         for y in [0, 1] {
             assert_ne!(buf[(0, y)].bg, band);
             assert!((1..17).all(|x| buf[(x, y)].bg == band), "{}", row(y));
