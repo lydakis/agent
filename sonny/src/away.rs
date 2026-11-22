@@ -16,8 +16,10 @@
 //! away since then. It keeps which leads it tells, and since when, in
 //! `~/.agent/sonny/away`, written before the first note: a lead the daemon
 //! did not answer for is told again the next minute, under the same request
-//! ID, until every lead answered. The next use reads that file ([`here`]) and tells
-//! those leads the person is back: as a steer to each lead that heard
+//! ID, until every lead answered. The next use after that reads the file
+//! ([`here`]) and tells those leads the person is back (a return while
+//! `sonny away` still tells them, it tells of itself, after each lead's
+//! away note): as a steer to each lead that heard
 //! anything while they were away, which answers with what it kept, and
 //! attached to the rest. Both notes name the absence's start in their
 //! request IDs, so a note sent twice, as by two windows at once, is one.
@@ -366,7 +368,10 @@ pub fn here() {
     });
 }
 
-/// Touch the presence file; what the leads were told, if they were.
+/// Touch the presence file; what the leads were told, once every one of
+/// them was. While `sonny away` still tells them, it tells them the person
+/// is back too, after each lead's away note, as does its next run when it
+/// stopped short.
 fn touch() -> Option<Away> {
     let file = present_file()?;
     if let Some(dir) = file.parent() {
@@ -380,7 +385,7 @@ fn touch() -> Option<Away> {
     {
         let _ = opened.set_modified(SystemTime::now());
     }
-    read_away()
+    read_away().filter(|away| away.told)
 }
 
 #[cfg(test)]
