@@ -28,7 +28,10 @@ use ratatui::{
 
 pub struct Embedded {
     parser: Arc<Mutex<vt100::Parser>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// What goes to the program: keys, pastes and answers, written in
+    /// order on a thread of its own, so a program that stops reading holds
+    /// that thread, never the window.
+    writer: std::sync::mpsc::Sender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     size: (u16, u16),
@@ -67,9 +70,15 @@ impl Embedded {
             .map_err(|e| e.to_string())?;
         drop(pty.slave);
         let mut reader = pty.master.try_clone_reader().map_err(|e| e.to_string())?;
-        let writer = Arc::new(Mutex::new(
-            pty.master.take_writer().map_err(|e| e.to_string())?,
-        ));
+        let mut input = pty.master.take_writer().map_err(|e| e.to_string())?;
+        let (writer, written) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            while let Ok(bytes) = written.recv() {
+                if input.write_all(&bytes).and_then(|()| input.flush()).is_err() {
+                    break;
+                }
+            }
+        });
         let parser = Arc::new(Mutex::new(vt100::Parser::new(
             nonzero(rows),
             nonzero(cols),
@@ -127,13 +136,8 @@ impl Embedded {
                 }
                 drop(parser);
                 held = rest.to_vec();
-                if !answers.is_empty()
-                    && let Ok(mut writer) = replies.lock()
-                {
-                    for answer in answers {
-                        let _ = writer.write_all(&answer);
-                    }
-                    let _ = writer.flush();
+                for answer in answers {
+                    let _ = replies.send(answer);
                 }
                 drawn();
             }
@@ -193,10 +197,7 @@ impl Embedded {
     }
 
     fn send(&self, bytes: &[u8]) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
-        }
+        let _ = self.writer.send(bytes.to_vec());
     }
 
     /// A key, as a terminal sends it.
@@ -787,6 +788,23 @@ mod tests {
         };
         assert_eq!(opened, "shop.fix");
         assert_eq!(program.opened(), None);
+    }
+
+    /// A program that stops reading what it is sent never holds the
+    /// window: a paste far past what its terminal holds unread returns at
+    /// once, as do the keys after it.
+    #[test]
+    fn a_program_that_reads_nothing_never_holds_the_window() {
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let program = Embedded::spawn(command, 5, 20, || {}).unwrap();
+        let began = std::time::Instant::now();
+        program.paste(&"x".repeat(4 << 20));
+        for _ in 0..100 {
+            program.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        }
+        let took = began.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "held {took:?}");
     }
 
     #[test]
