@@ -3145,12 +3145,14 @@ that has `wait` and `history`; the approval modes never gate them.
 
 `spawn_agent` and `close_agent` make and close agents the same way, as
 Codex's `spawn_agent` and `close_agent` do, and `spawn_agent` takes what
-`run --new` and `fork` take, so nothing the CLI could make is lost.
+`run --new` and `fork` take but a tool list: as one Codex, Claude Code or
+Pi spawns, the agent it makes has the caller's tools, and only a profile,
+which a person writes, narrows them.
 `spawn_agent` makes an agent with the caller as its creator, so it works in
 the caller's folder (this turn's, or the `workspace` it names), in its
 sandbox and under its gates, never more loosely (see `Settings::under`),
-with the caller's tools and settings (its speed among them) unless `tools`
-and `settings` name others, and sends it `message` as its first, with
+with the caller's tools and settings (its speed among them) unless a
+profile names its tools and `settings` others, and sends it `message` as its first, with
 `quote` and `turn_budget_tokens` as `submit` takes them. A `name` with no
 dot is put in the caller's project (`review` from `shop.lead` is
 `shop.review`). Its instructions are those `run --new` gives: the preamble
@@ -3162,9 +3164,8 @@ profile's model. `budget_tokens`, `budget_counts`,
 `compaction_instructions` (empty: it never compacts), `compaction_model`,
 `fallback` and a gate (`approve`, `approver`, `approve_expire_ms`) are
 `create`'s. With `fork` it starts instead from a copy of the caller's
-conversation (the `fork` request, with its `checkpoint`, `allow` and
-`expire_ms`), taking no instructions, profile, model, effort, tools,
-settings or compaction. One `request_id`, the call's own unless the model
+conversation (the `fork` request, with its `checkpoint` and `expire_ms`),
+taking no instructions, profile, model, effort, settings or compaction. One `request_id`, the call's own unless the model
 names one, keys both the making and the message, so a call made again
 makes and sends nothing new. What it reads of the person's file system (the
 files composed for it, and its folder and writable folders by their real
@@ -3801,19 +3802,6 @@ own client declares others, a fork keeps its source's, and a fork's `allow`
 narrows them as it does the daemon's. Changing them changes the request's
 tool definitions, so a fork keys its own prompt cache from then on, as for
 instructions.
-
-Protocol version 100 gives `create` the `allow` a fork takes, naming every
-tool the new bot may call: the daemon's, declared ones, and the step names
-(`mcp__SERVER__TOOL`) its scripts may reach through a declared tool named
-that takes steps. Its `tools` and declared tools are kept to those named, so
-its model is shown only them, and `[]` leaves it nothing to call. A name it
-would not have, or one its creator is kept from, is `unsupported_tool_set`.
-Left out, a bot made by one kept to a list is kept to that list, of what it
-has. A bot kept to a list, made so or a fork, reaches through a script only
-the steps the list names: `approve_step` for any other is
-`tool_not_available`, as `run_step` is for a tool it may not call. A fork's
-`allow` takes step names the same way. `spawn_agent`'s `tools` is this list,
-by the names its caller sees, and the CLI's `run --new --allow` sends it.
 
 Protocol version 20 adds `inherit` to a declared tool, default `true` and
 reported only when `false`: a tool declared with `"inherit": false` stays

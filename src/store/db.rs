@@ -1508,12 +1508,6 @@ pub struct Binding<'a> {
     pub starts_line: bool,
     /// The profile its client composed it from, by name, kept on the bot.
     pub profile: Option<&'a str>,
-    /// Every tool it may call, its own and declared ones and the step
-    /// names (`mcp__SERVER__TOOL`) its scripts may reach, as a fork's
-    /// `allow` lists them: its tools and declared tools are those named,
-    /// and its scripts' steps only those named. `None` keeps it to its
-    /// creator's list, if its creator has one.
-    pub allow: Option<&'a [String]>,
 }
 /// What became of the message a submission replaces: withdrawn by it
 /// while still in line, or how it had ended already.
@@ -2004,71 +1998,6 @@ pub fn unserved(detail: String) -> Outcome {
 }
 /// The tools a gate may hold back: the daemon's a bot has and those its
 /// client declared.
-/// A new bot's own tools, declared tools and allowed list, from those it
-/// is made with (`tools`, `declared`), the list it is allowed (`allow`) and
-/// its creator's (`above`). With neither, it keeps what it is made with.
-/// `allow` names every tool it may call: its own and declared tools are
-/// kept to those named, and a step name (`mcp__SERVER__TOOL`) is one its
-/// scripts may call through a declared tool named that takes steps. A
-/// name it would not have is refused, as is one its creator may not call.
-/// Without `allow`, it is kept to its creator's list, of what it has.
-fn allowed_tools(
-    tools: &[String],
-    declared: ToolList,
-    allow: Option<&[String]>,
-    above: Option<&[String]>,
-) -> Result<(Vec<String>, ToolList, Option<Vec<String>>)> {
-    let within = |name: &String| above.is_none_or(|above| above.contains(name));
-    let has = |name: &String, allow: &[String]| {
-        tools.contains(name)
-            || declared.iter().any(|tool| &tool.name == name)
-            || (crate::tools::is_step_name(name)
-                && (declared.iter()).any(|tool| tool.steps && allow.contains(&tool.name)))
-    };
-    let allowed: Vec<String> = match (allow, above) {
-        (None, None) => return Ok((tools.to_vec(), declared, None)),
-        (Some(allow), _) => {
-            let mut allowed: Vec<String> = Vec::with_capacity(allow.len());
-            for name in allow {
-                if allowed.contains(name) {
-                    continue;
-                }
-                if !within(name) {
-                    return fail_with(
-                        "unsupported_tool_set",
-                        format!("{name}: its creator may not call it"),
-                    );
-                }
-                if !has(name, allow) {
-                    return fail_with(
-                        "unsupported_tool_set",
-                        format!("{name}: not among its tools, declared tools or step names"),
-                    );
-                }
-                allowed.push(name.clone());
-            }
-            allowed
-        }
-        (None, Some(above)) => (above.iter())
-            .filter(|name| has(name, above))
-            .cloned()
-            .collect(),
-    };
-    let own: Vec<String> = (tools.iter())
-        .filter(|tool| allowed.contains(tool))
-        .cloned()
-        .collect();
-    let declared = match declared.iter().all(|tool| allowed.contains(&tool.name)) {
-        true => declared,
-        false => ToolList::new(
-            (declared.iter())
-                .filter(|tool| allowed.contains(&tool.name))
-                .cloned()
-                .collect(),
-        )?,
-    };
-    Ok((own, declared, Some(allowed)))
-}
 fn gateable(tools: &[String], declared: &[Declared]) -> Vec<String> {
     tools
         .iter()
@@ -5030,13 +4959,6 @@ impl Database {
     /// The tools the creating bot's client declared, which a bot it
     /// creates takes unless its own client declares others: all but those
     /// declared as the creator's own, each passed on one generation fewer.
-    /// The tools the bot holding identity `id` is kept to, when it is.
-    fn creator_allowed(conn: &Connection, id: i64) -> Result<Option<Vec<String>>> {
-        let stored: Option<String> = conn
-            .prepare_cached("SELECT allowed FROM bots WHERE id=?")?
-            .query_row([id], |r| r.get(0))?;
-        Ok(stored.as_deref().map(split_tools))
-    }
     fn creator_declared(conn: &Connection, creator: Option<i64>) -> Result<ToolList> {
         let Some(id) = creator else {
             return Ok(ToolList::default());
@@ -6416,9 +6338,6 @@ impl Database {
             if binding.starts_line {
                 request["starts_line"] = json!(true);
             }
-            if let Some(allow) = binding.allow {
-                request["allow"] = json!(allow);
-            }
             if let Some(profile) = binding.profile {
                 request["profile"] = json!(profile);
             }
@@ -6444,16 +6363,9 @@ impl Database {
             Some(declared) => declared.clone(),
             None => Self::creator_declared(&tx, created_by_id)?,
         };
-        // Kept to the tools it is allowed, and to its creator's: never more.
-        let above = match created_by_id {
-            Some(id) => Self::creator_allowed(&tx, id)?,
-            None => None,
-        };
-        let (own, declared, allowed) =
-            allowed_tools(binding.tools, declared, binding.allow, above.as_deref())?;
         // A gate may hold back the tools the bot is declared, its own or
         // its creator's.
-        let tools = gateable(&own, &declared);
+        let tools = gateable(binding.tools, &declared);
         let declared = keep_list(&tx, &declared)?;
         if let Some(gate) = binding.gate {
             not_in_tools(&gate.tools, &tools)?;
@@ -6480,7 +6392,7 @@ impl Database {
             None => binding.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_model,fallback,gates,settings,creation,declared,budget_counts,depth,profile,allowed) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_model,fallback,gates,settings,creation,declared,budget_counts,depth,profile) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -6490,7 +6402,7 @@ impl Database {
                 binding.model,
                 binding.effort,
                 binding.budget_tokens.map(|b| b as i64),
-                own.join(","),
+                binding.tools.join(","),
                 binding.created_by,
                 created_by_id,
                 binding.compaction_model,
@@ -6502,7 +6414,6 @@ impl Database {
                 binding.budget_counts.stored(),
                 depth as i64,
                 binding.profile,
-                allowed.as_ref().map(|allowed| allowed.join(",")),
             ],
         )?;
         instruct(
@@ -11797,13 +11708,6 @@ impl Database {
         if self.request(turn, &id)?.is_some() {
             return fail_with("step_waiting", format!("step {step} is waiting already"));
         }
-        // A bot kept to a list of tools reaches through its scripts only
-        // those the list names, as it calls them itself.
-        if tool != parent
-            && !(bot.allowed.as_ref()).is_none_or(|allowed| allowed.iter().any(|t| t == tool))
-        {
-            return Err(Error::with("tool_not_available", tool));
-        }
         // A step that names one of the bot's own tools, other than its
         // call's, is decided as that call from the model would be, by the
         // plan every caller shares; its client does what it allows.
@@ -16593,19 +16497,8 @@ impl Database {
             None => parent.allowed.clone(),
             Some(allow) => {
                 let mut allowed: Vec<String> = Vec::with_capacity(allow.len());
-                // A step name its scripts reach through a tool named that
-                // takes steps, as a new bot's list names one.
-                let steps = |tool: &String| {
-                    parent.allowed.is_none()
-                        && crate::tools::is_step_name(tool)
-                        && (allow.iter()).any(|named| {
-                            parent
-                                .declared(named)
-                                .is_some_and(|declared| declared.steps)
-                        })
-                };
                 for tool in allow {
-                    if !parent.entitled(tool) && !steps(tool) {
+                    if !parent.entitled(tool) {
                         return fail_with(
                             "allow_not_in_source",
                             format!("{source} may not call {tool}"),

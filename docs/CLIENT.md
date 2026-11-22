@@ -47,7 +47,7 @@ A profile (`<role>.md`) is Markdown with optional YAML front matter (unknown key
 | --- | --- |
 | `description` | One-line summary shown in the profiles index and `/new` |
 | `model` | Default `PROVIDER/MODEL` when the caller doesn't specify one |
-| `tools` | Default tool list for this runtime. For an agent `spawn_agent` starts in the profile, it is every tool the agent may call, as the call's own `tools` is: the daemon's, its maker's declared tools (Sonny's among them) and `mcp__SERVER__TOOL` names its scripts may call; a name its maker may not give is refused |
+| `tools` | Default tool list for this runtime |
 | `sandbox` | `read-only`, `workspace-write`, or `danger-full-access`, as a Codex role's `config_file` sets `sandbox_mode`. An agent started in the profile (`--profile`, `spawn_agent`'s `profile`, Sonny's `start_task` and workflow workers) starts in it unless the call names its own sandbox. It never loosens what the agent would get from its maker: a stricter one replaces that (`read-only` with no writable folders, network, or sockets), and a looser one is refused as `invalid_setting` rather than tightened. Any other value is `profile_invalid`. |
 | `extends` | Inherit body and unset keys from another profile (chains up to 8 deep; cycles fail with `profile_invalid`). Extending your own name builds on the shadowed file (e.g., project `lead.md` extending user `lead.md` extending Sonny's shipped `lead.md`) |
 | `skills` | List of skill names whose full `SKILL.md` bodies are inlined under `## Skill: NAME` instead of indexed |

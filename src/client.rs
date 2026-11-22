@@ -1618,6 +1618,36 @@ fn held_declared(bot: &Value) -> Vec<&str> {
         .collect()
 }
 
+/// `named` split into the daemon's tools and the tools `maker` declared
+/// that are named, as it passes them on: each a generation fewer, as the
+/// daemon passes them, and none it keeps from the bots it makes.
+fn named_tools(named: &[String], maker: &Value) -> (Vec<String>, Vec<Value>) {
+    let passed = (maker["declared"].as_array().into_iter().flatten())
+        .filter(|tool| tool["inherit"] != false && tool["inherit"] != 0);
+    let (mut tools, mut declare) = (Vec::new(), Vec::new());
+    for name in named {
+        match passed.clone().find(|tool| tool["name"] == name.as_str()) {
+            Some(tool)
+                if !declare
+                    .iter()
+                    .any(|had: &Value| had["name"] == name.as_str()) =>
+            {
+                let mut tool = tool.clone();
+                if let Some(left) = tool["inherit"].as_u64() {
+                    tool["inherit"] = match left - 1 {
+                        0 => json!(false),
+                        left => json!(left),
+                    };
+                }
+                declare.push(tool);
+            }
+            Some(_) => {}
+            None => tools.push(name.clone()),
+        }
+    }
+    (tools, declare)
+}
+
 /// Whether a bot record has a gate the `auto` approver answers: none for
 /// a bot that never asks, whatever gates it keeps.
 fn answered_by_auto(bot: &Value) -> bool {
@@ -2198,15 +2228,17 @@ fn run(options: &Options) -> Result<i32> {
                 .map(str::to_owned)
                 .collect(),
         };
-        // --allow: every tool it may call, its own among them.
-        let allow: Option<Vec<String>> = (options.allow.as_deref()).map(|allow| {
-            (allow.split(',').filter(|t| !t.is_empty()))
-                .map(str::to_owned)
-                .collect()
-        });
-        let tools: Vec<String> = match &allow {
-            Some(allow) => tools.into_iter().filter(|t| allow.contains(t)).collect(),
-            None => tools,
+        // --tools names every tool it gets: the daemon's and, of those its
+        // maker declared and passes on, the ones named. Without it, it gets
+        // every one its maker passes on.
+        let (tools, declare) = match (&created_by, options.tools_explicit) {
+            (Some(by), true) => {
+                let maker =
+                    connection.request("inspect", json!({"bot": by, "bot_id": created_by_id}))?;
+                let (tools, declare) = named_tools(&tools, &maker);
+                (tools, Some(declare))
+            }
+            _ => (tools, None),
         };
         let mut settings = options.settings.clone();
         // The role's sandbox, unless --sandbox names one; the daemon keeps
@@ -2249,8 +2281,8 @@ fn run(options: &Options) -> Result<i32> {
             // The role it is composed in, or the one its client composed
             // it in, kept on the bot.
             "profile":options.profile.as_ref().or(options.profile_name.as_ref())});
-        if let Some(allow) = &allow {
-            create["allow"] = json!(allow);
+        if let Some(declare) = &declare {
+            create["declare"] = json!(declare);
         }
         if let Value::Object(mut gate) = requested_gate(options, &tools)? {
             // The tools its creator declared, which it inherits, held by
@@ -2264,9 +2296,9 @@ fn run(options: &Options) -> Result<i32> {
                     connection.request("inspect", json!({"bot": by, "bot_id": created_by_id}))?;
                 if let Some(Value::Array(approve)) = gate.get_mut("approve") {
                     for name in held_declared(&maker) {
-                        let kept =
-                            (allow.as_ref()).is_none_or(|allow| allow.iter().any(|a| a == name));
-                        if kept && !approve.iter().any(|have| have == name) {
+                        let has = (declare.as_ref())
+                            .is_none_or(|declare| declare.iter().any(|tool| tool["name"] == name));
+                        if has && !approve.iter().any(|have| have == name) {
                             approve.push(json!(name));
                         }
                     }

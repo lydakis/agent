@@ -772,9 +772,6 @@ pub struct Steps {
     next: std::sync::atomic::AtomicU64,
     /// The one step of the call the daemon runs at a time.
     one: tokio::sync::Mutex<()>,
-    /// The tools its agent is kept to, when it is: the script is shown
-    /// and reaches only those, as its daemon lets it.
-    allowed: Option<Vec<String>>,
 }
 
 /// Where a step is put: this machine's daemon, or the gate of the agent of
@@ -818,14 +815,7 @@ impl Steps {
             ),
             next: Default::default(),
             one: Default::default(),
-            allowed: None,
         }
-    }
-
-    /// These steps, of an agent kept to `allowed` when it is.
-    pub fn kept_to(mut self, allowed: Option<Vec<String>>) -> Self {
-        self.allowed = allowed;
-        self
     }
 
     /// Tell the agent's daemon of the call of `tool`, which the agent
@@ -1080,13 +1070,6 @@ async fn run_keeping(
         entries.push(entry);
     }
     listed.splice(0..0, entries);
-    // An agent kept to a list of tools is shown only those it names.
-    if let Some(allowed) = steps.as_ref().and_then(|steps| steps.allowed.as_ref()) {
-        nested.retain(|name, _| allowed.contains(name));
-        listed.retain(|entry| {
-            (entry["name"].as_str()).is_some_and(|name| allowed.iter().any(|a| a == name))
-        });
-    }
     // A trigger's shadow run reads and does nothing else: a call of a tool
     // that does not say it only reads, or that would ask the person, is
     // refused, never asked about.

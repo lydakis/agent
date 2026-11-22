@@ -184,16 +184,6 @@ fn wanted(record: &Value, role: Role) -> Option<Vec<Value>> {
     if !role.lead && !role.worker && resolves(record) {
         ours.push(kinded(crate::resolved::tool()));
     }
-    // One kept to a list of tools, as a helper made with `tools` is, is
-    // given none of Sonny's the list leaves out; a fork keeps those it was
-    // copied with, as its prompt cache is its source's.
-    if let Some(allowed) = record["allowed"].as_array() {
-        let has = |tool: &Value| {
-            (record["declared"].as_array())
-                .is_some_and(|have| have.iter().any(|had| had["name"] == tool["name"]))
-        };
-        ours.retain(|tool| allowed.contains(&tool["name"]) || has(tool));
-    }
     // A gate Sonny did not set, as another client's tag or several, is
     // not one Sonny can add its gated tools to, so that bot goes without
     // them rather than run them unjudged.
@@ -598,28 +588,6 @@ mod tests {
             .collect();
         assert!(!names.contains(&"goal"));
         assert!(names.contains(&"theirs"));
-    }
-
-    #[test]
-    fn a_helper_kept_to_a_list_takes_none_of_sonnys_tools_it_does_not_name() {
-        // Made with tools ["read", "memory"]: memory alone of Sonny's.
-        let memory: Vec<Value> = (tools(a_helper()).into_iter())
-            .filter(|tool| tool["name"] == crate::served::MEMORY)
-            .collect();
-        let helper = json!({"name": "calc.fix.check", "bot_id": 9, "created_by": "calc.fix",
-            "tools": ["read"], "declared": memory,
-            "allowed": ["read", crate::served::MEMORY]});
-        assert_eq!(refresh(&helper), Ok(None));
-        assert_eq!(declare(&helper, Role::TASK), None);
-        // Made with ["read"]: none of Sonny's, and none adopted.
-        let bare = json!({"name": "calc.fix.look", "bot_id": 10, "created_by": "calc.fix",
-            "tools": ["read"], "allowed": ["read"]});
-        assert_eq!(adopt(&bare), None);
-        assert_eq!(declare(&bare, Role::TASK), None);
-        // A copy that may call nothing keeps the tools it was copied with.
-        let copy = json!({"name": "calc.lead.side-1", "bot_id": 11, "declared": tools(a_lead()),
-            "allowed": []});
-        assert_eq!(refresh(&copy), Ok(None));
     }
 
     #[test]

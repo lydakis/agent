@@ -140,7 +140,6 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             declare,
             settings,
             profile,
-            allow,
             ..
         } => (
             // A bot that takes its creator's declared tools shows them too,
@@ -157,7 +156,6 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                 compaction_model,
                 fallback,
                 profile,
-                allow,
             ))
             .map(|bytes| {
                 bytes
@@ -389,12 +387,6 @@ enum Command {
         /// The profile its client composed it from, by name: kept on the
         /// bot and listed with it. The daemon reads nothing for it.
         profile: Option<String>,
-        /// Every tool it may call, as a fork's `allow`: its own tools,
-        /// declared tools and the step names (`mcp__SERVER__TOOL`) its
-        /// scripts may reach through a tool named that takes steps. Its
-        /// tools and declared tools are kept to those named; `[]` allows
-        /// none. Left out, it is kept to its creator's list, if any.
-        allow: Option<Vec<String>>,
     },
     /// A bot's record, as `inspect` gives it, and the path of its own
     /// socket, which listens while this session lasts: so a client can run
@@ -5208,35 +5200,6 @@ impl Service {
         Ok(())
     }
 
-    /// An `allow` list of a fork or a new bot, bounded: its tools, as many
-    /// declared and as many step names as `steps_only` lists. Repeats are
-    /// allowed; the set stops growing past the bound.
-    fn allow_list(&self, tools: Vec<String>) -> Result<Vec<String>> {
-        let most =
-            self.registry.tool_count() + MAX_DECLARED + agent_runtime::store::STEPS_ONLY_NAMES;
-        if tools.len() > most && {
-            let mut distinct = std::collections::HashSet::new();
-            tools.iter().any(|tool| {
-                distinct.insert(tool.as_str());
-                distinct.len() > most
-            })
-        } {
-            return fail_with(
-                "invalid_allow",
-                format!("allow names more tools than a bot may have, {most}"),
-            );
-        }
-        if let Some(tool) = tools
-            .iter()
-            .find(|tool| tool.is_empty() || tool.len() > 256)
-        {
-            return fail_with(
-                "invalid_allow",
-                format!("a tool's name is 1 to 256 bytes, not {} bytes", tool.len()),
-            );
-        }
-        Ok(tools)
-    }
     /// The list a `declare` names, found and checked once: tools are
     /// checked and named by their digest, and a digest is the list in use
     /// or the store's (`tool_list_unknown` for one no bot holds now).
@@ -6186,7 +6149,6 @@ impl Service {
                 request_id,
                 starts_line,
                 profile,
-                allow,
             } => {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
@@ -6195,7 +6157,6 @@ impl Service {
                 if let Some(key) = &request_id {
                     name("request_id", key)?;
                 }
-                let allow = allow.map(|tools| self.allow_list(tools)).transpose()?;
                 // `approve: []` alone asks for no gate: a root bot has none,
                 // and a bot made by another, which keeps its creator's, is
                 // refused rather than given them unasked.
@@ -6321,7 +6282,6 @@ impl Service {
                                 request_id: request_id.as_deref(),
                                 starts_line,
                                 profile: profile.as_deref(),
-                                allow: allow.as_deref(),
                             },
                         )?;
                         let cursor = event.as_ref().and_then(|e| e["cursor"].as_i64());
@@ -7642,7 +7602,26 @@ impl Service {
                     Some(None) => {
                         return fail_with("invalid_allow", "allow is a list of tool names");
                     }
-                    Some(Some(tools)) => Some(self.allow_list(tools)?),
+                    // Repeats are allowed; the set stops growing past the
+                    // bound, the daemon's tools and as many declared.
+                    Some(Some(tools))
+                        if tools.len() > self.registry.tool_count() + MAX_DECLARED && {
+                            let mut distinct = std::collections::HashSet::new();
+                            tools.iter().any(|tool| {
+                                distinct.insert(tool.as_str());
+                                distinct.len() > self.registry.tool_count() + MAX_DECLARED
+                            })
+                        } =>
+                    {
+                        return fail_with(
+                            "invalid_allow",
+                            format!(
+                                "allow names more tools than a bot may have, {}",
+                                self.registry.tool_count() + MAX_DECLARED
+                            ),
+                        );
+                    }
+                    Some(Some(tools)) => Some(tools),
                 };
                 let gate = gate(
                     approve,
@@ -8990,7 +8969,6 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
-                        allow: None,
                     },
                 )?;
                 let turn = db
@@ -9194,7 +9172,6 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
-                        allow: None,
                     },
                 )?;
                 let turn = db
@@ -9462,7 +9439,6 @@ mod tests {
             request_id: None,
             starts_line: false,
             profile: None,
-            allow: None,
         };
         let in_use = |providers: &[&str]| {
             let providers: Vec<String> = providers.iter().map(|p| (*p).to_owned()).collect();
@@ -9527,7 +9503,6 @@ mod tests {
             request_id: None,
             starts_line: false,
             profile: None,
-            allow: None,
         };
         let turn = store
             .op("create", move |db| {
@@ -9801,7 +9776,6 @@ mod tests {
                                 request_id: None,
                                 starts_line: false,
                                 profile: None,
-                                allow: None,
                             },
                         )?;
                         let turn = db
@@ -10408,7 +10382,6 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
-                        allow: None,
                     },
                 )?;
                 // No slot was free when it was accepted, so it queued.
@@ -10499,7 +10472,6 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
-                        allow: None,
                     },
                 )
                 .map(|_| ())
@@ -10903,7 +10875,6 @@ mod tests {
             request_id: None,
             starts_line: false,
             profile: None,
-            allow: None,
         }
     }
     #[test]
@@ -12346,7 +12317,6 @@ mod tests {
                             request_id: None,
                             starts_line: false,
                             profile: None,
-                            allow: None,
                         },
                     )?;
                     creator = Some(bot);
@@ -12636,7 +12606,6 @@ mod tests {
                         request_id: None,
                         starts_line: false,
                         profile: None,
-                        allow: None,
                     },
                 )?;
                 let turn = db

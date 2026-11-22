@@ -581,13 +581,6 @@ class SocketAndCliTests(ModelFixture):
                          '--tools', 'nothing', '--new', '--bot', 'Odd', '--detach', 'hi', check=False)
         self.assertEqual(bad.returncode, 1)
         self.assertIn('unsupported_tool_set', bad.stderr + bad.stdout)
-        # --allow names every tool it may call: its tools are those named.
-        kept = json.loads(self.agent('run', '--store', str(self.store), '--model', 'openai/synthetic-model',
-                                     '--tools', 'echo,shell', '--allow', 'echo', '--new', '--bot', 'Kept',
-                                     '--detach', 'hi').stdout)
-        self.agent('wait', '--store', str(self.store), kept['handle'])
-        record = json.loads(self.agent('inspect', '--store', str(self.store), '--bot', 'Kept').stdout)
-        self.assertEqual((record['tools'], record['allowed']), (['echo'], ['echo']))
 
     def test_a_new_bot_needs_a_model_from_the_client(self):
         without = self.agent('run', '--store', str(self.store), '--provider', f'openai=responses,{self.url}',
@@ -853,7 +846,7 @@ class SocketAndCliTests(ModelFixture):
         # A copy is named, made fresh, and keeps its source's choices.
         for args, says in ((('--fork', 'Bob', 'q'), 'needs --bot'),
                            (('--bot', 'Bob', '--expires', '15m', 'q'), 'is for a copy made with --fork'),
-                           (('--bot', 'Bob', '--allow=', 'q'), 'is for a new bot or a copy made with --fork'),
+                           (('--bot', 'Bob', '--allow=', 'q'), 'is for a copy made with --fork'),
                            (('--fork', 'Bob', '--bot', 'C', '--new', 'q'), 'conflicts with'),
                            (('--fork', 'Bob', '--bot', 'C', '--instructions', 'x', 'q'), 'is for a new bot'),
                            (('--fork', 'Bob', '--bot', 'C', '--expires', '500ms', 'q'), 'from 1s to 365d')):
@@ -1201,6 +1194,38 @@ class SocketAndCliTests(ModelFixture):
                    '--created-by', 'p.lead', '--bot', 'p.asked', 'hello')
         self.assertEqual(control.request('inspect', bot='p.asked')['result']['settings']['sandbox'],
                          'workspace-write')
+
+    def test_tools_name_which_of_its_makers_declared_tools_a_new_bot_gets(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.first', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        declare = [{'name': 'ask', 'description': 'Ask.', 'parameters': {'type': 'object'}},
+                   {'name': 'memory', 'description': 'Notes.', 'parameters': {'type': 'object'},
+                    'answered_by': 'sonny', 'inherit': 2},
+                   {'name': 'mine', 'description': 'Its own.', 'parameters': {'type': 'object'},
+                    'inherit': False}]
+        made = control.request('create', bot='p.lead', workspace=str(self.path), declare=declare,
+                               model='openai/synthetic-model', tools=['echo', 'shell'])
+        self.assertIn('result', made, made)
+        declared = lambda bot: {tool['name']: tool.get('inherit', True)
+                                for tool in control.request('inspect', bot=bot)['result'].get('declared') or []}
+        # Without --tools: every one its maker passes on, a generation fewer.
+        plain = self.common[:6]
+        self.agent('run', *plain, '--new', '--created-by', 'p.lead', '--bot', 'p.every', '--detach', 'hi')
+        self.assertEqual(declared('p.every'), {'ask': True, 'memory': 1})
+        # --tools names them too: those named, and the daemon's it names.
+        self.agent('run', *plain, '--tools', 'echo,memory', '--new', '--created-by', 'p.lead',
+                   '--bot', 'p.some', '--detach', 'hi')
+        some = control.request('inspect', bot='p.some')['result']
+        self.assertEqual((some['tools'], declared('p.some')), (['echo'], {'memory': 1}))
+        self.agent('run', *plain, '--tools', 'echo', '--new', '--created-by', 'p.lead', '--bot', 'p.none',
+                   '--detach', 'hi')
+        self.assertEqual(declared('p.none'), {})
+        # One its maker keeps to itself is no tool it can name.
+        kept = self.agent('run', *plain, '--tools', 'echo,mine', '--new', '--created-by', 'p.lead',
+                          '--bot', 'p.mine', '--detach', 'hi', check=False)
+        self.assertNotEqual(kept.returncode, 0)
+        self.assertIn('unsupported_tool_set', kept.stderr + kept.stdout)
 
     def test_a_client_makes_a_bot_for_another_while_the_prompt_stays_its_own(self):
         # As Sonny's /new starts a task for the lead in its window: the task

@@ -2097,26 +2097,13 @@ async fn script(
 ) -> Result<Value, (&'static str, String)> {
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
     let bot = str_of(&call["bot"]);
-    let record = unreviewed(client, &bot, &Value::Null, EXEC).await?;
-    // One kept to a list of tools (`allowed`) is shown and reaches only
-    // those it names.
-    let allowed = (record
-        .as_ref()
-        .and_then(|record| record["allowed"].as_array()))
-    .map(|allowed| {
-        allowed
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect()
-    });
+    unreviewed(client, &bot, &Value::Null, EXEC).await?;
     let steps = crate::exec::Steps::new(
         client.clone(),
         bot.clone(),
         call["turn"].as_i64().unwrap_or(0),
         str_of(&call["call_id"]),
-    )
-    .kept_to(allowed);
+    );
     // On the machine its options line names, against that machine's
     // servers, with this agent's gate asked what they ask first.
     if let Ok(crate::exec::Script {
@@ -2488,16 +2475,16 @@ async fn unreviewed(
     bot: &str,
     bot_id: &Value,
     tool: &str,
-) -> Result<Option<Value>, (&'static str, String)> {
+) -> Result<(), (&'static str, String)> {
     if !GATED.contains(&tool) {
-        return Ok(None);
+        return Ok(());
     }
     let inspected = client
         .request("inspect", json!({"bot": bot, "bot_id": bot_id}))
         .await
         .map_err(|e| ("caller_unknown", e.to_string()))?;
     match crate::approvals::may_run(&inspected, tool) {
-        true => Ok(Some(inspected)),
+        true => Ok(()),
         false => Err((
             "escalation_refused",
             format!(
