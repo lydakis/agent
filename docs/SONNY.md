@@ -1832,6 +1832,7 @@ sonny link forget laptop       # run on the host to forget a linked machine
 - **Desktop (`desktop` with `machine: "laptop"`):** Runs `agent-desktop` on the linked machine with action approvals routed to the host agent's gate.
 - **MCP (`exec`):** Prefix a script with `// @exec: {"machine": "laptop"}` to run against that machine's MCP servers (listed under `# On NAME`).
 - **Opening links & files:** On headless hosts, clicking an `http(s)` URL or large image/PDF in Sonny opens it directly on your connected laptop.
+- **Dropped files & clipboard:** Drop a file from your laptop on a Sonny window you reached over SSH and the host's Sonny fetches it over the link: a picture attaches as `[Image #n]` (HEIC and other Mac formats converted there), any other file is copied to `~/.agent/sonny/dropped` and the composer names the copy. Ctrl+V over SSH takes the picture on the laptop's clipboard.
 
 Configuration in `~/.agent/config.toml`:
 
@@ -1930,6 +1931,16 @@ The host's agents see each linked machine by name:
   in its browser. A viewer's file (a picture, a PDF or plain text, up to
   32 MB) is kept in `~/.agent/sonny/links/opened`, marked as downloaded,
   and opened.
+- A file dropped on a Sonny window over SSH names a path on the machine
+  you are at. When it is not on the host, the host's Sonny asks each
+  connected machine for it (`file`, which only the person's own window
+  sends and no gate asks about, as opening). A picture comes back
+  converted and scaled there and attaches as `[Image #n]`; another file
+  (up to 32 MB) is copied to `~/.agent/sonny/dropped` and the composer
+  names the copy, which the agent reads. Its path stands in the composer
+  while it comes, and Send waits for it. Ctrl+V in a window reached over
+  SSH (`SSH_CONNECTION` or `SSH_TTY`) takes the picture on that machine's
+  clipboard.
 
 What a call asks to confirm (an MCP call its server's `approval_mode` asks
 about, an action in `browser_confirm`) comes back over the link to the

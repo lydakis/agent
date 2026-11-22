@@ -114,13 +114,9 @@ impl Prompt {
             return false;
         };
         let end = start + piece.len();
-        let moved = |at: usize| match at {
-            at if at >= end => at - piece.len() + with.len(),
-            at if at > start => start + with.len(),
-            at => at,
-        };
-        self.at = moved(self.at);
-        self.anchor = self.anchor.map(moved);
+        let swapped = start..end;
+        self.at = replaced(self.at, &swapped, with.len());
+        self.anchor = (self.anchor).map(|at| replaced(at, &swapped, with.len()));
         self.goal = None;
         self.splice(start..end, with);
         self.laid.take();
@@ -872,6 +868,16 @@ fn inline(
 }
 
 /// Where `at` lands once the bytes `gone` are taken out.
+/// A place in the text after `swapped` became `with` bytes: kept on the
+/// words it was at, or after the new ones when it was in the old.
+fn replaced(at: usize, swapped: &Range<usize>, with: usize) -> usize {
+    match at {
+        at if at >= swapped.end => at - swapped.len() + with,
+        at if at > swapped.start => swapped.start + with,
+        at => at,
+    }
+}
+
 fn kept(at: usize, gone: &Range<usize>) -> usize {
     if at >= gone.end {
         at - gone.len()
