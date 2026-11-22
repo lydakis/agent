@@ -8,6 +8,7 @@ from pathlib import Path
 
 from bench import memory_eval, synthetic_model
 from bench.targets import clean_env
+from tests.test_runtime import lift_instructions
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,7 +47,7 @@ class PlumbingTests(unittest.TestCase):
             length = int(handler.headers['Content-Length'])
             body = handler.rfile.read(length)
             with lock:
-                seen.append(json.loads(body).get('instructions', ''))
+                seen.append(lift_instructions(json.loads(body)).get('instructions', ''))
             handler.rfile = io.BytesIO(body)
             return reply(handler)
         synthetic_model.Model.reply = recording

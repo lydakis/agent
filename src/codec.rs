@@ -140,12 +140,6 @@ impl Family {
         )
         .facts(json!({"efforts":efforts})))
     }
-    /// Whether the provider's input limits count prompt-cache reads.
-    /// Anthropic counts only uncached input and cache writes for its current
-    /// models; OpenAI does not say it leaves cache reads out.
-    pub fn counts_cache_reads(self) -> bool {
-        matches!(self, Family::Responses)
-    }
     /// The quota a model draws on. Dated snapshots and their alias share one
     /// allowance at both providers, so they share one pool: `gpt-5.6-luna`
     /// and `gpt-5.6-luna-2026-05-01`, `claude-sonnet-5` and

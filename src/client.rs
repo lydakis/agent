@@ -546,8 +546,8 @@ fn parse(args: &[String]) -> Result<Options> {
                         }
                     }
                     "--cache-ttl" => {
-                        if !matches!(value.as_str(), "5m" | "1h") {
-                            return fail_with("usage", "--cache-ttl needs 5m or 1h");
+                        if !matches!(value.as_str(), "5m" | "1h" | "12h") {
+                            return fail_with("usage", "--cache-ttl needs 5m, 1h or 12h");
                         }
                         options
                             .settings

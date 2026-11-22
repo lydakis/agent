@@ -154,12 +154,24 @@ impl Lab {
         arguments: serde_json::Value,
         fail: bool,
     ) -> (bool, String) {
+        // Who calls, as the tool host gives it with the call, beside the
+        // shell's variables the process runs with.
+        let invocation = serde_json::json!({
+            "bot": self.bot.borrow().as_str(),
+            "bot_id": 1,
+            "call": "call-1",
+            "model": self.model.borrow().clone().unwrap_or_default(),
+            "pwd": dir,
+            "folder": std::fs::canonicalize(dir).unwrap(),
+            "store": self.store(),
+        });
+        let given = serde_json::json!({"invocation": invocation, "arguments": arguments});
         let (ok, out, err) = self.run_with(
             dir,
             env!("CARGO_BIN_EXE_sonny"),
             &["tool", name],
             fail,
-            Some(&arguments.to_string()),
+            Some(&given.to_string()),
         );
         assert!(ok, "{err}");
         let answer: serde_json::Value =
@@ -482,11 +494,17 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
         .unwrap();
     use std::io::Write;
     let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it"});
+    let invocation = serde_json::json!({
+        "bot": "demo.lead",
+        "pwd": &lab.repo,
+        "folder": std::fs::canonicalize(&lab.repo).unwrap(),
+    });
+    let given = serde_json::json!({"invocation": invocation, "arguments": start});
     child
         .stdin
         .take()
         .unwrap()
-        .write_all(start.to_string().as_bytes())
+        .write_all(given.to_string().as_bytes())
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(

@@ -1486,8 +1486,11 @@ or a browser can, never holds up the news a lead hears, and either can be
 replaced without the other.
 
 Each call that starts, or waited from before the host did, runs as
-`sonny tool NAME` in the calling agent's folder, with the environment its
-shell would have; `exec` runs in the host itself, where the MCP servers
+`sonny tool NAME` in the calling agent's folder, handed who calls (its
+agent, turn, call, folder and model) with the arguments, as Codex hands
+each tool its invocation; the tools read the caller only from that, and
+the environment its shell would have is there for the programs a tool
+starts; `exec` runs in the host itself, where the MCP servers
 stay up (next section). A turn that ends stops the calls it still has
 running. A script the host was running when it stopped, a crash, an
 upgrade or a host that gave way, runs on in the next one, as Pi Durable's

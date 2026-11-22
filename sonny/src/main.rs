@@ -4608,8 +4608,12 @@ fn nowhere_to_open(var: &dyn Fn(&str) -> Option<std::ffi::OsString>, mac: bool) 
 /// row above it to the row below, the conversation's width, as Codex
 /// draws its composer and the user's messages on one shade: what was
 /// written and what is being written read as one thing, the words in the
-/// middle of it, and the composer's limits show in any theme. Without
-/// colour (`NO_COLOR`) a muted rule above it.
+/// middle of it, and the composer's limits show in any theme. A free
+/// column each end, as their sent messages have: the band starts in the
+/// blank column before the lead, and what is typed wraps a column short
+/// of its end, the column the cursor takes at a full row's end. Without
+/// color (`NO_COLOR`) a muted rule above it, from the lead to the
+/// column's edge.
 fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
     let width = composer.width.min(measure() as u16);
     if look::no_color() {
@@ -4617,11 +4621,12 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
         frame.render_widget(Paragraph::new(rule), Rect { width, ..gap });
         return;
     }
+    let before = u16::from(composer.x > 0);
     let band = Rect {
+        x: composer.x - before,
         y: gap.y,
         height: pad.bottom().saturating_sub(gap.y),
-        width,
-        ..composer
+        width: width + before,
     };
     frame
         .buffer_mut()
@@ -22325,8 +22330,11 @@ impl App {
         let room = (size.height as usize).saturating_sub(VIEWPORT as usize - 1);
         // What is typed to answer a question has the question over it,
         // as a reply in a chat has what it replies to.
-        let mut headings = self.quoting_over(width.min(measure()));
-        headings.extend(self.answering_over(width.min(measure())));
+        // A column short of the composer's band, as the person's words
+        // are once sent.
+        let heading = transcript::on_band(width.min(measure()));
+        let mut headings = self.quoting_over(heading);
+        headings.extend(self.answering_over(heading));
         // The newest over the words, the room kept for one row of them.
         let heading_room = room.saturating_sub(1);
         headings.drain(..headings.len().saturating_sub(heading_room));
@@ -23342,6 +23350,12 @@ impl App {
     /// column. A list or picker open over the composer keeps it to the
     /// cursor's row.
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
+        // What is typed is laid with the band's last column free, where the
+        // cursor goes at a full row's end ([`prompt::Input::layout`]), so
+        // it wraps as it will read once sent; a guess or a hint leaves it
+        // free too ([`transcript::on_band`]).
+        let typed = width;
+        let width = transcript::on_band(width);
         // What is sent answers the open question in focus.
         let answering = self.asking();
         // The guess at the next message, for Tab to take.
@@ -23460,7 +23474,7 @@ impl App {
             }
             return (vec![Line::from(spans)], (0, prompt::LEAD));
         }
-        let layout = self.input.layout(width);
+        let layout = self.input.layout(typed);
         let (row, col) = self.input.cursor(&layout);
         // A shell command is marked as one while it is typed.
         let shell = self.input.starts_with('!');
@@ -39545,6 +39559,37 @@ mod tests {
             .collect();
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
         (row, (cursor.x, cursor.y))
+    }
+
+    #[tokio::test]
+    async fn the_band_has_a_free_column_at_each_end() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        // 34 columns of words: one row at the column's 36, two at 35.
+        let said = format!("{} bb", "a".repeat(31));
+        let mut terminal = Terminal::new(Shot(ratatui::backend::TestBackend::new(40, 20))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        app.land(5, (&said, ""), (None, false), false);
+        app.input.set(&said);
+        app.draw(&mut terminal).unwrap();
+        let buffer = terminal.backend().0.buffer().clone();
+        let band = look::band();
+        let row = |y: u16| -> String { (0..40).map(|x| buffer[(x, y)].symbol()).collect() };
+        let words = format!("  › {}", "a".repeat(31));
+        let opens: Vec<u16> = (0..20).filter(|&y| row(y).starts_with(&words)).collect();
+        // The sent message, then the composer: each `›` in the column's
+        // first cell, under a reply's `•`.
+        assert_eq!(opens.len(), 2, "{:?}", (0..20).map(row).collect::<Vec<_>>());
+        for y in opens {
+            assert_eq!(row(y + 1).trim_end(), "    bb", "{}", row(y + 1));
+            for y in [y, y + 1] {
+                // The band from the blank column before the `›` to the
+                // column's edge, its last column free of words.
+                assert_ne!(buffer[(0, y)].bg, band, "{}", row(y));
+                assert!((1..38).all(|x| buffer[(x, y)].bg == band), "{}", row(y));
+                assert_eq!(buffer[(37, y)].symbol(), " ");
+                assert_ne!(buffer[(38, y)].bg, band, "{}", row(y));
+            }
+        }
     }
 
     #[tokio::test]
