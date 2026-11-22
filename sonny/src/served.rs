@@ -1236,16 +1236,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 crate::task::gone(holder, id)
             })
             .map_err(|e| ("commons_refused", e))?;
-            // The turn that wrote in a thread is not told it holds that
-            // work, and the work the host knows is kept as it is now.
-            if (arguments["post"].is_object() || arguments["reply"].is_object())
-                && said["posted"] != false
-                && let Some(thread) = said["thread"].as_str()
-            {
-                let bot = std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone());
-                let turn = (std::env::var("AGENT_TURN").ok()).and_then(|t| t.parse().ok());
-                crate::turn_end::wrote(&home, &bot, turn, thread);
-            }
             // Posting in a thread follows it for the agent, in its store,
             // and the answer says how its posts will reach the agent: the
             // follow is how they do, the invite only how it came.
@@ -1315,12 +1305,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 return Err(("no_caller", "AGENT_CALL or AGENT_TURN is not set".into()));
             };
             tokio::task::spawn_blocking(move || {
-                let served = crate::asks::served(&arguments, &asker, turn, &call);
-                // One that waits for the person holds back its turn's end.
-                if served.is_ok() {
-                    crate::turn_end::asked(&asker, turn, &call, &arguments);
-                }
-                served
+                crate::asks::served(&arguments, &asker, turn, &call)
             })
             .await
             .map_err(|e| ("tool_failed", e.to_string()))?
@@ -2914,7 +2899,11 @@ async fn answer(
         .last()
         .and_then(|line| serde_json::from_str(line).ok());
     match said {
-        Some(said) if said["output"].is_string() => Ok(str_of(&said["output"])),
+        Some(said) if said["output"].is_string() => {
+            let output = str_of(&said["output"]);
+            noted(name, bot, turn, &call["call_id"], &arguments, &output);
+            Ok(output)
+        }
         Some(said) if said["error"]["code"].is_string() => Err((
             code(said["error"]["code"].as_str().unwrap_or_default()),
             str_of(&said["error"]["detail"]),
@@ -2923,6 +2912,29 @@ async fn answer(
             "tool_failed",
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         )),
+    }
+}
+
+/// What the host keeps between turns of a call it answered: the call runs
+/// in a process of its own, so what a turn's end reads is noted here, in
+/// the host, from the call and its answer. A commons post or reply wrote
+/// in its thread; an ask that waits for the person holds its turn's end.
+fn noted(name: &str, bot: &str, turn: i64, call: &Value, arguments: &Value, output: &str) {
+    match name {
+        COMMONS if arguments["post"].is_object() || arguments["reply"].is_object() => {
+            let said: Value = serde_json::from_str(output).unwrap_or_default();
+            if let (Some(thread), Some(home)) = (said["thread"].as_str(), std::env::var_os("HOME"))
+                && said["posted"] != false
+            {
+                crate::turn_end::wrote(Path::new(&home), bot, Some(turn), thread);
+            }
+        }
+        crate::asks::TOOL => {
+            if let Some(call) = call.as_str() {
+                crate::turn_end::asked(bot, turn, call, arguments);
+            }
+        }
+        _ => {}
     }
 }
 

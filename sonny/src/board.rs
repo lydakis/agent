@@ -776,6 +776,14 @@ pub fn reply(
                     if !ours(board) {
                         return Err(not_ours(board, "take work"));
                     }
+                    // As the work stands after this reply's own fields.
+                    let mut after = it.clone();
+                    for key in ["needs", "for"] {
+                        if post[key].is_array() {
+                            after[key] = post[key].clone();
+                        }
+                    }
+                    let it = &after;
                     if !is_for(it, caller.name, caller.profile) {
                         let named: Vec<&str> = (it["for"].as_array().into_iter().flatten())
                             .filter_map(Value::as_str)
@@ -1886,6 +1894,44 @@ mod tests {
     }
 
     #[test]
+    fn a_take_reads_the_needs_and_for_its_own_reply_gives() {
+        let home = home("take-fields");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        lead(work("api", "Type the api errors", json!({}))).unwrap();
+        let w = |args| send(&home, "shop.w1", "shop", None, false, args);
+        // Needing undone work in the same reply refuses the take.
+        let mut take = act("api", "take");
+        take["reply"]["needs"] = json!(["store"]);
+        let refused = w(take).unwrap_err();
+        assert!(refused.starts_with("work_waiting"), "{refused}");
+        // Kept for someone else in the same reply, it isn't this agent's.
+        let mut take = act("api", "take");
+        take["reply"]["for"] = json!(["shop.other"]);
+        let refused = w(take).unwrap_err();
+        assert!(refused.starts_with("work_reserved"), "{refused}");
+        assert!(w(act("api", "take")).is_ok());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_thread_opened_as_work_lists_with_the_short_title_it_was_given() {
+        let home = home("retitled");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(json!({"post": {"name": "long", "title": "A long question about how errors should carry causes",
+            "text": "x"}}))
+        .unwrap();
+        lead(
+            json!({"reply": {"thread": "long", "do": "open", "board": "shop/errors",
+            "title": "Carry error causes", "text": "y"}}),
+        )
+        .unwrap();
+        let summary = commons::summary("long", &commons::dir(&home).join("long.jsonl")).unwrap();
+        assert_eq!(summary["work"]["title"], "Carry error causes", "{summary}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn taking_work_follows_its_board_and_its_thread_as_its_holder() {
         let home = home("follows");
         let store = home.join("store");
@@ -1904,6 +1950,12 @@ mod tests {
         let held = follows(&store, "shop.w1", Some(2), &take, &said).unwrap();
         assert_eq!(held.about.as_deref(), Some(HOLDS));
         assert_eq!(held.quiet.as_deref(), Some("15m"));
+        // A reply that moves nothing keeps its holder following as one.
+        let talk = json!({"reply": {"thread": "store", "text": "halfway"}});
+        let said = send(&home, "shop.w1", "shop", None, false, talk.clone()).unwrap();
+        let still = follows(&store, "shop.w1", Some(2), &talk, &said).unwrap();
+        assert_eq!(still.about.as_deref(), Some(HOLDS));
+        assert_eq!(still.quiet.as_deref(), Some("15m"));
         assert_eq!(followed(&store, "shop.w1").as_deref(), Some("shop/errors"));
         // Dropped by the lead, its holder's follow says it posted there.
         crate::lookout::subs::put(&store, "shop.w1", held).unwrap();

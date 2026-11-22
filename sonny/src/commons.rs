@@ -1226,6 +1226,11 @@ pub(crate) fn add_locked(
     if let Some(board) = board {
         said["board"] = json!(board);
     }
+    // Its work as it stands, which a reply moving nothing leaves as it was,
+    // so its holder still follows it as its holder.
+    if let Some(work) = crate::board::item(&earlier) {
+        said["work"] = work;
+    }
     Ok(said)
 }
 
@@ -1463,10 +1468,9 @@ pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
     // Only a line holding `"do":` can be an action: in a post's text the
     // quotes are escaped, so no text passes for one.
     let marked = |line: &[u8]| line.windows(5).any(|w| w == br#""do":"#);
-    let mut actions = Vec::new();
-    if first["do"].is_string() {
-        actions.push(first.clone());
-    }
+    // The first post always, an action or not, so a later reply that
+    // opens the thread as work is never taken for its first post.
+    let mut actions = vec![first.clone()];
     for line in lines {
         count += 1;
         last = Some(line);
