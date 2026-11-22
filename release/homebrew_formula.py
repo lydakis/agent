@@ -25,9 +25,14 @@ FORMULAS = {
         # sandboxed by default), which it never looks up on PATH: the
         # build fixes where this one is.
         '  on_linux do\n    depends_on "bubblewrap"\n  end\n',
+        # The way back to an older release's store (release/store_down.py)
+        # goes with each release, since only the release being left knows
+        # its own steps.
         '    ENV["AGENT_BWRAP"] = (formula_opt_bin("bubblewrap")/"bwrap").to_s if OS.linux?\n'
-        '    system "cargo", "install", *std_cargo_args\n',
-        '    assert_equal "agent-runtime #{version}", shell_output("#{bin}/agent --version").strip\n',
+        '    system "cargo", "install", *std_cargo_args\n'
+        '    libexec.install "release/store_down.py", "release/store_lift_yields.py"\n',
+        '    assert_equal "agent-runtime #{version}", shell_output("#{bin}/agent --version").strip\n'
+        '    assert_match "store_down.py STORE SCHEMA", shell_output("#{libexec}/store_down.py --help")\n',
     ),
     "sonny": (
         "Terminal coordinator for a daemon that hosts many durable AI agents",

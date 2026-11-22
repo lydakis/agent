@@ -1253,6 +1253,8 @@ reply, as a task is. A task that will change files still starts with
 
 ![A window reopened on 0.9.5 by the update above, its unsent message still in the composer](sonny/update-reopened.png)
 
+**Going back a release:** while the newer release is still installed, stop the daemon (`agent shutdown`) and take the store back with the script that release installs, `PREFIX/opt/sonny/libexec/store_down.py` (Linux tarball) or `$(brew --prefix agent)/libexec/store_down.py` (Homebrew; `sonny-nightly` in its own `libexec`): `store_down.py ~/.agent/state.sqlite N`, where N is the older release's schema (`--help` lists each step). It needs `python3`, keeps a copy of the store beside it with the store's own permissions, and keeps everything the older release can hold. Then install the older release. See [the store](RUST_PROTOTYPE.md) for how the daemon backs up and migrates.
+
 <details>
 <summary><strong>Full details: upgrading</strong></summary>
 

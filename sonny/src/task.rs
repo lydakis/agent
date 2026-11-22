@@ -409,16 +409,18 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         speed: config.sonny.task_speed,
     };
     let flags: Vec<&String> = flags.iter().collect();
-    let flags = with_defaults(&info, &flags, lead_picks, task_picks);
-    let flags: Vec<&String> = flags.iter().collect();
     // Roles are the lead's project's, which `info` names, as its files are
     // now: the ones the lead or the person picked from, even uncommitted,
     // never a worktree's copy as of its last commit, nor a folder inside.
     let roles = here;
-    let (mut flags, role_sandbox) = match told(&place.told, roles, here, &info, &flags) {
+    // The role first, so its model is named before the defaults fill one,
+    // as `spawn_agent` and `agent run --profile` take it.
+    let (flags, role_sandbox) = match told(&place.told, roles, here, &info, &flags) {
         Ok(told) => told,
         Err(error) => return failed(&place, false, error),
     };
+    let flags: Vec<&String> = flags.iter().collect();
+    let mut flags = with_defaults(&info, &flags, lead_picks, task_picks);
     with_cache(&mut flags);
     // A task works in its lead's mode's sandbox: confined to its folder,
     // committing to its repository and running the commands the config
@@ -850,9 +852,10 @@ fn approved(
 }
 
 /// The run flags with the task's model, effort and speed, unless they
-/// name their own: the project's `task_model`, else the lead's (`lead`,
-/// its AGENT_MODEL and AGENT_EFFORT, and the speed its record holds), so a
-/// role (--profile) never swaps it; the project's `task_effort`, else
+/// name their own, as the call or its role (--profile, which `told`
+/// names first) does: the project's `task_model`, else the lead's (`lead`,
+/// its AGENT_MODEL and AGENT_EFFORT, and the speed its record holds); the
+/// project's `task_effort`, else
 /// the config's `[sonny] task_effort` (`task`), else the lead's own when
 /// the task runs its model; and the speed the same way, from
 /// `task_speed` and `[sonny] task_speed`. Standard needs no flag.
@@ -943,8 +946,9 @@ fn with_cache(flags: &mut Vec<String>) {
 /// for a task in `dir` given as `--instructions`, with what every task is
 /// told (`task.md`, or the task profile the project `info` or the config
 /// names) after it, and the role's model and tools unless the flags name
-/// their own; and the role's sandbox. Roles are found from `roles`. Other
-/// flags pass as they are.
+/// their own, so the role's model comes before the project's `task_model`
+/// and the lead's, which `with_defaults` fills after; and the role's
+/// sandbox. Roles are found from `roles`. Other flags pass as they are.
 fn told(
     dir: &Path,
     roles: &Path,
@@ -3182,6 +3186,74 @@ mod tests {
             run(none, &["--model", "a/lead"], None),
             ["--model", "a/lead", "--effort", "high"]
         );
+    }
+
+    #[test]
+    fn a_task_runs_its_profiles_model() {
+        let dir = std::env::temp_dir().join(format!("sonny-task-model-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
+        std::fs::write(
+            dir.join(".agents/agents/reviewer.md"),
+            "---\nmodel: a/b\n---\nReview it.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".agents/agents/plain.md"), "Do it.\n").unwrap();
+        // As start_task runs them: the role first, then the defaults.
+        let run = |info: Value, flags: &[&str]| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            let (flags, _) =
+                told(&dir, &dir, &dir, &info, &flags.iter().collect::<Vec<_>>()).unwrap();
+            let lead = Picks {
+                model: Some("x/y".to_owned()),
+                effort: Some("high".to_owned()),
+                speed: Some("fast".to_owned()),
+            };
+            let flags = with_defaults(
+                &info,
+                &flags.iter().collect::<Vec<_>>(),
+                lead,
+                Picks::default(),
+            );
+            let named = |name: &str| {
+                let at = flags.iter().position(|f| f == name)?;
+                Some(flags[at + 1].clone())
+            };
+            (named("--model"), named("--effort"), named("--speed"))
+        };
+        let none = serde_json::json!({"task_profile": "task"});
+        let pinned = serde_json::json!({"task_profile": "task", "task_model": "p/q"});
+        let some = |s: &str| Some(s.to_owned());
+        // The profile's model over the lead's, which leaves the lead's
+        // effort and speed, set for its own model.
+        assert_eq!(
+            run(none.clone(), &["--profile", "reviewer"]),
+            (some("a/b"), None, None)
+        );
+        // A model named in the call over the profile's.
+        assert_eq!(
+            run(none.clone(), &["--profile", "reviewer", "--model", "c/d"]),
+            (some("c/d"), None, None)
+        );
+        // The profile's model over the project's task_model.
+        assert_eq!(
+            run(pinned.clone(), &["--profile", "reviewer"]),
+            (some("a/b"), None, None)
+        );
+        // A profile without a model: the project's task_model, else the
+        // lead's, at the lead's effort and speed.
+        assert_eq!(
+            run(pinned, &["--profile", "plain"]),
+            (some("p/q"), None, None)
+        );
+        assert_eq!(
+            run(none.clone(), &["--profile", "plain"]),
+            (some("x/y"), some("high"), some("fast"))
+        );
+        assert_eq!(
+            run(none, &["--agents"]),
+            (some("x/y"), some("high"), some("fast"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

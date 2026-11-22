@@ -23,6 +23,9 @@ class NightlyFormulaTest(unittest.TestCase):
         self.assertIn('version "12.1"', formula)
         self.assertIn('std_cargo_args(root: libexec)', formula)
         self.assertIn('libexec.install libexec/"bin/agent"', formula)
+        # The way back to an older store, beside the daemon as a release has it.
+        self.assertIn('libexec.install "release/store_down.py", "release/store_lift_yields.py"', formula)
+        self.assertIn('shell_output("#{libexec}/store_down.py --help")', formula)
         self.assertIn('std_cargo_args(path: "sonny")', formula)
         self.assertNotIn('depends_on "lydakis/agent/agent"', formula)
         for dependency in ["rust", "ripgrep", "bubblewrap"]:

@@ -173,7 +173,8 @@ def held(store):
     daemon holds the store, or while another hard link (another lock) does."""
     if os.stat(store).st_nlink != 1:
         raise SystemExit("the store has another hard link, so another daemon lock; copy it first")
-    lock = open(store + ".owner-lock", "a")
+    # Made as the daemon makes it (src/store.rs): readable by no one else.
+    lock = os.fdopen(os.open(store + ".owner-lock", os.O_RDWR | os.O_CREAT, 0o600), "r+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

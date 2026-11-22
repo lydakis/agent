@@ -14729,8 +14729,13 @@ impl App {
                 if !said.is_empty() {
                     self.replay = Some((said, 0));
                 }
+                // Says why, as /status does: `Rate limited` when the
+                // provider said slow down, else `Retrying: CAUSE`.
                 if let Some(running) = &mut self.running {
-                    running.phase = "Retrying".into();
+                    running.phase = match data["error"].as_str() {
+                        Some(code) => crate::task::capitalized(&status::backs_off(code)),
+                        None => "Retrying".into(),
+                    };
                 }
             }
             "tool_started" if data["name"] == reactions::TOOL => {
@@ -35566,6 +35571,47 @@ mod tests {
         // A pool a rate limit closed says so.
         app.daemon(paced(json!({"resume_at_ms": 9}))).await;
         assert_eq!(app.running.as_ref().unwrap().phase, "Rate limited");
+    }
+
+    #[tokio::test]
+    async fn a_retry_says_why_in_the_words_status_uses() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        for (error, phase) in [
+            (json!("provider_http_429"), "Rate limited"),
+            (json!("provider_rate_limited"), "Rate limited"),
+            (json!("provider_http_529"), "Retrying: provider overloaded"),
+            (
+                json!("provider_stream_failed"),
+                "Retrying: provider unreachable",
+            ),
+            (json!("provider_http_502"), "Retrying: HTTP 502"),
+            (
+                json!("process_interrupted"),
+                "Retrying: process_interrupted",
+            ),
+            (Value::Null, "Retrying"),
+        ] {
+            let mut data = json!({"attempt": 1, "delay_ms": 500});
+            if !error.is_null() {
+                data["error"] = error;
+            }
+            app.daemon(turn_event("retry", 1, data)).await;
+            assert_eq!(app.running.as_ref().unwrap().phase, phase);
+        }
+        // A backoff parked after a 429 reads the same, as does /status.
+        app.daemon(turn_event(
+            "turn_paced",
+            1,
+            json!({"resume_at_ms": 9, "retrying": "provider_http_429"}),
+        ))
+        .await;
+        assert_eq!(app.running.as_ref().unwrap().phase, "Rate limited");
+        assert_eq!(
+            status::paced(&json!({"retrying": "provider_http_429"}), 0),
+            "rate limited"
+        );
     }
 
     #[tokio::test]

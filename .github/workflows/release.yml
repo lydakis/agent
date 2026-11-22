@@ -263,6 +263,8 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           # The formula's layout: Sonny finds the daemon in libexec beside it.
+          # The way back to an older release's store goes with them, since
+          # only the release being left knows its own steps.
           version="${RELEASE_TAG#v}"
           target="${ARCH}-unknown-linux-musl"
           name="sonny-${version}-linux-${ARCH}"
@@ -270,6 +272,9 @@ jobs:
           mkdir -p "$stage/bin" "$stage/libexec" dist
           cp ".local/target/$target/release/sonny" "$stage/bin/sonny"
           cp ".local/target/$target/release/agent" "$stage/libexec/agent"
+          install -m 755 release/store_down.py release/store_lift_yields.py "$stage/libexec/"
+          # Run from where it is installed, with its helper beside it.
+          "$stage/libexec/store_down.py" --help | grep -F "store_down.py STORE SCHEMA" > /dev/null
           for binary in "$stage/bin/sonny" "$stage/libexec/agent"; do
             file "$binary" | grep -q 'static'
           done

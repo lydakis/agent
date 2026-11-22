@@ -1,6 +1,8 @@
+import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import tempfile
 import textwrap
@@ -68,6 +70,47 @@ class LinuxBuildTest(unittest.TestCase):
         self.assertIn('gh release upload "$RELEASE_TAG"', job)
         # Nothing is signed: no Apple secret reaches any job.
         self.assertNotIn("secrets.APP", workflow)
+
+
+class StoreDownShipsTest(unittest.TestCase):
+    """The way back to an older release's store goes with every release,
+    beside the daemon, and runs from where it is installed."""
+
+    SCRIPTS = ("store_down.py", "store_lift_yields.py")
+
+    def test_the_linux_tarball_carries_it_and_runs_it(self):
+        step = workflow_step("Package Sonny for Linux and verify it")
+        self.assertIn('install -m 755 release/store_down.py release/store_lift_yields.py "$stage/libexec/"\n',
+                      step)
+        self.assertIn('"$stage/libexec/store_down.py" --help | grep -F "store_down.py STORE SCHEMA" > /dev/null\n',
+                      step)
+        # Packed after it ran, with nothing it left behind.
+        self.assertLess(step.index('store_down.py" --help'), step.index('tar -C "$RUNNER_TEMP"'))
+
+    def test_it_is_executable_and_runs_from_its_installed_folder(self):
+        release = Path(__file__).resolve().parent
+        for script in self.SCRIPTS:
+            with self.subTest(script=script):
+                self.assertTrue(os.access(release / script, os.X_OK))
+                self.assertEqual((release / script).read_text().splitlines()[0], "#!/usr/bin/env python3")
+        with tempfile.TemporaryDirectory() as temp:
+            libexec = Path(temp) / "opt/sonny-1.2.3-linux-x86_64/libexec"
+            libexec.mkdir(parents=True)
+            subprocess.run(["install", "-m", "755", *(release / script for script in self.SCRIPTS),
+                            f"{libexec}/"], check=True)
+            store = Path(temp) / "state.sqlite"
+            conn = sqlite3.connect(store)
+            conn.executescript("CREATE TABLE bots(name TEXT, profile TEXT); PRAGMA user_version=110;")
+            conn.close()
+            # From another folder, with nothing on Python's path: it finds
+            # its helper beside it, and leaves that folder as it was.
+            env = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+            run = lambda *args: subprocess.run([libexec / "store_down.py", *args], cwd=temp, env=env,
+                                               capture_output=True, text=True, check=True).stdout
+            self.assertIn("store_down.py STORE SCHEMA [--dry-run]", run("--help"))
+            self.assertEqual(json.loads(run(str(store), "109", "--dry-run")),
+                             {"store": str(store.resolve()), "from": 110, "schema": 109, "dry_run": True})
+            self.assertEqual(sorted(path.name for path in libexec.iterdir()), sorted(self.SCRIPTS))
 
 
 class StampTest(unittest.TestCase):

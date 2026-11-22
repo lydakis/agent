@@ -12800,3 +12800,19 @@ piece; `edit` reads, matches and replaces in one blocking job. A first
 revision of `edit` read the file through Tokio and matched on a job of
 its own: 10% slower than main on small and medium files, so it was
 changed to this one.
+
+## The daemon's socket binds without the process's umask
+
+`Owner::bind` no longer sets a `177` umask around the bind. The umask is
+the whole process's, and a folder another thread made in that instant was
+`0600` and could not be entered (a unit test failed so on main, 11-21).
+The socket is now bound in `NAME.b`, a `0700` folder beside it held under
+the owner lock, made `0600` there and renamed into place, so the name is
+still owner-only from its first instant. That is a `mkdir`, a `chmod`, the
+`bind`, a `chmod`, a `rename` and a `rmdir`: once, at start, before any
+session is accepted. A `NAME.b` left by a daemon that died mid-bind is
+cleared only when it is the owner's private folder holding nothing but
+its socket; anything else there refuses the bind and stays. The staged
+address is 4 bytes longer, so `default_socket` takes the short `/tmp`
+rendezvous for a store whose adjacent socket leaves no such room. Nothing is added per bot or per turn, and no store
+job. The pull request's Perf screen is the matched comparison.

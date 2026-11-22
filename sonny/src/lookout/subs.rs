@@ -1559,8 +1559,9 @@ fn as_read(event: &super::sources::Event, cut: bool) -> Value {
 /// would have heard of its sources' last 24 hours, as the lookout keeps
 /// them, and adding nothing. How many events it would hear, how many
 /// would steer, about how many notes they would be, with its digest or
-/// its sources', and the newest few as examples. What `subscriber` said
-/// itself it does not hear, as live.
+/// its sources', and the newest few as examples; for a source whose
+/// history kept whole starts later than the day, when. What `subscriber`
+/// said itself it does not hear, as live.
 pub fn tried(
     store: &Path,
     subscriber: &str,
@@ -1580,9 +1581,23 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
         .collect();
     named.sort_unstable();
     named.dedup();
-    let mut events: Vec<(super::sources::Event, bool)> = (named.iter())
-        .flat_map(|source| super::sources::recent(store, source, since))
-        .collect();
+    let mut events: Vec<(super::sources::Event, bool)> = Vec::new();
+    // Where a busy source's whole history starts later than `since`: the
+    // lookout keeps so many events, which may reach back less than a day.
+    let mut kept_from = serde_json::Map::new();
+    for source in &named {
+        let recent = super::sources::recent(store, source, since);
+        if let Some((from, held)) = recent.whole_from {
+            let held = crate::background::thousands(held as u64);
+            let plural = if held == "1" { "" } else { "s" };
+            let from = super::sources::clock(from);
+            kept_from.insert(
+                (*source).to_owned(),
+                json!(format!("{from} ({held} event{plural})")),
+            );
+        }
+        events.extend(recent.events);
+    }
     events.sort_by_key(|(event, _)| event.at_ms);
     let (mut heard, mut steers, mut cut) = (0, 0, 0);
     let mut times = Vec::new();
@@ -1630,6 +1645,9 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
         "heard": heard, "steers": steers,
         // One that lasts so many notes ends after them.
         "notes": notes(&times).min(sub.runs.map_or(usize::MAX, |runs| runs as usize))});
+    if !kept_from.is_empty() {
+        tried["kept_from"] = Value::Object(kept_from);
+    }
     if cut > 0 {
         tried["cut"] = json!(format!(
             "{cut} of the events it heard were kept cut, which a filter may misjudge"
@@ -2464,6 +2482,63 @@ mod tests {
         assert!(gone.get("follows").is_none(), "{gone}");
         assert!(gone.get("sources").is_none(), "{gone}");
         let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_dir_all(&sources_dir);
+    }
+
+    #[test]
+    fn a_test_names_a_source_whose_kept_history_starts_after_the_day() {
+        use super::super::sources::{clock, recent_file, trim};
+        let store = std::env::temp_dir().join(format!("subs-kept-from-{}", std::process::id()));
+        let sources_dir = super::super::beside(&store, ".sources");
+        let _ = std::fs::remove_dir_all(&sources_dir);
+        std::fs::create_dir_all(&sources_dir).unwrap();
+        let now = super::super::epoch_ms() as u64;
+        let hour = 60 * 60 * 1000;
+        // Kept as the lookout keeps a source: written, then cut to its bounds.
+        let write = |source: &str, times: &[u64]| {
+            let file = recent_file(&sources_dir, source);
+            let lines: String = (times.iter().enumerate())
+                .map(|(n, at)| {
+                    json!({"source": source, "text": format!("{source} {n}"), "at_ms": at,
+                        "seq": n})
+                    .to_string()
+                        + "\n"
+                })
+                .collect();
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, lines).unwrap();
+            trim(&file, u128::from(now));
+        };
+        // A busy source: 2,500 events over the last 10 hours, more than it keeps.
+        let busy: Vec<u64> = (0..2_500)
+            .map(|n| now - 10 * hour + n * 4 * hour / 1_000)
+            .collect();
+        write("ci", &busy);
+        // A quiet one: a few events over the whole day.
+        write("deploys", &[now - 23 * hour, now - 12 * hour, now - hour]);
+        let sources = ["ci".to_owned(), "deploys".to_owned()];
+        let test = |names: &[&str]| {
+            let add = json!({"name": "t", "sources": names});
+            tried(&store, "shop.lead", &add, &sources).unwrap()["test"].clone()
+        };
+        // The busy one is named, from its oldest event kept whole.
+        let kept_from = clock(u128::from(busy[500]));
+        assert_eq!(
+            test(&["ci"])["kept_from"],
+            json!({"ci": format!("{kept_from} (2,000 events)")})
+        );
+        assert_eq!(test(&["ci"])["events"], 2_000);
+        // The quiet one covers the day: nothing is added.
+        let quiet = test(&["deploys"]);
+        assert!(quiet.get("kept_from").is_none(), "{quiet}");
+        assert_eq!(quiet["events"], 3);
+        // Of the two, only the short one is named.
+        let both = test(&["ci", "deploys"]);
+        assert_eq!(
+            both["kept_from"],
+            json!({"ci": format!("{kept_from} (2,000 events)")})
+        );
+        assert_eq!(both["events"], 2_003);
         let _ = std::fs::remove_dir_all(&sources_dir);
     }
 
