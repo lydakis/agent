@@ -19665,6 +19665,7 @@ impl App {
         self.input.clear();
         self.pictures.clear();
         self.preparing.clear();
+        self.replaced.clear();
         self.quotes.clear();
     }
 
@@ -40687,6 +40688,21 @@ mod tests {
         app.prepare(|| Ok(None));
         app.all_ready().await;
         assert_eq!(&*app.input, "keep these words");
+        // A draft let go with one still being read takes its words along:
+        // none come into the next.
+        app.input.select(5, 10);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(None)
+        });
+        app.discard();
+        drop(go);
+        app.input.set("next");
+        app.input.select(0, 4);
+        app.prepare(|| Ok(None));
+        app.all_ready().await;
+        assert_eq!(&*app.input, "next");
     }
 
     #[tokio::test]
