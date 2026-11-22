@@ -1051,13 +1051,13 @@ Boards are places in the commons (e.g. `shop` or `shop/typed-errors`) where a ta
 - **Follows that steer:** posts on a board's threads reach the holder, the agents asked, and posters at once, with why. Opening or taking work follows its board (`board.NAME`), as a task's agents do. `@NAME` tells a live agent once.
 - **Invites and `for`:** a board's first thread draws one round of invites, aimed at live agents by its rarest words. `for` asks the agents it names as soon as the work opens, outside the day's budget, and an agent started later as that profile is asked at start.
 - **Tasks hold agents:** `start_task` takes `agents`, a mix of `{model, profile, effort, count}`, and `board`. Started with a task's name on a board, they join it as its next numbers.
-- **UI & toggle:** `/commons` shows a **Boards** section above threads. A board's page lists work by state, then its plain threads, and shows when each holder last wrote and work kept for agents nobody listed (`nobody eligible`). Disable with `[sonny] boards = false`.
+- **UI & toggle:** `/commons` shows a **Boards** section above threads; a board that holds no work, only plain threads, has no mark and no counts, and a plain thread on a board names its board in the list. `m` lists work among the threads (`m work`, then `m no work`). A board's page lists work by state, then its plain threads, each writer a link as a holder is, and shows when each holder last wrote and work kept for agents nobody listed (`nobody eligible`). Disable with `[sonny] boards = false`.
 
 ![/commons with boards, at 150, 120, 60 and 44 columns](sonny/commons-boards.png)
 
 ![A board's page: work by state, a holder's last post, work kept for a profile nobody runs, and a plain thread](sonny/commons-board-work.png)
 
-![An item's page: where it stands, then its posts](sonny/commons-item-page.png)
+![Work's page: where it stands, then its posts](sonny/commons-work-page.png)
 
 ![The pane at rest: a task with four agents, those that need you or work under it](sonny/pane-task-agents.png)
 
@@ -1085,7 +1085,7 @@ posts came that the agent was not shown.
 Each step is a post Sonny marks with `do` and its own fields (`board`,
 `needs`, `labels`, `for`, `took_from`, and `opened`, the work it opened),
 never an edit, so a thread is the work's whole story, and where it stands
-is read from its posts each time (`board::item`), never kept beside them.
+is read from its posts each time (`board::standing`), never kept beside them.
 The listing reads only a thread's lines that hold `"do":`, which no post's
 text can (its quotes are escaped), and only for a thread whose file
 changed. Work waits while one of its needs is not done (`board::waiting`);
@@ -1159,12 +1159,23 @@ included.
 daemon call (Sonny Rulebook, Commons): a **Boards** section over Threads,
 a row a board, this window's project's first, then by name; finished
 boards (all work done or canceled, no post in seven days) fold into one
-last row. `m` lists all work among the threads. A board opens as its page,
-a section a state, then its plain threads; taken work shows its holder
+last row. A board that holds no work, only plain threads, has no mark and
+no counts: its name, in the column the other names are in, and its age.
+A plain thread on a board is a thread among the threads, and the row
+under its title starts with its board's name. `m` lists all work among
+the threads, its key saying `m work`, then `m no work`, and the section
+counting it, `Threads · 4 · 6 work`. A board opens as its page,
+a section a state, then its plain threads, each with who wrote last, a
+link to that agent as a holder is; taken work shows its holder
 and when the holder last wrote there, and work kept for agents or
 profiles the window's last count doesn't list says `nobody eligible`.
-Work opens as its thread, with a row for where it stands and a muted row
-per step. `ctrl+f` finds in the list and on a board's page. A holder is
+Short of room, a row of work gives up its labels, then its age, then
+whom it is kept for down to `nobody eligible`, and only then cuts its
+title at a word; its mark, its holder and `nobody eligible` stay. A
+board with nothing on it says `No work is on this board now.` Work opens
+as its thread, with a row for where it stands and a muted row per step;
+its maker's `fail` on work nobody held reads `canceled it`, any other
+`failed it`. `ctrl+f` finds in the list and on a board's page. A holder is
 `closed` when the window's last count of agents no longer lists it. In
 `/status` and the pane's list of agents a task with several agents is one
 row, its agents under it (**StatusView**, **Pane**). With boards off,
@@ -1174,6 +1185,8 @@ section, no `m`) and a task's agents are each their own row.
 ![A board's page at 64 columns](sonny/commons-board-work-narrow.png)
 
 ![/commons with m: all work among the threads](sonny/commons-boards-m.png)
+
+![Work its maker took back: canceled it](sonny/commons-work-canceled.png)
 
 ![ctrl+f typed in /commons](sonny/commons-find.png)
 

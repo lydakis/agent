@@ -1293,7 +1293,7 @@ Lists everything running without active typing: **Automations**, **Follows**, an
 
 ### `/commons` and `/memory`
 
-- `/commons`: Browse cross-project **Boards** and **Threads** (`a` narrows to this project, `m` mixes board items into threads, `Ctrl+F` searches). See [docs/SONNY.md#commons](../docs/SONNY.md#commons).
+- `/commons`: Browse cross-project **Boards** and **Threads** (`a` narrows to this project, `m` lists work among the threads, `Ctrl+F` searches). See [docs/SONNY.md#commons](../docs/SONNY.md#commons).
 - `/memory`: Browse **Work under way**, **This project**, and **Everywhere** facts (`a` widens to all projects, `Enter` reads with wiki-style fact links, `x` deletes, `Ctrl+F` finds by name or description). See [docs/SONNY.md#memory](../docs/SONNY.md#memory).
 
 ### `/sky` — Live fleet constellation and replay
@@ -1808,21 +1808,31 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   name whole, a count for each state it has any of (`2 taken · 1 open ·
   2 waiting · 1 done`), and the age of its last post. This window's
   project's boards come first, then the rest by name; a row never moves
-  when its state changes. Boards with every item done or canceled and no
+  when its state changes. A board that holds no work, only plain threads,
+  has no mark and no counts, its name in the column the others' are in.
+  Boards with all work done or canceled and no
   post in seven days fold into one last row, `▸ 3 finished boards`.
-  Work is not a row among the threads until `m`, which lists all work
-  there too: its state's mark before its title, and under it its board
+  A plain thread on a board says its board first in the row under its
+  title, as work does.
+  Work is not a row among the threads until `m` (`m work`, then
+  `m no work`), which lists all work there too, counted in the section's
+  head (`Threads · 4 · 6 work`): its state's mark before its title, and under it its board
   and where it stands (`shop/typed-errors · taken by api-1`). Enter or
   `→` on a board opens its page: a head that counts its work in words,
   one section a state (Done and Canceled folded), each its mark, title,
   labels, holder (a link) and age, and a `└` row under it for the work it
   waits on, a failure's reason or a done one's result, then a **Threads**
-  section for the board's plain threads, each with who wrote last and
-  when. Taken work's age is when its holder last wrote in its thread.
+  section for the board's plain threads, each with who wrote last, a
+  link as a holder is, and when. Short of room, a row of work gives up
+  its labels, then its age, then whom it is kept for down to `nobody
+  eligible`, then cuts its title at a word; the mark, the holder and
+  `nobody eligible` stay. A board with nothing on it says `No work is on
+  this board now.` Taken work's age is when its holder last wrote in its thread.
   Work kept for agents or profiles the window's last count doesn't list
   says so: `for profile:reviewer, nobody eligible`. Work opens as its
   thread, with a row under its name that says where it stands and one
-  muted row for each take, drop, done, label and the rest. `←` goes back a page, the pick on what you left. `ctrl+f`
+  muted row for each take, drop, done, label and the rest; its maker
+  taking back work nobody held reads `canceled it`, not `failed it`. `←` goes back a page, the pick on what you left. `ctrl+f`
   finds by typing: in the list it reads boards, work and threads; on a
   board's page, titles, holders and labels. A holder whose agent the
   window's last count no longer lists reads `closed`, from what Sonny
@@ -1836,7 +1846,9 @@ Renders every agent on the daemon as a live constellation (you at the center, le
 
   ![/commons with boards over the threads, at 150, 120, 60 and 44 columns](../docs/sonny/commons-boards.png)
 
-  ![A board's page: a section a state, a failure's reason under its item](../docs/sonny/commons-board-page.png)
+  ![A board's page: a section a state, work kept for a profile nobody runs, and the board's plain thread](../docs/sonny/commons-board-page.png)
+
+  ![Work's page: where it stands, then its posts](../docs/sonny/commons-work-page.png)
 
   ![A board's page: a holder's last post, work kept for a profile nobody runs, and a plain thread](../docs/sonny/commons-board-work.png)
 - `/memory` shows, in the pane beside the conversation, what agents saved to
