@@ -3842,7 +3842,8 @@ calls `tool_calls` lists say it, `null` for one not taken. A second take,
 by a client that restarted or by another one, is `call_taken` with the
 first take's `taken_ms` beside its detail; the call may have done its work,
 and only the client that took it knows, so a client answers such a call
-rather than running it again (Sonny answers `tool_outcome_unknown`). A take
+rather than running it again (Sonny answers `tool_outcome_unknown`, except
+for an `exec` script, which it runs again from its own journal). A take
 is refused as an answer is: an answered call is `call_already_answered`,
 one that ended or ran out of time is `no_pending_call` or `stale_turn`.
 Taking is the client's choice and never expires; a taken call is answered

@@ -518,7 +518,9 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(sorted((self.path / 'made').read_text().split()), ['0', '1'])
 
     def test_a_message_before_a_script_s_first_step_leaves_the_script_answerable(self):
-        code = ('const t = Date.now(); while (Date.now() - t < 1500) {}\n'
+        # The script's clock stands still between steps, as Pi Durable's does,
+        # so it counts to spend its time.
+        code = ('for (let n = 0; n < 5e7; n++) {}\n'
                 'const r = await tools.shell({command: "sleep 1; echo ran > made; echo ran"});\n'
                 'text(JSON.parse(r.content[0].text).stdout.trim());')
         results, status = self.steered_script('', code=code, steer_after=0.3)
@@ -527,7 +529,9 @@ class ServedToolTests(ModelFixture):
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_message_before_an_escalated_step_is_asked_leaves_the_script_answerable(self):
-        code = ('const t = Date.now(); while (Date.now() - t < 1500) {}\n'
+        # The script's clock stands still between steps, as Pi Durable's does,
+        # so it counts to spend its time.
+        code = ('for (let n = 0; n < 5e7; n++) {}\n'
                 'const r = await tools.shell({command: "sleep 1; echo ran > made; echo ran", '
                 'sandbox_permissions: "require_escalated", justification: "outside"});\n'
                 'text(JSON.parse(r.content[0].text).stdout.trim());')
@@ -592,6 +596,47 @@ class ServedToolTests(ModelFixture):
                                        'text(JSON.parse(r.content[0].text).stdout.trim());')
         self.assertEqual(len(results), 1, results)
         self.assertTrue(results[0].startswith('Script completed\n') and results[0].endswith('quick'), results)
+
+    def test_a_script_the_host_was_running_when_it_gave_way_runs_on_in_the_next(self):
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
+                                           check=True, capture_output=True, text=True).stdout)
+        code = ('const a = await tools.shell({command: "echo a >> ran"});\n'
+                'try { await tools.shell({command: "touch slow; sleep 3; echo b >> ran"}); text("slow ran"); }\n'
+                'catch (e) { text(e.message); }\n'
+                'await tools.shell({command: "echo c >> ran"});\n'
+                'text(Math.random() < 1 ? "done" : "");')
+
+        def respond(request, user):
+            outputs = [i for i in request['input'] if i.get('type') in ('function_call_output', 'custom_tool_call_output')]
+            return [['exec', code]] if not outputs else 'done'
+        self.model.respond = respond
+        made = dict(tools=['echo', 'shell'], declare=[script], settings={'steps_only': ['*']})
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', **made)
+        old = self.host()
+        self.keeps_its_tools(old, 'calc.lead', **made)
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='go', prompt='go')['result']['message']
+        deadline = time.monotonic() + 30
+        while not (self.path / 'slow').exists():
+            self.assertLess(time.monotonic(), deadline, 'the second step never started')
+            time.sleep(.05)
+        # The host gives way to another build while the second step runs.
+        (self.path / 'state.sqlite.tool-host.sonny').write_text('0.0.1 1')
+        self.host()
+        old.wait(timeout=10)
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        said = self.output('calc.lead', turn)
+        # The next host ran the script again: the first step's result came
+        # from its journal, the step cut off was not run again, and the
+        # script went on from there.
+        self.assertTrue(said.startswith('Script completed\n'), said)
+        self.assertTrue(said.endswith("Output:\ntools.shell was cut off when Sonny's tool host restarted: "
+                                      'it may have done its work, and was not run again\ndone'), said)
+        ran = (self.path / 'ran').read_text().split()
+        self.assertEqual((ran.count('a'), ran.count('c')), (1, 1), ran)
+        # Its journal, kept beside the store, is gone with its answer.
+        self.assertTrue((self.path / 'state.sqlite.exec').is_dir())
+        self.assertEqual(list((self.path / 'state.sqlite.exec').glob('*.jsonl')), [])
 
     def test_a_script_s_pictures_reach_the_model_in_order_with_its_text(self):
         server = Path(__file__).with_name('mcp_server.py')

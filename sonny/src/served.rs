@@ -1406,6 +1406,7 @@ impl Server {
         // work is paused ([`Server::connected`]).
         let held = Calls {
             paused: true,
+            journals: Some(crate::exec::journals(&store)),
             ..Default::default()
         };
         let (nudge, serving) = (Arc::new(Notify::new()), Arc::new(Mutex::new(held)));
@@ -1523,6 +1524,11 @@ struct Calls {
     /// waits for in the budget's fair queue, beside browser commands and
     /// other agents, or holds once it came: its next call takes it.
     reserved: HashMap<String, Reserved>,
+    /// Whether a whole listing was read since the host started, which the
+    /// journals of scripts whose calls no longer wait are swept by once.
+    swept: bool,
+    /// The folder of the journals of scripts, beside the daemon's store.
+    journals: Option<PathBuf>,
 }
 
 /// An agent's place in the budget's queue.
@@ -1651,7 +1657,7 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                         async move {
                             match call["name"].as_str() {
                                 // In the host, where the servers stay up.
-                                Some(EXEC) => script(&hub, &client, &call).await,
+                                Some(EXEC) => script(&hub, &client, &call, &store).await,
                                 Some(BROWSER) => browse(&client, &call).await,
                                 Some(DESKTOP) => desktop(&client, &call).await,
                                 // Started here, where it runs on after
@@ -1819,6 +1825,8 @@ where
     let (mut after, mut left, mut whole) = (0, false, false);
     // The agents this look found waiting for a place.
     let mut waited = HashSet::new();
+    // The scripts waiting, whose journals are kept.
+    let mut scripts = HashSet::new();
     'pages: loop {
         let page = client
             .request(
@@ -1829,6 +1837,9 @@ where
         let next = page["next_after"].as_i64();
         for call in page["calls"].as_array().into_iter().flatten() {
             let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
+            if call["name"] == EXEC {
+                scripts.insert(key.clone());
+            }
             {
                 let calls = serving.lock().unwrap();
                 if calls.paused || calls.jobs.contains_key(&key) {
@@ -1910,6 +1921,14 @@ where
     if calls.stops != stops {
         nudge.notify_one();
     }
+    // The journals of scripts left by an earlier host whose calls no
+    // longer wait, once a whole listing says which still do.
+    if whole && !calls.swept {
+        calls.swept = true;
+        if let Some(journals) = calls.journals.clone() {
+            crate::exec::sweep(journals, scripts);
+        }
+    }
     calls.retired.retain(|_, at| *at >= look);
     calls.ended.retain(|_, at| *at >= look);
     calls.left = left;
@@ -1953,6 +1972,7 @@ fn take<Run, Ran>(
         let ran = run(call.clone(), place);
         let base = json!({"bot": call["bot"], "turn": call["turn"], "call_id": call["call_id"]});
         let take = base.clone();
+        let journals = calls.journals.clone();
         let job = tokio::spawn(async move {
             // Its place goes with the job, whichever way it ends, and only
             // then is the next look woken: locals drop in reverse.
@@ -1962,8 +1982,33 @@ fn take<Run, Ran>(
             // host took, or this one before it restarted, may have done its
             // work already, and is answered that its outcome is unknown.
             let taken = client.request("take_call", take).await;
+            // A script this host or another was running when it stopped
+            // runs on from its journal; one another host still runs is left
+            // to it.
+            let again = match (&taken, &journals) {
+                (Err(error), Some(journals))
+                    if error.code == "call_taken" && call["name"] == EXEC =>
+                {
+                    Some(crate::exec::again(journals, &call).await)
+                }
+                _ => None,
+            };
             let answer = match taken {
                 Ok(_) => ran.await,
+                Err(_) if matches!(again, Some(crate::exec::Again::Replay)) => ran.await,
+                // Looked at again soon: the host running it may be on its
+                // way out.
+                Err(_) if matches!(again, Some(crate::exec::Again::Elsewhere)) => {
+                    let mut calls = serving.lock().unwrap();
+                    if matches!(calls.jobs.get(&key), Some(Job::Running { .. })) {
+                        calls.jobs.remove(&key);
+                    }
+                    tokio::spawn(async move {
+                        tokio::time::sleep(RESEND).await;
+                        nudge.notify_one();
+                    });
+                    return;
+                }
                 Err(error) if error.code == "call_taken" => Err((
                     "tool_outcome_unknown",
                     "this call may have started before Sonny's tool host restarted or was \
@@ -2025,6 +2070,10 @@ async fn hand_in(client: &Client, serving: &Serving, key: &(i64, String)) -> boo
     };
     if taken {
         serving.lock().unwrap().retire(key);
+        // A script's journal, if the call had one, is no longer needed.
+        if let Some(journals) = serving.lock().unwrap().journals.clone() {
+            crate::exec::forget(&journals, key);
+        }
     }
     taken
 }
@@ -2094,9 +2143,13 @@ async fn script(
     hub: &crate::mcp::Hub,
     client: &Arc<Client>,
     call: &Value,
+    store: &Path,
 ) -> Result<Value, (&'static str, String)> {
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
     let bot = str_of(&call["bot"]);
+    // The journal of a script this host takes again, held from here.
+    let journals = crate::exec::journals(store);
+    let again = crate::exec::retaken(&journals, call);
     unreviewed(client, &bot, &Value::Null, EXEC).await?;
     let steps = crate::exec::Steps::new(
         client.clone(),
@@ -2126,7 +2179,10 @@ async fn script(
         }
         return Ok(answer["answer"].clone());
     }
-    crate::exec::answer(hub, &bot, input, running(call), Some(steps))
+    // What it is given is recorded as it runs, so a host that takes the
+    // call again after this one stops runs it on from there.
+    let journal = again.or_else(|| crate::exec::begun(&journals, call));
+    crate::exec::answer(hub, &bot, input, running(call), Some(steps), journal)
         .await
         .map_err(|e| ("exec_refused", e))
 }
@@ -4105,7 +4161,7 @@ mod tests {
         let script_call = json!({"bot": "calc", "turn": 1, "call_id": "c1", "name": EXEC,
             "arguments": {"input": "1"}});
         let hub = crate::mcp::Hub::new(None);
-        let refused = script(&hub, &client, &script_call).await;
+        let refused = script(&hub, &client, &script_call, none).await;
         assert_eq!(refused.map_err(|(code, _)| code), Err("escalation_refused"));
     }
 

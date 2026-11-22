@@ -6,15 +6,19 @@
 //! models already write it; Pi's code mode keeps the same names. As in
 //! Codex, the script is not approved as a whole: each call of a tool that
 //! its server's `approval_mode` says asks first goes to the agent's gate,
-//! and the script's time stops while it waits.
+//! and the script's time stops while it waits. A script the tool host
+//! was running when it stopped runs on from where it was once a host takes
+//! its call again, as Pi Durable's code mode does (`journal`).
+pub mod journal;
+
 use crate::mcp::{Hub, Known, Servers};
 use agent_client::Client;
-use rquickjs::prelude::Async;
-use rquickjs::{AsyncContext, AsyncRuntime, Function, Promise};
+use journal::{Claim, Given, Journal};
+use rquickjs::{Context, Function, Runtime};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -954,10 +958,23 @@ pub async fn answer(
     input: &str,
     left: Duration,
     steps: Option<Steps>,
+    journal: Option<Journal>,
 ) -> Result<Value, String> {
     let servers = agent_client::config::load()?.sonny.mcp_servers;
     hub.configure(&servers).await;
-    run(hub, home_dir().as_deref(), bot, input, left, steps).await
+    let dir = home_dir();
+    let whole = Whole::Saved(dir.as_deref());
+    run_keeping(
+        hub,
+        dir.as_deref(),
+        &whole,
+        bot,
+        input,
+        left,
+        steps,
+        journal,
+    )
+    .await
 }
 
 /// Where the whole of an output cut to its budget goes.
@@ -991,7 +1008,17 @@ pub async fn lent(
         None => Whole::Saved(None),
     };
     let dir = home_dir().map(|dir| dir.join("linked").join(space));
-    let answer = run_keeping(hub, dir.as_deref(), &whole, bot, input, left, Some(steps)).await?;
+    let answer = run_keeping(
+        hub,
+        dir.as_deref(),
+        &whole,
+        bot,
+        input,
+        left,
+        Some(steps),
+        None,
+    )
+    .await?;
     Ok(json!({"answer": answer, "whole": cut.into_inner().unwrap()}))
 }
 
@@ -1017,6 +1044,7 @@ pub fn save_whole(file: &Path, text: &str) -> std::io::Result<()> {
 
 /// Run a script against the servers `hub` serves, keeping what it saves
 /// under `dir`.
+#[cfg(test)]
 pub(crate) async fn run(
     hub: &Hub,
     dir: Option<&Path>,
@@ -1025,10 +1053,12 @@ pub(crate) async fn run(
     left: Duration,
     steps: Option<Steps>,
 ) -> Result<Value, String> {
-    run_keeping(hub, dir, &Whole::Saved(dir), bot, input, left, steps).await
+    run_keeping(hub, dir, &Whole::Saved(dir), bot, input, left, steps, None).await
 }
 
-/// `run`, with the whole of an output cut to its budget going to `whole`.
+/// `run`, with the whole of an output cut to its budget going to `whole`,
+/// and what the script is given recorded in `journal`.
+#[allow(clippy::too_many_arguments)]
 async fn run_keeping(
     hub: &Hub,
     dir: Option<&Path>,
@@ -1037,7 +1067,14 @@ async fn run_keeping(
     input: &str,
     left: Duration,
     steps: Option<Steps>,
+    journal: Option<Journal>,
 ) -> Result<Value, String> {
+    let journal = journal.map(Arc::new);
+    // A script that ended before the host stopped, its answer not handed
+    // in: that answer, without running it again.
+    if let Some(end) = (journal.as_ref()).and_then(|j| j.replay.lock().unwrap().end.clone()) {
+        return Ok(end);
+    }
     let script = parse(input)?;
     let started = Instant::now();
     let alive = admit(&ALIVE)?;
@@ -1078,12 +1115,47 @@ async fn run_keeping(
             tool.refused = !tool.reads || tool.asks;
         }
     }
+    // What the script begins with: the tools it is shown, its clock and
+    // its seed; as the journal recorded them for a script run again.
+    let begun = journal
+        .as_ref()
+        .and_then(|j| j.replay.lock().unwrap().start.clone());
+    let (listed, shown, now, seed, yielded) = match &begun {
+        Some(start) => {
+            let shown = (journal.as_ref())
+                .and_then(|j| shown_tools(j, start))
+                .ok_or("the tools it was shown are no longer kept")?;
+            let yielded = journal.as_ref().unwrap().replay.lock().unwrap().yielded;
+            let (now, seed) = (start["now_ms"].as_u64(), start["seed"].as_u64());
+            (
+                shown.0,
+                shown.1,
+                now.unwrap_or(0),
+                seed.unwrap_or(0) as u32,
+                yielded,
+            )
+        }
+        None => {
+            let listed = Value::Array(listed).to_string();
+            let seed = (now_ms() as u32)
+                ^ std::process::id()
+                ^ (ANSWERINGS.fetch_add(1, Ordering::Relaxed) as u32);
+            if let Some(journal) = &journal {
+                let kept = kept_shown(journal, &nested, &listed);
+                journal.start(json!({"t": "start", "v": journal::VERSION, "input": input,
+                    "now_ms": now_ms(), "seed": seed, "tools": kept}));
+            }
+            let shown = Arc::new(nested.clone());
+            (listed, shown, now_ms(), seed, false)
+        }
+    };
     let run = Run {
         hub: hub.clone(),
         host: tokio::runtime::Handle::current(),
         nested: Arc::new(nested),
+        shown,
         failed: Arc::new(failed),
-        listed: Value::Array(listed).to_string(),
+        listed,
         store: dir.map(|dir| dir.join("store").join(format!("{bot}.json"))),
         said: Arc::new(Mutex::new(Output::new(budget, whole))),
         pictures: Arc::default(),
@@ -1092,12 +1164,26 @@ async fn run_keeping(
         steps: steps.map(Arc::new),
         clock: Clock::new(started + timeout, started + left.min(CALL_BOUND)),
         yielding: Arc::default(),
+        at_once: Arc::new(tokio::sync::Semaphore::new(CALLS)),
+        journal: journal.clone(),
+        shared: Arc::new(Shared {
+            made: Mutex::default(),
+            count: AtomicU64::new(0),
+            now_ms: AtomicU64::new(now),
+            seed,
+            ended: Mutex::default(),
+        }),
     };
+    // A call handed back to the model before the host stopped has no
+    // deadline now, and is not handed back again.
+    if yielded {
+        run.clock.yielded();
+    }
     // Still running at its yield time, or once it calls `yield_control()`,
     // the script hands its call back with what it said so far, as Codex's
     // `exec` yields, and runs on to its answer.
     let yielder = (run.steps.clone())
-        .filter(|steps| steps.yields())
+        .filter(|steps| steps.yields() && !yielded)
         .map(|steps| {
             let at = started
                 + script
@@ -1105,6 +1191,7 @@ async fn run_keeping(
                     .map_or(YIELD_TIME, Duration::from_millis);
             let (said, pictures) = (Arc::clone(&run.said), Arc::clone(&run.pictures));
             let (clock, now) = (Arc::clone(&run.clock), Arc::clone(&run.yielding));
+            let journal = journal.clone();
             Abort(tokio::spawn(async move {
                 tokio::select! {
                     _ = tokio::time::sleep_until(at.into()) => {}
@@ -1118,6 +1205,9 @@ async fn run_keeping(
                 let pictures = pictures.lock().unwrap().clone();
                 if steps.yield_call(parts(text, pictures)).await {
                     clock.yielded();
+                    if let Some(journal) = &journal {
+                        journal.yielded();
+                    }
                 }
             }))
         });
@@ -1150,7 +1240,141 @@ async fn run_keeping(
         *cut.lock().unwrap() = Some(sent);
     }
     let pictures = std::mem::take(&mut *pictures.lock().unwrap());
-    Ok(parts(text, pictures))
+    let answer = parts(text, pictures);
+    if let Some(journal) = &journal {
+        journal.end(&answer);
+    }
+    Ok(answer)
+}
+
+/// Keep the tools a script is shown, by their hash, in its journal's
+/// folder: their listing, and what `tool_search` looks through. Their
+/// hash, or none when they could not be kept, which no host replays.
+fn kept_shown(
+    journal: &Journal,
+    nested: &BTreeMap<String, Nested>,
+    listed: &str,
+) -> Option<String> {
+    let names: Vec<Value> = (nested.iter())
+        .map(|(id, tool)| json!([id, tool.server, tool.tool, tool.description]))
+        .collect();
+    let tools = json!({"listed": listed, "names": names}).to_string();
+    let hash = journal::hash(&tools);
+    let folder = journal.path().parent()?;
+    journal::keep_tools(folder, &hash, &tools).then_some(hash)
+}
+
+/// The tools a script run again was shown when it began: their listing,
+/// and what `tool_search` looks through.
+fn shown_tools(
+    journal: &Journal,
+    start: &Value,
+) -> Option<(String, Arc<BTreeMap<String, Nested>>)> {
+    let tools = journal::kept_tools(journal.path().parent()?, start["tools"].as_str()?)?;
+    let tools: Value = serde_json::from_str(&tools).ok()?;
+    let mut shown = BTreeMap::new();
+    for name in tools["names"].as_array()? {
+        let text = |at: usize| name[at].as_str().map(str::to_owned);
+        shown.insert(
+            text(0)?,
+            Nested {
+                server: text(1)?,
+                tool: text(2)?,
+                description: text(3)?,
+                asks: false,
+                reads: false,
+                facts: Facts {
+                    kind: "mcp",
+                    place: None,
+                    access: None,
+                },
+                refused: false,
+                daemon: false,
+            },
+        );
+    }
+    Some((tools["listed"].as_str()?.to_owned(), Arc::new(shown)))
+}
+
+/// What a host that finds `call`, an `exec` call of the daemon of `store`,
+/// taken already does: run its script again from its journal, which it
+/// holds from now on; leave it to the host that still runs it; or answer
+/// that its outcome is unknown.
+pub enum Again {
+    Replay,
+    Elsewhere,
+    Unknown,
+}
+
+/// The journals taken to run their scripts again, until the call's answer
+/// opens them.
+static TAKEN: std::sync::LazyLock<Mutex<HashMap<PathBuf, Journal>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// The folder the journals of the scripts of the daemon of `store` are
+/// kept in, beside its store file.
+pub fn journals(store: &Path) -> PathBuf {
+    journal::folder(store)
+}
+
+/// Where the journal of `call` is kept, in `journals`.
+fn journal_path(journals: &Path, call: &Value) -> PathBuf {
+    journal::path(
+        journals,
+        call["turn"].as_i64().unwrap_or(0),
+        call["call_id"].as_str().unwrap_or_default(),
+    )
+}
+
+/// Take the journal of `call`, in `journals`, found taken.
+pub async fn again(journals: &Path, call: &Value) -> Again {
+    let input = call["arguments"]["input"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let path = journal_path(journals, call);
+    let claimed = tokio::task::spawn_blocking(move || match Journal::claim(&path) {
+        Claim::Taken(journal) => {
+            // Run again only as it began: the same script, shown the same
+            // tools.
+            let start = journal.replay.lock().unwrap().start.clone();
+            let shown = start
+                .as_ref()
+                .and_then(|start| shown_tools(&journal, start));
+            if start.is_none_or(|start| start["input"] != input.as_str()) || shown.is_none() {
+                return Again::Unknown;
+            }
+            TAKEN.lock().unwrap().insert(path, *journal);
+            Again::Replay
+        }
+        Claim::Held => Again::Elsewhere,
+        Claim::None => Again::Unknown,
+    })
+    .await;
+    claimed.unwrap_or(Again::Unknown)
+}
+
+/// The journal of `call`, in `journals`, taken to run its script again,
+/// if it was.
+pub fn retaken(journals: &Path, call: &Value) -> Option<Journal> {
+    TAKEN.lock().unwrap().remove(&journal_path(journals, call))
+}
+
+/// A new journal for `call`'s script, in `journals`.
+pub fn begun(journals: &Path, call: &Value) -> Option<Journal> {
+    Journal::begin(journal_path(journals, call))
+}
+
+/// Let go of the journal of the call `call_id` of `turn`, in `journals`,
+/// once its answer is handed in or the call wants none.
+pub fn forget(journals: &Path, (turn, call_id): &(i64, String)) {
+    journal::forget(&journal::path(journals, *turn, call_id));
+}
+
+/// Remove the journals in `journals` whose calls no longer wait, those
+/// `waiting` does not hold, that no host has open.
+pub fn sweep(journals: PathBuf, waiting: std::collections::HashSet<(i64, String)>) {
+    std::thread::spawn(move || journal::sweep(&journals, &waiting));
 }
 
 /// A script's whole run on its thread: what it said once it ended.
@@ -1775,6 +1999,9 @@ struct Run {
     /// The tool host's runtime, where the servers' connections live.
     host: tokio::runtime::Handle,
     nested: Arc<BTreeMap<String, Nested>>,
+    /// The tools `tool_search` looks through: those the script was shown
+    /// when it began, which a script run again is shown again.
+    shown: Arc<BTreeMap<String, Nested>>,
     failed: Arc<Vec<String>>,
     listed: String,
     store: Option<PathBuf>,
@@ -1786,6 +2013,37 @@ struct Run {
     clock: Arc<Clock>,
     /// Woken by `yield_control()`.
     yielding: Arc<tokio::sync::Notify>,
+    /// Places for the script's calls in flight.
+    at_once: Arc<tokio::sync::Semaphore>,
+    /// Where what the script is given is recorded, and what an earlier
+    /// run of it was given is read back; none when it could not be made.
+    journal: Option<Arc<Journal>>,
+    /// What the script's JavaScript and its host share.
+    shared: Arc<Shared>,
+}
+
+/// What a script's JavaScript asks of the host as it runs, which the host
+/// acts on once it waits again; and what it sees of time and chance.
+struct Shared {
+    /// The calls it made since the host last looked: number, tool and
+    /// arguments.
+    made: Mutex<Vec<(u64, String, String)>>,
+    /// The calls it made in all.
+    count: AtomicU64,
+    /// Its clock, in ms since the epoch: when it began, then when it was
+    /// last given a result, never going back.
+    now_ms: AtomicU64,
+    /// What seeds its `Math.random()`.
+    seed: u32,
+    /// How it ended, once it did: an error, or none.
+    ended: Mutex<Option<Option<String>>>,
+}
+
+/// Now, in ms since the epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// A script's two times. Its own, which only its JavaScript spends: it
@@ -1985,22 +2243,35 @@ impl Drop for Stopped {
     }
 }
 
-/// The globals the script sees, made from the host's `__` functions.
+/// The globals the script sees, made from the host's `__` functions. A
+/// tool's call is a promise the host settles once it has its result
+/// (`__deliver`); `Date` reads the script's clock, and `Math.random()` its
+/// seed, so a script run again with the same results makes the same calls
+/// (`journal`); and nothing the collector decides reaches it, as Pi's code
+/// mode leaves out `WeakRef`.
 const PRELUDE: &str = r#"(() => {
-  const host = { call: __call, search: __search, text: __text, image: __image, store: __store, load: __load, yield: __yield };
-  for (const name of ["__call", "__search", "__text", "__image", "__store", "__load", "__yield", "__tools"]) delete globalThis[name];
+  const host = { start: __start, search: __search, text: __text, image: __image, store: __store, load: __load, yield: __yield, now: __now, seed: __seed };
+  for (const name of ["__start", "__search", "__text", "__image", "__store", "__load", "__yield", "__now", "__seed", "__tools"]) delete globalThis[name];
   const EXIT = globalThis.__exit;
   delete globalThis.__exit;
+  delete globalThis.WeakRef;
+  delete globalThis.FinalizationRegistry;
   const said = (raw) => { const said = JSON.parse(raw); if ("error" in said) throw new Error(said.error); return said.ok; };
   const show = (value) => typeof value === "string" ? value : (JSON.stringify(value) ?? String(value));
+  const waiting = new Map();
+  Object.defineProperty(globalThis, "__deliver", { value: (n, raw) => {
+    const settle = waiting.get(n);
+    if (settle !== undefined) { waiting.delete(n); settle(raw); }
+  } });
+  const call = (key, args) => new Promise((settle) => { waiting.set(host.start(key, args), settle); });
   const named = {
-    tool_search: async (args) => said(await host.search(JSON.stringify(args ?? {}))),
+    tool_search: async (args) => said(host.search(JSON.stringify(args ?? {}))),
   };
   globalThis.tools = new Proxy(named, {
     get(target, key) {
       if (key in target) return target[key];
       if (typeof key !== "string" || key === "then") return undefined;
-      return async (args) => said(await host.call(key, JSON.stringify(args ?? {})));
+      return async (args) => said(await call(key, JSON.stringify(args ?? {})));
     },
   });
   globalThis.text = (value) => { host.text(show(value)); };
@@ -2009,27 +2280,76 @@ const PRELUDE: &str = r#"(() => {
   globalThis.load = (key) => { const kept = host.load(String(key)); return kept == null ? undefined : JSON.parse(kept); };
   globalThis.exit = () => { throw EXIT; };
   globalThis.yield_control = () => { host.yield(); };
+  const RealDate = Date;
+  function ScriptDate(...args) {
+    if (new.target === undefined) return new RealDate(host.now()).toString();
+    return args.length === 0 ? new RealDate(host.now()) : new RealDate(...args);
+  }
+  ScriptDate.prototype = RealDate.prototype;
+  ScriptDate.now = () => host.now();
+  ScriptDate.parse = RealDate.parse;
+  ScriptDate.UTC = RealDate.UTC;
+  Object.defineProperty(RealDate.prototype, "constructor", { value: ScriptDate, writable: true, configurable: true });
+  globalThis.Date = ScriptDate;
+  let seed = host.seed() >>> 0;
+  Math.random = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
   globalThis.__ended = (e) => e === EXIT ? null : (e instanceof Error ? `${e}${e.stack ? "\n" + e.stack.trimEnd() : ""}` : show(e));
 })();"#;
 
+/// What a script that was run again after the host restarted says when it
+/// took another path than the first time.
+fn diverged(at: &str) -> Ended {
+    Ended::Terminated(format!(
+        "it ran again after Sonny's tool host restarted, took another path at {at}, and was \
+         stopped there; each call before that ran once"
+    ))
+}
+
+/// What a call cut off when the host stopped answers, as the daemon tells
+/// a model of a call a crash cut off.
+fn cut_off(tool: &str) -> String {
+    json!({"error": format!(
+        "tools.{tool} was cut off when Sonny's tool host restarted: it may have done its \
+         work, and was not run again"
+    )})
+    .to_string()
+}
+
+/// How a script's evaluation failed, read off its context.
+fn caught(ctx: &rquickjs::Ctx<'_>, error: rquickjs::Error) -> Ended {
+    let thrown = ctx.catch();
+    let text = match thrown.as_exception() {
+        Some(exception) => {
+            let message = exception.message().unwrap_or_default();
+            let name: String = exception.get("name").unwrap_or_else(|_| "Error".into());
+            match exception.stack() {
+                Some(stack) if !stack.trim().is_empty() => {
+                    format!("{name}: {message}\n{}", stack.trim_end())
+                }
+                _ => format!("{name}: {message}"),
+            }
+        }
+        None => match error {
+            rquickjs::Error::Exception => format!("{thrown:?}"),
+            error => error.to_string(),
+        },
+    };
+    Ended::Failed(text)
+}
+
 impl Run {
     async fn script(self, code: String) -> Result<Ended, String> {
-        let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
-        runtime.set_memory_limit(MEMORY).await;
+        let runtime = Runtime::new().map_err(|e| e.to_string())?;
+        runtime.set_memory_limit(MEMORY);
         let (halt, clock) = (Arc::clone(&self.halt), Arc::clone(&self.clock));
-        runtime
-            .set_interrupt_handler(Some(Box::new(move || halt.is_stopped() || clock.check())))
-            .await;
-        let context = AsyncContext::full(&runtime)
-            .await
-            .map_err(|e| e.to_string())?;
-        let halt = Arc::clone(&self.halt);
-        let ran = context.async_with(async |ctx| self.evaluate(ctx, &code).await);
-        let ended = tokio::select! {
-            ended = ran => ended,
-            _ = self.clock.run_out() => Ended::Terminated("it ran out of time".into()),
-            _ = halt.stopped() => Ended::Terminated("its turn ended".into()),
-        };
+        runtime.set_interrupt_handler(Some(Box::new(move || halt.is_stopped() || clock.check())));
+        let context = Context::full(&runtime).map_err(|e| e.to_string())?;
+        let ended = self.drive(&runtime, &context, &code).await;
         Ok(match ended {
             // An interrupt ends the evaluation as an uncatchable error.
             Ended::Failed(_) if self.halt.is_stopped() => {
@@ -2040,43 +2360,168 @@ impl Run {
         })
     }
 
-    async fn evaluate<'js>(&self, ctx: rquickjs::Ctx<'js>, code: &str) -> Ended {
-        let caught = |ctx: &rquickjs::Ctx<'js>, error: rquickjs::Error| -> Ended {
-            let thrown = ctx.catch();
-            let text = match thrown.as_exception() {
-                Some(exception) => {
-                    let message = exception.message().unwrap_or_default();
-                    let name: String = exception.get("name").unwrap_or_else(|_| "Error".into());
-                    match exception.stack() {
-                        Some(stack) if !stack.trim().is_empty() => {
-                            format!("{name}: {message}\n{}", stack.trim_end())
-                        }
-                        _ => format!("{name}: {message}"),
+    /// Run the script: its JavaScript until it waits on a call, then the
+    /// next result given to it, one at a time, so that what it does
+    /// depends only on what it is given and in what order. An earlier
+    /// run's results come first, from the journal, checked against the
+    /// calls it makes again; then those of the calls a restart cut off,
+    /// as errors; then the live ones as they come.
+    async fn drive(&self, runtime: &Runtime, context: &Context, code: &str) -> Ended {
+        let begun = context.with(|ctx| {
+            self.globals(&ctx)
+                .and_then(|()| ctx.eval::<(), _>(PRELUDE))
+                .map_err(|error| caught(&ctx, error))?;
+            // The script on the wrapper's first line, so its line numbers
+            // hold.
+            let wrapped = format!(
+                "(async () => {{{code}\n}})().then(() => __ended_with(null), (e) => __ended_with(__ended(e)))"
+            );
+            ctx.eval::<(), _>(wrapped)
+                .map_err(|error| caught(&ctx, error))
+        });
+        if let Err(ended) = begun {
+            return ended;
+        }
+        let (given, mut results) = tokio::sync::mpsc::unbounded_channel();
+        let mut flying: HashMap<u64, Abort<()>> = HashMap::new();
+        // The calls running when the host stopped, to be told so once the
+        // journal is used up.
+        let mut cut = VecDeque::new();
+        loop {
+            loop {
+                match runtime.execute_pending_job() {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(failed) => {
+                        return failed
+                            .0
+                            .with(|ctx| caught(&ctx, rquickjs::Error::Exception));
                     }
                 }
-                None => match error {
-                    rquickjs::Error::Exception => format!("{thrown:?}"),
-                    error => error.to_string(),
-                },
+            }
+            if let Some(ended) = self.shared.ended.lock().unwrap().take() {
+                return match ended {
+                    None => Ended::Completed,
+                    Some(error) => Ended::Failed(error),
+                };
+            }
+            let made = std::mem::take(&mut *self.shared.made.lock().unwrap());
+            let mut fresh = Vec::new();
+            {
+                let replay = self
+                    .journal
+                    .as_ref()
+                    .map(|journal| journal.replay.lock().unwrap());
+                for (n, tool, arguments) in made {
+                    let hash = journal::hash(&format!("{tool}\n{arguments}"));
+                    let before = replay.as_ref().and_then(|replay| {
+                        let call = replay.calls.get(n as usize - 1)?;
+                        Some((call, replay.answered.contains(&n)))
+                    });
+                    match before {
+                        Some(((was, hashed), answered)) if *was == tool && *hashed == hash => {
+                            if !answered {
+                                cut.push_back((n, tool));
+                            }
+                        }
+                        Some(_) => return diverged(&format!("tools.{tool}")),
+                        None if replay.as_ref().is_some_and(|r| !r.results.is_empty()) => {
+                            return diverged(&format!("tools.{tool}"));
+                        }
+                        None => fresh.push((n, tool, arguments, hash)),
+                    }
+                }
+            }
+            if !fresh.is_empty() {
+                // Recorded before they start, so a host that runs the
+                // script again knows every call this one made.
+                if let Some(journal) = &self.journal {
+                    let made: Vec<_> = (fresh.iter())
+                        .map(|(n, tool, _, hash)| (*n, tool.clone(), hash.clone()))
+                        .collect();
+                    journal.calls(&made);
+                }
+                for (n, tool, arguments, _) in fresh {
+                    let (caller, given) = (self.caller(), given.clone());
+                    let call = self.host.spawn(async move {
+                        let (raw, counted) = caller.call(tool, arguments).await;
+                        let _ = given.send((n, raw, counted));
+                    });
+                    flying.insert(n, Abort(call));
+                }
+            }
+            let replayed = self
+                .journal
+                .as_ref()
+                .and_then(|journal| journal.replay.lock().unwrap().results.pop_front());
+            let next = match replayed {
+                Some(given) => {
+                    if given.call > self.shared.count.load(Ordering::SeqCst) {
+                        return diverged(&format!("its call {}", given.call));
+                    }
+                    if let Some(counted) = &given.counted {
+                        *self
+                            .calls
+                            .lock()
+                            .unwrap()
+                            .entry(counted.clone())
+                            .or_default() += 1;
+                    }
+                    given
+                }
+                None => {
+                    let given = match cut.pop_front() {
+                        Some((call, tool)) => Given {
+                            call,
+                            now_ms: now_ms(),
+                            raw: cut_off(&tool),
+                            counted: None,
+                        },
+                        None => {
+                            let (halt, clock) = (&self.halt, &self.clock);
+                            let (call, raw, counted) = tokio::select! {
+                                Some(result) = results.recv(), if !flying.is_empty() => result,
+                                _ = clock.run_out() => return Ended::Terminated("it ran out of time".into()),
+                                _ = halt.stopped() => return Ended::Terminated("its turn ended".into()),
+                            };
+                            flying.remove(&call);
+                            Given {
+                                call,
+                                now_ms: now_ms(),
+                                raw,
+                                counted,
+                            }
+                        }
+                    };
+                    // Recorded before the script sees it.
+                    if let Some(journal) = &self.journal {
+                        journal.result(&given);
+                    }
+                    given
+                }
             };
-            Ended::Failed(text)
-        };
-        if let Err(error) = self.globals(&ctx) {
-            return caught(&ctx, error);
+            self.shared.now_ms.fetch_max(next.now_ms, Ordering::SeqCst);
+            let handed = context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__deliver")?;
+                deliver.call::<_, ()>((next.call as f64, next.raw))
+            });
+            if let Err(error) = handed {
+                return context.with(|ctx| caught(&ctx, error));
+            }
         }
-        if let Err(error) = ctx.eval::<(), _>(PRELUDE) {
-            return caught(&ctx, error);
-        }
-        // The script on the wrapper's first line, so its line numbers hold.
-        let wrapped = format!("(async () => {{{code}\n}})().then(() => null, __ended)");
-        let promise: Promise = match ctx.eval(wrapped) {
-            Ok(promise) => promise,
-            Err(error) => return caught(&ctx, error),
-        };
-        match promise.into_future::<Option<String>>().await {
-            Ok(None) => Ended::Completed,
-            Ok(Some(error)) => Ended::Failed(error),
-            Err(error) => caught(&ctx, error),
+    }
+
+    fn caller(&self) -> Caller {
+        Caller {
+            hub: self.hub.clone(),
+            host: self.host.clone(),
+            nested: Arc::clone(&self.nested),
+            failed: Arc::clone(&self.failed),
+            calls: Arc::clone(&self.calls),
+            steps: self.steps.clone(),
+            clock: Arc::clone(&self.clock),
+            at_once: Arc::clone(&self.at_once),
+            halt: Arc::clone(&self.halt),
         }
     }
 
@@ -2085,6 +2530,13 @@ impl Run {
         let exit = rquickjs::Object::new(ctx.clone())?;
         globals.set("__exit", exit)?;
         globals.set("ALL_TOOLS", ctx.json_parse(self.listed.clone())?)?;
+        let shared = Arc::clone(&self.shared);
+        globals.set(
+            "__ended_with",
+            Function::new(ctx.clone(), move |error: Option<String>| {
+                *shared.ended.lock().unwrap() = Some(error);
+            })?,
+        )?;
         let said = Arc::clone(&self.said);
         globals.set(
             "__text",
@@ -2092,38 +2544,31 @@ impl Run {
                 said.lock().unwrap().push(&text.replace([OPEN, CLOSE], ""))
             })?,
         )?;
-        let call = Caller {
-            hub: self.hub.clone(),
-            host: self.host.clone(),
-            nested: Arc::clone(&self.nested),
-            failed: Arc::clone(&self.failed),
-            calls: Arc::clone(&self.calls),
-            steps: self.steps.clone(),
-            clock: Arc::clone(&self.clock),
-            at_once: Arc::new(tokio::sync::Semaphore::new(CALLS)),
-            halt: Arc::clone(&self.halt),
-        };
+        let shared = Arc::clone(&self.shared);
         globals.set(
-            "__call",
-            Function::new(
-                ctx.clone(),
-                Async(move |id: String, arguments: String| {
-                    let call = call.clone();
-                    async move { rquickjs::Result::Ok(call.call(id, arguments).await) }
-                }),
-            )?,
+            "__start",
+            Function::new(ctx.clone(), move |id: String, arguments: String| -> f64 {
+                let n = shared.count.fetch_add(1, Ordering::SeqCst) + 1;
+                shared.made.lock().unwrap().push((n, id, arguments));
+                n as f64
+            })?,
         )?;
-        let nested = Arc::clone(&self.nested);
+        let shown = Arc::clone(&self.shown);
         globals.set(
             "__search",
-            Function::new(
-                ctx.clone(),
-                Async(move |arguments: String| {
-                    let nested = Arc::clone(&nested);
-                    async move { rquickjs::Result::Ok(search(&nested, &arguments).to_string()) }
-                }),
-            )?,
+            Function::new(ctx.clone(), move |arguments: String| {
+                search(&shown, &arguments).to_string()
+            })?,
         )?;
+        let shared = Arc::clone(&self.shared);
+        globals.set(
+            "__now",
+            Function::new(ctx.clone(), move || {
+                shared.now_ms.load(Ordering::SeqCst) as f64
+            })?,
+        )?;
+        let seed = self.shared.seed;
+        globals.set("__seed", Function::new(ctx.clone(), move || seed as f64)?)?;
         let (said, pictures) = (Arc::clone(&self.said), Arc::clone(&self.pictures));
         globals.set(
             "__image",
@@ -2161,12 +2606,24 @@ impl Run {
             "__yield",
             Function::new(ctx.clone(), move || yielding.notify_one())?,
         )?;
-        let store = self.store.clone();
+        // What `load()` read is recorded, as nothing else keeps it: a script
+        // run again reads what it read the first time.
+        let (store, journal) = (self.store.clone(), self.journal.clone());
         globals.set(
             "__load",
             Function::new(ctx.clone(), move |key: String| -> Option<String> {
-                let kept = kept(store.as_deref()?);
-                kept.get(&key).map(Value::to_string)
+                if let Some(journal) = &journal
+                    && let Some(read) = journal.replay.lock().unwrap().loads.pop_front()
+                {
+                    return read;
+                }
+                let read = store
+                    .as_deref()
+                    .and_then(|store| kept(store).get(&key).map(Value::to_string));
+                if let Some(journal) = &journal {
+                    journal.load(&read);
+                }
+                read
             })?,
         )?;
         Ok(())
@@ -2199,15 +2656,23 @@ struct Caller {
 
 impl Caller {
     /// Call the tool `id` names: `{"ok": CallToolResult}` or `{"error"}`,
-    /// as JSON for the script.
-    async fn call(&self, id: String, arguments: String) -> String {
-        match self.called(id, arguments).await {
+    /// as JSON for the script, and what the call counts under among its
+    /// calls, if it reached a tool.
+    async fn call(&self, id: String, arguments: String) -> (String, Option<String>) {
+        let mut counted = None;
+        let raw = match self.called(id, arguments, &mut counted).await {
             Ok(called) => format!("{{\"ok\":{}}}", called.json),
             Err(error) => json!({"error": error}).to_string(),
-        }
+        };
+        (raw, counted)
     }
 
-    async fn called(&self, id: String, arguments: String) -> Result<crate::mcp::Called, String> {
+    async fn called(
+        &self,
+        id: String,
+        arguments: String,
+        counted: &mut Option<String>,
+    ) -> Result<crate::mcp::Called, String> {
         let named = format!("tools.{id}");
         self.halt.refuse(&named)?;
         let Some(nested) = self.nested.get(&id).cloned() else {
@@ -2234,6 +2699,7 @@ impl Caller {
             let _place = self.at_once.acquire().await.map_err(|e| e.to_string())?;
             self.halt.refuse(&named)?;
             *self.calls.lock().unwrap().entry(id.clone()).or_default() += 1;
+            *counted = Some(id.clone());
             let arguments = match arguments {
                 Value::Null => json!({}),
                 arguments => arguments,
@@ -2285,6 +2751,7 @@ impl Caller {
             .unwrap()
             .entry(nested.server.clone())
             .or_default() += 1;
+        *counted = Some(nested.server.clone());
         let hub = self.hub.clone();
         // The server's own `tool_timeout_sec` bounds it, and the script's
         // own time stops meanwhile: only its JavaScript spends that.
@@ -3842,6 +4309,151 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         ran(&hub, &dir, "await tools.mcp__test__echo({text: 'b'});").await;
         let starts = std::fs::read_to_string(dir.join("starts")).unwrap();
         assert_eq!(starts.lines().count(), 2, "{starts}");
+        hub.stop().await;
+    }
+
+    /// Run `input` recording what it is given in the journal at `at`, or,
+    /// with `again`, run it again from that journal, as a host that takes
+    /// the call after another stopped does.
+    async fn journaled(hub: &Hub, dir: &Path, input: &str, at: &Path, again: bool) -> String {
+        let journal = match again {
+            true => match Journal::claim(at) {
+                Claim::Taken(journal) => *journal,
+                _ => panic!("the journal is not taken"),
+            },
+            false => Journal::begin(at.to_owned()).unwrap(),
+        };
+        let whole = Whole::Saved(Some(dir));
+        let said = run_keeping(
+            hub,
+            Some(dir),
+            &whole,
+            "shop.lead",
+            input,
+            Duration::from_secs(30),
+            None,
+            Some(journal),
+        )
+        .await
+        .unwrap();
+        said.as_str().unwrap().to_owned()
+    }
+
+    /// A journal's lines, those `keep` keeps written back.
+    fn rewrite(at: &Path, keep: impl Fn(&Value) -> Option<Value>) {
+        let text = std::fs::read_to_string(at).unwrap();
+        let kept: Vec<String> = (text.lines())
+            .filter_map(|line| keep(&serde_json::from_str(line).unwrap()))
+            .map(|line| line.to_string() + "\n")
+            .collect();
+        std::fs::write(at, kept.concat()).unwrap();
+    }
+
+    /// What a script printed, past its head.
+    fn printed(said: &str) -> &str {
+        said.split_once("Output:\n").unwrap().1
+    }
+
+    #[tokio::test]
+    async fn a_script_run_again_from_its_journal_sees_what_it_saw_and_calls_nothing_twice() {
+        let dir = scratch("replay");
+        let hub = hub(&dir).await;
+        let at = journal::path(&dir.join("journals"), 7, "c1");
+        let script = r#"text(Math.random());
+const a = await tools.mcp__test__echo({text: "one " + Math.random()});
+text(a.content[0].text);
+const t = Date.now();
+store("k", t);
+const [b, c] = await Promise.all([tools.mcp__test__add({a: 1, b: 2}), tools.mcp__test__slow({ms: 20})]);
+text(b.structuredContent.sum + " " + (load("k") === t) + " " + (Date.now() >= t));
+text((await tools.tool_search({query: "echo"})).tools[0].name);"#;
+        let first = journaled(&hub, &dir, script, &at, false).await;
+        assert!(
+            first.starts_with("Script completed") && first.contains("Calls: test 3"),
+            "{first}"
+        );
+        // The host stopped once the script ended, before its answer was
+        // handed in: the answer, as it was.
+        assert_eq!(journaled(&hub, &dir, script, &at, true).await, first);
+        // It stopped before the script ended, with every call answered:
+        // the script runs again, its servers down, and says the same.
+        rewrite(&at, |line| (line["t"] != "end").then(|| line.clone()));
+        let down = Hub::new(Some(dir.join("none")));
+        let again = journaled(&down, &dir, script, &at, true).await;
+        assert!(
+            again.starts_with("Script completed") && again.contains("Calls: test 3"),
+            "{again}"
+        );
+        assert_eq!(printed(&again), printed(&first));
+        assert!(
+            printed(&first).ends_with("3 true true\nmcp__test__echo"),
+            "{first}"
+        );
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_call_running_when_the_host_stopped_is_not_run_again_and_the_script_goes_on() {
+        let dir = scratch("replay-cut");
+        let hub = hub(&dir).await;
+        let at = journal::path(&dir.join("journals"), 7, "c1");
+        let script = r#"const a = await tools.mcp__test__echo({text: "one"});
+text(a.content[0].text);
+try { await tools.mcp__test__slow({ms: 20}); text("slow ran"); } catch (e) { text(e.message); }
+text((await tools.mcp__test__add({a: 2, b: 3})).structuredContent.sum);"#;
+        let first = journaled(&hub, &dir, script, &at, false).await;
+        assert!(printed(&first).ends_with("one\nslow ran\n5"), "{first}");
+        // The host stopped while `slow` ran: its result and what came
+        // after are not in the journal.
+        rewrite(&at, |line| match line["t"].as_str() {
+            Some("end") => None,
+            Some("result") if line["n"] != 1 => None,
+            Some("call") if line["n"] == 3 => None,
+            _ => Some(line.clone()),
+        });
+        let again = journaled(&hub, &dir, script, &at, true).await;
+        assert!(again.starts_with("Script completed"), "{again}");
+        assert!(
+            printed(&again).ends_with(
+                "one\ntools.mcp__test__slow was cut off when Sonny's tool host restarted: it may \
+                 have done its work, and was not run again\n5"
+            ),
+            "{again}"
+        );
+        // Run a third time, the journal has the cut-off and the live call.
+        rewrite(&at, |line| (line["t"] != "end").then(|| line.clone()));
+        let down = Hub::new(Some(dir.join("none")));
+        let third = journaled(&down, &dir, script, &at, true).await;
+        assert_eq!(printed(&third), printed(&again));
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_script_that_takes_another_path_when_run_again_stops_there() {
+        let dir = scratch("replay-diverged");
+        let hub = hub(&dir).await;
+        let at = journal::path(&dir.join("journals"), 7, "c1");
+        let script = r#"text((await tools.mcp__test__echo({text: "one"})).content[0].text);
+text((await tools.mcp__test__echo({text: "two"})).content[0].text);"#;
+        journaled(&hub, &dir, script, &at, false).await;
+        // The first call, as recorded, had other arguments.
+        rewrite(&at, |line| match line["t"].as_str() {
+            Some("end") => None,
+            Some("call") if line["n"] == 1 => {
+                let mut line = line.clone();
+                line["args"] = json!("another");
+                Some(line)
+            }
+            _ => Some(line.clone()),
+        });
+        let again = journaled(&hub, &dir, script, &at, true).await;
+        assert!(
+            again.starts_with(
+                "Script terminated: it ran again after Sonny's tool host restarted, took another \
+                 path at tools.mcp__test__echo"
+            ),
+            "{again}"
+        );
         hub.stop().await;
     }
 }

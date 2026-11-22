@@ -1422,7 +1422,8 @@ and `sonny acp` add beside the lookout, so the calls are answered with
 every window closed, by the build that declared them. A window adds it
 only when the daemon keeps none; one already kept is replaced only by
 `sonny update` or by a window that started the daemon, as replacing it
-stops the scripts it runs. It is the lookout's
+stops the scripts it runs, which the next host runs again from their
+journals. It is the lookout's
 sibling, not part of it, as Codex keeps its code-mode host apart from the
 session: a tool that runs long, crashes or holds memory, as an MCP server
 or a browser can, never holds up the news a lead hears, and either can be
@@ -1432,7 +1433,18 @@ Each call that starts, or waited from before the host did, runs as
 `sonny tool NAME` in the calling agent's folder, with the environment its
 shell would have; `exec` runs in the host itself, where the MCP servers
 stay up (next section). A turn that ends stops the calls it still has
-running. The host holds `STORE.tool-host.lock`, so a second one prints
+running. A script the host was running when it stopped, a crash, an
+upgrade or a host that gave way, runs on in the next one, as Pi Durable's
+code mode does ([journal.rs](../sonny/src/exec/journal.rs)): the host
+records each call a script makes before it starts and each result before
+the script sees it, in `STORE.exec`, and the next host runs the script
+again from the start, giving it every result it had in the same order
+without running a call twice. A call that was running when the host
+stopped is not run again; the script is told it was cut off and may have
+done its work. A script that takes another path the second time stops
+there. A script sees no clock or random number its journal does not hold:
+`Date` reads the time it was last given a result, and `Math.random()` a
+seed it began with. A call another host still runs is left to it. The host holds `STORE.tool-host.lock`, so a second one prints
 `{"event":"already_serving"}` and exits, unless another build started the
 running one, which it then stops and replaces (`STORE.tool-host.sonny`
 says which build runs). It follows the daemon's `tool_started` and
