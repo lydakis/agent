@@ -870,7 +870,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             // Who made it, as it was made: a name made again is another's.
             Some("created") => {
                 let by = event["data"]["created_by"].as_str().unwrap_or_default();
-                made_by.made(&bot, by);
+                made_by.made(&bot, by, &order);
                 continue;
             }
             Some("closed") => _ = closed.insert(bot.clone()),
@@ -1219,7 +1219,7 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     }
     let mut made_by = Makers::default();
     for bot in &listed {
-        made_by.made(&bot.name, bot.maker());
+        made_by.made(&bot.name, bot.maker(), &order);
     }
     Some(Seeded {
         needs,
@@ -1359,7 +1359,8 @@ fn tell_waiting(
 
 /// Who made each agent an agent made, kept small for a store of
 /// thousands: each agent by a hash of its name, and each maker's name
-/// once, shared by all it made. One no agent made is not kept.
+/// once, shared by all it made. One no agent made is not kept, nor one its
+/// project's first lead made, which [`above`] finds without it.
 #[derive(Default)]
 struct Makers {
     by: HashMap<u64, Arc<str>>,
@@ -1375,8 +1376,10 @@ impl Makers {
     }
 
     /// `bot` was made by `by`, or by no agent where it is empty.
-    fn made(&mut self, bot: &str, by: &str) {
-        if by.is_empty() {
+    fn made(&mut self, bot: &str, by: &str, projects: &HashMap<String, usize>) {
+        let first_lead = !crate::project::is_lead(bot)
+            && by.strip_suffix(".lead") == Some(project_in(bot, projects));
+        if by.is_empty() || first_lead {
             self.gone(bot);
             return;
         }
@@ -1539,14 +1542,23 @@ mod tests {
             ("shop.ring", "shop.loop"),
             ("shop.loop", "shop.ring"),
         ] {
-            made_by.made(bot, by);
+            made_by.made(bot, by, &projects);
         }
         // Made again by no agent, and one gone for good: its first lead's.
-        made_by.made("shop.again", "shop.fix");
-        made_by.made("shop.again", "");
-        made_by.made("shop.deleted", "shop.fix");
+        made_by.made("shop.again", "shop.fix", &projects);
+        made_by.made("shop.again", "", &projects);
+        made_by.made("shop.deleted", "shop.fix", &projects);
         made_by.gone("shop.deleted");
-        assert_eq!(made_by.names.len(), 6);
+        // Made by its project's first lead, as most are: found without
+        // being kept.
+        made_by.made("shop.plain", "shop.lead", &projects);
+        made_by.made("shop.web.page", "shop.web.lead", &projects);
+        assert_eq!(made_by.by.len(), 5);
+        assert_eq!(made_by.names.len(), 5);
+        assert_eq!(
+            above("shop.plain", &made_by, &projects),
+            ["shop.lead", "top.lead"]
+        );
         let above = |bot| above(bot, &made_by, &projects);
         assert_eq!(above("shop.again"), ["shop.lead", "top.lead"]);
         assert_eq!(above("shop.deleted"), ["shop.lead", "top.lead"]);
