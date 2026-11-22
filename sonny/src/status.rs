@@ -527,6 +527,13 @@ pub fn bots<R: std::borrow::Borrow<Row>>(rows: &[R]) -> std::collections::HashSe
     rows.iter().map(|row| row.borrow().bot.clone()).collect()
 }
 
+/// The profiles `rows`' agents were made as.
+pub fn profiles<R: std::borrow::Borrow<Row>>(rows: &[R]) -> std::collections::HashSet<String> {
+    rows.iter()
+        .map(|row| row.borrow().profile.clone())
+        .collect()
+}
+
 /// See [`Card`].
 pub fn card(
     project: &str,

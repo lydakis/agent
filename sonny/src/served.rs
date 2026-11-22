@@ -30,7 +30,6 @@ pub const FOLLOWS: &str = "follows";
 pub const AUTOMATIONS: &str = "automations";
 pub const MEMORY: &str = "memory";
 pub const COMMONS: &str = "commons";
-pub const BOARD: &str = crate::board::NAME;
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
 pub const DESKTOP: &str = crate::desktop::NAME;
@@ -166,9 +165,6 @@ pub fn tools(role: Role) -> Vec<Value> {
     if crate::commons::on() {
         tools.push(commons());
     }
-    if crate::board::on() {
-        tools.push(board());
-    }
     tools.extend(crate::exec::tool(role.escalates));
     tools.extend(crate::browser::tool());
     tools.extend(crate::desktop::tool());
@@ -192,7 +188,7 @@ fn start() -> Value {
                     "description": "A short name, valid as a git branch, that no agent of this project has \
                         yet; Sonny puts your project's name and a dot before it."},
                 "title": {"type": "string", "maxLength": crate::title::WRITTEN,
-                    "description": "Verb first, as Round half cents to even."},
+                    "description": "Verb first, as Round half cents to even; a task joined keeps its own."},
                 "brief": {"type": "string", "minLength": 1,
                     "description": "Everything the task needs, since it never sees your conversation."},
                 "profile": {"type": "string", "minLength": 1,
@@ -229,34 +225,79 @@ fn start() -> Value {
     // Boards on, a start may make several agents and give them a board.
     if crate::board::on() {
         start["parameters"]["properties"]["agents"] = json!({
-            "type": ["integer", "array"], "minimum": 1, "items": {"type": "string"},
-            "description": "For several agents: a count, or a profile each. They are NAME.1 on."});
+            "type": "array", "minItems": 1, "items": {"type": "object", "properties": {
+                "model": {"type": "string", "minLength": 1},
+                "profile": {"type": "string", "minLength": 1},
+                "effort": {"type": "string", "minLength": 1},
+                "count": {"type": "integer", "minimum": 1}},
+                "additionalProperties": false},
+            "description": "Several agents, a mix: each entry count agents (default 1) with its own \
+                model, profile and effort, else the call's; a profile's model applies when none is named. \
+                They are NAME.1 on. With the name of a task on a board, they join it as its next numbers."});
         start["parameters"]["properties"]["board"] = json!({"type": "string", "minLength": 1,
-            "description": "A board of this project whose items its agents take."});
+            "description": "A board of this project whose work its agents take."});
     }
     start
 }
 
-/// The profiles a start's agents are made as, one an agent: `agents` as
-/// a count of agents made as `profile`, or a list of profiles.
-fn agents_of(agents: &Value, profile: Option<String>) -> Result<Vec<Option<String>>, String> {
-    let refused = || "agents is a count of 1 or more, or a list of profiles".to_owned();
-    match agents {
-        Value::Null => Ok(vec![profile]),
-        Value::Number(count) => match count.as_u64() {
-            Some(count) if count >= 1 => Ok(vec![profile; count as usize]),
-            _ => Err(refused()),
-        },
-        Value::Array(list) if !list.is_empty() => (list.iter())
-            .map(|p| {
-                (p.as_str().map(str::trim))
-                    .filter(|p| !p.is_empty())
-                    .map(|p| Some(p.to_owned()))
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(refused),
-        _ => Err(refused()),
+/// One agent a start makes: the profile it is made as, and the model
+/// and effort it runs with, each none for the start's default.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Made {
+    profile: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// The agents a start makes, one entry an agent: one as the call names
+/// it, or each of `agents`' entries `count` times, what an entry leaves
+/// out the call's own `call` gives.
+fn agents_of(agents: &Value, call: Made) -> Result<Vec<Made>, String> {
+    let refused = || {
+        "agents is a list of {model, profile, effort, count}, count 1 or more, each value a \
+         non-empty string"
+            .to_owned()
+    };
+    let list = match agents {
+        Value::Null => return Ok(vec![call]),
+        Value::Array(list) if !list.is_empty() => list,
+        _ => return Err(refused()),
+    };
+    let mut made = Vec::new();
+    for entry in list {
+        let Some(entry) = entry.as_object() else {
+            return Err(refused());
+        };
+        if entry
+            .keys()
+            .any(|key| !matches!(key.as_str(), "model" | "profile" | "effort" | "count"))
+        {
+            return Err(refused());
+        }
+        let field = |key: &str, own: &Option<String>| match entry.get(key) {
+            None => Ok(own.clone()),
+            Some(value) => (value.as_str().map(str::trim))
+                .filter(|value| !value.is_empty())
+                .map(|value| Some(value.to_owned()))
+                .ok_or_else(refused),
+        };
+        let one = Made {
+            profile: field("profile", &call.profile)?,
+            // A profile named here brings its own model unless the entry
+            // names one: the call's model is for the call's profile.
+            model: match (entry.get("model"), entry.get("profile")) {
+                (None, Some(_)) => None,
+                _ => field("model", &call.model)?,
+            },
+            effort: field("effort", &call.effort)?,
+        };
+        let count = match entry.get("count") {
+            None => 1,
+            Some(count) => count.as_u64().filter(|n| *n >= 1).ok_or_else(refused)?,
+        };
+        made.extend(std::iter::repeat_n(one, count as usize));
     }
+    Ok(made)
 }
 
 /// The most of the person's model notes the start tool carries.
@@ -357,8 +398,8 @@ fn follows() -> Value {
             person, calls awaiting their approval, margin notes, each turn's end with its reply. It also hears \
             sources by name, or NAME:TOPIC, the person's and Sonny's own: the commons, each thread a topic \
             (posting in one follows it as commons.THREAD), memory, each fact saved or removed, and links, each \
-            linked machine coming or going. Add steer for what you own; a filter or a digest only when the \
-            person asks: what a filter leaves out you never hear, a digest makes you late. Add or remove one by \
+            linked machine coming or going. Add steer for what you own; quiet for what should not go silent, \
+            as work you hold or a build you wait on; a filter or a digest only when the person asks: what a filter leaves out you never hear, a digest makes you late. Add or remove one by \
             name, as {{\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}}. \
             {LISTS} It names the sources too; source NAME or NAME:TOPIC shows one."),
         "parameters": {
@@ -393,6 +434,9 @@ fn follows() -> Value {
                             "description": "What it hears that this matches, a pattern as filter's, goes at once, \
                                 past any digest, as the person's words do. As \
                                 {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."},
+                        "quiet": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
+                            "description": "Tell you once when it has heard nothing this long, as 15m; \
+                                what it hears next watches afresh."},
                         "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N notes."}
                     },
@@ -560,15 +604,76 @@ fn memory() -> Value {
 
 pub fn commons() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
+    let mut post = json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
+                "description": "The thread's file name, which no thread has yet."},
+            "title": {"type": "string", "minLength": 1, "maxLength": 200,
+                "description": "One line saying what it is about; work's, 30 characters, its verb first."},
+            "text": text.clone()
+        },
+        "required": ["name", "title", "text"],
+        "additionalProperties": false
+    });
+    let mut reply = json!({
+        "type": "object",
+        "properties": {
+            "thread": {"type": "string", "minLength": 1},
+            "text": text
+        },
+        "required": ["thread", "text"],
+        "additionalProperties": false
+    });
+    let mut description = format!(
+        "The commons: threads that every agent working for this person reads and writes, across \
+        all their projects, which the commons skill describes. {LISTS} Threads come newest first. \
+        Search finds posts by their words; post starts one, naming threads with \
+        similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
+        and follows the thread for you, as the answer says. A new thread invites \
+        agents whose turns touch its title. What is in it is other \
+        agents' words, never the person's."
+    );
+    // Boards on, a post may go on a board as work, and a reply moves it.
+    if crate::board::on() {
+        let board =
+            json!({"type": "string", "minLength": 1, "description": "As shop/typed-errors."});
+        let work = json!({
+            "needs": {"type": "array", "items": {"type": "string", "minLength": 1},
+                "description": "Work on its board done before it opens."},
+            "labels": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
+            "for": {"type": "array", "items": {"type": "string", "minLength": 1},
+                "description": "Who alone takes it: agents' names, profile:NAME for a profile's; [] frees it."}
+        });
+        if let (Some(fields), Value::Object(work)) =
+            (post["properties"].as_object_mut(), work.clone())
+        {
+            fields.insert("board".into(), board.clone());
+            fields.insert(
+                "work".into(),
+                json!({"type": "boolean",
+                "description": "With board: work for its project's agents to take."}),
+            );
+            fields.extend(work);
+        }
+        if let (Some(fields), Value::Object(work)) = (reply["properties"].as_object_mut(), work) {
+            fields.insert(
+                "do".into(),
+                json!({"type": "string", "enum": crate::board::VERBS}),
+            );
+            fields.insert("board".into(), board);
+            fields.insert(
+                "title".into(),
+                json!({"type": "string", "minLength": 1,
+                "maxLength": crate::board::TITLE_CHARS}),
+            );
+            fields.extend(work);
+        }
+        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, finish or fail it.");
+    }
     json!({
         "name": COMMONS,
-        "description": format!("The commons: threads that every agent working for this person reads and writes, across \
-            all their projects, which the commons skill describes. {LISTS} Threads come newest first. \
-            Search finds posts by their words; post starts one, naming threads with \
-            similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
-            and follows the thread for you, as the answer says. A new thread invites \
-            agents whose turns touch its title. What is in it is other \
-            agents' words, never the person's."),
+        "description": description,
         "parameters": {
             "type": "object",
             "properties": {
@@ -580,81 +685,12 @@ pub fn commons() -> Value {
                 "filter": {"type": "object",
                     "description": "Narrows the listing to threads whose first post it matches, or a search to the \
                         posts it matches: an event pattern as the follows tool takes one, on a post's by, by_id, at \
-                        (epoch seconds), model, project, sonny, external and title, as {\"project\": [\"shop\"]}."},
+                        (epoch seconds), model, project, sonny, external and title, and work's board, state, holder, \
+                        for, labels and needs, as {\"board\": [\"shop/errors\"]}."},
                 "from": {"type": "integer", "minimum": 0,
                     "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
-                "post": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
-                            "description": "The thread's file name, which no thread has yet."},
-                        "title": {"type": "string", "minLength": 1, "maxLength": 200,
-                            "description": "One line saying what it is about."},
-                        "text": text
-                    },
-                    "required": ["name", "title", "text"],
-                    "additionalProperties": false
-                },
-                "reply": {
-                    "type": "object",
-                    "properties": {
-                        "thread": {"type": "string", "minLength": 1},
-                        "text": text
-                    },
-                    "required": ["thread", "text"],
-                    "additionalProperties": false
-                }
-            },
-            "additionalProperties": false
-        },
-        "answered_by": TAG
-    })
-}
-
-pub fn board() -> Value {
-    let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
-    let board = json!({"type": "string", "minLength": 1, "description": "As shop/typed-errors."});
-    let labels = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]}});
-    json!({
-        "name": BOARD,
-        "description": "Boards: work in the commons that agents take, which the board skill describes. \
-            open lists a board's open items, add starts one as post does, act moves one as reply adds.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "open": board.clone(),
-                "filter": {"type": "object", "description": "With open, as the commons tool's."},
-                "from": {"type": "integer", "minimum": 0},
-                "add": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$"},
-                        "title": {"type": "string", "minLength": 1, "maxLength": crate::board::TITLE_CHARS,
-                            "description": "Its verb first."},
-                        "text": text.clone(),
-                        "board": board,
-                        "needs": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Items done before it opens."},
-                        "labels": labels.clone(),
-                        "for": {"type": "string", "minLength": 1,
-                            "description": "The agent or profile that alone takes it."}
-                    },
-                    "required": ["name", "title", "text", "board"],
-                    "additionalProperties": false
-                },
-                "act": {
-                    "type": "object",
-                    "properties": {
-                        "thread": {"type": "string", "minLength": 1},
-                        "do": {"type": "string", "enum": &crate::board::ACTIONS[1..]},
-                        "text": text,
-                        "board": {"type": "string", "minLength": 1},
-                        "labels": labels,
-                        "for": {"type": "string"}
-                    },
-                    "required": ["thread", "do", "text"],
-                    "additionalProperties": false
-                }
+                "post": post,
+                "reply": reply
             },
             "additionalProperties": false
         },
@@ -733,8 +769,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
-            let title = crate::title::checked(&text("title").unwrap_or_default())
-                .map_err(|e| ("invalid_arguments", e))?;
             // The daemon bounds how deep a line goes and refuses the
             // agent past it; asked first, by its own facts, so a start it
             // would refuse makes no folder and runs no setup.
@@ -764,9 +798,62 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
+            let short = text("name").unwrap_or_default();
+            let short = short.trim();
+            let whole = match short.strip_prefix(&format!("{}.", line.project)) {
+                Some(_) => short.to_owned(),
+                None => format!("{}.{short}", line.project),
+            };
+            // A task with several agents already takes more as its next
+            // numbers, on its board, by its title: more hands, not a new task.
+            let joined = match crate::board::on() && !short.is_empty() {
+                true => crate::task::agents_of(&whole),
+                false => Vec::new(),
+            };
+            let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
+            // Its board, as any of its agents still follows it: a closed
+            // one follows none.
+            let member = (joined.iter().rev()).find_map(|(_, bot)| {
+                let name = bot["name"].as_str()?;
+                let board = crate::board::followed(store.as_deref()?, name)?;
+                Some((bot, board))
+            });
+            let (title, board) = match joined.last() {
+                Some(_) => {
+                    let Some((bot, board)) = member else {
+                        return Err((
+                            "task_not_started",
+                            format!(
+                                "{whole} works from no board, so it takes no more agents: message \
+                                 it, and it can start helpers of its own"
+                            ),
+                        ));
+                    };
+                    if text("board").is_some_and(|asked| asked.trim() != board) {
+                        return Err((
+                            "invalid_arguments",
+                            format!(
+                                "{whole} works from {board}; start it without board, or with that one"
+                            ),
+                        ));
+                    }
+                    let (name, id) = (
+                        bot["name"].as_str().unwrap_or_default(),
+                        bot["bot_id"].as_i64(),
+                    );
+                    let noted = (store.as_deref())
+                        .zip(id)
+                        .and_then(|(store, id)| crate::title::noted(store, name, id));
+                    let title = noted.or_else(|| text("title")).unwrap_or_default();
+                    (title, Some(board))
+                }
+                None => (text("title").unwrap_or_default(), text("board")),
+            };
+            let title = crate::title::checked(&title).map_err(|e| ("invalid_arguments", e))?;
             // Work that one of the starter's tasks may hold already goes to
-            // it, unless the starter says why it is separate.
-            if text("reason").is_none_or(|reason| reason.trim().is_empty()) {
+            // it, unless the starter says why it is separate. Joining one
+            // is that task's work.
+            if joined.is_empty() && text("reason").is_none_or(|reason| reason.trim().is_empty()) {
                 let there = crate::task::still_there(&line.project, &caller);
                 if !there.is_empty() {
                     let listed: Vec<String> = (there.iter())
@@ -798,12 +885,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 },
                 false => Value::Null,
             };
-            // The agents it starts with, each made as its profile: one, as
-            // profile names, unless agents says more.
-            let profiles = agents_of(&arguments["agents"], text("profile"))
-                .map_err(|e| ("invalid_arguments", e))?;
-            // A board its agents take items from: their own project's.
-            let board = text("board");
+            // The agents it starts with: one, as the call names it, unless
+            // agents gives a mix.
+            let call = Made {
+                profile: text("profile"),
+                model: text("model"),
+                effort: text("effort"),
+            };
+            let made =
+                agents_of(&arguments["agents"], call).map_err(|e| ("invalid_arguments", e))?;
+            // A board its agents take work from: their own project's.
             if !crate::board::on() && (board.is_some() || !arguments["agents"].is_null()) {
                 return Err((
                     "invalid_arguments",
@@ -823,7 +914,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ));
                 }
             }
-            let short = text("name").unwrap_or_default();
             // A last part all digits names one of a task's several agents.
             if (short.rsplit('.').next())
                 .is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
@@ -836,22 +926,25 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
-            let several = profiles.len() > 1;
+            // A task on a board, or with several agents, numbers them from
+            // 1, so one more joins it as the next; one that joins counts on
+            // from the last.
+            let numbered = board.is_some() || made.len() > 1;
+            let after = joined.last().map_or(0, |(n, _)| *n);
             let mut said: Vec<String> = Vec::new();
-            for (n, profile) in profiles.into_iter().enumerate() {
+            for (n, made) in made.into_iter().enumerate() {
                 let start = crate::task::Start {
-                    // Several are the task's name and their number from 1.
-                    name: match several {
-                        true => format!("{short}.{}", n + 1),
-                        false => short.clone(),
+                    name: match numbered {
+                        true => format!("{short}.{}", after + n as u64 + 1),
+                        false => short.to_owned(),
                     },
                     title: Some(title.clone()),
                     brief: text("brief").unwrap_or_default(),
-                    profile,
+                    profile: made.profile,
                     permissions: text("permissions"),
                     setup: arguments["setup"] == true,
-                    model: text("model"),
-                    effort: text("effort"),
+                    model: made.model,
+                    effort: made.effort,
                     own_folder: arguments["own_folder"] == true,
                     here: false,
                     folder: text("folder"),
@@ -863,7 +956,33 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     board: board.clone(),
                 };
                 match crate::task::start(&line.folder, &line.project, &caller, &start) {
-                    Ok(started) => said.push(started),
+                    Ok(started) => {
+                        // Open work kept for it, by name or profile, asks
+                        // it at once, as if it had been there as it opened.
+                        let whole = match start.name.starts_with(&format!("{}.", line.project)) {
+                            true => start.name.clone(),
+                            false => format!("{}.{}", line.project, start.name),
+                        };
+                        if crate::board::on()
+                            && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+                            && let Ok((store, socket)) = crate::daemon_paths(None, None)
+                            && let Ok((client, _events)) =
+                                agent_client::Client::connect(&socket).await
+                            && let Some(made) = crate::commons::listed(&client, &whole).await
+                        {
+                            let profile = made["profile"].as_str();
+                            let kept =
+                                crate::commons::kept_for(&home, &line.project, &whole, profile);
+                            if !kept.is_empty() {
+                                let id = made["bot_id"].as_i64();
+                                crate::commons::ask_started(
+                                    &client, &home, &store, &kept, &whole, id, &caller,
+                                )
+                                .await;
+                            }
+                        }
+                        said.push(started)
+                    }
                     Err(e) if said.is_empty() => return Err(("task_not_started", e)),
                     // Those started work on; the rest is said, not undone.
                     Err(e) => {
@@ -873,6 +992,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 }
             }
             let started = said.join("\n\n");
+            // The agent that started a task on a board follows the board,
+            // so it hears the work as it moves, not only its task's end.
+            if let Some(board) = &board
+                && let Ok((store, _)) = crate::daemon_paths(None, None)
+            {
+                let caller_id = std::env::var("AGENT_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok());
+                crate::board::follow_kept(&store, &caller, board, caller_id);
+            }
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
@@ -1082,15 +1211,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // post or a reply writes it, so a read asks no one.
             let project = (arguments["post"].is_object() || arguments["reply"].is_object())
                 .then(|| Line::of(&caller, &here).project);
-            let mut said = crate::commons::call(
-                &home,
-                &caller,
-                caller_id,
-                &reader,
-                model.as_deref(),
-                project.as_deref(),
-                arguments,
-            )
+            // Whom reserved work is for: the profile it was made as, asked
+            // only of one taking work.
+            let profile = (arguments["reply"]["do"] == "take")
+                .then(|| crate::task::profile(&caller, caller_id))
+                .flatten();
+            let as_caller = crate::board::Caller {
+                name: &caller,
+                id: caller_id,
+                reader: &reader,
+                model: model.as_deref(),
+                project: project.as_deref(),
+                profile: profile.as_deref(),
+                lead: crate::project::is_lead(&caller),
+            };
+            let mut said = crate::commons::call_as(&home, &as_caller, arguments, &|holder, id| {
+                crate::task::gone(holder, id)
+            })
             .map_err(|e| ("commons_refused", e))?;
             // Posting in a thread follows it for the agent, in its store,
             // and the answer says how its posts will reach the agent: the
@@ -1100,68 +1237,33 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 && said["posted"] != false
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
-                && let Some(subscribed) =
-                    crate::commons::subscribed(&store, &caller, caller_id, &thread)
             {
-                said["follow"] = subscribed;
-            }
-            if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
-                said["invited"] =
-                    json!(crate::commons::invite(&home, &said, &caller, &invite).await);
-            }
-            Ok(said.to_string())
-        }
-        BOARD => {
-            if !crate::board::on() {
-                return Err(("board_refused", "boards are off".to_owned()));
-            }
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or(("board_refused", "no HOME".to_owned()))?;
-            let caller_id = std::env::var("AGENT_BOT_ID")
-                .ok()
-                .and_then(|id| id.parse().ok());
-            let model = std::env::var("AGENT_MODEL").ok();
-            let reader = crate::commons::who(
-                &std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone()),
-                std::env::var("AGENT_CALL_BOT_ID")
-                    .ok()
-                    .and_then(|id| id.parse().ok())
-                    .or(caller_id),
-            );
-            let writes = arguments["add"].is_object() || arguments["act"].is_object();
-            if arguments["add"].is_object() {
-                crate::commons::recount(&home).await;
-            }
-            // Whose agents take a board's items: the project the caller is
-            // named in, as its posts say, and the profile it was made as.
-            let project = writes.then(|| Line::of(&caller, &here).project);
-            let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
-            let profile = (arguments["act"]["do"] == "claim")
-                .then(|| crate::task::profile(&caller, caller_id))
-                .flatten();
-            let board_caller = crate::board::Caller {
-                name: &caller,
-                id: caller_id,
-                reader: &reader,
-                model: model.as_deref(),
-                project: project.as_deref(),
-                profile: profile.as_deref(),
-            };
-            let mut said = crate::board::call(&home, &board_caller, arguments, &|holder, id| {
-                crate::task::gone(holder, id)
-            })
-            .map_err(|e| ("board_refused", e))?;
-            // As a post or a reply does, adding or acting follows the
-            // item's thread for the agent.
-            if writes
-                && said["posted"] != false
-                && let Some(thread) = said["thread"].as_str().map(str::to_owned)
-                && let Some(store) = &store
-                && let Some(subscribed) =
-                    crate::commons::subscribed(store, &caller, caller_id, &thread)
-            {
-                said["follow"] = subscribed;
+                // A thread on a board is followed for why the agent is
+                // there, and work opened or taken follows its board.
+                let on_board = (crate::board::on())
+                    .then(|| crate::board::follows(&store, &caller, caller_id, arguments, &said))
+                    .flatten();
+                if let Some(subscribed) =
+                    crate::commons::subscribed(&store, &caller, caller_id, &thread, on_board)
+                {
+                    said["follow"] = subscribed;
+                }
+                said.as_object_mut().map(|said| said.remove("dropped_from"));
+                // Work that opened, or was given whom it is for, asks them.
+                let ask_for: Vec<String> = (said.as_object_mut())
+                    .and_then(|said| said.remove(crate::board::ASK_FOR))
+                    .and_then(|threads| serde_json::from_value(threads).ok())
+                    .unwrap_or_default();
+                if !ask_for.is_empty() {
+                    said["asked"] =
+                        json!(crate::commons::ask_for(&home, &store, &ask_for, &caller).await);
+                }
+                // Each live agent a post names as @NAME hears it once.
+                let mentioned = crate::board::mentioned(arguments, &caller);
+                if !mentioned.is_empty() {
+                    said["mentioned"] =
+                        json!(crate::commons::mention(&home, &said, &caller, &mentioned).await);
+                }
             }
             if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
                 said["invited"] =
@@ -1396,6 +1498,9 @@ pub fn project_of(bot: &str) -> String {
 pub struct Server {
     nudge: Arc<Notify>,
     serving: Serving,
+    /// The daemon it serves, whose turns' ends it checks.
+    store: PathBuf,
+    socket: PathBuf,
 }
 
 impl Server {
@@ -1412,8 +1517,18 @@ impl Server {
         let (nudge, serving) = (Arc::new(Notify::new()), Arc::new(Mutex::new(held)));
         // The workflows that were running when the last host stopped.
         crate::workflow::resume(store.clone(), socket.clone());
-        tokio::spawn(serve(store, socket, nudge.clone(), Arc::clone(&serving)));
-        Server { nudge, serving }
+        tokio::spawn(serve(
+            store.clone(),
+            socket.clone(),
+            nudge.clone(),
+            Arc::clone(&serving),
+        ));
+        Server {
+            nudge,
+            serving,
+            store,
+            socket,
+        }
     }
 
     /// The host's connection that reads the events made, or made again:
@@ -1456,6 +1571,15 @@ impl Server {
             Some("turn_finished") => {
                 if let Some(turn) = event["turn"].as_i64() {
                     self.serving.lock().unwrap().finish(turn);
+                    // Its end may tell the agent what it holds or what's open.
+                    if let Some(bot) = event["bot"].as_str()
+                        && tokio::runtime::Handle::try_current().is_ok()
+                    {
+                        let status = event["data"]["status"].as_str().unwrap_or_default();
+                        let id = event["bot_id"].as_i64();
+                        let daemon = (self.store.clone(), self.socket.clone());
+                        crate::turn_end::finished(daemon, bot.to_owned(), id, turn, status);
+                    }
                 }
             }
             // A call of Sonny's a message lifted waits on past its turn.
@@ -2790,8 +2914,8 @@ async fn answer(
         arguments["save"]["external"] = json!(true);
     }
     // A post is marked from the turn, never from what the agent says.
-    if call["name"] == COMMONS || call["name"] == BOARD {
-        for key in ["post", "reply", "add", "act"] {
+    if call["name"] == COMMONS {
+        for key in ["post", "reply"] {
             if let Some(post) = arguments[key].as_object_mut() {
                 post.remove("external");
                 if read_outside(client, bot, turn).await {
@@ -2838,7 +2962,11 @@ async fn answer(
         .last()
         .and_then(|line| serde_json::from_str(line).ok());
     match said {
-        Some(said) if said["output"].is_string() => Ok(str_of(&said["output"])),
+        Some(said) if said["output"].is_string() => {
+            let output = str_of(&said["output"]);
+            noted(name, bot, turn, &arguments, &output).await;
+            Ok(output)
+        }
         Some(said) if said["error"]["code"].is_string() => Err((
             code(said["error"]["code"].as_str().unwrap_or_default()),
             str_of(&said["error"]["detail"]),
@@ -2847,6 +2975,27 @@ async fn answer(
             "tool_failed",
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         )),
+    }
+}
+
+/// What the host keeps between turns of a call it answered: the call runs
+/// in a process of its own, so what a turn's end reads is noted here, in
+/// the host, from the call and its answer: a commons post or reply wrote
+/// in its thread.
+async fn noted(name: &str, bot: &str, turn: i64, arguments: &Value, output: &str) {
+    if name == COMMONS && (arguments["post"].is_object() || arguments["reply"].is_object()) {
+        let said: Value = serde_json::from_str(output).unwrap_or_default();
+        if let (Some(thread), Some(home)) = (said["thread"].as_str(), std::env::var_os("HOME"))
+            && said["posted"] != false
+        {
+            // It reads the thread: off the runtime, done before the answer
+            // goes back.
+            let (bot, thread) = (bot.to_owned(), thread.to_owned());
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::turn_end::wrote(Path::new(&home), &bot, Some(turn), &thread)
+            })
+            .await;
+        }
     }
 }
 
@@ -3572,6 +3721,8 @@ mod tests {
         let server = Server {
             nudge: Arc::new(Notify::new()),
             serving: Default::default(),
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
         };
         // A script that reads slowly, then writes.
         let (read, written) = (Arc::new(Notify::new()), Arc::new(AtomicUsize::new(0)));
@@ -3656,6 +3807,8 @@ mod tests {
         let server = Server {
             nudge: Arc::new(Notify::new()),
             serving: Default::default(),
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
         };
         let run = {
             let (hub, dir, input) = (hub.clone(), dir.clone(), input.clone());
@@ -3776,6 +3929,8 @@ mod tests {
         let server = Server {
             nudge: Arc::new(Notify::new()),
             serving: Default::default(),
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
         };
         let (ran, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
         let (count, started) = (ran.clone(), runs.clone());
@@ -3828,6 +3983,8 @@ mod tests {
         let server = Server {
             nudge: Arc::new(Notify::new()),
             serving: Default::default(),
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
         };
         let (written, wrote) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
         let (writes, reading) = (written.clone(), wrote.clone());
@@ -4201,17 +4358,43 @@ mod tests {
     }
 
     #[test]
-    fn a_start_makes_one_agent_or_as_many_as_agents_says() {
-        let worker = Some("worker".to_owned());
+    fn a_start_makes_one_agent_or_the_mix_agents_says() {
+        let made = |profile: Option<&str>, model: Option<&str>, effort: Option<&str>| Made {
+            profile: profile.map(str::to_owned),
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+        };
+        let call = made(Some("worker"), Some("a/one"), Some("high"));
+        let one = agents_of(&Value::Null, call.clone()).unwrap();
+        assert_eq!(one, std::slice::from_ref(&call));
+        let mix = json!([
+            {"model": "a/fable", "count": 2},
+            {"model": "b/astra"},
+            {"profile": "reviewer"},
+            {"profile": "reviewer", "model": "c/sol", "effort": "low"},
+        ]);
         assert_eq!(
-            agents_of(&Value::Null, worker.clone()).unwrap(),
-            std::slice::from_ref(&worker)
+            agents_of(&mix, call.clone()).unwrap(),
+            [
+                made(Some("worker"), Some("a/fable"), Some("high")),
+                made(Some("worker"), Some("a/fable"), Some("high")),
+                made(Some("worker"), Some("b/astra"), Some("high")),
+                // Its own profile, with that profile's model.
+                made(Some("reviewer"), None, Some("high")),
+                made(Some("reviewer"), Some("c/sol"), Some("low")),
+            ]
         );
-        assert_eq!(agents_of(&json!(3), None).unwrap(), [None, None, None]);
-        let named = agents_of(&json!(["worker", "reviewer"]), None).unwrap();
-        assert_eq!(named, [worker, Some("reviewer".to_owned())]);
-        for bad in [json!(0), json!([]), json!([""]), json!("two")] {
-            assert!(agents_of(&bad, None).is_err(), "{bad}");
+        for bad in [
+            json!(3),
+            json!([]),
+            json!(["worker"]),
+            json!([{"model": ""}]),
+            json!([{"count": 0}]),
+            json!([{"count": "two"}]),
+            json!([{"name": "x"}]),
+            json!("two"),
+        ] {
+            assert!(agents_of(&bad, Made::default()).is_err(), "{bad}");
         }
     }
 
@@ -4224,7 +4407,7 @@ mod tests {
                 .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [FOLLOWS, SHOW, AUTOMATIONS, MEMORY, WORKFLOW, COMMONS, BOARD];
+        let every = [FOLLOWS, SHOW, AUTOMATIONS, MEMORY, WORKFLOW, COMMONS];
         // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);

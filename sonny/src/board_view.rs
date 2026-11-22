@@ -1,6 +1,6 @@
 //! Boards in `/commons`: a project's lists of work that agents pull from,
 //! drawn from what the commons listing already keeps of each thread. An
-//! item is a thread on a board, with a state the board tool's posts set;
+//! item is a thread of work on a board, with a state its step posts set;
 //! [`crate::board::item`] says where each stands, and this draws it:
 //! the Boards section over the threads, a board's page, an item's row
 //! among the threads, and the row under an item's name that says where
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum State {
     Failed,
-    Claimed,
+    Taken,
     Open,
     Waiting,
     Done,
@@ -28,7 +28,7 @@ pub enum State {
 impl State {
     pub const ALL: [State; 6] = [
         State::Failed,
-        State::Claimed,
+        State::Taken,
         State::Open,
         State::Waiting,
         State::Done,
@@ -38,7 +38,7 @@ impl State {
     fn parse(word: &str) -> Option<Self> {
         Some(match word {
             "failed" => State::Failed,
-            "claimed" => State::Claimed,
+            "taken" => State::Taken,
             "open" => State::Open,
             "waiting" => State::Waiting,
             "done" => State::Done,
@@ -51,7 +51,7 @@ impl State {
     pub fn word(self) -> &'static str {
         match self {
             State::Failed => "failed",
-            State::Claimed => "claimed",
+            State::Taken => "taken",
             State::Open => "open",
             State::Waiting => "waiting",
             State::Done => "done",
@@ -62,7 +62,7 @@ impl State {
     fn heading(self) -> &'static str {
         match self {
             State::Failed => "Failed",
-            State::Claimed => "Claimed",
+            State::Taken => "Taken",
             State::Open => "Open",
             State::Waiting => "Waiting",
             State::Done => "Done",
@@ -80,7 +80,7 @@ impl State {
     pub fn sign(self) -> Span<'static> {
         match self {
             State::Failed => Span::raw("✗").fg(Color::Red),
-            State::Claimed => Span::raw("●").fg(Color::Cyan),
+            State::Taken => Span::raw("●").fg(Color::Cyan),
             State::Open => Span::raw("○").dim(),
             State::Waiting => Span::raw("◌").dim(),
             State::Done => Span::raw("✓").dim(),
@@ -96,24 +96,26 @@ pub struct Item {
     pub title: String,
     pub board: String,
     pub state: State,
-    /// The agent that claimed it, by its own name.
+    /// The agent that took it, by its own name.
     pub holder: Option<String>,
     pub labels: Vec<(String, String)>,
-    /// The agent or profile it is kept for.
-    pub kept_for: Option<String>,
+    /// The agents and profiles it is kept for, as `for` names them.
+    pub kept_for: Vec<String>,
     /// The threads of the items it needs.
     pub needs: Vec<String>,
     /// The closing post's text: a done one's result, a failed one's why.
     pub result: Option<String>,
     /// When its last post was written, in seconds.
     pub at: i64,
+    /// When its holder last wrote in it, in seconds.
+    pub holder_at: Option<i64>,
 }
 
 /// The item a thread's listing line says, if it is one: `summary` as the
 /// commons listing keeps it, its `item` as [`crate::board::item`] gave
 /// it, and `at` its last post's time.
 pub fn item_of(summary: &Value, at: i64) -> Option<Item> {
-    let item = summary.get("item").filter(|item| item.is_object())?;
+    let item = summary.get("work").filter(|item| item.is_object())?;
     let text = |value: &Value| value.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
     let mut labels: Vec<(String, String)> = (item["labels"].as_object().into_iter().flatten())
         .filter_map(|(key, value)| Some((key.clone(), value_text(value)?)))
@@ -121,17 +123,23 @@ pub fn item_of(summary: &Value, at: i64) -> Option<Item> {
     labels.sort();
     Some(Item {
         thread: summary["thread"].as_str()?.to_owned(),
-        title: summary["title"].as_str().unwrap_or_default().to_owned(),
+        title: (item["title"].as_str())
+            .or(summary["title"].as_str())
+            .unwrap_or_default()
+            .to_owned(),
         board: text(&item["board"])?,
         state: State::parse(item["state"].as_str()?)?,
         holder: text(&item["holder"]),
         labels,
-        kept_for: text(&item["for"]),
+        kept_for: (item["for"].as_array().into_iter().flatten())
+            .filter_map(|one| one.as_str().map(str::to_owned))
+            .collect(),
         needs: (item["needs"].as_array().into_iter().flatten())
             .filter_map(|need| need.as_str().map(str::to_owned))
             .collect(),
         result: text(&item["result"]),
         at,
+        holder_at: item["holder_at"].as_i64(),
     })
 }
 
@@ -184,23 +192,31 @@ impl Board {
 
 /// The boards `items` are on: this window's project's first, then the
 /// rest by name, an order that never follows state.
-pub fn boards(items: &[Item], here: &str) -> Vec<Board> {
-    let mut by_name: HashMap<&str, usize> = HashMap::new();
+pub fn boards(items: &[Item], plain: &[(&str, i64)], here: &str) -> Vec<Board> {
+    let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<Board> = Vec::new();
-    for (at, item) in items.iter().enumerate() {
-        let board = *by_name.entry(item.board.as_str()).or_insert_with(|| {
+    let mut board_of = |name: &str, out: &mut Vec<Board>| -> usize {
+        *by_name.entry(name.to_owned()).or_insert_with(|| {
             out.push(Board {
-                name: item.board.clone(),
+                name: name.to_owned(),
                 items: Vec::new(),
                 last: 0,
                 counts: [0; 6],
             });
             out.len() - 1
-        });
+        })
+    };
+    for (at, item) in items.iter().enumerate() {
+        let board = board_of(&item.board, &mut out);
         let board = &mut out[board];
         board.items.push(at);
         board.last = board.last.max(item.at);
         board.counts[item.state as usize] += 1;
+    }
+    // Its plain threads, each `(board, last post)`, make it a board too.
+    for (name, at) in plain {
+        let board = board_of(name, &mut out);
+        out[board].last = out[board].last.max(*at);
     }
     out.sort_by(|a, b| {
         let theirs = |board: &Board| project_of(&board.name) != here;
@@ -239,6 +255,8 @@ pub fn named(bot: &str, here: &str) -> String {
 pub struct Present {
     pub project: String,
     pub bots: std::collections::HashSet<String>,
+    /// The profiles they were made as.
+    pub profiles: std::collections::HashSet<String>,
 }
 
 impl Present {
@@ -251,16 +269,43 @@ impl Present {
                 .is_some_and(|rest| rest.starts_with('.'))
             && !self.bots.contains(bot)
     }
+
+    /// Whether no agent the window lists may take `item`, open or waiting
+    /// on this project's board and kept for agents or profiles none of
+    /// them is: the lead starts one, or the work waits.
+    pub fn nobody_for(&self, item: &Item) -> bool {
+        matches!(item.state, State::Open | State::Waiting)
+            && !item.kept_for.is_empty()
+            && !self.bots.is_empty()
+            && project_of(&item.board) == self.project
+            && !(item.kept_for.iter()).any(|one| match one.strip_prefix(crate::board::PROFILE) {
+                Some(profile) => self.profiles.contains(profile),
+                None => self.bots.contains(one),
+            })
+    }
+}
+
+/// Whom `item` is kept for, in words: `for profile:reviewer`, and
+/// `nobody eligible` after it when no agent the window lists is.
+fn kept_words(item: &Item, present: &Present) -> Option<String> {
+    if item.kept_for.is_empty() {
+        return None;
+    }
+    let mut said = format!("for {}", item.kept_for.join(", "));
+    if present.nobody_for(item) {
+        said.push_str(", nobody eligible");
+    }
+    Some(said)
 }
 
 /// An item's state in words, with its holder where it has one: `open`,
-/// `claimed by errors-2`, `errors-2 closed`.
+/// `taken by errors-2`, `errors-2 closed`.
 pub fn state_words(item: &Item, here: &str, present: &Present) -> String {
     match (&item.holder, item.state) {
-        (Some(holder), State::Claimed) if present.closed(holder) => {
+        (Some(holder), State::Taken) if present.closed(holder) => {
             format!("{} closed", named(holder, here))
         }
-        (Some(holder), State::Claimed) => format!("claimed by {}", named(holder, here)),
+        (Some(holder), State::Taken) => format!("taken by {}", named(holder, here)),
         (_, state) => state.word().to_owned(),
     }
 }
@@ -373,22 +418,27 @@ pub fn page_row(
     let lead_width = spans_width(&lead);
     // What stands at the right, which stays.
     let (who, link): (Vec<Span<'static>>, Option<String>) = match (&item.holder, item.state) {
-        (Some(holder), State::Claimed) if present.closed(holder) => (
+        (Some(holder), State::Taken) if present.closed(holder) => (
             vec![Span::raw(format!("{} closed", named(holder, here))).dim()],
             None,
         ),
-        (Some(holder), State::Claimed) => (
+        (Some(holder), State::Taken) => (
             vec![Span::raw(named(holder, here)).fg(Color::Blue)],
             Some(holder.clone()),
         ),
-        _ => match &item.kept_for {
+        _ => match kept_words(item, present) {
             Some(kept) if matches!(item.state, State::Open | State::Waiting) => {
-                (vec![Span::raw(format!("for {kept}")).dim()], None)
+                (vec![Span::raw(kept).dim()], None)
             }
             _ => (Vec::new(), None),
         },
     };
-    let age = age(now - item.at);
+    // Taken work shows when its holder last wrote there.
+    let at = match item.state {
+        State::Taken => item.holder_at.unwrap_or(item.at),
+        _ => item.at,
+    };
+    let age = age(now - at);
     let labels: String = (item.labels.iter())
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
@@ -442,6 +492,24 @@ pub fn page_row(
         }
     }
     (Line::from(spans), named_at)
+}
+
+/// A plain thread's row on its board's page, `width` wide: its title in
+/// the columns an item's mark leaves, and at the right who last wrote and
+/// when, `at`, which stay.
+pub fn plain_row(thread: &Value, at: i64, width: usize, now: i64, here: &str) -> Line<'static> {
+    let by = named(thread["last_by"].as_str().unwrap_or_default(), here);
+    let right = format!("{by} · {}", age(now - at));
+    let room = width.saturating_sub(3 + 2 + right.chars().count());
+    let title = crate::title::cut(thread["title"].as_str().unwrap_or_default(), room);
+    let used = 3 + crate::title::width(&title);
+    let pad = width.saturating_sub(used + right.chars().count()).max(2);
+    Line::from(vec![
+        Span::raw("   "),
+        Span::raw(title),
+        Span::raw(" ".repeat(pad)),
+        Span::raw(right).dim(),
+    ])
 }
 
 /// What hangs under an item's row on its board's page, if anything: what
@@ -507,45 +575,69 @@ pub fn found_on_page(item: &Item, query: &str) -> bool {
         .any(|words| crate::find::says(query, words))
 }
 
-/// What one action post did to its item, in words: `claimed`,
-/// `released`, `took it over from errors-2, closed`. None for a post
-/// that is no action, or the first post, which is the item's text.
-pub fn action_words(post: &Value, here: &str) -> Option<String> {
+/// What one step post did to its work, in words: `taken`, `dropped`,
+/// `took it over from errors-2, closed`. None for a post that is no step,
+/// or the first post opening work, which is the work's text.
+pub fn action_words(post: &Value, first: bool, here: &str) -> Option<String> {
     let did = post["do"].as_str()?;
-    Some(match did {
-        "add" => return None,
-        "item" => "made it an item".to_owned(),
-        "claim" => match post["took_from"].as_str() {
+    let mut said = match did {
+        "open" if first => return None,
+        "open" => match post["board"].as_str() {
+            Some(board) => format!("opened it as work on {board}"),
+            None => "opened it again".to_owned(),
+        },
+        "take" => match post["took_from"].as_str() {
             Some(from) => format!("took it over from {}, closed", named(from, here)),
-            None => "claimed".to_owned(),
+            None => "took it".to_owned(),
         },
-        "release" => "released".to_owned(),
+        "drop" => "dropped it".to_owned(),
         "done" => "done".to_owned(),
-        "fail" => "failed".to_owned(),
-        "cancel" => "canceled".to_owned(),
-        "reopen" => "reopened".to_owned(),
-        "label" => {
-            let mut said: Vec<String> = (post["labels"].as_object().into_iter().flatten())
-                .map(|(key, value)| match value_text(value) {
-                    Some(value) => format!("{key}={value}"),
-                    None => format!("{key} off"),
-                })
-                .collect();
-            said.sort();
-            format!("labeled {}", said.join(" "))
-        }
-        "assign" => match post["for"].as_str().filter(|kept| !kept.is_empty()) {
-            Some(kept) => format!("kept it for {kept}"),
-            None => "kept it for anyone".to_owned(),
-        },
+        "fail" => "failed it".to_owned(),
+        "set" => String::new(),
         other => other.to_owned(),
-    })
+    };
+    // What its fields changed, after what it did.
+    let mut changed: Vec<String> = Vec::new();
+    if let Some(labels) = post["labels"].as_object() {
+        let mut labeled: Vec<String> = (labels.iter())
+            .map(|(key, value)| match value_text(value) {
+                Some(value) => format!("{key}={value}"),
+                None => format!("{key} off"),
+            })
+            .collect();
+        labeled.sort();
+        changed.push(format!("labeled {}", labeled.join(" ")));
+    }
+    if let Some(named) = post["for"].as_array() {
+        let named: Vec<&str> = named.iter().filter_map(Value::as_str).collect();
+        changed.push(match named.is_empty() {
+            true => "kept it for anyone".to_owned(),
+            false => format!("kept it for {}", named.join(", ")),
+        });
+    }
+    if let Some(needs) = post["needs"]
+        .as_array()
+        .filter(|_| !(first || did == "open"))
+    {
+        let needs: Vec<&str> = needs.iter().filter_map(Value::as_str).collect();
+        changed.push(match needs.is_empty() {
+            true => "needs nothing now".to_owned(),
+            false => format!("needs {}", needs.join(", ")),
+        });
+    }
+    for change in changed {
+        if !said.is_empty() {
+            said.push_str(", ");
+        }
+        said.push_str(&change);
+    }
+    Some(said).filter(|said| !said.is_empty())
 }
 
 /// A link on a row: the row, its columns from and to, and what it opens.
 pub type Linked = (usize, usize, usize, Target);
 
-/// The row under an item's name, which says where it stands: `item on
+/// The row under an item's name, which says where it stands: `work on
 /// BOARD`, its state and holder, who it is for, how many items it needs,
 /// its labels. The board, the holder and the items it needs are links,
 /// each by its columns and what it opens.
@@ -557,19 +649,19 @@ pub fn item_head(
 ) -> (Vec<Line<'static>>, Vec<Linked>) {
     let mut parts: Vec<Vec<(Span<'static>, Option<Target>)>> = Vec::new();
     parts.push(vec![
-        (Span::raw("item on ").dim(), None),
+        (Span::raw("work on ").dim(), None),
         (
             Span::raw(item.board.clone()).bold(),
             Some(Target::Board(item.board.clone())),
         ),
     ]);
     match (&item.holder, item.state) {
-        (Some(holder), State::Claimed) if present.closed(holder) => parts.push(vec![(
+        (Some(holder), State::Taken) if present.closed(holder) => parts.push(vec![(
             Span::raw(format!("{} closed", named(holder, here))).dim(),
             None,
         )]),
-        (Some(holder), State::Claimed) => parts.push(vec![
-            (Span::raw("claimed by ").dim(), None),
+        (Some(holder), State::Taken) => parts.push(vec![
+            (Span::raw("taken by ").dim(), None),
             (
                 Span::raw(named(holder, here)).fg(Color::Blue),
                 Some(Target::Agent(holder.clone())),
@@ -577,8 +669,8 @@ pub fn item_head(
         ]),
         (_, state) => parts.push(vec![(Span::raw(state.word()).dim(), None)]),
     }
-    if let Some(kept) = &item.kept_for {
-        parts.push(vec![(Span::raw(format!("for {kept}")).dim(), None)]);
+    if let Some(kept) = kept_words(item, present) {
+        parts.push(vec![(Span::raw(kept).dim(), None)]);
     }
     if !item.needs.is_empty() {
         let mut part = vec![(Span::raw("needs ").dim(), None)];
@@ -655,11 +747,11 @@ pub(crate) mod tests {
         home
     }
 
-    /// The board tool called as `name` of its project, every post of the
-    /// thread it acts on shown to it first.
+    /// The commons tool called as `name` of its project, every post of
+    /// the thread it replies to shown to it first.
     fn send(home: &Path, name: &str, arguments: Value) -> Value {
         let project = name.split('.').next().unwrap_or(name);
-        if let Some(thread) = arguments["act"]["thread"].as_str()
+        if let Some(thread) = arguments["reply"]["thread"].as_str()
             && let Ok(posts) =
                 crate::commons::posts(&crate::commons::dir(home).join(format!("{thread}.jsonl")))
         {
@@ -672,23 +764,25 @@ pub(crate) mod tests {
             model: None,
             project: Some(project),
             profile: None,
+            lead: name.ends_with(".lead"),
         };
-        crate::board::call(home, &caller, &arguments, &|_, _| false).unwrap()
+        crate::commons::call_as(home, &caller, &arguments, &|_, _| false).unwrap()
     }
 
     fn add(home: &Path, by: &str, board: &str, name: &str, title: &str, extra: Value) {
-        let mut add = json!({"name": name, "title": title, "text": "x", "board": board});
+        let mut add =
+            json!({"name": name, "title": title, "text": "x", "board": board, "work": true});
         for (key, value) in extra.as_object().into_iter().flatten() {
             add[key] = value.clone();
         }
-        send(home, by, json!({"add": add}));
+        send(home, by, json!({"post": add}));
     }
 
     fn act(home: &Path, by: &str, thread: &str, what: &str, text: &str) {
         send(
             home,
             by,
-            json!({"act": {"thread": thread, "do": what, "text": text}}),
+            json!({"reply": {"thread": thread, "do": what, "text": text}}),
         );
     }
 
@@ -802,7 +896,7 @@ pub(crate) mod tests {
             te,
             "review",
             "Review the typed errors change",
-            json!({"needs": ["enum"], "for": "reviewer"}),
+            json!({"needs": ["enum"], "for": ["profile:reviewer"]}),
         );
         add(
             h,
@@ -812,9 +906,9 @@ pub(crate) mod tests {
             "Write the error docs",
             json!({}),
         );
-        act(h, "shop.errors-2", "api", "claim", "mine");
-        act(h, "shop.errors-3", "cli", "claim", "mine");
-        act(h, "shop.errors-1", "docs", "claim", "mine");
+        act(h, "shop.errors-2", "api", "take", "mine");
+        act(h, "shop.errors-3", "cli", "take", "mine");
+        act(h, "shop.errors-1", "docs", "take", "mine");
         act(
             h,
             "shop.errors-1",
@@ -846,9 +940,9 @@ pub(crate) mod tests {
             "Fix the broken links",
             json!({}),
         );
-        act(h, "docs.pager", "pages", "claim", "mine");
+        act(h, "docs.pager", "pages", "take", "mine");
         act(h, "docs.pager", "pages", "fail", "The generator is gone.");
-        act(h, "docs.pager", "links", "claim", "mine");
+        act(h, "docs.pager", "links", "take", "mine");
         act(h, "docs.pager", "links", "done", "Fixed.");
         thread(
             h,
@@ -915,7 +1009,7 @@ pub(crate) mod tests {
             before,
             ["docs/api-pages", "shop/release", "shop/typed-errors"]
         );
-        act(home, "shop.errors-4", "notes", "claim", "mine");
+        act(home, "shop.errors-4", "notes", "take", "mine");
         view.reload();
         assert_eq!(order(&mut view), before);
         let lines = card(&mut view, 80);
@@ -937,8 +1031,8 @@ pub(crate) mod tests {
                 .iter()
                 .any(|l| l.contains("docs/api-pages"))
         );
-        act(home, "docs.pager", "pages", "reopen", "again");
-        act(home, "docs.pager", "pages", "claim", "mine");
+        act(home, "docs.pager", "pages", "open", "again");
+        act(home, "docs.pager", "pages", "take", "mine");
         act(home, "docs.pager", "pages", "done", "Drawn.");
         age_by(home, "pages", FINISHED_AFTER + 60);
         view.reload();
@@ -984,7 +1078,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(lines[api], "● Add typed errors to the api");
         assert!(
-            lines[api + 1].starts_with("  shop/typed-errors · claimed by errors-2 · 2 posts · by shop.lead · last shop.errors-2 · "),
+            lines[api + 1].starts_with("  shop/typed-errors · taken by errors-2 · 2 posts · by shop.lead · last shop.errors-2 · "),
             "{:?}",
             lines[api + 1]
         );
@@ -1027,14 +1121,14 @@ pub(crate) mod tests {
         let lines = card(&mut view, 80);
         assert_eq!(
             lines[0],
-            "shop/typed-errors · 2 claimed · 1 open · 2 waiting · 1 done"
+            "shop/typed-errors · 2 taken · 1 open · 2 waiting · 1 done"
         );
         assert_eq!(lines[1], "board of shop");
         let at = |needle: &str| {
             (lines.iter().position(|l| l.contains(needle)))
                 .unwrap_or_else(|| panic!("{needle}: {lines:#?}"))
         };
-        assert!(at("Claimed · 2") < at("Open · 1"));
+        assert!(at("Taken · 2") < at("Open · 1"));
         assert!(at("Open · 1") < at("Waiting · 2"));
         assert!(at("Waiting · 2") < at("Done · 1 ▸"));
         // Done starts folded.
@@ -1053,7 +1147,7 @@ pub(crate) mod tests {
         );
         let review = at("Review the typed errors change");
         assert!(
-            lines[review].contains("for reviewer"),
+            lines[review].contains("for profile:reviewer"),
             "{:?}",
             lines[review]
         );
@@ -1095,7 +1189,7 @@ pub(crate) mod tests {
         send(
             home,
             "shop.errors-2",
-            json!({"act": {"thread": "api", "do": "label", "text": "x", "labels": {"kind": "refactor"}}}),
+            json!({"reply": {"thread": "api", "text": "x", "labels": {"kind": "refactor"}}}),
         );
         let mut view = View::open(home, "shop".into());
         press(&mut view, KeyCode::Down);
@@ -1110,12 +1204,12 @@ pub(crate) mod tests {
         assert_eq!(lines[1], "api");
         assert_eq!(
             lines[2],
-            "item on shop/typed-errors · claimed by errors-2 · kind=refactor"
+            "work on shop/typed-errors · taken by errors-2 · kind=refactor"
         );
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("shop.errors-2 · claimed · ")),
+                .any(|l| l.starts_with("shop.errors-2 · took it · ")),
             "{lines:#?}"
         );
         assert!(
@@ -1259,13 +1353,13 @@ pub(crate) mod tests {
         let mut view = View::open(home, "shop".into());
         view.open_thread("pages");
         let lines = card(&mut view, 80);
-        assert_eq!(lines[2], "item on docs/api-pages · failed");
+        assert_eq!(lines[2], "work on docs/api-pages · failed");
         let failed = lines
             .iter()
-            .position(|l| l.starts_with("docs.pager · failed · "))
+            .position(|l| l.starts_with("docs.pager · failed it · "))
             .unwrap();
         assert_eq!(lines[failed + 1], "  The generator is gone.");
-        // A claim on a closed holder's item takes it over.
+        // A take of a closed holder's work takes it over.
         let caller = crate::board::Caller {
             name: "shop.errors-4",
             id: None,
@@ -1273,6 +1367,7 @@ pub(crate) mod tests {
             model: None,
             project: Some("shop"),
             profile: None,
+            lead: false,
         };
         let posts = crate::commons::posts(&crate::commons::dir(home).join("api.jsonl")).unwrap();
         crate::commons::told(
@@ -1281,10 +1376,10 @@ pub(crate) mod tests {
             "api",
             &(0..posts.len()).collect::<Vec<_>>(),
         );
-        crate::board::call(
+        crate::commons::call_as(
             home,
             &caller,
-            &json!({"act": {"thread": "api", "do": "claim", "text": "mine now"}}),
+            &json!({"reply": {"thread": "api", "do": "take", "text": "mine now"}}),
             &|_, _| true,
         )
         .unwrap();
@@ -1306,6 +1401,7 @@ pub(crate) mod tests {
         view.set_present(Present {
             project: "shop".into(),
             bots: ["shop.lead", "shop.errors-3"].map(str::to_owned).into(),
+            ..Present::default()
         });
         press(&mut view, KeyCode::Down);
         press(&mut view, KeyCode::Enter);
@@ -1325,7 +1421,8 @@ pub(crate) mod tests {
         assert!(
             !Present {
                 project: "shop".into(),
-                bots: ["shop.lead".into()].into()
+                bots: ["shop.lead".into()].into(),
+                ..Present::default()
             }
             .closed("docs.pager")
         );
@@ -1333,10 +1430,94 @@ pub(crate) mod tests {
         assert!(
             !Present {
                 project: "shop".into(),
-                bots: Default::default()
+                ..Present::default()
             }
             .closed("shop.errors-2")
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn work_kept_for_a_profile_nobody_listed_has_says_nobody_is_eligible() {
+        let home = &commons("nobody");
+        let review = (crate::commons::summaries(&crate::commons::dir(home)).into_iter())
+            .find(|(name, _)| name == "review")
+            .and_then(|(_, summary)| item_of(&summary, 0))
+            .unwrap();
+        let mut present = Present {
+            project: "shop".into(),
+            bots: ["shop.lead", "shop.errors-3"].map(str::to_owned).into(),
+            profiles: ["lead", "worker"].map(str::to_owned).into(),
+        };
+        assert!(present.nobody_for(&review));
+        let (row, _) = page_row(&review, 100, 0, "shop", &present);
+        assert!(
+            text(&row).contains("for profile:reviewer, nobody eligible"),
+            "{row:?}"
+        );
+        present.profiles.insert("reviewer".into());
+        assert!(!present.nobody_for(&review));
+        let (row, _) = page_row(&review, 100, 0, "shop", &present);
+        assert!(!text(&row).contains("nobody"), "{row:?}");
+        // Before the window has counted anyone, it says nothing.
+        assert!(!Present::default().nobody_for(&review));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn taken_work_shows_when_its_holder_last_wrote_and_plain_threads_sit_beside_it() {
+        let home = &home("holder-at");
+        add(
+            home,
+            "shop.lead",
+            "shop/x",
+            "store",
+            "Type the store",
+            json!({}),
+        );
+        act(home, "shop.w", "store", "take", "mine");
+        age_by(home, "store", 7200);
+        // Another's post later is not the holder's.
+        send(
+            home,
+            "shop.lead",
+            json!({"reply": {"thread": "store", "text": "how goes?"}}),
+        );
+        send(
+            home,
+            "shop.lead",
+            json!({"post": {"name": "plan", "title": "The plan",
+            "text": "x", "board": "shop/x"}}),
+        );
+        let summary = (crate::commons::summaries(&crate::commons::dir(home)).into_iter())
+            .find(|(name, _)| name == "store")
+            .map(|(_, summary)| summary)
+            .unwrap();
+        let item = item_of(&summary, summary["at"].as_i64().unwrap()).unwrap();
+        let now = item.at;
+        let (row, _) = page_row(&item, 80, now, "shop", &Present::default());
+        assert!(text(&row).ends_with("w · 2h"), "{row:?}");
+        let mut view = View::open(home, "shop".into());
+        assert!(picked(&mut view, 80).contains("shop/x"));
+        press(&mut view, KeyCode::Enter);
+        let lines = card(&mut view, 80);
+        let at = lines.iter().position(|l| l.starts_with("Threads · 1"));
+        let at = at.unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(lines[at + 1].contains("The plan"), "{lines:#?}");
+        // The plain thread is picked and opened as any thread.
+        press(&mut view, KeyCode::Down);
+        assert!(picked(&mut view, 80).contains("The plan"));
+        // A board of plain threads alone is a board all the same.
+        send(
+            home,
+            "shop.lead",
+            json!({"post": {"name": "notes", "title": "Notes so far",
+            "text": "x", "board": "shop/notes"}}),
+        );
+        press(&mut view, KeyCode::Esc);
+        view.reload();
+        let lines = card(&mut view, 80);
+        assert!(lines.iter().any(|l| l.contains("shop/notes")), "{lines:#?}");
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -1563,7 +1744,7 @@ pub(crate) mod tests {
         press(&mut view, KeyCode::Enter);
         let lines = card(&mut view, 80);
         assert!(
-            !lines.iter().any(|l| l.starts_with("item on ")),
+            !lines.iter().any(|l| l.starts_with("work on ")),
             "{lines:#?}"
         );
         let _ = std::fs::remove_dir_all(home);
@@ -1590,8 +1771,8 @@ pub(crate) mod tests {
             }
         }
         for b in 0..50 {
-            act(&home, "shop.fix", &format!("b{b:02}-00"), "claim", "on it");
-            act(&home, "shop.fix", &format!("b{b:02}-01"), "claim", "on it");
+            act(&home, "shop.fix", &format!("b{b:02}-00"), "take", "on it");
+            act(&home, "shop.fix", &format!("b{b:02}-01"), "take", "on it");
             act(&home, "shop.fix", &format!("b{b:02}-01"), "done", "fixed");
         }
         let best = |runs: usize, mut f: Box<dyn FnMut() + '_>| -> Duration {
@@ -1615,7 +1796,7 @@ pub(crate) mod tests {
         // One thread changed: claimed, then released, each read and drawn.
         let changed = (0..10)
             .map(|n| {
-                let what = if n % 2 == 0 { "claim" } else { "release" };
+                let what = if n % 2 == 0 { "take" } else { "drop" };
                 act(&home, "shop.fix", "b07-05", what, "x");
                 let at = Instant::now();
                 view.reload();

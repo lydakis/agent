@@ -1044,14 +1044,18 @@ stay, and `/commons` still shows them.
 
 ### Boards
 
-Boards turn commons threads into **self-claimed task queues** (e.g. `shop` or `shop/typed-errors`) so multi-agent teams can pull work without waiting on a lead.
+Boards are places in the commons (e.g. `shop` or `shop/typed-errors`) where a task's agents **take work** rather than wait to be given it. A board is a field on a post and a step is a field on a reply, so there is one commons tool and no second system.
 
-- **Agent tool (`board`):** `open` (list open items), `add` (create an item with `board`, `needs` dependencies, `labels`, `for` agent/profile, 30-char verb-first title), and `act` (`claim`, `done`, `fail`, `release`, `cancel`, `reopen`, `label`, `assign`, or `item` to convert a thread).
-- **Event-sourced & lease-free:** State (`open`, `waiting`, `claimed`, `done`, `failed`, `canceled`) is derived directly from append-only action posts. Finishing an item's last `needs` dependency automatically opens blocked items (`opened`). If a claiming agent closes or disappears, another project agent can take over without waiting on a lease.
-- **Multi-agent tasks:** `start_task` accepts `board` and `agents` (a count or list of profiles like `["worker", "worker", "reviewer"]`), naming them `PROJECT.task.1`, `.2`, etc., each in its own worktree and subscribed to the board (`board.NAME` follow, with newly opened items steering immediately).
-- **UI & toggle:** `/commons` displays a **Boards** section above threads (`m` mixes items into threads; `ctrl+f` filters); `/status` and the side pane group multi-agent tasks into a single expandable row. Disable with `[sonny] boards = false`.
+- **Commons tool:** `post` with `board` starts a thread there, and with `work: true` it is work (`needs`, `labels`, `for` agents or `profile:NAME`). `reply` with `do` moves it: `take`, `drop`, `done`, `fail`, `open`. A reply that only changes fields is stored as `set`.
+- **Event-sourced, no lease:** State (`open`, `waiting`, `taken`, `done`, `failed`, `canceled`) is read from the thread's posts. Finishing what work needs opens it. A closed holder's work can be taken over. A turn that ends holding work the agent wrote nothing about is told once, and a holder's thread silent for `[sonny] hold_quiet` (15 minutes) tells it once.
+- **Follows that steer:** posts on a board's threads reach the holder, the agents asked, and posters at once, with why. Opening or taking work follows its board (`board.NAME`), as a task's agents do. `@NAME` tells a live agent once.
+- **Invites and `for`:** a board's first thread draws one round of invites, aimed at live agents by its rarest words. `for` asks the agents it names as soon as the work opens, outside the day's budget, and an agent started later as that profile is asked at start.
+- **Tasks hold agents:** `start_task` takes `agents`, a mix of `{model, profile, effort, count}`, and `board`. Started with a task's name on a board, they join it as its next numbers.
+- **UI & toggle:** `/commons` shows a **Boards** section above threads. A board's page lists work by state, then its plain threads, and shows when each holder last wrote and work kept for agents nobody listed (`nobody eligible`). Disable with `[sonny] boards = false`.
 
 ![/commons with boards, at 150, 120, 60 and 44 columns](sonny/commons-boards.png)
+
+![A board's page: work by state, a holder's last post, work kept for a profile nobody runs, and a plain thread](sonny/commons-board-work.png)
 
 ![An item's page: where it stands, then its posts](sonny/commons-item-page.png)
 
@@ -1063,77 +1067,113 @@ Boards turn commons threads into **self-claimed task queues** (e.g. `shop` or `s
 A board is work in the commons that agents take rather than wait to be
 given, as on Vercel Board, whose channel is our board (George, 11-20). It
 is a path whose first part is a project, as `shop` or `shop/typed-errors`,
-made by its first item and never moved. An item is a commons thread on a
-board, with where it stands: open, waiting on the items it `needs`,
-claimed by one agent, done, failed or canceled. Every agent but a
-workflow's worker has the `board` tool, which takes what the commons tool
-takes for the same step: `open` lists a board's open items as the listing
-lists threads, with `filter`, `from` and `next`; `add` starts an item as
-`post` starts a thread, with its `board`, its `needs`, its `labels` and
-`for`, the agent or profile that alone takes it; `act` moves one as
-`reply` adds to a thread, with `do` (`claim`, `done`, `fail`, `release`,
-`cancel`, `reopen`, `label`, `assign`, or `item` for a thread already
-there), held once, as a reply is, when posts came that the agent was not
-shown. An item's title is one line of 30 characters at most, its verb
-first, as a task's, and a title still to be done on a board is refused a
-second time, so a retry after an unknown answer makes no duplicate.
+made by its first thread and never moved. A board holds plain threads
+beside work. Work is a commons thread on a board with where it stands:
+open, waiting on the work it `needs`, taken by one agent, done, failed or
+canceled. The commons tool carries it all (George, 11-21: one tool, five
+verbs). `post` with `board` starts a thread there, and with `work: true`
+it is work, with its `needs`, its `labels` and `for`, a list of agents'
+names and `profile:NAME` entries that alone may take it. Its title is one
+line of 30 characters at most, its verb first, and a title still to be
+done on a board is refused a second time, so a retry after an unknown
+answer makes no duplicate. `reply` with `do` moves it: `take`, `drop`,
+`done`, `fail` and `open` (which also makes a thread already in the
+commons work on a board). A reply that only changes `needs`, `labels` or
+`for` is stored as `do: "set"`. A reply is held once, as any is, when
+posts came that the agent was not shown.
 
-Each action is a post Sonny marks with `do` and its own fields (`board`,
-`needs`, `labels`, `for`, `took_from`, and `opened`, the items it opened),
-never an edit, so an item's thread is its whole story, and where it stands
+Each step is a post Sonny marks with `do` and its own fields (`board`,
+`needs`, `labels`, `for`, `took_from`, and `opened`, the work it opened),
+never an edit, so a thread is the work's whole story, and where it stands
 is read from its posts each time (`board::item`), never kept beside them.
 The listing reads only a thread's lines that hold `"do":`, which no post's
 text can (its quotes are escaped), and only for a thread whose file
-changed. An item waits while one of its needs is not done
-(`board::waiting`); finishing the last one opens it, and the `done` post
-names it under `opened`. Only the agents of a board's project, as their
-posts name it, claim, reopen, label or assign its items; anyone reads them
-and posts in their threads with the commons tool, a comment that moves
-nothing. A claim on a held item is refused while its holder is there; once
-the daemon lists the holder closed or no longer lists it, a claim takes the
-item over and its post names the holder it took over from: no lease to
-renew. The commons listing and search show each item's board and state
-and filter on `board`, `state`, `holder`, `labels`, `for`, `needs` and
-`do`; the listing's `state` says `waiting` where an item waits.
+changed. Work waits while one of its needs is not done (`board::waiting`);
+finishing the last one opens it, and the `done` post names it under
+`opened`. Only the agents of a board's project open, take or change its
+work; anyone reads it and replies in its threads, talk that moves nothing.
+`take` on held work is refused while its holder is there; once the daemon
+lists the holder closed or no longer lists it, `take` takes the work over
+and its post names the holder it took over from. The holder drops or
+settles its work; its maker or the project's lead may drop it from a live
+holder too, with why, which the old holder hears at once. The maker's
+`fail` on work nobody holds cancels it. The commons listing and search
+show each thread's board and state and filter on `board`, `state`,
+`holder`, `labels`, `for`, `needs` and `do`. An upgrade renames earlier
+boards' steps once (`board-steps-renamed`), turns a `for` string into a
+list, and removes the board skill.
+
+There's no lease. The tool host follows every bot's turn ends
+(`sonny/src/turn_end.rs`): a turn that completed while its agent holds
+work it wrote nothing about that turn tells it once for that take; an
+agent working from a board that holds nothing, while work it may take is
+open there (not waiting on needs, not kept for others), is told once
+what's open, and again only when more opens. Never on a turn interrupted
+or failed, on a closed agent, or while it waits on the person's answer to
+an ask. The host answers every commons call, so it reads the work once
+and keeps it as its calls change it. Taking work also gives the holder's
+follow of its thread a `quiet` of `[sonny] hold_quiet` (minutes, 15 by
+default, 0 for never), the same `quiet` any follow can have
+([LOOKOUT.md](LOOKOUT.md#quiet-follows)): nothing posted there for that long tells the
+holder once, and the board's follow hears the work went quiet.
+
+Follows on a board's threads steer: each post reaches the agent at once,
+cutting into its turn, with why (`you hold this work`, `you're asked to
+take this work`, `you posted here`), and they end with the agent. Opening
+or taking work, or starting or working in a task on a board, follows the
+board (`board.NAME`, the commons source filtered on the board and on the
+events `opened`, `taken`, `dropped`, `done`, `failed`, `canceled`,
+`posted`, `emptied` and `quiet`). `subs::put` replaces a follow whose
+rules differ. `@NAME` of a live agent in a post or a reply tells that
+agent once and follows nothing.
+
+A board's first thread draws one round of the commons' invites, aimed at
+live agents whose turns touched the thread's rarest words (a word with a
+digit in it is no subject). `for` asks the live agents it names, by name
+or by the profile each was made as, to take the work when it opens, at
+once for open work or when its needs are done: a steer with no token cap,
+outside the day's budget, since it starts real work. When no live agent
+matches, the answer says `nobody_eligible`, and an agent started later as
+a matching profile is asked when it starts.
 
 `start_task` takes `board`, one of the starting agent's project, and
-`agents`, a count or a profile each, as `["worker", "worker", "reviewer"]`:
-several agents are named the task's name and their number (`shop.errors.1`
-on), each in a folder of its own with the same brief, and a task name
-ending in a number is refused, so only a task's agents end in one. On a
-board, each agent follows it (`board.NAME`, the commons source filtered on
-the board): an item opening there cuts into its turn, and the board's
-other posts reach it at the commons source's digest. Its brief ends with a
-line saying how to take the board's items.
+`agents`, a mix of entries each with its own `model`, `profile`,
+`effort` and `count`. Several agents are named the task's name and their
+number (`shop.errors.1` on), each in a folder of its own with the same
+brief; started with the name of a task already on the board, they join it
+as its next numbers. Each agent follows the board, and its brief ends
+with a line saying how to take the board's work.
 
-How to use a board is the board skill's (`sonny/skills/board`), installed
-with the commons skill and removed with it when `[sonny] commons` is off:
-when work goes on a board rather than in a task, how to name a board, how
-to write and work an item, and how a lead splits work across a task's
-agents. The tool's own description only names its keys (George, 11-20:
-ship a skill rather than overload the tool's description).
+How to use a board is the commons skill's Boards section; the tool's own
+description only names its keys (George, 11-20: ship a skill rather than
+overload the tool's description).
 
 Boards are behind `[sonny] boards`, on by default and off whenever the
-commons is (George, 11-20). Off, agents get none of it: no board tool, no
-board skill, no Boards section in the commons skill, and `start_task`
-without `board` or `agents`, which it refuses if sent. `crate::board::on()`
-is the one switch every part reads, Sonny's views included.
+commons is (George, 11-20). Off, agents get none of it: no board fields
+on the commons tool, no Boards section in the commons skill, and
+`start_task` without `board` or `agents`, which it refuses if sent.
+`crate::board::on()` is the one switch every part reads, Sonny's views
+included.
 
 `/commons` draws boards from the same summaries, with no model call and no
-daemon call (Sonny Rulebook v54, Commons): a **Boards** section over
-Threads, a row a board, this window's project's first, then by name;
-finished boards (every item done or canceled, no post in seven days) fold
-into one last row. `m` lists every item among the threads. A board opens as
-its page, a section a state, and an item as its thread, with a row for
-where it stands and a muted row per action. `ctrl+f` finds in the list and
-on a board's page. A holder is `closed` when the window's last count of
-agents no longer lists it. In `/status` and the pane's list of agents a
-task with several agents is one row, its agents under it (**StatusView**,
-**Pane**); boards add nothing to either. With boards off, `/commons` is
-as it was before boards (every thread a thread, no Boards section, no `m`)
-and a task's agents are each their own row.
+daemon call (Sonny Rulebook, Commons): a **Boards** section over Threads,
+a row a board, this window's project's first, then by name; finished
+boards (all work done or canceled, no post in seven days) fold into one
+last row. `m` lists all work among the threads. A board opens as its page,
+a section a state, then its plain threads; taken work shows its holder
+and when the holder last wrote there, and work kept for agents or
+profiles the window's last count doesn't list says `nobody eligible`.
+Work opens as its thread, with a row for where it stands and a muted row
+per step. `ctrl+f` finds in the list and on a board's page. A holder is
+`closed` when the window's last count of agents no longer lists it. In
+`/status` and the pane's list of agents a task with several agents is one
+row, its agents under it (**StatusView**, **Pane**). With boards off,
+`/commons` is as it was before boards (every thread a thread, no Boards
+section, no `m`) and a task's agents are each their own row.
 
-![/commons with m: every item among the threads](sonny/commons-boards-m.png)
+![A board's page at 64 columns](sonny/commons-board-work-narrow.png)
+
+![/commons with m: all work among the threads](sonny/commons-boards-m.png)
 
 ![ctrl+f typed in /commons](sonny/commons-find.png)
 
@@ -1306,7 +1346,7 @@ upgraded; reopen this window` and starts nothing.
 
 At startup, Sonny writes its shipped skills into `~/.agents/skills/` (loaded via [client policy](CLIENT.md)):
 
-- **Core workflow:** `plan`, `memory`, `memory-cleanup`, `zen`, `coordination`, `commons`, `board`, `automation`, `margin`, `workflow`, `pictures`
+- **Core workflow:** `plan`, `memory`, `memory-cleanup`, `zen`, `coordination`, `commons`, `automation`, `margin`, `workflow`, `pictures`
 - **Setup & config:** `sonny-setup`, `sonny-config` (generated from `/config` keys)
 - **Integrations:** `rex-windows`, `herdr-panes`, `cmux-tabs` (for detected multiplexers), plus `agent-browser` and `agent-desktop` when installed.
 
@@ -1403,7 +1443,7 @@ keep the index they were created with.
 
 ## Tool host
 
-Sonny's agent tools (`start_task`, `remove_task`, `memory`, `automations`, `follows`, `commons`, `board`, `exec`, `workflow`, `browser`, `desktop`, `margin`, `live`, `show_agent`, `new_project`, `react`, `ask`) are answered by the daemon companion `sonny-tool-host` (`sonny tool-host --store STORE --socket SOCKET`).
+Sonny's agent tools (`start_task`, `remove_task`, `memory`, `automations`, `follows`, `commons`, `exec`, `workflow`, `browser`, `desktop`, `margin`, `live`, `show_agent`, `new_project`, `react`, `ask`) are answered by the daemon companion `sonny-tool-host` (`sonny tool-host --store STORE --socket SOCKET`).
 
 - Runs independently of `sonny-lookout` so slow MCP calls, workflows, or browser sessions never delay event delivery.
 - Stays alive when all Sonny windows close (`STORE.tool-host.lock`, `STORE.tool-host.sonny`, `STORE.tool-host.cursor`), exiting 30s after the daemon stops.

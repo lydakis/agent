@@ -566,11 +566,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             if let Some(title) = &start.title {
                 let _ = crate::title::note(store, name, id, title);
             }
-            // The board's posts reach it as the commons' do, its items
-            // opening as they come.
+            // The board's work reaches it as it moves.
             if let Some(board) = &start.board {
-                let follow = crate::board::follow(board, Some(id));
-                let _ = crate::lookout::subs::ensure(store, name, follow);
+                let follow = crate::board::works_from(board, Some(id));
+                let _ = crate::lookout::subs::put(store, name, follow);
             }
         }
     }
@@ -1333,10 +1332,28 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
 /// The line a task working from `board` finds under its brief.
 pub fn board_line(board: &str) -> String {
     format!(
-        "\n\nYou work from the board {board}: board with open \"{board}\" lists its open items. \
-         Take one with act claim, close it with act done and what you made, then take the next; \
-         you hear of items opening there. The board skill says more."
+        "\n\nYou work from the board {board}: the commons tool with filter \
+         {{\"board\": [\"{board}\"], \"state\": [\"open\"]}} lists its open work. Take one with a \
+         reply doing take, close it with done and what you made, then take the next; you hear \
+         of work opening there. The commons skill's Boards section says more."
     )
+}
+
+/// The agents of the task `name` (whole, with its project) that has
+/// several, NAME.1 on, closed or not, each by its number; empty when it
+/// has none or the daemon can't be read.
+pub fn agents_of(name: &str) -> Vec<(u64, Value)> {
+    let mut agents: Vec<(u64, Value)> = (listed(&format!("{name}.*")).into_iter().flatten())
+        .filter_map(|bot| {
+            let n = (bot["name"].as_str()?.strip_prefix(name)?.strip_prefix('.'))
+                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))?
+                .parse()
+                .ok()?;
+            Some((n, bot))
+        })
+        .collect();
+    agents.sort_by_key(|(n, _)| *n);
+    agents
 }
 
 /// The daemon's records of agents named `name`, or None when it can't be
@@ -2641,8 +2658,8 @@ mod tests {
     #[test]
     fn a_task_on_a_board_is_told_how_to_take_its_items() {
         let line = board_line("shop/errors");
-        assert!(line.contains(r#"board with open "shop/errors""#));
-        assert!(line.contains("act claim"));
+        assert!(line.contains(r#"{"board": ["shop/errors"], "state": ["open"]}"#));
+        assert!(line.contains("doing take"));
     }
 
     #[test]

@@ -361,9 +361,18 @@ pub const SETTINGS: &[Setting] = &[
         group: "Commons and sky",
         name: "boards",
         label: "whether agents have boards; read when Sonny starts",
-        about: "whether agents have boards, work in the commons they take: the board tool, its skill, and start_task's board and agents; only with the commons; read when Sonny starts",
+        about: "whether agents have boards, work in the commons they take: the commons tool's work fields, the commons skill's Boards section, and start_task's board and agents; only with the commons; read when Sonny starts",
         values: SWITCH,
         default: "true",
+    },
+    Setting {
+        key: "sonny.hold_quiet",
+        group: "",
+        name: "hold quiet",
+        label: "",
+        about: "minutes work an agent took may go without a post in its thread before the holder is asked whether it is still on it and its board hears it went quiet; 0 never; read as work is taken",
+        values: &[],
+        default: "15",
     },
     Setting {
         key: "sonny.commons_invites",
@@ -1423,6 +1432,7 @@ mod tests {
             "sonny.sky_haiku_margin",
             "sonny.sky_haiku_hold",
             "sonny.commons_invite_tokens",
+            "sonny.hold_quiet",
             "sonny.tool_processes",
             "sonny.lookout_waiting",
         ] {

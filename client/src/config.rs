@@ -61,7 +61,8 @@
 //! suggest = false               # no guess at the next message, on by default
 //! suggest_ideas = false         # a guess never offers an idea or a tip in its place, on by default
 //! commons = false               # agents go without the commons, on by default
-//! boards = false                # agents go without boards (the board tool and skill, start_task's board and agents), on by default; off with the commons
+//! boards = false                # agents go without boards (the commons tool's work fields and Boards section, start_task's board and agents), on by default; off with the commons
+//! hold_quiet = 15               # minutes held work may go without a post before its holder is asked whether it is still on it; 0: never
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
 //! commons_pointer = false       # a new task's brief names no commons threads sharing its words, on by default
@@ -694,9 +695,13 @@ pub struct Sonny {
     /// lines about it.
     pub commons: bool,
     /// Whether agents have boards, work in the commons they take: the
-    /// board tool and skill, and `start_task`'s `board` and `agents`. Only
-    /// with the commons.
+    /// commons tool's work fields, the commons skill's Boards section, and
+    /// `start_task`'s `board` and `agents`. Only with the commons.
     pub boards: bool,
+    /// How long work an agent took may go without a post in its thread,
+    /// in minutes, before the holder is asked whether it is still on it
+    /// and its board hears it went quiet: its follow's `quiet`. 0 never.
+    pub hold_quiet: u64,
     /// Code mode: whether agents reach the daemon's own tools (`shell`,
     /// `read`, `write`, `edit`, `apply_patch`, `web_fetch`) only from
     /// `exec` scripts, their model shown `exec` in their place. Off, their
@@ -1015,6 +1020,7 @@ impl Default for Sonny {
             suggest_ideas: true,
             commons: true,
             boards: true,
+            hold_quiet: 15,
             code_mode: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
@@ -1857,6 +1863,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons",
                 "code_mode",
                 "boards",
+                "hold_quiet",
                 "commons_invites",
                 "commons_invite_tokens",
                 "commons_pointer",
@@ -1987,6 +1994,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
+                "hold_quiet" => Some(&mut config.sonny.hold_quiet),
                 "away_minutes" => Some(&mut config.sonny.away_minutes),
                 "most_task_tabs" => Some(&mut config.sonny.most_task_tabs),
                 "task_worktrees" => Some(&mut config.sonny.task_worktrees),
@@ -2982,6 +2990,11 @@ mod tests {
         assert!(!parse("[sonny]\ncommons = false").unwrap().sonny.commons);
         assert!(parse("[sonny]").unwrap().sonny.boards);
         assert!(!parse("[sonny]\nboards = false").unwrap().sonny.boards);
+        assert_eq!(parse("[sonny]").unwrap().sonny.hold_quiet, 15);
+        assert_eq!(
+            parse("[sonny]\nhold_quiet = 0").unwrap().sonny.hold_quiet,
+            0
+        );
         let sonny = parse("[sonny]\ncommons_invites = 0\ncommons_invite_tokens = 500")
             .unwrap()
             .sonny;

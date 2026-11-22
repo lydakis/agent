@@ -78,10 +78,11 @@ A follow must specify at least one target (`tasks_of`, `agents`, or `sources`), 
 | `filter` | Event pattern narrowing which events are heard ([Filters](#filters)) |
 | `digest` | How often at most it tells what it hears (e.g. `"15m"`, `"1h"`, `"0"` for as they come); overrides the source's digest ([Digests](#digests)) |
 | `steer` | Event pattern that cuts through any digest immediately ([Steers](#steers)) |
+| `quiet` | Tells the follower once when the follow has heard nothing this long (e.g. `"15m"`); what it hears next, or the follower's own words in a topic it watches, starts the span again ([Quiet follows](#quiet-follows)) |
 | `until` | Local timestamp (`"2026-11-08 18:00"`) when the follow ends, as an automation's `--until` |
 | `runs` | Ends the follow after it was told in that many notes, as an automation's `--runs` (`"runs": 1` for a one-shot alert) |
 
-A follow with no `filter`, `digest`, or `steer` is heard as it always was and costs the lookout nothing more: no event is built for the bots it watches.
+A follow with no `filter`, `digest`, `steer`, or `quiet` is heard as it always was and costs the lookout nothing more: no event is built for the bots it watches.
 
 Examples:
 
@@ -91,6 +92,7 @@ Examples:
 {"add": {"name": "leads", "agents": ["*.lead"], "digest": "1h"}}
 {"add": {"name": "migration", "tasks_of": ["shop.migrate"], "steer": {"status": ["failed"]}}}
 {"add": {"name": "deploy", "agents": ["ops.deploy"], "steer": {"status": ["failed"]}, "runs": 1}}
+{"add": {"name": "build", "sources": ["ci:main"], "quiet": "30m"}}
 {"add": {"name": "launch", "sources": ["slack:launch"], "until": "2026-11-08 18:00"}}
 ```
 
@@ -287,7 +289,11 @@ Every note goes as a steer, joining the running turn at its next round or starti
 ### Steers
 
 - An event the source marks `"steer": true`, one the source's `steer` pattern matches, or one a follow's `steer` matches goes at once, as the person's words do, and waits for no digest; the follow counts it as its steer.
-- Who sets which: an agent adds `steer` itself for what it owns, as a pull request it opened; a `filter` or a `digest` only when the person asks for one, since what a filter leaves out it never hears and a digest makes it late. The `follows` tool says so. The person sets a source's own `digest` and `steer` in the settings. `/background` lists each follow with its filter, digest, and `steer`.
+- Who sets which: an agent adds `steer` itself for what it owns, as a pull request it opened, and `quiet` for what should not go silent, as work it holds or a build it waits on; a `filter` or a `digest` only when the person asks for one, since what a filter leaves out it never hears and a digest makes it late. The `follows` tool says so. The person sets a source's own `digest` and `steer` in the settings. `/background` lists each follow with its filter, digest, `steer`, and `quiet`.
+
+### Quiet follows
+
+A digest batches what comes; it can't say that nothing came, since with nothing held it never fires. A follow's `quiet` does: when the follow has heard nothing for that span, the lookout steers one note to its follower in its own words, `Nothing came here for 15m, as your follow NAME watches.`, which only that follow hears, whatever its filter, as Prometheus's `absent_over_time` or Datadog's "no data" alert. It says so once a silence; what the follow hears next, or the follower's own words in a topic it watches, starts the span again. It needs no timer of its own: the lookout's one-second tick checks each quiet follow against when it last heard. Any follow can have one, of any source or agent, set by the agent with the `follows` tool or by the person. Boards use it the same way: taking work gives the holder's follow of its thread `quiet` from `[sonny] hold_quiet` (15 minutes by default).
 
 ## The note
 

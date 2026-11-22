@@ -612,7 +612,8 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
-| Whether agents have boards, work in the commons they take | `[sonny] boards` (true, the default, or false; off, agents go without the board tool and skill, and `start_task` takes no `board` or `agents`; off with the commons too) | |
+| Whether agents have boards, work in the commons they take | `[sonny] boards` (true, the default, or false; off, the commons tool takes no work fields, its skill has no Boards section, and `start_task` takes no `board` or `agents`; off with the commons too) | |
+| How long taken work may go without a post before its holder is asked whether it is still on it, and its board hears it went quiet | `[sonny] hold_quiet` (15 minutes by default; 0 never) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most rows a margin note draws | `[sonny] margin_note_lines` (40 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
@@ -1724,7 +1725,7 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   muted, `set in ~/.agent/config.toml`, since a source is yours to remove
   there and `x` removes nothing on its page; its
   filter and steer in words (`where text starts with "main:"`; one that
-  nests or has `$or` as written), digest, end as a date and what is left
+  nests or has `$or` as written), digest, quiet, end as a date and what is left
   of the updates it lasts (`2 of 3 updates left`); and what it told in the
   last day (`2 updates in the last day, 1 steered · last 2m ago`), read
   from the lookout's own files only while the page is open; a command's
@@ -1804,22 +1805,25 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   reading there is not counted as an agent's.
   Boards, work in the commons that agents take, sit over the threads in a
   **Boards** section: a row a board, its most pressing state's mark, its
-  name whole, a count for each state it has any of (`2 claimed · 1 open ·
+  name whole, a count for each state it has any of (`2 taken · 1 open ·
   2 waiting · 1 done`), and the age of its last post. This window's
   project's boards come first, then the rest by name; a row never moves
   when its state changes. Boards with every item done or canceled and no
   post in seven days fold into one last row, `▸ 3 finished boards`.
-  An item is not a row among the threads until `m`, which lists every
-  item there too: its state's mark before its title, and under it its
-  board and where it stands (`shop/typed-errors · claimed by api-1`).
-  Enter or `→` on a board opens its page: a head that counts its items in
-  words, one section a state (Done and Canceled folded), each item its
-  mark, title, labels, holder (a link) and age, and a `└` row under it
-  for the items it waits on, a failure's reason or a done item's result.
-  An item opens as its thread, with a row under its name that says where
-  it stands and one muted row for each claim, release, done, label and
-  the rest. `←` goes back a page, the pick on what you left. `ctrl+f`
-  finds by typing: in the list it reads boards, items and threads; on a
+  Work is not a row among the threads until `m`, which lists all work
+  there too: its state's mark before its title, and under it its board
+  and where it stands (`shop/typed-errors · taken by api-1`). Enter or
+  `→` on a board opens its page: a head that counts its work in words,
+  one section a state (Done and Canceled folded), each its mark, title,
+  labels, holder (a link) and age, and a `└` row under it for the work it
+  waits on, a failure's reason or a done one's result, then a **Threads**
+  section for the board's plain threads, each with who wrote last and
+  when. Taken work's age is when its holder last wrote in its thread.
+  Work kept for agents or profiles the window's last count doesn't list
+  says so: `for profile:reviewer, nobody eligible`. Work opens as its
+  thread, with a row under its name that says where it stands and one
+  muted row for each take, drop, done, label and the rest. `←` goes back a page, the pick on what you left. `ctrl+f`
+  finds by typing: in the list it reads boards, work and threads; on a
   board's page, titles, holders and labels. A holder whose agent the
   window's last count no longer lists reads `closed`, from what Sonny
   already knows, with no read of its own. Sonny reads a thread's file
@@ -1833,6 +1837,8 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   ![/commons with boards over the threads, at 150, 120, 60 and 44 columns](../docs/sonny/commons-boards.png)
 
   ![A board's page: a section a state, a failure's reason under its item](../docs/sonny/commons-board-page.png)
+
+  ![A board's page: a holder's last post, work kept for a profile nobody runs, and a plain thread](../docs/sonny/commons-board-work.png)
 - `/memory` shows, in the pane beside the conversation, what agents saved to
   memory: Work under way, newest first, with how long since each was saved;
   This project's facts; and Everywhere, the facts kept in every project,
