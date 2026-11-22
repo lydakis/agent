@@ -29,8 +29,12 @@ static PROBE: OnceLock<Probe> = OnceLock::new();
 /// The theme as the terminal said it: the one window's, read by every
 /// frame.
 static SEEN: Seen = Seen::new();
-/// The terminal answered its background at start: its colors are asked
-/// again as it switches and as the window comes to the front.
+/// The terminal answers its colors, or may: it answered its background at
+/// start or since, or had not finished answering when the start's wait
+/// ran out (as a tab opened behind others may not yet). Its colors are
+/// asked again as it switches and as the window comes to the front; a
+/// terminal that answered everything else at start but not its
+/// background is not asked again.
 static ANSWERS: AtomicBool = AtomicBool::new(false);
 /// What asks a terminal for its colors: background first, so its answer
 /// says which background the rest belong to.
@@ -218,6 +222,9 @@ pub fn switched() -> bool {
 /// A terminal's answer as Sonny runs (crossterm's `Event::Reply`), kept;
 /// a colour-scheme report asks the colors that go with it.
 pub fn heard(reply: &str) {
+    if color(reply, "]11;").is_some() {
+        ANSWERS.store(true, Ordering::Relaxed);
+    }
     if SEEN.heard(reply) {
         ask();
     }
@@ -313,7 +320,7 @@ pub fn detect() {
         .or(mac)
         .unwrap_or(true);
     let theme = answered(&reply);
-    ANSWERS.store(theme.background.is_some(), Ordering::Relaxed);
+    ANSWERS.store(asks_again(&reply), Ordering::Relaxed);
     SEEN.start(light, theme);
     let _ = PROBE.set(Probe {
         graphics: reply.contains("_Gi=31;OK"),
@@ -358,9 +365,10 @@ pub fn follow(on: bool) {
     let _ = stdout.flush();
 }
 
-/// Ask the terminal for its colors again, when it answered them at start:
-/// as the window comes to the front, where a terminal that sends no
-/// colour-scheme reports may have switched meanwhile. The answers come as
+/// Ask the terminal for its colors again, when it answers them or may
+/// ([`ANSWERS`]): as the window comes to the front, where a terminal that
+/// sends no colour-scheme reports may have switched meanwhile, or not yet
+/// have answered at all. The answers come as
 /// input, read by [`heard`].
 pub fn ask() {
     if !ANSWERS.load(Ordering::Relaxed) {
@@ -555,14 +563,24 @@ fn query() -> Option<String> {
             break;
         }
         got.extend_from_slice(&buf[..n as usize]);
-        // DA1's answer, `ESC [ ? … c`, comes last.
-        if let Some(at) = find(&got, b"\x1b[?")
-            && got[at..].contains(&b'c')
-        {
+        if finished(&got) {
             break;
         }
     }
     Some(String::from_utf8_lossy(&got).into_owned())
+}
+
+/// The start's answers are all in: DA1's, `ESC [ ? … c`, comes last.
+fn finished(got: &[u8]) -> bool {
+    find(got, b"\x1b[?").is_some_and(|at| got[at..].contains(&b'c'))
+}
+
+/// Whether to ask the terminal's colors again as it switches and comes to
+/// the front: it answered its background at start, or the wait ran out
+/// before it answered at all, as for a tab opened behind others; not when
+/// it answered the rest and said nothing of its colors.
+fn asks_again(reply: &str) -> bool {
+    parse(reply).is_some() || !finished(reply.as_bytes())
 }
 
 /// `ESC [ 6 ; height ; width t`.
@@ -699,6 +717,21 @@ mod tests {
         // A report that names neither is no switch.
         seen.heard("\x1b[?997;3n");
         assert!(!seen.switched());
+    }
+
+    #[test]
+    fn colors_are_asked_again_unless_the_terminal_finished_without_them() {
+        // Answered: asked again as the window comes to the front.
+        assert!(asks_again(
+            "\x1b]11;rgb:fefe/fcfc/f1f1\x1b\\\x1b]10;rgb:10/0f/0f\x07\x1b[?62;22c"
+        ));
+        // Nothing by the time the wait ran out, or part of the answers: the
+        // terminal had not finished, and is asked again.
+        assert!(asks_again(""));
+        assert!(asks_again("\x1b_Gi=31;OK\x1b\\"));
+        // Every other answer in, DA1 last, and no colors: it has none to
+        // give, and is not asked again.
+        assert!(!asks_again("\x1b[?997;2n\x1b[?2027;2$y\x1b[?62;22c"));
     }
 
     #[test]
