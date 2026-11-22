@@ -12677,13 +12677,14 @@ impl Database {
         let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
             return fail("turn_not_found");
         };
-        // Answered, its tool's status, when it expires, paused, when taken,
-        // and whether a message lifted it.
+        // Answered, its tool's status, when it expires, whether its time is
+        // stopped (paused, or yielded: a yielded call has none, as a step
+        // of it reads), when taken, and whether a message lifted it.
         type Waiting = (bool, Option<String>, i64, bool, Option<i64>, bool);
         let call: Option<Waiting> = self
             .conn
             .prepare_cached(
-                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,a.taken_ms,
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL OR a.yielded,a.taken_ms,
                     a.process IS NOT NULL
                  FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
