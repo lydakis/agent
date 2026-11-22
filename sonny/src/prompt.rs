@@ -128,12 +128,13 @@ impl Prompt {
         true
     }
 
-    /// `piece` taken out of what Ctrl-Y brings back, with a space after it.
-    pub fn unkill(&mut self, piece: &str) {
+    /// `with` put in place of `piece`, with a space after it, in what
+    /// Ctrl-Y brings back.
+    pub fn unkill(&mut self, piece: &str, with: &str) {
         if let Some(start) = self.killed.find(piece) {
             let mut end = start + piece.len();
             end += usize::from(self.killed[end..].starts_with(' '));
-            self.killed.replace_range(start..end, "");
+            self.killed.replace_range(start..end, with);
         }
     }
 
