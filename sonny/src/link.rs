@@ -1749,6 +1749,8 @@ async fn dial(
     let mut stdout = lines(BufReader::new(stdout), LINE_BYTES, None);
     let mut ping = tokio::time::interval(PING);
     let mut refused = None;
+    // The build the host said it runs, once it has.
+    let mut there: Option<Value> = None;
     // What the host was last told this machine has, told again as it
     // changes: a server added or taken away, agent-browser installed. Read
     // apart from the calls, since a server starting holds what it knows.
@@ -1786,6 +1788,7 @@ async fn dial(
                     // Whatever the protocols: ends apart are what an
                     // upgrade brings together.
                     upgrade_behind(key, link, &hello["build"]);
+                    there = Some(hello["build"].clone());
                     continue;
                 }
                 let Some(id) = said["id"].as_u64() else { continue };
@@ -1832,6 +1835,11 @@ async fn dial(
                 // stands follows the session whatever wrote it last.
                 if told.is_some() && refused.is_none() {
                     stood(key, link, true, None, None);
+                }
+                // Looked at again while the session lasts, which it may for
+                // days: a pair still apart is tried again when it is due.
+                if let Some(there) = &there {
+                    upgrade_behind(key, link, there);
                 }
             }
             Some(lends) = freshened.recv() => {
