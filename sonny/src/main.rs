@@ -6646,6 +6646,9 @@ struct App {
     /// numbers: each placeholder is in the composer at once, its picture
     /// behind it once ready ([`App::prepared`]).
     preparing: Vec<(usize, Preparing)>,
+    /// The selected words a picture's placeholder went in place of, by its
+    /// number: put back if no picture comes.
+    replaced: Vec<(usize, String)>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The slash commands the person ran, for the menu to rank.
@@ -8832,6 +8835,7 @@ impl App {
             steering: Vec::new(),
             pictures: Vec::new(),
             preparing: Vec::new(),
+            replaced: Vec::new(),
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
             picks_kept: false,
@@ -20290,6 +20294,9 @@ impl App {
         self.forget_pictures();
         self.pictures.push(None);
         let number = self.pictures.len();
+        if let Some(selected) = self.input.selection() {
+            (self.replaced).push((number, self.input[selected].to_owned()));
+        }
         self.input
             .insert(&format!("{} ", attach::placeholder(number)));
         self.notice = None;
@@ -20333,13 +20340,20 @@ impl App {
     /// message may hold, its placeholder taken out and why said.
     fn ready(&mut self, number: usize, got: Result<Option<attach::Picture>, String>) {
         let placeholder = attach::placeholder(number);
+        let replaced = (self.replaced.iter().position(|(at, _)| *at == number))
+            .map(|at| self.replaced.remove(at).1);
         if !(self.input.contains(&placeholder) || self.input.killed().contains(&placeholder))
             || !(self.pictures.get(number - 1)).is_some_and(Option::is_none)
         {
             return;
         }
-        // The daemon takes a message's pictures up to a size together.
-        let placed: usize = (self.placed(&self.input).iter())
+        // The daemon takes a message's pictures up to a size together: those
+        // of the draft it is in, or of the one Ctrl-Y brings back.
+        let draft = match self.input.contains(&placeholder) {
+            true => &*self.input,
+            false => self.input.killed(),
+        };
+        let placed: usize = (self.placed(draft).iter())
             .map(|placed| placed.data.len())
             .sum();
         let said = match got {
@@ -20355,8 +20369,10 @@ impl App {
             Ok(None) => "no picture on the clipboard".into(),
             Err(error) => error,
         };
-        if !self.input.remove(&format!("{placeholder} ")) {
-            self.input.remove(&placeholder);
+        // The words it went in place of, if any, come back.
+        let replaced = replaced.unwrap_or_default();
+        if !self.input.swap(&format!("{placeholder} "), &replaced) {
+            self.input.swap(&placeholder, &replaced);
         }
         self.input.unkill(&placeholder);
         // Its number goes to the next picture, when none came after it.
@@ -40645,6 +40661,32 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(&*app.input, "[Image #1] ", "{:?}", app.notice);
+        // Two cut together while being read: the draft Ctrl-Y brings back
+        // holds no more than a message may.
+        app.discard();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(Some(big()))
+        });
+        app.prepare(|| Ok(Some(big())));
+        app.key(press(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        go.send(()).unwrap();
+        while !app.preparing.is_empty() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        app.key(press(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
+        // Words selected when no picture comes are put back.
+        app.discard();
+        app.input.set("keep these words");
+        app.input.select(5, 10);
+        app.prepare(|| Ok(None));
+        app.all_ready().await;
+        assert_eq!(&*app.input, "keep these words");
     }
 
     #[tokio::test]
