@@ -1088,7 +1088,8 @@ never an edit, so a thread is the work's whole story, and where it stands
 is read from its posts each time (`board::standing`), never kept beside them.
 The listing reads only a thread's lines that hold `"do":`, which no post's
 text can (its quotes are escaped), and only for a thread whose file
-changed. Work waits while one of its needs is not done (`board::waiting`);
+changed. Work waits while one of its needs is not done (`board::waiting`),
+and every answer, read and listing says so (`board::shown`);
 finishing the last one opens it, and the `done` post names it under
 `opened`. Only the agents of a board's project open, take or change its
 work; anyone reads it and replies in its threads, talk that moves nothing.

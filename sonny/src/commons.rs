@@ -1267,7 +1267,7 @@ pub(crate) fn add_locked(
     // Its work as it stands, which a reply moving nothing leaves as it was,
     // so its holder still follows it as its holder.
     if let Some(work) = crate::board::standing(&earlier) {
-        said["work"] = work;
+        said["work"] = crate::board::shown(dir, work);
     }
     Ok(said)
 }
@@ -1407,7 +1407,7 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
         .collect();
     let mut shown = json!({"thread": name, "title": title, "posts": shown});
     if let Some(item) = crate::board::standing(&posts) {
-        shown["work"] = item;
+        shown["work"] = crate::board::shown(dir, item);
     }
     Ok(shown)
 }
@@ -1761,17 +1761,7 @@ fn search(
         let mut whole = true;
         // An item's posts each show where it stands, as the listing's
         // first post does, waiting while a need is not done.
-        let mut item = crate::board::standing(&posts);
-        if let Some(item) = &mut item {
-            let done = |need: &str| {
-                (crate::commons::posts(&dir.join(format!("{need}.jsonl"))).ok())
-                    .and_then(|posts| crate::board::standing(&posts))
-                    .is_some_and(|it| it["state"] == "done")
-            };
-            if crate::board::waiting(item, &done) {
-                item["state"] = json!("waiting");
-            }
-        }
+        let item = crate::board::standing(&posts).map(|item| crate::board::shown(dir, item));
         let seen = |post: &Value| match (&item, post) {
             (Some(Value::Object(item)), Value::Object(fields)) => {
                 // The post's own fields stand, by being who wrote it, but
