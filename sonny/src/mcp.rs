@@ -42,6 +42,9 @@ pub struct Hub(Arc<Inner>);
 struct Inner {
     slots: Mutex<HashMap<String, Arc<Slot>>>,
     cache: Option<PathBuf>,
+    /// The tools `exec` last gave scripts, built from these servers'
+    /// listings and reused while they hold.
+    catalogs: Mutex<Vec<Arc<crate::exec::Catalog>>>,
 }
 
 struct Slot {
@@ -51,11 +54,18 @@ struct Slot {
     used: Mutex<Instant>,
     /// Calls in flight, which keep it up.
     busy: AtomicUsize,
+    /// Its last listing on disk as last read, and which file that was, so
+    /// a script reads it again only once it was written again.
+    kept: Mutex<Option<(Stamp, Option<Known>)>>,
 }
+
+/// Which write of a listing's file was read: a write puts a new file in
+/// its place.
+type Stamp = (u64, i64, i64, u64);
 
 struct Live {
     client: RunningService<RoleClient, ClientConfig>,
-    tools: Vec<Value>,
+    tools: Arc<[Value]>,
     instructions: Option<String>,
     /// A stdio server's process group, stopped with it.
     group: Option<u32>,
@@ -65,7 +75,9 @@ struct Live {
 /// listing, and why it last failed to start.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Known {
-    pub tools: Vec<Value>,
+    /// Shared, not copied, by whoever reads them, so a listing that did
+    /// not change is the same one.
+    pub tools: Arc<[Value]>,
     pub instructions: Option<String>,
     pub error: Option<String>,
     pub live: bool,
@@ -77,6 +89,7 @@ impl Hub {
         Hub(Arc::new(Inner {
             slots: Mutex::default(),
             cache,
+            catalogs: Mutex::default(),
         }))
     }
 
@@ -106,6 +119,7 @@ impl Hub {
                         live: tokio::sync::Mutex::default(),
                         used: Mutex::new(Instant::now()),
                         busy: AtomicUsize::new(0),
+                        kept: Mutex::default(),
                     })
                 });
             }
@@ -147,8 +161,13 @@ impl Hub {
         Ok(self.cached(&slot).unwrap_or_default())
     }
 
+    /// The tools `exec` last gave scripts, which it keeps here.
+    pub(crate) fn catalogs(&self) -> &Mutex<Vec<Arc<crate::exec::Catalog>>> {
+        &self.0.catalogs
+    }
+
     /// `server`'s tools, started to list them when no listing is kept.
-    pub async fn tools(&self, server: &str) -> Result<Vec<Value>, String> {
+    pub async fn tools(&self, server: &str) -> Result<Arc<[Value]>, String> {
         let known = self.known(server).await?;
         if known.live || !known.tools.is_empty() {
             return Ok(known.tools);
@@ -263,8 +282,25 @@ impl Hub {
         Some(self.0.cache.as_ref()?.join(format!("{}.json", slot.name)))
     }
 
+    /// The slot's last listing on disk, read again only when its file
+    /// was written again since: a script asks for it each time it runs.
     fn cached(&self, slot: &Slot) -> Option<Known> {
-        kept(self.0.cache.as_ref()?, &slot.name, &slot.config)
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let mut file = std::fs::File::open(self.file(slot)?).ok()?;
+        let meta = file.metadata().ok()?;
+        let stamp = (meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.len());
+        let mut kept = slot.kept.lock().unwrap();
+        if let Some((read, known)) = kept.as_ref()
+            && *read == stamp
+        {
+            return known.clone();
+        }
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        file.read_to_end(&mut bytes).ok()?;
+        let known = parse_kept(&bytes, &slot.config);
+        *kept = Some((stamp, known.clone()));
+        known
     }
 
     fn keep(
@@ -326,9 +362,14 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// `config`.
 pub fn kept(cache: &Path, server: &str, config: &McpServer) -> Option<Known> {
     let file = cache.join(format!("{server}.json"));
-    let kept: Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    parse_kept(&std::fs::read(file).ok()?, config)
+}
+
+fn parse_kept(bytes: &[u8], config: &McpServer) -> Option<Known> {
+    let kept: Value = serde_json::from_slice(bytes).ok()?;
     (kept["config"] == fingerprint(config)).then(|| Known {
-        tools: kept["tools"].as_array().cloned().unwrap_or_default(),
+        tools: (kept["tools"].as_array())
+            .map_or_else(Arc::default, |tools| tools.as_slice().into()),
         instructions: kept["instructions"].as_str().map(str::to_owned),
         error: kept["error"].as_str().map(str::to_owned),
         live: false,
@@ -476,7 +517,7 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
         Err(error) => {
             let live = Live {
                 client,
-                tools: Vec::new(),
+                tools: Arc::default(),
                 instructions: None,
                 group: group.keep(),
             };
@@ -900,6 +941,7 @@ mod tests {
             live: tokio::sync::Mutex::default(),
             used: Mutex::new(Instant::now()),
             busy: AtomicUsize::new(0),
+            kept: Mutex::default(),
         };
         hub.keep(&slot, &[json!({"name": "t"})], &None, None);
         let file = dir.join("mcp/s.json");
@@ -914,6 +956,34 @@ mod tests {
             ..config
         };
         assert_eq!(kept(&dir.join("mcp"), "s", &changed), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kept_listing_is_read_again_only_once_written_again() {
+        let dir = std::env::temp_dir().join(format!("sonny-mcp-reread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Hub::new(Some(dir.join("mcp")));
+        let slot = Slot {
+            name: "s".into(),
+            config: McpServer::default(),
+            live: tokio::sync::Mutex::default(),
+            used: Mutex::new(Instant::now()),
+            busy: AtomicUsize::new(0),
+            kept: Mutex::default(),
+        };
+        assert_eq!(hub.cached(&slot), None);
+        hub.keep(&slot, &[json!({"name": "t"})], &None, None);
+        let (first, again) = (hub.cached(&slot).unwrap(), hub.cached(&slot).unwrap());
+        assert!(Arc::ptr_eq(&first.tools, &again.tools));
+        // Written again, by this process or another, it is read again.
+        hub.keep(
+            &slot,
+            &[json!({"name": "t"}), json!({"name": "u"})],
+            &None,
+            None,
+        );
+        assert_eq!(hub.cached(&slot).unwrap().tools.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

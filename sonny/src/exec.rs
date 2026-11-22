@@ -13,6 +13,7 @@ pub mod journal;
 
 use crate::mcp::{Hub, Known, Servers};
 use agent_client::Client;
+use agent_client::config::McpServer;
 use journal::{Claim, Given, Journal};
 use rquickjs::{Context, Function, Runtime};
 use serde_json::{Map, Value, json};
@@ -271,7 +272,7 @@ fn description(
                     ..Default::default()
                 };
                 let known = Known {
-                    tools: lent.tools.clone(),
+                    tools: lent.tools.as_slice().into(),
                     ..Known::default()
                 };
                 ((server.clone(), config), (server.clone(), known))
@@ -325,7 +326,7 @@ fn declare(
             section.push_str("\nIts tools are listed in `ALL_TOOLS` once it starts.");
         }
         sections.push(section);
-        for tool in &known.tools {
+        for tool in known.tools.iter() {
             let id = identifier(name, tool["name"].as_str().unwrap_or_default());
             if collided.contains_key(&id) {
                 continue;
@@ -1093,13 +1094,10 @@ async fn run_keeping(
         } else {
             timeout.min(left)
         };
-    let readied = tokio::time::timeout_at(deadline.into(), async {
-        tokio::join!(discover(hub), daemon_tools(steps.as_ref()))
-    })
-    .await;
+    let readied = tokio::time::timeout_at(deadline.into(), catalog(hub, steps.as_ref())).await;
     let budget = script.max_output_tokens.unwrap_or(OUTPUT_TOKENS);
-    let ((mut nested, mut listed, failed), own) = match readied {
-        Ok(readied) => readied,
+    let catalog = match readied {
+        Ok(catalog) => catalog,
         Err(_) => {
             let ended = Ended::Terminated("it ran out of time before it started".into());
             let output = Output::new(budget, whole);
@@ -1108,20 +1106,16 @@ async fn run_keeping(
             ));
         }
     };
-    // The agent's own tools first, under their own names.
-    let mut entries = Vec::with_capacity(own.len());
-    for (name, tool, entry) in own {
-        nested.insert(name, tool);
-        entries.push(entry);
-    }
-    listed.splice(0..0, entries);
+    let mut nested = Arc::clone(&catalog.nested);
     // A trigger's shadow run reads and does nothing else: a call of a tool
     // that does not say it only reads, or that would ask the person, is
     // refused, never asked about.
     if crate::trigger::shadow_source(bot).is_some() {
-        for tool in nested.values_mut() {
+        let mut refusing = (*nested).clone();
+        for tool in refusing.values_mut() {
             tool.refused = !tool.reads || tool.asks;
         }
+        nested = Arc::new(refusing);
     }
     // What the script begins with: the tools it is shown, its clock and
     // its seed; as the journal recorded them for a script run again.
@@ -1136,7 +1130,7 @@ async fn run_keeping(
             let yielded = journal.as_ref().unwrap().replay.lock().unwrap().yielded;
             let (now, seed) = (start["now_ms"].as_u64(), start["seed"].as_u64());
             (
-                shown.0,
+                Arc::from(shown.0),
                 shown.1,
                 now.unwrap_or(0),
                 seed.unwrap_or(0) as u32,
@@ -1144,7 +1138,6 @@ async fn run_keeping(
             )
         }
         None => {
-            let listed = Value::Array(listed).to_string();
             // Read once: the time recorded is the time the script sees.
             let now = now_ms();
             let seed = (now as u32)
@@ -1152,20 +1145,20 @@ async fn run_keeping(
                 ^ (ANSWERINGS.fetch_add(1, Ordering::Relaxed) as u32);
             if let Some(journal) = &journal {
                 let _sweeping = journal::sweeping();
-                let kept = kept_shown(journal, &nested, &listed);
+                let kept = kept_shown(journal, &catalog);
                 journal.start(json!({"t": "start", "v": journal::VERSION, "input": input,
                     "now_ms": now, "seed": seed, "tools": kept}));
             }
-            let shown = Arc::new(nested.clone());
-            (listed, shown, now, seed, false)
+            let listed = Arc::clone(&catalog.listed);
+            (listed, Arc::clone(&nested), now, seed, false)
         }
     };
     let run = Run {
         hub: hub.clone(),
         host: tokio::runtime::Handle::current(),
-        nested: Arc::new(nested),
+        nested,
         shown,
-        failed: Arc::new(failed),
+        failed: Arc::clone(&catalog.failed),
         listed,
         store: dir.map(|dir| dir.join("store").join(format!("{bot}.json"))),
         said: Arc::new(Mutex::new(Output::new(budget, whole))),
@@ -1261,18 +1254,9 @@ async fn run_keeping(
 /// Keep the tools a script is shown, by their hash, in its journal's
 /// folder: their listing, and what `tool_search` looks through. Their
 /// hash, or none when they could not be kept, which no host replays.
-fn kept_shown(
-    journal: &Journal,
-    nested: &BTreeMap<String, Nested>,
-    listed: &str,
-) -> Option<String> {
-    let names: Vec<Value> = (nested.iter())
-        .map(|(id, tool)| json!([id, tool.server, tool.tool, tool.description]))
-        .collect();
-    let tools = json!({"listed": listed, "names": names}).to_string();
-    let hash = journal::hash(&tools);
+fn kept_shown(journal: &Journal, catalog: &Catalog) -> Option<String> {
     let folder = journal.path().parent()?;
-    journal::keep_tools(folder, &hash, &tools).then_some(hash)
+    journal::keep_tools(folder, &catalog.hash, &catalog.kept).then(|| catalog.hash.clone())
 }
 
 /// The tools a script run again was shown when it began: their listing,
@@ -1480,10 +1464,35 @@ fn parts(text: String, pictures: Vec<Picture>) -> Value {
     Value::Array(parts)
 }
 
-/// The servers' tools, each by the identifier a script calls it by, as
-/// `ALL_TOOLS` lists them, and why any server's are missing: its own
-/// failure, or tools whose identifiers collide.
-async fn discover(hub: &Hub) -> (BTreeMap<String, Nested>, Vec<Value>, Vec<String>) {
+/// The tools scripts are given: built once from the servers' listings
+/// and the agent's own tools, and kept in the hub for every script after,
+/// until a listing changes, as Codex keeps its catalog across cells
+/// (#61846). Each script built and copied them again, a cost that grew
+/// with the tools while most scripts call one or two.
+pub(crate) struct Catalog {
+    /// What it was built from.
+    from: Vec<Listed>,
+    /// Whether the agent's own tools are in it.
+    own: bool,
+    /// Each tool by the identifier a script calls it by.
+    nested: Arc<BTreeMap<String, Nested>>,
+    /// `ALL_TOOLS`, as JSON.
+    listed: Arc<str>,
+    /// Why any server's tools are missing: its own failure, or tools whose
+    /// identifiers collide.
+    failed: Arc<Vec<String>>,
+    /// What a journal keeps of it, and that text's hash.
+    kept: String,
+    hash: String,
+}
+
+/// A server, as configured, with its listing or why it has none.
+type Listed = (String, McpServer, Result<Arc<[Value]>, String>);
+
+/// The catalog for the hub's servers as they list now, and the agent's own
+/// tools when `steps` reach its daemon: the one kept when nothing it was
+/// built from changed, else a new one, kept in its place.
+async fn catalog(hub: &Hub, steps: Option<&Steps>) -> Arc<Catalog> {
     let servers = hub.servers();
     let mut listing = tokio::task::JoinSet::new();
     for server in servers.keys() {
@@ -1494,26 +1503,70 @@ async fn discover(hub: &Hub) -> (BTreeMap<String, Nested>, Vec<Value>, Vec<Strin
         });
     }
     let mut lists = BTreeMap::new();
-    let mut failed = Vec::new();
     while let Some(Ok((server, tools))) = listing.join_next().await {
-        match tools {
-            Ok(tools) => {
-                lists.insert(server, tools);
-            }
-            Err(error) => failed.push(error),
-        }
+        lists.insert(server, tools);
     }
+    let own = daemon_listed(steps).await;
+    let from: Vec<_> = (servers.into_iter())
+        .filter_map(|(server, config)| {
+            let tools = lists.remove(&server)?;
+            Some((server, config, tools))
+        })
+        .collect();
+    let same = |kept: &Catalog| {
+        kept.own == own.is_some()
+            && kept.from.len() == from.len()
+            && kept.from.iter().zip(&from).all(|(a, b)| {
+                a.0 == b.0
+                    && a.1 == b.1
+                    && match (&a.2, &b.2) {
+                        (Ok(a), Ok(b)) => Arc::ptr_eq(a, b),
+                        (Err(a), Err(b)) => a == b,
+                        _ => false,
+                    }
+            })
+    };
+    if let Some(kept) = hub
+        .catalogs()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|kept| same(kept))
+    {
+        return Arc::clone(kept);
+    }
+    let built = Arc::new(build(from, own));
+    let mut kept = hub.catalogs().lock().unwrap();
+    kept.retain(|kept| kept.own != built.own);
+    kept.push(Arc::clone(&built));
+    built
+}
+
+/// A catalog of `from`'s tools, the agent's `own` first under their own
+/// names.
+fn build(from: Vec<Listed>, own: Option<&[Value]>) -> Catalog {
+    let mut failed: Vec<String> = (from.iter())
+        .filter_map(|(_, _, tools)| tools.as_ref().err().cloned())
+        .collect();
     let collided = collisions(
-        lists
-            .iter()
-            .map(|(server, tools)| (server.as_str(), &tools[..])),
+        from.iter()
+            .filter_map(|(server, _, tools)| Some((server.as_str(), &tools.as_ref().ok()?[..]))),
     );
     failed.extend(collided.values().cloned());
     let mut nested = BTreeMap::new();
     let mut listed = Vec::new();
-    for (server, tools) in &lists {
-        let config = &servers[server];
-        for tool in tools {
+    for tool in own.unwrap_or_default() {
+        let Some((name, tool, entry)) = daemon_tool(tool) else {
+            continue;
+        };
+        nested.insert(name, tool);
+        listed.push(entry);
+    }
+    for (server, config, tools) in &from {
+        let Ok(tools) = tools else {
+            continue;
+        };
+        for tool in tools.iter() {
             let name = tool["name"].as_str().unwrap_or_default();
             let id = identifier(server, name);
             if collided.contains_key(&id) {
@@ -1522,36 +1575,46 @@ async fn discover(hub: &Hub) -> (BTreeMap<String, Nested>, Vec<Value>, Vec<Strin
             let description = declaration(server, tool);
             listed.push(json!({"name": id, "description": description}));
             let asks = config.approval_mode(name).asks(&tool["annotations"]);
-            nested.insert(
-                id,
-                Nested {
-                    server: server.clone(),
-                    tool: name.to_owned(),
-                    description,
-                    asks,
-                    reads: tool["annotations"]["readOnlyHint"] == true,
-                    facts: Facts {
-                        kind: "mcp",
-                        place: Some(mcp_place(config)),
-                        access: mcp_access(&tool["annotations"]),
-                    },
-                    refused: false,
-                    daemon: false,
+            // The agent's own tools keep their names.
+            nested.entry(id).or_insert_with(|| Nested {
+                server: server.clone(),
+                tool: name.to_owned(),
+                description,
+                asks,
+                reads: tool["annotations"]["readOnlyHint"] == true,
+                facts: Facts {
+                    kind: "mcp",
+                    place: Some(mcp_place(config)),
+                    access: mcp_access(&tool["annotations"]),
                 },
-            );
+                refused: false,
+                daemon: false,
+            });
         }
     }
-    (nested, listed, failed)
+    let listed = Value::Array(listed).to_string();
+    let names: Vec<Value> = (nested.iter())
+        .map(|(id, tool)| json!([id, tool.server, tool.tool, tool.description]))
+        .collect();
+    let kept = json!({"listed": listed, "names": names}).to_string();
+    Catalog {
+        own: own.is_some(),
+        from,
+        nested: Arc::new(nested),
+        listed: Arc::from(listed),
+        failed: Arc::new(failed),
+        hash: journal::hash(&kept),
+        kept,
+    }
 }
 
 /// The agent's own tools a script calls, as its daemon's `tools` lists
-/// those that run as steps, each with its declaration; none for a call
-/// made over a link. Whatever the setting says now: an agent's turn keeps
-/// the tools it began with, and its daemon gates each step as it would
-/// the same call made directly.
-async fn daemon_tools(steps: Option<&Steps>) -> Vec<(String, Nested, Value)> {
+/// those that run as steps; none for a call made over a link. Whatever
+/// the setting says now: an agent's turn keeps the tools it began with,
+/// and its daemon gates each step as it would the same call made directly.
+async fn daemon_listed(steps: Option<&Steps>) -> Option<&'static [Value]> {
     let Some(Via::Daemon { client, .. }) = steps.map(|steps| &steps.via) else {
-        return Vec::new();
+        return None;
     };
     // The daemon's tools are its build's, so they are asked once.
     static LISTED: tokio::sync::OnceCell<Vec<Value>> = tokio::sync::OnceCell::const_new();
@@ -1565,39 +1628,41 @@ async fn daemon_tools(steps: Option<&Steps>) -> Vec<(String, Nested, Value)> {
                 .collect(),
         )
     });
-    let Ok(listed) = asked.await else {
-        return Vec::new();
+    asked.await.ok().map(Vec::as_slice)
+}
+
+/// One of the agent's own tools, with its declaration.
+fn daemon_tool(tool: &Value) -> Option<(String, Nested, Value)> {
+    let name = tool["name"].as_str()?.to_owned();
+    let mut text = format!("### `{name}`");
+    if let Some(about) = tool["description"].as_str().map(str::trim) {
+        text.push('\n');
+        text.push_str(about);
+    }
+    let input = typescript(&tool["parameters"]);
+    text.push_str(&format!(
+        "\n```ts\ndeclare const tools: {{ {name}(args: {input}): Promise<CallToolResult>; }};\n```"
+    ));
+    let reads = matches!(name.as_str(), "read" | "echo");
+    let nested = Nested {
+        server: String::new(),
+        tool: name.clone(),
+        description: text.clone(),
+        asks: false,
+        reads,
+        facts: Facts {
+            kind: "daemon",
+            place: None,
+            access: None,
+        },
+        refused: false,
+        daemon: true,
     };
-    listed.iter()
-        .filter_map(|tool| {
-            let name = tool["name"].as_str()?.to_owned();
-            let mut text = format!("### `{name}`");
-            if let Some(about) = tool["description"].as_str().map(str::trim) {
-                text.push('\n');
-                text.push_str(about);
-            }
-            let input = typescript(&tool["parameters"]);
-            text.push_str(&format!(
-                "\n```ts\ndeclare const tools: {{ {name}(args: {input}): Promise<CallToolResult>; }};\n```"
-            ));
-            let reads = matches!(name.as_str(), "read" | "echo");
-            let nested = Nested {
-                server: String::new(),
-                tool: name.clone(),
-                description: text.clone(),
-                asks: false,
-                reads,
-                facts: Facts {
-                    kind: "daemon",
-                    place: None,
-                    access: None,
-                },
-                refused: false,
-                daemon: true,
-            };
-            Some((name.clone(), nested, json!({"name": name, "description": text})))
-        })
-        .collect()
+    Some((
+        name.clone(),
+        nested,
+        json!({"name": name, "description": text}),
+    ))
 }
 
 /// What `exec` answers: how the script ended, its time and calls, then
@@ -2018,7 +2083,8 @@ struct Run {
     /// when it began, which a script run again is shown again.
     shown: Arc<BTreeMap<String, Nested>>,
     failed: Arc<Vec<String>>,
-    listed: String,
+    /// `ALL_TOOLS`, as JSON, parsed only by a script that reads it.
+    listed: Arc<str>,
     store: Option<PathBuf>,
     said: Arc<Mutex<Output>>,
     pictures: Arc<Mutex<Vec<Picture>>>,
@@ -2265,8 +2331,13 @@ impl Drop for Stopped {
 /// (`journal`); and nothing the collector decides reaches it, as Pi's code
 /// mode leaves out `WeakRef`.
 const PRELUDE: &str = r#"(() => {
-  const host = { start: __start, search: __search, text: __text, image: __image, store: __store, load: __load, yield: __yield, now: __now, seed: __seed };
+  const host = { start: __start, search: __search, text: __text, image: __image, store: __store, load: __load, yield: __yield, now: __now, seed: __seed, tools: __tools };
   for (const name of ["__start", "__search", "__text", "__image", "__store", "__load", "__yield", "__now", "__seed", "__tools"]) delete globalThis[name];
+  // `ALL_TOOLS` is made the first time it is read, as Codex's catalog
+  // globals are (#61845): most scripts never read it. Once read or set,
+  // it is a plain property, as any global the script writes.
+  const plain = (value) => Object.defineProperty(globalThis, "ALL_TOOLS", { value, writable: true, enumerable: true, configurable: true });
+  Object.defineProperty(globalThis, "ALL_TOOLS", { get() { const all = JSON.parse(host.tools()); plain(all); return all; }, set: plain, enumerable: true, configurable: true });
   const EXIT = globalThis.__exit;
   delete globalThis.__exit;
   delete globalThis.WeakRef;
@@ -2554,7 +2625,11 @@ impl Run {
         let globals = ctx.globals();
         let exit = rquickjs::Object::new(ctx.clone())?;
         globals.set("__exit", exit)?;
-        globals.set("ALL_TOOLS", ctx.json_parse(self.listed.clone())?)?;
+        let listed = Arc::clone(&self.listed);
+        globals.set(
+            "__tools",
+            Function::new(ctx.clone(), move || listed.to_string())?,
+        )?;
         let shared = Arc::clone(&self.shared);
         globals.set(
             "__ended_with",
@@ -3863,6 +3938,53 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     }
 
     #[tokio::test]
+    async fn scripts_share_one_catalog_until_a_listing_changes() {
+        let dir = scratch("catalog");
+        let hub = hub(&dir).await;
+        let catalog = || Arc::clone(&hub.catalogs().lock().unwrap()[0]);
+        assert!(ran(&hub, &dir, "text(1);").await.contains("Output:\n1"));
+        let first = catalog();
+        ran(&hub, &dir, "text(2);").await;
+        assert!(
+            Arc::ptr_eq(&first, &catalog()),
+            "built again for the same tools"
+        );
+        // Another server is another catalog, which the next script is given.
+        let mut servers = hub.servers();
+        let echo = servers["test"].clone();
+        servers.insert("other".to_owned(), echo);
+        hub.configure(&servers).await;
+        let said = ran(
+            &hub,
+            &dir,
+            "text(ALL_TOOLS.some(t => t.name.startsWith('mcp__other__')));",
+        )
+        .await;
+        assert!(said.contains("Output:\ntrue"), "{said}");
+        assert!(!Arc::ptr_eq(&first, &catalog()));
+        assert_eq!(hub.catalogs().lock().unwrap().len(), 1);
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn all_tools_is_each_script_s_own_to_change() {
+        let dir = scratch("all-tools");
+        let hub = hub(&dir).await;
+        let said = ran(&hub, &dir, "ALL_TOOLS = 5; text(ALL_TOOLS);").await;
+        assert!(said.contains("Output:\n5"), "{said}");
+        let said = ran(&hub, &dir, "ALL_TOOLS.length = 0; text(ALL_TOOLS.length);").await;
+        assert!(said.contains("Output:\n0"), "{said}");
+        let said = ran(
+            &hub,
+            &dir,
+            "text(Array.isArray(ALL_TOOLS) && ALL_TOOLS.length > 0);",
+        )
+        .await;
+        assert!(said.contains("Output:\ntrue"), "{said}");
+        hub.stop().await;
+    }
+
+    #[tokio::test]
     async fn waiting_and_listing_spend_the_script_s_time() {
         let dir = scratch("deadline");
         let server = McpServer {
@@ -3920,7 +4042,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
                 (
                     name.to_owned(),
                     Known {
-                        tools,
+                        tools: tools.into(),
                         ..Known::default()
                     },
                 )
