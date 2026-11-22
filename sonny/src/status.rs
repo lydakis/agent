@@ -252,8 +252,19 @@ pub fn paced(on: &serde_json::Value, now: u64) -> String {
 /// else its provider's pool, closed by a rate limit.
 pub fn waits_out(on: &serde_json::Value) -> String {
     match on["retrying"].as_str() {
-        Some(code) => format!("{RETRYING}{}", cause(code)),
+        Some(code) => backs_off(code),
         None => "rate limited".into(),
+    }
+}
+
+/// What a failed call waits out before it is tried again, from what
+/// failed (`code`): a provider that said slow down is rate limited, the
+/// state's own word; anything else is retrying, with what failed in
+/// [`cause`]'s words.
+pub fn backs_off(code: &str) -> String {
+    match code {
+        "provider_rate_limited" | "provider_http_429" => "rate limited".into(),
+        _ => format!("{RETRYING}{}", cause(code)),
     }
 }
 
@@ -514,6 +525,13 @@ fn tally(listed: &[&Row]) -> Counts {
 /// The agents `rows` lists, by their own names.
 pub fn bots<R: std::borrow::Borrow<Row>>(rows: &[R]) -> std::collections::HashSet<String> {
     rows.iter().map(|row| row.borrow().bot.clone()).collect()
+}
+
+/// The profiles `rows`' agents were made as.
+pub fn profiles<R: std::borrow::Borrow<Row>>(rows: &[R]) -> std::collections::HashSet<String> {
+    rows.iter()
+        .map(|row| row.borrow().profile.clone())
+        .collect()
 }
 
 /// See [`Card`].

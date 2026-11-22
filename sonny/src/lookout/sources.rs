@@ -98,6 +98,10 @@ const RECENT_TEXT_CHARS: usize = 2_000;
 /// most this many topics and bytes more.
 const RECENT_TOPICS: usize = 1_000;
 const RECENT_TOPIC_BYTES: u64 = RECENT_BYTES / 8;
+/// The key a kept line has when the lookout left out events of the span
+/// before it to stay in its bounds: what is kept before it is only each
+/// topic's newest.
+const DROPPED_BEFORE: &str = "dropped_before";
 /// The fields every event has, which the note says on its own.
 pub const OWN: [&str; 6] = ["text", "id", "topic", "from", "url", "steer"];
 /// What a `follows` read says of what it gives.
@@ -1560,17 +1564,42 @@ pub fn status(
     (newest, down)
 }
 
+/// What a source printed since a time, as the lookout keeps it.
+#[derive(Debug, Default)]
+pub struct Recent {
+    /// The events, oldest first, each with whether it was kept cut.
+    pub events: Vec<(Event, bool)>,
+    /// When the history kept whole starts and how many events it holds,
+    /// when that is after the time asked for: the lookout left out older
+    /// events of the span to stay in its bounds.
+    pub whole_from: Option<(u128, usize)>,
+}
+
 /// The events `source` printed since `since_ms`, oldest first, as kept.
-pub fn recent(store: &Path, source: &str, since_ms: u128) -> Vec<(Event, bool)> {
+pub fn recent(store: &Path, source: &str, since_ms: u128) -> Recent {
     let file = recent_file(&super::beside(store, ".sources"), source);
     let Ok(text) = std::fs::read_to_string(file) else {
-        return Vec::new();
+        return Recent::default();
     };
-    (text.lines())
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|kept| Some((Event::from_json(&kept)?, kept["cut"] == true)))
-        .filter(|(event, _)| event.at_ms >= since_ms)
-        .collect()
+    let mut recent = Recent::default();
+    let mut whole_from: Option<(u128, usize)> = None;
+    for kept in (text.lines()).filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        if kept[DROPPED_BEFORE] == true {
+            whole_from = kept["at_ms"].as_u64().map(|at| (u128::from(at), 0));
+        }
+        let Some(event) = Event::from_json(&kept) else {
+            continue;
+        };
+        if event.at_ms < since_ms {
+            continue;
+        }
+        if let Some((_, held)) = &mut whole_from {
+            *held += 1;
+        }
+        recent.events.push((event, kept["cut"] == true));
+    }
+    recent.whole_from = whole_from.filter(|&(from, _)| from > since_ms);
+    recent
 }
 
 /// What a source's events lately looked like: each field they had and
@@ -1796,13 +1825,15 @@ fn add_lines(path: &Path, lines: &str) -> Option<u64> {
 /// at once; and past those, each other topic's newest event, the source's
 /// own and the lookout's word on it as topics too, at most
 /// `RECENT_TOPICS` of them in `RECENT_TOPIC_BYTES`, a topic cleared last
-/// keeping nothing.
-fn trim(path: &Path, now_ms: u128) {
+/// keeping nothing. When its bounds leave out an event of the span, the
+/// oldest kept whole says so (`DROPPED_BEFORE`), and the history kept
+/// whole ends there, as a test reads it.
+pub(super) fn trim(path: &Path, now_ms: u128) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
     let since = now_ms.saturating_sub(RECENT_SPAN.as_millis());
-    let (mut kept, mut bytes) = (Vec::new(), 0);
+    let (mut kept, mut bytes): (Vec<std::borrow::Cow<str>>, _) = (Vec::new(), 0);
     let mut topics = std::collections::HashSet::new();
     let mut lately = true;
     let (mut older, mut older_bytes) = (0, 0);
@@ -1811,17 +1842,28 @@ fn trim(path: &Path, now_ms: u128) {
         let Ok(read) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let at = read["at_ms"].as_u64();
-        lately = lately
-            && kept.len() < RECENT_EVENTS
-            && bytes + size <= RECENT_BYTES * 3 / 4
-            && at.is_some_and(|at| u128::from(at) >= since);
-        if lately {
+        let within = read["at_ms"]
+            .as_u64()
+            .is_some_and(|at| u128::from(at) >= since);
+        let bounded = lately;
+        lately = lately && kept.len() < RECENT_EVENTS && bytes + size <= RECENT_BYTES * 3 / 4;
+        if lately && within {
             bytes += size;
             topics.insert(kept_key(&read));
-            kept.push(line);
+            kept.push(line.into());
+            lately = read[DROPPED_BEFORE] != true;
             continue;
         }
+        if bounded
+            && !lately
+            && within
+            && let Some(oldest) = kept.last_mut()
+        {
+            let mut marked: Value = serde_json::from_str(oldest).unwrap_or_default();
+            marked[DROPPED_BEFORE] = json!(true);
+            *oldest = marked.to_string().into();
+        }
+        lately = false;
         // Past the day, a topic's newest word is kept, the source's own
         // and its health's too; a clear goes with all before it, as Kafka
         // compacts a tombstone away.
@@ -1832,7 +1874,7 @@ fn trim(path: &Path, now_ms: u128) {
             break;
         }
         (older, older_bytes) = (older + 1, older_bytes + size);
-        kept.push(line);
+        kept.push(line.into());
     }
     kept.reverse();
     let mut body = kept.join("\n");
@@ -2275,6 +2317,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         assert!(sub(None).hears(&event));
         assert!(sub(Some(json!({"event": ["merged"]}))).hears(&event));
@@ -2356,7 +2400,7 @@ mod tests {
         ];
         assert!(add_lines(&file, &(lines.join("\n") + "\n")).is_some());
         // Read back, only what is within the day counts.
-        let read: Vec<String> = (recent(&store, "ci", now - day).into_iter())
+        let read: Vec<String> = (recent(&store, "ci", now - day).events.into_iter())
             .map(|(e, _)| e.text)
             .collect();
         assert_eq!(read, ["new"]);
@@ -2385,6 +2429,77 @@ mod tests {
         assert_eq!(left.lines().count(), RECENT_EVENTS);
         let newest: Value = serde_json::from_str(left.lines().last().unwrap()).unwrap();
         assert_eq!(newest["text"], (RECENT_EVENTS + 9).to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_oldest_kept_whole_says_when_the_bounds_dropped_events_of_the_day() {
+        let dir = std::env::temp_dir().join(format!("lookout-dropped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("state.sqlite");
+        let file = recent_file(&super::super::beside(&store, ".sources"), "ci");
+        let now = super::super::epoch_ms();
+        let day = RECENT_SPAN.as_millis();
+        let event = |n: usize, topic: Option<&str>, at: u128| {
+            let printed = json!({"text": n.to_string(), "topic": topic});
+            recent_line(&Event {
+                at_ms: at,
+                ..Event::parse("ci", &printed.to_string(), at).unwrap()
+            })
+        };
+        let marked = |file: &Path| -> Vec<String> {
+            (std::fs::read_to_string(file).unwrap().lines())
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|kept| kept[DROPPED_BEFORE] == true)
+                .map(|kept| kept["text"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // A day's events within the bounds: none is dropped, none marked.
+        let quiet: String = (0..10)
+            .map(|n| event(n, None, now - day + 1_000 + n as u128) + "\n")
+            .collect();
+        add_lines(&file, &quiet);
+        trim(&file, now);
+        assert!(marked(&file).is_empty());
+        let whole = recent(&store, "ci", now - day);
+        assert_eq!((whole.events.len(), whole.whole_from), (10, None));
+        // Past the bounds within the day, the oldest kept whole says so;
+        // a topic's newest word from before it is kept but not counted.
+        let _ = std::fs::remove_file(&file);
+        let busy: String = std::iter::once(event(0, Some("old"), now - day + 1_000))
+            .chain((1..=RECENT_EVENTS + 10).map(|n| event(n, None, now - 2 * day / 3 + n as u128)))
+            .map(|line| line + "\n")
+            .collect();
+        add_lines(&file, &busy);
+        trim(&file, now);
+        assert_eq!(marked(&file), ["11"]);
+        let short = recent(&store, "ci", now - day);
+        let from = now - 2 * day / 3 + 11;
+        assert_eq!(short.whole_from, Some((from, RECENT_EVENTS)));
+        assert_eq!(short.events.len(), RECENT_EVENTS + 1);
+        // Read from after it, the history is whole again.
+        assert_eq!(recent(&store, "ci", from).whole_from, None);
+        // Cut again, the mark stays where the history kept whole starts;
+        // one more event moves it on.
+        let before = std::fs::read_to_string(&file).unwrap();
+        trim(&file, now);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        add_lines(&file, &(event(9_999, None, now) + "\n"));
+        trim(&file, now);
+        assert_eq!(marked(&file), ["12"]);
+        assert_eq!(
+            recent(&store, "ci", now - day).whole_from,
+            Some((from + 1, RECENT_EVENTS))
+        );
+        // Bounded on the day itself, not on its count, nothing is marked.
+        let _ = std::fs::remove_file(&file);
+        let edge: String = std::iter::once(event(0, None, now - day - 1))
+            .chain((1..=10).map(|n| event(n, None, now - n as u128)))
+            .map(|line| line + "\n")
+            .collect();
+        add_lines(&file, &edge);
+        trim(&file, now);
+        assert!(marked(&file).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2503,7 +2618,7 @@ mod tests {
         assert_eq!(texts, ["#4 opened", "all quiet", "#1 green"]);
         assert_eq!(down.as_deref(), Some("prs is down"));
         // The tests of filters read no clear as an event.
-        let recent: Vec<String> = (recent(&store, "prs", now - day).into_iter())
+        let recent: Vec<String> = (recent(&store, "prs", now - day).events.into_iter())
             .map(|(e, _)| e.text)
             .collect();
         assert_eq!(recent, ["#3 opened", "prs is down", "#4 opened"]);
@@ -3127,6 +3242,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let subscribers = HashMap::from([(
             "shop.lead".to_owned(),
@@ -3189,6 +3306,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let wanted = |subs: &[super::super::subs::Sub], field: &str| {
             super::super::subs::wanted(subs, "cr", field)

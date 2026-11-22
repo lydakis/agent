@@ -38,8 +38,13 @@ const READS: &str = ".reads";
 /// invites are still being sent holds one entry with no `bot`, its `reach`
 /// how many it may send.
 const INVITES: &str = ".invites";
+/// Each board that had its one round of invites, and the thread that
+/// drew it, its first: `{"BOARD": "THREAD"}`. Later threads on a board
+/// draw none, so work posted one piece at a time costs no more than a
+/// plan posted whole.
+const BOARDS: &str = ".boards";
 /// The origin of the notes the commons sends agents.
-const ORIGIN: &str = "commons";
+pub(crate) const ORIGIN: &str = "commons";
 /// The threads a day the commons sends invites for, whatever came of
 /// earlier ones, for `agents` that took a turn in the last week: the
 /// square root of them, as a town's meeting places grow slower than its
@@ -191,11 +196,8 @@ pub fn dir(home: &Path) -> PathBuf {
 
 /// The commons tool's answer, for `author`, the agent the daemon knows
 /// as `author_id`, writing with `model` for `project`, the one its name is
-/// made in.
-///
-/// `reader` is whom `.shown` counts what the answer shows for: the
-/// conversation it reaches, as `who` names it. That is the author but for a
-/// side chat, which signs as its agent and reads on its own.
+/// made in, as [`call_as`] gives it with no profile and no holder gone.
+#[cfg(test)]
 pub fn call(
     home: &Path,
     author: &str,
@@ -205,6 +207,34 @@ pub fn call(
     project: Option<&str>,
     arguments: &Value,
 ) -> Result<Value, String> {
+    let caller = crate::board::Caller {
+        name: author,
+        id: author_id,
+        reader,
+        model,
+        project,
+        profile: None,
+        lead: crate::project::is_lead(author),
+    };
+    call_as(home, &caller, arguments, &|_, _| false)
+}
+
+/// The commons tool's answer for `caller`.
+///
+/// Its `reader` is whom `.shown` counts what the answer shows for: the
+/// conversation it reaches, as `who` names it. That is the author but for a
+/// side chat, which signs as its agent and reads on its own. A post or a
+/// reply that does something to work on a board goes to [`crate::board`],
+/// with `gone` saying whether a holder, by name and id, is closed or no
+/// longer there.
+pub fn call_as(
+    home: &Path,
+    caller: &crate::board::Caller,
+    arguments: &Value,
+    gone: &dyn Fn(&str, Option<i64>) -> bool,
+) -> Result<Value, String> {
+    let (author, author_id, reader) = (caller.name, caller.id, caller.reader);
+    let (model, project) = (caller.model, caller.project);
     let dir = dir(home);
     let from = arguments["from"].as_u64().unwrap_or(0) as usize;
     let filter = filter(arguments)?;
@@ -214,8 +244,15 @@ pub fn call(
     if let Some(words) = arguments["search"].as_str() {
         return search(&dir, words, filter, author, reader, from, LIST_BYTES);
     }
+    let boards = crate::board::on();
     if arguments["post"].is_object() {
         let post = &arguments["post"];
+        if crate::board::posts_work(post) {
+            return match boards {
+                true => crate::board::post(&dir, caller, post),
+                false => Err("commons_invalid: boards are off".into()),
+            };
+        }
         let (name, title, text) = (
             post["name"].as_str().unwrap_or_default(),
             post["title"].as_str().unwrap_or_default(),
@@ -231,6 +268,12 @@ pub fn call(
     }
     if arguments["reply"].is_object() {
         let reply = &arguments["reply"];
+        if crate::board::replies_work(reply) {
+            return match boards {
+                true => crate::board::reply(&dir, caller, reply, gone),
+                false => Err("commons_invalid: boards are off".into()),
+            };
+        }
         let thread = reply["thread"].as_str().unwrap_or_default();
         let text = reply["text"].as_str().unwrap_or_default();
         return add(
@@ -251,7 +294,7 @@ pub fn call(
 }
 
 /// What a post holds that a filter matches: all Sonny wrote of it, and
-/// of an item on a board, where it stands (`crate::board::item`).
+/// of work on a board, where it stands (`crate::board::item`).
 const FIELDS: [&str; 15] = [
     "by", "by_id", "at", "model", "project", "sonny", "external", "title", "board", "do", "needs",
     "labels", "for", "state", "holder",
@@ -415,7 +458,13 @@ fn append(path: &Path, post: &Value) -> Result<(), String> {
         .map_err(failed)
 }
 
-fn start(dir: &Path, name: &str, title: &str, post: &Value, reader: &str) -> Result<Value, String> {
+pub(crate) fn start(
+    dir: &Path,
+    name: &str,
+    title: &str,
+    post: &Value,
+    reader: &str,
+) -> Result<Value, String> {
     valid_name(name)?;
     if title.trim().is_empty() || title.contains('\n') || title.chars().count() > 200 {
         return Err(
@@ -446,16 +495,36 @@ pub(crate) fn start_locked(
     saw(dir, name, post["by"].as_str().unwrap_or_default());
     show(dir, name, reader, 1);
     let mut started = json!({"thread": name, "posts": 1});
+    // A thread on a board says so, so its writer follows it as one.
+    if let Some(board) = post["board"].as_str() {
+        started["board"] = json!(board);
+    }
     let similar = similar(dir, name, title);
     if !similar.is_empty() {
         started["similar_titles"] = json!(similar);
     }
     // Agents whose turns touch it are invited, while the day has threads
-    // left; now and then one of them is any agent at all.
-    if let Some((reach, golden)) = reserve(dir, name) {
-        started["invite"] = json!({"title": title, "golden": golden, "reach": reach});
+    // left; now and then one of them is any agent at all. A board draws
+    // one round, on its first thread.
+    let first = (post["board"].as_str()).is_none_or(|board| first_on(dir, board, name));
+    if first && let Some((reach, golden)) = reserve(dir, name) {
+        let words = invite_words(dir, title, post["text"].as_str().unwrap_or_default());
+        started["invite"] =
+            json!({"title": title, "golden": golden, "reach": reach, "words": words});
     }
     Ok(started)
+}
+
+/// Whether `thread` is the first on `board`, which draws the board's one
+/// round of invites: noted so, under the lock the caller holds.
+fn first_on(dir: &Path, board: &str, thread: &str) -> bool {
+    let mut boards = json_file(&dir.join(BOARDS));
+    if boards.contains_key(board) {
+        return false;
+    }
+    boards.insert(board.to_owned(), json!(thread));
+    let text = Value::Object(boards).to_string();
+    agent_client::files::replace_mode(&dir.join(BOARDS), text.as_bytes(), 0o600).is_ok()
 }
 
 /// The day an invite counts in, UTC.
@@ -637,13 +706,51 @@ fn answered(dir: &Path, thread: &str, bot: &str) {
 /// How many pages of a word's matches an invite looks through at most.
 const SEARCH_PAGES: usize = 4;
 
-/// What of a title is searched for in agents' turns: its three longest
+/// What of a title a similar title is matched on: its three longest
 /// words of four letters or more.
 fn words(title: &str) -> Vec<String> {
     let mut words = match_words(title);
     words.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then(a.cmp(b)));
     words.truncate(3);
     words
+}
+
+/// What of a thread's title and first post is searched for in agents'
+/// turns, rarest first: each word of four letters or more, scored as the
+/// pointer scores a thread's (BM25 over the commons' threads), a word few
+/// threads say above one many do, the title's twice the text's. A word
+/// with a digit in it is a hash, a number or an id, which names no
+/// subject, and is left out.
+fn invite_words(dir: &Path, title: &str, text: &str) -> Vec<String> {
+    let mut said: HashMap<String, (u32, u32)> = HashMap::new();
+    for word in counted_words(title) {
+        said.entry(word).or_default().0 += 1;
+    }
+    for word in counted_words(text) {
+        said.entry(word).or_default().1 += 1;
+    }
+    said.retain(|word, _| !word.chars().any(|c| c.is_ascii_digit()));
+    let mut held = INDEX.lock().unwrap_or_else(|p| p.into_inner());
+    let held = held.get_or_insert_with(HashMap::new);
+    index(dir, held);
+    let threads: Vec<&Indexed> = (held.iter())
+        .filter(|(path, thread)| path.starts_with(dir) && thread.posts > 0)
+        .map(|(_, thread)| thread)
+        .collect();
+    let count = threads.len() as f64;
+    let mut scored: Vec<(f64, String)> = (said.into_iter())
+        .map(|(word, (title, text))| {
+            let holding = threads
+                .iter()
+                .filter(|t| t.words.contains_key(&word))
+                .count() as f64;
+            let weight = (1.0 + (count - holding + 0.5) / (holding + 0.5)).ln();
+            let tf = TITLE_BOOST * f64::from(title) + f64::from(text);
+            (weight * tf * (BM25_K1 + 1.0) / (tf + BM25_K1), word)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, word)| word).collect()
 }
 
 /// The note an invited agent gets: why it, from whom, and the budget of
@@ -667,10 +774,23 @@ fn draw() -> usize {
         .map_or(0, |d| d.subsec_nanos() as usize)
 }
 
-/// The agents whose turns mention a title's words, besides its author.
-async fn touched(client: &agent_client::Client, title: &str, author: &str) -> Vec<String> {
+/// The live agents whose turns mention a thread's words, besides its
+/// author, `words` rarest first: down the list until `reach` are found,
+/// so a word that matches no one costs no seat.
+async fn touched(
+    client: &agent_client::Client,
+    words: &[String],
+    author: &str,
+    live: &[String],
+    reach: usize,
+) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    for word in words(title) {
+    // Past every live agent but its author, no search finds another.
+    let could = live.iter().filter(|one| *one != author).count();
+    for word in words {
+        if found.len() >= reach.min(could) {
+            break;
+        }
         // Older pages too, while a word's matches are all the poster's or
         // agents already found, so a busy poster crowds out no one.
         let mut before = Value::Null;
@@ -683,7 +803,10 @@ async fn touched(client: &agent_client::Client, title: &str, author: &str) -> Ve
             for bot in (said["matches"].as_array().into_iter().flatten())
                 .filter_map(|found| found["bot"].as_str())
             {
-                if bot != author && !found.iter().any(|one| one == bot) {
+                if bot != author
+                    && live.iter().any(|one| one == bot)
+                    && !found.iter().any(|one| one == bot)
+                {
                     found.push(bot.to_owned());
                     new = true;
                 }
@@ -697,12 +820,12 @@ async fn touched(client: &agent_client::Client, title: &str, author: &str) -> Ve
     found
 }
 
-/// Every agent besides `author`.
+/// Every live agent besides `author`: one closed is no one to invite.
 async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
     let mut bots = Vec::new();
     let mut after = json!("");
     while let Ok(page) = client
-        .request("bots", json!({"after": after, "limit": 256}))
+        .request("bots", json!({"after": after, "limit": 256, "open": true}))
         .await
     {
         bots.extend(
@@ -768,6 +891,9 @@ async fn in_zen(client: &agent_client::Client, home: &Path) -> Vec<String> {
 pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) -> Vec<String> {
     let thread = started["thread"].as_str().unwrap_or_default();
     let title = invite["title"].as_str().unwrap_or_default();
+    let words: Vec<String> = (invite["words"].as_array().into_iter().flatten())
+        .filter_map(|word| word.as_str().map(str::to_owned))
+        .collect();
     let golden = invite["golden"] == true;
     let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
     let mut invited: Vec<(String, bool)> = Vec::new();
@@ -798,13 +924,14 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
             true => in_zen(&client, home).await,
             false => Vec::new(),
         };
-        let mut matched = touched(&client, title, author).await;
-        matched.retain(|bot| !zen.contains(bot));
+        // Only those it may invite count toward who is found.
+        let mut live = everyone(&client, author).await;
+        live.retain(|bot| !zen.contains(bot));
+        let mut matched = touched(&client, &words, author, &live, reach).await;
         let mut anyone = match golden {
-            true => everyone(&client, author).await,
+            true => live.clone(),
             false => Vec::new(),
         };
-        anyone.retain(|bot| !zen.contains(bot));
         for seat in 0..reach {
             // The golden ticket goes first, so a match can't take its agent.
             let ticket = golden && seat == 0;
@@ -832,6 +959,252 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
     let _ = sent;
     settle(&dir(home), thread, &invited);
     invited.into_iter().map(|(bot, _)| bot).collect()
+}
+
+/// Each of `named`, a live agent, hears the post `said` answers for once,
+/// as `@NAME` asks: a note that cuts into its turn, following nothing, so
+/// it posts there if it would hear more. The ones told.
+pub async fn mention(home: &Path, said: &Value, author: &str, named: &[String]) -> Vec<String> {
+    let thread = said["thread"].as_str().unwrap_or_default().to_owned();
+    let n = said["posts"].as_u64().unwrap_or(1).saturating_sub(1) as usize;
+    let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
+        return Vec::new();
+    };
+    let Some(post) = posts.get(n) else {
+        return Vec::new();
+    };
+    let title = posts[0]["title"].as_str().unwrap_or_default();
+    let text = post["text"].as_str().unwrap_or_default();
+    let note = format!(
+        "{author} named you in the commons thread {thread}, \"{title}\":\n\n{text}\n\n\
+         Reply there to answer; this note follows nothing."
+    );
+    let Ok((_, socket)) = crate::daemon_paths(None, None) else {
+        return Vec::new();
+    };
+    let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
+        return Vec::new();
+    };
+    let mut told = Vec::new();
+    for name in named {
+        let asked = name.clone();
+        let gone = tokio::task::spawn_blocking(move || crate::task::gone(&asked, None)).await;
+        if gone.unwrap_or(true) {
+            continue;
+        }
+        let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
+            "request_id": request_id(&format!("commons.mention.{thread}.{n}.{name}"))});
+        if client.request("submit", submit).await.is_ok() {
+            told.push(name.clone());
+        }
+    }
+    told
+}
+
+/// The live agents of a board's project that `work`'s `for` names, by
+/// name or by the profile each was made as, `but` aside: each name, its
+/// id. From `live`, the project's live agents as the daemon lists them.
+pub fn eligible(work: &Value, live: &[Value], but: &str) -> Vec<(String, Option<i64>)> {
+    (live.iter())
+        .filter_map(|bot| {
+            let name = bot["name"].as_str()?;
+            let profile = bot["profile"].as_str();
+            let named = (work["for"].as_array().into_iter().flatten()).any(|one| {
+                one == name
+                    || (one.as_str())
+                        .and_then(|one| one.strip_prefix(crate::board::PROFILE))
+                        .is_some_and(|p| Some(p) == profile)
+            });
+            (named && name != but).then(|| (name.to_owned(), bot["bot_id"].as_i64()))
+        })
+        .collect()
+}
+
+/// The project of `name`'s line: the one the lead it leads to leads, by
+/// who made each agent, as a call's line is read; else, led by no lead,
+/// its name up to the first dot.
+async fn project_by_line(client: &agent_client::Client, name: &str) -> String {
+    let mut at = name.to_owned();
+    for _ in 0..256 {
+        let Ok(mut record) = client.request("inspect", json!({"bot": at})).await else {
+            break;
+        };
+        record["name"] = json!(at);
+        if crate::project::is_lead_record(&record) {
+            return crate::served::project_of(&at);
+        }
+        match record["created_by"].as_str() {
+            Some(by) => at = by.to_owned(),
+            None => break,
+        }
+    }
+    crate::served::project_of(name)
+}
+
+/// The live agents of `project`, as the daemon lists them: name, id and
+/// profile.
+async fn live_in(client: &agent_client::Client, project: &str) -> Vec<Value> {
+    let mut bots = Vec::new();
+    let mut after = json!("");
+    while let Ok(page) = client
+        .request(
+            "bots",
+            json!({"name": format!("{project}.*"), "after": after, "limit": 256, "open": true}),
+        )
+        .await
+    {
+        bots.extend((page["bots"].as_array().into_iter().flatten()).map(
+            |bot| json!({"name": bot["name"], "bot_id": bot["bot_id"], "profile": bot["profile"]}),
+        ));
+        match &page["next_after"] {
+            Value::Null => break,
+            next => after = next.clone(),
+        }
+    }
+    bots
+}
+
+/// The open agent `name` as the daemon lists it: its id, and the profile
+/// it was made as, a default one included.
+pub async fn listed(client: &agent_client::Client, name: &str) -> Option<Value> {
+    let page = (client
+        .request("bots", json!({"name": name, "open": true, "limit": 1}))
+        .await)
+        .ok()?;
+    page["bots"]
+        .get(0)
+        .filter(|bot| bot["name"] == name)
+        .cloned()
+}
+
+/// The note that asks an agent to take work kept for it.
+fn asked_note(author: &str, thread: &str, title: &str, board: &str) -> String {
+    format!(
+        "[{author} asks you to take the work {thread}, \"{title}\", on {board}: it is kept for \
+         you. Reply there with do take to hold it, or say why you can't. Its posts reach you as \
+         they come.]"
+    )
+}
+
+/// Asks the live agents each of `threads`' open work is for to take it,
+/// as `for` does, outside the day's invites: a note that cuts into each
+/// one's turn, with no budget of its own since it starts real work, and
+/// a follow of the thread in `store` saying why. What came of each:
+/// `{"thread", "asked": [names]}`, or `nobody_eligible` naming whom it is
+/// for when no live agent is.
+pub async fn ask_for(home: &Path, store: &Path, threads: &[String], author: &str) -> Vec<Value> {
+    let Ok((_, socket)) = crate::daemon_paths(None, None) else {
+        return Vec::new();
+    };
+    let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
+        return Vec::new();
+    };
+    let mut projects: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut said = Vec::new();
+    for thread in threads {
+        let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
+            continue;
+        };
+        let Some(work) = crate::board::item(&posts) else {
+            continue;
+        };
+        if work["state"] != "open" || !work["for"].is_array() {
+            continue;
+        }
+        let board = work["board"].as_str().unwrap_or_default();
+        let project = crate::board::project_of(board).to_owned();
+        if !projects.contains_key(&project) {
+            let live = live_in(&client, &project).await;
+            projects.insert(project.clone(), live);
+        }
+        // Named like the project is not of it: shop.web.review is
+        // shop.web's, by the lead its line leads to.
+        let mut named = Vec::new();
+        for (name, id) in eligible(&work, &projects[&project], author) {
+            if project_by_line(&client, &name).await == project {
+                named.push((name, id));
+            }
+        }
+        if named.is_empty() {
+            said.push(json!({"thread": thread, "nobody_eligible": work["for"]}));
+            continue;
+        }
+        let title = (work["title"].as_str())
+            .or(posts[0]["title"].as_str())
+            .unwrap_or_default();
+        let note = asked_note(author, thread, title, board);
+        let mut asked = Vec::new();
+        for (name, id) in named {
+            let follow = crate::board::post_follow(thread, id, crate::board::ASKED, None);
+            let _ = crate::lookout::subs::put(store, &name, follow);
+            let submit = json!({"bot": name, "prompt": note, "delivery": "steer",
+                "origin": ORIGIN, "request_id": request_id(&format!("commons.asked.{thread}.{}.{name}", posts.len()))});
+            if client.request("submit", submit).await.is_ok() {
+                asked.push(name);
+            }
+        }
+        said.push(json!({"thread": thread, "asked": asked}));
+    }
+    said
+}
+
+/// The open work of `project`'s boards that is for `name`, made as
+/// `profile`, and that nobody holds: what an agent just started is asked
+/// to take, as it would have been had it been there when the work opened.
+/// Each thread's name.
+pub fn kept_for(home: &Path, project: &str, name: &str, profile: Option<&str>) -> Vec<String> {
+    let threads = summaries(&dir(home));
+    let done: Vec<&str> = (threads.iter())
+        .filter(|(_, thread)| thread["work"]["state"] == "done")
+        .map(|(name, _)| name.as_str())
+        .collect();
+    (threads.iter())
+        .filter(|(_, thread)| {
+            let work = &thread["work"];
+            work["state"] == "open"
+                && work["board"].as_str().map(crate::board::project_of) == Some(project)
+                && (work["for"].as_array()).is_some_and(|named| !named.is_empty())
+                && crate::board::is_for(work, name, profile)
+                && !crate::board::waiting(work, &|need| done.contains(&need))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Asks the agent `name`, known as `id`, just started, to take each of
+/// `threads`, as [`ask_for`] asks those there when work opens.
+pub async fn ask_started(
+    client: &agent_client::Client,
+    home: &Path,
+    store: &Path,
+    threads: &[String],
+    name: &str,
+    id: Option<i64>,
+    starter: &str,
+) {
+    for thread in threads {
+        let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
+            continue;
+        };
+        let Some(work) = crate::board::item(&posts) else {
+            continue;
+        };
+        let title = (work["title"].as_str())
+            .or(posts[0]["title"].as_str())
+            .unwrap_or_default();
+        let by = work["by"].as_str().unwrap_or(starter);
+        let note = asked_note(
+            by,
+            thread,
+            title,
+            work["board"].as_str().unwrap_or_default(),
+        );
+        let follow = crate::board::post_follow(thread, id, crate::board::ASKED, None);
+        let _ = crate::lookout::subs::put(store, name, follow);
+        let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
+            "request_id": request_id(&format!("commons.asked.{thread}.{}.{name}", posts.len()))});
+        let _ = client.request("submit", submit).await;
+    }
 }
 
 /// The submit that brings `bot` an invite to `thread`: the note, queued
@@ -882,7 +1255,21 @@ pub(crate) fn add_locked(
     show(dir, name, who, earlier.len() + 1);
     answered(dir, name, by);
     let title = earlier.first().map_or(Value::Null, |p| p["title"].clone());
-    Ok(json!({"thread": name, "title": title, "posts": earlier.len() + 1}))
+    let mut said = json!({"thread": name, "title": title, "posts": earlier.len() + 1});
+    // A thread on a board says so, so its writer follows it as one.
+    let board = (crate::board::item(&earlier)
+        .and_then(|it| it["board"].as_str().map(str::to_owned)))
+    .or_else(|| earlier.first()?["board"].as_str().map(str::to_owned))
+    .or_else(|| post["board"].as_str().map(str::to_owned));
+    if let Some(board) = board {
+        said["board"] = json!(board);
+    }
+    // Its work as it stands, which a reply moving nothing leaves as it was,
+    // so its holder still follows it as its holder.
+    if let Some(work) = crate::board::item(&earlier) {
+        said["work"] = work;
+    }
+    Ok(said)
 }
 
 fn reads(dir: &Path) -> serde_json::Map<String, Value> {
@@ -1009,7 +1396,7 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
                     shown[key] = post[key].clone();
                 }
             }
-            // What a board's post did, as the item's history.
+            // What a board's post did, as the work's history.
             for key in ["do", "board", "needs", "labels", "for", "took_from"] {
                 if !post[key].is_null() {
                     shown[key] = post[key].clone();
@@ -1020,7 +1407,7 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
         .collect();
     let mut shown = json!({"thread": name, "title": title, "posts": shown});
     if let Some(item) = crate::board::item(&posts) {
-        shown["item"] = item;
+        shown["work"] = item;
     }
     Ok(shown)
 }
@@ -1109,18 +1496,23 @@ const OPENING: &str = "opening";
 /// count of lines, decoding no post between them but a board's actions:
 /// an item's, under `item`, as [`crate::board::item`] reads its posts.
 pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
-    let text = std::fs::read(path).ok()?;
-    let mut lines =
-        (text.split(|b| *b == b'\n')).filter(|line| !line.iter().all(u8::is_ascii_whitespace));
+    summary_of(name, &std::fs::read(path).ok()?)
+}
+
+/// [`summary`] of a thread's file as read, `text`.
+pub(crate) fn summary_of(name: &str, text: &[u8]) -> Option<Value> {
+    let all: Vec<&[u8]> = (text.split(|b| *b == b'\n'))
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .collect();
+    let mut lines = all.iter().copied();
     let first: Value = serde_json::from_slice(lines.next()?).ok()?;
     let (mut count, mut last) = (1, None);
     // Only a line holding `"do":` can be an action: in a post's text the
     // quotes are escaped, so no text passes for one.
     let marked = |line: &[u8]| line.windows(5).any(|w| w == br#""do":"#);
-    let mut actions = Vec::new();
-    if first["do"].is_string() {
-        actions.push(first.clone());
-    }
+    // The first post always, an action or not, so a later reply that
+    // opens the thread as work is never taken for its first post.
+    let mut actions = vec![first.clone()];
     for line in lines {
         count += 1;
         last = Some(line);
@@ -1146,8 +1538,23 @@ pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
     if first["project"].is_string() {
         summary["project"] = first["project"].clone();
     }
-    if let Some(item) = crate::board::item(&actions) {
-        summary["item"] = item;
+    // A plain thread on a board is listed beside its work.
+    if first["board"].is_string() && first["do"].is_null() {
+        summary["board"] = first["board"].clone();
+    }
+    if let Some(mut item) = crate::board::item(&actions) {
+        // When its holder last wrote there, which its board shows: a key
+        // in a post's text has its quotes escaped, so none passes for it.
+        if let Some(holder) = item["holder"].as_str() {
+            let by = format!("\"by\":{}", json!(holder));
+            let wrote = (all.iter().rev())
+                .find(|line| line.windows(by.len()).any(|w| w == by.as_bytes()))
+                .and_then(|line| serde_json::from_slice::<Value>(line).ok());
+            if let Some(at) = wrote.as_ref().and_then(|post| post["at"].as_i64()) {
+                item["holder_at"] = json!(at);
+            }
+        }
+        summary["work"] = item;
     }
     // Its first post but its text, which a filter on the listing matches
     // and the listing leaves out.
@@ -1155,6 +1562,21 @@ pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
     opening.as_object_mut().map(|post| post.remove("text"));
     summary[OPENING] = opening;
     Some(summary)
+}
+
+/// The daemon's longest request ID, in bytes.
+const REQUEST_ID_BYTES: usize = 128;
+
+/// `id` as a request ID the daemon takes: as it is when it fits, else
+/// named by its digest, as unique as it.
+pub(crate) fn request_id(id: &str) -> String {
+    if id.len() <= REQUEST_ID_BYTES {
+        return id.to_owned();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("commons.{hex}")
 }
 
 /// The threads from the `from`th newest, as many as `bytes` holds, with
@@ -1205,20 +1627,20 @@ pub(crate) fn list(
     // An item waits while one of its needs is not done, which only the
     // other items say.
     let done: std::collections::HashSet<String> = (all.iter())
-        .filter(|(_, thread)| thread["item"]["state"] == "done")
+        .filter(|(_, thread)| thread["work"]["state"] == "done")
         .map(|(name, _)| name.clone())
         .collect();
     let mut threads = Vec::new();
     for (name, mut thread) in all {
-        if crate::board::waiting(&thread["item"], &|need| done.contains(need)) {
-            thread["item"]["state"] = json!("waiting");
+        if crate::board::waiting(&thread["work"], &|need| done.contains(need)) {
+            thread["work"]["state"] = json!("waiting");
         }
         let mut opening = (thread.as_object_mut())
             .and_then(|t| t.remove(OPENING))
             .unwrap_or(Value::Null);
         // A filter sees where an item stands as its first post's own: what
         // the item has since cleared is gone from it too.
-        if let (Some(fields), Some(item)) = (opening.as_object_mut(), thread["item"].as_object()) {
+        if let (Some(fields), Some(item)) = (opening.as_object_mut(), thread["work"].as_object()) {
             for key in crate::board::CHANGING {
                 fields.remove(key);
             }
@@ -1412,7 +1834,7 @@ fn search(
             "posts": posts.len(), "last_by": last["by"], "last_when": when(at),
             "matches": matches});
         if let Some(item) = &item {
-            thread["item"] = item.clone();
+            thread["work"] = item.clone();
         }
         if let Some((count, from)) = more {
             thread["more_matches"] = json!(count);
@@ -1459,8 +1881,8 @@ fn snippet(text: &str) -> String {
     }
 }
 
-/// The threads besides `name` whose titles share a word with `title`, as
-/// invites match agents (`words`): those sharing the most first, then the
+/// The threads besides `name` whose titles share a word with `title`
+/// (`words`): those sharing the most first, then the
 /// newest started, at most `SIMILAR`. Each thread's first line alone.
 fn similar(dir: &Path, name: &str, title: &str) -> Vec<Value> {
     let words = words(title);
@@ -1809,22 +2231,32 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             .first()
             .and_then(|p| p["title"].as_str())
             .unwrap_or_default();
-        // An item's board, which a follow of the board hears it by.
+        // Its board, which a follow of the board hears it by: work's, or
+        // a plain thread's on a board.
         let board = (posts.iter().any(|post| post["do"].is_string()))
             .then(|| crate::board::item(&posts))
             .flatten()
-            .and_then(|item| item["board"].as_str().map(str::to_owned));
+            .and_then(|item| item["board"].as_str().map(str::to_owned))
+            .or_else(|| (posts.first()?["board"].as_str()).map(str::to_owned));
         for (n, post) in posts.iter().enumerate().skip(had).filter(|_| !first) {
             let text = post["text"].as_str().unwrap_or_default();
-            let text = match (n, post["do"].as_str()) {
+            let mut text = match (n, post["do"].as_str()) {
                 (0, Some(_)) => format!(
-                    "new item {thread} on {}, \"{title}\": {text}",
+                    "new work {thread} on {}, \"{title}\": {text}",
                     board.as_deref().unwrap_or_default()
                 ),
                 (0, None) => format!("new thread {thread}, \"{title}\": {text}"),
                 (_, Some(done)) => format!("{done} in {thread}, \"{title}\": {text}"),
                 (_, None) => format!("reply in {thread}, \"{title}\": {text}"),
             };
+            // Work it opened beside its own.
+            let others: Vec<&str> = (post["opened"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .filter(|opened| *opened != thread)
+                .collect();
+            if !others.is_empty() {
+                text.push_str(&format!("\nIt opened {}.", others.join(", ")));
+            }
             let mut line = json!({"id": format!("{thread}/{n}"), "topic": thread, "text": text});
             if let Some(by) = post["by"].as_str() {
                 line["from"] = json!(by);
@@ -1833,6 +2265,7 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             // it opened, which a worker's follow is steered by.
             if let Some(board) = &board {
                 line["board"] = json!(board);
+                line["event"] = json!(crate::board::event_of(&posts, n, &thread));
             }
             for key in ["do", "opened"] {
                 if !post[key].is_null() {
@@ -1840,9 +2273,54 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 }
             }
             lines.push(line.to_string());
+            // The board's last work settling: the board's own news, on no
+            // thread, so the thread's followers hear the post alone.
+            if let Some(emptied) = post["emptied"].as_str() {
+                let mut line = json!({"id": format!("{thread}/{n}/emptied"), "board": emptied,
+                    "event": "emptied",
+                    "text": format!("{emptied} holds no open or taken work now: {thread} settled last.")});
+                if let Some(by) = post["by"].as_str() {
+                    line["from"] = json!(by);
+                }
+                lines.push(line.to_string());
+            }
         }
-        read.insert(thread, json!({"posts": posts.len(), "bytes": bytes}));
+        let mut kept = json!({"posts": posts.len(), "bytes": bytes});
+        // Work held, kept to tell its board once it goes quiet.
+        if let Some(work) = crate::board::item(&posts).filter(|it| it["state"] == "taken") {
+            let title = work["title"].as_str().unwrap_or(title);
+            kept["held"] = json!({"at": posts.last().map_or(0, |p| p["at"].as_i64().unwrap_or(0)),
+                "board": work["board"], "holder": work["holder"], "title": title});
+        }
+        read.insert(thread, kept);
         changed = true;
+    }
+    // Held work with no post for `[sonny] hold_quiet`: its board hears it
+    // once, until its thread moves again.
+    let quiet = crate::board::hold_quiet()
+        .and_then(|quiet| Some((agent_client::config::span("quiet", &quiet).ok()?, quiet)));
+    if let Some((span, quiet)) = quiet.filter(|_| !first) {
+        let now = now();
+        for (thread, kept) in read.iter_mut() {
+            let held = &mut kept["held"];
+            let Some(at) = held["at"].as_i64() else {
+                continue;
+            };
+            if held["told"] == true || now < at + span as i64 {
+                continue;
+            }
+            held["told"] = json!(true);
+            changed = true;
+            let (holder, title) = (
+                held["holder"].as_str().unwrap_or_default(),
+                held["title"].as_str().unwrap_or_default(),
+            );
+            let text =
+                format!("{holder} has held {thread}, \"{title}\", with no post there for {quiet}.");
+            let line = json!({"id": format!("{thread}/{at}/quiet"), "board": held["board"],
+                "event": "quiet", "thread": thread, "holder": holder, "text": text});
+            lines.push(line.to_string());
+        }
     }
     News {
         lines,
@@ -1859,10 +2337,21 @@ pub fn subscribe(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Resu
 
 /// Subscribes `bot` to `thread`, as posting there does, and says what it
 /// is subscribed to, for the post's answer: the subscription's name, how
-/// often the thread's posts reach it, and how to change that. None when
-/// its subscriptions cannot be written.
-pub fn subscribed(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Option<Value> {
-    subscribe(store, bot, id, thread).ok()?;
+/// often the thread's posts reach it, and how to change that. A thread on
+/// a board is followed as `on_board` says, in place of a follow of it
+/// whose rules differ: each post as it comes, and why. None when its
+/// subscriptions cannot be written.
+pub fn subscribed(
+    store: &Path,
+    bot: &str,
+    id: Option<i64>,
+    thread: &str,
+    on_board: Option<crate::lookout::subs::Sub>,
+) -> Option<Value> {
+    match on_board {
+        Some(follow) => _ = crate::lookout::subs::put(store, bot, follow).ok()?,
+        None => _ = subscribe(store, bot, id, thread).ok()?,
+    }
     let name = crate::lookout::subs::Sub::commons(thread, id).name;
     // One it already held may have a digest or filter of its own.
     let held = (crate::lookout::subs::read(store, bot).into_iter())
@@ -1888,9 +2377,17 @@ fn said_of(sub: &crate::lookout::subs::Sub, thread: &str, source: Option<&str>) 
         Some(digest) => (digest.as_str(), "its own digest"),
         None => (source.unwrap_or("0"), "the commons source's digest"),
     };
-    let pace = match digest {
-        "0" => "as they come".to_owned(),
-        digest => format!("at most every {digest}"),
+    let pace = match (&sub.steer, digest) {
+        (Some(_), _) => "as they come, cutting into your turn".to_owned(),
+        (None, "0") => "as they come".to_owned(),
+        (None, digest) => format!("at most every {digest}"),
+    };
+    let whose = match (&sub.about, &sub.quiet) {
+        (Some(about), Some(quiet)) => {
+            format!("since {about}; and once if nothing is posted there for {quiet}")
+        }
+        (Some(about), None) => format!("since {about}"),
+        _ => whose.to_owned(),
     };
     let filtered = match sub.filter.is_some() {
         true => ", those its filter matches",
@@ -2091,6 +2588,8 @@ enum Row {
     Heading(crate::board_view::State),
     /// An item on a board's page, by its place in `items`.
     Item(usize),
+    /// A plain thread on a board's page, by its place in `threads`.
+    Plain(usize),
 }
 
 /// A page over the list: a board, or a thread.
@@ -2203,7 +2702,19 @@ impl View {
         self.item_at = (self.items.iter().enumerate())
             .map(|(at, item)| (item.thread.clone(), at))
             .collect();
-        self.boards = crate::board_view::boards(&self.items, &self.project);
+        // A board's plain threads, and the last post of each.
+        let plain: Vec<(&str, i64)> = (self.threads.iter())
+            .filter(|_| self.boards_on)
+            .filter(|thread| !self.is_item(thread))
+            .filter_map(|thread| {
+                let board = thread["board"].as_str()?;
+                let name = thread["thread"].as_str()?;
+                let at =
+                    (self.known.get(name)).map_or(0, |(_, kept)| kept["at"].as_i64().unwrap_or(0));
+                Some((board, at))
+            })
+            .collect();
+        self.boards = crate::board_view::boards(&self.items, &plain, &self.project);
         self.settle();
         for page in &mut self.pages {
             let Page::Thread {
@@ -2281,10 +2792,16 @@ impl View {
     /// with those items hung under them, then the threads that match,
     /// an item hung under its board not again among them.
     fn rows(&self) -> Vec<Row> {
-        let (open, finished) = self.boards_split();
         let query = (self.finding.as_ref())
             .filter(|find| find.typed())
             .map(|find| find.query.clone());
+        self.rows_finding(query)
+    }
+
+    /// [`View::rows`] while finding `query`, every row before anything
+    /// is typed; with none, as at rest.
+    fn rows_finding(&self, query: Option<String>) -> Vec<Row> {
+        let (open, finished) = self.boards_split();
         let mut rows = Vec::new();
         let mut hung_threads = std::collections::HashSet::new();
         match &query {
@@ -2338,7 +2855,7 @@ impl View {
             Row::Board(at) => Pick::Board(self.boards[at].name.clone()),
             Row::Fold(_) => Pick::Fold,
             Row::Hung(at) | Row::Item(at) => Pick::Thread(self.items[at].thread.clone()),
-            Row::Thread(at) => Pick::Thread(
+            Row::Thread(at) | Row::Plain(at) => Pick::Thread(
                 self.threads[at]["thread"]
                     .as_str()
                     .unwrap_or_default()
@@ -2415,6 +2932,17 @@ impl View {
                 rows.extend(items.into_iter().map(Row::Item));
             }
         }
+        // Its plain threads beside its work, newest first as listed.
+        rows.extend(
+            (self.threads.iter().enumerate())
+                .filter(|(_, thread)| thread["board"] == name && !self.is_item(thread))
+                .filter(|(_, thread)| {
+                    (finding.as_deref()).is_none_or(|q| {
+                        crate::find::says(q, thread["title"].as_str().unwrap_or(""))
+                    })
+                })
+                .map(|(at, _)| Row::Plain(at)),
+        );
         rows
     }
 
@@ -2450,6 +2978,7 @@ impl View {
                     self.found();
                     return Key::Stay;
                 }
+                crate::find::Typed::Held => return Key::Stay,
                 crate::find::Typed::Other => {}
             }
         }
@@ -2576,7 +3105,7 @@ impl View {
         .unwrap_or_default();
         let matches = |row: &Row| match row {
             Row::Board(at) => crate::find::says(&query, &self.boards[*at].name),
-            Row::Hung(_) | Row::Thread(_) | Row::Item(_) => true,
+            Row::Hung(_) | Row::Thread(_) | Row::Item(_) | Row::Plain(_) => true,
             Row::Fold(_) | Row::Heading(_) => false,
         };
         // The pick to the first match, as every find has it.
@@ -2639,7 +3168,7 @@ impl View {
                 let name = self.items[at].thread.clone();
                 self.open_thread_page(name);
             }
-            Row::Thread(at) => {
+            Row::Thread(at) | Row::Plain(at) => {
                 let name = self.threads[at]["thread"]
                     .as_str()
                     .unwrap_or_default()
@@ -2825,25 +3354,52 @@ impl View {
 
     /// The card `width` wide, as [`Card`] says.
     pub fn card_rows(&mut self, width: usize) -> Card {
-        let mut card = match self.pages.last() {
+        match self.pages.last() {
             Some(Page::Thread { .. }) => self.thread_card(width),
             Some(Page::Board { name, .. }) => {
                 let name = name.clone();
                 self.board_card(&name, width)
             }
             None => self.list_card(width),
-        };
-        // The find row, the view's last.
-        let query = match self.pages.last() {
-            Some(Page::Board { finding, .. }) => finding.as_ref(),
-            Some(Page::Thread { .. }) => None,
-            None => self.finding.as_ref(),
-        };
-        if let Some(find) = query {
-            card.lines.push(Line::default());
-            card.lines.push(crate::find::line(&find.query));
         }
-        card
+    }
+
+    /// The find field over the list or a board's page, while finding:
+    /// how many rows say what is typed, of how many. None on a thread,
+    /// whose text does not step yet.
+    pub fn field(&self) -> Option<crate::find::Field> {
+        // A row that says it itself, not a board kept for what it holds.
+        let says = |query: &str, row: &Row| match row {
+            Row::Board(at) => crate::find::says(query, &self.boards[*at].name),
+            Row::Hung(_) | Row::Thread(_) | Row::Item(_) | Row::Plain(_) => true,
+            Row::Fold(_) | Row::Heading(_) => false,
+        };
+        match self.pages.last() {
+            Some(Page::Thread { .. }) => None,
+            Some(Page::Board { name, finding, .. }) => {
+                let find = finding.as_ref()?;
+                let board = self.boards.iter().find(|board| board.name == *name)?;
+                let left = (board.items.iter())
+                    .filter(|item| {
+                        crate::board_view::found_on_page(&self.items[**item], &find.query)
+                    })
+                    .count();
+                Some(crate::find::Field::rows(
+                    &find.query,
+                    left,
+                    board.items.len(),
+                ))
+            }
+            None => {
+                let find = self.finding.as_ref()?;
+                let count = |rows: Vec<Row>, query: &str| {
+                    rows.iter().filter(|row| says(query, row)).count()
+                };
+                let left = count(self.rows(), &find.query);
+                let of = count(self.rows_finding(Some(String::new())), "");
+                Some(crate::find::Field::rows(&find.query, left, of))
+            }
+        }
     }
 
     fn head(&self, boards: usize, threads: usize) -> Line<'static> {
@@ -3009,7 +3565,7 @@ impl View {
                     card.starts.push(out.len());
                     self.thread_row(&self.threads[*at], pick, width, &mut out);
                 }
-                Row::Heading(_) | Row::Item(_) => {}
+                Row::Heading(_) | Row::Item(_) | Row::Plain(_) => {}
             }
         }
         card.lines = out;
@@ -3118,8 +3674,9 @@ impl View {
             }) = self.pages.last()
         {
             out.push(Line::default());
-            out.push(Line::from(format!("no item matches {}", find.query)).dim());
+            out.push(Line::from(format!("nothing here matches {}", find.query)).dim());
         }
+        let mut plain_heading = false;
         for row in &rows {
             match row {
                 Row::Heading(state) => {
@@ -3163,6 +3720,31 @@ impl View {
                     if let Some(detail) = crate::board_view::page_detail(item, &others, width) {
                         out.push(detail);
                     }
+                }
+                Row::Plain(at) => {
+                    let thread = &self.threads[*at];
+                    if !plain_heading {
+                        plain_heading = true;
+                        let n = rows.iter().filter(|r| matches!(r, Row::Plain(_))).count();
+                        out.push(Line::default());
+                        out.push(Line::from(vec![
+                            Span::raw("Threads").bold(),
+                            Span::raw(format!(" · {n}")).dim(),
+                        ]));
+                    }
+                    if picked == Some(*row) {
+                        card.at = out.len();
+                    }
+                    card.starts.push(out.len());
+                    let at = (thread["thread"].as_str())
+                        .and_then(|name| self.known.get(name))
+                        .map_or(0, |(_, kept)| kept["at"].as_i64().unwrap_or(0));
+                    let mut line =
+                        crate::board_view::plain_row(thread, at, width, now, &self.project);
+                    if picked == Some(*row) {
+                        crate::list::pick(&mut line);
+                    }
+                    out.push(line);
                 }
                 _ => {}
             }
@@ -3214,15 +3796,15 @@ impl View {
             }
             out.extend(rows);
         }
-        for post in posts {
+        for (at, post) in posts.iter().enumerate() {
             out.push(Line::default());
             let by = post["by"].as_str().unwrap_or_default();
             let when = when(post["at"].as_i64().unwrap_or(0));
-            // What an agent did to the item: who, what, when, one muted
+            // What an agent did to the work: who, what, when, one muted
             // row; a closing one has its text under it, as any post.
-            if let Some(did) = crate::board_view::action_words(post, &self.project) {
+            if let Some(did) = crate::board_view::action_words(post, at == 0, &self.project) {
                 out.push(Line::from(format!("{by} · {did} · {when}")).dim());
-                let closes = matches!(post["do"].as_str(), Some("done" | "fail" | "cancel"));
+                let closes = matches!(post["do"].as_str(), Some("done" | "fail"));
                 let text = post["text"].as_str().unwrap_or_default();
                 if closes && !text.trim().is_empty() {
                     let mut markdown = crate::transcript::Markdown::default();
@@ -3425,7 +4007,9 @@ mod tests {
         let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         assert_eq!(view.press(ctrl_f), Key::Stay);
         assert!(view.finding());
-        assert_eq!(text(&mut view).last().unwrap(), "find");
+        // The field is the pane's, under its title, not a row of the list.
+        assert!(!text(&mut view).iter().any(|line| line.starts_with("find")));
+        assert_eq!(view.field(), Some(crate::find::Field::rows("", 3, 3)));
         // Typed, it narrows; the pick to the first match.
         assert_eq!(view.press(key(KeyCode::Char('c'))), Key::Stay);
         assert!(says(&mut view, "round half cents") && says(&mut view, "README"));
@@ -3437,7 +4021,7 @@ mod tests {
         assert!(!says(&mut view, "round half") && says(&mut view, "Caching the CI"));
         assert!(!says(&mut view, "README"), "{:#?}", text(&mut view));
         assert!(picked(&mut view).contains("Caching the CI"));
-        assert_eq!(text(&mut view).last().unwrap(), "find cac");
+        assert_eq!(view.field(), Some(crate::find::Field::rows("cac", 1, 3)));
         // The arrows stay among the threads found.
         view.press(key(KeyCode::Up));
         assert!(picked(&mut view).contains("Caching the CI"));
@@ -3457,7 +4041,7 @@ mod tests {
         assert!(!view.finding() && !view.paste("zz"));
         assert!(picked(&mut view).contains("README"));
         assert!(says(&mut view, "README") && says(&mut view, "round half"));
-        assert!(!text(&mut view).last().unwrap().contains("find"));
+        assert_eq!(view.field(), None);
         assert_eq!(view.press(key(KeyCode::Esc)), Key::Close);
         let _ = std::fs::remove_dir_all(home);
     }
@@ -3978,7 +4562,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(store.parent().unwrap()).unwrap();
-        let said = subscribed(&store, "a.x", Some(1), "t").unwrap();
+        let said = subscribed(&store, "a.x", Some(1), "t", None).unwrap();
         assert_eq!(said["name"], "commons.t");
         let about = said["about"].as_str().unwrap();
         assert!(about.contains("as commons.t"), "{about}");
@@ -3987,7 +4571,7 @@ mod tests {
         assert!(crate::lookout::subs::remove(&store, "a.x", "commons.t").unwrap());
         assert!(crate::lookout::subs::read(&store, "a.x").is_empty());
         assert_eq!(
-            subscribed(&store, "a.x", Some(1), "t").unwrap()["name"],
+            subscribed(&store, "a.x", Some(1), "t", None).unwrap()["name"],
             "commons.t"
         );
         assert_eq!(crate::lookout::subs::read(&store, "a.x").len(), 1);
@@ -4031,7 +4615,8 @@ mod tests {
         assert_eq!(
             post("first")["invite"],
             json!({"title": "SQLite checkpoint stalls", "golden": false,
-                "reach": reach(0, 0, base as usize)})
+                "reach": reach(0, 0, base as usize),
+                "words": ["checkpoint", "sqlite", "stalls", "seen"]})
         );
         // A thread no agent's invite reached is given back.
         settle(&dir, "first", &[]);
@@ -4090,6 +4675,197 @@ mod tests {
             ["checkpoint", "sqlite", "stalls"]
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn invites_aim_by_the_rarest_words_and_a_board_draws_one_round() {
+        let home = home("rarest");
+        let dir = dir(&home);
+        let post = |name: &str, title: &str, text: &str, board: Option<&str>| {
+            let mut post = json!({"name": name, "title": title, "text": text});
+            if let Some(board) = board {
+                post["board"] = json!(board);
+            }
+            call(
+                &home,
+                "a.x",
+                None,
+                "a.x",
+                None,
+                Some("a"),
+                &json!({"post": post}),
+            )
+            .unwrap()
+        };
+        for n in 0..6 {
+            post(
+                &format!("t{n}"),
+                "Fix the error handling",
+                "error error",
+                None,
+            );
+        }
+        // A word few threads say leads; one with a digit is no subject.
+        let words = invite_words(
+            &dir,
+            "Fix the checkpoint error",
+            "wal stalls on 0x1f2e3d sha256",
+        );
+        assert_eq!(words.first().map(String::as_str), Some("checkpoint"));
+        assert!(
+            words.iter().all(|w| !w.chars().any(|c| c.is_ascii_digit())),
+            "{words:?}"
+        );
+        assert!(words.iter().position(|w| w == "error") > words.iter().position(|w| w == "stalls"));
+        // The board's first thread draws its round; later ones none.
+        let _ = std::fs::remove_dir_all(&home);
+        let first = post("plan", "Type the errors", "the plan", Some("a/errors"));
+        assert!(first["invite"]["words"].is_array(), "{first}");
+        let later = post("more", "Type the cli errors", "more", Some("a/errors"));
+        assert!(later["invite"].is_null(), "{later}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn work_for_names_and_profiles_asks_the_live_agents_they_name() {
+        let live = [
+            json!({"name": "shop.review.1", "bot_id": 4, "profile": "reviewer"}),
+            json!({"name": "shop.fix.1", "bot_id": 5, "profile": "worker"}),
+            json!({"name": "shop.w9", "bot_id": 6}),
+        ];
+        let work = json!({"for": ["profile:reviewer", "shop.w9"]});
+        let named = eligible(&work, &live, "shop.lead");
+        assert_eq!(
+            named,
+            [
+                ("shop.review.1".to_owned(), Some(4)),
+                ("shop.w9".to_owned(), Some(6))
+            ]
+        );
+        assert!(
+            eligible(&work, &live, "shop.w9")
+                .iter()
+                .all(|(n, _)| n != "shop.w9")
+        );
+        assert!(eligible(&json!({"for": ["profile:docs"]}), &live, "x").is_empty());
+    }
+
+    #[test]
+    fn an_agent_started_later_is_asked_to_take_open_work_kept_for_it() {
+        let home = home("kept-for");
+        let caller = crate::board::Caller {
+            name: "shop.lead",
+            id: None,
+            reader: "shop.lead",
+            model: None,
+            project: Some("shop"),
+            profile: None,
+            lead: true,
+        };
+        let post = |name: &str, extra: Value| {
+            let mut post = json!({"name": name, "title": format!("Do {name}"), "text": "x",
+                "board": "shop/errors", "work": true});
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                post[key] = value.clone();
+            }
+            call_as(&home, &caller, &json!({"post": post}), &|_, _| false).unwrap()
+        };
+        let said = post("review", json!({"for": ["profile:reviewer"]}));
+        assert_eq!(said[crate::board::ASK_FOR], json!(["review"]));
+        post(
+            "waits",
+            json!({"for": ["profile:reviewer"], "needs": ["review"]}),
+        );
+        post("anyone", json!({}));
+        assert_eq!(
+            kept_for(&home, "shop", "shop.r.1", Some("reviewer")),
+            ["review"]
+        );
+        assert!(kept_for(&home, "shop", "shop.w.1", Some("worker")).is_empty());
+        assert!(kept_for(&home, "docs", "docs.r.1", Some("reviewer")).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_request_id_too_long_for_the_daemon_is_named_by_its_digest() {
+        let short = "commons.asked.store.3.shop.w1";
+        assert_eq!(request_id(short), short);
+        let name = "a".repeat(50);
+        let long = format!("commons.asked.{}.12.{name}", "t".repeat(64));
+        let id = request_id(&long);
+        assert!(id.len() <= REQUEST_ID_BYTES, "{id}");
+        assert_eq!(request_id(&long), id);
+        assert_ne!(request_id(&format!("{long}x")), id);
+    }
+
+    /// The walk down a post's words stops once no live agent is left to
+    /// find: none live costs no search, and every one found ends it.
+    #[tokio::test]
+    async fn the_words_are_searched_only_while_someone_is_left_to_find() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let searched = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = searched.clone();
+        let client = crate::tests::daemon_answering(move |request| match request["op"].as_str() {
+            Some("history_search") => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                json!({"matches": [{"bot": "shop.w1"}], "next_before": null})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let words: Vec<String> = (0..50).map(|n| format!("word{n}")).collect();
+        assert!(
+            touched(&client, &words, "shop.lead", &[], 8)
+                .await
+                .is_empty()
+        );
+        assert_eq!(searched.load(Ordering::SeqCst), 0);
+        let live = ["shop.lead".to_owned(), "shop.w1".to_owned()];
+        assert_eq!(
+            touched(&client, &words, "shop.lead", &live, 8).await,
+            ["shop.w1"]
+        );
+        assert_eq!(searched.load(Ordering::SeqCst), 1);
+    }
+
+    /// An agent's project is its lead's, not its name's first part: a
+    /// project named inside another's name keeps its own agents.
+    #[tokio::test]
+    async fn an_agent_belongs_to_the_project_its_line_leads_to() {
+        let client = crate::tests::daemon_answering(|request| match request["bot"].as_str() {
+            Some("shop.web.review") => json!({"created_by": "shop.web.lead"}),
+            Some("shop.w1") => json!({"created_by": "shop.lead"}),
+            Some("shop.lead" | "shop.web.lead") => json!({}),
+            _ => json!({}),
+        })
+        .await;
+        assert_eq!(
+            project_by_line(&client, "shop.web.review").await,
+            "shop.web"
+        );
+        assert_eq!(project_by_line(&client, "shop.w1").await, "shop");
+    }
+
+    /// A task started with no profile is made as the default one: what
+    /// it was made as is read from the daemon, not from the start's words.
+    #[tokio::test]
+    async fn a_started_agent_is_read_as_the_daemon_lists_it() {
+        let client = crate::tests::daemon_answering(|request| {
+            match (request["op"].as_str(), request["name"].as_str()) {
+                (Some("bots"), Some("shop.r.1")) => {
+                    json!({"bots": [{"name": "shop.r.1", "bot_id": 7, "profile": "task"}]})
+                }
+                (Some("bots"), Some(_)) => json!({"bots": [{"name": "shop.other", "bot_id": 8}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let made = listed(&client, "shop.r.1").await.unwrap();
+        assert_eq!(
+            (made["bot_id"].as_i64(), made["profile"].as_str()),
+            (Some(7), Some("task"))
+        );
+        assert_eq!(listed(&client, "shop.gone").await, None);
     }
 
     #[test]

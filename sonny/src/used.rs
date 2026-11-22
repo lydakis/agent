@@ -165,6 +165,7 @@ impl Marks {
         if let Some(file) = file(bot) {
             tokio::task::spawn_blocking(move || mark(&file));
         }
+        crate::away::here();
     }
 }
 

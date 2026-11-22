@@ -1277,6 +1277,14 @@ impl View {
         self.finding.is_some() && self.page.is_none()
     }
 
+    /// The find field over the list, while finding: how many rows say
+    /// what is typed, of how many. None on a page, which has no find.
+    pub fn field(&self) -> Option<crate::find::Field> {
+        let find = self.finding.as_ref().filter(|_| self.page.is_none())?;
+        let left = (0..self.rows()).filter(|at| self.shown(*at)).count();
+        Some(crate::find::Field::rows(&find.query, left, self.rows()))
+    }
+
     /// The command picked, when the pick is past the items.
     fn command(&self) -> Option<&Value> {
         (self.selected.checked_sub(self.items.len())).and_then(|at| self.commands.rows.get(at))
@@ -1562,6 +1570,7 @@ impl View {
                         self.found();
                         return Key::Stay;
                     }
+                    crate::find::Typed::Held => return Key::Stay,
                     crate::find::Typed::Other => {}
                 }
             } else if crate::find::opens(&key) {
@@ -2006,15 +2015,14 @@ impl View {
                 out.push(commands::line(row, name, name_width, width, now_ms, picked));
             }
         }
-        // The find row, the view's last; and a find that keeps nothing says
-        // so.
-        if let Some(find) = &self.finding {
-            if find.typed() && !(0..self.rows()).any(|at| self.shown(at)) {
-                out.push(Line::default());
-                out.push(Line::from(format!("nothing here matches {}", find.query)).dim());
-            }
+        // A find that keeps nothing says so; the field is the pane's,
+        // under its title.
+        if let Some(find) = &self.finding
+            && find.typed()
+            && !(0..self.rows()).any(|at| self.shown(at))
+        {
             out.push(Line::default());
-            out.push(crate::find::line(&find.query));
+            out.push(Line::from(format!("nothing here matches {}", find.query)).dim());
         }
         (out, at, starts, links)
     }
@@ -2585,6 +2593,14 @@ impl View {
                 vec![Field::text(format!("at most every {digest}"))],
             ));
         }
+        if let Some(quiet) = &sub.quiet {
+            fields.push((
+                "quiet",
+                vec![Field::text(format!(
+                    "tells once after {quiet} with nothing"
+                ))],
+            ));
+        }
         if let Some(until) = &sub.until {
             let until = sub.ends_at().map_or_else(|| until.clone(), trigger::date);
             fields.push(("until", vec![Field::text(until)]));
@@ -2973,6 +2989,9 @@ impl View {
         }
         if let Some(steer) = &sub.steer {
             words.push(format!("steers when {}", pattern(steer)));
+        }
+        if let Some(quiet) = &sub.quiet {
+            words.push(format!("quiet after {quiet}"));
         }
         if let Some(until) = &sub.until {
             let until = sub.ends_at().map_or_else(|| until.clone(), trigger::date);
@@ -3398,7 +3417,7 @@ fn first_line(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -3446,6 +3465,22 @@ mod tests {
         );
         assert_eq!(fact(&items, "calc.digest", &none), "↻ 1 automation");
         assert_eq!(fact(&items, "calc.fix", &none), "");
+    }
+
+    /// A view of `n` automations in project `calc`, longer than a pane
+    /// when `n` is: for a test of the window that shows it.
+    pub(crate) fn long(n: usize) -> View {
+        let items = (0..n)
+            .map(|at| {
+                item(
+                    Kind::Trigger,
+                    &format!("nightly-{at}"),
+                    &["calc.lead"],
+                    false,
+                )
+            })
+            .collect();
+        view_of(std::env::temp_dir(), items)
     }
 
     /// A view of `items` in project `calc`, its first row picked.
@@ -3535,7 +3570,14 @@ mod tests {
         let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         assert!(matches!(view.key(ctrl_f, 0..0), Key::Stay));
         assert!(view.finding());
-        assert_eq!(text(&view).last().unwrap(), "find");
+        // The field is the pane's, under its title, not a row of the list:
+        // every row there, before anything is typed.
+        let rows = text(&view);
+        assert!(
+            !rows.iter().any(|line| line.starts_with("find")),
+            "{rows:#?}"
+        );
+        assert_eq!(view.field(), Some(crate::find::Field::rows("", 3, 3)));
         assert!(view.keys().ends_with("esc cancel"), "{}", view.keys());
         // Typed, even a letter the list keeps for itself, it narrows: the
         // rows that say it stay, a section with none is not drawn, and the
@@ -3550,7 +3592,7 @@ mod tests {
         );
         assert!(!says(&view, "Failed") && !says(&view, "pushcheck"));
         assert_eq!(view.selected, 2);
-        assert_eq!(text(&view).last().unwrap(), "find mail");
+        assert_eq!(view.field(), Some(crate::find::Field::rows("mail", 1, 3)));
         // Only a row found has a place a click lands on: one left out has
         // none, so no click on a row shown, or on the head, opens it.
         let (lines, _, starts, _) = view.card_linked(80);
@@ -3571,9 +3613,12 @@ mod tests {
         // A row found opened as a page: a paste there is no more to find.
         assert!(matches!(view.key(key(KeyCode::Enter), 0..0), Key::Stay));
         assert!(view.page.is_some() && !view.finding());
+        assert_eq!(view.field(), None);
         assert!(!view.paste("zz"));
+        // Back on the list, the field and the narrowing are as they were.
         view.key(key(KeyCode::Left), 0..0);
         assert!(view.page.is_none() && view.finding());
+        assert_eq!(view.field(), Some(crate::find::Field::rows("mail", 1, 3)));
         // A removal asked for, then a paste: the paste moves the find, so
         // the question is dropped, as any other key drops it.
         assert!(matches!(view.key(key(KeyCode::Delete), 0..0), Key::Stay));
@@ -3591,6 +3636,7 @@ mod tests {
             "{:#?}",
             text(&view)
         );
+        assert_eq!(view.field(), Some(crate::find::Field::rows("mailzz", 0, 3)));
         for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Delete] {
             assert!(matches!(view.key(key(code), 0..0), Key::Stay));
         }
@@ -3643,6 +3689,8 @@ mod tests {
             runs: Some(3),
             made: Some(7),
             outlives_close: false,
+            quiet: Some("30m".into()),
+            about: None,
         };
         let now = now_ms();
         // The lookout's files: mail down, ci's newest word on main, one
@@ -3723,6 +3771,7 @@ mod tests {
                 "where    text starts with \"main:\" or starts with \"release:\"".into(),
                 "steers   {\"$or\": [{\"text\": [{\"suffix\": \"failed\"}]}]}".into(),
                 "tells    at most every 5m".into(),
+                "quiet    tells once after 30m with nothing".into(),
                 format!("until    {until}"),
                 "lasts    2 of 3 updates left".into(),
                 "told     2 updates in the last day, 1 steered · last 2m ago".into(),
@@ -3737,7 +3786,7 @@ mod tests {
         )));
         assert!(
             view.follow_words(&sub)
-                .ends_with(&format!("at most every 5m, steers when {{\"$or\": [{{\"text\": [{{\"suffix\": \"failed\"}}]}}]}}, until {until}, for 3 updates")),
+                .ends_with(&format!("at most every 5m, steers when {{\"$or\": [{{\"text\": [{{\"suffix\": \"failed\"}}]}}]}}, quiet after 30m, until {until}, for 3 updates")),
         );
         // At 44 columns the newest word goes under its name, whole.
         assert_eq!(
@@ -3798,6 +3847,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let inbox = follow("inbox", &["mail", "ci:main"]);
         lookout::subs::ensure(&store, "calc.lead", inbox.clone()).unwrap();
@@ -4026,6 +4077,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let task = |name: &str, maker: &str, state: &str, group: &str| {
             Arc::new(
@@ -4142,6 +4195,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, false)]);
         view.key(
@@ -4355,6 +4410,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         let task = |name: &str, maker: &str| {
             Arc::new(
@@ -4433,6 +4490,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         };
         lookout::subs::ensure(&store, "calc.lead", follow("inbox", &["mail", "ci:main"])).unwrap();
         lookout::subs::ensure(&store, "calc.lead", follow("builds", &["ci"])).unwrap();

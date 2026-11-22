@@ -366,6 +366,7 @@ impl View {
                     self.found(now);
                     return Act::Stay;
                 }
+                crate::find::Typed::Held => return Act::Stay,
                 crate::find::Typed::Other => {}
             }
         }
@@ -493,6 +494,20 @@ impl View {
         };
     }
 
+    /// The find field, while finding: how many projects say what is
+    /// typed, of how many.
+    pub fn field(&self) -> Option<crate::find::Field> {
+        let find = self.finding.as_ref()?;
+        let left = (self.projects.iter())
+            .filter(|project| project.found(&find.query))
+            .count();
+        Some(crate::find::Field::rows(
+            &find.query,
+            left,
+            self.projects.len(),
+        ))
+    }
+
     /// The page's keys, as its title row says them.
     pub fn keys(&self) -> crate::hint::Keys {
         use crate::hint::{Enter, Esc, Keys};
@@ -511,8 +526,14 @@ impl View {
         let room = width.saturating_sub(1 + name.width() + 3);
         let mut title = vec![Span::raw(" "), Span::raw(name).bold(), Span::raw("   ")];
         title.extend(crate::hint::spans(&keys.fit(room)));
-        let mut out = vec![Line::from(title), head(&self.projects, width)];
-        self.drawn = vec![None, None];
+        // The row under the title is the find field's: empty at rest,
+        // drawn over while finding, so nothing moves when it opens.
+        let mut out = vec![
+            Line::from(title),
+            Line::default(),
+            head(&self.projects, width),
+        ];
+        self.drawn = vec![None, None, None];
         if !self.read {
             out.push(Line::default());
             out.push(Line::from(" reading…").dim());
@@ -524,7 +545,7 @@ impl View {
         let shown = self.shown(now);
         if shown.is_empty() {
             let said = match &self.finding {
-                Some(find) if find.typed() => format!(" no project matches {}", find.query),
+                Some(find) if find.typed() => format!(" nothing here matches {}", find.query),
                 _ => " no project yet".to_owned(),
             };
             out.push(Line::from(said).dim());
@@ -768,6 +789,7 @@ mod tests {
             text(&mut view, 70),
             [
                 " projects   ↑↓ pick · enter open · ctrl+f find · esc close",
+                "",
                 " every project · 2 need you · 3 working",
                 "",
                 " ○ Bookkeeping  superlead",
@@ -796,8 +818,8 @@ mod tests {
         assert_eq!(view.shown(NOW), before);
         assert_eq!(view.picked().unwrap().lead, "tally.lead");
         let drawn = text(&mut view, 70);
-        assert_eq!(drawn[3], " ✗ Bookkeeping  superlead  ✗ 1");
-        assert_eq!(drawn[4], "   ○ Ledger import");
+        assert_eq!(drawn[4], " ✗ Bookkeeping  superlead  ✗ 1");
+        assert_eq!(drawn[5], "   ○ Ledger import");
     }
 
     #[test]
@@ -835,10 +857,10 @@ mod tests {
         assert!(text(&mut view, 70).contains(&" ▾ 4 idle projects".to_owned()));
         view.key(&key(KeyCode::Down), NOW);
         assert_eq!(view.picked().unwrap().lead, "a.lead");
-        assert_eq!(text(&mut view, 70)[8], "   ○ a");
+        assert_eq!(text(&mut view, 70)[9], "   ○ a");
         view.key(&key(KeyCode::Left), NOW);
         assert_eq!(view.pick, Some(Pick::Fold));
-        assert_eq!(text(&mut view, 70).len(), 8);
+        assert_eq!(text(&mut view, 70).len(), 9);
         assert_eq!(view.key(&key(KeyCode::Tab), NOW), Act::Stay);
         assert_eq!(view.key(&key(KeyCode::Esc), NOW), Act::Close);
     }
@@ -866,15 +888,15 @@ mod tests {
         view.fold_open = true;
         assert_eq!(view.picked().unwrap().lead, "books.lead");
         let rows = |view: &mut View| -> Vec<String> {
-            (view.lines(70, 7, NOW).iter())
+            (view.lines(70, 8, NOW).iter())
                 .map(|line| line.to_string().trim_end().to_owned())
                 .collect()
         };
-        assert_eq!(rows(&mut view)[3], " ○ Bookkeeping  superlead");
+        assert_eq!(rows(&mut view)[4], " ○ Bookkeeping  superlead");
         view.scroll(true);
-        assert_eq!(rows(&mut view)[3], " ? Site redesign           ? 1");
+        assert_eq!(rows(&mut view)[4], " ? Site redesign           ? 1");
         view.key(&KeyEvent::from(KeyCode::Down), NOW);
-        assert_eq!(rows(&mut view)[3], "   ● Ledger import         ● 1");
+        assert_eq!(rows(&mut view)[4], "   ● Ledger import         ● 1");
     }
 
     #[test]
@@ -888,8 +910,15 @@ mod tests {
         }
         let drawn = text(&mut view, 70);
         assert_eq!(drawn[0], " projects   ↑↓ pick · enter open · esc cancel");
+        // The row under the title is the field's, drawn over by the
+        // window; the rows start where they do at rest.
+        assert_eq!(drawn[1], "");
         assert_eq!(
-            &drawn[3..],
+            view.field(),
+            Some(crate::find::Field::rows("ledg", 1, view.projects().len()))
+        );
+        assert_eq!(
+            &drawn[4..],
             [
                 " ○ Bookkeeping  superlead",
                 "   ● Ledger import         ● 1"
@@ -913,11 +942,11 @@ mod tests {
     fn too_narrow_the_counts_go_then_the_title_is_cut_and_the_mark_stays() {
         let mut view = rulebook();
         let drawn = text(&mut view, 24);
-        assert_eq!(drawn[5], "   ? Tally invoices");
-        assert_eq!(drawn[3], " ○ Bookkeeping");
+        assert_eq!(drawn[6], "   ? Tally invoices");
+        assert_eq!(drawn[4], " ○ Bookkeeping");
         let drawn = text(&mut view, 16);
-        assert_eq!(drawn[5], "   ? Tally…");
-        assert_eq!(drawn[3], " ○ Bookkeeping");
+        assert_eq!(drawn[6], "   ? Tally…");
+        assert_eq!(drawn[4], " ○ Bookkeeping");
     }
 
     #[test]

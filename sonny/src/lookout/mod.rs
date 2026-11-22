@@ -1335,6 +1335,7 @@ impl Service {
                         self.reread();
                     }
                     for lookout in self.lookouts.values_mut() {
+                        lookout.quiet_check(now);
                         lookout.flush();
                     }
                 }
@@ -1847,6 +1848,7 @@ impl Service {
         // What it subscribed to before it was made, or made again.
         // Less what was made for another bot of its name.
         lookout.subs = file.into_iter().filter(|sub| sub.held_by(record)).collect();
+        lookout.watch_quiet();
         lookout.roots(&self.records, &self.made);
         lookout.restore(held_file(&self.store, lead));
         lookout.counts = subs::counts(&self.store, lead);
@@ -2333,6 +2335,10 @@ struct Lookout {
     /// The subscriptions with a digest of their own whose news that note
     /// tells: none tells more till it lands.
     sourced_subs: Vec<String>,
+    /// For each subscription with a `quiet`, by its identity: when it last
+    /// heard anything, its subscriber's own words too, and whether a note
+    /// has said it went quiet since.
+    quiet: HashMap<String, (Instant, bool)>,
     log: Option<PathBuf>,
 }
 
@@ -2377,6 +2383,7 @@ impl Lookout {
             sending: None,
             sent_ms: 0,
             sourced_subs: Vec::new(),
+            quiet: HashMap::new(),
             log: None,
         }
     }
@@ -2699,6 +2706,23 @@ impl Lookout {
         if event.from.as_deref() == Some(self.lead.as_str()) {
             return Vec::new();
         }
+        (self.hearers(event).into_iter())
+            .map(|sub| sub.name.clone())
+            .collect()
+    }
+
+    /// The subscriptions whose rules hear `event`, whoever wrote it.
+    fn hearers(&self, event: &sources::Event) -> Vec<&subs::Sub> {
+        // A follow's own word that it went quiet is its alone, whatever
+        // its filter, however often what is held is heard again.
+        if event.lookout
+            && let Some(follow) = event.fields["follow"].as_str()
+            && event.fields["quiet"].is_string()
+        {
+            return (self.subs.iter())
+                .filter(|sub| sub.name == follow && sub.quiet.is_some())
+                .collect();
+        }
         let task = match event.source == activity::SOURCE && !event.lookout {
             true => Some(event.topic.as_deref().unwrap_or_default()),
             false => None,
@@ -2711,8 +2735,110 @@ impl Lookout {
                 Some(task) => self.sub_watches(sub, task) && filtered(sub),
                 None => sub.hears(event),
             })
-            .map(|sub| sub.name.clone())
             .collect()
+    }
+
+    /// What `event` says to the subscriptions with a `quiet` that hear it,
+    /// its subscriber's own words too: something came, so each watches
+    /// afresh.
+    fn not_quiet(&mut self, event: &sources::Event) {
+        if self.quiet.is_empty() || event.lookout {
+            return;
+        }
+        let id = self.lead_id;
+        let heard: Vec<String> = (self.hearers(event).into_iter())
+            .filter(|sub| sub.quiet_span().is_some())
+            .map(|sub| sub.identity(id))
+            .collect();
+        let now = Instant::now();
+        for identity in heard {
+            self.quiet.insert(identity, (now, false));
+        }
+    }
+
+    /// Each subscription with a `quiet` that has heard nothing for that
+    /// span, and has not said so since, says so now: a note tells its
+    /// subscriber, once, as its steer would any event, with what it is
+    /// `about`.
+    fn quiet_check(&mut self, now: Instant) {
+        if self.quiet.is_empty() {
+            return;
+        }
+        let id = self.lead_id;
+        let mut gone_quiet: Vec<(String, sources::Event)> = Vec::new();
+        for sub in &self.subs {
+            let Some(span) = sub.quiet_span() else {
+                continue;
+            };
+            let identity = sub.identity(id);
+            let Some((at, told)) = self.quiet.get(&identity) else {
+                continue;
+            };
+            if *told || now < *at + span {
+                continue;
+            }
+            let quiet = sub.quiet.clone().unwrap_or_default();
+            let (source, topic) =
+                (sub.sources.first()).map_or((ORIGIN, None), |named| sources::named(named));
+            let (source, topic) = (source.to_owned(), topic.map(str::to_owned));
+            let text = format!(
+                "Nothing came here for {quiet}, as your follow {} watches.",
+                sub.name
+            );
+            let fields = json!({"quiet": quiet, "follow": sub.name, "text": text});
+            let (at_ms, seq) = (epoch_ms(), sources::next_seq());
+            let event = sources::Event {
+                source,
+                id: Some(format!("quiet.{}.{at_ms}.{seq}", sub.name)),
+                topic,
+                text,
+                from: None,
+                details: None,
+                quote: None,
+                steer: false,
+                steer_by: None,
+                digest: None,
+                fields: Arc::new(fields),
+                // The lookout's own word, which only this follow hears.
+                lookout: true,
+                at_ms,
+                seq,
+            };
+            gone_quiet.push((identity, event));
+        }
+        // Heard as any event is: through its follow's steer, and kept only
+        // while fewer than `lookout_waiting` wait.
+        for (identity, event) in gone_quiet {
+            if let Some(entry) = self.quiet.get_mut(&identity) {
+                entry.1 = true;
+            }
+            self.hear(event, 0);
+        }
+    }
+
+    /// `event`, heard through `subs`, says what each of those is about,
+    /// after its text.
+    fn annotate(&self, event: &mut sources::Event, subs: &[String]) {
+        let mut abouts: Vec<&str> = Vec::new();
+        for sub in (self.subs.iter()).filter(|sub| subs.contains(&sub.name)) {
+            if let Some(about) = sub.about.as_deref()
+                && !abouts.contains(&about)
+            {
+                abouts.push(about);
+            }
+        }
+        if abouts.is_empty() {
+            return;
+        }
+        let said = abouts
+            .iter()
+            .map(|about| format!("({about})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        event.details = Some(match event.details.take() {
+            Some(details) => format!("{details}\n{said}"),
+            None => said,
+        });
     }
 
     /// Whether the end of a turn the subscriber sent a message into
@@ -2763,10 +2889,12 @@ impl Lookout {
     /// `order` in the stream for the agent source's: after what its task
     /// said before.
     fn hear(&mut self, mut event: sources::Event, order: i64) {
+        self.not_quiet(&event);
         let subs = self.hearing(&event);
         if subs.is_empty() || self.holds(&event) {
             return;
         }
+        self.annotate(&mut event, &subs);
         // What a subscription that hears it marks as a steer is one, as if
         // its source had.
         if !event.steer
@@ -3090,7 +3218,23 @@ impl Lookout {
         }
         self.told_subs.retain(|name, _| !gone.contains(name));
         self.subs = subs;
+        self.watch_quiet();
         self.counting();
+    }
+
+    /// Each subscription with a quiet watches from when it came, or as it
+    /// did; one gone no longer does.
+    fn watch_quiet(&mut self) {
+        let id = self.lead_id;
+        let watched: Vec<String> = (self.subs.iter())
+            .filter(|sub| sub.quiet_span().is_some())
+            .map(|sub| sub.identity(id))
+            .collect();
+        self.quiet.retain(|identity, _| watched.contains(identity));
+        let now = Instant::now();
+        for identity in watched {
+            self.quiet.entry(identity).or_insert((now, false));
+        }
     }
 
     /// The note landed, under `key`: each subscription it charged that
@@ -3844,6 +3988,8 @@ mod tests {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         }
     }
 
@@ -5182,6 +5328,111 @@ mod tests {
         let mut sub = sub(name, &[], &[]);
         sub.sources = vec!["slack".into()];
         sub
+    }
+
+    #[test]
+    fn a_quiet_follow_says_once_when_nothing_came_and_its_own_words_count() {
+        let mut lookout = lookout();
+        let mut held = hears("held");
+        held.sources = vec!["slack:eng".into()];
+        held.quiet = Some("15m".into());
+        held.steer = Some(json!({}));
+        held.about = Some("you hold this".into());
+        lookout.resubscribed(vec![held]);
+        let start = Instant::now();
+        // Not yet: nothing is told before the span passes.
+        lookout.quiet_check(start + Duration::from_secs(14 * 60));
+        assert!(lookout.heard.is_empty());
+        lookout.quiet_check(start + Duration::from_secs(15 * 60 + 1));
+        assert_eq!(lookout.heard.len(), 1);
+        let told = &lookout.heard[0];
+        assert_eq!(told.subs, ["held"]);
+        assert!(told.event.steer);
+        assert_eq!(told.event.source, "slack");
+        assert_eq!(told.event.topic.as_deref(), Some("eng"));
+        assert_eq!(told.event.fields["quiet"], "15m");
+        assert_eq!(told.event.details.as_deref(), Some("(you hold this)"));
+        // Said once a silence.
+        lookout.quiet_check(start + Duration::from_secs(60 * 60));
+        assert_eq!(lookout.heard.len(), 1);
+        // The subscriber's own words, never told it, still count as
+        // something coming: it watches afresh from them.
+        let mut own = slack("on it", false);
+        own.topic = Some("eng".into());
+        own.from = Some(lookout.lead.clone());
+        lookout.heard_from(&own);
+        assert_eq!(lookout.heard.len(), 1);
+        let after = Instant::now();
+        lookout.quiet_check(after + Duration::from_secs(14 * 60));
+        assert_eq!(lookout.heard.len(), 1);
+        lookout.quiet_check(after + Duration::from_secs(15 * 60 + 1));
+        assert_eq!(lookout.heard.len(), 2);
+        // What others say there comes with what the follow is about.
+        let mut other = slack("ping", false);
+        other.topic = Some("eng".into());
+        lookout.heard_from(&other);
+        assert_eq!(
+            lookout.heard[2].event.details.as_deref(),
+            Some("(you hold this)")
+        );
+    }
+
+    /// A quiet alert is its follow's, through any filter, when what waits
+    /// is heard again, as a change of follows has it, and kept and read
+    /// back so.
+    #[test]
+    fn a_quiet_alert_stays_its_follows_when_heard_again() {
+        let mut lookout = lookout();
+        let mut held = hears("held");
+        held.sources = vec!["ci".into()];
+        held.filter = Some(json!({"branch": ["main"]}));
+        held.quiet = Some("15m".into());
+        let mut other = hears("other");
+        other.sources = vec!["ci".into()];
+        lookout.resubscribed(vec![held, other]);
+        lookout.quiet_check(Instant::now() + Duration::from_secs(15 * 60 + 1));
+        assert_eq!(lookout.heard.len(), 1);
+        let kept = lookout.heard[0].event.to_json();
+        lookout.heard[0].event = sources::Event::from_json(&kept).unwrap();
+        lookout.rehear();
+        assert_eq!(lookout.heard.len(), 1);
+        assert_eq!(lookout.heard[0].subs, ["held"]);
+    }
+
+    /// A quiet alert waits within `lookout_waiting` as any event does.
+    #[test]
+    fn a_quiet_alert_is_not_kept_past_what_may_wait() {
+        let mut lookout = lookout();
+        let mut held = hears("held");
+        held.sources = vec!["ci".into()];
+        held.quiet = Some("15m".into());
+        let mut chat = hears("chat");
+        chat.sources = vec!["slack".into()];
+        lookout.resubscribed(vec![held, chat]);
+        lookout.waiting = 1;
+        lookout.heard_from(&slack("lunch?", false));
+        lookout.quiet_check(Instant::now() + Duration::from_secs(15 * 60 + 1));
+        assert_eq!(lookout.heard.len(), 1);
+        assert_eq!(lookout.heard[0].event.text, "lunch?");
+        assert_eq!(lookout.unkept.count, 1);
+    }
+
+    /// A bot first seated with a quiet follow watches for silence from
+    /// then, as one whose follows change does.
+    #[test]
+    fn a_quiet_follow_is_watched_from_the_first_seating() {
+        let record = json!({"name": "shop.w1", "bot_id": 5, "workspace": "/", "status": "idle"});
+        let mut service = service(PathBuf::new(), std::slice::from_ref(&record));
+        let mut held = hears("held");
+        held.sources = vec!["slack:eng".into()];
+        held.quiet = Some("15m".into());
+        service.subscribers.insert("shop.w1".into(), vec![held]);
+        let start = Instant::now();
+        assert!(service.place(&record));
+        let lookout = service.lookouts.get_mut("shop.w1").unwrap();
+        lookout.quiet_check(start + Duration::from_secs(15 * 60 + 1));
+        assert_eq!(lookout.heard.len(), 1);
+        assert_eq!(lookout.heard[0].subs, ["held"]);
     }
 
     #[test]

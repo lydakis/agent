@@ -2198,6 +2198,9 @@ pub enum Halted {
     /// Found it parked already, by its own park that committed as the pull
     /// cancelled its task, with that park's next lapse.
     Already(Box<Waiting>, Option<u64>),
+    /// Parked it on the answer to the call a client was answering, which
+    /// waits on, with that park's next lapse.
+    Kept(Box<Waiting>, Option<u64>),
 }
 /// What a wake-up for a parked turn finds.
 #[derive(Debug, PartialEq)]
@@ -12674,13 +12677,14 @@ impl Database {
         let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
             return fail("turn_not_found");
         };
-        // Answered, its tool's status, when it expires, paused, when taken,
-        // and whether a message lifted it.
+        // Answered, its tool's status, when it expires, whether its time is
+        // stopped (paused, or yielded: a yielded call has none, as a step
+        // of it reads), when taken, and whether a message lifted it.
         type Waiting = (bool, Option<String>, i64, bool, Option<i64>, bool);
         let call: Option<Waiting> = self
             .conn
             .prepare_cached(
-                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,a.taken_ms,
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL OR a.yielded,a.taken_ms,
                     a.process IS NOT NULL
                  FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
@@ -14101,18 +14105,25 @@ impl Database {
         )?;
         if pending {
             let parked = waiting.is_some();
-            (head, entries) = close_unanswered(&tx, &bot, turn, head, |executing| {
-                let unknown = executing && !parked;
-                let output = json!({"error":if unknown { "tool_outcome_unknown" } else { "cancelled" },
-                "detail":if unknown {
-                    "turn ended before this tool's result was recorded; it may have had effects and may still be running. Inspect the current state before retrying"
-                } else if parked && executing {
-                    "turn interrupted while parked"
-                } else {
-                    "turn ended before this call ran"
-                }});
-                (output, unknown)
-            })?;
+            (head, entries) = close_unanswered(
+                &tx,
+                &bot,
+                turn,
+                head,
+                &Unfinished::default(),
+                |executing| {
+                    let unknown = executing && !parked;
+                    let output = json!({"error":if unknown { "tool_outcome_unknown" } else { "cancelled" },
+                    "detail":if unknown {
+                        "turn ended before this tool's result was recorded; it may have had effects and may still be running. Inspect the current state before retrying"
+                    } else if parked && executing {
+                        "turn interrupted while parked"
+                    } else {
+                        "turn ended before this call ran"
+                    }});
+                    (output, unknown)
+                },
+            )?;
         }
         if let Some(waiting) = &waiting {
             tx.execute(
@@ -14738,10 +14749,12 @@ impl Database {
     }
     /// Park a running turn the pull cord stopped, until `resume`, or one the
     /// daemon stopping cut off, until the next start. It is parked as a
-    /// closed pool parks it, at a model-call boundary: each call it had not
-    /// answered gets a result saying the pause or the stop cut it off, or
-    /// came before it ran, and none is run again, as Codex answers the
-    /// calls an interrupt cut off. The reply it was writing
+    /// closed pool parks it: each call the daemon was running gets a result
+    /// saying the pause or the stop cut it off, and none is run again, as
+    /// Codex answers the calls an interrupt cut off; the calls not started,
+    /// and the one a client was answering, are kept, as Pi Durable keeps
+    /// them (see [`Unfinished`]), a client's call parking the turn on its
+    /// answer instead. The reply it was writing
     /// is asked for again when it continues. A turn whose own park committed
     /// as the pull cancelled its task stays as it parked: its park comes
     /// back, with its next lapse, for the task to register its wake-ups.
@@ -14806,8 +14819,27 @@ impl Database {
             refused,
             rulings: BTreeMap::new(),
         };
+        // An answer the worker holds for a call a client answered is the
+        // call's, kept with it.
+        let held: Vec<(String, Outcome)> = (self.live.get(&turn).into_iter())
+            .flat_map(|live| live.answers.iter())
+            .map(|(call_id, outcome)| (call_id.clone(), outcome.clone()))
+            .collect();
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
+        for (call_id, outcome) in held {
+            tx.prepare_cached(
+                "UPDATE answers SET output=?,failed=?,parts=? WHERE turn=? AND call_id=?",
+            )?
+            .execute(params![
+                outcome.output,
+                outcome.failed,
+                stored_parts(&outcome.parts)?,
+                turn,
+                call_id
+            ])?;
+        }
+        let mut kept = kept(&tx, &bot, turn)?;
         // The model reads these only once its turn continues, after the
         // resume or the next start, so they say the halt is over; read as
         // a halt still holding, they made models report and stop. Facts
@@ -14821,6 +14853,7 @@ impl Database {
             &bot,
             turn,
             reason,
+            &kept,
             |executing| match (stop, executing) {
                 (Halt::Pause, true) => json!({"error":"daemon_paused","detail":
                     "the pause stopped this call before its result was recorded, so it may have had effects; nothing has run it again. Work has since resumed and this turn goes on",
@@ -14833,6 +14866,38 @@ impl Database {
                     "the daemon stopped before this call ran, so it did not run. The daemon has since started again and this turn goes on"}),
             },
         )?;
+        // A client was answering a call: the turn waits on for its answer,
+        // as its own park on it would, and the calls after it then meet the
+        // halt as the next ones do.
+        if let Some((call_id, tag)) = &kept.answer {
+            let pending = std::mem::take(&mut kept.pending);
+            let (waiting, data) = kept_answer(&tx, &bot, turn, call_id, tag, pending, route)?;
+            tx.execute(
+                "UPDATE turns SET status='waiting',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
+                    summary_ms=summary_ms+? WHERE id=?",
+                params![
+                    serde_json::to_string(&waiting)?,
+                    retries as i64,
+                    paced_ms as i64,
+                    summary_ms as i64,
+                    turn
+                ],
+            )?;
+            parked(&tx, &bot.name, "waiting", &data)?;
+            event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
+            tx.commit()?;
+            self.forget_live(turn);
+            self.released(turn, released);
+            let wake = match (self.next_lapse(turn)?, waiting.deadline_ms) {
+                (Some(lapse), Some(deadline)) => Some(lapse.min(deadline)),
+                (lapse, deadline) => lapse.or(deadline),
+            };
+            return Ok(Halted::Kept(Box::new(waiting), wake));
+        }
+        let waiting = Waiting {
+            pending: kept.pending,
+            ..waiting
+        };
         tx.execute(
             "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
                 summary_ms=summary_ms+? WHERE id=?",
@@ -14872,10 +14937,11 @@ impl Database {
     /// Continue each turn the daemon's process left running when it ended
     /// unplanned, a crash, a kill or a fatal error, rather than end it, as
     /// Pi Durable continues a task its host was cut off in. It parks as a
-    /// planned stop leaves it, at a model-call boundary: each call it had
-    /// not answered gets a result saying the daemon's process ended before
-    /// the call ran, or while it ran so it may have had effects, and none
-    /// is run again. A turn that had no call open was waiting on its model,
+    /// planned stop leaves it: each call the daemon was running gets a
+    /// result saying the daemon's process ended while it ran, so it may
+    /// have had effects, and none is run again; the calls not started, and
+    /// the one a client was answering, are kept as a stop keeps them. A
+    /// turn that had no call open was waiting on its model,
     /// or about to ask it: that call counts as a failed attempt and is
     /// asked again after its backoff, `delay_ms` of the turn. Its
     /// cut-offs are counted, and a turn cut off `limit` times in a row
@@ -14978,11 +15044,13 @@ impl Database {
             [turn],
             |r| r.get(0),
         )?;
+        let kept = kept(&tx, &bot, turn)?;
         let (_, released) = release_unanswered(
             &tx,
             &bot,
             turn,
             "the daemon's process ended",
+            &kept,
             |executing| match executing {
                 true => json!({"error":"process_interrupted","detail":
                     "the daemon's process ended while this call ran, before its result was recorded, so it may have had effects; nothing has run it again. The daemon has since started again and this turn goes on"}),
@@ -14993,6 +15061,19 @@ impl Database {
         let head: Option<i64> = tx
             .prepare_cached("SELECT head FROM bots WHERE name=?")?
             .query_row([&bot.name], |r| r.get(0))?;
+        // A client was answering a call: the turn waits on for its answer.
+        if let Some((call_id, tag)) = &kept.answer {
+            let (waiting, data) = kept_answer(&tx, &bot, turn, call_id, tag, kept.pending, None)?;
+            tx.execute(
+                "UPDATE turns SET status='waiting',waiting=?,restarts=?,restart_head=? WHERE id=?",
+                params![serde_json::to_string(&waiting)?, restarts, head, turn],
+            )?;
+            parked(&tx, &bot.name, "waiting", &data)?;
+            event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
+            tx.commit()?;
+            self.released(turn, released);
+            return Ok(());
+        }
         let now = epoch_ms();
         // Only a model call that was asked and not answered is charged.
         let delay_ms = if calling { delay_ms } else { 0 };
@@ -15010,7 +15091,7 @@ impl Database {
             handles: Vec::new(),
             deadline_ms: Some(resume_at_ms),
             any: false,
-            pending: Vec::new(),
+            pending: kept.pending,
             paced_since_ms: Some(now),
             call_attempts: u32::from(calling),
             call_spent_ms: delay_ms,
@@ -19421,11 +19502,186 @@ struct Released {
 /// the round they were in, and let go of what waited on them: their
 /// requests, what a client was to answer, and each step a call asked
 /// about, denied for `reason` as an answered call's are.
+/// What a stop or a cut-off keeps of a turn's round, as Pi Durable keeps
+/// a task it recovers: only a call the daemon was running is cut off. The
+/// call a client was answering waits on for its answer, as it would once
+/// parked, and the calls that had not started run, their verdicts asked for
+/// as they were, when the turn goes on.
+#[derive(Default)]
+struct Unfinished {
+    /// The call a client was answering: its id and the client's tag.
+    answer: Option<(String, String)>,
+    /// The calls not started, in the order the model made them.
+    pending: Vec<ToolCall>,
+}
+impl Unfinished {
+    fn holds(&self, call_id: &str) -> bool {
+        self.answer.as_ref().is_some_and(|(id, _)| id == call_id)
+            || self.pending.iter().any(|call| call.call_id == call_id)
+    }
+}
+/// The park of `turn` on the answer to `call_id`, the call a client was
+/// answering as a stop or a cut-off came, with the calls not started after
+/// it in `pending`, as a park on the answer itself is (see
+/// [`Database::suspend_answer`]); and its `turn_waiting` data.
+fn kept_answer(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    call_id: &str,
+    tag: &str,
+    pending: Vec<ToolCall>,
+    route: Option<&str>,
+) -> Result<(Waiting, Value)> {
+    let (expires_ms, paused): (i64, bool) = tx
+        .prepare_cached(
+            "SELECT expires_ms,paused_ms IS NOT NULL FROM answers WHERE turn=? AND call_id=?",
+        )?
+        .query_row(params![turn, call_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    // A step waiting on a gate stops the call's time: no deadline.
+    let deadline_ms = (!paused).then_some(expires_ms.max(0) as u64);
+    let waiting = Waiting {
+        turn,
+        bot: bot.name.clone(),
+        call_id: call_id.to_owned(),
+        handles: Vec::new(),
+        deadline_ms,
+        any: false,
+        pending,
+        paced_since_ms: None,
+        call_attempts: 0,
+        call_spent_ms: 0,
+        compaction: false,
+        route: route.map(str::to_owned),
+        approval: false,
+        holder: None,
+        since_ms: None,
+        served: Vec::new(),
+        answer: Some(tag.to_owned()),
+        copied: None,
+        summary_retry_ms: None,
+        fallback: None,
+        halt: None,
+        blocked: None,
+        retrying: None,
+        held_since_ms: None,
+        poll: false,
+        load: false,
+        refilled: false,
+        refused: None,
+        rulings: BTreeMap::new(),
+    };
+    let data = json!({"call_id":call_id,"answer":tag,"deadline_ms":deadline_ms});
+    Ok((waiting, data))
+}
+/// What `turn`'s round keeps through a stop or a cut-off (see [`Unfinished`]).
+/// Its calls are read back from the model's reply in `bot`'s history.
+fn kept(tx: &Connection, bot: &Bot, turn: i64) -> Result<Unfinished> {
+    let open: Vec<(String, String, Option<String>)> = tx
+        .prepare_cached(
+            "SELECT t.call_id,t.status,a.tag FROM tools t LEFT JOIN answers a
+               ON a.turn=t.turn AND a.call_id=t.call_id AND a.yielded=0 AND a.process IS NULL
+             WHERE t.turn=? AND t.status IN ('planned','executing') ORDER BY t.rowid",
+        )?
+        .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    // One call a client answers runs at a time, and the calls after it
+    // wait for it: at most one, ahead of every call not started.
+    let mut kept = Unfinished {
+        answer: (open.iter()).find_map(|(call_id, status, tag)| match (status.as_str(), tag) {
+            ("executing", Some(tag)) => Some((call_id.clone(), tag.clone())),
+            _ => None,
+        }),
+        pending: Vec::new(),
+    };
+    let planned: Vec<&str> = (open.iter())
+        .filter(|(_, status, _)| status == "planned")
+        .map(|(call_id, _, _)| call_id.as_str())
+        .collect();
+    if planned.is_empty() {
+        return Ok(kept);
+    }
+    // The reply that made them is in the history above its answered
+    // calls' results, within the turn.
+    let mut found: HashMap<String, ToolCall> = HashMap::new();
+    let mut at = bot.head;
+    while let Some(id) = at
+        && found.len() < planned.len()
+    {
+        let (parent, item, prompt): (Option<i64>, Vec<u8>, Option<i64>) = tx
+            .prepare_cached("SELECT parent,item,turn FROM nodes WHERE id=?")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        if prompt.is_some() {
+            break;
+        }
+        for call in stored_calls(&item) {
+            if planned.contains(&call.call_id.as_str()) {
+                found.entry(call.call_id.clone()).or_insert(call);
+            }
+        }
+        at = parent;
+    }
+    // A call its reply no longer shows cannot run again: it is answered.
+    kept.pending = (planned.into_iter())
+        .filter_map(|call_id| found.remove(call_id))
+        .collect();
+    Ok(kept)
+}
+/// The calls a stored item makes, as its provider read them: a Responses
+/// `function_call` or `custom_tool_call`, or an Anthropic message's
+/// `tool_use` blocks.
+fn stored_calls(item: &[u8]) -> Vec<ToolCall> {
+    let Ok(item) = serde_json::from_slice::<Value>(item) else {
+        return Vec::new();
+    };
+    let call = |name: &Value, call_id: &Value, arguments: String, custom: bool| {
+        Some(ToolCall {
+            name: name.as_str()?.to_owned(),
+            call_id: call_id.as_str()?.to_owned(),
+            arguments,
+            custom,
+            links: Default::default(),
+        })
+    };
+    match item["type"].as_str() {
+        Some("function_call") => {
+            // The provider's own search is the bot's `web_search`.
+            let name = match item["namespace"] == crate::provider::RUN_NAMESPACE
+                && item["name"] == crate::provider::RUN_NAME
+            {
+                true => json!("web_search"),
+                false => item["name"].clone(),
+            };
+            let arguments = item["arguments"].as_str().unwrap_or("{}").to_owned();
+            call(&name, &item["call_id"], arguments, false)
+                .into_iter()
+                .collect()
+        }
+        Some("custom_tool_call") => {
+            let arguments = json!({"input":item["input"]}).to_string();
+            call(&item["name"], &item["call_id"], arguments, true)
+                .into_iter()
+                .collect()
+        }
+        _ => (item["content"].as_array().into_iter().flatten())
+            .filter(|block| block["type"] == "tool_use")
+            .filter_map(|block| {
+                call(
+                    &block["name"],
+                    &block["id"],
+                    block["input"].to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    }
+}
 fn release_unanswered(
     tx: &Connection,
     bot: &Bot,
     turn: i64,
     reason: &str,
+    kept: &Unfinished,
     result: impl Fn(bool) -> Value,
 ) -> Result<(Vec<Value>, Released)> {
     let unanswered: Vec<String> = tx
@@ -19433,17 +19689,23 @@ fn release_unanswered(
             "SELECT call_id FROM tools WHERE turn=? AND status IN ('planned','executing')",
         )?
         .query_map([turn], |r| r.get(0))?
+        .filter(|row| {
+            !row.as_ref()
+                .is_ok_and(|call_id: &String| kept.holds(call_id))
+        })
         .collect::<rusqlite::Result<_>>()?;
     // A call cut off while it ran may have had effects: its event says the
     // outcome is unknown, as its result does.
-    let (head, entries) = close_unanswered(tx, bot, turn, bot.head, |executing| {
+    let (head, entries) = close_unanswered(tx, bot, turn, bot.head, kept, |executing| {
         (result(executing), executing)
     })?;
     if head != bot.head {
-        // Every call of the round is answered, so the round is closed.
+        // The round is closed once every call of it is answered; the calls
+        // kept stay open.
         tx.execute(
-            "UPDATE bots SET head=?1,closed=?1,open_calls=0 WHERE name=?2",
-            params![head, bot.name],
+            "UPDATE bots SET head=?1,open_calls=COALESCE(open_calls,?3)-?3,
+             closed=CASE WHEN COALESCE(open_calls,?3)=?3 THEN ?1 ELSE closed END WHERE name=?2",
+            params![head, bot.name, entries.len() as i64],
         )?;
     }
     let mut released = Released {
@@ -19493,11 +19755,15 @@ fn close_unanswered(
     bot: &Bot,
     turn: i64,
     mut head: Option<i64>,
+    kept: &Unfinished,
     output: impl Fn(bool) -> (Value, bool),
 ) -> Result<(Option<i64>, Vec<Value>)> {
     let unanswered: Vec<(String, String, bool)> = tx
         .prepare("SELECT call_id,status,custom FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
         .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .filter(|row: &rusqlite::Result<(String, String, bool)>| {
+            !row.as_ref().is_ok_and(|(call_id, _, _)| kept.holds(call_id))
+        })
         .collect::<rusqlite::Result<_>>()?;
     let mut entries = Vec::new();
     if unanswered.is_empty() {

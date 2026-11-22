@@ -424,7 +424,7 @@ fn print_flags(flags: &str) {
             ),
             "--tools" => (
                 "LIST",
-                "A new bot's tools; default shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents,spawn_agent,close_agent, apply_patch for a Responses model else edit, web_fetch, and web_search where the provider offers it",
+                "A new bot's tools: the daemon's, and of the tools its creator declared, those it gets (none named, none); default every one its creator passes on and shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents,spawn_agent,close_agent, apply_patch for a Responses model else edit, web_fetch, and web_search where the provider offers it",
             ),
             "--allow" => (
                 "LIST",

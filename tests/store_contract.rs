@@ -13414,7 +13414,7 @@ fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_p
 }
 
 #[test]
-fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started_is_cancelled() {
+fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_keeps_one_it_never_started() {
     for halt in [Halt::Pause, Halt::Shutdown] {
         let mut db = db();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
@@ -13467,12 +13467,13 @@ fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started
             .collect();
         assert_eq!(
             completed,
-            [
-                (json!("executing"), json!(true), json!(false)),
-                (json!("planned"), json!(false), json!(true)),
-            ],
+            [(json!("executing"), json!(true), json!(false))],
             "{halt:?}"
         );
+        // The call it never started runs when the turn goes on.
+        let (waiting, _) = cut_off(&db, turn);
+        assert_eq!(waiting.pending, calls[1..], "{halt:?}");
+        assert_eq!(db.inspect("Bob").unwrap().status, "paced", "{halt:?}");
     }
 }
 
@@ -13551,7 +13552,7 @@ fn a_turn_the_process_ended_under_goes_on_its_model_call_charged_as_one_failed_a
 }
 
 #[test]
-fn calls_the_process_ended_under_are_answered_and_never_run_again() {
+fn a_call_the_process_ended_under_is_answered_and_one_it_never_started_is_kept() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let turn = db
@@ -13603,21 +13604,82 @@ fn calls_the_process_ended_under_are_answered_and_never_run_again() {
             )
         })
         .collect();
-    assert_eq!(
-        completed,
-        [
-            (json!("executing"), json!(true)),
-            (json!("planned"), json!(false))
-        ]
-    );
+    assert_eq!(completed, [(json!("executing"), json!(true))]);
     let head = db.inspect("Bob").unwrap().head.unwrap();
     let said = read_item(&db, "Bob", head).unwrap();
     let output: Value = serde_json::from_str(said["output"].as_str().unwrap()).unwrap();
     assert_eq!(output["error"], "process_interrupted");
     assert!(
-        output["detail"].as_str().unwrap().contains("did not run"),
+        output["detail"]
+            .as_str()
+            .unwrap()
+            .contains("may have had effects"),
         "{output}"
     );
+    // The call it never started waits to run, read back from the reply.
+    assert_eq!(waiting.pending, calls[1..]);
+}
+
+#[test]
+fn calls_never_started_are_read_back_from_either_familys_reply() {
+    // An Anthropic reply's tool uses and a Responses custom call come back
+    // as their provider read them.
+    for (family, item, call) in [
+        (
+            Family::Anthropic,
+            json!({"type":"message","role":"assistant","content":[
+                {"type":"text","text":"on it"},
+                {"type":"tool_use","id":"toolu_1","name":"write","input":{"path":"file"}}]}),
+            ToolCall {
+                custom: false,
+                name: "write".into(),
+                call_id: "toolu_1".into(),
+                arguments: r#"{"path":"file"}"#.into(),
+                links: Default::default(),
+            },
+        ),
+        (
+            Family::Responses,
+            json!({"type":"custom_tool_call","call_id":"custom_1","name":"apply_patch",
+                "input":"*** Begin Patch"}),
+            ToolCall {
+                custom: true,
+                name: "apply_patch".into(),
+                call_id: "custom_1".into(),
+                arguments: json!({"input":"*** Begin Patch"}).to_string(),
+                links: Default::default(),
+            },
+        ),
+    ] {
+        let mut db = db();
+        let bound = Binding {
+            provider: if family == Family::Anthropic {
+                "anthropic"
+            } else {
+                "openai"
+            },
+            family,
+            ..binding()
+        };
+        db.create("Bob", Some("/synthetic"), bound).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "r",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let items = vec![serde_json::to_vec(&item).unwrap().into()];
+        db.append(turn, items, std::slice::from_ref(&call), None)
+            .unwrap();
+        db.continue_cut_off(Some(5), |_| 0).unwrap();
+        let (waiting, _) = cut_off(&db, turn);
+        assert_eq!(waiting.pending, [call], "{family:?}");
+    }
 }
 
 #[test]
@@ -23997,10 +24059,20 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
         ended,
         vec![(turn, "c2".to_owned()), (turn, "c3".to_owned())]
     );
-    // A pause that parks a turn ends the answered calls it leaves.
-    db.suspend_halted(halted, Halt::Pause, (0, 0, 0), None, (false, None))
+    // A pause keeps the call a client answers: the turn waits on for
+    // its answer, as it would once parked on it.
+    let parked = db
+        .suspend_halted(halted, Halt::Pause, (0, 0, 0), None, (false, None))
         .unwrap();
-    assert_eq!(heard(&mut db), vec![(halted, "c1".to_owned())]);
+    assert!(matches!(parked, agent_runtime::store::Halted::Kept(..)));
+    assert_eq!(heard(&mut db), vec![]);
+    let waiting = (db.waiting_turns().unwrap().into_iter())
+        .find(|w| w.turn == halted)
+        .unwrap();
+    assert_eq!(
+        (waiting.call_id.as_str(), waiting.answer.is_some()),
+        ("c1", true)
+    );
 }
 
 #[test]
@@ -24321,6 +24393,7 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
         panic!("a call of a tool that does not yield yielded");
     };
     assert_eq!(refused.code, "call_not_yieldable");
+    db.take_call("Lead", turn, "exec-1", now).unwrap();
     let yielded = db
         .yield_call("Lead", turn, "exec-1", &result("built 3 of 9"), now)
         .unwrap();
@@ -24334,6 +24407,12 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
     let Lifted::Waiting(None) = db.lifted_check(process, now + 60_000, false).unwrap() else {
         panic!("a yielded call ran out of time");
     };
+    // A client that took it and stopped is told another took it, not that
+    // it ran out of time, so the next runs it on from where it was.
+    let Err(taken) = db.take_call("Lead", turn, "exec-1", now + 60_000) else {
+        panic!("a yielded call was taken twice");
+    };
+    assert_eq!(taken.code, "call_taken", "{taken:?}");
     db.answer_call("Lead", turn, "exec-1", result("all 9 built"), now + 60_000)
         .unwrap();
     let Lifted::Ended { result: ended, .. } =

@@ -1,21 +1,29 @@
-//! `ctrl+f` in a view of rows (Rulebook, Keys and mouse, Find), as
-//! **Projects** first had it, made once and given to each view: the key,
-//! what is typed and what `esc` puts back, whether a row's words say what
-//! is typed, and the find row. Each view keeps the rows that say it and
-//! what they hang under in its own nesting (Projects' folders, `/status`'s
-//! makers, `/background`'s sections); a section with no match is not
-//! drawn; a fold is searched and stands open. The pick goes to the first
-//! match, and `esc` drops the find and puts the rows and the pick back as
-//! they were. The find row is the view's last: a muted `find`, then what
-//! was typed.
+//! `ctrl+f` in a view (Rulebook, Keys and mouse, Find), as **Projects**
+//! first had it, made once and given to each view: the key, what is typed
+//! and what `esc` puts back, whether a row's words say what is typed, and
+//! the find field. Each view keeps the rows that say it and what they hang
+//! under in its own nesting (Projects' folders, `/status`'s makers,
+//! `/background`'s sections); a section with no match is not drawn; a fold
+//! is searched and stands open. The pick goes to the first match, and
+//! `esc` drops the find and puts the rows and the pick back as they were.
+//!
+//! The field has one place (21 Nov): the row under the view's title row,
+//! which every view keeps empty at rest, so nothing moves when it opens or
+//! as the rows narrow. It is drawn here, once, for every view: one row on
+//! the band, a muted `find`, what was typed, the terminal's own cursor,
+//! and at its right end how many rows are left of how many. The
+//! conversation's own find, above the composer, is drawn by it too.
 //!
 //! Find reads what the view has already read: it asks the daemon nothing
 //! as you type.
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    style::Stylize,
+    buffer::Buffer,
+    layout::Rect,
+    style::{Style, Stylize},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 /// The key, the same in every view.
 pub const KEY: &str = "ctrl+f";
@@ -41,6 +49,9 @@ pub enum Typed {
     Changed,
     /// `esc`: the find is dropped, the rows and the pick put back.
     Dropped,
+    /// The find's key, which changed nothing: backspace with nothing
+    /// typed.
+    Held,
     /// Not the find's: the arrows, `enter` and the rest are the view's.
     Other,
 }
@@ -61,10 +72,10 @@ impl<P> Find<P> {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
         match key.code {
             KeyCode::Esc => Typed::Dropped,
-            KeyCode::Backspace => {
-                self.query.pop();
-                Typed::Changed
-            }
+            KeyCode::Backspace => match self.query.pop() {
+                Some(_) => Typed::Changed,
+                None => Typed::Held,
+            },
             KeyCode::Char(c) if !held => {
                 self.query.push(c);
                 Typed::Changed
@@ -102,9 +113,99 @@ pub fn says(query: &str, words: &str) -> bool {
     }
 }
 
-/// The find row, the view's last: a muted `find`, then what was typed.
-pub fn line(query: &str) -> Line<'static> {
-    Line::from(vec![Span::raw("find ").dim(), Span::raw(query.to_owned())])
+/// The find field as a view has it now: what was typed, what its right
+/// end says, and whether it finds in rows or steps through text.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Field {
+    pub query: String,
+    /// Muted at the right end: how many rows are left of how many,
+    /// `4 of 14`, or in text which place of how many, `4 of 7`.
+    pub said: String,
+    /// A view of text, which steps: `type to find`, not `type to narrow`.
+    pub text: bool,
+}
+
+impl Field {
+    /// In a view of rows: `left` rows say what is typed, of `of`.
+    pub fn rows(query: &str, left: usize, of: usize) -> Self {
+        Self {
+            query: query.to_owned(),
+            said: format!("{left} of {of}"),
+            text: false,
+        }
+    }
+
+    /// In a view of text: the place shown, `at` of `of`, once something
+    /// is typed.
+    pub fn text(query: &str, place: Option<(usize, usize)>) -> Self {
+        let said = match place {
+            Some((at, of)) if !query.is_empty() => format!("{at} of {of}"),
+            _ => String::new(),
+        };
+        Self {
+            query: query.to_owned(),
+            said,
+            text: true,
+        }
+    }
+
+    /// What the field shows after the cursor with nothing typed.
+    fn prompt(&self) -> &'static str {
+        match self.text {
+            true => "type to find",
+            false => "type to narrow",
+        }
+    }
+}
+
+/// The find field drawn on `row`, from its first column to its edge, all
+/// of it on the band: a muted `find` (bold with `NO_COLOR`), what was
+/// typed, the cursor, a muted prompt after it with nothing typed, and the
+/// count at the right end. Where the terminal's cursor goes.
+pub fn draw(field: &Field, row: Rect, buf: &mut Buffer) -> (u16, u16) {
+    let row = Rect { height: 1, ..row };
+    let row = row.intersection(buf.area);
+    if row.width == 0 || row.height == 0 {
+        return (row.x, row.y);
+    }
+    let band = Style::new().bg(crate::look::BAND);
+    buf.set_style(row, band);
+    for x in row.left()..row.right() {
+        buf[(x, row.y)].set_symbol(" ");
+    }
+    let width = row.width as usize;
+    let label = match crate::look::no_color() {
+        true => Span::raw("find").bold(),
+        false => Span::raw("find").dim(),
+    };
+    let lead = "find ".width();
+    // The count keeps its place while the words leave the cursor room;
+    // too narrow for both, it gives way.
+    let said = field.said.width();
+    let said = match lead + 1 + 2 + said <= width && said > 0 {
+        true => said,
+        false => 0,
+    };
+    let room = width.saturating_sub(lead + 1 + if said > 0 { said + 2 } else { 0 });
+    // Typed past the room, its end shows: where the next letter goes.
+    let mut typed = field.query.as_str();
+    while typed.width() > room {
+        let mut chars = typed.chars();
+        chars.next();
+        typed = chars.as_str();
+    }
+    let cursor = (row.x + (lead + typed.width()).min(width - 1) as u16, row.y);
+    let mut spans = vec![label, Span::raw(" "), Span::raw(typed.to_owned())];
+    if field.query.is_empty() {
+        let prompt = crate::transcript::cut(field.prompt(), room);
+        spans.push(Span::raw(prompt).dim());
+    }
+    buf.set_line(row.x, row.y, &Line::from(spans), row.width);
+    if said > 0 {
+        let x = row.x + (width - 1 - said) as u16;
+        buf.set_span(x, row.y, &Span::raw(field.said.clone()).dim(), said as u16);
+    }
+    cursor
 }
 
 #[cfg(test)]
@@ -151,15 +252,70 @@ mod tests {
     }
 
     #[test]
-    fn the_find_row_is_a_muted_find_then_what_was_typed() {
-        let line = line("main");
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "find main");
-        assert!(
-            line.spans[0]
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::DIM)
+    fn backspace_with_nothing_typed_does_nothing() {
+        let mut find = Find::new(());
+        let back = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(find.key(&back), Typed::Held);
+        find.paste("a");
+        assert_eq!(find.key(&back), Typed::Changed);
+        assert_eq!(find.key(&back), Typed::Held);
+    }
+
+    /// The row as text, and each cell's style.
+    fn drawn(field: &Field, width: u16) -> (String, Vec<Style>, (u16, u16)) {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+        let cursor = draw(field, Rect::new(0, 0, width, 1), &mut buf);
+        let text = (0..width)
+            .map(|x| buf[(x, 0)].symbol().to_owned())
+            .collect();
+        let styles = (0..width).map(|x| buf[(x, 0)].style()).collect();
+        (text, styles, cursor)
+    }
+
+    #[test]
+    fn the_field_is_a_muted_find_the_words_the_cursor_and_the_count_on_the_band() {
+        use ratatui::style::Modifier;
+        let (text, styles, cursor) = drawn(&Field::rows("main", 4, 14), 30);
+        assert_eq!(text, format!("find main{}4 of 14 ", " ".repeat(13)));
+        assert_eq!(text.width(), 30);
+        // The cursor after what was typed.
+        assert_eq!(cursor, (9, 0));
+        // All of it on the band, edge to edge.
+        assert!(styles.iter().all(|s| s.bg == Some(crate::look::BAND)));
+        // `find` and the count muted; the words in ink.
+        assert!(styles[0].add_modifier.contains(Modifier::DIM));
+        assert!(!styles[5].add_modifier.contains(Modifier::DIM));
+        assert!(styles[25].add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn with_nothing_typed_a_muted_prompt_follows_the_cursor() {
+        use ratatui::style::Modifier;
+        let (text, styles, cursor) = drawn(&Field::rows("", 14, 14), 32);
+        assert_eq!(
+            text,
+            format!("find type to narrow{}14 of 14 ", " ".repeat(4))
         );
+        assert_eq!(cursor, (5, 0));
+        assert!(styles[5].add_modifier.contains(Modifier::DIM));
+        let (text, _, cursor) = drawn(&Field::text("", None), 24);
+        assert_eq!(text.trim_end(), "find type to find");
+        assert_eq!(cursor, (5, 0));
+        // In text, which place of how many, once typed.
+        let (text, _, _) = drawn(&Field::text("cents", Some((4, 7))), 24);
+        assert_eq!(text, "find cents       4 of 7 ");
+        // Nothing found: none of all.
+        let (text, _, _) = drawn(&Field::rows("zz", 0, 14), 24);
+        assert_eq!(text, "find zz         0 of 14 ");
+    }
+
+    #[test]
+    fn typed_past_the_room_its_end_shows_and_the_count_stays() {
+        let (text, _, cursor) = drawn(&Field::rows("a long query typed", 1, 9), 20);
+        assert_eq!(text, "find  typed  1 of 9 ");
+        assert_eq!(cursor.0, 11);
+        // Too narrow for the count: it gives way, the words stay.
+        let (text, _, _) = drawn(&Field::rows("ab", 1, 9), 10);
+        assert_eq!(text, "find ab   ");
     }
 }

@@ -181,7 +181,8 @@ Rows keep the order of their titles, so none moves when an agent starts or
 ends a turn. Projects none of whose agents had a turn in seven days fold to
 `▸ N idle projects`. `↑` `↓` pick, `enter` or `→` goes to the picked
 project's lead as `/switch` does, `←` goes to the project that holds it,
-`ctrl+f` narrows the rows by title and name, and `esc` puts back the
+`ctrl+f` narrows the rows by title and name, in the find field on the
+row under the page's title, and `esc` puts back the
 conversation and what the pane showed. The empty composer says
 `← projects`. Zen, a side chat and an agent shown beside keep you where you
 are: `←` there does nothing.
@@ -582,6 +583,7 @@ Settings live in `~/.agent/config.toml` (editable via `/config`) and can be over
 | Task tab policy | `[sonny] task_tabs`, `most_task_tabs` | — | `"asked"` (`every`); `32` tabs (`0` = unlimited) |
 | Task worktree retention | `[sonny] task_worktrees` | — | `15` (min `1`; oldest idle clean worktrees pruned) |
 | Decision deadline | `[sonny] ask_wait_minutes` | — | `60` (`0` = always wait) |
+| Away, and back | `[sonny] away_minutes` | — | `30` (`0` = never): minutes without your use of any window or a message through `sonny acp` before every lead is told you are away; it raises only decisions until you are back, then gives the rest in one message. On, Sonny starts its scheduler, which tells them, with no automation; a lead the daemon did not answer for is told again each minute |
 | Start daemon at boot | `[sonny] start_at_boot` | — | `false` |
 | External lookout sources | `[sonny.sources.NAME]` | — | `command`, `every`, `digest`, `steer`, `watch`, `wants`, `icon` |
 | Lookout note trailer | `[sonny] lookout_trailer` | — | Default quiet-unless-urgent rule (`""` for none) |
@@ -610,7 +612,8 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
-| Whether agents have boards, work in the commons they take | `[sonny] boards` (true, the default, or false; off, agents go without the board tool and skill, and `start_task` takes no `board` or `agents`; off with the commons too) | |
+| Whether agents have boards, work in the commons they take | `[sonny] boards` (true, the default, or false; off, the commons tool takes no work fields, its skill has no Boards section, and `start_task` takes no `board` or `agents`; off with the commons too) | |
+| How long taken work may go without a post before its holder is asked whether it is still on it, and its board hears it went quiet | `[sonny] hold_quiet` (15 minutes by default; 0 never) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most rows a margin note draws | `[sonny] margin_note_lines` (40 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
@@ -1187,7 +1190,7 @@ has something on it, or is off the screen, no time shows.
 
 Type `/` to open the fuzzy command menu (ranked by frequency and recency in `~/.agent/sonny/picks.json`). Typos like `/stauts` stay in the composer instead of sending; paths like `/etc/hosts is wrong` send normally.
 
-**Quick commands:** `/copy` (copy last reply) · `/verbose` (toggle all tool calls in this window) · `/compact` (confirm & summarize conversation now; daemon also auto-compacts at `compact_tokens` and between turns at 70% context) · `/retry` (inspect and allow one retry of a reviewer-denied call) · `/margin` (reopen margin) · `/mcp` (list MCP servers & tools) · `/audit` (view tool audit trail: `a` all agents, `t`/`p`/`w` filters) · `/pause REASON` & `/resume` (fleet-wide andon cord) · `/quit` (exit window, leaving daemon and turns running).
+**Quick commands:** `/copy` (copy last reply) · `/verbose` (toggle all tool calls in this window) · `/compact` (confirm & summarize conversation now; daemon also auto-compacts at `compact_tokens` and between turns at 70% context) · `/retry` (inspect and allow one retry of a reviewer-denied call) · `/margin` (reopen margin) · `/mcp` (list MCP servers & tools) · `/audit` (view tool audit trail: `a` all agents, `t`/`p`/`w` filters, `Ctrl+F` finds) · `/pause REASON` & `/resume` (fleet-wide andon cord) · `/quit` (exit window, leaving daemon and turns running).
 
 ### `/side` — Mid-turn side chats
 
@@ -1291,7 +1294,7 @@ Lists everything running without active typing: **Automations**, **Follows**, an
 ### `/commons` and `/memory`
 
 - `/commons`: Browse cross-project **Boards** and **Threads** (`a` narrows to this project, `m` mixes board items into threads, `Ctrl+F` searches). See [docs/SONNY.md#commons](../docs/SONNY.md#commons).
-- `/memory`: Browse **Work under way**, **This project**, and **Everywhere** facts (`a` widens to all projects, `Enter` reads with wiki-style fact links, `x` deletes). See [docs/SONNY.md#memory](../docs/SONNY.md#memory).
+- `/memory`: Browse **Work under way**, **This project**, and **Everywhere** facts (`a` widens to all projects, `Enter` reads with wiki-style fact links, `x` deletes, `Ctrl+F` finds by name or description). See [docs/SONNY.md#memory](../docs/SONNY.md#memory).
 
 ### `/sky` — Live fleet constellation and replay
 
@@ -1722,7 +1725,7 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   muted, `set in ~/.agent/config.toml`, since a source is yours to remove
   there and `x` removes nothing on its page; its
   filter and steer in words (`where text starts with "main:"`; one that
-  nests or has `$or` as written), digest, end as a date and what is left
+  nests or has `$or` as written), digest, quiet, end as a date and what is left
   of the updates it lasts (`2 of 3 updates left`); and what it told in the
   last day (`2 updates in the last day, 1 steered · last 2m ago`), read
   from the lookout's own files only while the page is open; a command's
@@ -1802,22 +1805,25 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   reading there is not counted as an agent's.
   Boards, work in the commons that agents take, sit over the threads in a
   **Boards** section: a row a board, its most pressing state's mark, its
-  name whole, a count for each state it has any of (`2 claimed · 1 open ·
+  name whole, a count for each state it has any of (`2 taken · 1 open ·
   2 waiting · 1 done`), and the age of its last post. This window's
   project's boards come first, then the rest by name; a row never moves
   when its state changes. Boards with every item done or canceled and no
   post in seven days fold into one last row, `▸ 3 finished boards`.
-  An item is not a row among the threads until `m`, which lists every
-  item there too: its state's mark before its title, and under it its
-  board and where it stands (`shop/typed-errors · claimed by api-1`).
-  Enter or `→` on a board opens its page: a head that counts its items in
-  words, one section a state (Done and Canceled folded), each item its
-  mark, title, labels, holder (a link) and age, and a `└` row under it
-  for the items it waits on, a failure's reason or a done item's result.
-  An item opens as its thread, with a row under its name that says where
-  it stands and one muted row for each claim, release, done, label and
-  the rest. `←` goes back a page, the pick on what you left. `ctrl+f`
-  finds by typing: in the list it reads boards, items and threads; on a
+  Work is not a row among the threads until `m`, which lists all work
+  there too: its state's mark before its title, and under it its board
+  and where it stands (`shop/typed-errors · taken by api-1`). Enter or
+  `→` on a board opens its page: a head that counts its work in words,
+  one section a state (Done and Canceled folded), each its mark, title,
+  labels, holder (a link) and age, and a `└` row under it for the work it
+  waits on, a failure's reason or a done one's result, then a **Threads**
+  section for the board's plain threads, each with who wrote last and
+  when. Taken work's age is when its holder last wrote in its thread.
+  Work kept for agents or profiles the window's last count doesn't list
+  says so: `for profile:reviewer, nobody eligible`. Work opens as its
+  thread, with a row under its name that says where it stands and one
+  muted row for each take, drop, done, label and the rest. `←` goes back a page, the pick on what you left. `ctrl+f`
+  finds by typing: in the list it reads boards, work and threads; on a
   board's page, titles, holders and labels. A holder whose agent the
   window's last count no longer lists reads `closed`, from what Sonny
   already knows, with no read of its own. Sonny reads a thread's file
@@ -1831,6 +1837,8 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   ![/commons with boards over the threads, at 150, 120, 60 and 44 columns](../docs/sonny/commons-boards.png)
 
   ![A board's page: a section a state, a failure's reason under its item](../docs/sonny/commons-board-page.png)
+
+  ![A board's page: a holder's last post, work kept for a profile nobody runs, and a plain thread](../docs/sonny/commons-board-work.png)
 - `/memory` shows, in the pane beside the conversation, what agents saved to
   memory: Work under way, newest first, with how long since each was saved;
   This project's facts; and Everywhere, the facts kept in every project,
@@ -2657,7 +2665,10 @@ both shows the one the keys are in. With nothing typed, Home goes up to
 the conversation's first turn, drawing the turns over it on the way, and
 End comes back to the newest. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
-newer, and Esc stops where you are. Sonny draws the whole screen again on
+newer, and Esc stops where you are. The conversation's find stays above
+the composer, never in it, with the find field's parts: a muted `find`,
+the words, the cursor and the place, `4 of 7`; with nothing typed, a muted
+`type to find`. Sonny draws the whole screen again on
 every resize and when the terminal regains focus, so a multiplexer that
 reattaches or a display that wakes never leaves stale rows; Ctrl+L
 redraws it by hand, as in a shell.
@@ -2716,18 +2727,32 @@ and a key the view does not name does nothing (`q` included), never
 typed into the composer.
 
 `ctrl+f` finds in a view of rows, as it does in Projects: `/status`,
-`/background` and `/commons`'s list of threads. What you type narrows the
-rows to those that say it, in any case unless you type a capital: a
-section with no match is not drawn, a fold is searched and stands open,
-and a row that holds a match (a task whose helper says it) stays, to keep
-it in its place. The pick goes to the first match, and `↑` `↓` and `enter`
-stay the view's. The find row is the view's last, a muted `find` and what
-you typed. `esc` drops the find and puts back the rows and the pick; the
-next `esc` closes the view. Each view's title names `ctrl+f find` with its
-keys. Find reads only what the view already read, nothing from the daemon
-as you type.
+`/background`, `/commons`'s list and a board's page, `/memory` and
+`/audit`. What you type narrows the rows to those that say it, in any case
+unless you type a capital: a section with no match is not drawn, a fold is
+searched and stands open, and a row that holds a match (a task whose
+helper says it) stays, to keep it in its place. The pick goes to the first
+match, and `↑` `↓` and `enter` stay the view's.
 
-![ctrl+f with a find typed in /status, /background and /commons: each narrowed to the rows that say it, the pick on the first, the find row last](../docs/sonny/find-views.png)
+The find field is the row under the title row, in every pane view and in
+Projects. Every view keeps that row, empty at rest, so nothing moves when
+find opens. It is one row on a band from the pane's inset to its edge: a
+muted `find`, what you typed, then the terminal's cursor, and at its right
+end, muted, how many rows are left of how many there are (`4 of 14`).
+With nothing typed a muted `type to narrow` follows the cursor. With
+`NO_COLOR`, `find` is bold. Backspace with nothing typed does nothing.
+With nothing matching the field says `0 of 14` and the view says
+`nothing here matches X`. Going into a row and back keeps the field and
+the narrowing. `esc` drops the find and puts back the rows and the pick;
+the next `esc` closes the view. Each view's title names `ctrl+f find` with
+its keys. Find reads only what the view already read, nothing from the
+daemon as you type, and a key draws again only the field and the rows it
+changed. The field is drawn in one place (`find.rs`) and every view is
+given it.
+
+![ctrl+f in /memory at 150, 60 and 44 columns: the field on the row under the title, nothing typed, then words typed with the rows narrowed](../docs/sonny/find-field.png)
+
+![ctrl+f in /status, /background, /commons, /audit and Projects at 60 columns, words typed: the field on the row under each title](../docs/sonny/find-views.png)
 
 Every view is laid out the same way, too. Its title row is the command
 that opens it (`mcp`, not "MCP servers") and the keys it takes. Under it

@@ -61,11 +61,13 @@
 //! suggest = false               # no guess at the next message, on by default
 //! suggest_ideas = false         # a guess never offers an idea or a tip in its place, on by default
 //! commons = false               # agents go without the commons, on by default
-//! boards = false                # agents go without boards (the board tool and skill, start_task's board and agents), on by default; off with the commons
+//! boards = false                # agents go without boards (the commons tool's work fields and Boards section, start_task's board and agents), on by default; off with the commons
+//! hold_quiet = 15               # minutes held work may go without a post before its holder is asked whether it is still on it; 0: never
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
 //! commons_pointer = false       # a new task's brief names no commons threads sharing its words, on by default
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0: go now, no reminder
+//! away_minutes = 30             # minutes without your use of any window, or a message through `sonny acp`, before leads are told you are away; 0 never
 //! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! most_task_tabs = 64          # task tabs a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
@@ -693,9 +695,13 @@ pub struct Sonny {
     /// lines about it.
     pub commons: bool,
     /// Whether agents have boards, work in the commons they take: the
-    /// board tool and skill, and `start_task`'s `board` and `agents`. Only
-    /// with the commons.
+    /// commons tool's work fields, the commons skill's Boards section, and
+    /// `start_task`'s `board` and `agents`. Only with the commons.
     pub boards: bool,
+    /// How long work an agent took may go without a post in its thread,
+    /// in minutes, before the holder is asked whether it is still on it
+    /// and its board hears it went quiet: its follow's `quiet`. 0 never.
+    pub hold_quiet: u64,
     /// Code mode: whether agents reach the daemon's own tools (`shell`,
     /// `read`, `write`, `edit`, `apply_patch`, `web_fetch`) only from
     /// `exec` scripts, their model shown `exec` in their place. Off, their
@@ -720,6 +726,10 @@ pub struct Sonny {
     /// it can be undone, or is reminded of a one-way door; 0 has one
     /// that can be undone go on at once and reminds of none.
     pub ask_wait_minutes: u64,
+    /// How long the person goes without using Sonny, in minutes, before
+    /// every lead is told they are away, and told again when they are
+    /// back; 0 never.
+    pub away_minutes: u64,
     /// Which tasks open in a tab of their own in the lead's multiplexer.
     pub task_tabs: TaskTabs,
     /// How many task folders a store keeps in `~/.agent/worktrees`, as
@@ -929,6 +939,10 @@ pub const MARGIN_NOTES: u64 = 6;
 /// as many as Codex's app keeps worktrees (`DEFAULT_WORKTREE_KEEP_COUNT`).
 pub const TASK_WORKTREES: u64 = 15;
 
+/// How long the person goes without using Sonny, in minutes, before the
+/// leads are told they are away, unless `away_minutes` says otherwise.
+pub const AWAY_MINUTES: u64 = 30;
+
 /// The most rows a note draws unless `margin_note_lines` says otherwise:
 /// state to glance at beside the conversation; anything longer goes in
 /// the reply or a file it names.
@@ -1006,12 +1020,14 @@ impl Default for Sonny {
             suggest_ideas: true,
             commons: true,
             boards: true,
+            hold_quiet: 15,
             code_mode: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
             commons_pointer: true,
             own_sources: OWN_SOURCES.iter().map(|name| own_source(name)).collect(),
             ask_wait_minutes: 60,
+            away_minutes: AWAY_MINUTES,
             task_tabs: TaskTabs::default(),
             task_worktrees: TASK_WORKTREES,
             most_task_tabs: 32,
@@ -1847,10 +1863,12 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons",
                 "code_mode",
                 "boards",
+                "hold_quiet",
                 "commons_invites",
                 "commons_invite_tokens",
                 "commons_pointer",
                 "ask_wait_minutes",
+                "away_minutes",
                 "task_tabs",
                 "task_worktrees",
                 "most_task_tabs",
@@ -1976,6 +1994,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
+                "hold_quiet" => Some(&mut config.sonny.hold_quiet),
+                "away_minutes" => Some(&mut config.sonny.away_minutes),
                 "most_task_tabs" => Some(&mut config.sonny.most_task_tabs),
                 "task_worktrees" => Some(&mut config.sonny.task_worktrees),
                 "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
@@ -2970,6 +2990,11 @@ mod tests {
         assert!(!parse("[sonny]\ncommons = false").unwrap().sonny.commons);
         assert!(parse("[sonny]").unwrap().sonny.boards);
         assert!(!parse("[sonny]\nboards = false").unwrap().sonny.boards);
+        assert_eq!(parse("[sonny]").unwrap().sonny.hold_quiet, 15);
+        assert_eq!(
+            parse("[sonny]\nhold_quiet = 0").unwrap().sonny.hold_quiet,
+            0
+        );
         let sonny = parse("[sonny]\ncommons_invites = 0\ncommons_invite_tokens = 500")
             .unwrap()
             .sonny;
@@ -2981,6 +3006,9 @@ mod tests {
         let asks = parse("[sonny]\nask_wait_minutes = 0").unwrap().sonny;
         assert_eq!(asks.ask_wait_minutes, 0);
         assert!(parse("[sonny]\nask_wait_minutes = \"1h\"").is_err());
+        assert_eq!(config.sonny.away_minutes, AWAY_MINUTES);
+        let away = parse("[sonny]\naway_minutes = 0").unwrap().sonny;
+        assert_eq!(away.away_minutes, 0);
         assert_eq!(config.sonny.browser_confirm, BROWSER_CONFIRM);
         let browser =
             parse("[sonny]\nbrowser_confirm = [\"eval\", \"plugin:vault:credential.read\"]");

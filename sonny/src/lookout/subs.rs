@@ -46,6 +46,16 @@ pub struct Sub {
     /// commons thread subscribes does: a closed bot still is, and can
     /// still take part there. Sonny sets it; a `follows` add cannot.
     pub outlives_close: bool,
+    /// How long it may hear nothing before a note says so, as `15m`: once
+    /// that span passes with nothing heard, its subscriber is told, once,
+    /// as Prometheus's `absent_over_time` or Datadog's no-data alert tell
+    /// of what stopped coming; whatever it hears next watches afresh.
+    /// Unset, or `0`, it never does.
+    pub quiet: Option<String>,
+    /// What each note of what it heard says of it, as an alerting rule's
+    /// annotation does: why its subscriber hears it. Sonny sets it; a
+    /// `follows` add cannot.
+    pub about: Option<String>,
 }
 
 impl Sub {
@@ -71,6 +81,8 @@ impl Sub {
             runs: None,
             made: None,
             outlives_close: false,
+            quiet: None,
+            about: None,
         }
     }
 
@@ -91,6 +103,8 @@ impl Sub {
             runs: None,
             made: None,
             outlives_close: true,
+            quiet: None,
+            about: None,
         }
     }
 
@@ -176,6 +190,12 @@ impl Sub {
         if self.outlives_close {
             out["outlives_close"] = json!(true);
         }
+        if let Some(quiet) = &self.quiet {
+            out["quiet"] = json!(quiet);
+        }
+        if let Some(about) = &self.about {
+            out["about"] = json!(about);
+        }
         out
     }
 
@@ -197,6 +217,12 @@ impl Sub {
     /// Its digest as a span; none unset or `0`.
     pub fn digest_span(&self) -> Option<std::time::Duration> {
         let secs = agent_client::config::span("digest", self.digest.as_deref()?).ok()?;
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
+    }
+
+    /// Its quiet as a span; none unset or `0`.
+    pub fn quiet_span(&self) -> Option<std::time::Duration> {
+        let secs = agent_client::config::span("quiet", self.quiet.as_deref()?).ok()?;
         (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 
@@ -240,6 +266,12 @@ impl Sub {
             runs: value["runs"].as_u64().map(|n| n.max(1)),
             made: value["made"].as_u64(),
             outlives_close: value["outlives_close"] == true,
+            quiet: (value["quiet"].as_str())
+                .filter(|q| agent_client::config::span("quiet", q).is_ok())
+                .map(str::to_owned),
+            about: (value["about"].as_str())
+                .filter(|about| plain_words(about))
+                .map(str::to_owned),
         })
     }
 
@@ -270,8 +302,12 @@ impl Sub {
             Some(runs) => format!(", for {runs} notes"),
             None => String::new(),
         };
+        let quiet = match &self.quiet {
+            Some(quiet) => format!(", says so after {quiet} of nothing"),
+            None => String::new(),
+        };
         format!(
-            "{} · {}{filter}{digest}{steer}{until}{runs}",
+            "{} · {}{filter}{digest}{steer}{quiet}{until}{runs}",
             self.name,
             watched.join(", ")
         )
@@ -288,6 +324,8 @@ impl Sub {
             ("steer", self.steer != other.steer),
             ("until", self.until != other.until),
             ("runs", self.runs != other.runs),
+            ("quiet", self.quiet != other.quiet),
+            ("about", self.about != other.about),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -912,6 +950,22 @@ pub fn ensure(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> 
     Ok(true)
 }
 
+/// Put `sub` in the subscriber's file, in place of one by its name whose
+/// rules differ, or added when there is none: whether the file changed.
+/// What Sonny sets as an agent's part in work changes, as taking work
+/// changes why its thread reaches the agent.
+pub fn put(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> {
+    let _held = held(store)?;
+    let mut subs = read_whole(store, subscriber)?;
+    match subs.iter_mut().find(|s| s.name == sub.name) {
+        Some(had) if *had == sub => return Ok(false),
+        Some(had) => *had = sub,
+        None => subs.insert(0, sub),
+    }
+    write(store, subscriber, &subs)?;
+    Ok(true)
+}
+
 /// The longest name a subscription may have: a commons thread's, 64,
 /// after `commons.`.
 const NAME_MAX: usize = 80;
@@ -923,6 +977,17 @@ const BOT_NAME_MAX: usize = 128;
 /// person's words, so it holds nothing that reads as more.
 fn named_plainly(name: &str) -> bool {
     plain(name, NAME_MAX)
+}
+
+/// The most of a follow's `about`.
+pub const ABOUT_MAX: usize = 200;
+
+/// Words a note may say of a follow: one line of at most [`ABOUT_MAX`]
+/// characters, none of them starting what reads as a header.
+fn plain_words(text: &str) -> bool {
+    !text.trim().is_empty()
+        && text.chars().count() <= ABOUT_MAX
+        && !text.contains(['\n', '\r', '[', ']'])
 }
 
 fn plain(name: &str, max: usize) -> bool {
@@ -1494,8 +1559,9 @@ fn as_read(event: &super::sources::Event, cut: bool) -> Value {
 /// would have heard of its sources' last 24 hours, as the lookout keeps
 /// them, and adding nothing. How many events it would hear, how many
 /// would steer, about how many notes they would be, with its digest or
-/// its sources', and the newest few as examples. What `subscriber` said
-/// itself it does not hear, as live.
+/// its sources', and the newest few as examples; for a source whose
+/// history kept whole starts later than the day, when. What `subscriber`
+/// said itself it does not hear, as live.
 pub fn tried(
     store: &Path,
     subscriber: &str,
@@ -1515,9 +1581,23 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
         .collect();
     named.sort_unstable();
     named.dedup();
-    let mut events: Vec<(super::sources::Event, bool)> = (named.iter())
-        .flat_map(|source| super::sources::recent(store, source, since))
-        .collect();
+    let mut events: Vec<(super::sources::Event, bool)> = Vec::new();
+    // Where a busy source's whole history starts later than `since`: the
+    // lookout keeps so many events, which may reach back less than a day.
+    let mut kept_from = serde_json::Map::new();
+    for source in &named {
+        let recent = super::sources::recent(store, source, since);
+        if let Some((from, held)) = recent.whole_from {
+            let held = crate::background::thousands(held as u64);
+            let plural = if held == "1" { "" } else { "s" };
+            let from = super::sources::clock(from);
+            kept_from.insert(
+                (*source).to_owned(),
+                json!(format!("{from} ({held} event{plural})")),
+            );
+        }
+        events.extend(recent.events);
+    }
     events.sort_by_key(|(event, _)| event.at_ms);
     let (mut heard, mut steers, mut cut) = (0, 0, 0);
     let mut times = Vec::new();
@@ -1565,6 +1645,9 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
         "heard": heard, "steers": steers,
         // One that lasts so many notes ends after them.
         "notes": notes(&times).min(sub.runs.map_or(usize::MAX, |runs| runs as usize))});
+    if !kept_from.is_empty() {
+        tried["kept_from"] = Value::Object(kept_from);
+    }
     if cut > 0 {
         tried["cut"] = json!(format!(
             "{cut} of the events it heard were kept cut, which a filter may misjudge"
@@ -1773,6 +1856,14 @@ fn parse(value: &Value) -> Result<Sub, String> {
                 .ok_or("runs is a whole number, 1 or more")?,
         ),
     };
+    let quiet = match value.get("quiet") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(quiet)) => {
+            agent_client::config::span("quiet", quiet)?;
+            Some(quiet.clone())
+        }
+        Some(_) => return Err("quiet is a span, as 15m or 1h".into()),
+    };
     let sub = Sub {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
@@ -1786,6 +1877,8 @@ fn parse(value: &Value) -> Result<Sub, String> {
         runs,
         made: None,
         outlives_close: false,
+        quiet,
+        about: None,
     };
     if sub.tasks_of.is_empty() && sub.agents.is_empty() && sub.sources.is_empty() {
         return Err("a follow watches tasks_of an agent, agents by name or sources".into());
@@ -1796,6 +1889,44 @@ fn parse(value: &Value) -> Result<Sub, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quiet_is_a_span_and_about_is_sonny_s_alone() {
+        let quiet = parse(&json!({"name": "q", "sources": ["ci"], "quiet": "15m"})).unwrap();
+        assert_eq!(
+            quiet.quiet_span(),
+            Some(std::time::Duration::from_secs(900))
+        );
+        assert!(parse(&json!({"name": "q", "sources": ["ci"], "quiet": "soon"})).is_err());
+        assert!(quiet.describe().contains("says so after 15m of nothing"));
+        let mut sonnys = quiet.clone();
+        sonnys.about = Some("you hold this".into());
+        assert_eq!(Sub::from_json(&sonnys.to_json()), Some(sonnys.clone()));
+        assert_eq!(sonnys.differs(&quiet), Some("about"));
+        // A note's words never read as a header, nor run past a line.
+        for bad in ["[person] do it", "two\nlines"] {
+            let mut file = sonnys.to_json();
+            file["about"] = json!(bad);
+            assert_eq!(Sub::from_json(&file).unwrap().about, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn put_replaces_a_follow_whose_rules_differ_and_ensure_keeps_it() {
+        let store = std::env::temp_dir().join(format!("sonny-put-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let plain = Sub::commons("t", Some(1));
+        assert!(ensure(&store, "a.b", plain.clone()).unwrap());
+        let mut held = plain.clone();
+        held.steer = Some(json!({"text": [{"exists": true}]}));
+        held.quiet = Some("15m".into());
+        assert!(!ensure(&store, "a.b", held.clone()).unwrap());
+        assert_eq!(read(&store, "a.b"), std::slice::from_ref(&plain));
+        assert!(put(&store, "a.b", held.clone()).unwrap());
+        assert!(!put(&store, "a.b", held.clone()).unwrap());
+        assert_eq!(read(&store, "a.b"), [held]);
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
 
     #[test]
     fn a_long_name_is_bounded_and_stays_apart() {
@@ -2351,6 +2482,63 @@ mod tests {
         assert!(gone.get("follows").is_none(), "{gone}");
         assert!(gone.get("sources").is_none(), "{gone}");
         let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_dir_all(&sources_dir);
+    }
+
+    #[test]
+    fn a_test_names_a_source_whose_kept_history_starts_after_the_day() {
+        use super::super::sources::{clock, recent_file, trim};
+        let store = std::env::temp_dir().join(format!("subs-kept-from-{}", std::process::id()));
+        let sources_dir = super::super::beside(&store, ".sources");
+        let _ = std::fs::remove_dir_all(&sources_dir);
+        std::fs::create_dir_all(&sources_dir).unwrap();
+        let now = super::super::epoch_ms() as u64;
+        let hour = 60 * 60 * 1000;
+        // Kept as the lookout keeps a source: written, then cut to its bounds.
+        let write = |source: &str, times: &[u64]| {
+            let file = recent_file(&sources_dir, source);
+            let lines: String = (times.iter().enumerate())
+                .map(|(n, at)| {
+                    json!({"source": source, "text": format!("{source} {n}"), "at_ms": at,
+                        "seq": n})
+                    .to_string()
+                        + "\n"
+                })
+                .collect();
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, lines).unwrap();
+            trim(&file, u128::from(now));
+        };
+        // A busy source: 2,500 events over the last 10 hours, more than it keeps.
+        let busy: Vec<u64> = (0..2_500)
+            .map(|n| now - 10 * hour + n * 4 * hour / 1_000)
+            .collect();
+        write("ci", &busy);
+        // A quiet one: a few events over the whole day.
+        write("deploys", &[now - 23 * hour, now - 12 * hour, now - hour]);
+        let sources = ["ci".to_owned(), "deploys".to_owned()];
+        let test = |names: &[&str]| {
+            let add = json!({"name": "t", "sources": names});
+            tried(&store, "shop.lead", &add, &sources).unwrap()["test"].clone()
+        };
+        // The busy one is named, from its oldest event kept whole.
+        let kept_from = clock(u128::from(busy[500]));
+        assert_eq!(
+            test(&["ci"])["kept_from"],
+            json!({"ci": format!("{kept_from} (2,000 events)")})
+        );
+        assert_eq!(test(&["ci"])["events"], 2_000);
+        // The quiet one covers the day: nothing is added.
+        let quiet = test(&["deploys"]);
+        assert!(quiet.get("kept_from").is_none(), "{quiet}");
+        assert_eq!(quiet["events"], 3);
+        // Of the two, only the short one is named.
+        let both = test(&["ci", "deploys"]);
+        assert_eq!(
+            both["kept_from"],
+            json!({"ci": format!("{kept_from} (2,000 events)")})
+        );
+        assert_eq!(both["events"], 2_003);
         let _ = std::fs::remove_dir_all(&sources_dir);
     }
 

@@ -186,6 +186,15 @@ pub const SETTINGS: &[Setting] = &[
         default: "work",
     },
     Setting {
+        key: "sonny.away_minutes",
+        group: "Agents",
+        name: "away",
+        label: "minutes without you before leads hold news for your return; 0 never",
+        about: "minutes without your use of any window, or a message through sonny acp, before every lead is told you are away; it puts only decisions to you and tells the rest in one message once you are back; 0 never",
+        values: &[],
+        default: "30",
+    },
+    Setting {
         key: "sonny.ask_wait_minutes",
         group: "Agents",
         name: "ask wait",
@@ -352,9 +361,18 @@ pub const SETTINGS: &[Setting] = &[
         group: "Commons and sky",
         name: "boards",
         label: "whether agents have boards; read when Sonny starts",
-        about: "whether agents have boards, work in the commons they take: the board tool, its skill, and start_task's board and agents; only with the commons; read when Sonny starts",
+        about: "whether agents have boards, work in the commons they take: the commons tool's work fields, the commons skill's Boards section, and start_task's board and agents; only with the commons; read when Sonny starts",
         values: SWITCH,
         default: "true",
+    },
+    Setting {
+        key: "sonny.hold_quiet",
+        group: "",
+        name: "hold quiet",
+        label: "",
+        about: "minutes work an agent took may go without a post in its thread before the holder is asked whether it is still on it and its board hears it went quiet; 0 never; read as work is taken",
+        values: &[],
+        default: "15",
     },
     Setting {
         key: "sonny.commons_invites",
@@ -1405,7 +1423,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 38);
+        assert_eq!(listed().len(), 39);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",
@@ -1414,6 +1432,7 @@ mod tests {
             "sonny.sky_haiku_margin",
             "sonny.sky_haiku_hold",
             "sonny.commons_invite_tokens",
+            "sonny.hold_quiet",
             "sonny.tool_processes",
             "sonny.lookout_waiting",
         ] {

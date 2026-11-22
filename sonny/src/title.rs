@@ -167,7 +167,6 @@ pub fn checked(title: &str) -> Result<String, String> {
 }
 
 /// The title noted for `bot`, the agent of id `id`, read from its file.
-#[cfg(test)]
 pub fn noted(store: &Path, bot: &str, id: i64) -> Option<String> {
     noted_in(&folder(store), bot, id)
 }

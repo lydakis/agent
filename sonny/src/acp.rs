@@ -1341,6 +1341,8 @@ impl Session {
         if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
             return Ok(json!({"stopReason": "end_turn"}));
         }
+        // The person wrote: they are here, and back if they were away.
+        crate::away::here();
         let bound = {
             let mut state = self.state.lock().await;
             state.cancelled = false;

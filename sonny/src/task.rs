@@ -409,16 +409,18 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         speed: config.sonny.task_speed,
     };
     let flags: Vec<&String> = flags.iter().collect();
-    let flags = with_defaults(&info, &flags, lead_picks, task_picks);
-    let flags: Vec<&String> = flags.iter().collect();
     // Roles are the lead's project's, which `info` names, as its files are
     // now: the ones the lead or the person picked from, even uncommitted,
     // never a worktree's copy as of its last commit, nor a folder inside.
     let roles = here;
-    let (mut flags, role_sandbox) = match told(&place.told, roles, here, &info, &flags) {
+    // The role first, so its model is named before the defaults fill one,
+    // as `spawn_agent` and `agent run --profile` take it.
+    let (flags, role_sandbox) = match told(&place.told, roles, here, &info, &flags) {
         Ok(told) => told,
         Err(error) => return failed(&place, false, error),
     };
+    let flags: Vec<&String> = flags.iter().collect();
+    let mut flags = with_defaults(&info, &flags, lead_picks, task_picks);
     with_cache(&mut flags);
     // A task works in its lead's mode's sandbox: confined to its folder,
     // committing to its repository and running the commands the config
@@ -564,11 +566,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             if let Some(title) = &start.title {
                 let _ = crate::title::note(store, name, id, title);
             }
-            // The board's posts reach it as the commons' do, its items
-            // opening as they come.
+            // The board's work reaches it as it moves.
             if let Some(board) = &start.board {
-                let follow = crate::board::follow(board, Some(id));
-                let _ = crate::lookout::subs::ensure(store, name, follow);
+                let follow = crate::board::works_from(board, Some(id));
+                let _ = crate::lookout::subs::put(store, name, follow);
             }
         }
     }
@@ -851,9 +852,10 @@ fn approved(
 }
 
 /// The run flags with the task's model, effort and speed, unless they
-/// name their own: the project's `task_model`, else the lead's (`lead`,
-/// its AGENT_MODEL and AGENT_EFFORT, and the speed its record holds), so a
-/// role (--profile) never swaps it; the project's `task_effort`, else
+/// name their own, as the call or its role (--profile, which `told`
+/// names first) does: the project's `task_model`, else the lead's (`lead`,
+/// its AGENT_MODEL and AGENT_EFFORT, and the speed its record holds); the
+/// project's `task_effort`, else
 /// the config's `[sonny] task_effort` (`task`), else the lead's own when
 /// the task runs its model; and the speed the same way, from
 /// `task_speed` and `[sonny] task_speed`. Standard needs no flag.
@@ -934,8 +936,9 @@ fn with_cache(flags: &mut Vec<String>) {
 /// for a task in `dir` given as `--instructions`, with what every task is
 /// told (`task.md`, or the task profile the project `info` or the config
 /// names) after it, and the role's model and tools unless the flags name
-/// their own; and the role's sandbox. Roles are found from `roles`. Other
-/// flags pass as they are.
+/// their own, so the role's model comes before the project's `task_model`
+/// and the lead's, which `with_defaults` fills after; and the role's
+/// sandbox. Roles are found from `roles`. Other flags pass as they are.
 fn told(
     dir: &Path,
     roles: &Path,
@@ -1329,10 +1332,28 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
 /// The line a task working from `board` finds under its brief.
 pub fn board_line(board: &str) -> String {
     format!(
-        "\n\nYou work from the board {board}: board with open \"{board}\" lists its open items. \
-         Take one with act claim, close it with act done and what you made, then take the next; \
-         you hear of items opening there. The board skill says more."
+        "\n\nYou work from the board {board}: the commons tool with filter \
+         {{\"board\": [\"{board}\"], \"state\": [\"open\"]}} lists its open work. Take one with a \
+         reply doing take, close it with done and what you made, then take the next; you hear \
+         of work opening there. The commons skill's Boards section says more."
     )
+}
+
+/// The agents of the task `name` (whole, with its project) that has
+/// several, NAME.1 on, closed or not, each by its number; empty when it
+/// has none or the daemon can't be read.
+pub fn agents_of(name: &str) -> Vec<(u64, Value)> {
+    let mut agents: Vec<(u64, Value)> = (listed(&format!("{name}.*")).into_iter().flatten())
+        .filter_map(|bot| {
+            let n = (bot["name"].as_str()?.strip_prefix(name)?.strip_prefix('.'))
+                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))?
+                .parse()
+                .ok()?;
+            Some((n, bot))
+        })
+        .collect();
+    agents.sort_by_key(|(n, _)| *n);
+    agents
 }
 
 /// The daemon's records of agents named `name`, or None when it can't be
@@ -2637,8 +2658,8 @@ mod tests {
     #[test]
     fn a_task_on_a_board_is_told_how_to_take_its_items() {
         let line = board_line("shop/errors");
-        assert!(line.contains(r#"board with open "shop/errors""#));
-        assert!(line.contains("act claim"));
+        assert!(line.contains(r#"{"board": ["shop/errors"], "state": ["open"]}"#));
+        assert!(line.contains("doing take"));
     }
 
     #[test]
@@ -3155,6 +3176,74 @@ mod tests {
             run(none, &["--model", "a/lead"], None),
             ["--model", "a/lead", "--effort", "high"]
         );
+    }
+
+    #[test]
+    fn a_task_runs_its_profiles_model() {
+        let dir = std::env::temp_dir().join(format!("sonny-task-model-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
+        std::fs::write(
+            dir.join(".agents/agents/reviewer.md"),
+            "---\nmodel: a/b\n---\nReview it.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".agents/agents/plain.md"), "Do it.\n").unwrap();
+        // As start_task runs them: the role first, then the defaults.
+        let run = |info: Value, flags: &[&str]| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            let (flags, _) =
+                told(&dir, &dir, &dir, &info, &flags.iter().collect::<Vec<_>>()).unwrap();
+            let lead = Picks {
+                model: Some("x/y".to_owned()),
+                effort: Some("high".to_owned()),
+                speed: Some("fast".to_owned()),
+            };
+            let flags = with_defaults(
+                &info,
+                &flags.iter().collect::<Vec<_>>(),
+                lead,
+                Picks::default(),
+            );
+            let named = |name: &str| {
+                let at = flags.iter().position(|f| f == name)?;
+                Some(flags[at + 1].clone())
+            };
+            (named("--model"), named("--effort"), named("--speed"))
+        };
+        let none = serde_json::json!({"task_profile": "task"});
+        let pinned = serde_json::json!({"task_profile": "task", "task_model": "p/q"});
+        let some = |s: &str| Some(s.to_owned());
+        // The profile's model over the lead's, which leaves the lead's
+        // effort and speed, set for its own model.
+        assert_eq!(
+            run(none.clone(), &["--profile", "reviewer"]),
+            (some("a/b"), None, None)
+        );
+        // A model named in the call over the profile's.
+        assert_eq!(
+            run(none.clone(), &["--profile", "reviewer", "--model", "c/d"]),
+            (some("c/d"), None, None)
+        );
+        // The profile's model over the project's task_model.
+        assert_eq!(
+            run(pinned.clone(), &["--profile", "reviewer"]),
+            (some("a/b"), None, None)
+        );
+        // A profile without a model: the project's task_model, else the
+        // lead's, at the lead's effort and speed.
+        assert_eq!(
+            run(pinned, &["--profile", "plain"]),
+            (some("p/q"), None, None)
+        );
+        assert_eq!(
+            run(none.clone(), &["--profile", "plain"]),
+            (some("x/y"), some("high"), some("fast"))
+        );
+        assert_eq!(
+            run(none, &["--agents"]),
+            (some("x/y"), some("high"), some("fast"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

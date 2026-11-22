@@ -296,10 +296,8 @@ impl Tool {
                 "effort":{"type":"string","minLength":1,"maxLength":32},
                 "fork":{"type":"boolean"},
                 "checkpoint":{"type":"integer","minimum":1,"description":"With fork: copy the conversation up to this node, not all of it"},
-                "allow":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"With fork: the tools the copy may call, within this agent's; [] allows none"},
                 "expire_ms":{"type":"integer","minimum":1000,"maximum":crate::store::HOLD_MAX_MS,"description":"With fork: delete the copy once idle this long"},
                 "workspace":{"type":"string","minLength":1,"description":"Its folder, within what this agent may reach; default this turn's folder"},
-                "tools":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Its tools, within this agent's; default this agent's, or the profile's"},
                 "settings":{"type":"object","description":"Its settings over this agent's own, never looser: sandbox, writable, network, unix_sockets, approval_policy, speed, cache_ttl, context_bytes, context_items, note_turns, compact_at, compact_keep, compact_tokens, post_turn_compact_percent, keep_turns, max_rounds, max_drops, max_output_tokens, approval_hold_ms, hold_ms, outputs, trailer, quiet_background, rules, env"},
                 "budget_tokens":{"type":"integer","minimum":1,"description":"Its lifetime token budget"},
                 "budget_counts":{"type":"string","enum":["tokens","work"]},
@@ -2527,10 +2525,8 @@ impl Registry {
                     #[serde(default)]
                     fork: bool,
                     checkpoint: Option<i64>,
-                    allow: Option<Vec<String>>,
                     expire_ms: Option<u64>,
                     workspace: Option<String>,
-                    tools: Option<Vec<String>>,
                     settings: Option<serde_json::Map<String, serde_json::Value>>,
                     budget_tokens: Option<u64>,
                     budget_counts: Option<String>,
@@ -2573,27 +2569,22 @@ impl Registry {
                         "agents and profile compose instructions; instructions sets them",
                     );
                 }
-                // A fork keeps its source's tools, settings and compaction;
-                // a fresh agent has no conversation to copy part of.
-                let fresh_only = args.tools.is_some()
-                    || args.settings.is_some()
+                // A fork keeps its source's settings and compaction; a fresh
+                // agent has no conversation to copy part of.
+                let fresh_only = args.settings.is_some()
                     || args.compaction_instructions.is_some()
                     || args.compaction_model.is_some()
                     || args.fallback.is_some();
                 if args.fork && fresh_only {
                     return fail_with(
                         "invalid_tool_arguments",
-                        "a fork keeps this agent's tools, settings and compaction: give it allow for its tools instead",
+                        "a fork keeps this agent's settings and compaction",
                     );
                 }
-                if !args.fork
-                    && (args.checkpoint.is_some()
-                        || args.allow.is_some()
-                        || args.expire_ms.is_some())
-                {
+                if !args.fork && (args.checkpoint.is_some() || args.expire_ms.is_some()) {
                     return fail_with(
                         "invalid_tool_arguments",
-                        "checkpoint, allow and expire_ms are for a fork",
+                        "checkpoint and expire_ms are for a fork",
                     );
                 }
                 if args.quote.len() > 16 {
@@ -2606,10 +2597,8 @@ impl Registry {
                     }
                 };
                 put("checkpoint", json!(args.checkpoint));
-                put("allow", json!(args.allow));
                 put("expire_ms", json!(args.expire_ms));
                 put("workspace", json!(args.workspace));
-                put("tools", json!(args.tools));
                 put("budget_tokens", json!(args.budget_tokens));
                 put("budget_counts", json!(args.budget_counts));
                 put(
