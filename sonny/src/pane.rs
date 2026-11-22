@@ -870,7 +870,8 @@ impl Pane {
         let Ok(rest) = coloring.job.join() else {
             return false;
         };
-        // The same words in the same rows, colored: the view stays on them.
+        // The same words in the same rows, colored: the view, and what is
+        // selected or found in them, stays on them.
         let mut screen = Screen::default();
         for (at, spans) in coloring.first.into_iter().chain(rest).enumerate() {
             coloring.numbered.push(&mut screen, at, spans);
@@ -878,11 +879,7 @@ impl Pane {
         if coloring.cut {
             screen.push(vec![Line::default(), past_shown()]);
         }
-        match self.screen.going_to() {
-            Some((row, above)) => screen.show_row(row, above),
-            None => screen.hold(self.screen.back()),
-        }
-        self.screen = screen;
+        self.screen.restyle(screen);
         true
     }
 

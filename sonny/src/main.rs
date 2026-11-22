@@ -18658,7 +18658,7 @@ impl App {
             return;
         }
         if self.searching.is_some() {
-            self.search_event(event);
+            self.search_event(event).await;
             return;
         }
         if self.new_listing()
@@ -18970,7 +18970,7 @@ impl App {
                     // and what was being written.
                     KeyCode::Up => {
                         if !self.input.up(self.prose())
-                            && let Some(text) = self.recalled(recall::Recall::older)
+                            && let Some(text) = self.recalled(recall::Recall::older).await
                         {
                             self.input.set(&text);
                             // One of several rows starts at its top, so Up
@@ -18982,7 +18982,7 @@ impl App {
                     }
                     KeyCode::Down => {
                         if !self.input.down(self.prose())
-                            && let Some(text) = self.recalled(recall::Recall::newer)
+                            && let Some(text) = self.recalled(recall::Recall::newer).await
                         {
                             self.input.set(&text);
                         }
@@ -19080,13 +19080,13 @@ impl App {
     /// A step through the prompts sent before, from what the composer
     /// holds: what it was sent with, pictures and quotes, swapped for
     /// what the composer had.
-    fn recalled(
+    async fn recalled(
         &mut self,
         step: impl FnOnce(&mut recall::Recall<Attached>, &str, &mut Attached) -> Option<String>,
     ) -> Option<String> {
-        // A picture still being made ready belongs to the draft swapped
-        // away: it is let go, never put behind another draft's placeholder.
-        self.preparing.clear();
+        // A picture still being made ready is waited for: it goes with the
+        // draft it is in, whether that stays or is swapped away and back.
+        self.all_ready().await;
         let mut attached = (
             std::mem::take(&mut self.pictures),
             std::mem::take(&mut self.quotes),
@@ -19113,7 +19113,7 @@ impl App {
     /// A key or paste while searching: typing narrows, ↑↓ (and Ctrl+R
     /// again, as a shell's goes further back) pick, Enter or Tab puts the
     /// pick in the composer to edit, Esc leaves the composer as it was.
-    fn search_event(&mut self, event: Event) {
+    async fn search_event(&mut self, event: Event) {
         let Some(search) = &mut self.searching else {
             return;
         };
@@ -19137,9 +19137,11 @@ impl App {
                             (search.found.get(search.pick)).map(|(at, _)| search.prompts[*at].0);
                         self.searching = None;
                         if let Some(back) = back
-                            && let Some(text) = self.recalled(|recall, current, attached| {
-                                recall.jump(back, current, attached)
-                            })
+                            && let Some(text) = self
+                                .recalled(|recall, current, attached| {
+                                    recall.jump(back, current, attached)
+                                })
+                                .await
                         {
                             self.input.set(&text);
                         }
@@ -19196,10 +19198,7 @@ impl App {
     async fn submit_as(&mut self, queue: bool) {
         // The pictures still being made ready go with it: what is sent is
         // what the composer shows.
-        while let Some((number, job)) = self.preparing.pop() {
-            let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
-            self.ready(number, got);
-        }
+        self.all_ready().await;
         let prompt = self.input.trim().to_owned();
         // A quote alone is a message, as it was typed into the words.
         if prompt.is_empty() && self.quotes.is_empty() {
@@ -20256,12 +20255,21 @@ impl App {
         any
     }
 
+    /// Every picture still being made ready, waited for and put behind its
+    /// placeholder.
+    async fn all_ready(&mut self) {
+        while let Some((number, job)) = self.preparing.pop() {
+            let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
+            self.ready(number, got);
+        }
+    }
+
     /// Picture `number` as it was made ready: behind its placeholder while
-    /// that is still written, or, none or past what a message may hold, its
-    /// placeholder taken out and why said.
+    /// the draft or Ctrl-Y can bring that back, or, none or past what a
+    /// message may hold, its placeholder taken out and why said.
     fn ready(&mut self, number: usize, got: Result<Option<attach::Picture>, String>) {
         let placeholder = attach::placeholder(number);
-        if !self.input.contains(&placeholder)
+        if !(self.input.contains(&placeholder) || self.input.killed().contains(&placeholder))
             || !(self.pictures.get(number - 1)).is_some_and(Option::is_none)
         {
             return;
@@ -20286,6 +20294,7 @@ impl App {
         if !self.input.remove(&format!("{placeholder} ")) {
             self.input.remove(&placeholder);
         }
+        self.input.unkill(&placeholder);
         // Its number goes to the next picture, when none came after it.
         if self.pictures.len() == number {
             self.pictures.pop();
@@ -40506,6 +40515,44 @@ mod tests {
             ]),
             "{submitted}"
         );
+        // Cut with Ctrl-U while being read, it is kept for Ctrl-Y.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(Some(attach::Picture {
+                media_type: "image/png",
+                data: vec![9],
+            }))
+        });
+        let press = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        app.key(press(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        assert!(app.input.is_empty());
+        go.send(()).unwrap();
+        while !app.preparing.is_empty() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        app.key(press(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
+        // Down past the newest while one is being read leaves the draft as
+        // it is, the picture still to come behind its placeholder.
+        app.discard();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(Some(attach::Picture {
+                media_type: "image/png",
+                data: vec![10],
+            }))
+        });
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = go.send(());
+        });
+        app.key(press(KeyCode::Down, KeyModifiers::NONE)).await;
+        assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
     }
 
     #[tokio::test]

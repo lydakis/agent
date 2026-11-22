@@ -106,6 +106,15 @@ impl Prompt {
         true
     }
 
+    /// `piece` taken out of what Ctrl-Y brings back, with a space after it.
+    pub fn unkill(&mut self, piece: &str) {
+        if let Some(start) = self.killed.find(piece) {
+            let mut end = start + piece.len();
+            end += usize::from(self.killed[end..].starts_with(' '));
+            self.killed.replace_range(start..end, "");
+        }
+    }
+
     /// Whether the cursor is before every word, nothing selected.
     pub fn at_start(&self) -> bool {
         self.at == 0 && self.selection().is_none()
