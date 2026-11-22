@@ -30,7 +30,8 @@ for a release, and `sonny upgrade` sees every release as newer than it.
 4. After tagging, regenerate the release store fixture from the tag
    (`python3 release/make_store_fixture.py vX.Y.Z`, which writes
    `tests/fixtures/store-vX.Y.Z.sql`) and add it in the next PR, keeping the
-   last two releases' fixtures.
+   last two releases' fixtures. `release/test_store_down.py` keeps its own
+   store (`release/fixtures/store-v0.10.2.sql`), which does not move with them.
 
 A tag the workflow refused, or a draft that failed, is deleted with its tag
 and made again from main; main itself never changes for a release.
