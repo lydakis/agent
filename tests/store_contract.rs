@@ -24393,6 +24393,7 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
         panic!("a call of a tool that does not yield yielded");
     };
     assert_eq!(refused.code, "call_not_yieldable");
+    db.take_call("Lead", turn, "exec-1", now).unwrap();
     let yielded = db
         .yield_call("Lead", turn, "exec-1", &result("built 3 of 9"), now)
         .unwrap();
@@ -24406,6 +24407,12 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
     let Lifted::Waiting(None) = db.lifted_check(process, now + 60_000, false).unwrap() else {
         panic!("a yielded call ran out of time");
     };
+    // A client that took it and stopped is told another took it, not that
+    // it ran out of time, so the next runs it on from where it was.
+    let Err(taken) = db.take_call("Lead", turn, "exec-1", now + 60_000) else {
+        panic!("a yielded call was taken twice");
+    };
+    assert_eq!(taken.code, "call_taken", "{taken:?}");
     db.answer_call("Lead", turn, "exec-1", result("all 9 built"), now + 60_000)
         .unwrap();
     let Lifted::Ended { result: ended, .. } =
