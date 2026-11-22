@@ -44,7 +44,7 @@ const INVITES: &str = ".invites";
 /// plan posted whole.
 const BOARDS: &str = ".boards";
 /// The origin of the notes the commons sends agents.
-const ORIGIN: &str = "commons";
+pub(crate) const ORIGIN: &str = "commons";
 /// The threads a day the commons sends invites for, whatever came of
 /// earlier ones, for `agents` that took a turn in the last week: the
 /// square root of them, as a town's meeting places grow slower than its

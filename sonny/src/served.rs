@@ -1236,6 +1236,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 crate::task::gone(holder, id)
             })
             .map_err(|e| ("commons_refused", e))?;
+            // The turn that wrote in a thread is not told it holds that
+            // work, and the work the host knows is kept as it is now.
+            if (arguments["post"].is_object() || arguments["reply"].is_object())
+                && said["posted"] != false
+                && let Some(thread) = said["thread"].as_str()
+            {
+                let bot = std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone());
+                let turn = (std::env::var("AGENT_TURN").ok()).and_then(|t| t.parse().ok());
+                crate::turn_end::wrote(&home, &bot, turn, thread);
+            }
             // Posting in a thread follows it for the agent, in its store,
             // and the answer says how its posts will reach the agent: the
             // follow is how they do, the invite only how it came.
@@ -1305,7 +1315,12 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 return Err(("no_caller", "AGENT_CALL or AGENT_TURN is not set".into()));
             };
             tokio::task::spawn_blocking(move || {
-                crate::asks::served(&arguments, &asker, turn, &call)
+                let served = crate::asks::served(&arguments, &asker, turn, &call);
+                // One that waits for the person holds back its turn's end.
+                if served.is_ok() {
+                    crate::turn_end::asked(&asker, turn, &call, &arguments);
+                }
+                served
             })
             .await
             .map_err(|e| ("tool_failed", e.to_string()))?
@@ -1564,6 +1579,14 @@ impl Server {
             Some("turn_finished") => {
                 if let Some(turn) = event["turn"].as_i64() {
                     self.serving.lock().unwrap().finish(turn);
+                    // Its end may tell the agent what it holds or what's open.
+                    if let Some(bot) = event["bot"].as_str()
+                        && tokio::runtime::Handle::try_current().is_ok()
+                    {
+                        let status = event["data"]["status"].as_str().unwrap_or_default();
+                        let id = event["bot_id"].as_i64();
+                        crate::turn_end::finished(bot.to_owned(), id, turn, status.to_owned());
+                    }
                 }
             }
             // A call of Sonny's a message lifted waits on past its turn.

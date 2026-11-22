@@ -119,6 +119,7 @@ mod transcript;
 mod tree;
 mod trigger;
 mod trusted;
+mod turn_end;
 mod update;
 mod upgrade;
 mod usage;
