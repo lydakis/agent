@@ -412,7 +412,7 @@ fn files_renamed(store: &Path, from: &str, to: &str) -> bool {
 
 /// Every subscription file beside `store` with `change` made to each of
 /// its subscriptions, written when it changed one: whether each was.
-fn files_changed(store: &Path, change: impl Fn(&mut Value) -> bool) -> bool {
+pub(crate) fn files_changed(store: &Path, change: impl Fn(&mut Value) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir(store)) else {
         return true;
     };

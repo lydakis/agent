@@ -669,7 +669,7 @@ pub fn commons() -> Value {
             );
             fields.extend(work);
         }
-        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, finish or fail it.");
+        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, pause, finish or fail it.");
     }
     json!({
         "name": COMMONS,

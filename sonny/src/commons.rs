@@ -3807,12 +3807,13 @@ impl View {
             let by = post["by"].as_str().unwrap_or_default();
             let when = when(post["at"].as_i64().unwrap_or(0));
             // What an agent did to the work: who, what, when, one muted
-            // row; a closing one has its text under it, as any post.
+            // row; a closing one, or a pause saying why, has its text
+            // under it, as any post.
             if let Some(did) =
                 crate::board_view::action_words(post, at == 0, cancels[at], &self.project)
             {
                 out.push(Line::from(format!("{by} · {did} · {when}")).dim());
-                let closes = matches!(post["do"].as_str(), Some("done" | "fail"));
+                let closes = matches!(post["do"].as_str(), Some("done" | "fail" | "pause"));
                 let text = post["text"].as_str().unwrap_or_default();
                 if closes && !text.trim().is_empty() {
                     let mut markdown = crate::transcript::Markdown::default();

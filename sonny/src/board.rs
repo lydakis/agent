@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 /// What an agent does to work, as a reply's `do`: open it, take it, drop
-/// it back, or close it done or failed.
-pub const VERBS: [&str; 5] = ["open", "take", "drop", "done", "fail"];
+/// it back, close it done or failed, or pause it until it is opened again.
+pub const VERBS: [&str; 6] = ["open", "take", "drop", "done", "fail", "pause"];
 
 /// The most of work's title, as of a task's: its verb first.
 pub const TITLE_CHARS: usize = 30;
@@ -68,9 +68,10 @@ pub fn valid_board(board: &str) -> Result<(), String> {
 /// What a board's follow hears, as the commons source names each step on
 /// a board in its `event`: work opening (new, open again, or its needs
 /// met), taken, dropped, settling, a plain thread starting there, the
-/// board's last work settling, and held work going quiet.
-pub const EVENTS: [&str; 9] = [
+/// board's last work settling, held work going quiet, and work paused.
+pub const EVENTS: [&str; 10] = [
     "opened", "taken", "dropped", "done", "failed", "canceled", "posted", "emptied", "quiet",
+    "paused",
 ];
 
 /// A pattern every event of the commons matches, as a steer: each post,
@@ -129,15 +130,17 @@ pub const ASKED: &str = "you're asked to take this work";
 /// Why a thread on a board reaches an agent that posted in it.
 pub const POSTED: &str = "you posted here";
 
-/// What follows a thread on a board for an agent, for `about`'s reason:
-/// each post as it comes, cutting into a busy turn, and, with `quiet`,
-/// a word once nothing is posted there for that long. As any thread an
-/// agent posts in, it lasts while the agent is closed.
+/// What follows work's thread for an agent, for `about`'s reason: each
+/// post as it comes, cutting into a busy turn, and, with `quiet`, a word
+/// once nothing is posted there for that long. Unlike a plain thread an
+/// agent posts in, it ends when the agent closes: work is what it was
+/// there for.
 pub fn post_follow(thread: &str, owner: Option<i64>, about: &str, quiet: Option<String>) -> Sub {
     let mut sub = Sub::commons(thread, owner);
     sub.steer = Some(every());
     sub.about = Some(about.to_owned());
     sub.quiet = quiet;
+    sub.outlives_close = false;
     sub
 }
 
@@ -182,11 +185,15 @@ pub fn follows(
     let holds = work["state"] == "taken" && work["holder"] == caller;
     let asked = matches!(work["state"].as_str(), Some("open"))
         && (work["for"].as_array().into_iter().flatten()).any(|named| named == caller);
-    Some(match (holds, asked) {
+    let mut follow = match (holds, asked) {
         (true, _) => post_follow(thread, id, HOLDS, hold_quiet()),
         (false, true) => post_follow(thread, id, ASKED, None),
         _ => post_follow(thread, id, POSTED, None),
-    })
+    };
+    // A plain thread on a board lasts while its agent is closed, as any
+    // commons thread it posts in; work's thread ends with it.
+    follow.outlives_close = !work.is_object();
+    Some(follow)
 }
 
 /// The agents a post or a reply of the commons tool names as `@NAME`, in
@@ -243,6 +250,7 @@ pub fn event_of(posts: &[Value], n: usize, thread: &str) -> &'static str {
         Some("take") => "taken",
         Some("drop") => "dropped",
         Some("done") => "done",
+        Some("pause") => "paused",
         Some("fail") => match standing(&posts[..=n]).is_some_and(|it| it["state"] == "canceled") {
             true => "canceled",
             false => "failed",
@@ -286,7 +294,7 @@ pub fn valid_title(title: &str) -> Result<(), String> {
 
 /// Where the work a thread's posts make stands, from its marked posts in
 /// order: None for a thread no `open` made work. Its `state` is open,
-/// taken, done, failed or canceled; whether an open one waits on its
+/// paused, taken, done, failed or canceled; whether an open one waits on its
 /// needs is [`waiting`]'s, which knows the other work.
 ///
 /// `{board, state, by, by_id?, at, labels, needs, for?, title?, holder?, holder_id?, result?}`:
@@ -319,7 +327,10 @@ pub fn standing(posts: &[Value]) -> Option<Value> {
         let Some(it) = item.as_mut().and_then(Value::as_object_mut) else {
             continue;
         };
-        let unheld = it.get("state").and_then(Value::as_str) == Some("open");
+        let unheld = matches!(
+            it.get("state").and_then(Value::as_str),
+            Some("open" | "paused")
+        );
         let mut set = |key: &str, value: Value| _ = it.insert(key.to_owned(), value);
         match action {
             "open" if !made => {
@@ -343,6 +354,7 @@ pub fn standing(posts: &[Value]) -> Option<Value> {
                 set("state", json!("done"));
                 set("result", post["text"].clone());
             }
+            "pause" => set("state", json!("paused")),
             // Its maker's fail while nobody holds it takes it back.
             "fail" => {
                 set("state", json!(if unheld { "canceled" } else { "failed" }));
@@ -461,7 +473,8 @@ fn title_of(thread: &Value) -> &str {
 }
 
 /// Work still to be done on `board` titled `title` but for case, other
-/// than `but`: a second would be the same work twice.
+/// than `but`: a second would be the same work twice. Paused work is
+/// still to be done.
 fn same_title<'a>(
     items: &'a [(String, Value)],
     board: &str,
@@ -473,7 +486,10 @@ fn same_title<'a>(
         .find(|(name, thread)| {
             name != but
                 && thread["work"]["board"] == board
-                && matches!(thread["work"]["state"].as_str(), Some("open" | "taken"))
+                && matches!(
+                    thread["work"]["state"].as_str(),
+                    Some("open" | "taken" | "paused")
+                )
                 && title_of(thread).trim().to_lowercase() == title
         })
         .map(|(name, _)| name.as_str())
@@ -782,14 +798,15 @@ pub fn reply(
             let holds = state == "taken" && same_agent(holder, holder_id);
             // The maker, not another agent later given its name.
             let made_it = same_agent(it["by"].as_str(), it["by_id"].as_i64());
+            let leads = caller.lead && ours(board);
             if changes {
                 if !ours(board) {
                     return Err(not_ours(board, "change work"));
                 }
                 if !post["needs"].is_null() {
-                    if state != "open" {
+                    if !matches!(state, "open" | "paused") {
                         return Err(format!(
-                            "work_closed: {thread} is {state}; needs change only while it is open"
+                            "work_closed: {thread} is {state}; needs change only while it is open or paused"
                         ));
                     }
                     let needs: Vec<String> =
@@ -805,11 +822,15 @@ pub fn reply(
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
                     let met_before = needs_met(&items, board, &was).unwrap_or(false);
-                    if needs_met(&items, board, &needs)? && !met_before && action.is_none() {
+                    if needs_met(&items, board, &needs)?
+                        && !met_before
+                        && action.is_none()
+                        && state == "open"
+                    {
                         opened.push(thread.to_owned());
                     }
                 }
-                if !post["for"].is_null() && !matches!(state, "open" | "taken") {
+                if !post["for"].is_null() && !matches!(state, "open" | "taken" | "paused") {
                     return Err(format!("work_closed: {thread} is {state}"));
                 }
             }
@@ -819,9 +840,15 @@ pub fn reply(
                     if !ours(board) {
                         return Err(not_ours(board, "open work"));
                     }
-                    if !matches!(state, "failed" | "canceled") {
+                    if !matches!(state, "failed" | "canceled" | "paused") {
                         return Err(format!(
-                            "work_invalid: {thread} is {state}; open only failed or canceled work"
+                            "work_invalid: {thread} is {state}; open only paused, failed or canceled work"
+                        ));
+                    }
+                    // Who paused it says when it is ready: its maker or the lead.
+                    if state == "paused" && !(made_it || leads) {
+                        return Err(format!(
+                            "work_not_maker: only {thread}'s maker or the project's lead opens it once paused"
                         ));
                     }
                     if let Some(same) = same_title(
@@ -881,6 +908,11 @@ pub fn reply(
                                 ));
                             }
                         }
+                        ("paused", _) => {
+                            return Err(format!(
+                                "work_paused: {thread} is paused until its maker or the lead opens it; pick other work"
+                            ));
+                        }
                         ("taken", Some(_)) if holds => {
                             return Err(format!("work_held: {thread} is yours already"));
                         }
@@ -904,7 +936,6 @@ pub fn reply(
                 Some("drop") => {
                     // Its holder gives it back; its maker or a lead of the
                     // board's project takes it from a live holder, saying why.
-                    let leads = caller.lead && ours(board);
                     if state != "taken" || !(holds || made_it || leads) {
                         return Err(format!(
                             "work_not_holder: only {thread}'s holder{}, its maker or the project's lead drops it",
@@ -922,8 +953,22 @@ pub fn reply(
                     }
                     opened = opened_by(dir, board, thread);
                 }
+                Some("pause") => {
+                    // Work no one holds yet, kept from being taken until
+                    // its maker or the lead opens it again.
+                    if state != "open" {
+                        return Err(format!(
+                            "work_invalid: {thread} is {state}; pause only open work, which no one holds"
+                        ));
+                    }
+                    if !(made_it || leads) {
+                        return Err(format!(
+                            "work_not_maker: only {thread}'s maker or the project's lead pauses it"
+                        ));
+                    }
+                }
                 Some("fail") => {
-                    let unheld = state == "open";
+                    let unheld = matches!(state, "open" | "paused");
                     if !(holds || (unheld && made_it)) {
                         return Err(format!(
                             "work_not_holder: only {thread}'s holder fails it, or its maker while nobody holds it{}",
@@ -938,7 +983,7 @@ pub fn reply(
     if !opened.is_empty() {
         post["opened"] = json!(opened);
     }
-    // The board's last open or held work settling empties it.
+    // The board's last open, paused or held work settling empties it.
     let settles = matches!(action, Some("done" | "fail"));
     if settles
         && opened.is_empty()
@@ -946,7 +991,10 @@ pub fn reply(
         && !(items.iter()).any(|(name, it)| {
             name != thread
                 && it["work"]["board"] == board
-                && matches!(it["work"]["state"].as_str(), Some("open" | "taken"))
+                && matches!(
+                    it["work"]["state"].as_str(),
+                    Some("open" | "taken" | "paused")
+                )
         })
     {
         post["emptied"] = json!(board);
@@ -1039,6 +1087,39 @@ fn opened_by(dir: &Path, board: &str, thread: &str) -> Vec<String> {
         })
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// Follows of work's threads end when their agent closes (after 0.10.4).
+pub const WORK_FOLLOWS_CLOSE: &str = "board-work-follows-close";
+
+/// Each follow of work's thread beside `store`, as [`post_follow`] wrote
+/// it for why its agent was there, ends with its agent from now on, once
+/// for the store: work's threads in `home`'s commons say which are work.
+/// One of a plain thread on a board still lasts while its agent is closed.
+pub fn work_follows_close(store: &Path, home: &Path) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    let dir = commons::dir(home);
+    let prefix = format!("{}.", agent_client::config::COMMONS_SOURCE);
+    crate::upgrade::once(Path::new(&record), WORK_FOLLOWS_CLOSE, || {
+        crate::lookout::subs::files_changed(store, |sub| {
+            let about = sub["about"].as_str();
+            let Some(thread) = sub["name"]
+                .as_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+            else {
+                return false;
+            };
+            let work = sub["outlives_close"] == true
+                && [HOLDS, ASKED, POSTED].iter().any(|why| about == Some(why))
+                && commons::posts(&dir.join(format!("{thread}.jsonl")))
+                    .is_ok_and(|posts| standing(&posts).is_some());
+            if work && let Some(sub) = sub.as_object_mut() {
+                sub.remove("outlives_close");
+            }
+            work
+        })
+    });
 }
 
 /// Work's steps take the verbs boards have now, the board tool folded
@@ -2116,5 +2197,132 @@ mod tests {
         let said = lead(plain.clone()).unwrap();
         assert!(follows(&store, "shop.lead", Some(1), &plain, &said).is_none());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn its_maker_or_the_lead_pauses_open_work_and_only_they_open_it() {
+        let home = home("pause");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        let w1 = |args| send(&home, "shop.w1", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        lead(work(
+            "api",
+            "Type the api errors",
+            json!({"needs": ["store"]}),
+        ))
+        .unwrap();
+        let refused = w1(act("store", "pause")).unwrap_err();
+        assert!(refused.starts_with("work_not_maker"), "{refused}");
+        let paused = lead(act("store", "pause")).unwrap();
+        assert_eq!(paused["work"]["state"], "paused", "{paused}");
+        // Never offered: not open, and no one takes it.
+        assert!(open_names(&home).is_empty());
+        assert_eq!(listed(&home, json!({"state": ["paused"]})), ["store"]);
+        let taken = w1(act("store", "take")).unwrap_err();
+        assert!(taken.starts_with("work_paused"), "{taken}");
+        // Paused work is still to be done: its title stays its own.
+        let twice = lead(work("store2", "Type the store errors", json!({}))).unwrap_err();
+        assert!(twice.starts_with("work_exists"), "{twice}");
+        // Only its maker or the lead opens it again.
+        let opened = w1(act("store", "open")).unwrap_err();
+        assert!(opened.starts_with("work_not_maker"), "{opened}");
+        let opened = lead(act("store", "open")).unwrap();
+        assert_eq!(opened["work"]["state"], "open", "{opened}");
+        assert_eq!(open_names(&home), ["store"]);
+        // Work waiting on its needs pauses too, and its needs done leave
+        // it paused; opened, it is open.
+        lead(act("api", "pause")).unwrap();
+        w1(act("store", "take")).unwrap();
+        let done = w1(act("store", "done")).unwrap();
+        assert!(done.get(ASK_FOR).is_none(), "{done}");
+        assert_eq!(listed(&home, json!({"state": ["paused"]})), ["api"]);
+        // A board with paused work left is not emptied.
+        let posts = commons::posts(&commons::dir(&home).join("store.jsonl")).unwrap();
+        assert!(posts.last().unwrap()["emptied"].is_null());
+        assert_eq!(event_of(&posts, 0, "store"), "opened");
+        assert_eq!(event_of(&posts, 1, "store"), "paused");
+        let opened = lead(act("api", "open")).unwrap();
+        assert_eq!(opened["work"]["state"], "open", "{opened}");
+        // Taken work is its holder's to drop, never paused.
+        w1(act("api", "take")).unwrap();
+        let held = lead(act("api", "pause")).unwrap_err();
+        assert!(held.starts_with("work_invalid"), "{held}");
+        // A worker pauses the work it made; failing it then cancels it.
+        w1(work("docs", "Write the error docs", json!({}))).unwrap();
+        w1(act("docs", "pause")).unwrap();
+        let canceled = w1(act("docs", "fail")).unwrap();
+        assert_eq!(canceled["work"]["state"], "canceled", "{canceled}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn works_threads_end_with_their_agent_and_plain_threads_outlast_it() {
+        let home = home("work-close");
+        let store = home.join("store");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        let opened = work("store", "Type the store errors", json!({}));
+        let said = lead(opened.clone()).unwrap();
+        let work_follow = follows(&store, "shop.lead", Some(1), &opened, &said).unwrap();
+        assert!(!work_follow.outlives_close);
+        let plain = json!({"post": {"name": "idea", "title": "An idea",
+            "text": "x", "board": "shop/errors"}});
+        let said = lead(plain.clone()).unwrap();
+        let plain_follow = follows(&store, "shop.lead", Some(1), &plain, &said).unwrap();
+        assert!(plain_follow.outlives_close);
+        assert!(
+            !Sub::from_json(&work_follow.to_json())
+                .unwrap()
+                .outlives_close
+        );
+        crate::lookout::subs::put(&store, "shop.lead", work_follow).unwrap();
+        crate::lookout::subs::put(&store, "shop.lead", plain_follow).unwrap();
+        assert_eq!(
+            crate::lookout::subs::closed(&store, "shop.lead", Some(1)),
+            Ok(2)
+        );
+        let kept: Vec<String> = (crate::lookout::subs::read(&store, "shop.lead").into_iter())
+            .map(|sub| sub.name)
+            .collect();
+        assert_eq!(kept, ["commons.idea"]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn follows_of_works_threads_written_before_end_with_their_agent_once() {
+        let home = home("work-close-migrate");
+        let store = home.join("store");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        lead(json!({"post": {"name": "idea", "title": "An idea",
+            "text": "x", "board": "shop/errors"}}))
+        .unwrap();
+        // As 0.10.4 wrote them: each lasting while its agent is closed.
+        let before = |thread: &str| {
+            let mut sub = post_follow(thread, Some(1), POSTED, None);
+            sub.outlives_close = true;
+            sub
+        };
+        crate::lookout::subs::put(&store, "shop.lead", before("store")).unwrap();
+        crate::lookout::subs::put(&store, "shop.lead", before("idea")).unwrap();
+        crate::lookout::subs::put(&store, "shop.lead", Sub::commons("q", Some(1))).unwrap();
+        work_follows_close(&store, &home);
+        let mut outlast: Vec<String> = (crate::lookout::subs::read(&store, "shop.lead")
+            .into_iter())
+        .filter(|sub| sub.outlives_close)
+        .map(|sub| sub.name)
+        .collect();
+        outlast.sort();
+        assert_eq!(outlast, ["commons.idea", "commons.q"]);
+        // Once: a follow written afterwards as before stays as it is.
+        crate::lookout::subs::put(&store, "shop.lead", before("store")).unwrap();
+        work_follows_close(&store, &home);
+        assert!(
+            (crate::lookout::subs::read(&store, "shop.lead").iter())
+                .any(|sub| sub.name == "commons.store" && sub.outlives_close)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(record);
     }
 }
