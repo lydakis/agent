@@ -1723,7 +1723,7 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   muted, `set in ~/.agent/config.toml`, since a source is yours to remove
   there and `x` removes nothing on its page; its
   filter and steer in words (`where text starts with "main:"`; one that
-  nests or has `$or` as written), digest, end as a date and what is left
+  nests or has `$or` as written), digest, quiet, end as a date and what is left
   of the updates it lasts (`2 of 3 updates left`); and what it told in the
   last day (`2 updates in the last day, 1 steered · last 2m ago`), read
   from the lookout's own files only while the page is open; a command's

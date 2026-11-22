@@ -2585,6 +2585,14 @@ impl View {
                 vec![Field::text(format!("at most every {digest}"))],
             ));
         }
+        if let Some(quiet) = &sub.quiet {
+            fields.push((
+                "quiet",
+                vec![Field::text(format!(
+                    "tells once after {quiet} with nothing"
+                ))],
+            ));
+        }
         if let Some(until) = &sub.until {
             let until = sub.ends_at().map_or_else(|| until.clone(), trigger::date);
             fields.push(("until", vec![Field::text(until)]));
@@ -2973,6 +2981,9 @@ impl View {
         }
         if let Some(steer) = &sub.steer {
             words.push(format!("steers when {}", pattern(steer)));
+        }
+        if let Some(quiet) = &sub.quiet {
+            words.push(format!("quiet after {quiet}"));
         }
         if let Some(until) = &sub.until {
             let until = sub.ends_at().map_or_else(|| until.clone(), trigger::date);
@@ -3643,7 +3654,7 @@ mod tests {
             runs: Some(3),
             made: Some(7),
             outlives_close: false,
-            quiet: None,
+            quiet: Some("30m".into()),
             about: None,
         };
         let now = now_ms();
@@ -3725,6 +3736,7 @@ mod tests {
                 "where    text starts with \"main:\" or starts with \"release:\"".into(),
                 "steers   {\"$or\": [{\"text\": [{\"suffix\": \"failed\"}]}]}".into(),
                 "tells    at most every 5m".into(),
+                "quiet    tells once after 30m with nothing".into(),
                 format!("until    {until}"),
                 "lasts    2 of 3 updates left".into(),
                 "told     2 updates in the last day, 1 steered · last 2m ago".into(),
@@ -3739,7 +3751,7 @@ mod tests {
         )));
         assert!(
             view.follow_words(&sub)
-                .ends_with(&format!("at most every 5m, steers when {{\"$or\": [{{\"text\": [{{\"suffix\": \"failed\"}}]}}]}}, until {until}, for 3 updates")),
+                .ends_with(&format!("at most every 5m, steers when {{\"$or\": [{{\"text\": [{{\"suffix\": \"failed\"}}]}}]}}, quiet after 30m, until {until}, for 3 updates")),
         );
         // At 44 columns the newest word goes under its name, whole.
         assert_eq!(

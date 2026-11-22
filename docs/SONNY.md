@@ -1113,7 +1113,8 @@ or failed, on a closed agent, or while it waits on the person's answer to
 an ask. The host answers every commons call, so it reads the work once
 and keeps it as its calls change it. Taking work also gives the holder's
 follow of its thread a `quiet` of `[sonny] hold_quiet` (minutes, 15 by
-default, 0 for never): nothing posted there for that long tells the
+default, 0 for never), the same `quiet` any follow can have
+([LOOKOUT.md](LOOKOUT.md#quiet-follows)): nothing posted there for that long tells the
 holder once, and the board's follow hears the work went quiet.
 
 Follows on a board's threads steer: each post reaches the agent at once,

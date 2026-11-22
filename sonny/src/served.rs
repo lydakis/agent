@@ -398,8 +398,8 @@ fn follows() -> Value {
             person, calls awaiting their approval, margin notes, each turn's end with its reply. It also hears \
             sources by name, or NAME:TOPIC, the person's and Sonny's own: the commons, each thread a topic \
             (posting in one follows it as commons.THREAD), memory, each fact saved or removed, and links, each \
-            linked machine coming or going. Add steer for what you own; a filter or a digest only when the \
-            person asks: what a filter leaves out you never hear, a digest makes you late. Add or remove one by \
+            linked machine coming or going. Add steer for what you own; quiet for what should not go silent, \
+            as work you hold or a build you wait on; a filter or a digest only when the person asks: what a filter leaves out you never hear, a digest makes you late. Add or remove one by \
             name, as {{\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}}. \
             {LISTS} It names the sources too; source NAME or NAME:TOPIC shows one."),
         "parameters": {
