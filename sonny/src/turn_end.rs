@@ -80,10 +80,11 @@ impl Ends {
     /// `thread` now reads as `read`, or is gone.
     fn refreshed(&mut self, thread: &str, read: Option<(Stamp, Option<Value>)>) {
         // A take let go is no longer the one its holder was told of, nor
-        // one taken over by another agent of its name.
+        // one taken over by another agent of its name, nor one let go and
+        // taken again since.
         let was = self.threads.get(thread).and_then(|(_, work)| work.as_ref());
         let now = read.as_ref().and_then(|(_, work)| work.as_ref());
-        let id = |t: Option<&Value>| t.map(|t| t["work"]["holder_id"].clone());
+        let id = |t: Option<&Value>| t.map(|t| (t["work"]["holder_id"].clone(), t[TAKES].clone()));
         let same = id(was) == id(now);
         let holder = now.and_then(|t| t["work"]["holder"].as_str());
         (self.held).retain(|(one, at)| at != thread || (same && Some(one.as_str()) == holder));
@@ -242,14 +243,25 @@ fn listing(dir: &Path) -> Option<Vec<(String, Stamp)>> {
     Some(here.collect())
 }
 
+/// How a take is written in a thread's file.
+const TAKE: &[u8] = br#""do":"take""#;
+/// Where a thread as kept here counts its takes.
+const TAKES: &str = "takes";
+
 /// The threads `stale` read again from the commons `dir`, each with its
 /// work, if it is work. One that will not read, as one half written, is
 /// left as it was, to be read once it changes again.
 fn reread(dir: &Path, stale: Vec<(String, Stamp)>) -> Vec<(String, Stamp, Option<Value>)> {
     (stale.into_iter())
         .filter_map(|(name, stamp)| {
-            let path = dir.join(format!("{name}.jsonl"));
-            let thread = crate::commons::summary(&name, &path)?;
+            let text = std::fs::read(dir.join(format!("{name}.jsonl"))).ok()?;
+            let mut thread = crate::commons::summary_of(&name, &text)?;
+            // Which take it is: the takes so far, each a line marked so,
+            // as a post's text holds its quotes escaped.
+            let takes = (text.split(|b| *b == b'\n'))
+                .filter(|line| line.windows(TAKE.len()).any(|w| w == TAKE))
+                .count();
+            thread[TAKES] = json!(takes);
             let work = thread["work"].is_object().then_some(thread);
             Some((name, stamp, work))
         })
@@ -622,16 +634,21 @@ mod tests {
         let found = end(&mut ends, &home, "shop.w.1", None, 3, true, &boards);
         assert_eq!(found.holding.len(), 1, "{found:?}");
         assert!(ends.told("shop.w.1", None, found).is_some());
-        // Let go there, and taken again, it is news once more.
+        // Let go there and taken again, even unseen between, it is news
+        // once more.
         send(&home, &mut elsewhere, "shop.w.1", 3, act("store", "drop"));
-        let found = end(&mut ends, &home, "shop.w.1", None, 4, true, &boards);
-        assert!(found.holding.is_empty(), "{found:?}");
         send(&home, &mut elsewhere, "shop.w.1", 4, act("store", "take"));
         let found = end(&mut ends, &home, "shop.w.1", None, 5, true, &boards);
         assert_eq!(found.holding.len(), 1, "{found:?}");
+        assert!(ends.told("shop.w.1", None, found).is_some());
+        // A reply there is the same take, told of already.
+        let reply = json!({"reply": {"thread": "store", "text": "on it"}});
+        send(&home, &mut elsewhere, "shop.w.1", 5, reply);
+        let found = end(&mut ends, &home, "shop.w.1", None, 6, true, &boards);
+        assert!(found.holding.is_empty(), "{found:?}");
         // A thread gone is forgotten.
         std::fs::remove_file(crate::commons::dir(&home).join("store.jsonl")).unwrap();
-        let found = end(&mut ends, &home, "shop.w.1", None, 6, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", None, 7, true, &boards);
         assert_eq!(found, Found::default());
         assert!(ends.threads.is_empty());
         let _ = std::fs::remove_dir_all(&home);

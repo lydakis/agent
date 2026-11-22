@@ -1496,7 +1496,11 @@ const OPENING: &str = "opening";
 /// count of lines, decoding no post between them but a board's actions:
 /// an item's, under `item`, as [`crate::board::item`] reads its posts.
 pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
-    let text = std::fs::read(path).ok()?;
+    summary_of(name, &std::fs::read(path).ok()?)
+}
+
+/// [`summary`] of a thread's file as read, `text`.
+pub(crate) fn summary_of(name: &str, text: &[u8]) -> Option<Value> {
     let all: Vec<&[u8]> = (text.split(|b| *b == b'\n'))
         .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
         .collect();
