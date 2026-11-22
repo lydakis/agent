@@ -480,12 +480,14 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // A path in the lead's folder would have the task write there instead
     // of in its copy, where nothing keeps it apart from the lead's work.
     let mut brief = vec![start.brief.clone()];
+    let pwd = shell_pwd(start);
+    let pwd = pwd.as_deref();
     // A helper's are where they were in its task's worktree.
     if let (Some(top), Some((_, worktree))) = (&helped, &place.copy) {
-        brief = in_copy(&brief, top, worktree).0;
+        brief = in_copy(&brief, top, worktree, pwd).0;
     }
     let (brief, moved) = match &place.copy {
-        Some((from, to)) => in_copy(&brief, from, to),
+        Some((from, to)) => in_copy(&brief, from, to, pwd),
         None => (brief, 0),
     };
     let mut brief = brief.join(" ");
@@ -494,7 +496,11 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     }
     // The commons threads that share the brief's words, named under it.
     let brief = match (crate::commons::pointer_on(), std::env::var_os("HOME")) {
-        (true, Some(home)) => crate::commons::pointed(Path::new(&home), &brief),
+        (true, Some(home)) => crate::commons::pointed(
+            Path::new(&home),
+            &brief,
+            env_of(start, crate::commons::POINTER_ENV),
+        ),
         _ => brief,
     };
     let run = |mut command: Command, flags: &[String]| {
@@ -550,7 +556,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             let socket = env_of(start, "AGENT_SOCKET").map(PathBuf::from);
             match crate::daemon_paths(Some(store.clone()), socket) {
                 Ok((store, socket)) => {
-                    let call = std::env::var("AGENT_CALL").unwrap_or_default();
+                    let call = env_of(start, "AGENT_CALL").unwrap_or_default();
                     make_room(name, (&store, &socket), keep, &call)
                 }
                 Err(_) => Vec::new(),
@@ -783,6 +789,17 @@ fn started_on(start: &Start) -> Option<PathBuf> {
 
 /// `key` as the task's agent commands see it: as `start` sets it, else as
 /// Sonny has it.
+/// The shell's own name for where it is, which may go through a link:
+/// the one the start names, else this process's, when it is where it says.
+fn shell_pwd(start: &Start) -> Option<PathBuf> {
+    if let Some((_, pwd)) = start.env.iter().find(|(key, _)| key == "PWD") {
+        return Some(PathBuf::from(pwd));
+    }
+    let (pwd, here) = (std::env::var_os("PWD")?, std::env::current_dir().ok()?);
+    let pwd = PathBuf::from(pwd);
+    (std::fs::canonicalize(&pwd).ok()? == std::fs::canonicalize(here).ok()?).then_some(pwd)
+}
+
 fn env_of(start: &Start, key: &str) -> Option<String> {
     (start.env.iter().find(|(k, _)| k == key))
         .map(|(_, value)| value.clone())
@@ -1014,8 +1031,8 @@ fn told(
 /// link in the home to it or a folder holding it (`~/projects` for
 /// `/Volumes/projects`), each also from `~`, and macOS's `/tmp` for
 /// `/private/tmp`.
-fn in_copy(brief: &[String], from: &Path, to: &Path) -> (Vec<String>, usize) {
-    let names = names(from);
+fn in_copy(brief: &[String], from: &Path, to: &Path, pwd: Option<&Path>) -> (Vec<String>, usize) {
+    let names = names(from, pwd);
     let to = to.to_string_lossy();
     let mut moved = 0;
     let brief = brief
@@ -1030,18 +1047,15 @@ fn in_copy(brief: &[String], from: &Path, to: &Path) -> (Vec<String>, usize) {
 }
 
 /// Every name of the folder `from` a brief might use, longest first.
-fn names(from: &Path) -> Vec<String> {
+fn names(from: &Path, pwd: Option<&Path>) -> Vec<String> {
     let mut names = vec![from.to_path_buf()];
     let canonical = std::fs::canonicalize(from).unwrap_or_else(|_| from.to_owned());
     names.push(canonical.clone());
     // The shell's own name for where it is, which may go through a link.
-    if let (Some(pwd), Ok(here)) = (std::env::var_os("PWD"), std::env::current_dir()) {
-        let pwd = PathBuf::from(pwd);
-        let here = std::fs::canonicalize(here).unwrap_or_default();
-        if std::fs::canonicalize(&pwd).is_ok_and(|real| real == here)
-            && let Ok(below) = here.strip_prefix(&canonical)
-        {
-            let mut top = pwd;
+    if let Some(pwd) = pwd {
+        let here = std::fs::canonicalize(pwd).unwrap_or_default();
+        if let Ok(below) = here.strip_prefix(&canonical) {
+            let mut top = pwd.to_path_buf();
             for _ in below.components() {
                 top.pop();
             }
