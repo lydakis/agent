@@ -155,6 +155,9 @@ impl Rows {
 #[serde(rename_all = "snake_case")]
 enum Line {
     Waiting(Shared),
+    /// As `Waiting`, with each project's place as told last: a store of
+    /// many projects tells them once, not on every change.
+    Kept(Shared),
     Rows(Moved),
 }
 
@@ -658,10 +661,18 @@ async fn tell_on(stream: UnixStream, mut shared: watch::Receiver<Shared>, book: 
     let mut asks = BufReader::new(read).lines();
     let mut rows: Option<(Asking<'_>, broadcast::Receiver<Arc<Moved>>, u64)> = None;
     let mut told = false;
+    let mut order_told = None;
     loop {
         if !told {
             told = true;
-            let line = Line::Waiting(shared.borrow_and_update().clone());
+            let mut now = shared.borrow_and_update().clone();
+            let line = if order_told.as_ref() == Some(&now.order) {
+                now.order = HashMap::new();
+                Line::Kept(now)
+            } else {
+                order_told = Some(now.order.clone());
+                Line::Waiting(now)
+            };
             if !write_line(&mut write, &line).await {
                 return;
             }
@@ -729,6 +740,15 @@ async fn hear(stream: UnixStream, tell: &watch::Sender<Shared>, here: &Here) {
                     Ok(Line::Waiting(mut shared)) => {
                         tell.send_if_modified(|was| {
                             let moved = *was != shared;
+                            *was = std::mem::take(&mut shared);
+                            moved
+                        });
+                    }
+                    Ok(Line::Kept(mut shared)) => {
+                        tell.send_if_modified(|was| {
+                            let order = std::mem::take(&mut was.order);
+                            let moved = *was != shared;
+                            shared.order = order;
                             *was = std::mem::take(&mut shared);
                             moved
                         });
@@ -1600,6 +1620,65 @@ mod tests {
 
     /// The socket the others hear on fits a Unix socket's address, however
     /// long the store's path.
+    /// A window that connected is told each project's place once, and
+    /// keeps it while the rest moves.
+    #[tokio::test]
+    async fn each_projects_place_is_told_once_and_kept() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let order = HashMap::from([("shop".to_owned(), 0), ("tally".to_owned(), 1)]);
+        let first = Shared {
+            order: order.clone(),
+            ..Default::default()
+        };
+        let (lead_tell, lead_shared) = watch::channel(first.clone());
+        let book = Arc::new(Book::new());
+        // One window as it reads the lines, and one as it hears them.
+        let (raw, at_raw) = UnixStream::pair().unwrap();
+        tokio::spawn(tell_on(at_raw, lead_shared.clone(), book.clone()));
+        let (heard, at_heard) = UnixStream::pair().unwrap();
+        tokio::spawn(tell_on(at_heard, lead_shared, book));
+        let (tell, mut told) = watch::channel(Shared::default());
+        let (_wish, wanted) = watch::channel(Wish::default());
+        tokio::spawn(async move {
+            let here = Here {
+                rows: Default::default(),
+                wanted,
+                woken: Default::default(),
+            };
+            hear(heard, &tell, &here).await
+        });
+        let mut lines = BufReader::new(raw).lines();
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert!(
+            line.starts_with(r#"{"waiting":"#) && line.contains("tally"),
+            "{line}"
+        );
+        told.wait_for(|shared| *shared == first).await.unwrap();
+
+        let second = Shared {
+            order,
+            agents: vec![(1, "tally".to_owned(), "tally.fix".to_owned())],
+            above: BTreeMap::from([("tally.fix".to_owned(), vec!["tally.lead".to_owned()])]),
+            ..Default::default()
+        };
+        lead_tell.send_replace(second.clone());
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert!(line.starts_with(r#"{"kept":"#), "{line}");
+        assert!(!line.contains(r#""shop""#), "{line}");
+        told.wait_for(|shared| *shared == second).await.unwrap();
+
+        // A project added: every place again.
+        let mut third = second.clone();
+        third.order.insert("web".to_owned(), 2);
+        lead_tell.send_replace(third.clone());
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert!(
+            line.starts_with(r#"{"waiting":"#) && line.contains("web"),
+            "{line}"
+        );
+        told.wait_for(|shared| *shared == third).await.unwrap();
+    }
+
     #[test]
     fn the_shared_socket_fits_beside_a_long_store() {
         let short = std::env::temp_dir().join("s/state.sqlite");
