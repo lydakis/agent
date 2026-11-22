@@ -2912,7 +2912,7 @@ async fn answer(
     match said {
         Some(said) if said["output"].is_string() => {
             let output = str_of(&said["output"]);
-            noted(name, bot, turn, &call["call_id"], &arguments, &output);
+            noted(name, bot, turn, &call["call_id"], &arguments, &output).await;
             Ok(output)
         }
         Some(said) if said["error"]["code"].is_string() => Err((
@@ -2930,14 +2930,20 @@ async fn answer(
 /// in a process of its own, so what a turn's end reads is noted here, in
 /// the host, from the call and its answer. A commons post or reply wrote
 /// in its thread; an ask that waits for the person holds its turn's end.
-fn noted(name: &str, bot: &str, turn: i64, call: &Value, arguments: &Value, output: &str) {
+async fn noted(name: &str, bot: &str, turn: i64, call: &Value, arguments: &Value, output: &str) {
     match name {
         COMMONS if arguments["post"].is_object() || arguments["reply"].is_object() => {
             let said: Value = serde_json::from_str(output).unwrap_or_default();
             if let (Some(thread), Some(home)) = (said["thread"].as_str(), std::env::var_os("HOME"))
                 && said["posted"] != false
             {
-                crate::turn_end::wrote(Path::new(&home), bot, Some(turn), thread);
+                // It reads the thread: off the runtime, done before the
+                // answer goes back.
+                let (bot, thread) = (bot.to_owned(), thread.to_owned());
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::turn_end::wrote(Path::new(&home), &bot, Some(turn), &thread)
+                })
+                .await;
             }
         }
         crate::asks::TOOL => {

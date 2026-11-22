@@ -58,20 +58,33 @@ impl Ends {
 
     /// `bot`'s turn `turn` wrote in `thread`, which the commons in `home`
     /// now holds as it is.
+    #[cfg(test)]
     pub fn wrote(&mut self, home: &Path, bot: &str, turn: Option<i64>, thread: &str) {
+        if self.writes(bot, turn, thread) {
+            self.refreshed(thread, read(home, thread));
+        }
+    }
+
+    /// `bot`'s turn `turn` wrote in `thread`: whether the work it keeps
+    /// is read, so the thread is to be read again.
+    fn writes(&mut self, bot: &str, turn: Option<i64>, thread: &str) -> bool {
         if let Some(turn) = turn {
             (self.wrote.entry((bot.to_owned(), turn)).or_default()).insert(thread.to_owned());
         }
-        if let Some(work) = self.work.as_mut() {
-            let path = crate::commons::dir(home).join(format!("{thread}.jsonl"));
-            let summary = crate::commons::summary(thread, &path).filter(|t| t["work"].is_object());
-            // A take let go is no longer the one its holder was told of.
-            let holder = summary.as_ref().and_then(|t| t["work"]["holder"].as_str());
-            (self.held).retain(|(one, at)| at != thread || Some(one.as_str()) == holder);
-            match summary {
-                Some(summary) => _ = work.insert(thread.to_owned(), summary),
-                None => _ = work.remove(thread),
-            }
+        self.work.is_some()
+    }
+
+    /// `thread` now holds `summary` as its work, or no work.
+    fn refreshed(&mut self, thread: &str, summary: Option<Value>) {
+        let Some(work) = self.work.as_mut() else {
+            return;
+        };
+        // A take let go is no longer the one its holder was told of.
+        let holder = summary.as_ref().and_then(|t| t["work"]["holder"].as_str());
+        (self.held).retain(|(one, at)| at != thread || Some(one.as_str()) == holder);
+        match summary {
+            Some(summary) => _ = work.insert(thread.to_owned(), summary),
+            None => _ = work.remove(thread),
         }
     }
 
@@ -207,8 +220,23 @@ fn title(thread: &Value) -> String {
 
 /// The host's commons call by `bot`, in its turn `turn`, wrote in
 /// `thread`.
+/// The work `thread` in the commons in `home` holds, if any.
+fn read(home: &Path, thread: &str) -> Option<Value> {
+    let path = crate::commons::dir(home).join(format!("{thread}.jsonl"));
+    crate::commons::summary(thread, &path).filter(|t| t["work"].is_object())
+}
+
+/// `bot`'s turn `turn` wrote in `thread`, which the commons in `home` now
+/// holds as it is; read with the turn ends free, off the host's runtime,
+/// as it reads a file. One read at a time, so an
+/// older read never lands after a newer one.
 pub fn wrote(home: &Path, bot: &str, turn: Option<i64>, thread: &str) {
-    ends().lock().unwrap().wrote(home, bot, turn, thread);
+    static READING: Mutex<()> = Mutex::new(());
+    let _reading = READING.lock().unwrap();
+    if ends().lock().unwrap().writes(bot, turn, thread) {
+        let summary = read(home, thread);
+        ends().lock().unwrap().refreshed(thread, summary);
+    }
 }
 
 /// `bot` asked the person in its turn `turn` as call `call`: one that
