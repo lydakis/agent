@@ -12,7 +12,9 @@ from pathlib import Path
 
 import store_down
 
-FIXTURES = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+# The store 0.10.2 made, kept here for the way back: tests/fixtures holds
+# only the last two releases' stores, and this one stays as they move on.
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 UP_111 = """
 DROP INDEX nodes_turn;
