@@ -411,12 +411,21 @@ impl Base {
             std::process::id(),
             self.next.fetch_add(1, Ordering::Relaxed)
         );
+        let schema = serde_json::from_str::<Value>(reply.schema)
+            .map_err(|_| failed("the reviewer's reply schema is not JSON"))?;
+        // The fork and its turn in one request, which the daemon commits
+        // together. Queued when every slot is taken: it starts when one
+        // frees, within the deadline. Said by the judge, not the person:
+        // clients draw it so.
+        let first = json!({"request_id": name, "prompt": prompt, "delivery": "queue",
+            "origin": "reviewer", "output_schema": schema});
+        let submitted_ms = epoch_ms();
         let fork = |workspace: &str| {
             client.request(
                 "fork",
                 json!({"source": self.name, "bot": name, "workspace": workspace,
                     "created_by": self.name, "created_by_id": self.id,
-                    "expire_ms": FORK_EXPIRE_MS}),
+                    "expire_ms": FORK_EXPIRE_MS, "submit": first}),
             )
         };
         let forked = match fork(workspace.unwrap_or("/")).await {
@@ -427,9 +436,12 @@ impl Base {
             }
             forked => forked,
         };
-        forked.map_err(|error| failed(format!("the reviewer could not start: {}", error.code)))?;
-        let (answered, running) = turn_with(client, &name, prompt, ids, reply, deadline).await;
-        remove(client, &name, running).await;
+        let forked = forked
+            .map_err(|error| failed(format!("the reviewer could not start: {}", error.code)))?;
+        let submitted = &forked["submitted"];
+        let (answered, running) =
+            turn_with(client, &name, submitted, submitted_ms, ids, reply, deadline).await;
+        remove(client, &name, &forked["bot_id"], running).await;
         answered
     }
 }
@@ -469,38 +481,18 @@ pub fn is_judge(bot: &Value, instructions: &str) -> bool {
 /// The longest the daemon's `wait` takes in one call, a day.
 const WAIT_MAX_MS: u64 = 86_400_000;
 
-/// One turn of a judge's fork `name`, its reply held to `reply`'s schema
-/// and read by its parse, by `deadline`; and the turn if it is still
-/// running.
-pub async fn turn_with(
+/// The turn of a judge's fork `name`, `submitted` (as `submit` answers)
+/// at `submitted_ms`, its reply held to `reply`'s schema and read by its
+/// parse, by `deadline`; and the turn if it is still running.
+async fn turn_with(
     client: &Client,
     name: &str,
-    prompt: &str,
+    submitted: &Value,
+    submitted_ms: i64,
     ids: &[&str],
     reply: &Reply,
     deadline: Instant,
 ) -> (Result<(Answers, Usage), Failed>, Option<i64>) {
-    let Ok(schema) = serde_json::from_str::<Value>(reply.schema) else {
-        return (Err(failed("the reviewer's reply schema is not JSON")), None);
-    };
-    // Queued when every slot is taken: it starts when one frees, within
-    // the deadline.
-    let submitted_ms = epoch_ms();
-    let submitted = match client
-        .request(
-            "submit",
-            // Said by the judge, not the person: clients draw it so.
-            json!({"bot": name, "request_id": name, "prompt": prompt, "delivery": "queue",
-                "origin": "reviewer", "output_schema": schema}),
-        )
-        .await
-    {
-        Ok(submitted) => submitted,
-        Err(error) => {
-            let why = format!("the reviewer's turn was refused: {}", error.code);
-            return (Err(failed(why)), None);
-        }
-    };
     let (Some(turn), Some(handle)) = (submitted["message"].as_i64(), submitted["handle"].as_str())
     else {
         return (Err(failed("the reviewer's turn was not started")), None);
@@ -616,7 +608,7 @@ async fn usage(client: &Client, bot: &str, turn: i64, submitted_ms: i64) -> Usag
 
 /// Delete a judge's fork, ending its turn first if it still runs. One that
 /// stays expires on its own.
-pub async fn remove(client: &Client, name: &str, running: Option<i64>) {
+pub async fn remove(client: &Client, name: &str, id: &Value, running: Option<i64>) {
     if let Some(turn) = running {
         let _ = client
             .request("interrupt", json!({"bot": name, "turn": turn}))
@@ -628,7 +620,9 @@ pub async fn remove(client: &Client, name: &str, running: Option<i64>) {
             )
             .await;
     }
-    let _ = client.request("delete", json!({"bot": name})).await;
+    let _ = client
+        .request("delete", json!({"bot": name, "bot_id": id}))
+        .await;
 }
 
 #[cfg(test)]

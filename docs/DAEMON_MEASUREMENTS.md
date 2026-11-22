@@ -12816,3 +12816,43 @@ its socket; anything else there refuses the bind and stays. The staged
 address is 4 bytes longer, so `default_socket` takes the short `/tmp`
 rendezvous for a store whose adjacent socket leaves no such room. Nothing is added per bot or per turn, and no store
 job. The pull request's Perf screen is the matched comparison.
+
+## Cheaper fork-and-delete
+
+2026-11-22, Linux x86_64 cloud VM, 4 CPUs, durability full, synthetic
+model. Main is `6ec9e9f`, built beside the change into its own target
+folder. "Fork" is what Sonny's suggestion, haiku and reviewer copies did:
+`fork` (allow none), `submit` a steer, `wait`, `delete` by identity. "Fork
+with message" sends the steer as the fork's `submit`. A source with 40
+turns of about 2 KB each; 200 calls a run, two runs a side.
+
+### One call on a quiet daemon (medians of two runs)
+
+| Measure | Main, fork | Change, fork | Change, fork with message | Plain turn |
+| --- | ---: | ---: | ---: | ---: |
+| Store commits | 11 | 7 | 6 | 5 |
+| Disk written, KiB | 586 | 558 | 515 | 252 |
+| Store run time, ms | 6.9 | 6.6 | 6.1 | — |
+| Daemon CPU, ms | 6.3 | 5.9 | 5.6 | 4.7 |
+| Whole call p50, ms | 52.1 | 52.0 | 51.5 | 48.1 |
+
+Main's 11 commits were the fork, the turn's 5, `gone`, three delete
+pieces and `switch_reclaim`. A copy now goes in the one job that starts
+its deletion (a stage that finds less than a piece goes on to the next in
+the same transaction), `switch_reclaim` runs only when the last piece
+says something waits for it, and `gone` is a read. A plain turn is
+unchanged: 5 commits and the same time.
+
+### Under load: 32 bots running turns back to back, 8 helpers beside them (20 s, three runs each)
+
+| Measure | Main, plain helpers | Main, fork | Change, fork | Change, fork with message | Change, plain helpers |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Helper call p50, ms | 68.8 (67.8 to 74.9) | 109.9 (105.5 to 114.9) | 95.3 (93.2 to 99.9) | 83.2 (82.8 to 92.9) | 67.5 (67.3 to 72.8) |
+| Helper call p95, ms | 101.9 | 169.6 | 154.3 | 119.2 | 96.9 |
+| Helper calls a second | 113 | 71 | 81 | 95 | 117 |
+| Fleet turns a second | 455 | 429 | 431 | 447 | 466 |
+| Fleet turn p50, ms | 68.6 | 74.6 | 72.5 | 71.4 | 67.7 |
+
+Both sides ran the same synthetic model and the same scripts, alternating
+binaries within each round. The matched perf gate screen is the pull
+request's Perf screen.

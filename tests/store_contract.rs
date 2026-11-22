@@ -7252,6 +7252,9 @@ fn an_attached_message_that_waited_its_time_goes_as_a_steer_would() {
 fn a_bot_being_deleted_has_no_message_coming_due() {
     let mut db = db();
     db.create("Gone", Some("/synthetic"), binding()).unwrap();
+    // A turn before it, so a piece of one turn leaves the deletion going.
+    let turn = begun(&mut db, "Gone", "r0");
+    db.finish(turn, None).unwrap();
     let capped = TurnOptions {
         delivery: Delivery::Attach,
         wait_ms: Some(1),
@@ -8298,6 +8301,50 @@ fn a_search_result_written_as_words_reads_through_its_handle_after_a_switch_and_
     drop(read);
     drop(db);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_small_bot_is_deleted_in_one_piece_and_a_large_one_in_several() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 0..3 {
+        converse(&mut db, "Bob", n);
+    }
+    db.fork(
+        "Bob",
+        "Bob.copy",
+        Fork {
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    converse(&mut db, "Bob.copy", 3);
+    // A throwaway copy, one turn of its own: records, turn rows, nodes and
+    // the bot in the job that starts the deletion, with nothing for
+    // `switch_reclaim` to look at.
+    let (copy, piece) = db.start_delete_bot("Bob.copy", 4).unwrap();
+    assert_eq!(piece["done"], true, "{piece}");
+    assert_eq!(piece["reclaim"], false, "{piece}");
+    assert_eq!(piece["turns"], 1, "{piece}");
+    assert!(piece["events"].as_i64().unwrap() > 0, "{piece}");
+    assert!(piece["nodes"].as_i64().unwrap() > 0, "{piece}");
+    assert_eq!(db.inspect("Bob.copy").unwrap_err().code, "bot_not_found");
+    assert!(db.gone("Bob.copy", copy).unwrap());
+    // Its source keeps the shared history.
+    assert_eq!(stored(&mut db, "Bob").len(), 6);
+    // A bot with a piece of turns or more still goes a piece at a time.
+    converse(&mut db, "Bob", 4);
+    let (id, mut piece) = db.start_delete_bot("Bob", 4).unwrap();
+    assert_eq!(piece["done"], false, "{piece}");
+    let mut pieces = 1;
+    while piece["done"] != true {
+        piece = db.delete_bot_piece("Bob", id, 4).unwrap();
+        pieces += 1;
+    }
+    assert!(pieces >= 2, "{pieces}");
+    assert_eq!(piece["reclaim"], false, "{piece}");
+    assert_eq!(db.inspect("Bob").unwrap_err().code, "bot_not_found");
 }
 
 #[test]

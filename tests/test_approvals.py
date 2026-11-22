@@ -382,6 +382,10 @@ class ApprovalTests(ModelFixture):
             dict(op='delete', bot='Kid'),
             dict(op='fork', source='Alice', bot='Copy'),
             dict(op='fork', source='Alice', bot='Ask', allow=[], expire_ms=60000),
+            dict(op='fork', source='Alice', bot='Said', allow=[],
+                 submit=dict(request_id='s', prompt='echo:hi', delivery='queue', person='Pat')),
+            dict(op='fork', source='Alice', bot='Asked', allow=[], expire_ms=60000,
+                 submit=dict(request_id='a', prompt='echo:hi', delivery='queue')),
             dict(child, bot='Hand', workspace=str(self.path / 'kid'), declare=[act]),
             dict(op='fork', source='Dave', bot='Tooled'),
             dict(op='submit', bot='Bob', request_id='away', prompt='echo:hi', workspace=str(outside),
@@ -438,7 +442,7 @@ class ApprovalTests(ModelFixture):
         # Nor reach another bot's, which would answer as that bot.
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
-         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, deeper, endless, stepper,
+         ask, said, asked, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, deeper, endless, stepper,
          root, resume) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
         # Passed on as it has it, not as a tool whose steps alone are gated,
@@ -446,7 +450,7 @@ class ApprovalTests(ModelFixture):
         self.assertIn('result', runner)
         # Nor may it do what its socket isn't for, such as starting a line of
         # its own, which would let it make bots without end.
-        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, deeper,
+        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, said, hand, tooled, away, deeper,
                         endless, stepper, root, resume):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
@@ -461,6 +465,11 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(twin_again['result']['bot_id'], twin['result']['bot_id'], twin_again)
         # A fork that may call nothing only answers.
         self.assertEqual(ask['result']['created_by'], 'Bob')
+        # Its first message, too, is the caller's own.
+        self.assertEqual((asked['result']['created_by'], asked['result']['submitted']['bot']), ('Bob', 'Asked'))
+        said_by = daemon.request('messages', bot='Asked', limit=8)['result']
+        self.assertIn('Bob', json.dumps(said_by))
+        self.assertEqual(daemon.request('inspect', bot='Said')['error'], 'bot_not_found')
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(daemon.request('inspect', bot='Bob')['result']['instructions'], 'Test agent.')
         # A bot's own socket goes with it.

@@ -28434,9 +28434,9 @@ mod tests {
     async fn guessed(said: &'static str) -> App {
         let client = daemon_answering(move |asked| {
             match (asked["op"].as_str(), asked["bot"].as_str()) {
-                (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
+                (Some("fork"), _) => json!({"bot_id": 9, "head": 4,
+                    "submitted": {"message": 1, "turn": 1, "handle": "copy/1"}}),
                 (Some("submit"), Some("b")) => json!({"message": 1, "turn": 1}),
-                (Some("submit"), _) => json!({"message": 1, "turn": 1, "handle": "copy/1"}),
                 (Some("wait"), _) => json!({"results": {"copy/1":
                     {"status": "completed", "text": said}}}),
                 // Only shop.pricing is an agent the daemon keeps.
@@ -28572,9 +28572,9 @@ mod tests {
         let client = daemon_answering(move |asked| {
             seen.lock().unwrap().push(asked.clone());
             match (asked["op"].as_str(), asked["bot"].as_str()) {
-                (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
+                (Some("fork"), _) => json!({"bot_id": 9, "head": 4,
+                    "submitted": {"message": 1, "turn": 1, "handle": "copy/1"}}),
                 (Some("submit"), Some("b")) => json!({"message": 1, "turn": 1}),
-                (Some("submit"), _) => json!({"message": 1, "turn": 1, "handle": "copy/1"}),
                 (Some("wait"), _) => json!({"results": {"copy/1":
                     {"status": "completed", "text": "Suggestion: run the tests"}}}),
                 _ => json!({}),
@@ -28613,6 +28613,12 @@ mod tests {
         assert_eq!(fork["source"], "b");
         assert_eq!(fork["allow"], json!([]));
         assert!(fork["expire_ms"].is_u64());
+        // Its question goes with it, in the same commit.
+        assert_eq!(fork["submit"]["delivery"], "steer");
+        assert!(
+            !ops.iter()
+                .any(|op| op["op"] == "submit" && op["bot"] != "b")
+        );
         let copy = fork["bot"].as_str().unwrap();
         assert!(
             ops.iter()
@@ -28632,8 +28638,8 @@ mod tests {
         assert_eq!(app.suggestion, None);
         assert_eq!(
             ops.iter().filter(|op| op["op"] == "submit").count(),
-            2,
-            "the person's and the copy's"
+            1,
+            "the person's; the copy's went with its fork"
         );
     }
 
