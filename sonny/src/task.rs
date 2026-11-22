@@ -564,11 +564,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             if let Some(title) = &start.title {
                 let _ = crate::title::note(store, name, id, title);
             }
-            // The board's posts reach it as the commons' do, its items
-            // opening as they come.
+            // The board's work reaches it as it moves.
             if let Some(board) = &start.board {
                 let follow = crate::board::follow(board, Some(id));
-                let _ = crate::lookout::subs::ensure(store, name, follow);
+                let _ = crate::lookout::subs::put(store, name, follow);
             }
         }
     }

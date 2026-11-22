@@ -961,6 +961,20 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 }
             }
             let started = said.join("\n\n");
+            // The agent that started a task on a board follows the board,
+            // so it hears the work as it moves, not only its task's end.
+            if let Some(board) = &board
+                && let Ok((store, _)) = crate::daemon_paths(None, None)
+            {
+                let caller_id = std::env::var("AGENT_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok());
+                let _ = crate::lookout::subs::put(
+                    &store,
+                    &caller,
+                    crate::board::follow(board, caller_id),
+                );
+            }
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
@@ -1196,10 +1210,24 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 && said["posted"] != false
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
-                && let Some(subscribed) =
-                    crate::commons::subscribed(&store, &caller, caller_id, &thread)
             {
-                said["follow"] = subscribed;
+                // A thread on a board is followed for why the agent is
+                // there, and work opened or taken follows its board.
+                let on_board = (crate::board::on())
+                    .then(|| crate::board::follows(&store, &caller, caller_id, arguments, &said))
+                    .flatten();
+                if let Some(subscribed) =
+                    crate::commons::subscribed(&store, &caller, caller_id, &thread, on_board)
+                {
+                    said["follow"] = subscribed;
+                }
+                said.as_object_mut().map(|said| said.remove("dropped_from"));
+                // Each live agent a post names as @NAME hears it once.
+                let mentioned = crate::board::mentioned(arguments, &caller);
+                if !mentioned.is_empty() {
+                    said["mentioned"] =
+                        json!(crate::commons::mention(&home, &said, &caller, &mentioned).await);
+                }
             }
             if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
                 said["invited"] =

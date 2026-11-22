@@ -65,26 +65,162 @@ pub fn valid_board(board: &str) -> Result<(), String> {
     }
 }
 
-/// What a task's agent working from `board` follows: the commons' posts
-/// on its work, at the commons source's digest, and work opening there
-/// as it comes, cutting into a busy turn, so a worker that finished one
-/// hears of the next.
+/// What a board's follow hears, as the commons source names each step on
+/// a board in its `event`: work opening (new, open again, or its needs
+/// met), taken, dropped, settling, a plain thread starting there, the
+/// board's last work settling, and held work going quiet.
+pub const EVENTS: [&str; 9] = [
+    "opened", "taken", "dropped", "done", "failed", "canceled", "posted", "emptied", "quiet",
+];
+
+/// A pattern every event of the commons matches, as a steer: each post,
+/// and a follow's word that it went quiet, has text.
+pub fn every() -> Value {
+    json!({"text": [{"exists": true}]})
+}
+
+/// What follows `board` for an agent: each of its [`EVENTS`] as it comes,
+/// cutting into a busy turn, so a worker that finished one piece hears
+/// the next open and a lead hears the board as it moves. A task's agents
+/// on the board follow it, the lead that started the task, and any agent
+/// that opens or takes work there. It ends with its agent.
 pub fn follow(board: &str, owner: Option<i64>) -> Sub {
     Sub {
         name: Sub::bounded(format!("board.{}", board.replace('/', "."))),
         tasks_of: Vec::new(),
         agents: Vec::new(),
         sources: vec![agent_client::config::COMMONS_SOURCE.to_owned()],
-        filter: Some(json!({"board": [board]})),
+        filter: Some(json!({"board": [board], "event": EVENTS})),
         digest: None,
-        steer: Some(json!({"opened": [{"exists": true}]})),
+        steer: Some(every()),
         owner,
         until: None,
         runs: None,
         made: None,
-        outlives_close: true,
+        outlives_close: false,
         quiet: None,
-        about: None,
+        about: Some(format!("you follow the board {board}")),
+    }
+}
+
+/// Why a thread on a board reaches an agent that holds its work.
+pub const HOLDS: &str =
+    "you hold this work: once it goes quiet, say where it stands, finish it or drop it";
+/// Why a thread on a board reaches an agent its work is for.
+pub const ASKED: &str = "you're asked to take this work";
+/// Why a thread on a board reaches an agent that posted in it.
+pub const POSTED: &str = "you posted here";
+
+/// What follows a thread on a board for an agent, for `about`'s reason:
+/// each post as it comes, cutting into a busy turn, and, with `quiet`,
+/// a word once nothing is posted there for that long. As any thread an
+/// agent posts in, it lasts while the agent is closed.
+pub fn post_follow(thread: &str, owner: Option<i64>, about: &str, quiet: Option<String>) -> Sub {
+    let mut sub = Sub::commons(thread, owner);
+    sub.steer = Some(every());
+    sub.about = Some(about.to_owned());
+    sub.quiet = quiet;
+    sub
+}
+
+/// What a call to the commons tool that `said` this follows for the
+/// agents it touches, in `store`: the board for `caller`, known as `id`,
+/// when it opened or took work there, and for an agent another dropped
+/// work from, its thread as one that posted there. The caller's own
+/// follow of the thread, as [`commons::subscribed`] takes it: as its
+/// holder, one the work is for, or one that posted; none for a thread on
+/// no board.
+pub fn follows(
+    store: &Path,
+    caller: &str,
+    id: Option<i64>,
+    arguments: &Value,
+    said: &Value,
+) -> Option<Sub> {
+    let thread = said["thread"].as_str()?;
+    let work = &said["work"];
+    let board = work["board"].as_str().or(said["board"].as_str())?;
+    let step = arguments["reply"]["do"].as_str();
+    if work.is_object()
+        && (arguments["post"]["work"] == true || matches!(step, Some("open" | "take")))
+    {
+        let _ = crate::lookout::subs::put(store, caller, follow(board, id));
+    }
+    if let Some(name) = said["dropped_from"]["name"].as_str() {
+        let held_by = said["dropped_from"]["id"].as_i64();
+        let _ = crate::lookout::subs::put(store, name, post_follow(thread, held_by, POSTED, None));
+    }
+    let holds = work["state"] == "taken" && work["holder"] == caller;
+    let asked = matches!(work["state"].as_str(), Some("open"))
+        && (work["for"].as_array().into_iter().flatten()).any(|named| named == caller);
+    Some(match (holds, asked) {
+        (true, _) => post_follow(thread, id, HOLDS, hold_quiet()),
+        (false, true) => post_follow(thread, id, ASKED, None),
+        _ => post_follow(thread, id, POSTED, None),
+    })
+}
+
+/// The agents a post or a reply of the commons tool names as `@NAME`, in
+/// the order it names them, once each, `caller` aside: a name with a dot
+/// in it, as agents' are, at a word's start, so an email, `@types/node`
+/// and the like stay text. Whether each is a live agent is the caller's
+/// to ask.
+pub fn mentioned(arguments: &Value, caller: &str) -> Vec<String> {
+    let text = (arguments["post"]["text"].as_str())
+        .or(arguments["reply"]["text"].as_str())
+        .unwrap_or_default();
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    let mut named: Vec<String> = Vec::new();
+    let mut before: Option<char> = None;
+    for (at, c) in text.char_indices() {
+        let starts = c == '@' && !before.is_some_and(|b| name_char(b) || matches!(b, '@' | '/'));
+        before = Some(c);
+        if !starts {
+            continue;
+        }
+        let rest = &text[at + 1..];
+        let end = rest.find(|c: char| !name_char(c)).unwrap_or(rest.len());
+        let name = rest[..end].trim_end_matches(['.', '-', '_']);
+        let follows = rest[end..].chars().next();
+        if name.contains('.')
+            && name.len() <= 128
+            && follows != Some('/')
+            && name != caller
+            && !named.iter().any(|n| n == name)
+        {
+            named.push(name.to_owned());
+        }
+    }
+    named
+}
+
+/// How long work taken may go without a post before its holder is asked
+/// whether it is still on it, as a follow's `quiet`: `[sonny] hold_quiet`
+/// minutes, 15 by default; none for 0.
+pub fn hold_quiet() -> Option<String> {
+    let minutes = crate::kept::config().map_or(15, |config| config.sonny.hold_quiet);
+    (minutes > 0).then(|| format!("{minutes}m"))
+}
+
+/// What the post at `n` of a thread on a board did there, as the board's
+/// follow hears it: one of [`EVENTS`], or `waiting` (work posted that
+/// waits on its needs), `set` (fields changed) or `reply` (talk).
+pub fn event_of(posts: &[Value], n: usize, thread: &str) -> &'static str {
+    let post = &posts[n];
+    let opens = (post["opened"].as_array().into_iter().flatten()).any(|t| t == thread);
+    match post["do"].as_str() {
+        None if n == 0 => "posted",
+        None => "reply",
+        Some("take") => "taken",
+        Some("drop") => "dropped",
+        Some("done") => "done",
+        Some("fail") => match item(&posts[..=n]).is_some_and(|it| it["state"] == "canceled") {
+            true => "canceled",
+            false => "failed",
+        },
+        Some("open" | "set") if opens => "opened",
+        Some("open") => "waiting",
+        Some(_) => "set",
     }
 }
 
@@ -710,6 +846,26 @@ pub fn reply(
     if !opened.is_empty() {
         post["opened"] = json!(opened);
     }
+    // The board's last open or held work settling empties it.
+    let settles = matches!(action, Some("done" | "fail"));
+    if settles
+        && opened.is_empty()
+        && let Some(board) = current.as_ref().and_then(|it| it["board"].as_str())
+        && !(items.iter()).any(|(name, it)| {
+            name != thread
+                && it["work"]["board"] == board
+                && matches!(it["work"]["state"].as_str(), Some("open" | "taken"))
+        })
+    {
+        post["emptied"] = json!(board);
+    }
+    // A live holder another drops it from hears of it.
+    let dropped_from = match (action, &current) {
+        (Some("drop"), Some(it)) if it["holder"] != caller.name => {
+            Some(json!({"name": it["holder"], "id": it["holder_id"]}))
+        }
+        _ => None,
+    };
     // A full thread still takes what moves its work, so talk in it never
     // leaves the work stuck where it stands.
     let moves = action.is_some();
@@ -733,6 +889,9 @@ pub fn reply(
             }
         }
         said["work"] = work;
+        if let Some(from) = dropped_from {
+            said["dropped_from"] = from;
+        }
     }
     Ok(said)
 }
@@ -1380,7 +1539,9 @@ mod tests {
         let one = follow(&long, Some(7));
         let back = Sub::from_json(&one.to_json()).expect("reads back");
         assert_eq!(back.name, one.name);
-        assert_eq!(back.filter, Some(json!({"board": [long]})));
+        assert_eq!(back.filter, Some(json!({"board": [long], "event": EVENTS})));
+        assert_eq!(back.steer, Some(every()));
+        assert!(!back.outlives_close);
     }
 
     #[test]
@@ -1579,6 +1740,141 @@ mod tests {
         assert!(!is_for(&kept, "shop.w1", Some("worker")));
         let record = home.join(".agent/sonny/migrated");
         assert_eq!(crate::upgrade::lines(&record), [STEPS_RENAMED]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_mention_names_agents_at_a_word_s_start_and_never_an_email() {
+        let said =
+            |text: &str| mentioned(&json!({"reply": {"thread": "t", "text": text}}), "shop.w1");
+        assert_eq!(
+            said("@shop.review, does this handle retries? cc @billing.api."),
+            ["shop.review", "billing.api"]
+        );
+        assert!(said("mail ana@shop.com or see @types/node and @everyone").is_empty());
+        assert!(said("me, @shop.w1, and @shop.w1 again").is_empty());
+        assert_eq!(said("(@shop.lead) and @shop.lead"), ["shop.lead"]);
+    }
+
+    #[test]
+    fn a_board_s_news_names_each_step_and_says_when_it_empties_or_goes_quiet() {
+        let home = home("events");
+        let cursor = home.join("cursor");
+        let _ = commons::news(&home, &cursor).mark_read();
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        lead(work("enum", "Remove the enum", json!({"needs": ["store"]}))).unwrap();
+        lead(
+            json!({"post": {"name": "idea", "title": "An idea", "text": "x",
+            "board": "shop/errors"}}),
+        )
+        .unwrap();
+        lead(json!({"reply": {"thread": "idea", "text": "more"}})).unwrap();
+        let w1 = |args| send(&home, "shop.w1", "shop", None, false, args);
+        w1(act("store", "take")).unwrap();
+        w1(act("store", "done")).unwrap();
+        w1(act("enum", "take")).unwrap();
+        let events = |news: &crate::lookout::sources::News| -> Vec<(String, String)> {
+            (news.lines.iter())
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .map(|line| {
+                    let event = line["event"].as_str().unwrap_or_default().to_owned();
+                    let topic = line["topic"].as_str().unwrap_or("-").to_owned();
+                    (topic, event)
+                })
+                .collect()
+        };
+        let news = commons::news(&home, &cursor);
+        let mut said = events(&news);
+        said.sort();
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            let mut list: Vec<_> = (list.iter())
+                .map(|(t, e)| ((*t).to_owned(), (*e).to_owned()))
+                .collect();
+            list.sort();
+            list
+        };
+        assert_eq!(
+            said,
+            pairs(&[
+                ("store", "opened"),
+                ("store", "taken"),
+                ("store", "done"),
+                ("enum", "waiting"),
+                ("enum", "taken"),
+                ("idea", "posted"),
+                ("idea", "reply"),
+            ])
+        );
+        // The done line says what it opened.
+        let done = (news.lines.iter())
+            .find(|line| line.contains("\"done\"") && line.contains("\"store\""))
+            .unwrap();
+        assert!(done.contains("It opened enum."), "{done}");
+        let _ = news.mark_read();
+        // The last work settling empties the board: its own line, on no
+        // thread.
+        w1(act("enum", "done")).unwrap();
+        let news = commons::news(&home, &cursor);
+        let mut said = events(&news);
+        said.sort();
+        assert_eq!(said, pairs(&[("enum", "done"), ("-", "emptied")]));
+        let _ = news.mark_read();
+        // Held work with no post for hold_quiet goes quiet, once.
+        lead(work("api", "Type the api errors", json!({}))).unwrap();
+        w1(act("api", "take")).unwrap();
+        let path = commons::dir(&home).join("api.jsonl");
+        let aged: String = (commons::posts(&path).unwrap().into_iter())
+            .map(|mut post| {
+                post["at"] = json!(post["at"].as_i64().unwrap() - 3600);
+                format!("{post}\n")
+            })
+            .collect();
+        std::fs::write(&path, aged).unwrap();
+        let news = commons::news(&home, &cursor);
+        assert!(events(&news).contains(&("-".to_owned(), "quiet".to_owned())));
+        let _ = news.mark_read();
+        assert!(commons::news(&home, &cursor).lines.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn taking_work_follows_its_board_and_its_thread_as_its_holder() {
+        let home = home("follows");
+        let store = home.join("store");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        let opened = work("store", "Type the store errors", json!({}));
+        let said = lead(opened.clone()).unwrap();
+        let mine = follows(&store, "shop.lead", Some(1), &opened, &said).unwrap();
+        assert_eq!(mine.about.as_deref(), Some(POSTED));
+        assert_eq!(mine.steer, Some(every()));
+        assert_eq!(
+            followed(&store, "shop.lead").as_deref(),
+            Some("shop/errors")
+        );
+        let take = act("store", "take");
+        let said = send(&home, "shop.w1", "shop", None, false, take.clone()).unwrap();
+        let held = follows(&store, "shop.w1", Some(2), &take, &said).unwrap();
+        assert_eq!(held.about.as_deref(), Some(HOLDS));
+        assert_eq!(held.quiet.as_deref(), Some("15m"));
+        assert_eq!(followed(&store, "shop.w1").as_deref(), Some("shop/errors"));
+        // Dropped by the lead, its holder's follow says it posted there.
+        crate::lookout::subs::put(&store, "shop.w1", held).unwrap();
+        let drop = act("store", "drop");
+        let said = lead(drop.clone()).unwrap();
+        assert_eq!(said["dropped_from"]["name"], "shop.w1");
+        follows(&store, "shop.lead", Some(1), &drop, &said).unwrap();
+        let after = crate::lookout::subs::read(&store, "shop.w1");
+        let thread = after
+            .iter()
+            .find(|sub| sub.name == "commons.store")
+            .unwrap();
+        assert_eq!(thread.about.as_deref(), Some(POSTED));
+        assert_eq!(thread.quiet, None);
+        // A plain thread on no board follows as any commons thread.
+        let plain = json!({"post": {"name": "q", "title": "A question", "text": "x"}});
+        let said = lead(plain.clone()).unwrap();
+        assert!(follows(&store, "shop.lead", Some(1), &plain, &said).is_none());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

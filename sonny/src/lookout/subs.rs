@@ -950,6 +950,22 @@ pub fn ensure(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> 
     Ok(true)
 }
 
+/// Put `sub` in the subscriber's file, in place of one by its name whose
+/// rules differ, or added when there is none: whether the file changed.
+/// What Sonny sets as an agent's part in work changes, as taking work
+/// changes why its thread reaches the agent.
+pub fn put(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> {
+    let _held = held(store)?;
+    let mut subs = read_whole(store, subscriber)?;
+    match subs.iter_mut().find(|s| s.name == sub.name) {
+        Some(had) if *had == sub => return Ok(false),
+        Some(had) => *had = sub,
+        None => subs.insert(0, sub),
+    }
+    write(store, subscriber, &subs)?;
+    Ok(true)
+}
+
 /// The longest name a subscription may have: a commons thread's, 64,
 /// after `commons.`.
 const NAME_MAX: usize = 80;
@@ -1875,6 +1891,23 @@ mod tests {
             file["about"] = json!(bad);
             assert_eq!(Sub::from_json(&file).unwrap().about, None, "{bad}");
         }
+    }
+
+    #[test]
+    fn put_replaces_a_follow_whose_rules_differ_and_ensure_keeps_it() {
+        let store = std::env::temp_dir().join(format!("sonny-put-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let plain = Sub::commons("t", Some(1));
+        assert!(ensure(&store, "a.b", plain.clone()).unwrap());
+        let mut held = plain.clone();
+        held.steer = Some(json!({"text": [{"exists": true}]}));
+        held.quiet = Some("15m".into());
+        assert!(!ensure(&store, "a.b", held.clone()).unwrap());
+        assert_eq!(read(&store, "a.b"), std::slice::from_ref(&plain));
+        assert!(put(&store, "a.b", held.clone()).unwrap());
+        assert!(!put(&store, "a.b", held.clone()).unwrap());
+        assert_eq!(read(&store, "a.b"), [held]);
+        let _ = std::fs::remove_dir_all(dir(&store));
     }
 
     #[test]

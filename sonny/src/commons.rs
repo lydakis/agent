@@ -490,6 +490,10 @@ pub(crate) fn start_locked(
     saw(dir, name, post["by"].as_str().unwrap_or_default());
     show(dir, name, reader, 1);
     let mut started = json!({"thread": name, "posts": 1});
+    // A thread on a board says so, so its writer follows it as one.
+    if let Some(board) = post["board"].as_str() {
+        started["board"] = json!(board);
+    }
     let similar = similar(dir, name, title);
     if !similar.is_empty() {
         started["similar_titles"] = json!(similar);
@@ -878,6 +882,46 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
     invited.into_iter().map(|(bot, _)| bot).collect()
 }
 
+/// Each of `named`, a live agent, hears the post `said` answers for once,
+/// as `@NAME` asks: a note that cuts into its turn, following nothing, so
+/// it posts there if it would hear more. The ones told.
+pub async fn mention(home: &Path, said: &Value, author: &str, named: &[String]) -> Vec<String> {
+    let thread = said["thread"].as_str().unwrap_or_default().to_owned();
+    let n = said["posts"].as_u64().unwrap_or(1).saturating_sub(1) as usize;
+    let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
+        return Vec::new();
+    };
+    let Some(post) = posts.get(n) else {
+        return Vec::new();
+    };
+    let title = posts[0]["title"].as_str().unwrap_or_default();
+    let text = post["text"].as_str().unwrap_or_default();
+    let note = format!(
+        "{author} named you in the commons thread {thread}, \"{title}\":\n\n{text}\n\n\
+         Reply there to answer; this note follows nothing."
+    );
+    let Ok((_, socket)) = crate::daemon_paths(None, None) else {
+        return Vec::new();
+    };
+    let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
+        return Vec::new();
+    };
+    let mut told = Vec::new();
+    for name in named {
+        let asked = name.clone();
+        let gone = tokio::task::spawn_blocking(move || crate::task::gone(&asked, None)).await;
+        if gone.unwrap_or(true) {
+            continue;
+        }
+        let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
+            "request_id": format!("commons.mention.{thread}.{n}.{name}")});
+        if client.request("submit", submit).await.is_ok() {
+            told.push(name.clone());
+        }
+    }
+    told
+}
+
 /// The submit that brings `bot` an invite to `thread`: the note, queued
 /// as its own turn, with the invite's budget, counted as work.
 fn invite_submit(bot: &str, thread: &str, note: String, golden: bool) -> Value {
@@ -926,7 +970,16 @@ pub(crate) fn add_locked(
     show(dir, name, who, earlier.len() + 1);
     answered(dir, name, by);
     let title = earlier.first().map_or(Value::Null, |p| p["title"].clone());
-    Ok(json!({"thread": name, "title": title, "posts": earlier.len() + 1}))
+    let mut said = json!({"thread": name, "title": title, "posts": earlier.len() + 1});
+    // A thread on a board says so, so its writer follows it as one.
+    let board = (crate::board::item(&earlier)
+        .and_then(|it| it["board"].as_str().map(str::to_owned)))
+    .or_else(|| earlier.first()?["board"].as_str().map(str::to_owned))
+    .or_else(|| post["board"].as_str().map(str::to_owned));
+    if let Some(board) = board {
+        said["board"] = json!(board);
+    }
+    Ok(said)
 }
 
 fn reads(dir: &Path) -> serde_json::Map<String, Value> {
@@ -1862,7 +1915,7 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             .or_else(|| (posts.first()?["board"].as_str()).map(str::to_owned));
         for (n, post) in posts.iter().enumerate().skip(had).filter(|_| !first) {
             let text = post["text"].as_str().unwrap_or_default();
-            let text = match (n, post["do"].as_str()) {
+            let mut text = match (n, post["do"].as_str()) {
                 (0, Some(_)) => format!(
                     "new work {thread} on {}, \"{title}\": {text}",
                     board.as_deref().unwrap_or_default()
@@ -1871,6 +1924,14 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 (_, Some(done)) => format!("{done} in {thread}, \"{title}\": {text}"),
                 (_, None) => format!("reply in {thread}, \"{title}\": {text}"),
             };
+            // Work it opened beside its own.
+            let others: Vec<&str> = (post["opened"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .filter(|opened| *opened != thread)
+                .collect();
+            if !others.is_empty() {
+                text.push_str(&format!("\nIt opened {}.", others.join(", ")));
+            }
             let mut line = json!({"id": format!("{thread}/{n}"), "topic": thread, "text": text});
             if let Some(by) = post["by"].as_str() {
                 line["from"] = json!(by);
@@ -1879,6 +1940,7 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             // it opened, which a worker's follow is steered by.
             if let Some(board) = &board {
                 line["board"] = json!(board);
+                line["event"] = json!(crate::board::event_of(&posts, n, &thread));
             }
             for key in ["do", "opened"] {
                 if !post[key].is_null() {
@@ -1886,9 +1948,54 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 }
             }
             lines.push(line.to_string());
+            // The board's last work settling: the board's own news, on no
+            // thread, so the thread's followers hear the post alone.
+            if let Some(emptied) = post["emptied"].as_str() {
+                let mut line = json!({"id": format!("{thread}/{n}/emptied"), "board": emptied,
+                    "event": "emptied",
+                    "text": format!("{emptied} holds no open or taken work now: {thread} settled last.")});
+                if let Some(by) = post["by"].as_str() {
+                    line["from"] = json!(by);
+                }
+                lines.push(line.to_string());
+            }
         }
-        read.insert(thread, json!({"posts": posts.len(), "bytes": bytes}));
+        let mut kept = json!({"posts": posts.len(), "bytes": bytes});
+        // Work held, kept to tell its board once it goes quiet.
+        if let Some(work) = crate::board::item(&posts).filter(|it| it["state"] == "taken") {
+            let title = work["title"].as_str().unwrap_or(title);
+            kept["held"] = json!({"at": posts.last().map_or(0, |p| p["at"].as_i64().unwrap_or(0)),
+                "board": work["board"], "holder": work["holder"], "title": title});
+        }
+        read.insert(thread, kept);
         changed = true;
+    }
+    // Held work with no post for `[sonny] hold_quiet`: its board hears it
+    // once, until its thread moves again.
+    let quiet = crate::board::hold_quiet()
+        .and_then(|quiet| Some((agent_client::config::span("quiet", &quiet).ok()?, quiet)));
+    if let Some((span, quiet)) = quiet.filter(|_| !first) {
+        let now = now();
+        for (thread, kept) in read.iter_mut() {
+            let held = &mut kept["held"];
+            let Some(at) = held["at"].as_i64() else {
+                continue;
+            };
+            if held["told"] == true || now < at + span as i64 {
+                continue;
+            }
+            held["told"] = json!(true);
+            changed = true;
+            let (holder, title) = (
+                held["holder"].as_str().unwrap_or_default(),
+                held["title"].as_str().unwrap_or_default(),
+            );
+            let text =
+                format!("{holder} has held {thread}, \"{title}\", with no post there for {quiet}.");
+            let line = json!({"id": format!("{thread}/{at}/quiet"), "board": held["board"],
+                "event": "quiet", "thread": thread, "holder": holder, "text": text});
+            lines.push(line.to_string());
+        }
     }
     News {
         lines,
@@ -1905,10 +2012,21 @@ pub fn subscribe(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Resu
 
 /// Subscribes `bot` to `thread`, as posting there does, and says what it
 /// is subscribed to, for the post's answer: the subscription's name, how
-/// often the thread's posts reach it, and how to change that. None when
-/// its subscriptions cannot be written.
-pub fn subscribed(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Option<Value> {
-    subscribe(store, bot, id, thread).ok()?;
+/// often the thread's posts reach it, and how to change that. A thread on
+/// a board is followed as `on_board` says, in place of a follow of it
+/// whose rules differ: each post as it comes, and why. None when its
+/// subscriptions cannot be written.
+pub fn subscribed(
+    store: &Path,
+    bot: &str,
+    id: Option<i64>,
+    thread: &str,
+    on_board: Option<crate::lookout::subs::Sub>,
+) -> Option<Value> {
+    match on_board {
+        Some(follow) => _ = crate::lookout::subs::put(store, bot, follow).ok()?,
+        None => _ = subscribe(store, bot, id, thread).ok()?,
+    }
     let name = crate::lookout::subs::Sub::commons(thread, id).name;
     // One it already held may have a digest or filter of its own.
     let held = (crate::lookout::subs::read(store, bot).into_iter())
@@ -1934,9 +2052,17 @@ fn said_of(sub: &crate::lookout::subs::Sub, thread: &str, source: Option<&str>) 
         Some(digest) => (digest.as_str(), "its own digest"),
         None => (source.unwrap_or("0"), "the commons source's digest"),
     };
-    let pace = match digest {
-        "0" => "as they come".to_owned(),
-        digest => format!("at most every {digest}"),
+    let pace = match (&sub.steer, digest) {
+        (Some(_), _) => "as they come, cutting into your turn".to_owned(),
+        (None, "0") => "as they come".to_owned(),
+        (None, digest) => format!("at most every {digest}"),
+    };
+    let whose = match (&sub.about, &sub.quiet) {
+        (Some(about), Some(quiet)) => {
+            format!("since {about}; and once if nothing is posted there for {quiet}")
+        }
+        (Some(about), None) => format!("since {about}"),
+        _ => whose.to_owned(),
     };
     let filtered = match sub.filter.is_some() {
         true => ", those its filter matches",
@@ -4024,7 +4150,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(store.parent().unwrap()).unwrap();
-        let said = subscribed(&store, "a.x", Some(1), "t").unwrap();
+        let said = subscribed(&store, "a.x", Some(1), "t", None).unwrap();
         assert_eq!(said["name"], "commons.t");
         let about = said["about"].as_str().unwrap();
         assert!(about.contains("as commons.t"), "{about}");
@@ -4033,7 +4159,7 @@ mod tests {
         assert!(crate::lookout::subs::remove(&store, "a.x", "commons.t").unwrap());
         assert!(crate::lookout::subs::read(&store, "a.x").is_empty());
         assert_eq!(
-            subscribed(&store, "a.x", Some(1), "t").unwrap()["name"],
+            subscribed(&store, "a.x", Some(1), "t", None).unwrap()["name"],
             "commons.t"
         );
         assert_eq!(crate::lookout::subs::read(&store, "a.x").len(), 1);

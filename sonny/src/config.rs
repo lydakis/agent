@@ -357,6 +357,15 @@ pub const SETTINGS: &[Setting] = &[
         default: "true",
     },
     Setting {
+        key: "sonny.hold_quiet",
+        group: "",
+        name: "hold quiet",
+        label: "",
+        about: "minutes work an agent took may go without a post in its thread before the holder is asked whether it is still on it and its board hears it went quiet; 0 never; read as work is taken",
+        values: &[],
+        default: "15",
+    },
+    Setting {
         key: "sonny.commons_invites",
         group: "Commons and sky",
         name: "commons invites",
@@ -1414,6 +1423,7 @@ mod tests {
             "sonny.sky_haiku_margin",
             "sonny.sky_haiku_hold",
             "sonny.commons_invite_tokens",
+            "sonny.hold_quiet",
             "sonny.tool_processes",
             "sonny.lookout_waiting",
         ] {
