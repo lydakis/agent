@@ -526,6 +526,9 @@ pub enum CacheTtl {
     Minutes,
     #[serde(rename = "1h")]
     Hour,
+    /// OpenAI's longer lifetime; Claude calls keep five minutes under it.
+    #[serde(rename = "12h")]
+    HalfDay,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
 /// The most a bot's command rules take as JSON.
@@ -700,6 +703,9 @@ impl Settings {
     }
     pub fn cache_hour(&self) -> bool {
         self.cache_ttl == Some(CacheTtl::Hour)
+    }
+    pub fn cache_half_day(&self) -> bool {
+        self.cache_ttl == Some(CacheTtl::HalfDay)
     }
     /// What the line after each prompt's words names: its own list, else
     /// the sender alone.

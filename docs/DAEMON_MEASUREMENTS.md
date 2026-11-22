@@ -12967,3 +12967,16 @@ flags are not the code's work:
 | lifecycle | CPU, s | 0.65 | 0.64 | -1.5% |
 | lifecycle | p95 turn, ms | 582.873 | 587.353 | +0.8% |
 | lifecycle | peak RSS, MiB | 28.93 | 29.414 | +1.7% |
+
+## Responses instructions as a developer message, cache writes, 12-hour cache
+
+2026-11-22. A Responses request sends the bot's instructions as the input's
+first item, a developer message, instead of the top-level `instructions`
+field. The instructions are encoded once per call as before, now into their
+own buffer beside the fields; a socket continuation that the server already
+holds sends no lead, so its frame is no bigger than before. The socket's
+key hashes the lead too, which is the same bytes the fields held. Reading
+`cache_write_tokens` and `prompt_cache_options` adds two optional fields to
+the parsed usage and the encoded request. Nothing is added per bot or per
+turn, and no store job. The pull request's Perf screen is the matched
+comparison.

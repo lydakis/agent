@@ -50,7 +50,9 @@ class Model(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers['Content-Length']))
         request = json.loads(body)
         gate = queue.Queue()
-        self.server.arrivals.put((request['input'], len(body), gate, time.monotonic()))
+        # The history, after the instructions' developer message.
+        items = [i for i in request['input'][:1] if i.get('role') != 'developer'] + request['input'][1:]
+        self.server.arrivals.put((items, len(body), gate, time.monotonic()))
         output = gate.get(timeout=60)
         event = {'type': 'response.completed', 'response': {
             'status': 'completed', 'output': output,
