@@ -888,7 +888,12 @@ async fn in_zen(client: &agent_client::Client, home: &Path) -> Vec<String> {
 /// A thread started in a turn the commons itself began brings none: as an
 /// automatic reply never answers another (RFC 3834), so an invited agent's
 /// threads cannot set off a chain of invites with no person behind them.
-pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) -> Vec<String> {
+pub async fn invite(
+    home: &Path,
+    started: &Value,
+    (author, turn): (&str, Option<i64>),
+    invite: &Value,
+) -> Vec<String> {
     let thread = started["thread"].as_str().unwrap_or_default();
     let title = invite["title"].as_str().unwrap_or_default();
     let words: Vec<String> = (invite["words"].as_array().into_iter().flatten())
@@ -900,8 +905,7 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
     let sent = async {
         let (_, socket) = crate::daemon_paths(None, None).ok()?;
         let (client, _events) = agent_client::Client::connect(&socket).await.ok()?;
-        if let Ok(turn) = std::env::var("AGENT_TURN") {
-            let turn: i64 = turn.parse().ok()?;
+        if let Some(turn) = turn {
             // Someone who steered it there, a person or an agent, is behind it:
             // not the commons, nor a source's news of it (or of anything
             // else, which no one steered either).
@@ -2054,12 +2058,9 @@ fn index(dir: &Path, index: &mut HashMap<PathBuf, Indexed>) {
 /// kept between tasks and read again only as far as it grew, so a start
 /// costs one look at the folder once each thread was read. A fact about
 /// the commons, never a request to read it.
-pub fn pointed(home: &Path, brief: &str) -> String {
-    pointed_with(home, brief, std::env::var(POINTER_ENV).ok())
-}
-
-/// [`pointed`], with the line the host `handed` when it ran the start.
-fn pointed_with(home: &Path, brief: &str, handed: Option<String>) -> String {
+/// `handed` is the line the tool host found when it ran the start, which
+/// it is: a start made elsewhere finds its own.
+pub fn pointed(home: &Path, brief: &str, handed: Option<String>) -> String {
     let line = match handed {
         Some(line) => (!line.is_empty()).then_some(line),
         None => pointer(&dir(home), brief),
@@ -4231,7 +4232,7 @@ mod tests {
             json!({"reply": {"thread": "cache", "text": "fixed"}}),
         );
         let brief = "Fix the sandbox cache: builds miss it since the upgrade.";
-        let said = pointed(&home, brief);
+        let said = pointed(&home, brief, None);
         let (kept, line) = said.split_once("\n\n").unwrap();
         assert_eq!(kept, brief);
         assert_eq!(
@@ -4241,9 +4242,9 @@ mod tests {
              shares cache, sandbox, upgrade)]"
         );
         // One shared word, however rare, is no match.
-        assert_eq!(pointed(&home, "Render the page."), "Render the page.");
+        assert_eq!(pointed(&home, "Render the page.", None), "Render the page.");
         // Nor are words of three letters or fewer.
-        assert_eq!(pointed(&home, "Fix the bad UI."), "Fix the bad UI.");
+        assert_eq!(pointed(&home, "Fix the bad UI.", None), "Fix the bad UI.");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -4263,7 +4264,7 @@ mod tests {
             json!({"post": {"name": "other", "title": "Lunch", "text": "Tacos on Friday."}}),
         );
         let brief = "Two worktrees fail to build: the lockfile changed.";
-        let line = pointed(&home, brief)
+        let line = pointed(&home, brief, None)
             .split_once("\n\n")
             .unwrap()
             .1
@@ -4278,13 +4279,13 @@ mod tests {
         }
         assert!(!line.contains("other"), "{line}");
         // A reply read past what was read before: what it says counts.
-        let before = pointed(&home, "Tacos and burritos for the team.");
+        let before = pointed(&home, "Tacos and burritos for the team.", None);
         assert_eq!(before, "Tacos and burritos for the team.");
         send(
             "b.y",
             json!({"reply": {"thread": "other", "text": "Burritos too."}}),
         );
-        let after = pointed(&home, "Tacos and burritos for the team.");
+        let after = pointed(&home, "Tacos and burritos for the team.", None);
         assert!(after.contains("- other \"Lunch\" (2 posts"), "{after}");
         assert!(after.contains("shares "), "{after}");
         let _ = std::fs::remove_dir_all(&home);
@@ -4404,11 +4405,11 @@ mod tests {
         let home = home("pointer-handed");
         let line = "[The commons has threads that share words with this brief:\n- t \"T\"]";
         assert_eq!(
-            pointed_with(&home, "Fix the sandbox cache.", Some(line.into())),
+            pointed(&home, "Fix the sandbox cache.", Some(line.into())),
             format!("Fix the sandbox cache.\n\n{line}")
         );
         assert_eq!(
-            pointed_with(&home, "Fix the sandbox cache.", Some(String::new())),
+            pointed(&home, "Fix the sandbox cache.", Some(String::new())),
             "Fix the sandbox cache."
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -4431,7 +4432,7 @@ mod tests {
             post(&format!("sonny-agent-{n}"), "Sonny agent notes");
         }
         post("lookout", "Sonny lookout digest");
-        let said = pointed(&home, "Sonny's agent and lookout digest need a look.");
+        let said = pointed(&home, "Sonny's agent and lookout digest need a look.", None);
         let line = said.split_once("\n\n").unwrap().1;
         let named: Vec<&str> = (line.lines().skip(1))
             .map(|l| l.trim_start_matches("- ").split(' ').next().unwrap())
@@ -4448,7 +4449,7 @@ mod tests {
     fn an_empty_or_missing_commons_leaves_a_brief_as_written() {
         let home = home("pointer-empty");
         assert_eq!(
-            pointed(&home, "Fix the sandbox cache"),
+            pointed(&home, "Fix the sandbox cache", None),
             "Fix the sandbox cache"
         );
         assert_eq!(ago(30), "just now");

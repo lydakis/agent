@@ -19,7 +19,13 @@ fn live(home: &Path, folder: &Path, markdown: &str) -> serde_json::Value {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let input = serde_json::json!({"markdown": markdown}).to_string();
+    let invocation = serde_json::json!({
+        "bot": "Reader",
+        "pwd": folder,
+        "folder": std::fs::canonicalize(folder).unwrap(),
+    });
+    let input = serde_json::json!({"invocation": invocation, "arguments": {"markdown": markdown}})
+        .to_string();
     child
         .stdin
         .take()
