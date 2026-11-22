@@ -154,6 +154,24 @@ fn effort_marks(
     Ok(marks)
 }
 
+/// The most effort marks a window may send and their bytes, before
+/// separators: one wherever a turn's recorded effort differs from the turn
+/// before it (the first against none), each at most the longest mark.
+fn marks_room(window: &agent_runtime::store::Window) -> ContextUsage {
+    let mut before = None;
+    let mut items = 0;
+    for (_, effort) in &window.efforts {
+        if effort.as_deref() != before {
+            items += 1;
+            before = effort.as_deref();
+        }
+    }
+    ContextUsage {
+        bytes: items * Provider::EFFORT_MARK_MOST,
+        items,
+    }
+}
+
 /// Split window items into read-ahead batches by count and by bytes.
 fn batches(ids: &[i64], sizes: &[u32], pictured: &[i32]) -> Vec<Vec<i64>> {
     let mut out: Vec<Vec<i64>> = Vec::with_capacity(ids.len().div_ceil(WINDOW_BATCH));
@@ -1050,13 +1068,20 @@ impl Turn {
         };
         let mut prefix_budget = limit.bytes * 2 / 3;
         while !context.usage().fits(limit) {
+            // The window's effort marks shrink with it: room for the ones
+            // it has now is room enough for the ones a smaller one has.
+            let marks = (context.window.as_ref()).map_or(ContextUsage::default(), marks_room);
             let next = ContextUsage {
-                bytes: raw
-                    .bytes
-                    .min(limit.bytes.saturating_sub(context.prefix.bytes.len())),
-                items: raw
-                    .items
-                    .min(limit.items.saturating_sub(context.prefix.items)),
+                bytes: raw.bytes.min(
+                    limit
+                        .bytes
+                        .saturating_sub(context.prefix.bytes.len() + marks.bytes + marks.items),
+                ),
+                items: raw.items.min(
+                    limit
+                        .items
+                        .saturating_sub(context.prefix.items + marks.items),
+                ),
             };
             if next.bytes == 0 || next.items == 0 {
                 return agent_runtime::fail_with(
@@ -8336,11 +8361,16 @@ impl Context {
             thinking: Strip::default(),
         }
     }
+    /// What the window sends, with room for every effort mark it may
+    /// carry ([`effort_marks`]): whatever the bot's own effort, a mark goes
+    /// only where a turn's recorded effort differs from the one before it,
+    /// so these are at most as many.
     fn usage(&self) -> ContextUsage {
         self.window.as_ref().map_or(ContextUsage::default(), |w| {
+            let marks = marks_room(w);
             ContextUsage {
-                bytes: w.item_bytes as usize,
-                items: w.ids.len(),
+                bytes: w.item_bytes as usize + marks.bytes,
+                items: w.ids.len() + marks.items,
             }
             .with_prefix(&self.prefix)
         })

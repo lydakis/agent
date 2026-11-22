@@ -6,7 +6,7 @@ import unittest
 
 from bench.runtime_client import Client
 from bench.targets import clean_env
-from tests.test_runtime import AnthropicModel, Model, ModelFixture
+from tests.test_runtime import AnthropicModel, Model, ModelFixture, is_summary
 
 RUNTIME = unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1',
                               'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -54,6 +54,20 @@ class ClaudeEffortMarkTests(Turns, ModelFixture):
         # change stays where it was said.
         self.assertEqual(back['messages'][:len(messages)], messages)
 
+    def test_a_fork_keeps_the_marks_of_the_turns_it_shares_after_its_source_goes(self):
+        client = self.anthropic('claude-opus-5-5')
+        self.turn(client, 'one', effort='max')
+        checkpoint = client.request('inspect', bot='Bob')['result']['head']
+        self.assertIn('result', client.request('fork', source='Bob', checkpoint=checkpoint, bot='Fork',
+                                               workspace=str(self.path)))
+        self.assertIn('result', client.request('delete', bot='Bob'))
+        turn = client.request('submit', bot='Fork', request_id='two', prompt='two')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        request = self.model.requests.get(timeout=3)
+        self.assertEqual(request['output_config'], {'effort': 'high'})
+        self.assertEqual([m['output_config']['effort'] for m in request['messages'] if m['role'] == 'system'],
+                         ['max', 'high'])
+
     def test_a_model_without_it_runs_the_turn_at_its_own_effort(self):
         client = self.anthropic('synthetic-claude')
         self.turn(client, 'one')
@@ -68,9 +82,9 @@ class ClaudeEffortMarkTests(Turns, ModelFixture):
 class ResponsesEffortMarkTests(Turns, ModelFixture):
     handler = Model
 
-    def responses(self, model):
+    def responses(self, model, settings=None):
         self.model.models = (model,)
-        client = Client(self.binary, self.path / 'state.sqlite', self.url, model=model)
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, model=model, settings=settings)
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), effort='high'))
         return client
@@ -89,6 +103,19 @@ class ResponsesEffortMarkTests(Turns, ModelFixture):
         self.assertEqual([i['reasoning']['effort'] for i in back['input'] if i.get('type') == 'configuration_update'],
                          ['xhigh', 'high'])
         self.assertEqual(back['input'][:len(boosted['input'])], boosted['input'])
+
+    def test_a_window_keeps_room_for_its_marks_within_the_item_limit(self):
+        client = self.responses('gpt-6-sol', settings={'context_items': 6})
+        for n in range(8):
+            turn = client.request('submit', bot='Bob', request_id=f't{n}', prompt=f'turn {n}',
+                                  **({'effort': 'xhigh'} if n % 2 else {}))['result']['message']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get_nowait())
+        work = [r for r in requests if not is_summary(r)]
+        self.assertTrue(any(i.get('type') == 'configuration_update' for r in work for i in r['input']))
+        self.assertTrue(all(len(r['input']) <= 6 for r in work), [len(r['input']) for r in work])
 
     def test_an_earlier_model_runs_the_turn_at_its_own_effort(self):
         client = self.responses('synthetic-model')

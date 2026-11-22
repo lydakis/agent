@@ -1230,6 +1230,10 @@ impl Provider {
     /// The item that sets the effort from where it sits in a history on:
     /// Claude's system message with its own output config, or OpenAI's
     /// configuration update. The request's own effort stays as it was.
+    /// The most bytes an effort mark takes, at any level either family
+    /// takes: what a window holds back for each one it may send.
+    pub const EFFORT_MARK_MOST: usize = 66;
+
     pub fn effort_mark(&self, level: &str) -> Result<Bytes> {
         let item = match self.family {
             Family::Anthropic => {
@@ -3630,6 +3634,12 @@ mod tests {
             &openai.effort_mark("xhigh").unwrap()[..],
             br#"{"reasoning":{"effort":"xhigh"},"type":"configuration_update"}"#
         );
+        for provider in [&claude, &openai] {
+            for level in provider.family.efforts() {
+                let mark = provider.effort_mark(level).unwrap();
+                assert!(mark.len() <= Provider::EFFORT_MARK_MOST, "{level}");
+            }
+        }
     }
 
     /// Bedrock takes no fallback credit, so a retry there redeems none,

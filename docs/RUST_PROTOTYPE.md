@@ -1164,8 +1164,13 @@ as before ([BEDROCK.md](BEDROCK.md)). OpenAI's is a
 own API with a key (its reasoning guide, read 2026-11-22); Bedrock's OpenAI
 models and the ChatGPT plan are not documented to take it. A turn that asked
 for no effort runs at the bot's, and a turn after a boosted one says so. The
-items are made from each turn's recorded effort as the window is read, the
-same every time, so they stay in place; nothing is stored. Other models, a
+items are made as the window is read from the effort each turn's prompt
+holds (schema 113: the prompt node keeps its turn's effort, so a fork keeps
+it after its source is deleted), the same every time, so they stay in place.
+A window keeps room for every mark it may carry within `context_bytes` and
+`context_items`: one wherever a turn's effort differs from the one before
+it, at the longest mark's size. A prompt from before schema 113 holds no
+effort and gets no mark, as its request had none. Other models, a
 fallback to one, and a bot without an effort of its own run the turn at its
 effort on the request, as before.
 Every Anthropic call sets `max_tokens` to the model's full output limit:
