@@ -1357,7 +1357,14 @@ there.wait()
         laptop, lender = self.linked()
         listed = subprocess.run([str(self.sonny), 'link'], env={**clean_env(), 'HOME': str(self.path)},
                                 check=True, capture_output=True, text=True).stdout
-        self.assertIn('laptop  linked here · connected · 1 MCP servers, opens', listed)
+        self.assertIn('laptop  linked here · connected · 1 MCP servers, opens · runs ', listed)
+        # Each end says its build; one from a checkout is left to how it was built.
+        lends = json.loads((self.path / '.agent/links/laptop.json').read_text())
+        self.assertEqual(lends['build']['installed'], 'other')
+        self.assertTrue(lends['upgrade'])
+        mine = subprocess.run([str(self.sonny), 'link'], env={**clean_env(), 'HOME': str(laptop)},
+                              check=True, capture_output=True, text=True).stdout
+        self.assertNotIn(' runs ', mine)
         # The box has no server of its own: the tool is there for the laptop's.
         script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
                                            check=True, capture_output=True, text=True).stdout)

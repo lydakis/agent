@@ -1842,9 +1842,14 @@ machine = "laptop"
 command = "/home/me/.local/bin/sonny"
 browser_profile = "Default"    # Chrome profile name, path, or "" for fresh browsers
 calls = 16                     # max concurrent remote calls (default: 4 × CPUs)
+upgrade = true                 # the end behind upgrades as the link connects (default: true)
 ```
 
 Error codes: `not_connected` (asleep/offline), `tool_outcome_unknown` (link dropped mid-call), `link_busy` (at `calls` cap). Both ends must speak link protocol 1.
+
+### Upgrading linked machines
+
+Upgrade either machine and the other follows. Each end says its build as the link connects, and the one behind runs `sonny upgrade`: the linked machine runs it on the host over SSH, or on itself. A link session on the host ends once another Sonny is installed there, however it was installed (`sonny upgrade`, `brew upgrade`, install.sh), so the linked machine dials onto the new build within seconds and catches up; one asleep catches up when it next connects. `sonny link` shows both builds while they differ and how the upgrade went (its output is in `~/.agent/sonny/links/NAME.upgrade.log`). A failed upgrade is not retried for the same pair of builds; one that left them apart, such as a release Homebrew does not have yet, is retried within the hour. Builds made by hand are left alone. `upgrade = false` turns it off.
 
 <details>
 <summary><strong>Full details: links</strong></summary>
@@ -1874,6 +1879,7 @@ machine = "laptop"              # what the agents there call this machine; its h
 command = "/home/me/.local/bin/sonny"   # Sonny there, as setup found it
 browser_profile = "Default"     # the Chrome profile their shared browser is copied from once, or a folder; "" a fresh one each
 calls = 16                      # how many of their calls this machine runs at once; 4 per CPU by default
+upgrade = true                  # the end behind runs `sonny upgrade` as the link connects; on by default
 ```
 
 The linked machine dials. Its tool host keeps
