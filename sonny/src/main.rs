@@ -6387,6 +6387,17 @@ impl Search {
 /// A picture being read, decoded and scaled beside the loop.
 type Preparing = tokio::task::JoinHandle<Result<Option<attach::Picture>, String>>;
 
+/// A file dropped from another machine, being fetched over its link.
+type Fetching = tokio::task::JoinHandle<Result<Fetched, String>>;
+
+/// A file dropped from another machine, here.
+enum Fetched {
+    /// A picture, to go behind a placeholder.
+    Picture(attach::Picture),
+    /// Another file, copied here at this path for the agent to read.
+    File(std::path::PathBuf),
+}
+
 struct App {
     client: Arc<Client>,
     bot: String,
@@ -6646,6 +6657,10 @@ struct App {
     /// numbers: each placeholder is in the composer at once, its picture
     /// behind it once ready ([`App::prepared`]).
     preparing: Vec<(usize, Preparing)>,
+    /// Files dropped from the machine the person is at, when that is not
+    /// this one, being fetched over its link: each by the words standing
+    /// for it in the composer until it is here ([`App::fetched`]).
+    fetching: Vec<(String, Fetching)>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The slash commands the person ran, for the menu to rank.
@@ -8832,6 +8847,7 @@ impl App {
             steering: Vec::new(),
             pictures: Vec::new(),
             preparing: Vec::new(),
+            fetching: Vec::new(),
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
             picks_kept: false,
@@ -18868,14 +18884,10 @@ impl App {
         }
         match event {
             // Terminals send a pasted line break as a carriage return.
-            // Image files dropped on the terminal arrive as their paths.
+            // Files dropped on the terminal arrive as their paths.
             Event::Paste(text) => {
-                match attach::paths(&text, std::path::Path::new(&self.workspace)) {
-                    Some(paths) => {
-                        for path in paths {
-                            self.prepare(move || attach::load(&path).map(Some));
-                        }
-                    }
+                match attach::dropped(&text, std::path::Path::new(&self.workspace)) {
+                    Some(dropped) => self.drop_files(dropped),
                     None => self
                         .input
                         .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
@@ -18951,7 +18963,7 @@ impl App {
                     KeyCode::Char('j') if ctrl => self.input.insert("\n"),
                     // A picture on the clipboard, as Codex and Claude Code
                     // take one: terminals paste only text.
-                    KeyCode::Char('v') if ctrl => self.prepare(attach::clipboard),
+                    KeyCode::Char('v') if ctrl => self.prepare(attach::pasted),
                     // With nothing typed, the agent above or below in the
                     // pane's list of the project's agents. A terminal that
                     // sends alt+← as alt+b is taken at its word.
@@ -19661,6 +19673,7 @@ impl App {
         self.input.clear();
         self.pictures.clear();
         self.preparing.clear();
+        self.fetching.clear();
         self.quotes.clear();
     }
 
@@ -20309,15 +20322,105 @@ impl App {
             self.ready(number, got);
             any = true;
         }
+        while (self.fetching.first()).is_some_and(|(_, job)| job.is_finished()) {
+            let (words, job) = self.fetching.remove(0);
+            let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
+            self.fetched(&words, got);
+            any = true;
+        }
         any
     }
 
     /// Every picture still being made ready, waited for and put behind its
-    /// placeholder.
+    /// placeholder, and every file still being fetched, here.
     async fn all_ready(&mut self) {
         for (number, job) in std::mem::take(&mut self.preparing) {
             let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
             self.ready(number, got);
+        }
+        for (words, job) in std::mem::take(&mut self.fetching) {
+            let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
+            self.fetched(&words, got);
+        }
+    }
+
+    /// Files dropped on the terminal, as their paths named them: a picture
+    /// here behind a placeholder, made ready beside the loop; another file
+    /// or folder here as its path; one on the machine the person is at,
+    /// not this one, fetched over its link while its path stands in the
+    /// composer, then a picture or this machine's copy of it.
+    fn drop_files(&mut self, dropped: Vec<attach::Dropped>) {
+        let mut said = None;
+        for word in dropped {
+            match word {
+                attach::Dropped::Picture(path) => {
+                    self.prepare(move || attach::load(&path).map(Some));
+                }
+                attach::Dropped::Here(path) => {
+                    let path = path.to_string_lossy();
+                    self.input
+                        .insert(&format!("{} ", attach::shell_quoted(&path)));
+                }
+                attach::Dropped::Unread(path, why) => {
+                    self.input
+                        .insert(&format!("{} ", attach::shell_quoted(&path)));
+                    said = Some(unread(&path, &why));
+                }
+                attach::Dropped::Elsewhere(path) => {
+                    let words = attach::shell_quoted(&path);
+                    self.input.insert(&format!("{words} "));
+                    if !link::handing() {
+                        // A path pasted as words is words; dropped over
+                        // SSH, it names a file on the person's machine.
+                        if attach::over_ssh() {
+                            said = Some(format!(
+                                "{} is not on this machine; link the one it is on with \
+                                 `sonny link` to drop files from it",
+                                file_name(&path)
+                            ));
+                        }
+                        continue;
+                    }
+                    let woken = self.woken.clone();
+                    let job = tokio::task::spawn_blocking(move || {
+                        let got = match attach::is_picture(std::path::Path::new(&path)) {
+                            true => link::picture(&path).map(Fetched::Picture),
+                            false => {
+                                let to = link::kept_as(&path).ok_or("HOME is not set")?;
+                                link::copy(&path, &to).map(|()| Fetched::File(to))
+                            }
+                        };
+                        woken.notify_one();
+                        got.map_err(|why| format!("{}: {why}", file_name(&path)))
+                    });
+                    self.fetching.push((words, job));
+                }
+            }
+        }
+        self.notice = said.or(self.notice.take());
+    }
+
+    /// A file dropped from another machine, here: its path's words in the
+    /// composer become a picture's placeholder or the path of this
+    /// machine's copy; or, not had, they stay and why is said. Words the
+    /// person deleted meanwhile take nothing with them.
+    fn fetched(&mut self, words: &str, got: Result<Fetched, String>) {
+        match got {
+            Ok(Fetched::Picture(picture)) => {
+                if !self.input.contains(words) {
+                    return;
+                }
+                self.forget_pictures();
+                self.pictures.push(None);
+                let number = self.pictures.len();
+                self.input.replace(words, &attach::placeholder(number));
+                self.ready(number, Ok(Some(picture)));
+            }
+            Ok(Fetched::File(path)) => {
+                let path = attach::shell_quoted(&path.to_string_lossy());
+                self.input.replace(words, &path);
+            }
+            Err(why) => self.notice = Some(why),
         }
     }
 
@@ -24964,6 +25067,27 @@ struct Pick {
     ask: asks::Ask,
     held: bool,
     verdict: Option<repick::Verdict>,
+}
+
+/// A file's name, from its path.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+}
+
+/// Why a dropped file could not be looked at here, said so it can be
+/// mended: on a Mac, a folder macOS keeps from the terminal Sonny runs in
+/// until it is let in.
+fn unread(path: &str, why: &str) -> String {
+    let name = file_name(path);
+    match cfg!(target_os = "macos") && why.contains("not permitted") {
+        true => format!(
+            "{name}: macOS keeps its folder from this terminal; let the terminal in under \
+             System Settings, Privacy & Security, Files and Folders"
+        ),
+        false => format!("{name}: {why}"),
+    }
 }
 
 /// What is being written, as a window keeps it for the one it becomes
@@ -40498,6 +40622,81 @@ mod tests {
         app.attach(Ok(picture(6)));
         let kept: Vec<_> = app.pictures.iter().map(Option::is_some).collect();
         assert_eq!(kept, [false, false, false, false, true, true]);
+    }
+
+    /// Files dropped on the window: a picture behind its placeholder,
+    /// another file as its path; one from another machine stands as its
+    /// path while it is fetched, then is a picture or this machine's copy,
+    /// and a message sent meanwhile waits for it.
+    #[tokio::test]
+    async fn dropped_files_are_pictures_or_paths_and_ones_from_elsewhere_are_fetched() {
+        let client = daemon_answering(|_: &Value| json!({"message": 2})).await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(format!("sonny-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = resvg::tiny_skia::Pixmap::new(2, 2)
+            .unwrap()
+            .encode_png()
+            .unwrap();
+        std::fs::write(dir.join("shot (1).png"), &png).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"n").unwrap();
+        app.workspace = dir.display().to_string();
+        app.key(Event::Paste("shot\\ \\(1\\).png notes.txt".into()))
+            .await;
+        app.all_ready().await;
+        let notes = attach::shell_quoted(&dir.join("notes.txt").to_string_lossy());
+        assert_eq!(*app.input, format!("[Image #1] {notes} "));
+        assert_eq!(app.placed(&app.input).len(), 1);
+        // From another machine: its path stands until it is here.
+        app.input.clear();
+        let shot = "/Users/someone/Desktop/Screenshot 1.png";
+        let words = attach::shell_quoted(shot);
+        let picture = attach::Picture {
+            media_type: "image/png",
+            data: png.clone(),
+        };
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.input.insert(&format!("look {words} "));
+        app.fetching.push((
+            words.clone(),
+            tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+                Ok(Fetched::Picture(picture))
+            }),
+        ));
+        assert!(!app.prepared().await);
+        assert_eq!(*app.input, format!("look {words} "));
+        go.send(()).unwrap();
+        app.all_ready().await;
+        assert_eq!(&*app.input, "look [Image #2] ");
+        assert_eq!(app.placed(&app.input).len(), 1);
+        // Another file is this machine's copy; one not had stays its path.
+        let report = "/Users/someone/report.pdf";
+        let copy = dir.join("dropped").join("ab12cd34-report.pdf");
+        app.input
+            .insert(&format!("{report} /Users/someone/gone.txt"));
+        let kept = copy.clone();
+        app.fetching.push((
+            report.into(),
+            tokio::task::spawn_blocking(move || Ok(Fetched::File(kept))),
+        ));
+        app.fetching.push((
+            "/Users/someone/gone.txt".into(),
+            tokio::task::spawn_blocking(|| Err("gone.txt: not on mac".into())),
+        ));
+        app.all_ready().await;
+        assert_eq!(
+            *app.input,
+            format!("look [Image #2] {} /Users/someone/gone.txt", copy.display())
+        );
+        assert_eq!(app.notice.as_deref(), Some("gone.txt: not on mac"));
+        // A path from another machine with none linked is words.
+        app.input.clear();
+        app.key(Event::Paste("/Users/someone/elsewhere.pdf".into()))
+            .await;
+        assert!(app.fetching.is_empty() || link::handing());
+        assert_eq!(&*app.input, "/Users/someone/elsewhere.pdf ");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A picture is made ready beside the loop: its placeholder shows at

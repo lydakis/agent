@@ -61,11 +61,12 @@ const VIEWED: [&str; 14] = [
 ];
 
 /// The codes a call's error may carry back, as typed here.
-const CODES: [&str; 12] = [
+const CODES: [&str; 13] = [
     "browser_refused",
     "desktop_refused",
     "exec_refused",
     "open_refused",
+    "file_refused",
     "timed_out",
     "not_connected",
     "no_machine",
@@ -126,6 +127,9 @@ pub struct Machine {
     pub desktop: bool,
     /// Whether it opens links and files sent to it.
     pub open: bool,
+    /// Whether it hands over a file dropped from it and its clipboard's
+    /// picture, for the person at it whose window is here.
+    pub files: bool,
     /// Its MCP servers, by name.
     pub servers: BTreeMap<String, Lent>,
 }
@@ -156,6 +160,7 @@ impl Machine {
             signed_in: said["signed_in"] == true,
             desktop: said["desktop"] == true,
             open: said["open"] == true,
+            files: said["files"] == true,
             servers,
         }
     }
@@ -1604,6 +1609,7 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
         "calls": calls,
         "desktop": crate::desktop::here(),
         "open": true,
+        "files": true,
         "servers": servers,
     })
 }
@@ -1662,11 +1668,146 @@ async fn lend(
                 Err(e) => Err(("open_refused", e.to_string())),
             }
         }
+        // Reading and converting block, as opening does.
+        Some("file") => {
+            let payload = payload.clone();
+            match tokio::task::spawn_blocking(move || handed(&payload)).await {
+                Ok(handed) => handed.map_err(|e| ("file_refused", e)),
+                Err(e) => Err(("file_refused", e.to_string())),
+            }
+        }
         other => Err((
             "link_refused",
             format!("{} is not lent here", other.unwrap_or("that")),
         )),
     }
+}
+
+/// What the window of a machine this one links to asks of the person at
+/// this one: a file they dropped from here (`path`, the picture in it with
+/// `picture`), or the picture on the clipboard (`clipboard`). The person's
+/// own window asks, as a drop or Ctrl-V: what an agent there could already
+/// see through the desktop it is lent, so no gate asks again. `missing`
+/// says the file is not here, for the next machine to be asked.
+fn handed(payload: &Value) -> Result<Value, String> {
+    use base64::Engine;
+    if payload["clipboard"] == true {
+        return Ok(match crate::attach::clipboard()? {
+            Some(picture) => json!({"picture": crate::attach::to_json(&picture)}),
+            None => json!({"none": true}),
+        });
+    }
+    let path = Path::new(payload["path"].as_str().unwrap_or_default());
+    if !path.is_absolute() {
+        return Err("only a whole path is handed over".into());
+    }
+    let found = match std::fs::metadata(path) {
+        Ok(found) => found,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({"missing": true})),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if !found.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    if payload["picture"] == true {
+        let picture = crate::attach::load(path)?;
+        return Ok(json!({"picture": crate::attach::to_json(&picture)}));
+    }
+    let name = path.display();
+    if found.len() > OPEN_BYTES as u64 {
+        return Err(format!("{name} is more than {} MB", OPEN_BYTES >> 20));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
+    Ok(json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+
+/// Whether a machine linked here that hands over files is connected.
+pub fn handing() -> bool {
+    machines()
+        .iter()
+        .any(|machine| machine.files && up(&machine.name))
+}
+
+/// What `payload` asks of the machines linked here that hand over files,
+/// each connected one asked in turn until one has it: its answer, or why
+/// none did. Blocks while it waits, on a thread of its own.
+fn hand(payload: Value) -> Result<Value, String> {
+    let asked: Vec<String> = (machines().into_iter())
+        .filter(|machine| machine.files && up(&machine.name))
+        .map(|machine| machine.name)
+        .collect();
+    if asked.is_empty() {
+        return Err("no machine linked here is connected".into());
+    }
+    let answered = std::thread::spawn(move || {
+        let runtime = (tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build())
+        .map_err(|e| e.to_string())?;
+        for machine in &asked {
+            match runtime.block_on(call(machine, "file", payload.clone(), None)) {
+                Ok(answer) if answer["missing"] == true => {}
+                Ok(answer) => return Ok(answer),
+                Err(("not_connected", _)) => {}
+                Err((_, why)) => return Err(why),
+            }
+        }
+        Err(format!("not on {}", asked.join(" or ")))
+    });
+    answered
+        .join()
+        .map_err(|_| "the link's thread failed".to_owned())?
+}
+
+/// The picture in a file dropped from a machine linked here, at `path`
+/// there, converted there when it is one models do not take as it is.
+pub fn picture(path: &str) -> Result<crate::attach::Picture, String> {
+    let answer = hand(json!({"path": path, "picture": true}))?;
+    crate::attach::from_json(&answer["picture"])
+}
+
+/// The picture on the clipboard of a machine linked here, if it holds one.
+pub fn clipboard() -> Result<Option<crate::attach::Picture>, String> {
+    let answer = hand(json!({"clipboard": true}))?;
+    match answer["none"] == true {
+        true => Ok(None),
+        false => crate::attach::from_json(&answer["picture"]).map(Some),
+    }
+}
+
+/// A file dropped from a machine linked here, at `path` there, copied to
+/// `to` here for the agent to read.
+pub fn copy(path: &str, to: &Path) -> Result<(), String> {
+    use base64::Engine;
+    let answer = hand(json!({"path": path}))?;
+    let bytes = (base64::engine::general_purpose::STANDARD)
+        .decode(answer["data"].as_str().unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    if let Some(dir) = to.parent() {
+        private(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(to, bytes).map_err(|e| format!("{}: {e}", to.display()))
+}
+
+/// Where a file dropped from another machine is kept here, by its name
+/// there: `~/.agent/sonny/dropped`, each under a name of its own.
+pub fn kept_as(path: &str) -> Option<PathBuf> {
+    let name = Path::new(path).file_name()?.to_str()?;
+    let name: String = (name.chars())
+        .map(|c| match c.is_alphanumeric() || "._- ()".contains(c) {
+            true => c,
+            false => '_',
+        })
+        .collect();
+    let name = name.trim_start_matches('.');
+    let name = if name.is_empty() { "file" } else { name };
+    let nonce = crate::attach::nonce();
+    Some(
+        mine()?
+            .parent()?
+            .join("dropped")
+            .join(format!("{}-{name}", &nonce[..8])),
+    )
 }
 
 /// Open what another machine sent: a web address in the browser, or a file
@@ -2171,6 +2312,63 @@ mod tests {
         assert_eq!(
             forget_in(&dir, "../x"),
             "No machine ../x is linked here, only mac, other."
+        );
+    }
+
+    #[test]
+    fn a_file_dropped_from_here_is_handed_over_whole_and_one_not_here_is_missing() {
+        use base64::Engine;
+        let dir = scratch("handed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("report final.pdf");
+        std::fs::write(&file, b"%PDF").unwrap();
+        let handed_over = handed(&json!({"path": file.to_str().unwrap()})).unwrap();
+        let data = handed_over["data"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            b"%PDF"
+        );
+        let png = resvg::tiny_skia::Pixmap::new(3, 3)
+            .unwrap()
+            .encode_png()
+            .unwrap();
+        let shot = dir.join("shot.png");
+        std::fs::write(&shot, &png).unwrap();
+        let picture = handed(&json!({"path": shot.to_str().unwrap(), "picture": true})).unwrap();
+        assert_eq!(
+            crate::attach::from_json(&picture["picture"]).unwrap().data,
+            png
+        );
+        // Not here: the next machine is asked.
+        let gone = dir.join("gone.pdf");
+        let missing = handed(&json!({"path": gone.to_str().unwrap()})).unwrap();
+        assert_eq!(missing, json!({"missing": true}));
+        // Only a whole path, and only a file.
+        assert!(handed(&json!({"path": "report final.pdf"})).is_err());
+        assert!(handed(&json!({"path": dir.to_str().unwrap()})).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_from_elsewhere_is_kept_under_a_name_of_its_own() {
+        let kept = kept_as("/Users/someone/Downloads/report (1).pdf").unwrap();
+        let name = kept.file_name().unwrap().to_str().unwrap();
+        assert!(name.ends_with("-report (1).pdf"), "{name}");
+        assert!(kept.parent().unwrap().ends_with(".agent/sonny/dropped"));
+        let hidden = kept_as("/tmp/.env").unwrap();
+        assert!(
+            hidden
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("-env")
+        );
+        assert_ne!(
+            kept,
+            kept_as("/Users/someone/Downloads/report (1).pdf").unwrap()
         );
     }
 

@@ -106,6 +106,27 @@ impl Prompt {
         true
     }
 
+    /// `piece` swapped for `with` where it first is, the cursor kept on the
+    /// words it was at, or after `with` when it was in `piece`; whether
+    /// `piece` was there.
+    pub fn replace(&mut self, piece: &str, with: &str) -> bool {
+        let Some(start) = self.text.find(piece) else {
+            return false;
+        };
+        let end = start + piece.len();
+        let moved = |at: usize| match at {
+            at if at >= end => at - piece.len() + with.len(),
+            at if at > start => start + with.len(),
+            at => at,
+        };
+        self.at = moved(self.at);
+        self.anchor = self.anchor.map(moved);
+        self.goal = None;
+        self.splice(start..end, with);
+        self.laid.take();
+        true
+    }
+
     /// `piece` taken out of what Ctrl-Y brings back, with a space after it.
     pub fn unkill(&mut self, piece: &str) {
         if let Some(start) = self.killed.find(piece) {
