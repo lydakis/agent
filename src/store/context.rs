@@ -49,6 +49,7 @@ impl Window {
         self.sizes.truncate(len);
         self.thinking.truncate(len);
         self.pictured.truncate(len);
+        self.efforts.retain(|(index, _)| *index < len);
     }
 
     /// What goes ahead of the window, its pinned blocks cached for an hour

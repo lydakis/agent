@@ -199,6 +199,9 @@ const TURN_STATE: &str = "x-codex-turn-state";
 /// naming `speed` uses. Bedrock takes only the first.
 const ANTHROPIC_BETAS: &str = "thinking-binding-controls-2026-08-01,fallback-credit-2026-07-01,server-side-fallback-2026-07-01,fast-mode-2026-02-01";
 const BEDROCK_BETAS: &str = "thinking-binding-controls-2026-08-01";
+/// The beta a Claude request opts into when its messages change the effort
+/// inside the conversation ([`Provider::effort_mark`]).
+const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
 
 /// How fast a bot's calls are served, each faster tier at a higher price.
 /// The Claude API serves `fast` (fast mode) and OpenAI `fast` (its
@@ -676,6 +679,9 @@ pub struct Request<'a> {
     /// The credit a refusal minted, sent with this retry of the refused
     /// request on another model. Bedrock takes none.
     pub fallback_credit: Option<&'a str>,
+    /// Whether the items hold effort changes ([`Provider::effort_mark`]),
+    /// which a Claude request opts into with a beta.
+    pub effort_marks: bool,
     /// Groups calls that share a prefix for the Responses prompt cache. All
     /// bots share their leading instructions, so without a key their calls
     /// route by that prefix alone, pile onto the same cache machines and
@@ -1191,6 +1197,55 @@ impl Provider {
         self
     }
 
+    /// Whether a call to `model` here takes a change of effort as an item
+    /// in its history ([`Self::effort_mark`]), so a turn at another effort
+    /// than the bot's keeps the request's own and its cache. Claude takes
+    /// it on the models Anthropic lists (its per-message effort guide, read
+    /// 2026-11-22); OpenAI's API from GPT-6 on (its reasoning guide, read
+    /// 2026-11-22). Bedrock is left out: Anthropic lists the beta there,
+    /// but Mantle refuses a beta it does not take with a 400, and this one
+    /// has not been tried there (docs/BEDROCK.md). Neither Bedrock's OpenAI
+    /// models nor the ChatGPT plan are documented to take it.
+    pub fn takes_effort_marks(&self, model: &str) -> bool {
+        if self.bedrock {
+            return false;
+        }
+        match self.family {
+            Family::Anthropic => [
+                "claude-fable-5-2",
+                "claude-mythos-5-2",
+                "claude-fable-5-1",
+                "claude-mythos-5-1",
+                "claude-opus-5-5",
+                "claude-opus-5",
+                "claude-sonnet-5-5",
+                "claude-haiku-5-5",
+            ]
+            .iter()
+            .any(|name| names(claude_model(model), name)),
+            Family::Responses => self.login.is_none() && model.starts_with("gpt-6"),
+        }
+    }
+
+    /// The item that sets the effort from where it sits in a history on:
+    /// Claude's system message with its own output config, or OpenAI's
+    /// configuration update. The request's own effort stays as it was.
+    /// The most bytes an effort mark takes, at any level either family
+    /// takes: what a window holds back for each one it may send.
+    pub const EFFORT_MARK_MOST: usize = 66;
+
+    pub fn effort_mark(&self, level: &str) -> Result<Bytes> {
+        let item = match self.family {
+            Family::Anthropic => {
+                json!({"role":"system","content":[],"output_config":{"effort":level}})
+            }
+            Family::Responses => {
+                json!({"type":"configuration_update","reasoning":{"effort":level}})
+            }
+        };
+        Ok(serde_json::to_vec(&item)?.into())
+    }
+
     /// Whether this endpoint offers the twelve-hour cache at all.
     fn takes_cache_half_day(&self) -> bool {
         self.family == Family::Responses && !self.bedrock && self.login.is_none()
@@ -1469,17 +1524,23 @@ impl Provider {
         }
     }
 
-    /// Version, betas, and key for an Anthropic request.
+    /// Version, betas, and key for an Anthropic request; `effort_marks` as
+    /// the request's.
     fn anthropic_headers(
         &self,
         http: reqwest::RequestBuilder,
         key: Option<&String>,
+        effort_marks: bool,
     ) -> reqwest::RequestBuilder {
+        let betas = match self.bedrock {
+            true => BEDROCK_BETAS,
+            false => ANTHROPIC_BETAS,
+        };
         let http = http.header("anthropic-version", "2023-06-01").header(
             "anthropic-beta",
-            match self.bedrock {
-                true => BEDROCK_BETAS,
-                false => ANTHROPIC_BETAS,
+            match effort_marks {
+                true => format!("{betas},{EFFORT_BETA}"),
+                false => betas.to_owned(),
             },
         );
         match key {
@@ -1644,6 +1705,7 @@ impl Provider {
                 .await;
         }
         let (cache_key, route, sent) = (request.cache_key, request.route, request.sent);
+        let effort_marks = request.effort_marks;
         let (body, len) = self.body(prefix, &request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
@@ -1661,7 +1723,7 @@ impl Provider {
             .body(body);
         http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
-            (Family::Anthropic, key) => self.anthropic_headers(http, key),
+            (Family::Anthropic, key) => self.anthropic_headers(http, key, effort_marks),
             (Family::Responses, None) => http,
         };
         // The ChatGPT Codex endpoint takes cache affinity from this header, not
@@ -2541,6 +2603,22 @@ fn five_minute_cache(model: &str) -> bool {
     .any(|prefix| model.starts_with(prefix))
 }
 
+/// Whether Claude model id `model` is `name` itself, dated, versioned on
+/// Bedrock or with a context suffix, rather than a later point release of
+/// it (`claude-opus-5-5` is not `claude-opus-5`).
+fn names(model: &str, name: &str) -> bool {
+    let Some(rest) = model.strip_prefix(name) else {
+        return false;
+    };
+    match rest.strip_prefix('-') {
+        Some(rest) => {
+            let part = rest.split('-').next().unwrap_or_default();
+            !(part.len() == 1 && part.bytes().all(|b| b.is_ascii_digit()))
+        }
+        None => rest.is_empty() || rest.starts_with('['),
+    }
+}
+
 /// Model ids that predate adaptive thinking and still require a token budget.
 fn legacy_thinking(model: &str) -> bool {
     let model = claude_model(model);
@@ -2973,6 +3051,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
@@ -3007,6 +3086,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: Some("credit"),
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: Some("k"),
                 items: Items::empty(),
@@ -3035,6 +3115,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
+                    effort_marks: false,
                     asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
@@ -3058,6 +3139,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
@@ -3083,6 +3165,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
@@ -3112,6 +3195,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: Some("k"),
                 items: Items::empty(),
@@ -3139,6 +3223,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: None,
                 items,
@@ -3170,6 +3255,7 @@ mod tests {
                         output_schema: None,
                         web_search: false,
                         fallback_credit: None,
+                        effort_marks: false,
                         asker: Asker::Waits,
                         cache_key: None,
                         items: item(),
@@ -3196,6 +3282,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
+                    effort_marks: false,
                     asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
@@ -3256,6 +3343,7 @@ mod tests {
                             output_schema: None,
                             web_search: false,
                             fallback_credit: None,
+                            effort_marks: false,
                             asker: Asker::Waits,
                             cache_key: None,
                             items: Items::empty(),
@@ -3325,6 +3413,7 @@ mod tests {
                         output_schema,
                         web_search: false,
                         fallback_credit: None,
+                        effort_marks: false,
                         asker: Asker::Waits,
                         cache_key: None,
                         items: Items::empty(),
@@ -3418,6 +3507,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
+                    effort_marks: false,
                     asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
@@ -3494,6 +3584,64 @@ mod tests {
         );
     }
 
+    /// Claude takes a change of effort inside the conversation on the
+    /// models Anthropic lists, not yet on Bedrock; OpenAI from GPT-6 on, on
+    /// its own API with a key. The change is an item of its own.
+    #[test]
+    fn effort_marks_go_where_a_model_takes_them() {
+        let transport = Transport::new(64, 1).unwrap();
+        let provider =
+            |family, url: &str| Provider::new(transport.clone(), family, url, None).unwrap();
+        let claude = provider(Family::Anthropic, "https://api.anthropic.com/v1");
+        let bedrock = provider(
+            Family::Anthropic,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+        );
+        for (model, takes) in [
+            ("claude-opus-5-5", true),
+            ("claude-opus-5-5[1m]", true),
+            ("us.anthropic.claude-opus-5-5-v1:0", true),
+            ("claude-opus-5", true),
+            ("claude-opus-5-20260301", true),
+            ("claude-fable-5-2", true),
+            ("claude-fable-5-1", true),
+            ("claude-mythos-5-2", true),
+            ("claude-mythos-5-1", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-haiku-5-5", true),
+            ("claude-fable-5", false),
+            ("claude-opus-4-8", false),
+            ("claude-sonnet-4-6", false),
+            ("synthetic-claude", false),
+        ] {
+            assert_eq!(claude.takes_effort_marks(model), takes, "{model}");
+            assert!(!bedrock.takes_effort_marks(model), "{model}");
+        }
+        let openai = provider(Family::Responses, "https://api.openai.com/v1");
+        assert!(openai.takes_effort_marks("gpt-6-sol"));
+        assert!(openai.takes_effort_marks("gpt-6.2-astra"));
+        assert!(!openai.takes_effort_marks("gpt-5.6-luna"));
+        let mantle = provider(
+            Family::Responses,
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+        );
+        assert!(!mantle.takes_effort_marks("gpt-6-sol"));
+        assert_eq!(
+            &claude.effort_mark("max").unwrap()[..],
+            br#"{"content":[],"output_config":{"effort":"max"},"role":"system"}"#
+        );
+        assert_eq!(
+            &openai.effort_mark("xhigh").unwrap()[..],
+            br#"{"reasoning":{"effort":"xhigh"},"type":"configuration_update"}"#
+        );
+        for provider in [&claude, &openai] {
+            for level in provider.family.efforts() {
+                let mark = provider.effort_mark(level).unwrap();
+                assert!(mark.len() <= Provider::EFFORT_MARK_MOST, "{level}");
+            }
+        }
+    }
+
     /// Bedrock takes no fallback credit, so a retry there redeems none,
     /// whichever endpoint and however it authenticates.
     #[test]
@@ -3520,6 +3668,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: Some("credit"),
+                    effort_marks: false,
                     asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
@@ -3557,6 +3706,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
@@ -3625,6 +3775,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
@@ -3733,7 +3884,7 @@ mod tests {
             )
             .unwrap();
             let request = provider
-                .anthropic_headers(reqwest::Client::new().post(base), Some(&key))
+                .anthropic_headers(reqwest::Client::new().post(base), Some(&key), false)
                 .build()
                 .unwrap();
             assert_eq!(request.headers()[header], value, "{base}");
@@ -3774,6 +3925,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
+                    effort_marks: false,
                     asker: Asker::Waits,
                     cache_key: None,
                     items,
@@ -3968,6 +4120,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
@@ -4035,6 +4188,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
@@ -4125,6 +4279,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
@@ -4239,6 +4394,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
@@ -4315,6 +4471,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
@@ -4426,6 +4583,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
@@ -4516,6 +4674,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
@@ -4595,6 +4754,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
@@ -4662,6 +4822,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
@@ -4717,6 +4878,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             items: Items::empty(),
             chain: None,
@@ -4787,6 +4949,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             items: Items::empty(),
             chain: None,
@@ -4839,6 +5002,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             items: Items::empty(),
             chain: None,
@@ -4887,6 +5051,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
+                effort_marks: false,
                 asker: Asker::Waits,
                 items: Items::empty(),
                 chain: None,
@@ -4926,6 +5091,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             items: Items::empty(),
             chain: None,
@@ -4977,6 +5143,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
@@ -5053,6 +5220,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
+                    effort_marks: false,
                     asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
@@ -5298,6 +5466,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
+            effort_marks: false,
             asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),

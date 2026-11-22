@@ -248,6 +248,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::board::STEPS_RENAMED,
         retire: "0.12.0",
     },
+    // A follow of work's thread ends when its agent closes; one written
+    // before is marked so (after 0.10.4).
+    Migration {
+        id: crate::board::WORK_FOLLOWS_CLOSE,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -259,6 +265,7 @@ pub fn at_start(store: &Path) {
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
         crate::commons::woken_gone(&home);
         crate::board::steps_renamed(&home);
+        crate::board::work_follows_close(store, &home);
     }
 }
 
@@ -613,6 +620,7 @@ mod tests {
             "agents_files",
             "goals_gone",
             "commons_outlive_close",
+            "work_follows_close",
             "nested_gone",
             "woken_gone",
             "commons::projects",
