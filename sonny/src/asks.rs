@@ -1646,6 +1646,48 @@ pub async fn still_open(bot: &str, turn: i64, call: &str) -> Result<bool, String
     Ok(found == Some(true))
 }
 
+/// Whether `bot` waits on the person, read from its history newest first
+/// back to the person's own last words, which set the questions before
+/// them aside, as its window does: one of its questions still open that
+/// does not go ahead by itself, or goes ahead only at a deadline not yet
+/// past (`now`, in seconds since the epoch).
+pub async fn waits(
+    client: &agent_client::Client,
+    bot: &str,
+    now: i64,
+) -> agent_client::Result<bool> {
+    let (mut asked, mut said, mut waits) =
+        (Asked::default(), std::collections::HashMap::new(), false);
+    crate::said::walk(client, bot, 0, |at, entry| {
+        // A call's result, what Sonny took the ask as, comes after it, so
+        // is read first.
+        for item in crate::responses(&entry["item"]) {
+            if item["type"] == "function_call_output"
+                && let Some(call) = item["call_id"].as_str()
+                && let output = crate::output(&item).0
+                && output.contains("if_unanswered")
+            {
+                said.insert(id(at, call), output);
+            }
+        }
+        waits = (asked.entry(at, entry).into_iter()).any(|(ask, state)| {
+            let ask = match said.get(&ask.id) {
+                Some(output) => settled(ask, output),
+                None => ask,
+            };
+            state == State::Open
+                && match ask.unanswered {
+                    Some(Unanswered::Now) => false,
+                    Some(Unanswered::Later) => ask.deadline.is_none_or(|at| at > now),
+                    Some(Unanswered::Wait) | None => true,
+                }
+        });
+        waits || asked.moved_on()
+    })
+    .await?;
+    Ok(waits)
+}
+
 /// `sonny ask open BOT TURN CALL`, an ask's trigger's `--if`: exit 0
 /// while the ask is open, 1 once it is settled, 2 when it cannot be read.
 pub fn cli(args: &[String]) -> i32 {
@@ -3197,5 +3239,46 @@ mod tests {
             );
             assert_eq!(answer_of(&words, from.as_deref()).is_some(), theirs);
         }
+    }
+
+    /// A bot's history holding one ask, made with `arguments` and taken
+    /// as `output` says, newest first as the daemon pages it.
+    async fn history(arguments: Value, output: Value) -> std::sync::Arc<agent_client::Client> {
+        let call = json!({"node": 1, "item": {"type": "function_call", "call_id": "c1",
+            "name": TOOL, "arguments": arguments.to_string()}});
+        let result = json!({"node": 2, "item": {"type": "function_call_output",
+            "call_id": "c1", "output": output.to_string()}});
+        crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": [{"node": 2, "turn": 4}, {"node": 1, "turn": 4}]})
+            }
+            _ => json!({"items": [result.clone(), call.clone()]}),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_bot_waits_on_an_open_ask_until_it_goes_ahead_by_itself() {
+        let question = |one_way: bool| {
+            json!({"question": "Ship?", "why": "w", "one_way": one_way,
+                "options": [{"label": "Yes"}, {"label": "No"}], "recommended": 1})
+        };
+        let now = 1_000;
+        let waits = |arguments: Value, output: Value| async move {
+            let client = history(arguments, output).await;
+            waits(&client, "shop.w.1", now).await.unwrap()
+        };
+        // Until the person answers.
+        let wait = json!({"if_unanswered": "wait"});
+        assert!(waits(question(true), wait).await);
+        // Until it goes ahead.
+        let later = |at: i64| json!({"if_unanswered": "go_later", "deadline_s": at});
+        assert!(waits(question(false), later(now + 60)).await);
+        assert!(!waits(question(false), later(now - 60)).await);
+        // Not at all.
+        assert!(!waits(question(false), json!({"if_unanswered": "go_now"})).await);
+        // A step of the person's waits for them.
+        let step = json!({"question": "Sign in?", "why": "w", "one_way": false});
+        assert!(waits(step, json!({"if_unanswered": "wait"})).await);
     }
 }
