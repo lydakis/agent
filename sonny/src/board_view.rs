@@ -14,23 +14,25 @@ use std::collections::HashMap;
 
 /// Where an item stands, in the order every list of items takes: what
 /// broke, what is worked on, what waits to be taken, what cannot start
-/// yet, what is over.
+/// yet, what its maker paused, what is over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum State {
     Failed,
     Taken,
     Open,
     Waiting,
+    Paused,
     Done,
     Canceled,
 }
 
 impl State {
-    pub const ALL: [State; 6] = [
+    pub const ALL: [State; 7] = [
         State::Failed,
         State::Taken,
         State::Open,
         State::Waiting,
+        State::Paused,
         State::Done,
         State::Canceled,
     ];
@@ -41,6 +43,7 @@ impl State {
             "taken" => State::Taken,
             "open" => State::Open,
             "waiting" => State::Waiting,
+            "paused" => State::Paused,
             "done" => State::Done,
             "canceled" => State::Canceled,
             _ => return None,
@@ -54,6 +57,7 @@ impl State {
             State::Taken => "taken",
             State::Open => "open",
             State::Waiting => "waiting",
+            State::Paused => "paused",
             State::Done => "done",
             State::Canceled => "canceled",
         }
@@ -65,6 +69,7 @@ impl State {
             State::Taken => "Taken",
             State::Open => "Open",
             State::Waiting => "Waiting",
+            State::Paused => "Paused",
             State::Done => "Done",
             State::Canceled => "Canceled",
         }
@@ -83,6 +88,7 @@ impl State {
             State::Taken => Span::raw("●").fg(Color::Cyan),
             State::Open => Span::raw("○").dim(),
             State::Waiting => Span::raw("◌").dim(),
+            State::Paused => Span::raw("■").dim(),
             State::Done => Span::raw("✓").dim(),
             State::Canceled => Span::raw("–").dim(),
         }
@@ -166,7 +172,7 @@ pub struct Board {
     pub items: Vec<usize>,
     /// When its newest post was written, in seconds.
     pub last: i64,
-    counts: [usize; 6],
+    counts: [usize; 7],
 }
 
 impl Board {
@@ -206,7 +212,7 @@ pub fn boards(items: &[Item], plain: &[(&str, i64)], here: &str) -> Vec<Board> {
                 name: name.to_owned(),
                 items: Vec::new(),
                 last: 0,
-                counts: [0; 6],
+                counts: [0; 7],
             });
             out.len() - 1
         })
@@ -441,7 +447,7 @@ pub fn page_row(
                 let said = named(holder, here);
                 (said.clone(), said.clone(), Some((said, holder.clone())))
             }
-            (_, State::Open | State::Waiting) => match kept_words(item, present) {
+            (_, State::Open | State::Waiting | State::Paused) => match kept_words(item, present) {
                 Some(kept) => {
                     let short = match present.nobody_for(item) {
                         true => NOBODY.to_owned(),
@@ -644,6 +650,7 @@ pub fn action_words(post: &Value, first: bool, canceled: bool, here: &str) -> Op
             None => "took it".to_owned(),
         },
         "drop" => "dropped it".to_owned(),
+        "pause" => "paused it".to_owned(),
         "done" => "done".to_owned(),
         "fail" if canceled => "canceled it".to_owned(),
         "fail" => "failed it".to_owned(),

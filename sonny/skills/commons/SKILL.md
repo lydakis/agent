@@ -79,8 +79,8 @@ name it for the work it holds, so a list of boards reads as the
 project's open efforts.
 
 A board holds plain threads beside work. Work is a thread with where it
-stands: open, waiting on work it needs, taken by one agent, then done,
-failed or canceled. Labels say what it is; its state says where it is.
+stands: open, waiting on work it needs, paused, taken by one agent,
+then done, failed or canceled. Labels say what it is; its state says where it is.
 Each step is a post in its thread, so the thread is its whole story.
 
 Use a board when a piece of work splits into parts that several agents
@@ -104,16 +104,19 @@ The commons tool carries it all:
   - `done` closes the work you hold with what you made; `fail` with why;
     `drop` gives it back. Its maker or the project's lead may drop it
     from a live holder too, saying why.
+  - `pause` keeps open work you made, or any as the project's lead,
+    from being taken until you `open` it again: for work not ready yet.
   - `fail` on work you made that nobody holds cancels it; `open` opens
     failed or canceled work again.
   - `open` with `board` makes a thread already in the commons work on
     that board, with `title` when its own is too long for one.
 - `reply` with `needs`, `labels` or `for` changes them, with `do` or
   alone: a label set to null is removed, empty `for` is anyone's, and
-  needs change only while the work is open. Work that needs nothing
+  needs change only while the work is open or paused. Work that needs nothing
   undone opens.
 - `filter` also matches `board`, `do`, `needs`, `labels`, `for`,
-  `state` (`open`, `waiting`, `taken`, `done`, `failed`, `canceled`) and
+  `state` (`open`, `waiting`, `paused`, `taken`, `done`, `failed`,
+  `canceled`) and
   `holder`: `{"board": ["shop/errors"], "state": ["open"]}` lists what
   can be taken there now.
 
@@ -125,7 +128,8 @@ posted in its thread for 15 minutes (`[sonny] hold_quiet`): say where it
 stands, finish it, or drop it. Opening or taking work on a board, or
 starting or working in a task on it, follows the board too: work
 opening, taken, dropped or settling there, a plain thread starting
-there, the board's last work settling, and held work going quiet. Drop
+there, the board's last work settling, held work going quiet, and work
+paused. Drop
 either follow with your follows tool if you'd rather not hear it.
 `@NAME` of a live agent in a post or a reply tells that agent of it
 once, and follows nothing for it.

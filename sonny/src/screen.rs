@@ -1030,12 +1030,24 @@ impl Screen {
     /// were, the words and so the rows they wrap to being the same.
     pub fn restyle(&mut self, styled: Screen) {
         debug_assert_eq!(styled.rows.len(), self.rows.len());
+        let was = std::mem::take(&mut self.shown);
         self.rows = styled.rows;
-        self.shown.clear();
         self.wrapped = 0;
         self.relaid = 0;
         if self.width != 0 {
             self.wrap(self.width);
+        }
+        // Words split into other spans can wrap at other places: then what
+        // was selected is let go, as when rows are laid out again, never
+        // moved onto other words.
+        fn text(shown: &Shown) -> impl Iterator<Item = char> + '_ {
+            (shown.line.spans.iter()).flat_map(|span| span.content.chars())
+        }
+        let same = was.len() == self.shown.len()
+            && (was.iter().zip(&self.shown)).all(|(a, b)| text(a).eq(text(b)));
+        if !same {
+            self.selection = None;
+            self.linked = None;
         }
     }
 
@@ -3616,6 +3628,12 @@ mod tests {
         assert_eq!(row(&buf, 3).trim_end(), "  line 16");
         let drawn = &screen.shown[screen.top + 3].line;
         assert_eq!(drawn.spans[0].style.fg, Some(Color::Cyan), "{drawn:?}");
+        // Laid out at other places, what was selected is let go.
+        assert!(screen.selected().is_some());
+        let mut other = Screen::default();
+        other.push((0..20).map(|n| Line::from(format!("  item {n}"))).collect());
+        screen.restyle(other);
+        assert_eq!(screen.selected(), None);
     }
 
     #[test]

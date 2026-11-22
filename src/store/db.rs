@@ -185,6 +185,11 @@ pub struct Bot {
     /// runs and when it was submitted with one.
     #[serde(skip)]
     pub output_schema: Option<Box<serde_json::value::RawValue>>,
+    /// Its own effort while a turn runs at the turn's (`effort`): the one
+    /// its requests keep where a model takes a change of effort inside the
+    /// conversation.
+    #[serde(skip)]
+    pub own_effort: Option<String>,
     /// Input tokens sent and, of those, the ones the provider served from
     /// its prompt cache. Their ratio is what the context window's hysteresis
     /// exists to keep high.
@@ -2465,6 +2470,9 @@ pub struct Window {
     /// (less, for one that compresses to less than it costs): an item is
     /// sent with `sizes` plus these bytes.
     pub pictured: Vec<i32>,
+    /// Where each turn's prompt sits in `ids`, in order, with the effort
+    /// its turn asked for when it asked for one of its own.
+    pub efforts: Vec<(usize, Option<Box<str>>)>,
     /// Sum of item weights, without separators.
     pub item_bytes: i64,
     /// Full unsummarized span, even when the bounded window omits a backlog.
@@ -3818,7 +3826,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 112;
+    pub const SCHEMA: i32 = 113;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -4074,7 +4082,8 @@ impl Database {
                 turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
                 elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
                 total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0,
-                pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER, message INTEGER);
+                pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER, message INTEGER,
+                effort TEXT);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE TABLE IF NOT EXISTS lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
@@ -4762,6 +4771,7 @@ impl Database {
                 read: r.get(41)?,
             },
             turn_budget: None,
+            own_effort: None,
             output_schema: None,
             workspace: r.get(2)?,
             status: r.get(3)?,
@@ -6800,6 +6810,27 @@ impl Database {
             thinking.push(0);
             pictured.push(signed(pictures.extra));
         }
+        // Each turn's prompt in the window, with the effort its turn asked
+        // for: the pinned prompt first, then every turn start.
+        let ahead = ids.len();
+        let mut prompts: Vec<(usize, i64)> = pinned.map(|(id, ..)| (0, id)).into_iter().collect();
+        prompts.extend(
+            window
+                .iter()
+                .rev()
+                .enumerate()
+                .filter(|(_, r)| r.turn_seq.is_some())
+                .map(|(index, r)| (ahead + index, r.id)),
+        );
+        let mut asked = self
+            .conn
+            .prepare_cached("SELECT effort FROM nodes WHERE id=?")?;
+        let mut efforts = Vec::with_capacity(prompts.len());
+        for (index, id) in prompts {
+            let effort: Option<String> = asked.query_row([id], |r| r.get(0)).optional()?.flatten();
+            efforts.push((index, effort.map(Box::from)));
+        }
+        drop(asked);
         ids.extend(window.iter().rev().map(|r| r.id));
         sizes.extend(sent[..=chosen].iter().rev().map(|&b| clamp(b)));
         thinking.extend(window.iter().rev().map(|r| clamp(r.thinking)));
@@ -6829,6 +6860,7 @@ impl Database {
             sizes,
             thinking,
             pictured,
+            efforts,
             item_bytes: through[chosen]
                 + pinned.map_or(0, |(_, size, ..)| size)
                 + pins.iter().map(|(_, size, _)| size).sum::<i64>(),
@@ -8144,18 +8176,27 @@ impl Database {
         strip: impl Into<Strip>,
         elided: i64,
     ) -> Result<Vec<u8>> {
-        self.items_sent(ids, strip.into(), false, elided, &mut Joined::default())
+        self.items_sent(
+            ids,
+            strip.into(),
+            false,
+            elided,
+            &[],
+            &mut Joined::default(),
+        )
     }
     /// [`Self::items_by_ids`] after the items `joined` has seen, and with
     /// `reasoning` a Responses reasoning item `strip` names left out whole
     /// too, as [`Self::reasoning_of`] counts it. A message of only blank
-    /// text goes as spaces (see [`Joined`]).
+    /// text goes as spaces (see [`Joined`]). Each of `marks`, by the id of
+    /// the item it goes before, is an item of its own sent ahead of it.
     pub fn items_sent(
         &self,
         ids: &[i64],
         strip: Strip,
         reasoning: bool,
         elided: i64,
+        marks: &[(i64, bytes::Bytes)],
         joined: &mut Joined,
     ) -> Result<Vec<u8>> {
         let mut statement = self
@@ -8167,6 +8208,9 @@ impl Database {
             .prepare_cached("SELECT item FROM stubs WHERE node=?")?;
         let mut out = Vec::new();
         for id in ids {
+            if let Ok(at) = marks.binary_search_by_key(id, |(id, _)| *id) {
+                joined.send(&mut out, &marks[at].1);
+            }
             if *id <= elided
                 && let Some(stub) = stubs
                     .query_row([id], |r| Ok(r.get_ref(0)?.as_blob()?.to_vec()))
@@ -10088,7 +10132,7 @@ impl Database {
         let now = epoch_ms();
         // Each message keeps what it asked for; it runs with the turn's.
         for (steer, prompted, size, waiting, images, quotes) in steers {
-            let id = prompt_node(&tx, head, &prompted, None, steer)?;
+            let id = prompt_node(&tx, head, &prompted, None, steer, None)?;
             head = Some(id);
             keep_once(&tx, steer, images.as_deref())?;
             keep_quotes(&tx, steer, quotes.as_deref(), id)?;
@@ -10763,6 +10807,7 @@ impl Database {
             &tx,
             bot.head,
             &item,
+            None,
             None,
             None,
             elided,
@@ -20254,19 +20299,21 @@ fn start_locked(
     data: &mut Value,
     written_taken: bool,
 ) -> Result<Option<i64>> {
-    let (images, (after, quotes)) = tx
+    let (images, (after, quotes), effort) = tx
         .prepare_cached(
-            "SELECT images,from_bot,from_turn,origin,person,quotes,sent_ms FROM messages WHERE id=?",
+            "SELECT images,from_bot,from_turn,origin,person,quotes,sent_ms,reasoning
+             FROM messages WHERE id=?",
         )?
         .query_row([turn], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
                 after_words(r, 1, bot.settings.trailer(), &bot.name, turn)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })?;
     let pictures = images_from(images.as_deref())?;
     let prompted = prompt_item(bot.family()?, prompt, &after, &pictures)?;
-    let head = prompt_node(tx, bot.head, &prompted, Some(turn), turn)?;
+    let head = prompt_node(tx, bot.head, &prompted, Some(turn), turn, effort.as_deref())?;
     keep_once(tx, turn, images.as_deref())?;
     keep_quotes(tx, turn, quotes.as_deref(), head)?;
     data["node"] = json!(head);
@@ -22113,6 +22160,26 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
+    // Schema 113: a turn's prompt holds the effort its turn asked for, so
+    // the history keeps it whatever becomes of the turn's own row. A prompt
+    // from before has none, as its turn's requests carried the effort
+    // themselves; a turn still running or parked gets its own, so it goes
+    // on at the effort it asked for.
+    if from < 113 {
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='effort')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(
+                "ALTER TABLE nodes ADD COLUMN effort TEXT;
+                 UPDATE nodes SET effort=(SELECT reasoning FROM turns t WHERE t.id=nodes.turn)
+                 WHERE turn IN (SELECT running_turn FROM bots WHERE running_turn IS NOT NULL);",
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -22985,6 +23052,7 @@ fn node_with_turn(
         item,
         turn,
         None,
+        None,
         0,
         Pictured::default(),
         Some(epoch_ms()),
@@ -23093,6 +23161,7 @@ fn prompt_node(
     prompted: &Prompted,
     turn: Option<i64>,
     message: i64,
+    effort: Option<&str>,
 ) -> Result<i64> {
     let weight = prompted.item.len() as i64 - prompted.pictured.extra;
     let elided = prompted
@@ -23105,6 +23174,7 @@ fn prompt_node(
         &prompted.item,
         turn,
         Some(message),
+        effort,
         elided,
         prompted.pictured,
         Some(epoch_ms()),
@@ -23389,10 +23459,12 @@ impl Translation {
                 Option<Vec<u8>>,
                 Option<Vec<u8>>,
                 Option<i64>,
+                Option<String>,
             );
-            let (item, turn, message, extra, count, stub, declined, written_ms): Row = conn
+            let (item, turn, message, extra, count, stub, declined, written_ms, effort): Row = conn
             .prepare_cached(
-                "SELECT n.item,n.turn,n.message,n.pictured,n.pictures,s.item,d.item,n.written_ms FROM nodes n
+                "SELECT n.item,n.turn,n.message,n.pictured,n.pictures,s.item,d.item,n.written_ms,n.effort
+                 FROM nodes n
                  LEFT JOIN stubs s ON s.node=n.id LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
             )?
             .query_row([old], |r| {
@@ -23405,6 +23477,7 @@ impl Translation {
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    r.get(8)?,
                 ))
             })?;
             // A result's stub and declined form are the same result: they
@@ -23468,6 +23541,7 @@ impl Translation {
                     new_item,
                     turn.filter(|_| lead),
                     message.filter(|_| lead),
+                    effort.as_deref().filter(|_| lead),
                     elided,
                     pictured,
                     written_ms,
@@ -23635,6 +23709,7 @@ fn insert_node(
     item: &[u8],
     turn: Option<i64>,
     message: Option<i64>,
+    effort: Option<&str>,
     elided: i64,
     pictured: Pictured,
     written_ms: Option<i64>,
@@ -23667,8 +23742,8 @@ fn insert_node(
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
         "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided,
-            total_thinking,pictured,pictures,written_ms,message)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            total_thinking,pictured,pictures,written_ms,message,effort)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
@@ -23685,7 +23760,8 @@ fn insert_node(
         pictured.extra,
         pictured.count,
         written_ms,
-        message
+        message,
+        effort.filter(|_| turn.is_some())
     ])?;
 
     let id = conn.last_insert_rowid();
