@@ -770,7 +770,16 @@ pub fn reply(
                             "work_exists: {same} on {board} has its title already"
                         ));
                     }
-                    opened.push(thread.to_owned());
+                    // Reopened, it opens once what it needs is done, as new
+                    // work does: until then it waits.
+                    let mut after = it.clone();
+                    after["state"] = json!("open");
+                    if post["needs"].is_array() {
+                        after["needs"] = post["needs"].clone();
+                    }
+                    if !waiting(&after, &|need: &str| need_done(dir, need)) {
+                        opened.push(thread.to_owned());
+                    }
                 }
                 Some("take") => {
                     if !ours(board) {
@@ -1146,6 +1155,11 @@ mod tests {
         ))
         .unwrap();
         assert!(blocked.get(ASK_FOR).is_none(), "{blocked}");
+        // Waiting work canceled and opened again still waits: no one asked.
+        lead(act("guide", "fail")).unwrap();
+        let reopened = lead(act("guide", "open")).unwrap();
+        assert_eq!(reopened["work"]["state"], "open", "{reopened}");
+        assert!(reopened.get(ASK_FOR).is_none(), "{reopened}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

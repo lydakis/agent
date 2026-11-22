@@ -275,15 +275,13 @@ pub fn finished(
     status: &str,
 ) {
     let (store, socket) = daemon;
-    let status = status.to_owned();
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return;
     };
-    let on = crate::board::on();
+    let completed = crate::board::on() && status == "completed";
     tokio::spawn(async move {
         let (named, at) = (bot.clone(), home.clone());
         let found = tokio::task::spawn_blocking(move || {
-            let completed = on && status == "completed";
             let boards = match completed {
                 true => boards(&store, &named),
                 false => Vec::new(),
@@ -296,6 +294,11 @@ pub fn finished(
         .await;
         let Ok(found) = found else { return };
         if found.holding.is_empty() && found.open.is_empty() {
+            // Nothing open now: what it was told of is forgotten, so work
+            // that closes and opens again is news once more.
+            if completed {
+                ends().lock().unwrap().told(&bot, None, found);
+            }
             return;
         }
         let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
@@ -450,6 +453,17 @@ mod tests {
         // A board it doesn't work from, or a lead's, tells nothing.
         let found = ends.ended(&home, "shop.w.2", None, 1, true, &[]);
         assert_eq!(found, Found::default());
+        // Work others took leaves nothing open, which is told of as
+        // nothing, as a turn's end does: once let go, it is news again.
+        for thread in ["store", "cli"] {
+            send(&home, &mut ends, "shop.w.3", 1, act(thread, "take"));
+        }
+        let found = ends.ended(&home, "shop.w.1", None, 4, true, &boards);
+        assert_eq!(ends.told("shop.w.1", Some("worker"), found), None);
+        send(&home, &mut ends, "shop.w.3", 2, act("store", "drop"));
+        let found = ends.ended(&home, "shop.w.1", None, 5, true, &boards);
+        let note = ends.told("shop.w.1", Some("worker"), found).unwrap();
+        assert!(note.contains("store"), "{note}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
