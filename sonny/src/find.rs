@@ -23,7 +23,7 @@ use ratatui::{
     style::{Style, Stylize},
     text::{Line, Span},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The key, the same in every view.
 pub const KEY: &str = "ctrl+f";
@@ -188,12 +188,7 @@ pub fn draw(field: &Field, row: Rect, buf: &mut Buffer) -> (u16, u16) {
     };
     let room = width.saturating_sub(lead + 1 + if said > 0 { said + 2 } else { 0 });
     // Typed past the room, its end shows: where the next letter goes.
-    let mut typed = field.query.as_str();
-    while typed.width() > room {
-        let mut chars = typed.chars();
-        chars.next();
-        typed = chars.as_str();
-    }
+    let typed = end_within(&field.query, room);
     let cursor = (row.x + (lead + typed.width()).min(width - 1) as u16, row.y);
     let mut spans = vec![label, Span::raw(" "), Span::raw(typed.to_owned())];
     if field.query.is_empty() {
@@ -206,6 +201,61 @@ pub fn draw(field: &Field, row: Rect, buf: &mut Buffer) -> (u16, u16) {
         buf.set_span(x, row.y, &Span::raw(field.said.clone()).dim(), said as u16);
     }
     cursor
+}
+
+/// The longest end of `text` no wider than `room`: what shows of a query
+/// typed past its field. Its width is measured a room's worth at a time, not
+/// again from each letter on, so a long paste costs its length, not its
+/// length squared.
+fn end_within(text: &str, room: usize) -> &str {
+    if text.width() <= room {
+        return text;
+    }
+    // The letters from the end whose own widths fill the room: what shows,
+    // or nearly, since letters together (an emoji and its selector, a
+    // joined family) can draw wider or narrower than each alone.
+    let mut guess = text.len();
+    let mut filled = 0;
+    for (at, c) in text.char_indices().rev() {
+        filled += c.width().unwrap_or(0);
+        if filled > room {
+            break;
+        }
+        guess = at;
+    }
+    let fits = |at: usize| text[at..].width() <= room;
+    let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let at = |k: usize| starts.get(k).copied().unwrap_or(text.len());
+    let guess = starts.partition_point(|&at| at < guess);
+    // From `low` the rest is too wide; from `high` it fits.
+    let (mut low, mut high) = (0, starts.len());
+    if fits(at(guess)) && guess > 0 && !fits(at(guess - 1)) {
+        (low, high) = (guess - 1, guess);
+    }
+    // Otherwise the first letter from which the rest fits, halving: a
+    // letter dropped from the front mostly leaves the rest as wide or
+    // narrower, and a long joined run is measured a few times, not once
+    // per letter.
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if fits(at(mid)) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    // A letter can draw narrower beside the next than alone (a Khmer
+    // coeng and the consonant under it take no column), so the rest from
+    // a letter or two further back may fit again: those are looked at.
+    let mut first = high;
+    let mut look = high;
+    while look > 0 && first - look < 3 {
+        look -= 1;
+        if fits(at(look)) {
+            first = look;
+        }
+    }
+    &text[at(first)..]
 }
 
 #[cfg(test)]
@@ -317,5 +367,71 @@ mod tests {
         // Too narrow for the count: it gives way, the words stay.
         let (text, _, _) = drawn(&Field::rows("ab", 1, 9), 10);
         assert_eq!(text, "find ab   ");
+    }
+
+    /// What shows of a long query is what dropping a letter at a time from
+    /// its start until it fits showed, for any letters, and a long paste
+    /// costs its length, not its length squared.
+    #[test]
+    fn a_long_query_shows_its_end_as_dropping_a_letter_at_a_time_did() {
+        fn dropping(text: &str, room: usize) -> &str {
+            let mut typed = text;
+            while typed.width() > room {
+                let mut chars = typed.chars();
+                chars.next();
+                typed = chars.as_str();
+            }
+            typed
+        }
+        let pieces = [
+            "plain words ",
+            "漢字かな",
+            "e\u{301}",
+            "👨\u{200d}👩\u{200d}👧",
+            "☺\u{fe0f}",
+            "🇬🇷",
+            "\u{200b}",
+            "x",
+            "👩\u{200d}",
+            "\u{1780}\u{17D2}\u{1780}",
+            "\u{17D2}",
+        ];
+        for length in 0..60 {
+            for room in [0, 1, 2, 3, 7, 20] {
+                for shift in 0..pieces.len() {
+                    let text: String = (0..length)
+                        .map(|at| pieces[(at * 3 + shift) % pieces.len()])
+                        .collect();
+                    assert_eq!(
+                        end_within(&text, room),
+                        dropping(&text, room),
+                        "{text:?} in {room}"
+                    );
+                }
+            }
+        }
+        // A 1 MiB paste in a 100-column field: the old way measured it
+        // about half a million times, minutes of work.
+        let pasted: String = "find me 漢字 ".chars().cycle().take(1 << 20).collect();
+        let began = std::time::Instant::now();
+        let shown = end_within(&pasted, 100);
+        assert!(
+            shown.width() <= 100 && shown.width() >= 99,
+            "{}",
+            shown.width()
+        );
+        assert!(pasted.ends_with(shown));
+        // Khmer: a coeng and the consonant under it take no column, so
+        // the rest from it fits where the rest from the consonant did not.
+        let khmer = "xx\u{17D2}\u{1780}a";
+        assert_eq!(end_within(khmer, 1), "\u{17D2}\u{1780}a");
+        // A joined run as long, two columns however long it gets.
+        let joined = format!("xx{}👩", "👩\u{200d}".repeat(100_000));
+        assert_eq!(end_within(&joined, 2), dropping(&joined, 2));
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
     }
 }
