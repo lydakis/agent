@@ -1852,12 +1852,33 @@ pub fn kept_as(path: &str) -> Option<PathBuf> {
     let name = name.trim_start_matches('.');
     let name = if name.is_empty() { "file" } else { name };
     let nonce = crate::attach::nonce();
+    let name = bounded(name, NAME_BYTES - nonce[..8].len() - 1);
     Some(
         mine()?
             .parent()?
             .join("dropped")
             .join(format!("{}-{name}", &nonce[..8])),
     )
+}
+
+/// The most bytes a file's name may have on the file systems Sonny runs on.
+const NAME_BYTES: usize = 255;
+
+/// `name` in at most `most` bytes: the end of what comes before its
+/// extension cut, at a character's edge, to keep the extension.
+fn bounded(name: &str, most: usize) -> String {
+    if name.len() <= most {
+        return name.to_owned();
+    }
+    let extension = match name.rfind('.') {
+        Some(dot) if name.len() - dot <= 16 => &name[dot..],
+        _ => "",
+    };
+    let mut cut = most - extension.len();
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{extension}", &name[..cut])
 }
 
 /// Open what another machine sent: a web address in the browser, or a file
@@ -2447,6 +2468,14 @@ mod tests {
         assert_ne!(
             kept,
             kept_as("/Users/someone/Downloads/report (1).pdf").unwrap()
+        );
+        // A name as long as a file's may be still is one with the nonce.
+        let long = format!("/Users/someone/{}é.pdf", "a".repeat(248));
+        let kept = kept_as(&long).unwrap();
+        let name = kept.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.len() <= NAME_BYTES && name.ends_with("a.pdf"),
+            "{name}"
         );
     }
 
