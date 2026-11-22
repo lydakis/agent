@@ -850,11 +850,15 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             // Who made it, as it was made: a name made again is another's.
             Some("created") => {
                 let by = event["data"]["created_by"].as_str().unwrap_or_default();
-                made_by.insert(bot.clone(), by.to_owned());
+                made_by.made(&bot, by);
                 continue;
             }
             Some("closed") => _ = closed.insert(bot.clone()),
-            Some("deleted") => _ = closed.remove(&bot),
+            // Gone for good: what it made is its first lead's ([`above`]).
+            Some("deleted") => {
+                closed.remove(&bot);
+                made_by.gone(&bot);
+            }
             // A wait from an agent closed: only if a message opened it
             // again since, as `/status` lists it only then.
             _ if ours && closed.contains(&bot) && waits_from(&event) => {
@@ -1111,8 +1115,8 @@ struct Seeded {
     running: Vec<String>,
     /// The agents closed that hold a call for the person.
     closed: HashSet<String>,
-    /// The agent that made each agent listed, or empty.
-    made_by: HashMap<String, String>,
+    /// Who made each agent listed.
+    made_by: Makers,
 }
 
 /// The calls held for the person, and each idle agent's question as of
@@ -1193,9 +1197,10 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     if !read.is_empty() {
         crate::keep_seen(store, ".elsewhere", identity.as_deref(), &read);
     }
-    let made_by = (listed.into_iter())
-        .map(|bot| (bot.name, bot.created_by.unwrap_or_default()))
-        .collect();
+    let mut made_by = Makers::default();
+    for bot in &listed {
+        made_by.made(&bot.name, bot.maker());
+    }
     Some(Seeded {
         needs,
         order,
@@ -1299,7 +1304,7 @@ fn in_order(store: &std::path::Path, listed: &[standing::Agent]) -> HashMap<Stri
 fn tell_waiting(
     needs: &needs::Needs,
     order: &HashMap<String, usize>,
-    made_by: &HashMap<String, String>,
+    made_by: &Makers,
     tell: &watch::Sender<Shared>,
 ) {
     let mut agents: Vec<(usize, String, String)> = (needs.waiting())
@@ -1332,6 +1337,50 @@ fn tell_waiting(
     tell.send_replace(shared);
 }
 
+/// Who made each agent an agent made, kept small for a store of
+/// thousands: each agent by a hash of its name, and each maker's name
+/// once, shared by all it made. One no agent made is not kept.
+#[derive(Default)]
+struct Makers {
+    by: HashMap<u64, Arc<str>>,
+    names: HashSet<Arc<str>>,
+}
+
+impl Makers {
+    fn key(bot: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        bot.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// `bot` was made by `by`, or by no agent where it is empty.
+    fn made(&mut self, bot: &str, by: &str) {
+        if by.is_empty() {
+            self.gone(bot);
+            return;
+        }
+        let by = match self.names.get(by) {
+            Some(name) => name.clone(),
+            None => {
+                let name: Arc<str> = by.into();
+                self.names.insert(name.clone());
+                name
+            }
+        };
+        self.by.insert(Self::key(bot), by);
+    }
+
+    fn gone(&mut self, bot: &str) {
+        self.by.remove(&Self::key(bot));
+    }
+
+    /// The agent that made `bot`, when one did.
+    fn of(&self, bot: &str) -> Option<&str> {
+        self.by.get(&Self::key(bot)).map(|by| &**by)
+    }
+}
+
 /// How many agents above one are walked at most: a chain of makers is
 /// short, and this only stops a ring.
 const MOST_ABOVE: usize = 64;
@@ -1341,16 +1390,12 @@ const MOST_ABOVE: usize = 64;
 /// no agent made that is no lead is its project's first lead's, as
 /// `/status` counts it (and so is one whose maker is gone): that lead is
 /// above it, and whatever is above that lead.
-fn above(
-    bot: &str,
-    made_by: &HashMap<String, String>,
-    projects: &HashMap<String, usize>,
-) -> Vec<String> {
+fn above(bot: &str, made_by: &Makers, projects: &HashMap<String, usize>) -> Vec<String> {
     let mut chain: Vec<String> = Vec::new();
     let mut at = bot.to_owned();
     while chain.len() < MOST_ABOVE {
-        let next = match made_by.get(&at).filter(|by| !by.is_empty()) {
-            Some(by) => by.clone(),
+        let next = match made_by.of(&at) {
+            Some(by) => by.to_owned(),
             None if !crate::project::is_lead(&at) => format!("{}.lead", project_in(&at, projects)),
             None => break,
         };
@@ -1462,7 +1507,8 @@ mod tests {
         let projects: HashMap<String, usize> = [("shop", 0), ("shop.web", 1), ("top", 2)]
             .map(|(name, at)| (name.to_owned(), at))
             .into();
-        let made_by: HashMap<String, String> = [
+        let mut made_by = Makers::default();
+        for (bot, by) in [
             ("top.lead", ""),
             ("shop.lead", "top.lead"),
             ("shop.fix", "shop.lead"),
@@ -1472,10 +1518,18 @@ mod tests {
             ("shop.web.page", ""),
             ("shop.ring", "shop.loop"),
             ("shop.loop", "shop.ring"),
-        ]
-        .map(|(bot, by)| (bot.to_owned(), by.to_owned()))
-        .into();
+        ] {
+            made_by.made(bot, by);
+        }
+        // Made again by no agent, and one gone for good: its first lead's.
+        made_by.made("shop.again", "shop.fix");
+        made_by.made("shop.again", "");
+        made_by.made("shop.deleted", "shop.fix");
+        made_by.gone("shop.deleted");
+        assert_eq!(made_by.names.len(), 6);
         let above = |bot| above(bot, &made_by, &projects);
+        assert_eq!(above("shop.again"), ["shop.lead", "top.lead"]);
+        assert_eq!(above("shop.deleted"), ["shop.lead", "top.lead"]);
         assert_eq!(
             above("shop.fix.tests"),
             ["shop.fix", "shop.lead", "top.lead"]
