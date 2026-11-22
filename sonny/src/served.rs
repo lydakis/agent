@@ -2948,7 +2948,7 @@ async fn noted(name: &str, bot: &str, turn: i64, call: &Value, arguments: &Value
         }
         crate::asks::TOOL => {
             if let Some(call) = call.as_str() {
-                crate::turn_end::asked(bot, turn, call, arguments);
+                crate::turn_end::asked(bot, turn, call, arguments, output);
             }
         }
         _ => {}

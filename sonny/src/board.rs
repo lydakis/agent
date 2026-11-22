@@ -103,6 +103,19 @@ pub fn follow(board: &str, owner: Option<i64>) -> Sub {
     }
 }
 
+/// Why a task's agent follows the board its task works from, which marks
+/// that follow as its task's board among others it may follow.
+const WORKS_FROM: &str = "you work from the board ";
+
+/// The follow of the board a task works from, by an agent of it known as
+/// `owner`: [`follow`], marked as its task's.
+pub fn works_from(board: &str, owner: Option<i64>) -> Sub {
+    Sub {
+        about: Some(format!("{WORKS_FROM}{board}")),
+        ..follow(board, owner)
+    }
+}
+
 /// Where a call's answer names the work that opened or was given whom it
 /// is for, which its tool host asks them to take: taken out of the answer
 /// before the agent sees it.
@@ -149,7 +162,13 @@ pub fn follows(
     if work.is_object()
         && (arguments["post"]["work"] == true || matches!(step, Some("open" | "take")))
     {
-        let _ = crate::lookout::subs::put(store, caller, follow(board, id));
+        // Its task's board stays marked as its task's.
+        let named = follow(board, id);
+        let task = (crate::lookout::subs::read(store, caller).iter())
+            .any(|sub| sub.name == named.name && sub.about.as_deref().is_some_and(works));
+        if !task {
+            let _ = crate::lookout::subs::put(store, caller, named);
+        }
     }
     if let Some(name) = said["dropped_from"]["name"].as_str() {
         let held_by = said["dropped_from"]["id"].as_i64();
@@ -232,9 +251,18 @@ pub fn event_of(posts: &[Value], n: usize, thread: &str) -> &'static str {
 /// The board the agent `agent` works from, as its board follow in
 /// `store` names it: none when it follows none.
 pub fn followed(store: &std::path::Path, agent: &str) -> Option<String> {
-    (crate::lookout::subs::read(store, agent).into_iter())
+    let boards: Vec<Sub> = (crate::lookout::subs::read(store, agent).into_iter())
         .filter(|sub| sub.name.starts_with("board."))
-        .find_map(|sub| sub.filter?["board"][0].as_str().map(str::to_owned))
+        .collect();
+    // Its task's board, before boards it follows for work it took.
+    let task = (boards.iter()).find(|sub| sub.about.as_deref().is_some_and(works));
+    (task.into_iter().chain(&boards))
+        .find_map(|sub| sub.filter.as_ref()?["board"][0].as_str().map(str::to_owned))
+}
+
+/// Whether `about` says a follow is of its task's board.
+fn works(about: &str) -> bool {
+    about.starts_with(WORKS_FROM)
 }
 
 /// Work's title: one line of at most [`TITLE_CHARS`], as a task's.
@@ -1963,6 +1991,27 @@ mod tests {
         .unwrap();
         let summary = commons::summary("long", &commons::dir(&home).join("long.jsonl")).unwrap();
         assert_eq!(summary["work"]["title"], "Carry error causes", "{summary}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_tasks_board_stays_its_own_when_its_agent_takes_work_elsewhere() {
+        let home = home("works-from");
+        let store = home.join("store");
+        crate::lookout::subs::put(&store, "shop.w1", works_from("shop/a", Some(2))).unwrap();
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        for board in ["shop/a", "shop/b"] {
+            let mut opened = work(board.replace('/', "-").as_str(), "Do it", json!({}));
+            opened["post"]["board"] = json!(board);
+            opened["post"]["title"] = json!(format!("Do {board}"));
+            lead(opened).unwrap();
+        }
+        for thread in ["shop-b", "shop-a"] {
+            let take = act(thread, "take");
+            let said = send(&home, "shop.w1", "shop", None, false, take.clone()).unwrap();
+            follows(&store, "shop.w1", Some(2), &take, &said).unwrap();
+            assert_eq!(followed(&store, "shop.w1").as_deref(), Some("shop/a"));
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 

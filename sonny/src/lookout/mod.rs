@@ -2786,10 +2786,10 @@ impl Lookout {
                 sub.name
             );
             let fields = json!({"quiet": quiet, "follow": sub.name, "text": text});
-            let at_ms = epoch_ms();
-            let mut event = sources::Event {
+            let (at_ms, seq) = (epoch_ms(), sources::next_seq());
+            let event = sources::Event {
                 source,
-                id: Some(format!("quiet.{}.{at_ms}", sub.name)),
+                id: Some(format!("quiet.{}.{at_ms}.{seq}", sub.name)),
                 topic,
                 text,
                 from: None,
@@ -2802,30 +2802,17 @@ impl Lookout {
                 // The lookout's own word, which only this follow hears.
                 lookout: true,
                 at_ms,
-                seq: sources::next_seq(),
+                seq,
             };
-            if (sub.steer.as_ref()).is_some_and(|steer| pattern::matches(steer, &event.fields)) {
-                event.steer = true;
-                event.steer_by = Some(sub.name.clone());
-            }
             gone_quiet.push((identity, event));
         }
-        for (identity, mut event) in gone_quiet {
+        // Heard as any event is: through its follow's steer, and kept only
+        // while fewer than `lookout_waiting` wait.
+        for (identity, event) in gone_quiet {
             if let Some(entry) = self.quiet.get_mut(&identity) {
                 entry.1 = true;
             }
-            let Some(sub) = (self.subs.iter()).find(|sub| sub.identity(id) == identity) else {
-                continue;
-            };
-            let subs = vec![sub.name.clone()];
-            self.annotate(&mut event, &subs);
-            self.heard.push(sources::Heard {
-                event,
-                subs,
-                order: 0,
-                due: false,
-            });
-            self.keep();
+            self.hear(event, 0);
         }
     }
 
@@ -5410,6 +5397,24 @@ mod tests {
         lookout.rehear();
         assert_eq!(lookout.heard.len(), 1);
         assert_eq!(lookout.heard[0].subs, ["held"]);
+    }
+
+    /// A quiet alert waits within `lookout_waiting` as any event does.
+    #[test]
+    fn a_quiet_alert_is_not_kept_past_what_may_wait() {
+        let mut lookout = lookout();
+        let mut held = hears("held");
+        held.sources = vec!["ci".into()];
+        held.quiet = Some("15m".into());
+        let mut chat = hears("chat");
+        chat.sources = vec!["slack".into()];
+        lookout.resubscribed(vec![held, chat]);
+        lookout.waiting = 1;
+        lookout.heard_from(&slack("lunch?", false));
+        lookout.quiet_check(Instant::now() + Duration::from_secs(15 * 60 + 1));
+        assert_eq!(lookout.heard.len(), 1);
+        assert_eq!(lookout.heard[0].event.text, "lunch?");
+        assert_eq!(lookout.unkept.count, 1);
     }
 
     /// A bot first seated with a quiet follow watches for silence from

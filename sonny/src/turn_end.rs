@@ -239,11 +239,16 @@ pub fn wrote(home: &Path, bot: &str, turn: Option<i64>, thread: &str) {
     }
 }
 
-/// `bot` asked the person in its turn `turn` as call `call`: one that
-/// waits for their answer is noted.
-pub fn asked(bot: &str, turn: i64, call: &str, arguments: &Value) {
+/// `bot` asked the person in its turn `turn` as call `call`, answered
+/// `output`: one that waits for their answer, or for its time to go on,
+/// is noted.
+pub fn asked(bot: &str, turn: i64, call: &str, arguments: &Value, output: &str) {
     let step = (arguments["options"].as_array()).is_none_or(Vec::is_empty);
-    if step || arguments["one_way"] == true {
+    // One that goes on by itself later waits until then, as one that
+    // waits for the answer does.
+    let said: Value = serde_json::from_str(output).unwrap_or_default();
+    let waits = matches!(said["if_unanswered"].as_str(), Some("wait" | "go_later"));
+    if step || arguments["one_way"] == true || waits {
         ends().lock().unwrap().asked(bot, turn, call);
     }
 }
@@ -465,6 +470,27 @@ mod tests {
         let note = ends.told("shop.w.1", Some("worker"), found).unwrap();
         assert!(note.contains("store"), "{note}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_ask_that_goes_on_later_or_waits_is_noted_and_one_that_goes_now_is_not() {
+        let options = json!({"options": [{"label": "a"}, {"label": "b"}]});
+        let noted = |bot: &str, plan: &str| {
+            asked(
+                bot,
+                1,
+                "c1",
+                &options,
+                &json!({"if_unanswered": plan}).to_string(),
+            );
+            ends().lock().unwrap().asking.contains_key(bot)
+        };
+        assert!(noted("asks.later.1", "go_later"));
+        assert!(noted("asks.wait.1", "wait"));
+        assert!(!noted("asks.now.1", "go_now"));
+        for bot in ["asks.later.1", "asks.wait.1"] {
+            ends().lock().unwrap().settled(bot, 1, "c1");
+        }
     }
 
     #[test]

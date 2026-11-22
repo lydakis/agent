@@ -2681,7 +2681,19 @@ impl View {
         self.item_at = (self.items.iter().enumerate())
             .map(|(at, item)| (item.thread.clone(), at))
             .collect();
-        self.boards = crate::board_view::boards(&self.items, &self.project);
+        // A board's plain threads, and the last post of each.
+        let plain: Vec<(&str, i64)> = (self.threads.iter())
+            .filter(|_| self.boards_on)
+            .filter(|thread| !self.is_item(thread))
+            .filter_map(|thread| {
+                let board = thread["board"].as_str()?;
+                let name = thread["thread"].as_str()?;
+                let at =
+                    (self.known.get(name)).map_or(0, |(_, kept)| kept["at"].as_i64().unwrap_or(0));
+                Some((board, at))
+            })
+            .collect();
+        self.boards = crate::board_view::boards(&self.items, &plain, &self.project);
         self.settle();
         for page in &mut self.pages {
             let Page::Thread {

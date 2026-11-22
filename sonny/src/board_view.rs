@@ -192,23 +192,31 @@ impl Board {
 
 /// The boards `items` are on: this window's project's first, then the
 /// rest by name, an order that never follows state.
-pub fn boards(items: &[Item], here: &str) -> Vec<Board> {
-    let mut by_name: HashMap<&str, usize> = HashMap::new();
+pub fn boards(items: &[Item], plain: &[(&str, i64)], here: &str) -> Vec<Board> {
+    let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<Board> = Vec::new();
-    for (at, item) in items.iter().enumerate() {
-        let board = *by_name.entry(item.board.as_str()).or_insert_with(|| {
+    let mut board_of = |name: &str, out: &mut Vec<Board>| -> usize {
+        *by_name.entry(name.to_owned()).or_insert_with(|| {
             out.push(Board {
-                name: item.board.clone(),
+                name: name.to_owned(),
                 items: Vec::new(),
                 last: 0,
                 counts: [0; 6],
             });
             out.len() - 1
-        });
+        })
+    };
+    for (at, item) in items.iter().enumerate() {
+        let board = board_of(&item.board, &mut out);
         let board = &mut out[board];
         board.items.push(at);
         board.last = board.last.max(item.at);
         board.counts[item.state as usize] += 1;
+    }
+    // Its plain threads, each `(board, last post)`, make it a board too.
+    for (name, at) in plain {
+        let board = board_of(name, &mut out);
+        out[board].last = out[board].last.max(*at);
     }
     out.sort_by(|a, b| {
         let theirs = |board: &Board| project_of(&board.name) != here;
@@ -1499,6 +1507,17 @@ pub(crate) mod tests {
         // The plain thread is picked and opened as any thread.
         press(&mut view, KeyCode::Down);
         assert!(picked(&mut view, 80).contains("The plan"));
+        // A board of plain threads alone is a board all the same.
+        send(
+            home,
+            "shop.lead",
+            json!({"post": {"name": "notes", "title": "Notes so far",
+            "text": "x", "board": "shop/notes"}}),
+        );
+        press(&mut view, KeyCode::Esc);
+        view.reload();
+        let lines = card(&mut view, 80);
+        assert!(lines.iter().any(|l| l.contains("shop/notes")), "{lines:#?}");
         let _ = std::fs::remove_dir_all(home);
     }
 
