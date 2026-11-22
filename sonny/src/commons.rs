@@ -3350,7 +3350,7 @@ impl View {
         // A row that says it itself, not a board kept for what it holds.
         let says = |query: &str, row: &Row| match row {
             Row::Board(at) => crate::find::says(query, &self.boards[*at].name),
-            Row::Hung(_) | Row::Thread(_) | Row::Item(_) => true,
+            Row::Hung(_) | Row::Thread(_) | Row::Item(_) | Row::Plain(_) => true,
             Row::Fold(_) | Row::Heading(_) => false,
         };
         match self.pages.last() {
