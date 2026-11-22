@@ -6360,6 +6360,9 @@ impl Search {
     }
 }
 
+/// A picture being read, decoded and scaled beside the loop.
+type Preparing = tokio::task::JoinHandle<Result<Option<attach::Picture>, String>>;
+
 struct App {
     client: Arc<Client>,
     bot: String,
@@ -6612,6 +6615,10 @@ struct App {
     /// here, from 1; one neither the draft nor Ctrl-Y can bring back is let
     /// go.
     pictures: Vec<Option<attach::Picture>>,
+    /// Pictures being read, decoded and scaled beside the loop, by their
+    /// numbers: each placeholder is in the composer at once, its picture
+    /// behind it once ready ([`App::prepared`]).
+    preparing: Vec<(usize, Preparing)>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The slash commands the person ran, for the menu to rank.
@@ -8796,6 +8803,7 @@ impl App {
             queued: Vec::new(),
             steering: Vec::new(),
             pictures: Vec::new(),
+            preparing: Vec::new(),
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
             picks_kept: false,
@@ -9287,6 +9295,8 @@ impl App {
             self.wrote();
             self.hear();
             changed |= self.drawings();
+            changed |= self.prepared().await;
+            changed |= (self.pane.as_mut()).is_some_and(pane::Pane::colored);
             // The connection is gone: what it brought and was not applied
             // yet is let go, a read for it having failed with it, and the
             // window catches up from the last item it drew, so nothing is
@@ -18807,7 +18817,7 @@ impl App {
                 match attach::paths(&text, std::path::Path::new(&self.workspace)) {
                     Some(paths) => {
                         for path in paths {
-                            self.attach(attach::load(&path));
+                            self.prepare(move || attach::load(&path).map(Some));
                         }
                     }
                     None => self
@@ -18885,11 +18895,7 @@ impl App {
                     KeyCode::Char('j') if ctrl => self.input.insert("\n"),
                     // A picture on the clipboard, as Codex and Claude Code
                     // take one: terminals paste only text.
-                    KeyCode::Char('v') if ctrl => match attach::clipboard() {
-                        Ok(Some(picture)) => self.attach(Ok(picture)),
-                        Ok(None) => self.notice = Some("no picture on the clipboard".into()),
-                        Err(error) => self.notice = Some(error),
-                    },
+                    KeyCode::Char('v') if ctrl => self.prepare(attach::clipboard),
                     // With nothing typed, the agent above or below in the
                     // pane's list of the project's agents. A terminal that
                     // sends alt+← as alt+b is taken at its word.
@@ -19073,6 +19079,9 @@ impl App {
         &mut self,
         step: impl FnOnce(&mut recall::Recall<Attached>, &str, &mut Attached) -> Option<String>,
     ) -> Option<String> {
+        // A picture still being made ready belongs to the draft swapped
+        // away: it is let go, never put behind another draft's placeholder.
+        self.preparing.clear();
         let mut attached = (
             std::mem::take(&mut self.pictures),
             std::mem::take(&mut self.quotes),
@@ -19180,6 +19189,12 @@ impl App {
     /// Send what is written: a message to a busy bot joins its running
     /// turn, or with `queue` runs after it.
     async fn submit_as(&mut self, queue: bool) {
+        // The pictures still being made ready go with it: what is sent is
+        // what the composer shows.
+        while let Some((number, job)) = self.preparing.pop() {
+            let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
+            self.ready(number, got);
+        }
         let prompt = self.input.trim().to_owned();
         // A quote alone is a message, as it was typed into the words.
         if prompt.is_empty() && self.quotes.is_empty() {
@@ -19587,6 +19602,7 @@ impl App {
     fn discard(&mut self) {
         self.input.clear();
         self.pictures.clear();
+        self.preparing.clear();
         self.quotes.clear();
     }
 
@@ -20187,34 +20203,99 @@ impl App {
         }
     }
 
-    /// A picture for the message being written, behind a placeholder put
-    /// where the cursor is; or why there is none.
+    /// A picture to give with the message, made ready by `make` beside the
+    /// loop (a file read, a clipboard asked, a PNG decoded and scaled): its
+    /// placeholder goes in the composer now, and the keys go on.
+    fn prepare(
+        &mut self,
+        make: impl FnOnce() -> Result<Option<attach::Picture>, String> + Send + 'static,
+    ) {
+        let number = self.placeholder();
+        let woken = self.woken.clone();
+        let job = tokio::task::spawn_blocking(move || {
+            let made = make();
+            woken.notify_one();
+            made
+        });
+        self.preparing.push((number, job));
+    }
+
+    /// The next picture's placeholder, put where the cursor is: its number.
+    fn placeholder(&mut self) -> usize {
+        self.forget_pictures();
+        self.pictures.push(None);
+        let number = self.pictures.len();
+        self.input
+            .insert(&format!("{} ", attach::placeholder(number)));
+        self.notice = None;
+        number
+    }
+
+    /// A picture made ready already, behind its placeholder, or why not.
+    #[cfg(test)]
     fn attach(&mut self, picture: Result<attach::Picture, String>) {
-        for (at, picture) in self.pictures.iter_mut().enumerate() {
-            let placeholder = attach::placeholder(at + 1);
-            if !self.input.contains(&placeholder) && !self.input.killed().contains(&placeholder) {
-                *picture = None;
-            }
+        let number = self.placeholder();
+        self.ready(number, picture.map(Some));
+    }
+
+    /// Pictures made ready beside the loop since it last looked, each behind
+    /// its placeholder: whether any was.
+    async fn prepared(&mut self) -> bool {
+        let mut any = false;
+        while let Some(at) = (self.preparing.iter()).position(|(_, job)| job.is_finished()) {
+            let (number, job) = self.preparing.remove(at);
+            let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
+            self.ready(number, got);
+            any = true;
+        }
+        any
+    }
+
+    /// Picture `number` as it was made ready: behind its placeholder while
+    /// that is still written, or, none or past what a message may hold, its
+    /// placeholder taken out and why said.
+    fn ready(&mut self, number: usize, got: Result<Option<attach::Picture>, String>) {
+        let placeholder = attach::placeholder(number);
+        if !self.input.contains(&placeholder)
+            || !(self.pictures.get(number - 1)).is_some_and(Option::is_none)
+        {
+            return;
         }
         // The daemon takes a message's pictures up to a size together.
         let placed: usize = (self.placed(&self.input).iter())
             .map(|placed| placed.data.len())
             .sum();
-        match picture {
-            Ok(picture) if placed + picture.data.len() > attach::MOST_BYTES => {
-                self.notice = Some(format!(
-                    "a message's pictures may be {} MB together; this one makes {} MB",
-                    attach::MOST_BYTES / 1024 / 1024,
-                    (placed + picture.data.len()).div_ceil(1024 * 1024)
-                ));
+        let said = match got {
+            Ok(Some(picture)) if placed + picture.data.len() > attach::MOST_BYTES => format!(
+                "a message's pictures may be {} MB together; this one makes {} MB",
+                attach::MOST_BYTES / 1024 / 1024,
+                (placed + picture.data.len()).div_ceil(1024 * 1024)
+            ),
+            Ok(Some(picture)) => {
+                self.pictures[number - 1] = Some(picture);
+                return;
             }
-            Ok(picture) => {
-                self.pictures.push(Some(picture));
-                self.input
-                    .insert(&format!("{} ", attach::placeholder(self.pictures.len())));
-                self.notice = None;
+            Ok(None) => "no picture on the clipboard".into(),
+            Err(error) => error,
+        };
+        if !self.input.remove(&format!("{placeholder} ")) {
+            self.input.remove(&placeholder);
+        }
+        // Its number goes to the next picture, when none came after it.
+        if self.pictures.len() == number {
+            self.pictures.pop();
+        }
+        self.notice = Some(said);
+    }
+
+    /// Pictures whose placeholders neither the draft nor Ctrl-Y can bring
+    /// back, let go.
+    fn forget_pictures(&mut self) {
+        for (at, picture) in self.pictures.iter_mut().enumerate() {
+            let placeholder = attach::placeholder(at + 1);
+            if !self.input.contains(&placeholder) && !self.input.killed().contains(&placeholder) {
+                *picture = None;
             }
-            Err(error) => self.notice = Some(error),
         }
     }
 
@@ -40306,6 +40387,80 @@ mod tests {
         app.attach(Ok(picture(6)));
         let kept: Vec<_> = app.pictures.iter().map(Option::is_some).collect();
         assert_eq!(kept, [false, false, false, false, true, true]);
+    }
+
+    /// A picture is made ready beside the loop: its placeholder shows at
+    /// once and the keys go on while it is read; once ready it is behind
+    /// its placeholder, and a message sent before then waits for it.
+    #[tokio::test]
+    async fn a_picture_being_made_ready_never_holds_the_keys() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = asked.clone();
+        let client = daemon_answering(move |asked: &Value| {
+            heard.lock().unwrap().push(asked.clone());
+            json!({"message": 2})
+        })
+        .await;
+        let mut app = app(client);
+        let picture = attach::Picture {
+            media_type: "image/png",
+            data: vec![7],
+        };
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let made = picture.clone();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(Some(made))
+        });
+        let key = |c| Event::Key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        for c in "look".chars() {
+            app.key(key(c)).await;
+        }
+        assert_eq!(&*app.input, "[Image #1] look");
+        assert!(!app.prepared().await, "still being made ready");
+        go.send(()).unwrap();
+        while !app.prepared().await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(app.placed(&app.input), std::slice::from_ref(&picture));
+        // None on the clipboard, or a file that is no picture: the
+        // placeholder goes, and why is said.
+        app.prepare(|| Ok(None));
+        app.prepare(|| Err("notes.txt is not an image".into()));
+        while !app.preparing.is_empty() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(&*app.input, "[Image #1] look");
+        assert!(app.notice.is_some());
+        // Sent while one is still being read: it goes with the message.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(Some(attach::Picture {
+                media_type: "image/png",
+                data: vec![8],
+            }))
+        });
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = go.send(());
+        });
+        app.submit().await;
+        app.beside_done().await;
+        assert!(app.preparing.is_empty() && app.input.is_empty());
+        let submitted = (asked.lock().unwrap().iter())
+            .find(|asked| asked["op"] == "submit")
+            .cloned()
+            .expect("sent");
+        assert_eq!(
+            submitted["images"],
+            json!([
+                {"media_type": "image/png", "data": "Bw=="},
+                {"media_type": "image/png", "data": "CA=="}
+            ]),
+            "{submitted}"
+        );
     }
 
     #[tokio::test]

@@ -115,6 +115,22 @@ pub fn wake(woken: &Arc<tokio::sync::Notify>) {
     state.wake.push(Arc::downgrade(woken));
 }
 
+/// The windows woken to draw again, as for a picture ready, for something
+/// else made ready beside the loop.
+pub fn ring() {
+    let wake = {
+        let mut state = state();
+        let state = state.get_or_insert_with(State::default);
+        state.wake.retain(|w| w.strong_count() > 0);
+        (state.wake.iter())
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>()
+    };
+    for woken in wake {
+        woken.notify_one();
+    }
+}
+
 /// How many pictures were made ready so far.
 pub fn landed() -> u64 {
     LANDED.load(Ordering::Acquire)
