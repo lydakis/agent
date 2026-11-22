@@ -22162,7 +22162,9 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 
     // Schema 113: a turn's prompt holds the effort its turn asked for, so
     // the history keeps it whatever becomes of the turn's own row. A prompt
-    // from before has none, and its turn ran at the request's effort.
+    // from before has none, as its turn's requests carried the effort
+    // themselves; a turn still running or parked gets its own, so it goes
+    // on at the effort it asked for.
     if from < 113 {
         let has: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='effort')",
@@ -22170,7 +22172,11 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
             |r| r.get(0),
         )?;
         if !has {
-            conn.execute_batch("ALTER TABLE nodes ADD COLUMN effort TEXT;")?;
+            conn.execute_batch(
+                "ALTER TABLE nodes ADD COLUMN effort TEXT;
+                 UPDATE nodes SET effort=(SELECT reasoning FROM turns t WHERE t.id=nodes.turn)
+                 WHERE turn IN (SELECT running_turn FROM bots WHERE running_turn IS NOT NULL);",
+            )?;
         }
     }
 

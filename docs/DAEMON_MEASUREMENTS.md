@@ -12991,6 +12991,6 @@ column on the node (schema 113), written with the prompt in the insert that
 already writes it, so a turn start adds no write. A call on a model that
 takes effort changes encodes one small item per change of effort in its
 window (none for a bot whose turns all run at its own), and streams it
-ahead of the prompt it belongs to. Fitting the window counts room for them
-in one pass over the window's turn prompts. Nothing is kept per bot. The
+ahead of the prompt it belongs to. On such a model, fitting the window
+counts room for them in one pass over the window's turn prompts. Nothing is kept per bot. The
 pull request's Perf screen is the matched comparison.

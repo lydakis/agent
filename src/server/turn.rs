@@ -131,45 +131,49 @@ fn fingerprint(prefix: &[u8], first: i64, url: &str, model: &str) -> i64 {
     hash as i64
 }
 
-/// The effort changes a window's history makes against `own`, the effort
-/// its requests keep: where each turn whose effort differs from the one
-/// before it starts, by its prompt's id, the item `mark` makes of it. A
-/// turn that asked for none runs at `own`. The same window always makes
-/// the same marks, so a history keeps them in place and its cache holds.
-fn effort_marks(
-    window: &agent_runtime::store::Window,
-    own: &str,
-    mark: impl Fn(&str) -> agent_runtime::Result<Bytes>,
-) -> agent_runtime::Result<Vec<(i64, Bytes)>> {
-    let mut marks: Vec<(i64, Bytes)> = Vec::new();
+/// The bot's own effort and the levels its model's family takes.
+pub struct Marking {
+    own: Box<str>,
+    levels: &'static [&'static str],
+}
+
+/// Where a window's turns change effort, and to what: each turn's prompt
+/// (by its index in the window) whose effort differs from the one before
+/// it, the first against the bot's own. A turn that asked for none, or for
+/// a level the family does not take (one from before a switch of family),
+/// runs at the bot's own.
+fn mark_levels<'a>(
+    window: &'a agent_runtime::store::Window,
+    own: &'a str,
+    levels: &[&str],
+) -> Vec<(usize, &'a str)> {
+    let mut changes = Vec::new();
     let mut effective = own;
     for (index, effort) in &window.efforts {
-        let effort = effort.as_deref().unwrap_or(own);
+        let effort = (effort.as_deref())
+            .filter(|level| levels.contains(level))
+            .unwrap_or(own);
         if effort != effective {
-            marks.push((window.ids[*index], mark(effort)?));
+            changes.push((*index, effort));
             effective = effort;
         }
     }
-    marks.sort_unstable_by_key(|(id, _)| *id);
-    Ok(marks)
+    changes
 }
 
-/// The most effort marks a window may send and their bytes, before
-/// separators: one wherever a turn's recorded effort differs from the turn
-/// before it (the first against none), each at most the longest mark.
-fn marks_room(window: &agent_runtime::store::Window) -> ContextUsage {
-    let mut before = None;
-    let mut items = 0;
-    for (_, effort) in &window.efforts {
-        if effort.as_deref() != before {
-            items += 1;
-            before = effort.as_deref();
-        }
-    }
-    ContextUsage {
-        bytes: items * Provider::EFFORT_MARK_MOST,
-        items,
-    }
+/// The items that say each change of effort, by the node they go ahead of.
+fn effort_marks(
+    window: &agent_runtime::store::Window,
+    own: &str,
+    levels: &[&str],
+    mark: impl Fn(&str) -> agent_runtime::Result<Bytes>,
+) -> agent_runtime::Result<Vec<(i64, Bytes)>> {
+    let mut marks = mark_levels(window, own, levels)
+        .into_iter()
+        .map(|(index, level)| Ok((window.ids[index], mark(level)?)))
+        .collect::<agent_runtime::Result<Vec<_>>>()?;
+    marks.sort_unstable_by_key(|(id, _)| *id);
+    Ok(marks)
 }
 
 /// Split window items into read-ahead batches by count and by bytes.
@@ -275,6 +279,10 @@ pub struct Turn {
     pub ruled: std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>,
     /// The turn's model's context window, as the turn starts.
     pub window: std::sync::OnceLock<u64>,
+    /// The bot's own effort and the levels its model's family takes, when
+    /// the turn's model takes a change of effort inside the conversation:
+    /// what its windows keep room for ([`Turn::marks_room`]).
+    pub marking: std::sync::OnceLock<Option<Marking>>,
     /// The park this task continues, already claimed by the service: record
     /// its wait results, then keep going.
     pub resumed: Option<Waiting>,
@@ -968,10 +976,32 @@ impl Turn {
         };
         let prefix = self.prefix(&window, prefix_budget).await?;
         Ok(Context {
+            marks: self.marks_room(&window),
             window: Some(window),
             prefix,
             thinking: Strip::default(),
         })
+    }
+
+    /// Where the window's effort marks go, by index, on the turn's model.
+    fn mark_indexes(&self, window: &agent_runtime::store::Window) -> Vec<usize> {
+        match self.marking.get() {
+            Some(Some(marking)) => mark_levels(window, &marking.own, marking.levels)
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Room for the window's effort marks on the turn's model, each at the
+    /// longest mark's size; none on a model that takes no marks.
+    fn marks_room(&self, window: &agent_runtime::store::Window) -> ContextUsage {
+        let items = self.mark_indexes(window).len();
+        ContextUsage {
+            bytes: items * Provider::EFFORT_MARK_MOST,
+            items,
+        }
     }
 
     async fn prefix(
@@ -1070,7 +1100,7 @@ impl Turn {
         while !context.usage().fits(limit) {
             // The window's effort marks shrink with it: room for the ones
             // it has now is room enough for the ones a smaller one has.
-            let marks = (context.window.as_ref()).map_or(ContextUsage::default(), marks_room);
+            let marks = context.marks;
             let next = ContextUsage {
                 bytes: raw.bytes.min(
                     limit
@@ -2858,8 +2888,10 @@ impl Turn {
             .bound(record, &view.prefix.bytes, window, (summarizer, model))
             .await?;
         let sent = if whole { window.ids.len() } else { span.end };
+        let marks = self.mark_indexes(window);
         let choice = choose(&Shape {
             family,
+            marks: &marks,
             ids: &window.ids,
             sizes: &window.sizes,
             thinking: &window.thinking,
@@ -2949,6 +2981,7 @@ impl Turn {
             }
         };
         let view = Context {
+            marks: self.marks_room(&window),
             window: Some(window),
             prefix,
             thinking: Strip::default(),
@@ -3491,6 +3524,14 @@ impl Turn {
         // the effort that wrote it, unless the model takes a change of
         // effort inside the conversation: then every call keeps the bot's.
         let marked = record.own_effort.is_some() && provider.takes_effort_marks(model);
+        self.marking.get_or_init(|| {
+            (record.own_effort.as_deref())
+                .filter(|_| marked)
+                .map(|own| Marking {
+                    own: own.into(),
+                    levels: provider.family().efforts(),
+                })
+        });
         let mut inherited = context.view_sent.unwrap_or_else(|| {
             context
                 .previous_call
@@ -4407,7 +4448,9 @@ impl Turn {
                 .filter(|_| window.is_some() && provider.takes_effort_marks(model));
             let marks = match (window, own) {
                 (Some(window), Some(own)) => {
-                    effort_marks(window, own, |level| provider.effort_mark(level))?
+                    effort_marks(window, own, provider.family().efforts(), |level| {
+                        provider.effort_mark(level)
+                    })?
                 }
                 _ => Vec::new(),
             };
@@ -4809,6 +4852,7 @@ impl Turn {
                 window: Some(window),
                 prefix,
                 thinking,
+                ..
             }) => Chain {
                 bot: &self.bot,
                 window: Some((&prefix.bytes[..], window.elided, &window.ids[..])),
@@ -8345,6 +8389,8 @@ use agent_runtime::store::pinned_item;
 #[derive(Clone)]
 struct Context {
     window: Option<Window>,
+    /// Room for the window's effort marks ([`Turn::marks_room`]).
+    marks: ContextUsage,
     prefix: ContextPrefix,
     /// The items sent without their thinking blocks.
     thinking: Strip,
@@ -8353,6 +8399,7 @@ impl Context {
     fn empty() -> Self {
         Self {
             window: None,
+            marks: ContextUsage::default(),
             prefix: ContextPrefix {
                 bytes: Bytes::new(),
                 items: 0,
@@ -8361,16 +8408,12 @@ impl Context {
             thinking: Strip::default(),
         }
     }
-    /// What the window sends, with room for every effort mark it may
-    /// carry ([`effort_marks`]): whatever the bot's own effort, a mark goes
-    /// only where a turn's recorded effort differs from the one before it,
-    /// so these are at most as many.
+    /// What the window sends, with its effort marks.
     fn usage(&self) -> ContextUsage {
         self.window.as_ref().map_or(ContextUsage::default(), |w| {
-            let marks = marks_room(w);
             ContextUsage {
-                bytes: w.item_bytes as usize + marks.bytes,
-                items: w.ids.len() + marks.items,
+                bytes: w.item_bytes as usize + self.marks.bytes,
+                items: w.ids.len() + self.marks.items,
             }
             .with_prefix(&self.prefix)
         })
@@ -8831,6 +8874,8 @@ impl Choice {
 /// goes ahead of the window and after it, and a request of its own.
 struct Shape<'a> {
     family: agent_runtime::codec::Family,
+    /// Where the window's effort marks go, by index, ascending.
+    marks: &'a [usize],
     ids: &'a [i64],
     sizes: &'a [u32],
     thinking: &'a [u32],
@@ -8871,12 +8916,16 @@ fn choose(shape: &Shape<'_>) -> Choice {
             .map(|n| shape.thinking[n] as usize)
             .sum()
     };
+    // Effort marks go with the items they go ahead of.
+    let marks = |len: usize| shape.marks.partition_point(|&index| index < len);
     let items = |len: usize| -> usize {
+        let marks = marks(len);
         shape.sizes[..len]
             .iter()
             .map(|&size| size as usize)
             .sum::<usize>()
-            + len.saturating_sub(1)
+            + marks * agent_runtime::provider::Provider::EFFORT_MARK_MOST
+            + (len + marks).saturating_sub(1)
     };
     let mut lens = vec![shape.span.end];
     if shape.past && shape.ids.len() > shape.span.end {
@@ -8886,7 +8935,7 @@ fn choose(shape: &Shape<'_>) -> Choice {
     for len in lens {
         let usage = ContextUsage {
             bytes: shape.ahead.bytes + items(len) + shape.request,
-            items: shape.ahead.items + len + 1,
+            items: shape.ahead.items + len + marks(len) + 1,
         };
         if !usage.fits(shape.limit) {
             continue;
@@ -9454,6 +9503,7 @@ mod tests {
             given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
+            marking: Default::default(),
             resumed: None,
             steers: Arc::new(AtomicBool::new(true)),
             compact: Arc::default(),
@@ -9643,6 +9693,7 @@ mod tests {
             given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
+            marking: Default::default(),
             resumed: None,
             steers: Arc::default(),
             compact: Arc::default(),
@@ -9805,6 +9856,7 @@ mod tests {
             given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
+            marking: Default::default(),
             resumed: None,
             steers: Arc::default(),
             compact: Arc::default(),
@@ -9906,6 +9958,7 @@ mod tests {
         const THINKING: [u32; 4] = [0; 4];
         Shape {
             family,
+            marks: &[],
             ids: &IDS[..sizes.len()],
             sizes,
             thinking: &THINKING[..sizes.len()],
@@ -10026,6 +10079,7 @@ mod tests {
             given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
+            marking: Default::default(),
             resumed: None,
             steers: Arc::default(),
             compact: Arc::default(),

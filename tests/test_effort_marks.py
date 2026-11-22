@@ -6,6 +6,7 @@ import unittest
 
 from bench.runtime_client import Client
 from bench.targets import clean_env
+from tests import test_runtime
 from tests.test_runtime import AnthropicModel, Model, ModelFixture, is_summary
 
 RUNTIME = unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1',
@@ -123,6 +124,25 @@ class ResponsesEffortMarkTests(Turns, ModelFixture):
         boosted = self.turn(client, 'two', effort='xhigh')
         self.assertEqual(boosted['reasoning']['effort'], 'xhigh')
         self.assertFalse([i for i in boosted['input'] if i.get('type') == 'configuration_update'])
+
+
+@RUNTIME
+class SwitchedEffortMarkTests(unittest.TestCase):
+    start = test_runtime.SwitchFamilyTests.start
+    run_turn = test_runtime.SwitchFamilyTests.run_turn
+
+    def test_a_level_the_new_family_does_not_take_runs_at_the_bots_own(self):
+        client, openai, anthropic, path = self.start()
+        openai.models = ('gpt-6-sol',)
+        client.request('create', bot='Bob', workspace=str(path), model='anthropic/claude-opus-5-5', effort='high')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='one', effort='max')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.run_turn(client, '2', 'two')
+        self.assertIn('result', client.request('configure', bot='Bob', model='openai/gpt-6-sol', effort='high'))
+        self.run_turn(client, '3', 'three')
+        request = openai.requests.get(timeout=3)
+        self.assertEqual(request['reasoning']['effort'], 'high')
+        self.assertFalse([i for i in request['input'] if i.get('type') == 'configuration_update'])
 
 
 if __name__ == '__main__':

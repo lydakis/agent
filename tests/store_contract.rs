@@ -13928,6 +13928,48 @@ fn schema_112_counts_cut_offs_and_ends_what_an_older_daemon_left_running() {
 }
 
 #[test]
+fn schema_113_keeps_each_prompts_effort_and_a_running_turns_own() {
+    let path = std::env::temp_dir().join(format!("agent-efforts-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let boosted = TurnOptions {
+        effort: Some("xhigh".into()),
+        ..TurnOptions::default()
+    };
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin("Bob", "r", "work", true, &boosted, allow_provider)
+            .unwrap()
+            .turn;
+        let effort: Option<String> = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT effort FROM nodes WHERE turn=?", [turn], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+        turn
+    };
+    // A store from before 113, its turn still running.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE nodes DROP COLUMN effort; PRAGMA user_version=112;")
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let effort: Option<String> = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT effort FROM nodes WHERE turn=?", [turn], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(effort.as_deref(), Some("xhigh"));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
 fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
     // Bytes: a 4 KiB context keeps three quarters, 3,072 bytes, for the
     // running turn; its prompt item takes some, and two of three 1,000-byte

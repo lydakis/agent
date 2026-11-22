@@ -1167,10 +1167,12 @@ for no effort runs at the bot's, and a turn after a boosted one says so. The
 items are made as the window is read from the effort each turn's prompt
 holds (schema 113: the prompt node keeps its turn's effort, so a fork keeps
 it after its source is deleted), the same every time, so they stay in place.
-A window keeps room for every mark it may carry within `context_bytes` and
-`context_items`: one wherever a turn's effort differs from the one before
-it, at the longest mark's size. A prompt from before schema 113 holds no
-effort and gets no mark, as its request had none. Other models, a
+On a model that takes marks, a window and a summary's copy of it keep room
+for its marks within `context_bytes` and `context_items`, each at the
+longest mark's size. A level the model's family does not take, as `max`
+from before a switch to Responses, runs at the bot's own. A prompt from
+before schema 113 holds no effort and gets no mark, as its request had
+none; the migration gives a turn still running or parked its own. Other models, a
 fallback to one, and a bot without an effort of its own run the turn at its
 effort on the request, as before.
 Every Anthropic call sets `max_tokens` to the model's full output limit:
