@@ -215,6 +215,7 @@ pub fn call(
         project,
         profile: None,
         lead: crate::project::is_lead(author),
+        folder: None,
     };
     call_as(home, &caller, arguments, &|_, _| false)
 }
@@ -295,9 +296,25 @@ pub fn call_as(
 
 /// What a post holds that a filter matches: all Sonny wrote of it, and
 /// of work on a board, where it stands (`crate::board::standing`).
-const FIELDS: [&str; 15] = [
-    "by", "by_id", "at", "model", "project", "sonny", "external", "title", "board", "do", "needs",
-    "labels", "for", "state", "holder",
+const FIELDS: [&str; 18] = [
+    "by",
+    "by_id",
+    "at",
+    "model",
+    "project",
+    "sonny",
+    "external",
+    "title",
+    "board",
+    "do",
+    "needs",
+    "labels",
+    "for",
+    "state",
+    "holder",
+    "branch",
+    "commit",
+    "uncommitted",
 ];
 
 /// A call's `filter`, an event pattern as the follows tool takes one,
@@ -1401,7 +1418,10 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
                 }
             }
             // What a board's post did, as the work's history.
-            for key in ["do", "board", "needs", "labels", "for", "took_from"] {
+            for key in ["do", "board", "needs", "labels", "for", "took_from"]
+                .into_iter()
+                .chain(crate::board::MADE)
+            {
                 if !post[key].is_null() {
                     shown[key] = post[key].clone();
                 }
@@ -4770,6 +4790,7 @@ mod tests {
             project: Some("shop"),
             profile: None,
             lead: true,
+            folder: None,
         };
         let post = |name: &str, extra: Value| {
             let mut post = json!({"name": name, "title": format!("Do {name}"), "text": "x",

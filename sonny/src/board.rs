@@ -297,10 +297,11 @@ pub fn valid_title(title: &str) -> Result<(), String> {
 /// paused, taken, done, failed or canceled; whether an open one waits on its
 /// needs is [`waiting`]'s, which knows the other work.
 ///
-/// `{board, state, by, by_id?, at, labels, needs, for?, title?, holder?, holder_id?, result?}`:
-/// `by` made it, as the daemon knew it by `by_id`, `at` is its last step's time, `holder` holds
-/// taken work and did done or failed work, `result` is a closing post's text, and `title` is the
-/// short one a reply opening a thread already there gave it.
+/// `{board, state, by, by_id?, at, labels, needs, for?, title?, holder?, holder_id?, result?,
+/// branch?, commit?, uncommitted?}`: `by` made it, as the daemon knew it by `by_id`, `at` is its
+/// last step's time, `holder` holds taken work and did done or failed work, `result` is a closing
+/// post's text, `branch`, `commit` and `uncommitted` the checkout a done post recorded
+/// ([`MADE`]), and `title` is the short one a reply opening a thread already there gave it.
 pub fn standing(posts: &[Value]) -> Option<Value> {
     let mut item: Option<Value> = None;
     for post in posts {
@@ -361,6 +362,12 @@ pub fn standing(posts: &[Value]) -> Option<Value> {
                 set("result", post["text"].clone());
             }
             _ => {}
+        }
+        // What a done post recorded of its author's checkout.
+        if action == "done" {
+            for key in MADE.into_iter().filter(|key| !post[*key].is_null()) {
+                it.insert(key.to_owned(), post[key].clone());
+            }
         }
         // Fields any marked post carries change the work as of it.
         if let Some(labels) = post["labels"].as_object() {
@@ -430,8 +437,9 @@ pub fn shown(dir: &Path, mut item: Value) -> Value {
 
 /// Who calls the tool: the agent, the daemon's id for it, whom what it is
 /// shown counts for (as `commons::who` names it), the model it writes
-/// with, the project it is named in, the profile it was made as, and
-/// whether it is a lead.
+/// with, the project it is named in, the profile it was made as, whether
+/// it is a lead, and the folder it works in, whose checkout its `done`
+/// records.
 pub struct Caller<'a> {
     pub name: &'a str,
     pub id: Option<i64>,
@@ -440,6 +448,30 @@ pub struct Caller<'a> {
     pub project: Option<&'a str>,
     pub profile: Option<&'a str>,
     pub lead: bool,
+    pub folder: Option<&'a Path>,
+}
+
+/// What a `done` post records of its author's checkout, as git there
+/// says: its `branch` (none on a detached head), its `commit`, and
+/// `uncommitted` when changes there are not in it.
+pub const MADE: [&str; 3] = ["branch", "commit", "uncommitted"];
+
+/// `folder`'s checkout as a `done` post records it ([`MADE`]); nothing
+/// for a folder that is no git checkout with a commit.
+pub fn checkout(folder: &Path) -> serde_json::Map<String, Value> {
+    let git = |args: &[&str]| crate::task::git(folder, args).ok();
+    let mut made = serde_json::Map::new();
+    let Some(commit) = git(&["rev-parse", "--verify", "--quiet", "HEAD"]) else {
+        return made;
+    };
+    if let Some(branch) = git(&["symbolic-ref", "--short", "--quiet", "HEAD"]) {
+        made.insert("branch".into(), json!(branch));
+    }
+    made.insert("commit".into(), json!(commit));
+    if git(&["status", "--porcelain"]).is_some_and(|changed| !changed.is_empty()) {
+        made.insert("uncommitted".into(), json!(true));
+    }
+    made
 }
 
 /// Whether the commons tool's `post` puts its thread on a board.
@@ -952,6 +984,9 @@ pub fn reply(
                         ));
                     }
                     opened = opened_by(dir, board, thread);
+                    for (key, value) in caller.folder.map(checkout).into_iter().flatten() {
+                        post[key] = value;
+                    }
                 }
                 Some("pause") => {
                     // Work no one holds yet, kept from being taken until
@@ -1042,7 +1077,12 @@ pub fn reply(
                 .filter_map(|need| {
                     let (_, it) = items.iter().find(|(name, _)| name == need)?;
                     let it = &it["work"];
-                    Some(json!({"thread": need, "by": it["holder"], "result": it["result"]}))
+                    let mut made =
+                        json!({"thread": need, "by": it["holder"], "result": it["result"]});
+                    for key in MADE.into_iter().filter(|key| !it[*key].is_null()) {
+                        made[key] = it[key].clone();
+                    }
+                    Some(made)
                 })
                 .collect();
             if !made.is_empty() {
@@ -1235,6 +1275,7 @@ mod tests {
             project: Some(project),
             profile,
             lead: name.ends_with(".lead"),
+            folder: None,
         };
         commons::call_as(home, &caller, &arguments, &|_, _| gone)
     }
@@ -1663,6 +1704,7 @@ mod tests {
             project: Some("shop"),
             profile: None,
             lead: false,
+            folder: None,
         };
         // Never shown the work's post: held once, then taken.
         let held = commons::call_as(&home, &caller, &act("store", "take"), &|_, _| false).unwrap();
@@ -1798,6 +1840,7 @@ mod tests {
                 project: Some("shop"),
                 profile: None,
                 lead: false,
+                folder: None,
             };
             if let Some(thread) = arguments["reply"]["thread"].as_str()
                 && let Ok(posts) =
@@ -2196,6 +2239,114 @@ mod tests {
         let plain = json!({"post": {"name": "q", "title": "A question", "text": "x"}});
         let said = lead(plain.clone()).unwrap();
         assert!(follows(&store, "shop.lead", Some(1), &plain, &said).is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn done_records_its_authors_checkout_and_the_work_needing_it_hears_it() {
+        let home = home("checkout");
+        let repo = home.join("worktrees/shop.b.1");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "agent/b.1"]);
+        std::fs::write(repo.join("store.rs"), "typed").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "store"]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        // A builder in that checkout, as the tool host passes its folder.
+        let builder = |args: Value| {
+            if let Some(thread) = args["reply"]["thread"].as_str()
+                && let Ok(posts) =
+                    commons::posts(&commons::dir(&home).join(format!("{thread}.jsonl")))
+            {
+                commons::told(
+                    &home,
+                    "shop.b.1",
+                    thread,
+                    &(0..posts.len()).collect::<Vec<_>>(),
+                );
+            }
+            let caller = Caller {
+                name: "shop.b.1",
+                id: None,
+                reader: "shop.b.1",
+                model: None,
+                project: Some("shop"),
+                profile: None,
+                lead: false,
+                folder: Some(&repo),
+            };
+            commons::call_as(&home, &caller, &args, &|_, _| false)
+        };
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        lead(work(
+            "review",
+            "Review the store errors",
+            json!({"needs": ["store"]}),
+        ))
+        .unwrap();
+        builder(act("store", "take")).unwrap();
+        // Changes left out of the commit are said, not refused.
+        std::fs::write(repo.join("draft.rs"), "half").unwrap();
+        let done = builder(act("store", "done")).unwrap();
+        assert_eq!(done["work"]["branch"], "agent/b.1");
+        assert_eq!(done["work"]["commit"], commit.as_str());
+        assert_eq!(done["work"]["uncommitted"], true);
+        // It is the builder's own post that carries it.
+        let posts = commons::posts(&commons::dir(&home).join("store.jsonl")).unwrap();
+        let last = posts.last().unwrap();
+        assert_eq!(
+            (last["by"].as_str(), last["do"].as_str()),
+            (Some("shop.b.1"), Some("done"))
+        );
+        assert_eq!(last["branch"], "agent/b.1");
+        let read = send(&home, "x.y", "x", None, false, json!({"read": "store"})).unwrap();
+        let shown = read["posts"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(shown["commit"], commit.as_str());
+        // The reviewer taking work that needs it hears where it is.
+        let took = send(
+            &home,
+            "shop.r.1",
+            "shop",
+            None,
+            false,
+            act("review", "take"),
+        )
+        .unwrap();
+        let made = &took["needs_made"][0];
+        assert_eq!(made["thread"], "store");
+        assert_eq!(made["branch"], "agent/b.1");
+        assert_eq!(made["commit"], commit.as_str());
+        assert_eq!(made["uncommitted"], true);
+        // A done from no checkout records nothing.
+        let other = |args| send(&home, "shop.b.2", "shop", None, false, args);
+        lead(work("api", "Type the api errors", json!({}))).unwrap();
+        other(act("api", "take")).unwrap();
+        let done = other(act("api", "done")).unwrap();
+        for key in MADE {
+            assert!(done["work"][key].is_null(), "{key}: {done}");
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
