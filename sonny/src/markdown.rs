@@ -1552,6 +1552,90 @@ pub struct Markdown {
     /// A fence at the top level open: read a line at a time, its code
     /// colored as it comes, or a picture's source gathered until it closes.
     fence: Option<Open>,
+    /// Its line still coming, colored beside the loop once longer than the
+    /// rows shown hold.
+    coloring: Coloring,
+}
+
+/// A line of code still coming that is longer than the rows shown hold,
+/// colored beside the loop, as a picture is drawn: coloring reads the line
+/// from its start, so each frame coloring it again would cost its whole
+/// length, and the frames of one long line their length squared. Until
+/// the newest is colored, the line shows colored as far as it was last,
+/// what came since plain; the line once ended is colored whole, once.
+#[derive(Default)]
+struct Coloring(std::sync::Arc<std::sync::Mutex<Colored>>);
+
+/// A copy colors its own lines.
+impl Clone for Coloring {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Default)]
+struct Colored {
+    /// The last line colored, and its spans. A line read whole starts
+    /// another coloring ([`Markdown::read`]).
+    done: Option<(String, Vec<Span<'static>>)>,
+    running: bool,
+    /// How many colorings landed: a frame after one shows it.
+    landed: u64,
+}
+
+impl Coloring {
+    fn colored(&self) -> std::sync::MutexGuard<'_, Colored> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn landed(&self) -> u64 {
+        self.colored().landed
+    }
+
+    /// `line`, the code in `lang` still coming after the lines `read`,
+    /// colored as far as it is yet.
+    fn line(&self, lang: &str, read: &str, line: &str) -> Vec<Span<'static>> {
+        let mut colored = self.colored();
+        if let Some((text, spans)) = &colored.done
+            && text == line
+        {
+            return spans.clone();
+        }
+        if !colored.running {
+            colored.running = true;
+            let (slot, text) = (self.0.clone(), line.to_owned());
+            let (lang, read) = (lang.to_owned(), read.to_owned());
+            let started = std::thread::Builder::new()
+                .name("sonny-coloring".into())
+                .spawn(move || {
+                    // Colors are read from the fence's first line on: what
+                    // its lines leave open (a comment, a string) colors
+                    // this one.
+                    let mut code = crate::highlight::Code::language(&lang);
+                    for line in read.lines() {
+                        code_line(&mut code, line);
+                    }
+                    let spans = code_line(&mut code, &text);
+                    let mut colored = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    colored.done = Some((text, spans));
+                    colored.running = false;
+                    colored.landed += 1;
+                    drop(colored);
+                    crate::drawing::ring();
+                });
+            if started.is_err() {
+                colored.running = false;
+            }
+        }
+        match &colored.done {
+            Some((text, spans)) if line.starts_with(text.as_str()) => {
+                let mut spans = spans.clone();
+                spans.push(Span::raw(line[text.len()..].to_owned()));
+                spans
+            }
+            _ => vec![Span::raw("  "), Span::raw(line.to_owned())],
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1559,6 +1643,8 @@ struct Shown {
     /// Pictures drawn beside the loop by then: one landing since may
     /// fill a row that stood for it.
     landed: u64,
+    /// Lines of code colored beside the loop by then.
+    colored: u64,
     partial: String,
     width: usize,
     first: bool,
@@ -1572,6 +1658,9 @@ struct Open {
     /// A blank row goes before its first row.
     gap: bool,
     code: Option<crate::highlight::Code>,
+    /// Its code's lines read so far, from which a line still coming is
+    /// colored beside the loop ([`Coloring`]).
+    read: String,
     picture: Option<String>,
 }
 
@@ -1634,6 +1723,8 @@ impl Markdown {
     fn read(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) {
         self.fed = width;
         if let Some(open) = &mut self.fence {
+            // The line still coming ended: a coloring of it is let go.
+            self.coloring = Coloring::default();
             if open.fence.closed_by(line) {
                 let open = self.fence.take().expect("open");
                 if let Some(source) = open.picture {
@@ -1646,6 +1737,9 @@ impl Markdown {
             match &mut open.picture {
                 Some(source) => push_line(source, line),
                 None => {
+                    if open.code.is_some() {
+                        push_line(&mut open.read, line);
+                    }
                     let spans = code_line(&mut open.code, line);
                     let rows = wrap_lines(
                         Line::from(spans),
@@ -1784,10 +1878,15 @@ impl Markdown {
                     code_line(&mut code, line);
                 }
             }
+            let read = match code {
+                Some(_) => body.clone(),
+                None => String::new(),
+            };
             self.fence = Some(Open {
                 fence,
                 gap,
                 code,
+                read,
                 picture,
             });
             self.keep_defs(&links, drained, open.start);
@@ -2234,8 +2333,9 @@ impl Markdown {
         // changes nothing.
         let partial = if self.held.is_some() { "" } else { partial };
         let landed = crate::drawing::landed();
+        let colored = self.coloring.landed();
         if let Some(shown) = &*self.shown.borrow()
-            && shown.landed == landed
+            && (shown.landed, shown.colored) == (landed, colored)
             && shown.partial == partial
             && (shown.width, shown.first, shown.most) == (width, first, most)
         {
@@ -2244,6 +2344,7 @@ impl Markdown {
         let rows = self.preview(partial, width, first, most);
         *self.shown.borrow_mut() = Some(Shown {
             landed,
+            colored,
             partial: partial.to_owned(),
             width,
             first,
@@ -2257,8 +2358,15 @@ impl Markdown {
         let mut out = Vec::new();
         if let Some(open) = &self.fence {
             if open.picture.is_none() && !partial.is_empty() {
-                let mut code = open.code.clone();
-                let spans = code_line(&mut code, open.fence.strip(partial));
+                let line = open.fence.strip(partial);
+                // Longer than the rows shown hold, it is colored beside
+                // the loop: the loop's work stays what the screen shows.
+                let spans = match &open.code {
+                    Some(_) if line.width() > most.saturating_mul(width) => {
+                        self.coloring.line(&open.fence.lang, &open.read, line)
+                    }
+                    _ => code_line(&mut open.code.clone(), line),
+                };
                 out = wrap_lines(
                     Line::from(spans),
                     width,
@@ -2270,6 +2378,7 @@ impl Markdown {
                 }
             }
             bullet(&mut out, first && !self.any);
+            out.drain(..out.len().saturating_sub(most));
             return out;
         }
         // A table is drawn as its lines end: the line still coming waits
@@ -3351,5 +3460,60 @@ mod tests {
             }
         }
         panic!("{once:?} then {twice:?}");
+    }
+
+    /// A line of code still coming that is longer than the screen shows is
+    /// colored beside the loop: a frame shows it at once, plain where not
+    /// colored yet, as many rows as asked for, and once colored, as a line
+    /// colored on the loop is.
+    #[test]
+    fn a_long_line_of_code_still_coming_is_colored_beside_the_loop() {
+        let mut reader = Markdown::default();
+        reader.feed("```rust", 40, false);
+        let line: String = "let x = foo(\"bar\"); ".repeat(400);
+        let rows = reader.open_last(&line, 40, false, 5);
+        assert_eq!(rows.len(), 5, "only the rows asked for");
+        let began = std::time::Instant::now();
+        let colored = loop {
+            let rows = reader.open_last(&line, 40, false, 5);
+            if rows
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.style.fg.is_some())
+            {
+                break rows;
+            }
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(20),
+                "never colored"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let mut code = crate::highlight::Code::language("rust");
+        let whole = wrap_lines(
+            Line::from(code_line(&mut code, &line)),
+            40,
+            Line::from("  "),
+            Line::from("    "),
+        );
+        assert_eq!(colored, whole[whole.len() - 5..].to_vec());
+        // Grown, it shows as colored as far as it was, the rest plain.
+        let longer = format!("{line}tail");
+        let rows = reader.open_last(&longer, 40, false, 5);
+        let text: String = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.trim_end().ends_with("tail"), "{text:?}");
+        // A short line is colored on the loop, at once.
+        let mut short = Markdown::default();
+        short.feed("```rust", 40, false);
+        let rows = short.open_last("let x = 1;", 40, false, 5);
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.style.fg.is_some())
+        );
     }
 }
