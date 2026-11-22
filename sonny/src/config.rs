@@ -186,6 +186,15 @@ pub const SETTINGS: &[Setting] = &[
         default: "work",
     },
     Setting {
+        key: "sonny.away_minutes",
+        group: "Agents",
+        name: "away",
+        label: "minutes without you before leads hold news for your return; 0 never",
+        about: "minutes without your use of any window, or a message through sonny acp, before every lead is told you are away; it puts only decisions to you and tells the rest in one message once you are back; 0 never",
+        values: &[],
+        default: "30",
+    },
+    Setting {
         key: "sonny.ask_wait_minutes",
         group: "Agents",
         name: "ask wait",
@@ -1405,7 +1414,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 38);
+        assert_eq!(listed().len(), 39);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",

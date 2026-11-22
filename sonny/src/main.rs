@@ -14,6 +14,7 @@ mod asked;
 mod asks;
 mod attach;
 mod audit;
+mod away;
 mod background;
 mod banner;
 mod board;
@@ -3627,6 +3628,10 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "zen" => zen::cli(rest),
         Some((verb, rest)) if verb == "backup" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);
+        }
+        // Unlisted: the scheduler runs this once the person is away.
+        Some((verb, [])) if verb == away::VERB => {
+            return std::process::ExitCode::from(away::cli() as u8);
         }
         // Unlisted: the job `sonny.start_at_boot` keeps.
         Some((verb, [])) if verb == "boot" => {
