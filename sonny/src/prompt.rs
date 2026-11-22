@@ -108,11 +108,7 @@ impl Prompt {
     /// `with` put in place of `piece`, with a space after it, in what
     /// Ctrl-Y brings back.
     pub fn unkill(&mut self, piece: &str, with: &str) {
-        if let Some(start) = self.killed.find(piece) {
-            let mut end = start + piece.len();
-            end += usize::from(self.killed[end..].starts_with(' '));
-            self.killed.replace_range(start..end, with);
-        }
+        put_back(&mut self.killed, piece, with);
     }
 
     /// Whether the cursor is before every word, nothing selected.
@@ -851,6 +847,16 @@ fn inline(
 }
 
 /// Where `at` lands once the bytes `gone` are taken out.
+/// `with` put in place of `piece`, with a space after it, where it first
+/// is in `text`.
+pub fn put_back(text: &mut String, piece: &str, with: &str) {
+    if let Some(start) = text.find(piece) {
+        let mut end = start + piece.len();
+        end += usize::from(text[end..].starts_with(' '));
+        text.replace_range(start..end, with);
+    }
+}
+
 fn kept(at: usize, gone: &Range<usize>, put: usize) -> usize {
     if at >= gone.end {
         at - gone.len() + put

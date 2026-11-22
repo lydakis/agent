@@ -20378,6 +20378,10 @@ impl App {
             self.input.swap(&placeholder, &replaced);
         }
         self.input.unkill(&placeholder, &replaced);
+        // And in the words a picture still being read went in place of.
+        for (_, words) in &mut self.replaced {
+            prompt::put_back(words, &placeholder, &replaced);
+        }
         // Its number goes to the next picture, when none came after it.
         if self.pictures.len() == number {
             self.pictures.pop();
@@ -40744,6 +40748,21 @@ mod tests {
         app.all_ready().await;
         app.key(press(KeyCode::Char('y'), KeyModifiers::CONTROL))
             .await;
+        assert_eq!(&*app.input, "keep these words");
+        // One that never comes replaced by another that never comes: the
+        // words the first went in place of come back.
+        app.discard();
+        app.input.set("keep these words");
+        app.input.select(5, 10);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(None)
+        });
+        app.input.select(5, 16);
+        app.prepare(|| Ok(None));
+        go.send(()).unwrap();
+        app.all_ready().await;
         assert_eq!(&*app.input, "keep these words");
     }
 
