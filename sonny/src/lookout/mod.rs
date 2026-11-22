@@ -1848,6 +1848,7 @@ impl Service {
         // What it subscribed to before it was made, or made again.
         // Less what was made for another bot of its name.
         lookout.subs = file.into_iter().filter(|sub| sub.held_by(record)).collect();
+        lookout.watch_quiet();
         lookout.roots(&self.records, &self.made);
         lookout.restore(held_file(&self.store, lead));
         lookout.counts = subs::counts(&self.store, lead);
@@ -3219,7 +3220,13 @@ impl Lookout {
         }
         self.told_subs.retain(|name, _| !gone.contains(name));
         self.subs = subs;
-        // Each with a quiet watches from when it came, or as it did.
+        self.watch_quiet();
+        self.counting();
+    }
+
+    /// Each subscription with a quiet watches from when it came, or as it
+    /// did; one gone no longer does.
+    fn watch_quiet(&mut self) {
         let id = self.lead_id;
         let watched: Vec<String> = (self.subs.iter())
             .filter(|sub| sub.quiet_span().is_some())
@@ -3230,7 +3237,6 @@ impl Lookout {
         for identity in watched {
             self.quiet.entry(identity).or_insert((now, false));
         }
-        self.counting();
     }
 
     /// The note landed, under `key`: each subscription it charged that
@@ -5371,6 +5377,24 @@ mod tests {
             lookout.heard[2].event.details.as_deref(),
             Some("(you hold this)")
         );
+    }
+
+    /// A bot first seated with a quiet follow watches for silence from
+    /// then, as one whose follows change does.
+    #[test]
+    fn a_quiet_follow_is_watched_from_the_first_seating() {
+        let record = json!({"name": "shop.w1", "bot_id": 5, "workspace": "/", "status": "idle"});
+        let mut service = service(PathBuf::new(), std::slice::from_ref(&record));
+        let mut held = hears("held");
+        held.sources = vec!["slack:eng".into()];
+        held.quiet = Some("15m".into());
+        service.subscribers.insert("shop.w1".into(), vec![held]);
+        let start = Instant::now();
+        assert!(service.place(&record));
+        let lookout = service.lookouts.get_mut("shop.w1").unwrap();
+        lookout.quiet_check(start + Duration::from_secs(15 * 60 + 1));
+        assert_eq!(lookout.heard.len(), 1);
+        assert_eq!(lookout.heard[0].subs, ["held"]);
     }
 
     #[test]

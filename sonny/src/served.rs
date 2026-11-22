@@ -811,15 +811,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 false => Vec::new(),
             };
             let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
+            // Its board, as any of its agents still follows it: a closed
+            // one follows none.
+            let member = (joined.iter().rev()).find_map(|(_, bot)| {
+                let name = bot["name"].as_str()?;
+                let board = crate::board::followed(store.as_deref()?, name)?;
+                Some((bot, board))
+            });
             let (title, board) = match joined.last() {
-                Some((_, bot)) => {
-                    let (name, id) = (
-                        bot["name"].as_str().unwrap_or_default(),
-                        bot["bot_id"].as_i64(),
-                    );
-                    let board =
-                        (store.as_deref()).and_then(|store| crate::board::followed(store, name));
-                    let Some(board) = board else {
+                Some(_) => {
+                    let Some((bot, board)) = member else {
                         return Err((
                             "task_not_started",
                             format!(
@@ -836,6 +837,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                             ),
                         ));
                     }
+                    let (name, id) = (
+                        bot["name"].as_str().unwrap_or_default(),
+                        bot["bot_id"].as_i64(),
+                    );
                     let noted = (store.as_deref())
                         .zip(id)
                         .and_then(|(store, id)| crate::title::noted(store, name, id));

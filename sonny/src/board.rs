@@ -877,13 +877,19 @@ pub fn reply(
     {
         post["emptied"] = json!(board);
     }
-    // Work that opens, or open work given whom it is for, asks them.
+    // Work that opens, or open work given whom it is for, asks them, as
+    // this reply leaves it: needs it adds keep it waiting.
     let mut ask_for = opened.clone();
     let reserves = (post["for"].as_array()).is_some_and(|named| !named.is_empty());
+    let updated = || {
+        let mut after = posts.clone();
+        after.push(post.clone());
+        item(&after)
+    };
     if reserves
         && !ask_for.iter().any(|t| t == thread)
-        && current.as_ref().is_some_and(|it| {
-            it["state"] == "open" && !waiting(it, &|need: &str| need_done(dir, need))
+        && updated().is_some_and(|it| {
+            it["state"] == "open" && !waiting(&it, &|need: &str| need_done(dir, need))
         })
     {
         ask_for.push(thread.to_owned());
@@ -1131,6 +1137,15 @@ mod tests {
         send(&home, "shop.w.1", "shop", None, false, act("store", "take")).unwrap();
         let done = send(&home, "shop.w.1", "shop", None, false, act("store", "done")).unwrap();
         assert_eq!(done[ASK_FOR], json!(["api"]), "{done}");
+        // A reply that names someone and adds an undone need asks nobody.
+        lead(work("docs", "Write the error docs", json!({}))).unwrap();
+        lead(work("guide", "Write the guide", json!({}))).unwrap();
+        let blocked = lead(set(
+            "guide",
+            json!({"needs": ["docs"], "for": ["shop.w.2"]}),
+        ))
+        .unwrap();
+        assert!(blocked.get(ASK_FOR).is_none(), "{blocked}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
