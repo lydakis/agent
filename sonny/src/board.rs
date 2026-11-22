@@ -453,7 +453,7 @@ pub struct Caller<'a> {
 
 /// What a `done` post records of its author's checkout, as git there
 /// says: its `branch` (none on a detached head), its `commit`, and
-/// `uncommitted` when changes there are not in it.
+/// `uncommitted` when changes there are not in it, or git could not say.
 pub const MADE: [&str; 3] = ["branch", "commit", "uncommitted"];
 
 /// `folder`'s checkout as a `done` post records it ([`MADE`]); nothing
@@ -478,7 +478,8 @@ pub fn checkout(folder: &Path) -> serde_json::Map<String, Value> {
         "--untracked-files=all",
         "--ignore-submodules=none",
     ];
-    if crate::task::confined(folder, &status, &[]).is_ok_and(|changed| !changed.is_empty()) {
+    // A status that fails never passes for a clean checkout.
+    if !crate::task::confined(folder, &status, &[]).is_ok_and(|changed| changed.is_empty()) {
         made.insert("uncommitted".into(), json!(true));
     }
     made
@@ -772,6 +773,12 @@ pub fn reply(
     if action.is_none() && !changes {
         return Err("work_invalid: a reply to work gives do, or needs, labels or for".into());
     }
+    // A done's checkout, read before the lock, so a slow git there holds
+    // no other agent's post.
+    let checked = (action == Some("done"))
+        .then_some(caller.folder)
+        .flatten()
+        .map(checkout);
     let _lock = commons::lock(dir)?;
     let posts = commons::posts(&dir.join(format!("{thread}.jsonl")))?;
     let current = standing(&posts);
@@ -994,7 +1001,7 @@ pub fn reply(
                         ));
                     }
                     opened = opened_by(dir, board, thread);
-                    for (key, value) in caller.folder.map(checkout).into_iter().flatten() {
+                    for (key, value) in checked.clone().into_iter().flatten() {
                         post[key] = value;
                     }
                 }
