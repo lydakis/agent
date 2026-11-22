@@ -12980,3 +12980,17 @@ key hashes the lead too, which is the same bytes the fields held. Reading
 the parsed usage and the encoded request. Nothing is added per bot or per
 turn, and no store job. The pull request's Perf screen is the matched
 comparison.
+
+## Effort changes inside the conversation
+
+2026-11-22. Reading a window now also reads the effort each of its turns
+asked for: one primary-key lookup of the prompt node per turn prompt in the
+window, in the read that already walks every node of it, so a fraction of
+the walk's own lookups and no new store job. The effort is a nullable
+column on the node (schema 113), written with the prompt in the insert that
+already writes it, so a turn start adds no write. A call on a model that
+takes effort changes encodes one small item per change of effort in its
+window (none for a bot whose turns all run at its own), and streams it
+ahead of the prompt it belongs to. On such a model, fitting the window
+counts room for them in one pass over the window's turn prompts. Nothing is kept per bot. The
+pull request's Perf screen is the matched comparison.

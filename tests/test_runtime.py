@@ -699,16 +699,20 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             # No request asks for a server-side fallback, which would stick;
             # a refused request's own retry redeems the refusal's credit.
             assert 'fallbacks' not in request
+            # A request whose history changes the effort opts into its beta.
+            marked = any(m['role'] == 'system' for m in request['messages'])
             assert self.headers.get('anthropic-beta') == (
                 'thinking-binding-controls-2026-08-01,fallback-credit-2026-07-01,'
-                'server-side-fallback-2026-07-01,fast-mode-2026-02-01')
+                'server-side-fallback-2026-07-01,fast-mode-2026-02-01'
+                + (',mid-conversation-output-config-2026-07-01' if marked else ''))
             if 'fallback_credit_token' in request:
                 assert (request['fallback_credit_token'] == 'credit-1'
                         and request['model'] in ('synthetic-claude-2', 'synthetic-claude-3'))
                 self.server.credits = getattr(self.server, 'credits', 0) + 1
             if 'thinking' in request:
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
-            assert request['model'] in ('synthetic-claude', 'synthetic-claude-2', 'synthetic-claude-3') and request['stream']
+            assert request['model'] in ('synthetic-claude', 'synthetic-claude-2', 'synthetic-claude-3',
+                                        'claude-opus-5-5') and request['stream']
             # The API refuses blank text wherever a message holds it.
             if any(b['type'] == 'text' and not b['text'].strip()
                    for m in request['messages'] for b in m['content']):
