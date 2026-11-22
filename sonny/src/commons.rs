@@ -1041,6 +1041,19 @@ async fn live_in(client: &agent_client::Client, project: &str) -> Vec<Value> {
     bots
 }
 
+/// The open agent `name` as the daemon lists it: its id, and the profile
+/// it was made as, a default one included.
+pub async fn listed(client: &agent_client::Client, name: &str) -> Option<Value> {
+    let page = (client
+        .request("bots", json!({"name": name, "open": true, "limit": 1}))
+        .await)
+        .ok()?;
+    page["bots"]
+        .get(0)
+        .filter(|bot| bot["name"] == name)
+        .cloned()
+}
+
 /// The note that asks an agent to take work kept for it.
 fn asked_note(author: &str, thread: &str, title: &str, board: &str) -> String {
     format!(
@@ -1131,6 +1144,7 @@ pub fn kept_for(home: &Path, project: &str, name: &str, profile: Option<&str>) -
 /// Asks the agent `name`, known as `id`, just started, to take each of
 /// `threads`, as [`ask_for`] asks those there when work opens.
 pub async fn ask_started(
+    client: &agent_client::Client,
     home: &Path,
     store: &Path,
     threads: &[String],
@@ -1138,12 +1152,6 @@ pub async fn ask_started(
     id: Option<i64>,
     starter: &str,
 ) {
-    let Ok((_, socket)) = crate::daemon_paths(None, None) else {
-        return;
-    };
-    let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
-        return;
-    };
     for thread in threads {
         let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
             continue;
@@ -4679,6 +4687,28 @@ mod tests {
         assert!(kept_for(&home, "shop", "shop.w.1", Some("worker")).is_empty());
         assert!(kept_for(&home, "docs", "docs.r.1", Some("reviewer")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A task started with no profile is made as the default one: what
+    /// it was made as is read from the daemon, not from the start's words.
+    #[tokio::test]
+    async fn a_started_agent_is_read_as_the_daemon_lists_it() {
+        let client = crate::tests::daemon_answering(|request| {
+            match (request["op"].as_str(), request["name"].as_str()) {
+                (Some("bots"), Some("shop.r.1")) => {
+                    json!({"bots": [{"name": "shop.r.1", "bot_id": 7, "profile": "task"}]})
+                }
+                (Some("bots"), Some(_)) => json!({"bots": [{"name": "shop.other", "bot_id": 8}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let made = listed(&client, "shop.r.1").await.unwrap();
+        assert_eq!(
+            (made["bot_id"].as_i64(), made["profile"].as_str()),
+            (Some(7), Some("task"))
+        );
+        assert_eq!(listed(&client, "shop.gone").await, None);
     }
 
     #[test]

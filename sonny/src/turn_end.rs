@@ -239,15 +239,20 @@ fn boards(store: &Path, bot: &str) -> Vec<String> {
 /// The turn `turn` of `bot`, known as `id`, ended as `status`: a completed
 /// one may tell it what it holds or what is open, once the daemon says it
 /// is open and its asks wait on no one.
-pub fn finished(bot: String, id: Option<i64>, turn: i64, status: String) {
+pub fn finished(
+    daemon: (std::path::PathBuf, std::path::PathBuf),
+    bot: String,
+    id: Option<i64>,
+    turn: i64,
+    status: &str,
+) {
+    let (store, socket) = daemon;
+    let status = status.to_owned();
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return;
     };
     let on = crate::board::on();
     tokio::spawn(async move {
-        let Ok((store, socket)) = crate::daemon_paths(None, None) else {
-            return;
-        };
         let (named, at) = (bot.clone(), home.clone());
         let found = tokio::task::spawn_blocking(move || {
             let completed = on && status == "completed";

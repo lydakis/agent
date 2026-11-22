@@ -142,7 +142,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         Some(role) => vec!["--profile".to_owned(), role.clone()],
         None => vec!["--agents".to_owned()],
     };
-    if let Some(model) = model_of(here, start.model.as_deref(), start.profile.as_deref()) {
+    if let Some(model) = start.model.clone().filter(|m| !m.is_empty()) {
         flags.extend(["--model".to_owned(), model]);
     }
     if let Some(effort) = start.effort.clone().filter(|e| !e.is_empty()) {
@@ -910,16 +910,6 @@ fn with_defaults(info: &Value, flags: &[&String], lead: Picks, task: Picks) -> V
         }
     }
     flags
-}
-
-/// The model a task starts on: the one asked for, else its profile's,
-/// as the profiles of `here` have it, before the project's and the lead's
-/// defaults, so a profile written for a model runs on it.
-fn model_of(here: &Path, asked: Option<&str>, profile: Option<&str>) -> Option<String> {
-    match asked.map(str::trim).filter(|m| !m.is_empty()) {
-        Some(model) => Some(model.to_owned()),
-        None => crate::project::profile(here, profile?).ok()?.model,
-    }
 }
 
 /// The run flags with the prompt-cache lifetime Sonny gives the model it
@@ -3389,30 +3379,6 @@ mod tests {
             ["--model", "anthropic/claude-opus-5-5", "--cache-ttl=5m"]
         );
         assert_eq!(run(&[]), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_task_runs_on_its_profiles_model_unless_asked_for_another() {
-        let dir = std::env::temp_dir().join(format!("sonny-task-model-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
-        std::fs::write(
-            dir.join(".agents/agents/reviewer.md"),
-            "---\nmodel: a/reviewing\n---\nReview it.\n",
-        )
-        .unwrap();
-        std::fs::write(dir.join(".agents/agents/plain.md"), "Do it.\n").unwrap();
-        assert_eq!(
-            model_of(&dir, None, Some("reviewer")).as_deref(),
-            Some("a/reviewing")
-        );
-        assert_eq!(
-            model_of(&dir, Some("b/asked"), Some("reviewer")).as_deref(),
-            Some("b/asked")
-        );
-        // No model of its own, or no profile: the defaults decide.
-        assert_eq!(model_of(&dir, None, Some("plain")), None);
-        assert_eq!(model_of(&dir, None, None), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

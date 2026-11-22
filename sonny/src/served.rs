@@ -950,36 +950,28 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     providers: providers.clone(),
                     board: board.clone(),
                 };
-                let profile = start.profile.clone();
                 match crate::task::start(&line.folder, &line.project, &caller, &start) {
                     Ok(started) => {
                         // Open work kept for it, by name or profile, asks
                         // it at once, as if it had been there as it opened.
+                        let whole = match start.name.starts_with(&format!("{}.", line.project)) {
+                            true => start.name.clone(),
+                            false => format!("{}.{}", line.project, start.name),
+                        };
                         if crate::board::on()
                             && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-                            && let Ok((store, _)) = crate::daemon_paths(None, None)
+                            && let Ok((store, socket)) = crate::daemon_paths(None, None)
+                            && let Ok((client, _events)) =
+                                agent_client::Client::connect(&socket).await
+                            && let Some(made) = crate::commons::listed(&client, &whole).await
                         {
-                            let whole = match start.name.starts_with(&format!("{}.", line.project))
-                            {
-                                true => start.name.clone(),
-                                false => format!("{}.{}", line.project, start.name),
-                            };
-                            let kept = crate::commons::kept_for(
-                                &home,
-                                &line.project,
-                                &whole,
-                                profile.as_deref(),
-                            );
+                            let profile = made["profile"].as_str();
+                            let kept =
+                                crate::commons::kept_for(&home, &line.project, &whole, profile);
                             if !kept.is_empty() {
-                                let id = (started.split_once(": "))
-                                    .and_then(|(_, made)| {
-                                        let mut values = serde_json::Deserializer::from_str(made)
-                                            .into_iter::<Value>();
-                                        values.next()?.ok()
-                                    })
-                                    .and_then(|made| made["bot_id"].as_i64());
+                                let id = made["bot_id"].as_i64();
                                 crate::commons::ask_started(
-                                    &home, &store, &kept, &whole, id, &caller,
+                                    &client, &home, &store, &kept, &whole, id, &caller,
                                 )
                                 .await;
                             }
@@ -1505,6 +1497,9 @@ pub fn project_of(bot: &str) -> String {
 pub struct Server {
     nudge: Arc<Notify>,
     serving: Serving,
+    /// The daemon it serves, whose turns' ends it checks.
+    store: PathBuf,
+    socket: PathBuf,
 }
 
 impl Server {
@@ -1520,8 +1515,18 @@ impl Server {
         let (nudge, serving) = (Arc::new(Notify::new()), Arc::new(Mutex::new(held)));
         // The workflows that were running when the last host stopped.
         crate::workflow::resume(store.clone(), socket.clone());
-        tokio::spawn(serve(store, socket, nudge.clone(), Arc::clone(&serving)));
-        Server { nudge, serving }
+        tokio::spawn(serve(
+            store.clone(),
+            socket.clone(),
+            nudge.clone(),
+            Arc::clone(&serving),
+        ));
+        Server {
+            nudge,
+            serving,
+            store,
+            socket,
+        }
     }
 
     /// The host's connection that reads the events made, or made again:
@@ -1570,7 +1575,8 @@ impl Server {
                     {
                         let status = event["data"]["status"].as_str().unwrap_or_default();
                         let id = event["bot_id"].as_i64();
-                        crate::turn_end::finished(bot.to_owned(), id, turn, status.to_owned());
+                        let daemon = (self.store.clone(), self.socket.clone());
+                        crate::turn_end::finished(daemon, bot.to_owned(), id, turn, status);
                     }
                 }
             }
@@ -3660,6 +3666,8 @@ mod tests {
         let server = Server {
             nudge: Arc::new(Notify::new()),
             serving: Default::default(),
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
         };
         // A script that reads slowly, then writes.
         let (read, written) = (Arc::new(Notify::new()), Arc::new(AtomicUsize::new(0)));
@@ -3744,6 +3752,8 @@ mod tests {
         let server = Server {
             nudge: Arc::new(Notify::new()),
             serving: Default::default(),
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
         };
         let run = {
             let (hub, dir, input) = (hub.clone(), dir.clone(), input.clone());
@@ -3864,6 +3874,8 @@ mod tests {
         let server = Server {
             nudge: Arc::new(Notify::new()),
             serving: Default::default(),
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
         };
         let (ran, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
         let (count, started) = (ran.clone(), runs.clone());
@@ -3916,6 +3928,8 @@ mod tests {
         let server = Server {
             nudge: Arc::new(Notify::new()),
             serving: Default::default(),
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
         };
         let (written, wrote) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
         let (writes, reading) = (written.clone(), wrote.clone());
