@@ -873,6 +873,9 @@ impl Pane {
         // The same words in the same rows, colored: the view, and what is
         // selected or found in them, stays on them.
         let mut screen = Screen::default();
+        if !coloring.before.is_empty() {
+            screen.push(coloring.before);
+        }
         for (at, spans) in coloring.first.into_iter().chain(rest).enumerate() {
             coloring.numbered.push(&mut screen, at, spans);
         }
@@ -1036,6 +1039,8 @@ fn preview(
     let extension = (path.extension().and_then(|e| e.to_str()))
         .unwrap_or_default()
         .to_lowercase();
+    // Rows over the code, when a drawing of it failed: why.
+    let mut before = Vec::new();
     if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
         let shown = match crate::term::graphics() {
             true => {
@@ -1116,10 +1121,13 @@ fn preview(
                 screen.push(rows);
                 return Ok((0, false));
             }
-            Some(Err(error)) => screen.push(vec![
-                note(&format!("could not draw it: {error}")),
-                Line::default(),
-            ]),
+            Some(Err(error)) => {
+                before = vec![
+                    note(&format!("could not draw it: {error}")),
+                    Line::default(),
+                ];
+                screen.push(before.clone());
+            }
             None => {}
         }
     }
@@ -1191,6 +1199,7 @@ fn preview(
                     rest
                 });
             *coloring = job.ok().map(|job| Coloring {
+                before,
                 numbered,
                 first,
                 cut,
@@ -1241,6 +1250,8 @@ impl Numbered {
 /// A code file's lines past those colored before it showed (`first`),
 /// colored beside the loop; and whether a note says it was cut short.
 struct Coloring {
+    /// The rows over the code (why it could not be drawn), as they were.
+    before: Vec<Line<'static>>,
     numbered: Numbered,
     first: Vec<Vec<Span<'static>>>,
     cut: bool,

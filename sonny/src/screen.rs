@@ -3613,7 +3613,9 @@ mod tests {
         assert_eq!(copied, selected.map(Action::Copy));
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 4));
         screen.render(Rect::new(0, 0, 30, 4), &mut buf, |_| None);
-        assert_eq!(buf[(4, 3)].fg, Color::Cyan, "{:?}", row(&buf, 3));
+        assert_eq!(row(&buf, 3).trim_end(), "  line 16");
+        let drawn = &screen.shown[screen.top + 3].line;
+        assert_eq!(drawn.spans[0].style.fg, Some(Color::Cyan), "{drawn:?}");
     }
 
     #[test]

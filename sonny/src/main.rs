@@ -4238,6 +4238,11 @@ async fn run() -> Result<(), String> {
         app.notice = Some(said);
     }
     let result = app.main(&mut terminal, &mut events).await;
+    // A draft carried on to the next Sonny takes the pictures still being
+    // made ready, as it takes those that are.
+    if app.switch_to.is_some() || app.reopen_on.is_some() {
+        app.all_ready().await;
+    }
     let _ = wipe(&mut terminal);
     own_screen(false);
     keys_apart(false);
@@ -20246,8 +20251,11 @@ impl App {
     /// its placeholder: whether any was.
     async fn prepared(&mut self) -> bool {
         let mut any = false;
-        while let Some(at) = (self.preparing.iter()).position(|(_, job)| job.is_finished()) {
-            let (number, job) = self.preparing.remove(at);
+        // In the order they were given, so which of several past what a
+        // message takes together is let go never hangs on which was ready
+        // first.
+        while (self.preparing.first()).is_some_and(|(_, job)| job.is_finished()) {
+            let (number, job) = self.preparing.remove(0);
             let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
             self.ready(number, got);
             any = true;
@@ -20258,7 +20266,7 @@ impl App {
     /// Every picture still being made ready, waited for and put behind its
     /// placeholder.
     async fn all_ready(&mut self) {
-        while let Some((number, job)) = self.preparing.pop() {
+        for (number, job) in std::mem::take(&mut self.preparing) {
             let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
             self.ready(number, got);
         }
@@ -40553,6 +40561,31 @@ mod tests {
         });
         app.key(press(KeyCode::Down, KeyModifiers::NONE)).await;
         assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
+        // Two that fit alone but not together: the first given is kept,
+        // though the second was ready first.
+        app.discard();
+        fn big() -> attach::Picture {
+            attach::Picture {
+                media_type: "image/jpeg",
+                data: vec![0; 3 << 20],
+            }
+        }
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = wait.recv();
+            Ok(Some(big()))
+        });
+        app.prepare(|| Ok(Some(big())));
+        while !app.preparing[1].1.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!app.prepared().await, "the first given lands first");
+        go.send(()).unwrap();
+        while !app.preparing.is_empty() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(&*app.input, "[Image #1] ", "{:?}", app.notice);
     }
 
     #[tokio::test]
