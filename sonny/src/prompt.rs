@@ -89,17 +89,16 @@ impl Prompt {
         self.styled.take();
     }
 
-    /// `piece` taken out where it first is, the cursor kept on the words
-    /// it was at; whether it was there.
-    pub fn remove(&mut self, piece: &str) -> bool {
+    /// `with` put in place of `piece` where it first is, the cursor kept on
+    /// the words it was at; whether `piece` was there.
+    pub fn swap(&mut self, piece: &str, with: &str) -> bool {
         let Some(start) = self.text.find(piece) else {
             return false;
         };
-        let end = start + piece.len();
-        self.text.replace_range(start..end, "");
-        let gone = start..end;
-        self.at = kept(self.at, &gone);
-        self.anchor = self.anchor.map(|at| kept(at, &gone));
+        let gone = start..start + piece.len();
+        self.text.replace_range(gone.clone(), with);
+        self.at = kept(self.at, &gone, with.len());
+        self.anchor = self.anchor.map(|at| kept(at, &gone, with.len()));
         self.goal = None;
         self.laid.take();
         self.styled.take();
@@ -108,8 +107,8 @@ impl Prompt {
 
     /// `piece` swapped for `with` where it stands as words of its own, with
     /// nothing but whitespace or the text's ends beside it, the cursor kept
-    /// on the words it was at, or after `with` when it was in `piece`;
-    /// whether it stood so exactly once, and was swapped.
+    /// on the words it was at; whether it stood so exactly once, and was
+    /// swapped.
     pub fn replace_word(&mut self, piece: &str, with: &str) -> bool {
         let alone = |&(start, _): &(usize, &str)| {
             let end = start + piece.len();
@@ -121,8 +120,8 @@ impl Prompt {
             return false;
         };
         let swapped = start..start + piece.len();
-        self.at = replaced(self.at, &swapped, with.len());
-        self.anchor = (self.anchor).map(|at| replaced(at, &swapped, with.len()));
+        self.at = kept(self.at, &swapped, with.len());
+        self.anchor = (self.anchor).map(|at| kept(at, &swapped, with.len()));
         self.goal = None;
         self.splice(swapped, with);
         self.laid.take();
@@ -874,19 +873,9 @@ fn inline(
 }
 
 /// Where `at` lands once the bytes `gone` are taken out.
-/// A place in the text after `swapped` became `with` bytes: kept on the
-/// words it was at, or after the new ones when it was in the old.
-fn replaced(at: usize, swapped: &Range<usize>, with: usize) -> usize {
-    match at {
-        at if at >= swapped.end => at - swapped.len() + with,
-        at if at > swapped.start => swapped.start + with,
-        at => at,
-    }
-}
-
-fn kept(at: usize, gone: &Range<usize>) -> usize {
+fn kept(at: usize, gone: &Range<usize>, put: usize) -> usize {
     if at >= gone.end {
-        at - gone.len()
+        at - gone.len() + put
     } else {
         at.min(gone.start)
     }
