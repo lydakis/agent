@@ -34,6 +34,17 @@ class FormulaTest(unittest.TestCase):
         self.assertIn('shell_output("#{bin}/agent --version")', formula)
         self.assertNotIn("lydakis/agent/agent", formula)
 
+    def test_agent_carries_the_way_back_to_an_older_store(self):
+        formula = self.render("agent")
+        # Beside the daemon in every release, and run by brew test.
+        self.assertIn(
+            '    system "cargo", "install", *std_cargo_args\n'
+            '    libexec.install "release/store_down.py", "release/store_lift_yields.py"\n',
+            formula,
+        )
+        self.assertIn('shell_output("#{libexec}/store_down.py --help")', formula)
+        self.assertNotIn("store_down.py", self.render("sonny"))
+
     def test_agent_on_linux_builds_in_its_bubblewrap(self):
         formula = self.render("agent")
         # The daemon never looks bwrap up on PATH, so the build fixes where

@@ -17,18 +17,27 @@ that knows only SCHEMA opens the store with nothing lost that it can hold:
                 (0.10.1)
 
 Stop the daemon first (`agent shutdown`): a store a daemon holds is refused.
-The store is copied beside itself to STORE.schema-FROM.TIME.backup, then
-taken back in one transaction, so a failure leaves it as it was. Every
-schema change adds its way back here, with its step in src/store/db.rs.
+The store is copied beside itself to STORE.schema-FROM.TIME.backup, with
+the store's own permissions, then taken back in one transaction, so a
+failure leaves it as it was. Every schema change adds its way back here,
+with its step in src/store/db.rs.
+
+Every release installs this script with its helper, store_lift_yields.py:
+PREFIX/opt/sonny/libexec/ from the Linux tarball, $(brew --prefix
+agent)/libexec/ from Homebrew. Run the one of the release being left, since
+only it knows that release's steps.
 """
 
 import json
 import os
 import sqlite3
+import stat
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Its helper is beside it wherever it is installed, which it leaves as it was.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import store_lift_yields  # noqa: E402
 
@@ -129,6 +138,24 @@ def back_107(conn):
 BACK = {112: back_112, 111: back_111, 110: back_110, 109: back_109, 108: back_108, 107: back_107}
 
 
+def back_up(conn, store, copy):
+    """`store` copied to `copy` with `VACUUM INTO`, as the daemon backs up
+    before it migrates (src/store/db.rs, back_up): the copy holds everything
+    the store does, so it is made empty first, readable by no one else
+    whatever the umask, then given the store's own permissions before a
+    byte goes in. A copy that fails is removed."""
+    fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        try:
+            os.fchmod(fd, stat.S_IMODE(os.stat(store).st_mode))
+        finally:
+            os.close(fd)
+        conn.execute("VACUUM INTO ?", (copy,))
+    except BaseException:
+        os.unlink(copy)
+        raise
+
+
 def down(store, to, dry=False):
     """Take `store` back to schema `to`; gives the schema it was at."""
     store = os.path.realpath(store)
@@ -147,7 +174,7 @@ def down(store, to, dry=False):
             if to == at:
                 return at
             if not dry:
-                conn.execute("VACUUM INTO ?", (f"{store}.schema-{at}.{int(time.time())}.backup",))
+                back_up(conn, store, f"{store}.schema-{at}.{int(time.time())}.backup")
             # A table others point at is dropped; checked before the commit.
             conn.execute("PRAGMA foreign_keys=OFF")
             conn.execute("BEGIN IMMEDIATE")
@@ -171,6 +198,9 @@ def down(store, to, dry=False):
 
 
 def main(argv):
+    if argv in (["--help"], ["-h"]):
+        print(__doc__.strip())
+        return
     args = [arg for arg in argv if arg != "--dry-run"]
     if len(args) != 2 or not args[1].isdigit():
         raise SystemExit(__doc__)
