@@ -1529,7 +1529,8 @@ pub(crate) mod tests {
         ctrl_f(&mut view);
         typed(&mut view, "enum");
         let lines = card(&mut view, 80);
-        assert_eq!(lines.last().unwrap(), "find enum");
+        assert!(!lines.iter().any(|l| l.starts_with("find")), "{lines:#?}");
+        assert_eq!(view.field().map(|field| field.query), Some("enum".into()));
         assert!(
             lines.iter().any(|l| l.starts_with(" ● shop/typed-errors")),
             "{lines:#?}"
@@ -1562,7 +1563,7 @@ pub(crate) mod tests {
         // esc drops the find first, the pick as it was; then closes.
         press(&mut view, KeyCode::Esc);
         assert_eq!(picked(&mut view, 80), before);
-        assert!(!card(&mut view, 80).iter().any(|l| l.starts_with("find")));
+        assert_eq!(view.field(), None);
         assert_eq!(press(&mut view, KeyCode::Esc), crate::commons::Key::Close);
         let _ = std::fs::remove_dir_all(home);
     }

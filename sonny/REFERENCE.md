@@ -181,7 +181,8 @@ Rows keep the order of their titles, so none moves when an agent starts or
 ends a turn. Projects none of whose agents had a turn in seven days fold to
 `▸ N idle projects`. `↑` `↓` pick, `enter` or `→` goes to the picked
 project's lead as `/switch` does, `←` goes to the project that holds it,
-`ctrl+f` narrows the rows by title and name, and `esc` puts back the
+`ctrl+f` narrows the rows by title and name, in the find field on the
+row under the page's title, and `esc` puts back the
 conversation and what the pane showed. The empty composer says
 `← projects`. Zen, a side chat and an agent shown beside keep you where you
 are: `←` there does nothing.
@@ -1189,7 +1190,7 @@ has something on it, or is off the screen, no time shows.
 
 Type `/` to open the fuzzy command menu (ranked by frequency and recency in `~/.agent/sonny/picks.json`). Typos like `/stauts` stay in the composer instead of sending; paths like `/etc/hosts is wrong` send normally.
 
-**Quick commands:** `/copy` (copy last reply) · `/verbose` (toggle all tool calls in this window) · `/compact` (confirm & summarize conversation now; daemon also auto-compacts at `compact_tokens` and between turns at 70% context) · `/retry` (inspect and allow one retry of a reviewer-denied call) · `/margin` (reopen margin) · `/mcp` (list MCP servers & tools) · `/audit` (view tool audit trail: `a` all agents, `t`/`p`/`w` filters) · `/pause REASON` & `/resume` (fleet-wide andon cord) · `/quit` (exit window, leaving daemon and turns running).
+**Quick commands:** `/copy` (copy last reply) · `/verbose` (toggle all tool calls in this window) · `/compact` (confirm & summarize conversation now; daemon also auto-compacts at `compact_tokens` and between turns at 70% context) · `/retry` (inspect and allow one retry of a reviewer-denied call) · `/margin` (reopen margin) · `/mcp` (list MCP servers & tools) · `/audit` (view tool audit trail: `a` all agents, `t`/`p`/`w` filters, `Ctrl+F` finds) · `/pause REASON` & `/resume` (fleet-wide andon cord) · `/quit` (exit window, leaving daemon and turns running).
 
 ### `/side` — Mid-turn side chats
 
@@ -1293,7 +1294,7 @@ Lists everything running without active typing: **Automations**, **Follows**, an
 ### `/commons` and `/memory`
 
 - `/commons`: Browse cross-project **Boards** and **Threads** (`a` narrows to this project, `m` mixes board items into threads, `Ctrl+F` searches). See [docs/SONNY.md#commons](../docs/SONNY.md#commons).
-- `/memory`: Browse **Work under way**, **This project**, and **Everywhere** facts (`a` widens to all projects, `Enter` reads with wiki-style fact links, `x` deletes). See [docs/SONNY.md#memory](../docs/SONNY.md#memory).
+- `/memory`: Browse **Work under way**, **This project**, and **Everywhere** facts (`a` widens to all projects, `Enter` reads with wiki-style fact links, `x` deletes, `Ctrl+F` finds by name or description). See [docs/SONNY.md#memory](../docs/SONNY.md#memory).
 
 ### `/sky` — Live fleet constellation and replay
 
@@ -2664,7 +2665,10 @@ both shows the one the keys are in. With nothing typed, Home goes up to
 the conversation's first turn, drawing the turns over it on the way, and
 End comes back to the newest. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
-newer, and Esc stops where you are. Sonny draws the whole screen again on
+newer, and Esc stops where you are. The conversation's find stays above
+the composer, never in it, with the find field's parts: a muted `find`,
+the words, the cursor and the place, `4 of 7`; with nothing typed, a muted
+`type to find`. Sonny draws the whole screen again on
 every resize and when the terminal regains focus, so a multiplexer that
 reattaches or a display that wakes never leaves stale rows; Ctrl+L
 redraws it by hand, as in a shell.
@@ -2723,18 +2727,32 @@ and a key the view does not name does nothing (`q` included), never
 typed into the composer.
 
 `ctrl+f` finds in a view of rows, as it does in Projects: `/status`,
-`/background` and `/commons`'s list of threads. What you type narrows the
-rows to those that say it, in any case unless you type a capital: a
-section with no match is not drawn, a fold is searched and stands open,
-and a row that holds a match (a task whose helper says it) stays, to keep
-it in its place. The pick goes to the first match, and `↑` `↓` and `enter`
-stay the view's. The find row is the view's last, a muted `find` and what
-you typed. `esc` drops the find and puts back the rows and the pick; the
-next `esc` closes the view. Each view's title names `ctrl+f find` with its
-keys. Find reads only what the view already read, nothing from the daemon
-as you type.
+`/background`, `/commons`'s list and a board's page, `/memory` and
+`/audit`. What you type narrows the rows to those that say it, in any case
+unless you type a capital: a section with no match is not drawn, a fold is
+searched and stands open, and a row that holds a match (a task whose
+helper says it) stays, to keep it in its place. The pick goes to the first
+match, and `↑` `↓` and `enter` stay the view's.
 
-![ctrl+f with a find typed in /status, /background and /commons: each narrowed to the rows that say it, the pick on the first, the find row last](../docs/sonny/find-views.png)
+The find field is the row under the title row, in every pane view and in
+Projects. Every view keeps that row, empty at rest, so nothing moves when
+find opens. It is one row on a band from the pane's inset to its edge: a
+muted `find`, what you typed, then the terminal's cursor, and at its right
+end, muted, how many rows are left of how many there are (`4 of 14`).
+With nothing typed a muted `type to narrow` follows the cursor. With
+`NO_COLOR`, `find` is bold. Backspace with nothing typed does nothing.
+With nothing matching the field says `0 of 14` and the view says
+`nothing here matches X`. Going into a row and back keeps the field and
+the narrowing. `esc` drops the find and puts back the rows and the pick;
+the next `esc` closes the view. Each view's title names `ctrl+f find` with
+its keys. Find reads only what the view already read, nothing from the
+daemon as you type, and a key draws again only the field and the rows it
+changed. The field is drawn in one place (`find.rs`) and every view is
+given it.
+
+![ctrl+f in /memory at 150, 60 and 44 columns: the field on the row under the title, nothing typed, then words typed with the rows narrowed](../docs/sonny/find-field.png)
+
+![ctrl+f in /status, /background, /commons, /audit and Projects at 60 columns, words typed: the field on the row under each title](../docs/sonny/find-views.png)
 
 Every view is laid out the same way, too. Its title row is the command
 that opens it (`mcp`, not "MCP servers") and the keys it takes. Under it

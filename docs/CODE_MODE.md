@@ -108,7 +108,7 @@ and Codex removed the option.
 | Claude Code | JavaScript, runtime not stated | Not stated | Shell and edit helpers; each call passes permission rules and hooks | Not stated |
 | Anthropic's API | Python | The provider's container; the client runs no engine | Tools marked `allowed_callers`; each call comes back to the client as a `tool_use` naming its `caller` | Not read |
 | Agent | None | Nowhere: a client's companion runs one if the client brings one | Nothing of the daemon's; it judges and records the calls a client's tool reports | A waiting call is kept as a row; one already taken cannot be taken again |
-| Sonny, on Agent | QuickJS, 4 running and 16 alive, 256 MB | Its tool host, a companion, one for every bot | MCP tools only | The call ends `tool_outcome_unknown` |
+| Sonny, on Agent | QuickJS, 4 running and 16 alive, 256 MB | Its tool host, a companion, one for every bot | MCP tools only | Replayed, as Pi Durable's: the next host runs the script again against its journal (`sonny/src/exec/journal.rs`) |
 
 All of this is read in source except the Claude Code and Anthropic API
 rows, which are their documentation. Agent and Sonny already divide as Pi
@@ -211,9 +211,12 @@ What Sonny's lacks:
   and `desktop` it could offer a script today, with no change to Agent.
   The bot's `shell`, `read`, `edit` and `apply_patch` it cannot, which is
   the first of Agent's gaps.
-- **A restart loses the script.** A call taken before the host restarted is
-  answered `tool_outcome_unknown` (sonny/src/served.rs:1484). Only an
-  upgrade restarts the host now ([slice M](#m-a-message-never-ends-a-scripts-call)).
+- **A restart no longer loses the script** (11-22). A call taken before
+  the host restarted was answered `tool_outcome_unknown`; now the next host
+  runs the script again from its journal, as Pi Durable does, and only a
+  call running when the host stopped is told it was cut off. As in Pi, a script reads
+  its own clock, which moves only when a result reaches it, and its own
+  seeded `Math.random()`, so a second run sees what the first saw.
 - **It is about 3,400 lines** (engine, description, limits, step handling)
   that another client would write again.
 

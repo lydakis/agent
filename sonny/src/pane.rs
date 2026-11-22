@@ -129,6 +129,9 @@ pub struct Pane {
     /// `?` pressed while it has the keys: every key its title would name,
     /// one to a row, in place of what it shows, until the next key.
     pub sheet: bool,
+    /// The view's find, drawn on the row under the title, which stays
+    /// empty at rest so nothing moves when it opens (Rulebook, Find).
+    pub find: Option<crate::find::Field>,
 }
 
 /// The button beside an agent's name that opens it in the main view: the
@@ -236,6 +239,7 @@ impl Pane {
             tab: false,
             laid,
             sheet: false,
+            find: None,
         })
     }
 
@@ -414,6 +418,7 @@ impl Pane {
             tab: false,
             laid: None,
             sheet: false,
+            find: None,
         }
     }
 
@@ -450,6 +455,7 @@ impl Pane {
             tab: false,
             laid: None,
             sheet: false,
+            find: None,
         }
     }
 
@@ -727,6 +733,20 @@ impl Pane {
         head.extend(key_spans);
         let head = Line::from(head);
         buf.set_line(area.x, area.y, &head, area.width);
+        // The row under the title: empty at rest, the find field while the
+        // view finds, from the pane's inset to its edge.
+        let found = match (&self.find, area.height > 1) {
+            (Some(field), true) => {
+                let row = Rect {
+                    x: area.x + 1,
+                    y: area.y + 1,
+                    width: area.width.saturating_sub(1),
+                    height: 1,
+                };
+                Some(crate::find::draw(field, row, buf))
+            }
+            _ => None,
+        };
         // A row between the name and what it holds, and above the foot.
         let mut rows = Rect {
             y: area.y + 2,
@@ -758,7 +778,7 @@ impl Pane {
             for (at, line) in lines.iter().take(rows.height as usize).enumerate() {
                 buf.set_line(rows.x, rows.y + at as u16, line, rows.width);
             }
-            return None;
+            return found;
         }
         match &mut self.program {
             // A column off the line between, as the title is.
@@ -781,7 +801,7 @@ impl Pane {
                 };
                 self.lay(rows);
                 self.screen.render(rows, buf, file);
-                None
+                found
             }
         }
     }
