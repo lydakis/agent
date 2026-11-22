@@ -243,7 +243,7 @@ pub fn event_of(posts: &[Value], n: usize, thread: &str) -> &'static str {
         Some("take") => "taken",
         Some("drop") => "dropped",
         Some("done") => "done",
-        Some("fail") => match item(&posts[..=n]).is_some_and(|it| it["state"] == "canceled") {
+        Some("fail") => match standing(&posts[..=n]).is_some_and(|it| it["state"] == "canceled") {
             true => "canceled",
             false => "failed",
         },
@@ -293,7 +293,7 @@ pub fn valid_title(title: &str) -> Result<(), String> {
 /// `by` made it, as the daemon knew it by `by_id`, `at` is its last step's time, `holder` holds
 /// taken work and did done or failed work, `result` is a closing post's text, and `title` is the
 /// short one a reply opening a thread already there gave it.
-pub fn item(posts: &[Value]) -> Option<Value> {
+pub fn standing(posts: &[Value]) -> Option<Value> {
     let mut item: Option<Value> = None;
     for post in posts {
         let Some(action) = post["do"].as_str() else {
@@ -376,6 +376,25 @@ pub fn item(posts: &[Value]) -> Option<Value> {
         it.retain(|_, value| !value.is_null());
     }
     item
+}
+
+/// For each of a thread's posts, whether it is a `fail` that canceled
+/// its work: its maker's, while no one held it, as [`standing`] reads it.
+/// One pass, so a long thread's page asks no more than its posts.
+pub fn cancels(posts: &[Value]) -> Vec<bool> {
+    let mut unheld: Option<bool> = None;
+    (posts.iter())
+        .map(|post| {
+            let action = post["do"].as_str();
+            let canceled = action == Some("fail") && unheld == Some(true);
+            unheld = match (unheld, action) {
+                (_, Some("open" | "drop")) => Some(true),
+                (Some(_), Some("take" | "done" | "fail")) => Some(false),
+                (now, _) => now,
+            };
+            canceled
+        })
+        .collect()
 }
 
 /// Whether `item` waits: open, with a need that `done` says is not done.
@@ -638,7 +657,7 @@ pub fn post(dir: &Path, caller: &Caller, given: &Value) -> Result<Value, String>
         post["opened"] = json!([name]);
     }
     let mut said = commons::start_locked(dir, name, title.trim(), &post, caller.reader)?;
-    said["work"] = item(std::slice::from_ref(&post)).unwrap_or_default();
+    said["work"] = standing(std::slice::from_ref(&post)).unwrap_or_default();
     // Open work kept for some asks them to take it.
     if opens && post["for"].is_array() {
         said[ASK_FOR] = json!([name]);
@@ -684,7 +703,7 @@ pub fn reply(
     }
     let _lock = commons::lock(dir)?;
     let posts = commons::posts(&dir.join(format!("{thread}.jsonl")))?;
-    let current = item(&posts);
+    let current = standing(&posts);
     let ours = |board: &str| caller.project == Some(project_of(board));
     let items = items(dir);
     // A board and a title go with opening a thread that is no work yet.
@@ -926,7 +945,7 @@ pub fn reply(
     let updated = || {
         let mut after = posts.clone();
         after.push(post.clone());
-        item(&after)
+        standing(&after)
     };
     if reserves
         && !ask_for.iter().any(|t| t == thread)
@@ -954,7 +973,7 @@ pub fn reply(
     if said["posted"] != false {
         let mut after = posts;
         after.push(post);
-        let work = item(&after).unwrap_or_default();
+        let work = standing(&after).unwrap_or_default();
         // What the work it needed made, so its taker starts from it.
         if answer_needs {
             let made: Vec<Value> = (work["needs"].as_array().into_iter().flatten())
@@ -985,7 +1004,7 @@ fn need_done(dir: &Path, need: &str) -> bool {
     commons::valid_name(need).is_ok()
         && commons::posts(&dir.join(format!("{need}.jsonl")))
             .ok()
-            .and_then(|posts| item(&posts))
+            .and_then(|posts| standing(&posts))
             .is_some_and(|item| item["state"] == "done")
 }
 
@@ -1577,7 +1596,7 @@ mod tests {
     #[test]
     fn a_text_saying_do_is_no_step() {
         let posts = [json!({"by": "a", "at": 1, "title": "T", "text": "\"do\":\"take\""})];
-        assert!(item(&posts).is_none());
+        assert!(standing(&posts).is_none());
         let line = posts[0].to_string();
         assert!(!line.contains(r#""do":"#));
     }
@@ -1852,12 +1871,12 @@ mod tests {
         );
         assert_eq!(posts[0]["for"], json!(["reviewer", "profile:reviewer"]));
         assert_eq!(posts[4]["for"], json!([]));
-        let work = item(&posts).unwrap();
+        let work = standing(&posts).unwrap();
         assert_eq!(work["state"], "open");
         assert_eq!(work["labels"], json!({"kind": "review"}));
         assert!(work["for"].is_null());
         // A reviewer made as the profile takes work kept for it, as before.
-        let kept = item(&posts[..1]).unwrap();
+        let kept = standing(&posts[..1]).unwrap();
         assert!(is_for(&kept, "shop.r", Some("reviewer")));
         assert!(is_for(&kept, "reviewer", None));
         assert!(!is_for(&kept, "shop.w1", Some("worker")));

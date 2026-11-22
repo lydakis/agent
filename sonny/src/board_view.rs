@@ -1,7 +1,7 @@
 //! Boards in `/commons`: a project's lists of work that agents pull from,
 //! drawn from what the commons listing already keeps of each thread. An
 //! item is a thread of work on a board, with a state its step posts set;
-//! [`crate::board::item`] says where each stands, and this draws it:
+//! [`crate::board::standing`] says where each stands, and this draws it:
 //! the Boards section over the threads, a board's page, an item's row
 //! among the threads, and the row under an item's name that says where
 //! it stands. No model call and no daemon call: the folder alone.
@@ -112,7 +112,7 @@ pub struct Item {
 }
 
 /// The item a thread's listing line says, if it is one: `summary` as the
-/// commons listing keeps it, its `item` as [`crate::board::item`] gave
+/// commons listing keeps it, its `item` as [`crate::board::standing`] gave
 /// it, and `at` its last post's time.
 pub fn item_of(summary: &Value, at: i64) -> Option<Item> {
     let item = summary.get("work").filter(|item| item.is_object())?;
@@ -174,11 +174,16 @@ impl Board {
         self.counts[state as usize]
     }
 
-    /// The state of its most pressing item, which its mark is.
-    pub fn state(&self) -> State {
+    /// The state of its most pressing work, which its mark is: none for
+    /// a board that holds only plain threads, which has nothing whose
+    /// state a mark could say.
+    pub fn state(&self) -> Option<State> {
+        if self.items.is_empty() {
+            return None;
+        }
         (State::ALL.into_iter())
             .find(|state| *state != State::Canceled && self.count(*state) > 0)
-            .unwrap_or(State::Canceled)
+            .or(Some(State::Canceled))
     }
 
     /// Every item done or canceled, and no post in seven days.
@@ -285,6 +290,10 @@ impl Present {
     }
 }
 
+/// What work no agent the window lists may take says: the one thing on
+/// its row that waits on someone, which stays when the row is short.
+const NOBODY: &str = "nobody eligible";
+
 /// Whom `item` is kept for, in words: `for profile:reviewer`, and
 /// `nobody eligible` after it when no agent the window lists is.
 fn kept_words(item: &Item, present: &Present) -> Option<String> {
@@ -293,7 +302,8 @@ fn kept_words(item: &Item, present: &Present) -> Option<String> {
     }
     let mut said = format!("for {}", item.kept_for.join(", "));
     if present.nobody_for(item) {
-        said.push_str(", nobody eligible");
+        said.push_str(", ");
+        said.push_str(NOBODY);
     }
     Some(said)
 }
@@ -336,13 +346,14 @@ fn spans_width(spans: &[Span]) -> usize {
 /// bold in a column `column` wide, a count for each state that has any,
 /// and at the right the age of its last post. Too long for its row, the
 /// age goes first, then the counts from the right; the mark and the name
-/// stay.
+/// stay. A board with no work has no mark and no counts: its name, in
+/// the column the others' names are in, and its age.
 pub fn board_row(board: &Board, column: usize, width: usize, now: i64) -> Line<'static> {
     let name = board.name.clone();
     let pad = column.saturating_sub(crate::title::width(&name));
     let lead = vec![
         Span::raw(" "),
-        board.state().sign(),
+        board.state().map_or(Span::raw(" "), State::sign),
         Span::raw(" "),
         Span::raw(name).bold(),
         Span::raw(" ".repeat(pad)),
@@ -401,12 +412,15 @@ pub fn page_head(board: &Board) -> Vec<Line<'static>> {
 /// the column after its last, and the agent.
 pub type Named = (usize, usize, usize, String);
 
-/// An item's row on its board's page, `width` wide, with the agent its
+/// Work's row on its board's page, `width` wide, with the agent its
 /// holder's name links, by its columns: its mark, its title in `ink`, its
 /// labels muted, and at the right its holder and the age of its last
-/// post. An open item kept for an agent or a profile says `for NAME`,
-/// plain words. Too long for its row, the labels go first, then the age,
-/// then the title is cut at a word; the mark and the holder stay.
+/// post. Open or waiting work kept for agents or a profile says `for
+/// NAME`, plain words, and `nobody eligible` after it when no agent the
+/// window lists is one. Too long for its row, the labels go first, then
+/// the age, then whom it is kept for, down to `nobody eligible`, then the
+/// title is cut at a word; the mark, the holder and `nobody eligible`
+/// stay.
 pub fn page_row(
     item: &Item,
     width: usize,
@@ -416,23 +430,29 @@ pub fn page_row(
 ) -> (Line<'static>, Option<(usize, usize, String)>) {
     let lead = vec![Span::raw(" "), item.state.sign(), Span::raw(" ")];
     let lead_width = spans_width(&lead);
-    // What stands at the right, which stays.
-    let (who, link): (Vec<Span<'static>>, Option<String>) = match (&item.holder, item.state) {
-        (Some(holder), State::Taken) if present.closed(holder) => (
-            vec![Span::raw(format!("{} closed", named(holder, here))).dim()],
-            None,
-        ),
-        (Some(holder), State::Taken) => (
-            vec![Span::raw(named(holder, here)).fg(Color::Blue)],
-            Some(holder.clone()),
-        ),
-        _ => match kept_words(item, present) {
-            Some(kept) if matches!(item.state, State::Open | State::Waiting) => {
-                (vec![Span::raw(kept).dim()], None)
+    // What stands at the right: whole, and as short as it goes.
+    let (who, short, link): (String, String, Option<(String, String)>) =
+        match (&item.holder, item.state) {
+            (Some(holder), State::Taken) if present.closed(holder) => {
+                let said = format!("{} closed", named(holder, here));
+                (said.clone(), said, None)
             }
-            _ => (Vec::new(), None),
-        },
-    };
+            (Some(holder), State::Taken) => {
+                let said = named(holder, here);
+                (said.clone(), said.clone(), Some((said, holder.clone())))
+            }
+            (_, State::Open | State::Waiting) => match kept_words(item, present) {
+                Some(kept) => {
+                    let short = match present.nobody_for(item) {
+                        true => NOBODY.to_owned(),
+                        false => String::new(),
+                    };
+                    (kept, short, None)
+                }
+                None => (String::new(), String::new(), None),
+            },
+            _ => (String::new(), String::new(), None),
+        };
     // Taken work shows when its holder last wrote there.
     let at = match item.state {
         State::Taken => item.holder_at.unwrap_or(item.at),
@@ -444,30 +464,36 @@ pub fn page_row(
         .collect::<Vec<_>>()
         .join(" ");
     let title_width = crate::title::width(&item.title);
-    let who_width = spans_width(&who);
-    // The right side as it can be: the holder and the age, or the holder.
-    let right = |with_age: bool| -> usize {
-        match (who_width, with_age) {
+    // The right side's width: whom, then the age.
+    let right = |whom: &str, with_age: bool| -> usize {
+        match (crate::title::width(whom), with_age) {
             (0, true) => age.len(),
             (w, true) => w + 3 + age.len(),
             (w, false) => w,
         }
     };
-    let fits = |labels_on: bool, with_age: bool| -> bool {
+    let used = |labels_on: bool, whom: &str, with_age: bool| -> usize {
         let labels_w = if labels_on && !labels.is_empty() {
             2 + labels.len()
         } else {
             0
         };
-        let r = right(with_age);
-        lead_width + title_width + labels_w + if r > 0 { 2 + r } else { 0 } <= width
+        let r = right(whom, with_age);
+        lead_width + title_width + labels_w + if r > 0 { 2 + r } else { 0 }
     };
-    let (labels_on, with_age) = match () {
-        _ if fits(true, true) => (true, true),
-        _ if fits(false, true) => (false, true),
-        _ => (false, false),
-    };
-    let r = right(with_age);
+    // What gives way, in order: the labels, the age, whom it is kept
+    // for; past the last, the title is cut.
+    let ways = [
+        (true, who.as_str(), true),
+        (false, who.as_str(), true),
+        (false, who.as_str(), false),
+        (false, short.as_str(), false),
+    ];
+    let (labels_on, whom, with_age) = (ways.iter())
+        .find(|(labels_on, whom, with_age)| used(*labels_on, whom, *with_age) <= width)
+        .copied()
+        .unwrap_or(ways[3]);
+    let r = right(whom, with_age);
     let room = width.saturating_sub(lead_width + if r > 0 { 2 + r } else { 0 });
     let title = crate::title::cut(&item.title, room);
     let mut spans = lead;
@@ -480,12 +506,17 @@ pub fn page_row(
         let used = spans_width(&spans);
         spans.push(Span::raw(" ".repeat(width.saturating_sub(used + r).max(2))));
         let from = spans_width(&spans);
-        if let Some(bot) = link {
-            named_at = Some((from, from + who_width, bot));
+        let whom_width = crate::title::width(whom);
+        match &link {
+            Some((said, bot)) if said == whom => {
+                named_at = Some((from, from + whom_width, bot.clone()));
+                spans.push(Span::raw(whom.to_owned()).fg(Color::Blue));
+            }
+            _ if whom_width > 0 => spans.push(Span::raw(whom.to_owned()).dim()),
+            _ => {}
         }
-        spans.extend(who);
         if with_age {
-            if who_width > 0 {
+            if whom_width > 0 {
                 spans.push(Span::raw(" · ").dim());
             }
             spans.push(Span::raw(age).dim());
@@ -495,21 +526,42 @@ pub fn page_row(
 }
 
 /// A plain thread's row on its board's page, `width` wide: its title in
-/// the columns an item's mark leaves, and at the right who last wrote and
-/// when, `at`, which stay.
-pub fn plain_row(thread: &Value, at: i64, width: usize, now: i64, here: &str) -> Line<'static> {
-    let by = named(thread["last_by"].as_str().unwrap_or_default(), here);
-    let right = format!("{by} · {}", age(now - at));
-    let room = width.saturating_sub(3 + 2 + right.chars().count());
+/// the columns work's mark leaves, and at the right who last wrote, a
+/// link to that agent as a holder is, and when, `at`, which stay. A
+/// writer Sonny knows is closed is plain words, as any agent not there.
+pub fn plain_row(
+    thread: &Value,
+    at: i64,
+    width: usize,
+    now: i64,
+    here: &str,
+    present: &Present,
+) -> (Line<'static>, Option<(usize, usize, String)>) {
+    let bot = thread["last_by"].as_str().unwrap_or_default();
+    let by = named(bot, here);
+    let age = age(now - at);
+    let by_width = crate::title::width(&by);
+    let right = by_width + 3 + age.len();
+    let room = width.saturating_sub(3 + 2 + right);
     let title = crate::title::cut(thread["title"].as_str().unwrap_or_default(), room);
     let used = 3 + crate::title::width(&title);
-    let pad = width.saturating_sub(used + right.chars().count()).max(2);
-    Line::from(vec![
+    let pad = width.saturating_sub(used + right).max(2);
+    let from = used + pad;
+    let (writer, link) = match bot.is_empty() || present.closed(bot) {
+        true => (Span::raw(by).dim(), None),
+        false => (
+            Span::raw(by).fg(Color::Blue),
+            Some((from, from + by_width, bot.to_owned())),
+        ),
+    };
+    let line = Line::from(vec![
         Span::raw("   "),
         Span::raw(title),
         Span::raw(" ".repeat(pad)),
-        Span::raw(right).dim(),
-    ])
+        writer,
+        Span::raw(format!(" · {age}")).dim(),
+    ]);
+    (line, link)
 }
 
 /// What hangs under an item's row on its board's page, if anything: what
@@ -575,10 +627,11 @@ pub fn found_on_page(item: &Item, query: &str) -> bool {
         .any(|words| crate::find::says(query, words))
 }
 
-/// What one step post did to its work, in words: `taken`, `dropped`,
-/// `took it over from errors-2, closed`. None for a post that is no step,
-/// or the first post opening work, which is the work's text.
-pub fn action_words(post: &Value, first: bool, here: &str) -> Option<String> {
+/// What one step post did to its work, in words: `took it`, `dropped it`,
+/// `took it over from errors-2, closed`; a `fail` that `canceled` it, its
+/// maker's while no one held it, `canceled it`. None for a post that is
+/// no step, or the first post opening work, which is the work's text.
+pub fn action_words(post: &Value, first: bool, canceled: bool, here: &str) -> Option<String> {
     let did = post["do"].as_str()?;
     let mut said = match did {
         "open" if first => return None,
@@ -592,6 +645,7 @@ pub fn action_words(post: &Value, first: bool, here: &str) -> Option<String> {
         },
         "drop" => "dropped it".to_owned(),
         "done" => "done".to_owned(),
+        "fail" if canceled => "canceled it".to_owned(),
         "fail" => "failed it".to_owned(),
         "set" => String::new(),
         other => other.to_owned(),
@@ -1062,15 +1116,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn m_lists_every_item_among_the_threads_with_its_board_and_state() {
+    fn m_lists_all_work_among_the_threads_with_its_board_and_state() {
         let home = &commons("more");
         let mut view = View::open(home, "shop".into());
-        assert!(view.keys().contains("m items"), "{}", view.keys());
+        // The key says what it gives, in the book's word: work.
+        assert!(view.keys().contains("m work"), "{}", view.keys());
         press(&mut view, KeyCode::Char('m'));
+        assert!(view.keys().contains("m no work"), "{}", view.keys());
         let lines = card(&mut view, 100);
         assert!(
-            lines.iter().any(|l| l == "Threads · 1 · 9 items"),
+            lines.iter().any(|l| l == "Threads · 1 · 9 work"),
             "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("item")),
+            "no screen says item: {lines:#?}"
         );
         let api = lines
             .iter()
@@ -1815,5 +1875,295 @@ pub(crate) mod tests {
              · one thread changed, read and drawn {changed:?} · a board's page {page:?} · with m {items:?}"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// shop's board `shop/x`: work `store` taken by `shop.w`, and a plain
+    /// thread `plan` `shop.w` wrote last in; `shop/notes`, a board of one
+    /// plain thread and no work.
+    fn plain_boards(name: &str) -> PathBuf {
+        let home = home(name);
+        let h = &home;
+        add(
+            h,
+            "shop.lead",
+            "shop/x",
+            "store",
+            "Type the store",
+            json!({}),
+        );
+        act(h, "shop.w", "store", "take", "mine");
+        send(
+            h,
+            "shop.lead",
+            json!({"post": {"name": "plan", "title": "The plan", "text": "x", "board": "shop/x"}}),
+        );
+        send(
+            h,
+            "shop.w",
+            json!({"reply": {"thread": "plan", "text": "Agreed."}}),
+        );
+        send(
+            h,
+            "shop.lead",
+            json!({"post": {"name": "notes", "title": "Notes so far", "text": "x",
+            "board": "shop/notes"}}),
+        );
+        home
+    }
+
+    #[test]
+    fn a_board_with_no_work_has_no_mark_and_no_counts() {
+        let home = &plain_boards("no-work");
+        let mut view = View::open(home, "shop".into());
+        let lines = card(&mut view, 80);
+        let row = |board: &str| {
+            (lines.iter().find(|l| l.contains(board)))
+                .unwrap_or_else(|| panic!("{board}: {lines:#?}"))
+                .clone()
+        };
+        let notes = row("shop/notes");
+        let x = row("shop/x");
+        // Its name in the column the others' names are in, then its age.
+        let column = |row: &str, name: &str| row[..row.find(name).unwrap()].chars().count();
+        assert_eq!(
+            column(&notes, "shop/notes"),
+            column(&x, "shop/x"),
+            "{lines:#?}"
+        );
+        assert!(notes.starts_with("   shop/notes"), "{notes:?}");
+        assert!(!notes.contains('–'), "no canceled mark: {notes:?}");
+        let after = notes["   shop/notes".len()..].trim();
+        assert!(seconds_old(after), "only its age: {notes:?}");
+        assert!(x.starts_with(" ● shop/x"), "{x:?}");
+        // Its page: its head and its threads, no section of work.
+        while !picked(&mut view, 80).contains("shop/notes") {
+            press(&mut view, KeyCode::Down);
+        }
+        press(&mut view, KeyCode::Enter);
+        let page = card(&mut view, 80);
+        assert_eq!(page[0], "shop/notes");
+        assert!(page.iter().any(|l| l == "Threads · 1"), "{page:#?}");
+        assert!(page.iter().any(|l| l.contains("Notes so far")), "{page:#?}");
+        // One that holds nothing now says so, in the book's word.
+        std::fs::remove_file(crate::commons::dir(home).join("notes.jsonl")).unwrap();
+        view.reload();
+        let page = card(&mut view, 80);
+        assert!(
+            page.iter().any(|l| l == "No work is on this board now."),
+            "{page:#?}"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_plain_thread_on_a_board_says_its_board_in_the_list() {
+        let home = &plain_boards("plain-board");
+        let mut view = View::open(home, "shop".into());
+        let lines = card(&mut view, 100);
+        let plan = (lines.iter().position(|l| l.contains("The plan")))
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(
+            lines[plan + 1].starts_with("  shop/x · 2 posts · by shop.lead · "),
+            "{:?}",
+            lines[plan + 1]
+        );
+        // The board's name in `ink`, the rest muted, as work's row has it.
+        let (rows, _) = view.card(100);
+        let under = &rows[plan + 1];
+        let board = (under.spans.iter())
+            .find(|span| span.content == "shop/x")
+            .unwrap();
+        assert!(
+            !board
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM),
+            "{under:?}"
+        );
+        // A thread on no board says none.
+        thread(home, "mail.lead", "backoff", "Provider 429s: how long?");
+        view.reload();
+        let lines = card(&mut view, 100);
+        let backoff = lines.iter().position(|l| l.contains("Provider")).unwrap();
+        assert!(lines[backoff + 1].starts_with("  1 post · by mail.lead"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_plain_thread_s_last_writer_is_a_link_as_a_holder_is() {
+        let home = &plain_boards("writer-link");
+        let mut view = View::open(home, "shop".into());
+        assert!(picked(&mut view, 80).contains("shop/notes"));
+        press(&mut view, KeyCode::Down);
+        assert!(picked(&mut view, 80).contains("shop/x"));
+        press(&mut view, KeyCode::Enter);
+        let card = view.card_rows(80);
+        let lines: Vec<String> = card.lines.iter().map(text).collect();
+        let row = |needle: &str| {
+            (lines.iter().position(|l| l.contains(needle)))
+                .unwrap_or_else(|| panic!("{needle}: {lines:#?}"))
+        };
+        let (holder, plan) = (row("Type the store"), row("The plan"));
+        // Both names are agents' links, by their columns.
+        for (at, bot) in [(holder, "shop.w"), (plan, "shop.w")] {
+            let (_, from, to, _) = (card.agents.iter())
+                .find(|(row, _, _, linked)| *row == at && linked == bot)
+                .unwrap_or_else(|| panic!("{bot} on {at}: {:?}", card.agents));
+            let said: String = lines[at].chars().skip(*from).take(to - from).collect();
+            assert_eq!(said, "w", "{:?} {from}..{to}", lines[at]);
+        }
+        // Blue, as a holder is: the agents' hue.
+        let blue = |at: usize| {
+            (card.lines[at].spans.iter())
+                .find(|span| span.content == "w")
+                .and_then(|span| span.style.fg)
+        };
+        // (The holder's row is picked, which the window reverses.)
+        assert_eq!(blue(plan), Some(Color::Blue));
+        // A writer Sonny knows is closed is plain words.
+        view.set_present(Present {
+            project: "shop".into(),
+            bots: ["shop.lead".into()].into(),
+            ..Present::default()
+        });
+        let card = view.card_rows(80);
+        assert!(!card.agents.iter().any(|(row, ..)| *row == plan));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn short_of_room_work_gives_up_labels_age_then_whom_it_is_for_then_its_title() {
+        let home = &commons("give-up");
+        let summaries = crate::commons::summaries(&crate::commons::dir(home));
+        let item = |name: &str| {
+            (summaries.iter())
+                .find(|(thread, _)| thread == name)
+                .and_then(|(_, summary)| item_of(summary, 0))
+                .unwrap()
+        };
+        let present = Present {
+            project: "shop".into(),
+            bots: ["shop.lead", "shop.errors-2"].map(str::to_owned).into(),
+            profiles: ["lead"].map(str::to_owned).into(),
+        };
+        let row = |item: &Item, width: usize| -> String {
+            let (line, _) = page_row(item, width, 60, "shop", &present);
+            let said = text(&line);
+            assert!(said.chars().count() <= width, "{said:?} past {width}");
+            said
+        };
+        let review = item("review");
+        // Room for all of it: whom it is for, and its age.
+        let wide = row(&review, 100);
+        assert!(
+            wide.trim_end()
+                .ends_with("for profile:reviewer, nobody eligible · 1m"),
+            "{wide:?}"
+        );
+        // Short of room: the age goes before whom it is kept for.
+        let less = row(&review, 75);
+        assert!(
+            less.trim_end()
+                .ends_with("for profile:reviewer, nobody eligible"),
+            "{less:?}"
+        );
+        // Then whom it is for, down to `nobody eligible`, the title whole.
+        let narrow = row(&review, 64);
+        assert!(
+            narrow.starts_with(" ○ Review the typed errors change"),
+            "{narrow:?}"
+        );
+        assert!(narrow.trim_end().ends_with("nobody eligible"), "{narrow:?}");
+        assert!(!narrow.contains("profile:reviewer"), "{narrow:?}");
+        // Only then is the title cut, at a word; the mark and `nobody
+        // eligible` stay.
+        let narrowest = row(&review, 44);
+        assert!(
+            narrowest.starts_with(" ○ Review the typed errors…"),
+            "{narrowest:?}"
+        );
+        assert!(narrowest.trim_end().ends_with("nobody eligible"));
+        // Kept for an agent the window lists: nothing waits on anyone, so
+        // the words go whole.
+        let listed = Present {
+            profiles: ["lead", "reviewer"].map(str::to_owned).into(),
+            ..present.clone()
+        };
+        let (line, _) = page_row(&review, 40, 60, "shop", &listed);
+        assert!(!text(&line).contains("for "), "{line:?}");
+        assert!(text(&line).starts_with(" ○ Review the typed errors change"));
+        // The labels go first: the age outlasts them.
+        let flaky = item("flaky");
+        assert!(row(&flaky, 80).contains("  kind=bug"));
+        let short = row(&flaky, 34);
+        assert!(!short.contains("kind=bug"), "{short:?}");
+        assert!(short.trim_end().ends_with("1m"), "{short:?}");
+        // A holder stays, whatever the room.
+        let api = item("api");
+        let held = row(&api, 24);
+        assert!(held.starts_with(" ● Add typed…"), "{held:?}");
+        assert!(held.trim_end().ends_with("errors-2"), "{held:?}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn work_its_maker_took_back_says_canceled_it() {
+        let home = &home("canceled-it");
+        add(
+            home,
+            "shop.lead",
+            "shop/x",
+            "gone",
+            "Drop the cache",
+            json!({}),
+        );
+        act(home, "shop.lead", "gone", "fail", "Not needed after all.");
+        add(
+            home,
+            "shop.lead",
+            "shop/x",
+            "broke",
+            "Fix the cache",
+            json!({}),
+        );
+        act(home, "shop.w", "broke", "take", "mine");
+        act(home, "shop.w", "broke", "fail", "It cannot be fixed here.");
+        let mut view = View::open(home, "shop".into());
+        view.open_thread("gone");
+        let lines = card(&mut view, 80);
+        assert_eq!(lines[2], "work on shop/x · canceled");
+        let did = (lines
+            .iter()
+            .position(|l| l.starts_with("shop.lead · canceled it · ")))
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert_eq!(lines[did + 1], "  Not needed after all.");
+        assert!(!lines.iter().any(|l| l.contains("failed it")), "{lines:#?}");
+        // Its holder's fail is a failure, said as one.
+        view.open_thread("broke");
+        let lines = card(&mut view, 80);
+        assert!(
+            lines.iter().any(|l| l.starts_with("shop.w · failed it · ")),
+            "{lines:#?}"
+        );
+        // Dropped, then its maker's: taken back.
+        let posts = [
+            json!({"do": "open", "board": "shop/x"}),
+            json!({"do": "take"}),
+            json!({"do": "drop"}),
+            json!({"do": "fail"}),
+            json!({"do": "open"}),
+            json!({"do": "take"}),
+            json!({"do": "fail"}),
+        ];
+        assert_eq!(
+            crate::board::cancels(&posts),
+            [false, false, false, true, false, false, false]
+        );
+        assert_eq!(
+            crate::board::standing(&posts[..4]).unwrap()["state"],
+            "canceled"
+        );
+        assert_eq!(crate::board::standing(&posts).unwrap()["state"], "failed");
+        let _ = std::fs::remove_dir_all(home);
     }
 }

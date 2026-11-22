@@ -294,7 +294,7 @@ pub fn call_as(
 }
 
 /// What a post holds that a filter matches: all Sonny wrote of it, and
-/// of work on a board, where it stands (`crate::board::item`).
+/// of work on a board, where it stands (`crate::board::standing`).
 const FIELDS: [&str; 15] = [
     "by", "by_id", "at", "model", "project", "sonny", "external", "title", "board", "do", "needs",
     "labels", "for", "state", "holder",
@@ -1105,7 +1105,7 @@ pub async fn ask_for(home: &Path, store: &Path, threads: &[String], author: &str
         let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
             continue;
         };
-        let Some(work) = crate::board::item(&posts) else {
+        let Some(work) = crate::board::standing(&posts) else {
             continue;
         };
         if work["state"] != "open" || !work["for"].is_array() {
@@ -1186,7 +1186,7 @@ pub async fn ask_started(
         let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
             continue;
         };
-        let Some(work) = crate::board::item(&posts) else {
+        let Some(work) = crate::board::standing(&posts) else {
             continue;
         };
         let title = (work["title"].as_str())
@@ -1257,7 +1257,7 @@ pub(crate) fn add_locked(
     let title = earlier.first().map_or(Value::Null, |p| p["title"].clone());
     let mut said = json!({"thread": name, "title": title, "posts": earlier.len() + 1});
     // A thread on a board says so, so its writer follows it as one.
-    let board = (crate::board::item(&earlier)
+    let board = (crate::board::standing(&earlier)
         .and_then(|it| it["board"].as_str().map(str::to_owned)))
     .or_else(|| earlier.first()?["board"].as_str().map(str::to_owned))
     .or_else(|| post["board"].as_str().map(str::to_owned));
@@ -1266,7 +1266,7 @@ pub(crate) fn add_locked(
     }
     // Its work as it stands, which a reply moving nothing leaves as it was,
     // so its holder still follows it as its holder.
-    if let Some(work) = crate::board::item(&earlier) {
+    if let Some(work) = crate::board::standing(&earlier) {
         said["work"] = work;
     }
     Ok(said)
@@ -1406,7 +1406,7 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
         })
         .collect();
     let mut shown = json!({"thread": name, "title": title, "posts": shown});
-    if let Some(item) = crate::board::item(&posts) {
+    if let Some(item) = crate::board::standing(&posts) {
         shown["work"] = item;
     }
     Ok(shown)
@@ -1494,7 +1494,7 @@ const OPENING: &str = "opening";
 
 /// A thread's line in a listing, from its first and last posts and its
 /// count of lines, decoding no post between them but a board's actions:
-/// an item's, under `item`, as [`crate::board::item`] reads its posts.
+/// an item's, under `item`, as [`crate::board::standing`] reads its posts.
 pub(crate) fn summary(name: &str, path: &Path) -> Option<Value> {
     summary_of(name, &std::fs::read(path).ok()?)
 }
@@ -1542,7 +1542,7 @@ pub(crate) fn summary_of(name: &str, text: &[u8]) -> Option<Value> {
     if first["board"].is_string() && first["do"].is_null() {
         summary["board"] = first["board"].clone();
     }
-    if let Some(mut item) = crate::board::item(&actions) {
+    if let Some(mut item) = crate::board::standing(&actions) {
         // When its holder last wrote there, which its board shows: a key
         // in a post's text has its quotes escaped, so none passes for it.
         if let Some(holder) = item["holder"].as_str() {
@@ -1761,11 +1761,11 @@ fn search(
         let mut whole = true;
         // An item's posts each show where it stands, as the listing's
         // first post does, waiting while a need is not done.
-        let mut item = crate::board::item(&posts);
+        let mut item = crate::board::standing(&posts);
         if let Some(item) = &mut item {
             let done = |need: &str| {
                 (crate::commons::posts(&dir.join(format!("{need}.jsonl"))).ok())
-                    .and_then(|posts| crate::board::item(&posts))
+                    .and_then(|posts| crate::board::standing(&posts))
                     .is_some_and(|it| it["state"] == "done")
             };
             if crate::board::waiting(item, &done) {
@@ -2234,7 +2234,7 @@ pub fn news(home: &Path, cursor: &Path) -> News {
         // Its board, which a follow of the board hears it by: work's, or
         // a plain thread's on a board.
         let board = (posts.iter().any(|post| post["do"].is_string()))
-            .then(|| crate::board::item(&posts))
+            .then(|| crate::board::standing(&posts))
             .flatten()
             .and_then(|item| item["board"].as_str().map(str::to_owned))
             .or_else(|| (posts.first()?["board"].as_str()).map(str::to_owned));
@@ -2287,7 +2287,7 @@ pub fn news(home: &Path, cursor: &Path) -> News {
         }
         let mut kept = json!({"posts": posts.len(), "bytes": bytes});
         // Work held, kept to tell its board once it goes quiet.
-        if let Some(work) = crate::board::item(&posts).filter(|it| it["state"] == "taken") {
+        if let Some(work) = crate::board::standing(&posts).filter(|it| it["state"] == "taken") {
             let title = work["title"].as_str().unwrap_or(title);
             kept["held"] = json!({"at": posts.last().map_or(0, |p| p["at"].as_i64().unwrap_or(0)),
                 "board": work["board"], "holder": work["holder"], "title": title});
@@ -3503,10 +3503,7 @@ impl View {
                     Span::raw(format!(" · {threads}")).dim(),
                 ];
                 if self.more {
-                    heading.push(
-                        Span::raw(format!(" · {}", crate::board_view::counted(items, "item")))
-                            .dim(),
-                    );
+                    heading.push(Span::raw(format!(" · {items} work")).dim());
                 }
                 out.push(Line::from(heading));
             }
@@ -3626,9 +3623,16 @@ impl View {
             facts.push(format!("read {reads}×"));
         }
         let mut spans = Vec::new();
-        if let Some(item) = item {
-            // The board's name in `ink`, then the rest muted.
-            spans.push(Span::raw(item.board.clone()));
+        // Its board's name in `ink`, work's or a plain thread's on a
+        // board, then the rest muted.
+        let board = match item {
+            Some(item) => Some(item.board.clone()),
+            None => (thread["board"].as_str())
+                .filter(|_| self.boards_on)
+                .map(str::to_owned),
+        };
+        if let Some(board) = board {
+            spans.push(Span::raw(board));
             spans.push(Span::raw(" · ").dim());
         }
         spans.push(Span::raw(facts.join(" · ")).dim());
@@ -3653,7 +3657,7 @@ impl View {
             card.lines = vec![
                 Line::from(name.to_owned()).bold(),
                 Line::default(),
-                Line::from("No item is on this board now.").dim(),
+                Line::from("No work is on this board now.").dim(),
             ];
             return card;
         };
@@ -3739,8 +3743,17 @@ impl View {
                     let at = (thread["thread"].as_str())
                         .and_then(|name| self.known.get(name))
                         .map_or(0, |(_, kept)| kept["at"].as_i64().unwrap_or(0));
-                    let mut line =
-                        crate::board_view::plain_row(thread, at, width, now, &self.project);
+                    let (mut line, named) = crate::board_view::plain_row(
+                        thread,
+                        at,
+                        width,
+                        now,
+                        &self.project,
+                        &self.present,
+                    );
+                    if let Some((from, to, bot)) = named {
+                        card.agents.push((out.len(), from, to, bot));
+                    }
                     if picked == Some(*row) {
                         crate::list::pick(&mut line);
                     }
@@ -3796,13 +3809,17 @@ impl View {
             }
             out.extend(rows);
         }
+        // Which `fail` took its work back, in one pass over the posts.
+        let cancels = crate::board::cancels(posts);
         for (at, post) in posts.iter().enumerate() {
             out.push(Line::default());
             let by = post["by"].as_str().unwrap_or_default();
             let when = when(post["at"].as_i64().unwrap_or(0));
             // What an agent did to the work: who, what, when, one muted
             // row; a closing one has its text under it, as any post.
-            if let Some(did) = crate::board_view::action_words(post, at == 0, &self.project) {
+            if let Some(did) =
+                crate::board_view::action_words(post, at == 0, cancels[at], &self.project)
+            {
                 out.push(Line::from(format!("{by} · {did} · {when}")).dim());
                 let closes = matches!(post["do"].as_str(), Some("done" | "fail"));
                 let text = post["text"].as_str().unwrap_or_default();
@@ -3892,7 +3909,7 @@ impl View {
                 };
                 keys = keys.find().key("a", whose);
                 if !self.items.is_empty() {
-                    keys = keys.key("m", if self.more { "threads only" } else { "items" });
+                    keys = keys.key("m", if self.more { "no work" } else { "work" });
                 }
                 keys.esc(Esc::Close)
             }
