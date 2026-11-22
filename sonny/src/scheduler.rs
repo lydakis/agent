@@ -16,6 +16,9 @@
 //! of the scheduler: a fire holds a lock on its own file in
 //! `~/.agent/automations/.scheduler` while it runs.
 //!
+//! Once a minute it also looks whether the person is away
+//! ([`crate::away`]), and runs `sonny away` to tell the leads when they are.
+//!
 //! A write to its doorbell (`~/.agent/automations/.ring`, a FIFO) has it look
 //! again at once: Sonny rings it when a definition or a queue changes, and
 //! a fire's end wakes it for that trigger alone. Else it looks at least
@@ -494,7 +497,8 @@ fn relabel(home: &Path, scheduler: Scheduler, make: impl FnOnce() -> Result<(), 
 /// At Sonny's start: the job under its own label, runs this Sonny, when
 /// it ran one from elsewhere (an install that keeps each version in its
 /// own folder), even while the old one still answers its doorbell; and
-/// the scheduler running, when any trigger is there.
+/// the scheduler running, when any trigger is there or leads are told the
+/// person is away (`[sonny] away_minutes`), which it looks after.
 pub fn at_start() {
     let Ok(places) = Places::home() else {
         return;
@@ -515,7 +519,9 @@ pub fn at_start() {
         .flatten()
         .flatten()
         .any(|e| e.file_name().to_string_lossy().ends_with(".json"));
-    if any && let Err(error) = ring() {
+    if (any || crate::away::on())
+        && let Err(error) = ring()
+    {
         eprintln!("{}", trigger::error_json(&error));
     }
 }
@@ -1067,6 +1073,7 @@ pub fn run() -> i32 {
     }
     let home = crate::home::Places::home().ok();
     let mut syncing: Option<libc::pid_t> = None;
+    let mut telling: Option<libc::pid_t> = None;
     let identity = |path: &Path| {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
@@ -1116,6 +1123,9 @@ pub fn run() -> i32 {
             if syncing == Some(pid) {
                 syncing = None;
             }
+            if telling == Some(pid) {
+                telling = None;
+            }
         }
         // The home's backup, every ten minutes while it is set up.
         if every_minute
@@ -1124,6 +1134,15 @@ pub fn run() -> i32 {
             && crate::home::due(home, crate::home::now_ms())
         {
             syncing = run_own(me, &["backup", "sync", "--job"]);
+        }
+        // The leads told the person is away, once they are
+        // (`sonny.away_minutes`): whether a window is open or not.
+        if every_minute
+            && telling.is_none()
+            && let Some(me) = &me
+            && crate::away::due()
+        {
+            telling = run_own(me, &[crate::away::VERB]);
         }
         let now_folder = modified(&places.jobs);
         let mut fired = false;
