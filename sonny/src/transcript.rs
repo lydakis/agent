@@ -1032,7 +1032,6 @@ pub fn prompt(
     if let Some(news) = news(text) {
         return (vec![news_row(&news, width)], folds);
     }
-    let width = on_band(width);
     // An answer to the lead's question says which over the answer, on
     // its band, as a reply in a chat quotes what it replies to and as
     // the composer showed it while it was written.
@@ -1068,15 +1067,6 @@ pub fn prompt(
     }
     out.push(Line::default().bg(band));
     (out, folds)
-}
-
-/// The columns the person's words take on their band `width` wide: one
-/// short of its end, so they never touch it, as Codex wraps a user's
-/// message and its composer; the band itself starts a column before the
-/// `›` ([`crate::screen::Screen::render`]). Every row on the band keeps
-/// it: the `answering` row, a quote, a fold row, the words.
-pub fn on_band(width: usize) -> usize {
-    width.saturating_sub(1)
 }
 
 /// A message that opens with a quote and has words of its own after it,
@@ -1158,7 +1148,6 @@ pub fn prompt_quoted(
     open: bool,
     folder: Option<&std::path::Path>,
 ) -> Vec<Line<'static>> {
-    let width = on_band(width);
     let (_, body) = crate::asks::split(text).unwrap_or(("", text));
     let (_, more) = match replying(body) {
         Some((quote, _)) => quote_rows_of(quote, width, folder),
@@ -1221,7 +1210,6 @@ pub fn prompt_more(
     open: bool,
     folder: Option<&std::path::Path>,
 ) -> Vec<Line<'static>> {
-    let width = on_band(width);
     let (_, body) = crate::asks::split(text).unwrap_or(("", text));
     let body = replying(body).map_or(body, |(_, words)| words);
     let (_, more) = prompt_rows(body, width, folder);
@@ -1376,7 +1364,7 @@ pub fn with_quotes(
     };
     // A blank row of the band between its words and what they quote.
     let quotes = quotes.strip_prefix('\n').unwrap_or(quotes);
-    for line in quote_rows(quotes, on_band(width), Some(PROMPT_LINES)) {
+    for line in quote_rows(quotes, width, Some(PROMPT_LINES)) {
         prompt.push(line.dim().bg(band));
     }
     prompt.push(end);
@@ -4120,10 +4108,10 @@ mod tests {
         );
         let mark = rows[1].spans.iter().find(|span| span.content == "› ");
         assert_eq!(mark.unwrap().style.fg, Some(Color::Magenta));
-        // The same words drawn as the agent's reply draws them a column
-        // narrower, but its lead: they wrap a column short of the band's
-        // end, where a reply wraps at the column's edge.
-        let reply = text(&reply(said, 79, std::path::Path::new(".")));
+        // The same words drawn as the agent's reply draws them, but its
+        // lead: both wrap at the conversation's width, and the band
+        // reaches a column past it ([`crate::screen::Screen::render`]).
+        let reply = text(&reply(said, 80, std::path::Path::new(".")));
         let body: Vec<String> = shown[1..shown.len() - 1]
             .iter()
             .map(|row| row.chars().skip(2).collect::<String>())
@@ -4136,21 +4124,18 @@ mod tests {
             body.iter().map(|r| r.trim_end()).collect::<Vec<_>>(),
             reply.iter().map(|r| r.trim_end()).collect::<Vec<_>>()
         );
-        // A long line leaves the band's last column free; a reply at the
-        // same width fills it.
         let long = "aaaaaaaa bbbbbbbbb c";
         let replied = text(&crate::transcript::reply(
             long,
             20,
             std::path::Path::new("."),
         ));
-        assert_eq!(replied[0].trim_end().width(), 20, "{replied:?}");
         let (rows, _) = prompt(long, 20, None);
         let shown: Vec<String> = text(&rows)
             .iter()
             .map(|row| row.trim_end().to_owned())
             .collect();
-        assert_eq!(shown[1..4], ["› aaaaaaaa", "  bbbbbbbbb c", ""]);
+        assert_eq!(shown[1], replied[0].trim_end().replacen('•', "›", 1));
         assert!(
             rows.iter()
                 .all(|row| row.style.bg == Some(crate::look::BAND))
