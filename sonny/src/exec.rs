@@ -1084,7 +1084,15 @@ async fn run_keeping(
         .timeout_ms
         .map_or(TIMEOUT, Duration::from_millis)
         .min(TIMEOUT);
-    let deadline = started + timeout.min(left);
+    // A call handed back to the model before the host stopped has no
+    // deadline of its own any more, only its script's time.
+    let handed_back = (journal.as_ref()).is_some_and(|j| j.replay.lock().unwrap().yielded);
+    let deadline = started
+        + if handed_back {
+            timeout
+        } else {
+            timeout.min(left)
+        };
     let readied = tokio::time::timeout_at(deadline.into(), async {
         tokio::join!(discover(hub), daemon_tools(steps.as_ref()))
     })
@@ -1379,6 +1387,10 @@ pub fn forget(journals: &Path, (turn, call_id): &(i64, String)) {
 pub fn sweep(journals: PathBuf, waiting: std::collections::HashSet<(i64, String)>) {
     std::thread::spawn(move || journal::sweep(&journals, &waiting));
 }
+
+/// A place among a script's calls in flight, held until its result is the
+/// script's.
+type Place = tokio::sync::OwnedSemaphorePermit;
 
 /// A script's whole run on its thread: what it said once it ended.
 fn script_thread(
@@ -2390,6 +2402,9 @@ impl Run {
         // The calls running when the host stopped, to be told so once the
         // journal is used up.
         let mut cut = VecDeque::new();
+        // The place of the call whose result is being handed over, so no
+        // more results wait outside the script than calls may fly.
+        let mut held: Option<Place> = None;
         loop {
             loop {
                 match runtime.execute_pending_job() {
@@ -2447,8 +2462,8 @@ impl Run {
                 for (n, tool, arguments, _) in fresh {
                     let (caller, given) = (self.caller(), given.clone());
                     let call = self.host.spawn(async move {
-                        let (raw, counted) = caller.call(tool, arguments).await;
-                        let _ = given.send((n, raw, counted));
+                        let (raw, counted, place) = caller.call(tool, arguments).await;
+                        let _ = given.send((n, raw, counted, place));
                     });
                     flying.insert(n, Abort(call));
                 }
@@ -2482,12 +2497,13 @@ impl Run {
                         },
                         None => {
                             let (halt, clock) = (&self.halt, &self.clock);
-                            let (call, raw, counted) = tokio::select! {
+                            let (call, raw, counted, place) = tokio::select! {
                                 Some(result) = results.recv(), if !flying.is_empty() => result,
                                 _ = clock.run_out() => return Ended::Terminated("it ran out of time".into()),
                                 _ = halt.stopped() => return Ended::Terminated("its turn ended".into()),
                             };
                             flying.remove(&call);
+                            held = place;
                             Given {
                                 call,
                                 now_ms: now_ms(),
@@ -2511,6 +2527,8 @@ impl Run {
             if let Err(error) = handed {
                 return context.with(|ctx| caught(&ctx, error));
             }
+            // The script has the result: its place goes to the next call.
+            drop(held.take());
         }
     }
 
@@ -2661,13 +2679,18 @@ impl Caller {
     /// Call the tool `id` names: `{"ok": CallToolResult}` or `{"error"}`,
     /// as JSON for the script, and what the call counts under among its
     /// calls, if it reached a tool.
-    async fn call(&self, id: String, arguments: String) -> (String, Option<String>) {
-        let mut counted = None;
-        let raw = match self.called(id, arguments, &mut counted).await {
+    async fn call(&self, id: String, arguments: String) -> (String, Option<String>, Option<Place>) {
+        let (mut counted, mut place) = (None, None);
+        let raw = match self.called(id, arguments, &mut counted, &mut place).await {
             Ok(called) => format!("{{\"ok\":{}}}", called.json),
             Err(error) => json!({"error": error}).to_string(),
         };
-        (raw, counted)
+        (raw, counted, place)
+    }
+
+    /// A place among the script's calls in flight.
+    async fn place(&self) -> Result<Place, String> {
+        (Arc::clone(&self.at_once).acquire_owned().await).map_err(|e| e.to_string())
     }
 
     async fn called(
@@ -2675,6 +2698,7 @@ impl Caller {
         id: String,
         arguments: String,
         counted: &mut Option<String>,
+        place: &mut Option<Place>,
     ) -> Result<crate::mcp::Called, String> {
         let named = format!("tools.{id}");
         self.halt.refuse(&named)?;
@@ -2699,7 +2723,7 @@ impl Caller {
                 .steps
                 .clone()
                 .ok_or("the agent's own tools run only for its own calls")?;
-            let _place = self.at_once.acquire().await.map_err(|e| e.to_string())?;
+            *place = Some(self.place().await?);
             self.halt.refuse(&named)?;
             *self.calls.lock().unwrap().entry(id.clone()).or_default() += 1;
             *counted = Some(id.clone());
@@ -2743,7 +2767,7 @@ impl Caller {
         }
         // A place among the script's calls in flight, held until its
         // result is the script's.
-        let _place = self.at_once.acquire().await.map_err(|e| e.to_string())?;
+        *place = Some(self.place().await?);
         // The last look before the call reaches its server: a script
         // stopped meanwhile, though its JavaScript runs on until the
         // interrupt ends it, makes none.
