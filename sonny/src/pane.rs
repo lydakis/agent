@@ -844,9 +844,13 @@ impl Pane {
         let before = self.screen.height(laid).saturating_sub(height).max(1);
         let through = 1.0 - self.screen.back().min(before) as f64 / before as f64;
         let mut screen = Screen::default();
-        if preview(path, width, None, &mut screen, &mut None).is_err() {
+        let mut coloring = None;
+        if preview(path, width, None, &mut screen, &mut coloring).is_err() {
             return false;
         }
+        // The rest of a long source shown in place of its drawing comes
+        // colored beside the loop, as when it opened.
+        self.coloring = coloring;
         match going_to {
             Some((row, above)) => screen.show_row(row, above),
             None => {
@@ -1415,6 +1419,17 @@ mod tests {
         assert_eq!(pane.screen.texts(), words);
         assert_eq!(pane.screen.going_to(), going);
         assert!(pane.coloring.is_none() && !pane.colored());
+        // Read again, as when a drawing it waited for fails and its source
+        // shows instead: the rest comes colored beside the loop again.
+        assert!(pane.read_again(&long, 80, 80, 24));
+        assert!(pane.coloring.is_some(), "read again, colored again");
+        while !pane.colored() {
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(60),
+                "never colored again"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let short = dir.join("short.rs");
         std::fs::write(&short, "fn main() {}\n").unwrap();
         let pane = Pane::preview(&format!("file://{}", short.display()), &dir, 80).unwrap();

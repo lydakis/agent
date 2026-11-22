@@ -20268,10 +20268,17 @@ impl App {
         &mut self,
         make: impl FnOnce() -> Result<Option<attach::Picture>, String> + Send + 'static,
     ) {
+        // One picture is made at a time, in the order they came, as on the
+        // key loop before: a batch of big screenshots is decoded one by
+        // one, never all at once.
+        static MAKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let number = self.placeholder();
         let woken = self.woken.clone();
         let job = tokio::task::spawn_blocking(move || {
-            let made = make();
+            let made = {
+                let _one = MAKING.blocking_lock();
+                make()
+            };
             woken.notify_one();
             made
         });
@@ -40610,8 +40617,8 @@ mod tests {
         });
         app.key(press(KeyCode::Down, KeyModifiers::NONE)).await;
         assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
-        // Two that fit alone but not together: the first given is kept,
-        // though the second was ready first.
+        // Two that fit alone but not together: the first given is kept.
+        // They are made one at a time, in the order given.
         app.discard();
         fn big() -> attach::Picture {
             attach::Picture {
@@ -40624,10 +40631,13 @@ mod tests {
             let _ = wait.recv();
             Ok(Some(big()))
         });
-        app.prepare(|| Ok(Some(big())));
-        while !app.preparing[1].1.is_finished() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let (started, second) = std::sync::mpsc::channel::<()>();
+        app.prepare(move || {
+            let _ = started.send(());
+            Ok(Some(big()))
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(second.try_recv().is_err(), "one made at a time");
         assert!(!app.prepared().await, "the first given lands first");
         go.send(()).unwrap();
         while !app.preparing.is_empty() {
