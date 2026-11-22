@@ -1085,8 +1085,8 @@ async fn make(
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
 /// folder, on the caller's daemon (`created: false` when it was there
 /// already), its lead opened in a workspace of its own.
-pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
-    let (dir, mut picks) = picks(arguments)?;
+pub async fn add(caller: &str, model: Option<&str>, arguments: &Value) -> Result<Value, String> {
+    let (dir, mut picks) = picks(arguments, model)?;
     let config = agent_client::config::load()?;
     if picks.effort.is_none() {
         picks.effort = config.sonny.lead_effort;
@@ -1134,7 +1134,10 @@ async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut 
 
 /// The folder and picks a `new_project` call names: the caller's model
 /// when it names none.
-fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), String> {
+fn picks(
+    arguments: &Value,
+    model: Option<&str>,
+) -> Result<(PathBuf, agent_client::project::Picks), String> {
     let text = |key: &str| {
         arguments[key]
             .as_str()
@@ -1150,7 +1153,7 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
     }
     let mut picks = agent_client::project::Picks {
         title: Some(title),
-        model: text("model").or_else(|| std::env::var("AGENT_MODEL").ok()),
+        model: text("model").or_else(|| model.map(str::to_owned)),
         effort: text("effort"),
         ..Default::default()
     };
@@ -1304,7 +1307,7 @@ mod tests {
 
     #[test]
     fn a_new_project_reads_its_picks_and_refuses_others() {
-        let picked = |arguments: Value| picks(&arguments);
+        let picked = |arguments: Value| picks(&arguments, None);
         for bad in [json!({}), json!({"folder": "/", "task_in": "elsewhere"})] {
             assert!(
                 picked(bad.clone())

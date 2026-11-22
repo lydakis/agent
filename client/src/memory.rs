@@ -111,13 +111,20 @@ pub fn cli(args: &[String]) -> i32 {
 /// `check`, `changed` or `cleanup` (`start` or `finish`); with none,
 /// `show`. `user` or `project` picks the scope.
 pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String> {
-    call_in(home, cwd, cwd, arguments)
+    call_in_as(home, cwd, cwd, arguments, shell_caller().as_deref())
 }
 
 /// [`call`] for an agent whose project is found from `cwd` while it works
 /// in `folder`, as a task in a folder of its own works for its lead's
-/// project: a live fact's file blanks read `folder`.
-pub fn call_in(home: &Path, cwd: &Path, folder: &Path, arguments: &Value) -> Result<Value, String> {
+/// project: a live fact's file blanks read `folder`. `caller` is who
+/// changes memory ([`caller`]), as the call names them.
+pub fn call_in_as(
+    home: &Path,
+    cwd: &Path,
+    folder: &Path,
+    arguments: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
     let mut scope = Vec::new();
     if arguments["user"] == true {
@@ -174,9 +181,15 @@ pub fn call_in(home: &Path, cwd: &Path, folder: &Path, arguments: &Value) -> Res
         args.extend(["--".to_owned(), text(&save["text"])]);
     }
     // The text is the call's own: a lone "-" is that text, not stdin.
-    run_in(&home.join(".agents/memory"), cwd, folder, &args, &|| {
-        Ok("-".to_owned())
-    })
+    let stdin = || Ok("-".to_owned());
+    run_as_in(
+        &home.join(".agents/memory"),
+        cwd,
+        folder,
+        &args,
+        &stdin,
+        caller,
+    )
 }
 
 fn stdin() -> Result<String, String> {
@@ -219,13 +232,18 @@ fn run_in(
     args: &[String],
     stdin: &dyn Fn() -> Result<String, String>,
 ) -> Result<Value, String> {
+    run_as_in(root, cwd, folder, args, stdin, shell_caller().as_deref())
+}
+
+/// [`caller`] as this process's shell names it: an agent's shell has its
+/// id and store, and a run of an automation its name.
+fn shell_caller() -> Option<String> {
     let var = |key: &str| std::env::var(key).ok();
-    let caller = caller(
+    caller(
         var("AGENT_AUTOMATION"),
         var("AGENT_BOT_ID"),
         var("AGENT_STORE"),
-    );
-    run_as_in(root, cwd, folder, args, stdin, caller.as_deref())
+    )
 }
 
 /// Who changes memory, as an open cleanup tells its own changes from
@@ -233,7 +251,7 @@ fn run_in(
 /// its memory, so the store names which bot. A run of an automation is the
 /// automation (Sonny's tool host names it), so a cleanup one run started
 /// and a later run, in an agent of its own, carries on has one owner.
-fn caller(
+pub fn caller(
     automation: Option<String>,
     bot_id: Option<String>,
     store: Option<String>,
@@ -2981,7 +2999,14 @@ mod tests {
         // A task working in a folder of its own fills from that folder,
         // though its project is found from its lead's.
         let task = home.join("task");
-        let read = call_in(&home, &here, &task, &json!({"read": "where", "user": true})).unwrap();
+        let read = call_in_as(
+            &home,
+            &here,
+            &task,
+            &json!({"read": "where", "user": true}),
+            None,
+        )
+        .unwrap();
         assert_eq!(read["filled"], "The folder is task\n, as of now.");
         // An agent's index line fills to one line; the file keeps the blank.
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();

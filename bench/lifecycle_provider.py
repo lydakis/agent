@@ -80,6 +80,10 @@ async def serve(config, stats_path, mode, engine='rust'):
                 request = json.loads(await reader.readexactly(size))
                 assert request['model'] == 'synthetic-model' and request['stream'] and not request.get('previous_response_id')
                 items = request['input']
+                if engine == 'rust' and items and items[0].get('role') == 'developer':
+                    # Agent's instructions, the input's first item from
+                    # Responses on; the history follows them.
+                    items = items[1:]
                 user = [x for x in items if x.get('role') == 'user'][-1]['content'][0]['text']
                 match = re.match(r'BENCH agent=(\d+) turn=(\d+)\n', user)
                 assert match

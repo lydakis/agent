@@ -725,9 +725,116 @@ fn show() -> Value {
 /// An answer: the call's result, or an error as the daemon carries it.
 type Answer = Result<String, (&'static str, String)>;
 
-/// `sonny tool NAME`, as the tool host runs it for one call: the arguments
-/// on stdin, in the calling agent's folder and with its shell's variables.
-/// Prints the answer as one JSON line, `{"output": ...}` or
+/// Who a call of one of Sonny's tools is from and where it runs, as the
+/// tool host gives it with each call, the way Codex hands each tool its
+/// invocation: the tools read the caller from this, never from the
+/// process's variables or working folder, so a call acts only as the agent
+/// it came from. The process still runs in that folder with those
+/// variables ([`Invocation::env`]), for the programs a tool starts.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct Invocation {
+    /// The agent the call acts as: for a side chat, the agent it copies.
+    pub bot: String,
+    pub bot_id: Option<i64>,
+    /// The conversation whose turn made the call: a side chat's own.
+    pub call_bot: String,
+    pub call_bot_id: Option<i64>,
+    pub turn: Option<i64>,
+    pub call: String,
+    /// The calling turn's folder, as its shell names it.
+    pub pwd: PathBuf,
+    /// That folder, as it is.
+    pub folder: PathBuf,
+    /// The model and effort the calling turn runs.
+    pub model: String,
+    pub effort: Option<String>,
+    /// The automation a memory call works for, when a run of one made it.
+    pub automation: Option<String>,
+    /// The commons threads a task's brief shares words with, as the host
+    /// found them for a start.
+    pub pointer: Option<String>,
+    /// The daemon the call came through, else the one `daemon_paths`
+    /// finds.
+    pub store: Option<PathBuf>,
+    pub socket: Option<PathBuf>,
+}
+
+impl Invocation {
+    /// The variables an agent's shell has, as programs a tool starts read
+    /// them: set on the tool's process, or given to a program it starts.
+    pub fn env(&self) -> Vec<(String, String)> {
+        let id = |id: Option<i64>| id.map(|id| id.to_string());
+        let path = |path: &Option<PathBuf>| path.as_ref().map(|p| p.display().to_string());
+        let given = |text: &str| Some(text.to_owned()).filter(|text| !text.is_empty());
+        let pwd = self.pwd.display().to_string();
+        let set = [
+            ("AGENT_BOT", given(&self.bot)),
+            ("AGENT_BOT_ID", id(self.bot_id)),
+            ("AGENT_TURN", id(self.turn)),
+            ("AGENT_CALL", given(&self.call)),
+            ("AGENT_CALL_BOT", given(&self.call_bot)),
+            ("AGENT_CALL_BOT_ID", id(self.call_bot_id)),
+            ("AGENT_STORE", path(&self.store)),
+            ("AGENT_SOCKET", path(&self.socket)),
+            ("AGENT_MODEL", given(&self.model)),
+            ("AGENT_EFFORT", self.effort.clone()),
+            ("AGENT_AUTOMATION", self.automation.clone()),
+            (crate::commons::POINTER_ENV, self.pointer.clone()),
+            ("PWD", given(&pwd)),
+        ];
+        (set.into_iter())
+            .filter_map(|(key, value)| Some((key.to_owned(), value?)))
+            .collect()
+    }
+
+    /// Every variable [`Invocation::env`] may set: one it leaves out is not
+    /// inherited from the host's.
+    const ALL: [&str; 13] = [
+        "AGENT_BOT",
+        "AGENT_BOT_ID",
+        "AGENT_TURN",
+        "AGENT_CALL",
+        "AGENT_CALL_BOT",
+        "AGENT_CALL_BOT_ID",
+        "AGENT_STORE",
+        "AGENT_SOCKET",
+        "AGENT_MODEL",
+        "AGENT_EFFORT",
+        "AGENT_AUTOMATION",
+        crate::commons::POINTER_ENV,
+        "PWD",
+    ];
+
+    /// The daemon's store and socket: the call's, else as `daemon_paths`
+    /// finds them.
+    fn daemon(&self) -> Result<(PathBuf, PathBuf), String> {
+        crate::daemon_paths(self.store.clone(), self.socket.clone())
+    }
+
+    /// The shell an automation the call adds is added from: the agent's.
+    fn shell(&self) -> crate::trigger::Shell {
+        crate::trigger::Shell {
+            agent: self.bot_id.map(|id| (self.bot.clone(), id)),
+            folder: Some(self.folder.clone()),
+        }
+    }
+
+    /// Who changes memory, as an open cleanup tells its own changes from
+    /// others'.
+    fn memory_caller(&self) -> Option<String> {
+        agent_client::memory::caller(
+            self.automation.clone(),
+            self.bot_id.map(|id| id.to_string()),
+            self.store.as_ref().map(|store| store.display().to_string()),
+        )
+    }
+}
+
+/// `sonny tool NAME`, as the tool host runs it for one call: its
+/// invocation and arguments on stdin, `{"invocation", "arguments"}`, in the
+/// calling agent's folder and with its shell's variables. Prints the
+/// answer as one JSON line, `{"output": ...}` or
 /// `{"error": {"code", "detail"}}`.
 pub fn answer_here(args: &[String]) -> Result<(), String> {
     let [name] = args else {
@@ -735,12 +842,15 @@ pub fn answer_here(args: &[String]) -> Result<(), String> {
     };
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).map_err(|e| e.to_string())?;
-    let arguments: Value = serde_json::from_str(&input).map_err(|e| e.to_string())?;
+    let mut given: Value = serde_json::from_str(&input).map_err(|e| e.to_string())?;
+    let invocation: Invocation =
+        serde_json::from_value(given["invocation"].take()).map_err(|e| e.to_string())?;
+    let arguments = given["arguments"].take();
     let answer = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
-        .block_on(called(name, &arguments));
+        .block_on(called(&invocation, name, &arguments));
     let line = match answer {
         Ok(output) => json!({"output": output}),
         Err((code, detail)) => json!({"error": {"code": code, "detail": detail}}),
@@ -749,13 +859,15 @@ pub fn answer_here(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-async fn called(name: &str, arguments: &Value) -> Answer {
-    let here = std::env::current_dir()
-        .and_then(std::fs::canonicalize)
-        .map_err(|e| ("not_in_folder", e.to_string()))?;
+/// One call of Sonny's tool `name`, from the agent `invocation` names and
+/// in its folder.
+async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answer {
+    let here = invocation.folder.clone();
     let text = |key: &str| arguments[key].as_str().map(str::to_owned);
-    let caller =
-        std::env::var("AGENT_BOT").map_err(|_| ("no_caller", "AGENT_BOT is not set".into()))?;
+    if invocation.bot.is_empty() {
+        return Err(("no_caller", "the call names no agent".into()));
+    }
+    let caller = invocation.bot.clone();
     match name {
         START => {
             let line = Line::of(&caller, &here);
@@ -773,10 +885,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // agent past it; asked first, by its own facts, so a start it
             // would refuse makes no folder and runs no setup.
             // Without a daemon to ask, the start goes on to meet its answer.
-            let most = match (line.depth > 0)
-                .then(|| crate::daemon_paths(None, None).ok())
-                .flatten()
-            {
+            let most = match (line.depth > 0).then(|| invocation.daemon().ok()).flatten() {
                 Some((_, socket)) => match Client::connect(&socket).await {
                     Ok((client, _events)) => {
                         let most = client.max_depth();
@@ -810,7 +919,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 true => crate::task::agents_of(&whole),
                 false => Vec::new(),
             };
-            let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
+            let store = invocation.daemon().ok().map(|(store, _)| store);
             // Its board, as any of its agents still follows it: a closed
             // one follows none.
             let member = (joined.iter().rev()).find_map(|(_, bot)| {
@@ -872,7 +981,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // A row asked for gates the task as Sonny gates that row, over
             // the tools it will have, which the daemon's providers decide.
             let providers = match text("permissions").is_some() {
-                true => match crate::daemon_paths(None, None) {
+                true => match invocation.daemon() {
                     Ok((_, socket)) => match Client::connect(&socket).await {
                         Ok((client, _events)) => {
                             let providers = client.providers().clone();
@@ -950,7 +1059,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     folder: text("folder"),
                     // A task's own helper builds on its work.
                     builds_on: (!line.lead).then(|| caller.clone()),
-                    env: Vec::new(),
+                    env: invocation.env(),
                     made_by: None,
                     providers: providers.clone(),
                     board: board.clone(),
@@ -965,7 +1074,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                         };
                         if crate::board::on()
                             && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-                            && let Ok((store, socket)) = crate::daemon_paths(None, None)
+                            && let Ok((store, socket)) = invocation.daemon()
                             && let Ok((client, _events)) =
                                 agent_client::Client::connect(&socket).await
                             && let Some(made) = crate::commons::listed(&client, &whole).await
@@ -995,11 +1104,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // The agent that started a task on a board follows the board,
             // so it hears the work as it moves, not only its task's end.
             if let Some(board) = &board
-                && let Ok((store, _)) = crate::daemon_paths(None, None)
+                && let Ok((store, _)) = invocation.daemon()
             {
-                let caller_id = std::env::var("AGENT_BOT_ID")
-                    .ok()
-                    .and_then(|id| id.parse().ok());
+                let caller_id = invocation.bot_id;
                 crate::board::follow_kept(&store, &caller, board, caller_id);
             }
             // What the lead's gone tasks left, which only it can clear.
@@ -1037,8 +1144,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             // Done as `mark_done` marks it, by this call: the mark is a fact
             // the windows show, kept with no window open.
-            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
-            let call = std::env::var("AGENT_CALL").unwrap_or_default();
+            let (store, socket) = invocation.daemon().map_err(|e| ("no_store", e))?;
+            let call = invocation.call.clone();
             crate::task::remove(
                 &line.folder,
                 &task,
@@ -1056,15 +1163,13 @@ async fn called(name: &str, arguments: &Value) -> Answer {
         .await
         .map(|shown| shown.to_string())
         .map_err(|e| ("not_shown", e)),
-        PROJECT => crate::project::add(&caller, arguments)
+        PROJECT => crate::project::add(&caller, Some(&invocation.model), arguments)
             .await
             .map(|made| made.to_string())
             .map_err(|e| ("project_not_made", e)),
         FOLLOWS => {
-            let (store, _) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
-            let caller_id = std::env::var("AGENT_BOT_ID")
-                .ok()
-                .and_then(|id| id.parse().ok());
+            let (store, _) = invocation.daemon().map_err(|e| ("no_store", e))?;
+            let caller_id = invocation.bot_id;
             let sources = crate::lookout::sources::names();
             let alone = |key: &str| {
                 let others = ["add", "remove", "test", "read", "source"]
@@ -1118,16 +1223,14 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .map_err(|e| ("follow_refused", e))
         }
         name if name == crate::resolved::TOOL => {
-            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (store, socket) = invocation.daemon().map_err(|e| ("no_store", e))?;
             let (client, _events) = Client::connect(&socket)
                 .await
                 .map_err(|e| ("not_marked", e.to_string()))?;
-            let by = std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone());
-            let turn = std::env::var("AGENT_TURN")
-                .ok()
-                .and_then(|turn| turn.parse().ok())
-                .ok_or(("not_marked", "AGENT_TURN is not set".to_owned()))?;
-            let call = std::env::var("AGENT_CALL").unwrap_or_default();
+            let by = invocation.call_bot.clone();
+            let turn =
+                (invocation.turn).ok_or(("not_marked", "the call names no turn".to_owned()))?;
+            let call = invocation.call.clone();
             let marked =
                 crate::resolved::mark(&client, &store, (&caller, &by), (turn, &call), arguments)
                     .await;
@@ -1137,7 +1240,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
         name if name == crate::live::TOOL => {
             let template = (arguments["markdown"].as_str())
                 .ok_or(("invalid_arguments", "markdown is required".to_owned()))?;
-            let (store, _) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (store, _) = invocation.daemon().map_err(|e| ("no_store", e))?;
             let data = crate::template::Data {
                 store: Some(store),
                 sources: crate::template::configured_sources(),
@@ -1152,14 +1255,14 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             crate::live::answer(template, &data)
         }
         name if name == crate::margin::TOOL => {
-            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (store, socket) = invocation.daemon().map_err(|e| ("no_store", e))?;
             let (client, _events) = Client::connect(&socket)
                 .await
                 .map_err(|e| ("margin_unread", e.to_string()))?;
             // The margin is the conversation's whose turn called it, a side
             // chat's its own.
-            let bot = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
-            let call = std::env::var("AGENT_CALL").unwrap_or_default();
+            let bot = invocation.call_bot.clone();
+            let call = invocation.call.clone();
             crate::margin::answer(&client, &store, &bot, (&call, arguments)).await
         }
         MEMORY if arguments["said"] == true => crate::said::read(arguments["since_ms"].as_i64())
@@ -1179,7 +1282,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     .map(|said| said.to_string())
                     .map_err(|e| ("memory_refused", e));
             }
-            agent_client::memory::call_in(&home, &project, &here, arguments)
+            let by = invocation.memory_caller();
+            agent_client::memory::call_in_as(&home, &project, &here, arguments, by.as_deref())
                 .map(|said| said.to_string())
                 .map_err(|e| refused_as("memory_refused", e))
         }
@@ -1190,22 +1294,17 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("commons_refused", "no HOME".to_owned()))?;
-            let caller_id = std::env::var("AGENT_BOT_ID")
-                .ok()
-                .and_then(|id| id.parse().ok());
+            let caller_id = invocation.bot_id;
             // The model its turn runs, as the host set it for the call.
-            let model = std::env::var("AGENT_MODEL").ok();
+            let model = Some(invocation.model.clone());
             if arguments["post"].is_object() {
                 crate::commons::recount(&home).await;
             }
             // What the answer shows counts for the conversation it reaches:
             // a side chat reads on its own, though it signs as its agent.
             let reader = crate::commons::who(
-                &std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone()),
-                std::env::var("AGENT_CALL_BOT_ID")
-                    .ok()
-                    .and_then(|id| id.parse().ok())
-                    .or(caller_id),
+                &invocation.call_bot.clone(),
+                invocation.call_bot_id.or(caller_id),
             );
             // The project the agent is named in, as its tasks are: only a
             // post or a reply writes it, so a read asks no one.
@@ -1236,7 +1335,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             if (arguments["post"].is_object() || arguments["reply"].is_object())
                 && said["posted"] != false
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
-                && let Ok((store, _)) = crate::daemon_paths(None, None)
+                && let Ok((store, _)) = invocation.daemon()
             {
                 // A thread on a board is followed for why the agent is
                 // there, and work opened or taken follows its board.
@@ -1266,21 +1365,17 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 }
             }
             if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
-                said["invited"] =
-                    json!(crate::commons::invite(&home, &said, &caller, &invite).await);
+                said["invited"] = json!(
+                    crate::commons::invite(&home, &said, (&caller, invocation.turn), &invite).await
+                );
             }
             Ok(said.to_string())
         }
         crate::asks::CLOSE => {
             // The bot whose history holds the ask: a side chat's own.
-            let asker = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            let asker = invocation.call_bot.clone();
             // This call is in the history it reads: it closes nothing yet.
-            let (call, turn) = (
-                std::env::var("AGENT_CALL").ok(),
-                std::env::var("AGENT_TURN"),
-            );
-            let turn = turn.ok().and_then(|t| t.parse::<i64>().ok());
-            let this = turn.zip(call.as_deref());
+            let this = (invocation.turn).zip(Some(invocation.call.as_str()));
             crate::asks::served_close(arguments, &asker, this)
                 .await
                 .map_err(|e| ("ask_close_refused", e))
@@ -1289,16 +1384,14 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // A deadline is a trigger, whose add runs on a runtime of its own.
             // Its card is in the history of the bot that asked, a side chat
             // included, so the deadline is that bot's, not its source's.
-            let (arguments, call) = (arguments.clone(), std::env::var("AGENT_CALL").ok());
-            let asker = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
-            let turn = std::env::var("AGENT_TURN")
-                .ok()
-                .and_then(|t| t.parse().ok());
-            let (Some(call), Some(turn)) = (call, turn) else {
-                return Err(("no_caller", "AGENT_CALL or AGENT_TURN is not set".into()));
+            let (arguments, call) = (arguments.clone(), Some(invocation.call.clone()));
+            let asker = invocation.call_bot.clone();
+            let (Some(call), Some(turn)) = (call, invocation.turn) else {
+                return Err(("no_caller", "the call names no turn".into()));
             };
+            let shell = invocation.shell();
             tokio::task::spawn_blocking(move || {
-                crate::asks::served(&arguments, &asker, turn, &call)
+                crate::asks::served(&arguments, &asker, turn, &call, &shell)
             })
             .await
             .map_err(|e| ("tool_failed", e.to_string()))?
@@ -1307,24 +1400,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
         AUTOMATIONS => {
             // The daemon's store says whose automations are the caller's:
             // its id there, as fires deliver to it.
-            let client = match crate::daemon_paths(None, None) {
+            let client = match invocation.daemon() {
                 Ok((_, socket)) => Client::connect(&socket).await.ok().map(|(c, _)| c),
                 Err(_) => None,
             };
             let caller = crate::trigger::Caller {
-                id: std::env::var("AGENT_BOT_ID")
-                    .ok()
-                    .and_then(|id| id.parse().ok()),
+                id: invocation.bot_id,
                 store: client.as_ref().and_then(|c| c.store()).map(str::to_owned),
             };
             // A trigger's add runs on a runtime of its own.
             let from = arguments["from"].as_u64().unwrap_or(0) as usize;
-            let arguments = arguments.clone();
-            let mut said =
-                tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
-                    .await
-                    .map_err(|e| ("tool_failed", e.to_string()))?
-                    .map_err(|e| refused_as("automation_refused", e))?;
+            let (arguments, shell) = (arguments.clone(), invocation.shell());
+            let mut said = tokio::task::spawn_blocking(move || {
+                crate::trigger::tool(&arguments, &caller, &shell)
+            })
+            .await
+            .map_err(|e| ("tool_failed", e.to_string()))?
+            .map_err(|e| refused_as("automation_refused", e))?;
             // How the turns their last fires sent ended, as the person's
             // `/background` shows them; without the daemon, as the files say.
             // Only a trigger made on this daemon's store: a turn handle names
@@ -2839,41 +2931,10 @@ async fn answer(
         .await
         .map_err(|e| ("caller_unknown", e))?;
     let (workspace, model, effort) = as_running(&running, record);
-    let (workspace, effort) = (workspace.as_str(), effort.as_deref());
-    let mut command = tokio::process::Command::new(me);
-    command
-        .arg("tool")
-        .arg(call["name"].as_str().unwrap_or_default())
-        .current_dir(workspace)
-        .env("PWD", workspace)
-        .env("AGENT_BOT", str_of(&caller["name"]))
-        .env("AGENT_BOT_ID", caller["bot_id"].to_string())
-        .env("AGENT_TURN", call["turn"].to_string())
-        .env("AGENT_CALL", str_of(&call["call_id"]))
-        // The bot whose turn made the call, which a side chat's AGENT_BOT
-        // is not: an ask's deadline looks for the call in its history.
-        .env("AGENT_CALL_BOT", bot)
-        .env("AGENT_CALL_BOT_ID", record["bot_id"].to_string())
-        .env("AGENT_STORE", store)
-        .env("AGENT_SOCKET", socket)
-        .env("AGENT_MODEL", model)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // A group of its own, so what it started stops with it.
-        .process_group(0)
-        .kill_on_drop(true);
-    match effort {
-        Some(effort) => command.env("AGENT_EFFORT", effort),
-        None => command.env_remove("AGENT_EFFORT"),
-    };
-    if let Some(bin) = crate::agent_bin() {
-        command.env("AGENT_BIN", bin);
-    }
     // A run of an automation works for the automation: an open memory
     // cleanup is the automation's, whichever run's agent started it, so a
     // run that carries on one cut short changes it as its own.
-    if call["name"] == MEMORY
+    let automation = if call["name"] == MEMORY
         && running["request_id"]
             .as_str()
             .is_some_and(|r| r.starts_with(crate::trigger::SENT_PREFIX))
@@ -2881,30 +2942,69 @@ async fn answer(
             client.store(),
             crate::trigger::Places::home(),
             caller["bot_id"].as_i64(),
-        )
-        && let Some(name) =
-            crate::trigger::run_of(&places, Some(store_id), &str_of(&caller["name"]), id)
-    {
-        command.env("AGENT_AUTOMATION", name);
+        ) {
+        crate::trigger::run_of(&places, Some(store_id), &str_of(&caller["name"]), id)
     } else {
-        command.env_remove("AGENT_AUTOMATION");
-    }
+        None
+    };
     // A task's pointer comes from here, where the commons' words are kept
     // between tasks, never read whole again by each start's own process.
-    command.env_remove(crate::commons::POINTER_ENV);
-    if name == START
-        && let (Some(home), Some(brief)) = (
-            std::env::var_os("HOME"),
-            call["arguments"]["brief"].as_str(),
-        )
-    {
-        let brief = brief.to_owned();
-        let line = tokio::task::spawn_blocking(move || {
-            crate::commons::pointer_line(Path::new(&home), &brief)
-        })
-        .await
-        .unwrap_or_default();
-        command.env(crate::commons::POINTER_ENV, line);
+    let pointer = match (
+        name == START,
+        std::env::var_os("HOME"),
+        call["arguments"]["brief"].as_str(),
+    ) {
+        (true, Some(home), Some(brief)) => {
+            let brief = brief.to_owned();
+            let line = tokio::task::spawn_blocking(move || {
+                crate::commons::pointer_line(Path::new(&home), &brief)
+            })
+            .await
+            .unwrap_or_default();
+            Some(line)
+        }
+        _ => None,
+    };
+    let invocation = Invocation {
+        bot: str_of(&caller["name"]),
+        bot_id: caller["bot_id"].as_i64(),
+        // The bot whose turn made the call, which a side chat's caller is
+        // not: an ask's deadline looks for the call in its history.
+        call_bot: bot.to_owned(),
+        call_bot_id: record["bot_id"].as_i64(),
+        turn: call["turn"].as_i64(),
+        call: str_of(&call["call_id"]),
+        folder: tokio::fs::canonicalize(&workspace)
+            .await
+            .unwrap_or_else(|_| PathBuf::from(&workspace)),
+        pwd: PathBuf::from(&workspace),
+        model,
+        effort,
+        automation,
+        pointer,
+        store: Some(store.to_owned()),
+        socket: Some(socket.to_owned()),
+    };
+    let mut command = tokio::process::Command::new(me);
+    command
+        .arg("tool")
+        .arg(call["name"].as_str().unwrap_or_default())
+        .current_dir(&workspace)
+        .envs(invocation.env())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // A group of its own, so what it started stops with it.
+        .process_group(0)
+        .kill_on_drop(true);
+    let env = invocation.env();
+    for key in Invocation::ALL {
+        if !env.iter().any(|(set, _)| set == key) {
+            command.env_remove(key);
+        }
+    }
+    if let Some(bin) = crate::agent_bin() {
+        command.env("AGENT_BIN", bin);
     }
     let mut arguments = call["arguments"].clone();
     if call["name"] == MEMORY
@@ -2945,7 +3045,8 @@ async fn answer(
     let group = child.id().map(Group::new);
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(arguments.to_string().as_bytes()).await;
+        let given = json!({"invocation": invocation, "arguments": arguments});
+        let _ = stdin.write_all(given.to_string().as_bytes()).await;
     }
     let output = tokio::time::timeout(left(call), child.wait_with_output())
         .await

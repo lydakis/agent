@@ -1587,8 +1587,9 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
     let mut servers = serde_json::Map::new();
     for (name, server) in config.sonny.mcp_servers.iter().filter(|(_, s)| s.enabled) {
         let known = hub.known(name).await.unwrap_or_default();
-        let tools: Vec<Value> = (known.tools.into_iter())
+        let tools: Vec<Value> = (known.tools.iter())
             .filter(|tool| crate::mcp::allowed(server, tool["name"].as_str().unwrap_or_default()))
+            .cloned()
             .collect();
         let description = server.description.clone().or(known.instructions);
         servers.insert(

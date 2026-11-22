@@ -7,7 +7,7 @@ import threading
 import time
 from contextlib import closing
 from unittest import skipUnless
-from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
+from tests.test_runtime import AnthropicModel, ModelFixture, is_summary, lift_instructions
 from bench.runtime_client import Client
 from bench.targets import clean_env
 
@@ -1313,12 +1313,16 @@ class SummaryCopyTests(ModelFixture):
     def own_bytes(self, summary):
         """What a Responses request of its own sends, as the summary is
         priced: its instructions, its empty tool list, and its input's
-        items as they went, read from the request's body."""
-        body, = [b for b in self.model.bodies if json.loads(b) == summary]
+        items as they went after the instructions' developer message, read
+        from the request's body."""
+        body, = [b for b in self.model.bodies if lift_instructions(json.loads(b)) == summary]
         text = body.decode()
         start = text.index('"input":') + len('"input":')
-        _, end = json.JSONDecoder().raw_decode(text, start)
-        return len(summary['instructions']) + len(json.dumps(summary['tools'])) + len(text[start:end].encode()) - 2
+        decoder = json.JSONDecoder()
+        _, end = decoder.raw_decode(text, start)
+        _, lead = decoder.raw_decode(text, start + 1)
+        items = text[lead + 1:end] if text[lead] == ',' else text[lead:end]
+        return len(summary['instructions']) + len(json.dumps(summary['tools'])) + len(items.encode()) - 1
 
     def test_a_summary_by_another_model_is_a_request_of_its_own(self):
         self.model.bodies = []
