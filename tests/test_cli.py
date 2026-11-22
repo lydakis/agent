@@ -1218,6 +1218,11 @@ class SocketAndCliTests(ModelFixture):
                    '--bot', 'p.some', '--detach', 'hi')
         some = control.request('inspect', bot='p.some')['result']
         self.assertEqual((some['tools'], declared('p.some')), (['echo'], {'memory': 1}))
+        # A gate asked for holds the ones chosen too, as its own.
+        self.agent('run', *plain, '--tools', 'echo,memory', '--approval', 'manual', '--new',
+                   '--created-by', 'p.lead', '--bot', 'p.gated', '--detach', 'hi')
+        gated = control.request('inspect', bot='p.gated')['result']
+        self.assertIn('memory', [tool for gate in gated['gates'] for tool in gate['tools']], gated['gates'])
         self.agent('run', *plain, '--tools', 'echo', '--new', '--created-by', 'p.lead', '--bot', 'p.none',
                    '--detach', 'hi')
         self.assertEqual(declared('p.none'), {})

@@ -2284,7 +2284,14 @@ fn run(options: &Options) -> Result<i32> {
         if let Some(declare) = &declare {
             create["declare"] = json!(declare);
         }
-        if let Value::Object(mut gate) = requested_gate(options, &tools)? {
+        // Its gate asks for the tools it gets, those chosen of its maker's too.
+        let gated: Vec<String> = (tools.iter().cloned())
+            .chain(
+                (declare.iter().flatten())
+                    .filter_map(|tool| tool["name"].as_str().map(str::to_owned)),
+            )
+            .collect();
+        if let Value::Object(mut gate) = requested_gate(options, &gated)? {
             // The tools its creator declared, which it inherits, held by
             // its own gate too where its creator's gates hold them, so a
             // gate it asks for beside its creator's reaches them as well.
