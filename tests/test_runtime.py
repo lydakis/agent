@@ -2219,10 +2219,11 @@ class RuntimeTests(ModelFixture):
         replay = restarted.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertFalse(any(e['event'] == 'turn_finished' for e in replay))
 
-    def test_a_drain_starts_no_call_and_parks_the_turn_for_the_next_start(self):
+    def test_a_drain_starts_no_call_and_the_next_start_runs_them(self):
         # The model is answering when the drain starts. The calls it returns
         # do not start: the turn parks long before the grace ends, and the
-        # next start continues it with those calls answered as not run.
+        # next start continues it by running them, as Pi Durable runs the
+        # calls a stop came before.
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
@@ -2250,10 +2251,9 @@ class RuntimeTests(ModelFixture):
                    if i.get('type') == 'function_call_output'}
         self.assertEqual(set(outputs), {'script-0', 'script-0.1'})
         for output in outputs.values():
-            self.assertEqual(output['error'], 'daemon_shutdown')
-            self.assertIn('did not run', output['detail'])
-            self.assertIn('The daemon has since started again', output['detail'])
-        self.assertFalse((self.path / 'ran').exists())
+            self.assertNotIn('error', output)
+        self.assertEqual(outputs['script-0.1']['stdout'], 'y\n')
+        self.assertTrue((self.path / 'ran').exists())
 
     def test_a_drain_lets_a_running_command_finish_then_parks_before_the_next_call(self):
         marker = self.path / 'ran'
@@ -3327,6 +3327,34 @@ class RuntimeTests(ModelFixture):
         finished = next(e for e in events if e['event'] == 'turn_finished' and e.get('turn') == ended)
         self.assertEqual((finished['data']['error'], finished['data']['restarts']), ('process_interrupted', 1))
         self.assertTrue(self.model.requests.empty())
+
+    def test_a_crash_answers_the_call_it_cut_off_and_runs_the_ones_not_started(self):
+        # As Pi Durable recovers a task: only the call the process was
+        # running is cut off; the call after it had not started and runs
+        # when the turn goes on.
+        self.model.call_script = [[('shell', {'command': 'echo started > crash-marker; sleep 5'}),
+                                   ('echo', {'text': 'after the crash'})]]
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='crash', prompt='script')['result']['message']
+        deadline = time.monotonic() + 3
+        while not (self.path / 'crash-marker').exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue((self.path / 'crash-marker').exists())
+        client.close(kill=True)
+        self.model.requests.get(timeout=1)
+        client = self.client('echo,shell')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        completed = {e['data']['call_id']: e['data'] for e in events
+                     if e['event'] == 'tool_completed' and e['turn'] == turn}
+        self.assertTrue(completed['script-0']['outcome_unknown'])
+        self.assertFalse(completed['script-0.1'].get('cancelled'))
+        self.assertFalse(completed['script-0.1'].get('outcome_unknown'))
+        history = self.model.requests.get(timeout=1)['input']
+        outputs = {i['call_id']: i['output'] for i in history if i.get('type') == 'function_call_output'}
+        self.assertIn('process_interrupted', outputs['script-0'])
+        self.assertIn('after the crash', outputs['script-0.1'])
 
     def test_a_crash_during_a_tool_answers_it_and_continues_the_turn(self):
         client = self.client('echo,shell')

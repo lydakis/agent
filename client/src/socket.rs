@@ -40,12 +40,26 @@ pub fn canonical_store(store: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Where the daemon binds `socket` before it is renamed into place: a
+/// socket `s` in a private folder `SOCKET.b` beside it, so the name is
+/// owner-only from its first instant without the process's umask. The
+/// staged address is 4 bytes longer than `socket`'s, so a socket chosen
+/// here leaves that room under the Unix socket address limit.
+pub fn staged(socket: &Path) -> (PathBuf, PathBuf) {
+    let mut folder = socket.as_os_str().to_os_string();
+    folder.push(".b");
+    let folder = PathBuf::from(folder);
+    let staged = folder.join("s");
+    (folder, staged)
+}
+
 pub fn default_socket(store: &Path) -> Result<PathBuf> {
     let store = canonical_store(store)?;
     let mut adjacent = store.clone().into_os_string();
     adjacent.push(".sock");
     let adjacent = PathBuf::from(adjacent);
-    if SocketAddr::from_pathname(&adjacent).is_ok() {
+    // The daemon binds at the staged path first, so that must fit too.
+    if SocketAddr::from_pathname(staged(&adjacent).1).is_ok() {
         return Ok(adjacent);
     }
 
@@ -300,6 +314,28 @@ mod tests {
             default_socket(&short).unwrap(),
             root.canonicalize().unwrap().join("short.sqlite.sock")
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_store_whose_socket_leaves_no_room_to_stage_meets_at_the_rendezvous() {
+        let root = Path::new("/tmp").join(format!("agent-stage-room-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        // `STORE.sock` fits the address limit; `STORE.sock.b/s` does not.
+        let limit = if cfg!(target_os = "linux") { 107 } else { 103 };
+        let store = root.join("s".repeat(limit - root.as_os_str().len() - 1 - ".sock".len()));
+        let mut adjacent = store.clone().into_os_string();
+        adjacent.push(".sock");
+        assert!(SocketAddr::from_pathname(&adjacent).is_ok());
+        let socket = default_socket(&store).unwrap();
+        assert_ne!(socket.as_os_str(), adjacent);
+        assert!(
+            socket.to_string_lossy().starts_with("/tmp/agent-"),
+            "{}",
+            socket.display()
+        );
+        assert!(SocketAddr::from_pathname(staged(&socket).1).is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

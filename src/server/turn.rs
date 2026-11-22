@@ -810,7 +810,7 @@ impl Turn {
             // pull or the stop used to.
             match parked {
                 Ok(Halted::Parked(_)) => result = Ok(Round::Paced(0)),
-                Ok(Halted::Already(waiting, lapse)) => {
+                Ok(Halted::Already(waiting, lapse) | Halted::Kept(waiting, lapse)) => {
                     result = Ok(self.rejoin(*waiting, lapse).await);
                 }
                 Err(_) => {}
@@ -3157,6 +3157,29 @@ impl Turn {
                 accounting.resume_refusal(waiting);
                 resume_window = !waiting.compaction;
                 copied = waiting.copied.clone().filter(|_| waiting.compaction);
+                // A stop or a cut-off kept the calls that had not started:
+                // they run first, as their round was announced.
+                if !waiting.pending.is_empty() {
+                    self.set_ruled(Some(Arc::new(waiting.rules())));
+                    let ran = tokio::time::Instant::now();
+                    let stop = self
+                        .execute_calls(
+                            waiting.pending.clone(),
+                            (provider, model),
+                            None,
+                            &workspace,
+                            &environment,
+                            &record,
+                            accounting.route.get().map(String::as_str),
+                            accounting.summary_retry(),
+                        )
+                        .await;
+                    accounting.ran_calls(ran);
+                    self.set_ruled(None);
+                    if let Some(stop) = stop? {
+                        return Ok(stop.round());
+                    }
+                }
             } else {
                 // A verdict park resumes at its gated call, which has not
                 // started; an answer park first records the answer, and a
@@ -4823,8 +4846,8 @@ impl Turn {
         learn_links(record, &mut calls, workspace, false).await;
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
-            // Nor any tool: the calls not yet started are answered as not
-            // run when the turn parks.
+            // Nor any tool: the calls not yet started stay open when the
+            // turn parks, and run when it goes on.
             if self.stopping.load(Relaxed) {
                 return Ok(Some(Stop::Drained));
             }
@@ -5652,7 +5675,8 @@ impl Turn {
                 Some(first) => first,
                 None => {
                     // A drain that began while this waited for its verdict
-                    // starts nothing: the call is answered as not run.
+                    // starts nothing: the call stays open, to run when the
+                    // turn goes on.
                     if self.stopping.load(Relaxed) {
                         return Ok(Approval::Stop(Stop::Drained));
                     }

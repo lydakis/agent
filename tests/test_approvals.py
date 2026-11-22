@@ -58,9 +58,11 @@ class ApprovalTests(ModelFixture):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         return [e['data'] for e in events if e.get('turn') == turn and e['event'] == kind]
 
-    def test_a_call_allowed_during_a_drain_does_not_start(self):
+    def test_a_call_allowed_during_a_drain_runs_after_the_restart(self):
         # The call waits for its verdict as the drain begins; allowed then,
-        # it still does not run, and the turn parks for the next start.
+        # it does not start, and the turn parks for the next start, where
+        # the call runs with its verdict, as Pi Durable runs a call a stop
+        # came before.
         marker = self.path / 'ran'
         client = self.gated(settings={'approval_hold_ms': 60000})
         turn = client.request('submit', bot='Bob', request_id='t', prompt=f'shell:touch {marker}')['result']['message']
@@ -75,10 +77,31 @@ class ApprovalTests(ModelFixture):
         self.addCleanup(lambda: restarted.close(kill=True))
         self.assertEqual(restarted.finished(turn)['data']['status'], 'completed')
         completed, output = self.tool_output(restarted, call_id)
-        self.assertEqual((completed['cancelled'], completed['outcome_unknown']), (True, False))
-        self.assertEqual(output['error'], 'daemon_shutdown')
-        self.assertIn('did not run', output['detail'])
-        self.assertFalse(marker.exists())
+        self.assertNotIn('error', output)
+        self.assertFalse(completed.get('cancelled'))
+        self.assertTrue(marker.exists())
+        # Asked once: the verdict given before the stop is the one it ran on.
+        self.assertEqual(len(self.events(restarted, turn, 'approval_requested')), 1)
+
+    def test_a_call_waiting_for_its_verdict_keeps_its_request_through_a_crash(self):
+        # The process ends while the call waits for its verdict, before its
+        # turn parked on it: the request stays open and the call runs once
+        # allowed, as Pi Durable wakes a call parked at its gates.
+        marker = self.path / 'ran'
+        client = self.gated(settings={'approval_hold_ms': 60000})
+        turn = client.request('submit', bot='Bob', request_id='t', prompt=f'shell:touch {marker}')['result']['message']
+        call_id = self.announced(client, turn)[0]['call_id']
+        client.close(kill=True)
+        restarted = self.client('echo,shell,wait')
+        self.addCleanup(lambda: restarted.close(kill=True))
+        self.assertEqual([a['call_id'] for a in restarted.request('approvals')['result']['approvals']],
+                         [call_id])
+        self.assertEqual(self.answer(restarted, turn, call_id)['result']['pending'], [])
+        self.assertEqual(restarted.finished(turn)['data']['status'], 'completed')
+        completed, output = self.tool_output(restarted, call_id)
+        self.assertNotIn('error', output)
+        self.assertTrue(marker.exists())
+        self.assertEqual(len(self.events(restarted, turn, 'approval_requested')), 1)
 
     def test_an_ungated_bot_announces_nothing(self):
         client = self.client('echo,shell')
