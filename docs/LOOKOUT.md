@@ -186,7 +186,7 @@ A `follows` call with `source` NAME shows the source whole with its shape. A fie
 
 ### Dry runs and reads
 
-To try a follow before adding it, send it as `add` with `"test": true`. Nothing is added; the answer's `test` says what it would have heard of its sources' last 24 hours: how many events there were (`events`), how many it hears by source, topic, and filter (`heard`), how many of those steer, by the source's mark or the follow's `steer` (`steers`), and about how many notes they would have been with its digest or its sources' (`notes`), with the newest 3 it hears as examples, outside content as a source's are. What bots do is not kept, so a follow that watches bots says so under `untested`.
+To try a follow before adding it, send it as `add` with `"test": true`. Nothing is added; the answer's `test` says what it would have heard of its sources' last 24 hours: how many events there were (`events`), how many it hears by source, topic, and filter (`heard`), how many of those steer, by the source's mark or the follow's `steer` (`steers`), and about how many notes they would have been with its digest or its sources' (`notes`), with the newest 3 it hears as examples, outside content as a source's are. What bots do is not kept, so a follow that watches bots says so under `untested`. A busy source's kept events may reach back less than the day: `kept_from` then names it, with when its history kept whole starts and how many events that holds, as `"ci": "Sat 21 Nov 09:14 (2,000 events)"`.
 
 ```json
 {"add": {"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]}}, "test": true}
@@ -204,7 +204,7 @@ To know what a source says now without following it, send `source` NAME, or `NAM
 
 Both come from `STORE.sources/.recent/NAME.jsonl`, an event a line, kept for every source but the commons and tasks (a command's and Sonny's own `memory` and `links` alike):
 
-- A day of events, at most 2,000 events and 4 MiB, an event's fields cut as a shape's examples are past 16 KiB (`cut` then counts them, since a filter may misjudge a cut event).
+- A day of events, at most 2,000 events and 4 MiB, an event's fields cut as a shape's examples are past 16 KiB (`cut` then counts them, since a filter may misjudge a cut event). When those bounds leave out an event of the day, the oldest event kept whole carries `dropped_before`, and what is kept before it is only each topic's newest.
 - Past the day, the newest event of each topic, of the source itself (its events with no topic), and the lookout's newest word on it, however old, as an MQTT broker retains each topic's last message: at most 1,000 of them in 512 KiB. Live margin templates read it too.
 - A clear is kept as a line with no text while it is within the day, and past it goes with all before it, as Kafka compacts a tombstone away. The same writer thread appends to the file and cuts it back once an hour or when it grows past its bytes.
 
