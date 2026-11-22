@@ -4439,6 +4439,20 @@ fn is_wheel(event: &Event) -> bool {
     )
 }
 
+/// Whether `event` is a letter as typed, with no Ctrl, Alt or Cmd held: one
+/// that may join a burst of them ([`App::letter_burst`]).
+fn is_letter(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if key.kind != KeyEventKind::Release
+                && matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER
+                )
+    )
+}
+
 /// A new bot in the folder, with the instructions its folder gives it.
 async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), String> {
     let model = options
@@ -6404,6 +6418,9 @@ struct App {
     /// What `/context` read, and the width its card was last laid at.
     context_read: Option<(context::Parts, Option<usize>)>,
     input: prompt::Prompt,
+    /// The last key was a letter typed into the draft: letters already
+    /// waiting after it are typed before the next frame.
+    lettered: bool,
     /// The prompts sent before, which Up and Down bring back, with the
     /// pictures and quotes each went with.
     recall: recall::Recall<Attached>,
@@ -8699,6 +8716,7 @@ impl App {
             compacted: None,
             context_read: None,
             input: prompt::Prompt::default(),
+            lettered: false,
             recall: recall::Recall::default(),
             pending: Vec::new(),
             marks: Vec::new(),
@@ -9191,6 +9209,8 @@ impl App {
                     self.key(key).await;
                     if wheel {
                         held = self.wheel_burst(&mut keys, chat).await;
+                    } else if self.lettered {
+                        held = self.letter_burst(&mut keys).await;
                     }
                 }
                 // Taken only as fast as they are heard: the rest wait in
@@ -9466,6 +9486,31 @@ impl App {
             }
             let Ok(key) = keys.try_recv() else { break };
             if !is_wheel(&key) {
+                return Some(key);
+            }
+            self.key(key).await;
+        }
+        None
+    }
+
+    /// The letters already waiting after one typed into the draft, typed
+    /// into it before the next frame, as the wheel's notches are scrolled,
+    /// and as Codex's TUI handles what came before it draws: a burst of
+    /// keys (a fast typist, dictation, keys held while the window was
+    /// busy) is one frame, not one each. Only what had come counts. The
+    /// first event that is not such a letter is given back, handled after
+    /// that frame, so a click or any other key always meets the window as
+    /// drawn.
+    async fn letter_burst(
+        &mut self,
+        keys: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) -> Option<Event> {
+        for _ in 0..keys.len() {
+            if self.quit || !self.lettered {
+                break;
+            }
+            let Ok(key) = keys.try_recv() else { break };
+            if !is_letter(&key) {
                 return Some(key);
             }
             self.key(key).await;
@@ -18401,6 +18446,7 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
+        self.lettered = false;
         // The terminal answering: its colors, or its light and dark.
         if let Event::Reply(reply) = &event {
             term::heard(reply);
@@ -18928,7 +18974,10 @@ impl App {
                     {
                         self.shortcuts()
                     }
-                    KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
+                    KeyCode::Char(c) if !ctrl => {
+                        self.input.insert(c.encode_utf8(&mut [0; 4]));
+                        self.lettered = true;
+                    }
                     // At the start of the words, the newest quote over them
                     // goes whole: it is one message, sent whole.
                     KeyCode::Backspace if self.input.at_start() && !self.quotes.is_empty() => {
