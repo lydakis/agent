@@ -4444,8 +4444,11 @@ impl Turn {
                 Body::Copied(copy) => Some(copy.window),
                 Body::Span(..) => None,
             };
+            // Only where the window kept room for them: on the turn's own
+            // model, and on a fallback when the turn's model takes them too.
+            let room = matches!(self.marking.get(), Some(Some(_)));
             let own = (record.own_effort.as_deref())
-                .filter(|_| window.is_some() && provider.takes_effort_marks(model));
+                .filter(|_| room && window.is_some() && provider.takes_effort_marks(model));
             let marks = match (window, own) {
                 (Some(window), Some(own)) => {
                     effort_marks(window, own, provider.family().efforts(), |level| {
