@@ -889,7 +889,7 @@ impl App {
                 (shared.agents.iter())
                     .map(|(_, _, bot)| bot)
                     .filter(|bot| !self.status_bots.contains(*bot))
-                    .filter(|bot| shared.is_below(bot, &self.bot, &self.follows.0))
+                    .filter(|bot| shared.is_below(bot, &self.bot, &self.follows.leads))
                     .cloned(),
             );
         }
@@ -6479,10 +6479,9 @@ struct App {
     /// How many times what the store's one follow tells changed, as the
     /// questions pinned from it were read: the window's own count.
     hub_asks: u64,
-    /// The leads this window's agent follows by name, and those they
-    /// follow ([`followed_leads`]), with when they were last read and a
-    /// count of their changes: what waits below them waits here too.
-    follows: (Vec<String>, Option<Instant>, u64),
+    /// The leads this window's agent follows: what waits below them waits
+    /// here too.
+    follows: Follows,
     /// When a lead's window last read whether another window marked it
     /// done, which sets its own questions aside here too.
     done_read: Option<Instant>,
@@ -7665,6 +7664,23 @@ const FLEET_KINDS: [&str; 14] = [
     "lifted_ended",
 ];
 
+/// A file as it was when read: when it was changed and its length, none
+/// when there was none.
+type Stamp = Option<(Option<std::time::SystemTime>, u64)>;
+
+/// The leads a window's agent follows by name, and those they follow
+/// ([`followed_leads`]).
+#[derive(Default)]
+struct Follows {
+    leads: Vec<String>,
+    /// When they were last looked at.
+    at: Option<Instant>,
+    /// How many times they changed.
+    changes: u64,
+    /// Each file read for them, as it was.
+    read: Vec<(String, Stamp)>,
+}
+
 /// How often a lead's window reads again which leads it follows.
 const FOLLOWED_EVERY: Duration = Duration::from_secs(5);
 
@@ -8697,7 +8713,7 @@ impl App {
             settling: None,
             task_asks_read: None,
             hub_asks: 0,
-            follows: (Vec::new(), None, 0),
+            follows: Follows::default(),
             done_read: None,
             kept: Kept::default(),
             task_needs: Default::default(),
@@ -16323,7 +16339,7 @@ impl App {
             let shared = hub.waiting.borrow();
             wanted.extend(
                 (shared.calls.iter())
-                    .filter(|(bot, ..)| shared.is_below(bot, me, &self.follows.0))
+                    .filter(|(bot, ..)| shared.is_below(bot, me, &self.follows.leads))
                     .cloned(),
             );
         }
@@ -20407,7 +20423,7 @@ impl App {
             (self.fleet.as_ref()).map_or(0, |fleet| fleet.lineage.len() + fleet.raised.len()),
             self.tasks.values().map(Vec::len).sum(),
             self.hub_asks,
-            self.follows.2,
+            self.follows.changes,
         );
         if self.task_asks_read.replace(read) == Some(read) {
             return;
@@ -20443,7 +20459,7 @@ impl App {
         if let Some((hub, _)) = &self.other_projects {
             let shared = hub.waiting.borrow();
             let had: std::collections::HashSet<String> = open.iter().map(asks::Ask::key).collect();
-            let below: Vec<asks::Ask> = (shared.below(&self.bot, &self.follows.0))
+            let below: Vec<asks::Ask> = (shared.below(&self.bot, &self.follows.leads))
                 .map(|(bot, ask)| pinned(bot, ask, self.asker_name(bot)))
                 .filter(|ask| !had.contains(&ask.key()))
                 .collect();
@@ -20504,19 +20520,35 @@ impl App {
     /// files beside the store, nothing asked of the daemon.
     fn read_follows(&mut self) {
         let followed = match &self.fleet {
-            Some(fleet) if fleet.followed == self.follows.0 => return,
+            Some(fleet) if fleet.followed == self.follows.leads => return,
             Some(fleet) => fleet.followed.clone(),
             None if self.other_projects.is_none() => return,
-            None if (self.follows.1).is_some_and(|at| at.elapsed() < FOLLOWED_EVERY) => return,
+            None if (self.follows.at).is_some_and(|at| at.elapsed() < FOLLOWED_EVERY) => return,
             None => {
-                self.follows.1 = Some(Instant::now());
+                self.follows.at = Some(Instant::now());
                 let store = self.store();
-                followed_leads(&self.bot, |bot| lookout::subs::read(&store, bot))
+                let dir = lookout::subs::dir(&store);
+                let stamp = |bot: &str| -> Stamp {
+                    let file = std::fs::metadata(dir.join(format!("{bot}.json"))).ok()?;
+                    Some((file.modified().ok(), file.len()))
+                };
+                // No file changed since they were read: nothing to read.
+                let read = &self.follows.read;
+                if !read.is_empty() && read.iter().all(|(bot, was)| stamp(bot) == *was) {
+                    return;
+                }
+                let read = std::cell::RefCell::new(Vec::new());
+                let followed = followed_leads(&self.bot, |bot| {
+                    read.borrow_mut().push((bot.to_owned(), stamp(bot)));
+                    lookout::subs::read(&store, bot)
+                });
+                self.follows.read = read.into_inner();
+                followed
             }
         };
-        if followed != self.follows.0 {
-            self.follows.0 = followed;
-            self.follows.2 += 1;
+        if followed != self.follows.leads {
+            self.follows.leads = followed;
+            self.follows.changes += 1;
         }
     }
 
@@ -36685,7 +36717,7 @@ mod tests {
             json!({"subscriptions": [{"name": "shop", "agents": ["shop.lead"]}]}).to_string(),
         )
         .unwrap();
-        app.follows.1 = None;
+        app.follows.at = None;
         app.pin_task_asks();
         assert_eq!(
             pinned(&app),
@@ -36704,6 +36736,19 @@ mod tests {
             pinned(&app),
             [("shop.fix".to_owned(), "shop.fix".to_owned())]
         );
+        // Its file as it was: not read again. Following shop's no more,
+        // its question goes from here.
+        app.follows.at = None;
+        app.read_follows();
+        assert_eq!(app.follows.leads, ["shop.lead"]);
+        std::fs::write(
+            subs.join("calc.lead.json"),
+            json!({"subscriptions": []}).to_string(),
+        )
+        .unwrap();
+        app.follows.at = None;
+        app.pin_task_asks();
+        assert_eq!(pinned(&app), []);
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 
