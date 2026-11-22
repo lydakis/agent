@@ -43,6 +43,19 @@ def pipelined(client, requests):
     return [replies[i] for i in ids]
 
 
+def store_bytes(out):
+    return sum(f.stat().st_size for f in out.glob('state.sqlite*'))
+
+
+def written_bytes(process):
+    """Bytes the process sent toward the disk (Linux's /proc io), or None
+    where the system does not count them."""
+    try:
+        return process.io_counters().write_bytes
+    except (AttributeError, psutil.AccessDenied):
+        return None
+
+
 def run(binary, out, bots):
     model, url = start()
     client = None
@@ -63,6 +76,7 @@ def run(binary, out, bots):
                 assert 'result' in reply, reply
         created = rss_mib()
         before = client.request('stats')['result']['store']['operations']
+        stored, written = store_bytes(out), written_bytes(process)
         began, cpu = time.monotonic(), cpu_ms(process)
         turns = []
         for first in range(0, bots, BATCH):
@@ -74,6 +88,8 @@ def run(binary, out, bots):
             event = client.finished(turn, timeout=60)
             assert event['data']['status'] == 'completed', event
         elapsed, cpu = time.monotonic() - began, cpu_ms(process) - cpu
+        written = None if written is None else written_bytes(process) - written
+        stored = store_bytes(out) - stored
         after = client.request('stats')['result']['store']['operations']
         operations = {name: {key: value[key] - before.get(name, {}).get(key, 0) for key in ('count', 'ran_ms')}
                       for name, value in after.items()}
@@ -83,7 +99,12 @@ def run(binary, out, bots):
                     turns_rss_mib=turned, turns_s=elapsed, cpu_ms_per_turn=cpu / bots,
                     store_jobs_per_turn=jobs / bots,
                     commits_per_turn=operations.get('commit', {}).get('count', 0) / bots,
-                    store_bytes=sum(f.stat().st_size for f in out.glob('state.sqlite*')),
+                    store_bytes=store_bytes(out),
+                    # What the turns wrote to the disk against what the store
+                    # grew by: WAL frames, checkpoints and sidecars count in
+                    # the first, so it says what a turn costs the drive.
+                    written_kib_per_turn=None if written is None else written / 1024 / bots,
+                    store_growth_kib_per_turn=stored / 1024 / bots,
                     operations=operations)
     finally:
         if client:

@@ -12994,3 +12994,24 @@ window (none for a bot whose turns all run at its own), and streams it
 ahead of the prompt it belongs to. On such a model, fitting the window
 counts room for them in one pass over the window's turn prompts. Nothing is kept per bot. The
 pull request's Perf screen is the matched comparison.
+
+## Bytes a turn writes to the disk
+
+2026-11-22, main at 946531e, a 4-core Linux cloud box, FULL durability.
+`bench.disk_writes` turns one-reply turns one at a time on 10 bots against
+the synthetic Responses model and reads the daemon's `write_bytes` from
+`/proc` (WAL frames, checkpoints and sidecars), beside the store's growth.
+
+| Store before | Written per turn | Store growth per turn | p50 turn | p99 turn |
+| --- | ---: | ---: | ---: | ---: |
+| empty | 251.5 KiB | 47.05 KiB | 44.2 ms | 51.3 ms |
+| 3,000 turns | 287.1 KiB | 2.70 KiB | 48.2 ms | 61.9 ms |
+
+A lone turn writes about a hundred times what it keeps once the store has
+reached its size: each of its commits writes whole 4 KiB pages to the WAL,
+and the checkpoint writes them again into the database. A bigger store
+writes 14% more a turn, as its indexes touch more pages. In a burst the
+group commit folds turns together: `bench.footprint`'s 200 turns at once
+wrote 41.8 KiB a turn against 39.2 KiB of growth. `bench.footprint` now
+reports `written_kib_per_turn` and the Perf screen compares it, as a timing,
+since how turns fall into group commits moves with the runner.

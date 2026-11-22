@@ -84,7 +84,10 @@ TIMINGS = {
     'footprint': [('idle RSS, MiB', lambda r: r['idle_rss_mib']),
                   ('per idle bot, KiB', lambda r: r['per_idle_bot_kib']),
                   ('RSS after a turn each, MiB', lambda r: r['turns_rss_mib']),
-                  ('CPU per turn, ms', lambda r: r['cpu_ms_per_turn'])],
+                  ('CPU per turn, ms', lambda r: r['cpu_ms_per_turn']),
+                  # Group commits fold turns together by timing, so this moves
+                  # with the runner too.
+                  ('written to disk per turn, KiB', lambda r: r['written_kib_per_turn'])],
     # bench.sonny_screen: Sonny's own paths that grow with the fleet.
     # Lookout shapes are subscribing leads x tasks each.
     'sonny': [*((f'lookout CPU per 1k deltas at {n}, ms', lambda r, n=n: r['lookout'][n]['cpu_ms_per_1k_deltas'])
