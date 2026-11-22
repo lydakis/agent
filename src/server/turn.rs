@@ -93,6 +93,9 @@ struct Span<'a> {
     /// Whether a Responses reasoning item the strip names goes whole, as
     /// `thinking` then counts it ([`Turn::reasoning`]).
     reasoning: bool,
+    /// Effort changes, each an item sent ahead of the item whose id it
+    /// names ([`effort_marks`]); those for items outside `ids` are unsent.
+    marks: &'a [(i64, Bytes)],
 }
 impl Span<'_> {
     const EMPTY: Span<'static> = Span {
@@ -102,6 +105,7 @@ impl Span<'_> {
         pictured: &[],
         elided: 0,
         reasoning: false,
+        marks: &[],
     };
 }
 
@@ -125,6 +129,29 @@ fn fingerprint(prefix: &[u8], first: i64, url: &str, model: &str) -> i64 {
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash as i64
+}
+
+/// The effort changes a window's history makes against `own`, the effort
+/// its requests keep: where each turn whose effort differs from the one
+/// before it starts, by its prompt's id, the item `mark` makes of it. A
+/// turn that asked for none runs at `own`. The same window always makes
+/// the same marks, so a history keeps them in place and its cache holds.
+fn effort_marks(
+    window: &agent_runtime::store::Window,
+    own: &str,
+    mark: impl Fn(&str) -> agent_runtime::Result<Bytes>,
+) -> agent_runtime::Result<Vec<(i64, Bytes)>> {
+    let mut marks: Vec<(i64, Bytes)> = Vec::new();
+    let mut effective = own;
+    for (index, effort) in &window.efforts {
+        let effort = effort.as_deref().unwrap_or(own);
+        if effort != effective {
+            marks.push((window.ids[*index], mark(effort)?));
+            effective = effort;
+        }
+    }
+    marks.sort_unstable_by_key(|(id, _)| *id);
+    Ok(marks)
 }
 
 /// Split window items into read-ahead batches by count and by bytes.
@@ -158,9 +185,10 @@ fn item_chunks(
     strip: Strip,
     reasoning: bool,
     elided: i64,
+    marks: Arc<[(i64, Bytes)]>,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
     stream::unfold((0, Joined::default()), move |(index, joined)| {
-        let (store, chunks) = (store.clone(), chunks.clone());
+        let (store, chunks, marks) = (store.clone(), chunks.clone(), marks.clone());
         async move {
             let count = chunks.len();
             if index == count {
@@ -169,8 +197,14 @@ fn item_chunks(
             let read = store
                 .read("items_by_ids", move |db| {
                     let mut joined = joined;
-                    let bytes =
-                        db.items_sent(&chunks[index], strip, reasoning, elided, &mut joined)?;
+                    let bytes = db.items_sent(
+                        &chunks[index],
+                        strip,
+                        reasoning,
+                        elided,
+                        &marks,
+                        &mut joined,
+                    )?;
                     Ok((bytes, joined))
                 })
                 .await;
@@ -1063,7 +1097,13 @@ impl Turn {
     /// The window's items, those `strip` names without thinking: what
     /// each loses is `reasoning` when given, as [`Self::reasoning`] reads
     /// it, or else the window's own count.
-    fn items(&self, context: &Context, strip: Strip, reasoning: Option<&[u32]>) -> Items {
+    fn items(
+        &self,
+        context: &Context,
+        strip: Strip,
+        reasoning: Option<&[u32]>,
+        marks: &[(i64, Bytes)],
+    ) -> Items {
         match &context.window {
             Some(w) => self.window_items(
                 context.prefix.bytes.clone(),
@@ -1074,6 +1114,7 @@ impl Turn {
                     pictured: &w.pictured,
                     elided: w.elided,
                     reasoning: reasoning.is_some(),
+                    marks,
                 },
                 strip,
             ),
@@ -1191,7 +1232,12 @@ impl Turn {
 
     /// A copy of the bot's call with the compaction request after it;
     /// `reasoning` as for [`Self::items`].
-    fn copied_items(&self, copy: Copied<'_>, reasoning: Option<&[u32]>) -> Items {
+    fn copied_items(
+        &self,
+        copy: Copied<'_>,
+        reasoning: Option<&[u32]>,
+        marks: &[(i64, Bytes)],
+    ) -> Items {
         let (window, len) = (copy.window, copy.len);
         let span = Span {
             ids: &window.ids[..len],
@@ -1200,6 +1246,7 @@ impl Turn {
             pictured: &window.pictured[..len],
             elided: window.elided,
             reasoning: reasoning.is_some(),
+            marks,
         };
         self.framed_items(
             copy.prefix.clone(),
@@ -1219,6 +1266,7 @@ impl Turn {
             pictured,
             elided,
             reasoning,
+            marks,
         } = span;
         let stripped: usize = ids
             .iter()
@@ -1226,9 +1274,17 @@ impl Turn {
             .filter(|(id, _)| strip.strips(**id))
             .map(|(_, &bytes)| bytes as usize)
             .sum();
+        // Each sent mark is one more item, with its comma.
+        let marks: Arc<[(i64, Bytes)]> = marks
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .cloned()
+            .collect();
+        let marked: usize = marks.iter().map(|(_, mark)| mark.len() + 1).sum();
         let weight = (prefix.len()
             + sizes.iter().map(|&size| size as usize).sum::<usize>()
             + ids.len().saturating_sub(1)
+            + marked
             + tail.len())
         .saturating_sub(stripped);
         let pictures: i64 = pictured.iter().map(|&bytes| i64::from(bytes)).sum();
@@ -1241,6 +1297,7 @@ impl Turn {
                 strip,
                 reasoning,
                 elided,
+                marks.clone(),
             ));
             if tail.is_empty() {
                 items.boxed()
@@ -3039,6 +3096,7 @@ impl Turn {
                         strip,
                         reasoning.is_some(),
                         elided,
+                        Arc::from([]),
                     ))
                     .chain(stream::iter([Ok(tail.clone())]))
                     .boxed()
@@ -3072,7 +3130,7 @@ impl Turn {
             }
         }
         // A turn may run at its own effort; everything after reads the record.
-        record.effort = context.effort.clone();
+        record.own_effort = std::mem::replace(&mut record.effort, context.effort.clone());
         record.turn_budget = context.budget;
         record.output_schema = (context.output_schema.clone())
             .map(serde_json::value::RawValue::from_string)
@@ -3405,7 +3463,9 @@ impl Turn {
         // was on this turn's model: this turn's own before a wait, unless
         // a summary or elision rewrote the view after it, else the
         // previous turn's. Claude also keeps a history's cache only at
-        // the effort that wrote it.
+        // the effort that wrote it, unless the model takes a change of
+        // effort inside the conversation: then every call keeps the bot's.
+        let marked = record.own_effort.is_some() && provider.takes_effort_marks(model);
         let mut inherited = context.view_sent.unwrap_or_else(|| {
             context
                 .previous_call
@@ -3413,6 +3473,7 @@ impl Turn {
                 .is_some_and(|(model, effort)| {
                     model == called
                         && (provider.family() != agent_runtime::codec::Family::Anthropic
+                            || marked
                             || *effort == record.effort)
                 })
         });
@@ -4302,9 +4363,32 @@ impl Turn {
                 }
                 Body::Span(..) => (Strip::default(), None),
             };
+            // The call's own provider and model, and where this attempt goes.
+            let (own_provider, own_model) = (provider, model);
+            let target = (fallback.as_ref()).map(|to| (to.provider.clone(), to.model.clone()));
+            let (provider, model) = match &target {
+                Some((to, model)) => (to.as_ref(), model.as_str()),
+                None => (provider, model),
+            };
+            // A model that takes a change of effort inside the conversation
+            // keeps the bot's own on the request, and its cache with it;
+            // each turn at another effort says so where it starts.
+            let window = match body {
+                Body::Window(context) => context.window.as_ref(),
+                Body::Copied(copy) => Some(copy.window),
+                Body::Span(..) => None,
+            };
+            let own = (record.own_effort.as_deref())
+                .filter(|_| window.is_some() && provider.takes_effort_marks(model));
+            let marks = match (window, own) {
+                (Some(window), Some(own)) => {
+                    effort_marks(window, own, |level| provider.effort_mark(level))?
+                }
+                _ => Vec::new(),
+            };
             let items = match body {
-                Body::Window(context) => self.items(context, strip, reasoning.as_deref()),
-                Body::Copied(copy) => self.copied_items(copy, reasoning.as_deref()),
+                Body::Window(context) => self.items(context, strip, reasoning.as_deref(), &marks),
+                Body::Copied(copy) => self.copied_items(copy, reasoning.as_deref(), &marks),
                 Body::Span(plan, stripped) => self.span_items(plan, stripped).await?,
             };
             accounting.begin(attempt > 0);
@@ -4318,18 +4402,11 @@ impl Turn {
                 _ => 0,
             };
             let sent = agent_runtime::provider::Sent::default();
-            // The call's own provider and model, and where this attempt goes.
-            let (own_provider, own_model) = (provider, model);
-            let target = (fallback.as_ref()).map(|to| (to.provider.clone(), to.model.clone()));
-            let (provider, model) = match &target {
-                Some((to, model)) => (to.as_ref(), model.as_str()),
-                None => (provider, model),
-            };
             let call = provider.complete_accounted(
                     ModelRequest {
                         model,
                         instructions,
-                        reasoning: record.effort.as_deref(),
+                        reasoning: own.or(record.effort.as_deref()),
                         tools,
                         allow_tool_calls: tool_calls && !matches!(body, Body::Span(..)),
                         // The turn's own reply; a summary is free text.
@@ -4338,6 +4415,7 @@ impl Turn {
                         // the cache the bot's calls write.
                         web_search: searches(record),
                         fallback_credit: fallback.as_ref().and_then(|to| to.credit.as_deref()),
+                        effort_marks: !marks.is_empty(),
                         // The turn's own call parks it on a full ramp, to
                         // be woken when a place frees; one beside it waits.
                         asker: match accounting.beside {
@@ -4349,7 +4427,7 @@ impl Turn {
                         // A summary beside the turn's call keeps off the
                         // bot's connection, which that call holds.
                         chain: (!accounting.beside)
-                            .then(|| self.chain(body, strip, reasoning.as_deref())),
+                            .then(|| self.chain(body, strip, reasoning.as_deref(), &marks)),
                         // A summary of its own goes off the turn's route; a
                         // copy follows it to the server that holds its cache.
                         route: (!matches!(body, Body::Span(..))).then_some(&accounting.route),
@@ -4699,6 +4777,7 @@ impl Turn {
         body: Body<'a>,
         strip: Strip,
         reasoning: Option<&'a [u32]>,
+        marks: &'a [(i64, Bytes)],
     ) -> Chain<'a> {
         match body {
             Body::Window(Context {
@@ -4716,6 +4795,7 @@ impl Turn {
                         pictured: &window.pictured[skip..],
                         elided: window.elided,
                         reasoning: reasoning.is_some(),
+                        marks,
                     };
                     let strip = if reasoning.is_some() {
                         strip

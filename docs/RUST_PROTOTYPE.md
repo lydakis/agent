@@ -1148,6 +1148,26 @@ stay as they are.
 `effort` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
 (`thinking.type: adaptive` with summarized display) plus `output_config.effort`.
+A turn at another effort than its bot's, on a model that takes a change of
+effort inside the conversation, keeps the bot's effort on every request, so
+the history's cache holds: where each turn whose effort differs from the one
+before it starts, its prompt goes after an item that sets the effort from
+there on. Claude's is a `system` message with an empty `content` and its own
+`output_config.effort`, sent with the
+`mid-conversation-output-config-2026-07-01` beta, on Fable 5.2 and 5.1,
+Mythos 5.2 and 5.1, Opus 5.5 and 5, Sonnet 5.5 and Haiku 5.5 (Anthropic's
+per-message effort guide, read 2026-11-22). Anthropic lists the beta on
+Bedrock too, but Mantle refuses a beta it does not take with a 400 and this
+one has not been tried there, so Bedrock requests run the turn at its effort
+as before ([BEDROCK.md](BEDROCK.md)). OpenAI's is a
+`configuration_update` item with `reasoning.effort`, from GPT-6 on, on its
+own API with a key (its reasoning guide, read 2026-11-22); Bedrock's OpenAI
+models and the ChatGPT plan are not documented to take it. A turn that asked
+for no effort runs at the bot's, and a turn after a boosted one says so. The
+items are made from each turn's recorded effort as the window is read, the
+same every time, so they stay in place; nothing is stored. Other models, a
+fallback to one, and a bot without an effort of its own run the turn at its
+effort on the request, as before.
 Every Anthropic call sets `max_tokens` to the model's full output limit:
 128,000 for Claude 4.6 and later, 64,000 for Haiku 4.5, Sonnet 4.5, Opus 4.5,
 Sonnet 4 and Sonnet 3.7, 32,000 for Opus 4 and 4.1, and 8,192 for the Claude

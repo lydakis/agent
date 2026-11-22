@@ -15849,10 +15849,10 @@ fn requests_leave_out_blank_text_at_the_length_the_store_counted() {
         for at in 1..window.ids.len() {
             let mut joined = Joined::default();
             let mut batches = db
-                .items_sent(&window.ids[..at], strip.into(), false, 0, &mut joined)
+                .items_sent(&window.ids[..at], strip.into(), false, 0, &[], &mut joined)
                 .unwrap();
             batches.extend(
-                db.items_sent(&window.ids[at..], strip.into(), false, 0, &mut joined)
+                db.items_sent(&window.ids[at..], strip.into(), false, 0, &[], &mut joined)
                     .unwrap(),
             );
             assert_eq!(
