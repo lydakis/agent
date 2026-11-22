@@ -213,6 +213,10 @@ pub struct View {
     changed: u64,
     /// The width, change and minute last drawn at.
     drawn: Option<(usize, u64, u64)>,
+    /// `ctrl+f`: what is typed narrows the facts to those whose name or
+    /// description says it, and the pick and the folds as they were when
+    /// the find began, which `esc` puts back.
+    finding: Option<crate::find::Find<(usize, HashMap<String, bool>)>>,
 }
 
 const WORK: &str = "work";
@@ -249,6 +253,7 @@ impl View {
             notice: None,
             changed: 0,
             drawn: None,
+            finding: None,
         }
     }
 
@@ -344,6 +349,10 @@ impl View {
     /// Whether a section starts open: work, this project's facts and those
     /// kept everywhere do; with `a`, every other project's start folded.
     fn is_open(&self, key: &str) -> bool {
+        // While finding, a fold is searched and stands open.
+        if self.query().is_some() {
+            return true;
+        }
         if let Some(open) = self.folds.get(key) {
             return *open;
         }
@@ -363,7 +372,7 @@ impl View {
         };
         let mut out = Vec::new();
         if !listing.work.is_empty() {
-            let facts = (listing.work.iter())
+            let facts: Vec<Item> = (listing.work.iter())
                 .map(|work| Item::Fact {
                     scope: work.scope.clone(),
                     name: work.name.clone(),
@@ -389,7 +398,77 @@ impl View {
                 .collect();
             out.push((key, title, facts));
         }
+        // While finding, the facts that say what is typed; a section with
+        // none is not drawn.
+        if let Some(query) = self.query() {
+            for (_, _, facts) in &mut out {
+                facts.retain(|item| self.says(item, query));
+            }
+            out.retain(|(_, _, facts)| !facts.is_empty());
+        }
         out
+    }
+
+    /// What is typed to find, once anything is.
+    fn query(&self) -> Option<&str> {
+        (self.finding.as_ref())
+            .filter(|find| find.typed())
+            .map(|find| find.query.as_str())
+    }
+
+    /// Whether a fact's name or description says `query`, in the words
+    /// its row is drawn with.
+    fn says(&self, item: &Item, query: &str) -> bool {
+        let Item::Fact { scope, name } = item else {
+            return false;
+        };
+        let description = match self.work_of(scope, name) {
+            Some(work) => work.description.as_str(),
+            None => self
+                .fact_of(scope, name)
+                .map_or("", |fact| &fact.description),
+        };
+        crate::find::says(query, name) || crate::find::says(query, description)
+    }
+
+    /// Whether a find is under way over the list.
+    pub fn finding(&self) -> bool {
+        self.finding.is_some() && !self.on_page()
+    }
+
+    /// The find field over the list, while finding: how many facts say
+    /// what is typed, of how many. None on a fact's page.
+    pub fn field(&self) -> Option<crate::find::Field> {
+        let find = self.finding.as_ref().filter(|_| !self.on_page())?;
+        let listing = self.listing.as_ref()?;
+        let of = listing.work.len() + listing.scopes.iter().map(|s| s.facts.len()).sum::<usize>();
+        let left = (self.sections().iter())
+            .map(|(_, _, facts)| facts.len())
+            .sum::<usize>();
+        let left = match self.query() {
+            Some(_) => left,
+            None => of,
+        };
+        Some(crate::find::Field::rows(&find.query, left, of))
+    }
+
+    /// Words pasted while finding, as if typed: whether a find took them.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(find) = self.finding.as_mut().filter(|_| self.pages.is_empty()) else {
+            return false;
+        };
+        find.paste(text);
+        self.changed += 1;
+        self.found();
+        true
+    }
+
+    /// The pick on the first fact that says what is typed.
+    fn found(&mut self) {
+        let items = self.items();
+        self.selected = (items.iter())
+            .position(|item| matches!(item, Item::Fact { .. }))
+            .unwrap_or(0);
     }
 
     /// Every row the pick can land on, in order.
@@ -465,6 +544,31 @@ impl View {
         let pending = asked.is_some();
         let confirm = asked.filter(|_| key.code == KeyCode::Enter && !modified);
         self.notice = (pending && confirm.is_none()).then(|| "not removed".to_owned());
+        // `ctrl+f`: what is typed narrows the facts, the pick on the first
+        // that says it; `esc` drops the find and puts the pick and the
+        // folds back. The arrows and `enter` stay the list's.
+        if !self.on_page() {
+            if let Some(find) = &mut self.finding {
+                match find.key(&key) {
+                    crate::find::Typed::Dropped => {
+                        if let Some(find) = self.finding.take() {
+                            (self.selected, self.folds) = find.before;
+                        }
+                        self.selected = self.selected.min(self.items().len().saturating_sub(1));
+                        return Key::Stay;
+                    }
+                    crate::find::Typed::Changed => {
+                        self.found();
+                        return Key::Stay;
+                    }
+                    crate::find::Typed::Held => return Key::Stay,
+                    crate::find::Typed::Other => {}
+                }
+            } else if crate::find::opens(&key) && self.listing.is_some() {
+                self.finding = Some(crate::find::Find::new((self.selected, self.folds.clone())));
+                return Key::Stay;
+            }
+        }
         let code = match key.code {
             KeyCode::Char('k') => KeyCode::Up,
             KeyCode::Char('j') => KeyCode::Down,
@@ -702,6 +806,11 @@ impl View {
             return (out, 0, marks);
         };
         let sections = self.sections();
+        if let Some(query) = self.query().filter(|_| sections.is_empty()) {
+            out.push(Line::default());
+            out.push(Line::from(format!("nothing here matches {query}")).dim());
+            return (out, 0, marks);
+        }
         if sections.is_empty() {
             out.push(Line::default());
             out.push(Line::from("No facts saved yet."));
@@ -976,6 +1085,15 @@ impl View {
             Some(Item::Heading(key)) if self.is_open(key) => {}
             Some(Item::Heading(_)) => keys.push("enter open"),
             None => {}
+        }
+        // While finding, a letter is typed: the view's letters are not
+        // listed, and `esc` drops the find first.
+        if self.finding.is_some() {
+            keys.push("esc cancel");
+            return keys.join(" · ");
+        }
+        if self.listing.is_some() {
+            keys.push("ctrl+f find");
         }
         keys.push(match self.every {
             true => "a this project",
@@ -1256,7 +1374,7 @@ fn this_year() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A memory folder of its own, written as the memory tool writes it.
@@ -1285,6 +1403,22 @@ mod tests {
             None => arguments["user"] = true.into(),
         }
         agent_client::memory::call(&places.home, &places.folder, &arguments).unwrap();
+    }
+
+    /// A view of `n` facts of this project, longer than a pane when `n`
+    /// is: for a test of the window that shows it.
+    pub(crate) fn long(name: &str, n: usize) -> View {
+        let places = places(name);
+        for at in 0..n {
+            save(
+                &places,
+                Some("tally"),
+                &format!("fact-{at}"),
+                "project",
+                serde_json::json!({}),
+            );
+        }
+        view(&places)
     }
 
     fn view(places: &Places) -> View {

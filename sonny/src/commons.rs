@@ -2281,10 +2281,16 @@ impl View {
     /// with those items hung under them, then the threads that match,
     /// an item hung under its board not again among them.
     fn rows(&self) -> Vec<Row> {
-        let (open, finished) = self.boards_split();
         let query = (self.finding.as_ref())
             .filter(|find| find.typed())
             .map(|find| find.query.clone());
+        self.rows_finding(query)
+    }
+
+    /// [`View::rows`] while finding `query`, every row before anything
+    /// is typed; with none, as at rest.
+    fn rows_finding(&self, query: Option<String>) -> Vec<Row> {
+        let (open, finished) = self.boards_split();
         let mut rows = Vec::new();
         let mut hung_threads = std::collections::HashSet::new();
         match &query {
@@ -2450,6 +2456,7 @@ impl View {
                     self.found();
                     return Key::Stay;
                 }
+                crate::find::Typed::Held => return Key::Stay,
                 crate::find::Typed::Other => {}
             }
         }
@@ -2825,25 +2832,52 @@ impl View {
 
     /// The card `width` wide, as [`Card`] says.
     pub fn card_rows(&mut self, width: usize) -> Card {
-        let mut card = match self.pages.last() {
+        match self.pages.last() {
             Some(Page::Thread { .. }) => self.thread_card(width),
             Some(Page::Board { name, .. }) => {
                 let name = name.clone();
                 self.board_card(&name, width)
             }
             None => self.list_card(width),
-        };
-        // The find row, the view's last.
-        let query = match self.pages.last() {
-            Some(Page::Board { finding, .. }) => finding.as_ref(),
-            Some(Page::Thread { .. }) => None,
-            None => self.finding.as_ref(),
-        };
-        if let Some(find) = query {
-            card.lines.push(Line::default());
-            card.lines.push(crate::find::line(&find.query));
         }
-        card
+    }
+
+    /// The find field over the list or a board's page, while finding:
+    /// how many rows say what is typed, of how many. None on a thread,
+    /// whose text does not step yet.
+    pub fn field(&self) -> Option<crate::find::Field> {
+        // A row that says it itself, not a board kept for what it holds.
+        let says = |query: &str, row: &Row| match row {
+            Row::Board(at) => crate::find::says(query, &self.boards[*at].name),
+            Row::Hung(_) | Row::Thread(_) | Row::Item(_) => true,
+            Row::Fold(_) | Row::Heading(_) => false,
+        };
+        match self.pages.last() {
+            Some(Page::Thread { .. }) => None,
+            Some(Page::Board { name, finding, .. }) => {
+                let find = finding.as_ref()?;
+                let board = self.boards.iter().find(|board| board.name == *name)?;
+                let left = (board.items.iter())
+                    .filter(|item| {
+                        crate::board_view::found_on_page(&self.items[**item], &find.query)
+                    })
+                    .count();
+                Some(crate::find::Field::rows(
+                    &find.query,
+                    left,
+                    board.items.len(),
+                ))
+            }
+            None => {
+                let find = self.finding.as_ref()?;
+                let count = |rows: Vec<Row>, query: &str| {
+                    rows.iter().filter(|row| says(query, row)).count()
+                };
+                let left = count(self.rows(), &find.query);
+                let of = count(self.rows_finding(Some(String::new())), "");
+                Some(crate::find::Field::rows(&find.query, left, of))
+            }
+        }
     }
 
     fn head(&self, boards: usize, threads: usize) -> Line<'static> {
@@ -3118,7 +3152,7 @@ impl View {
             }) = self.pages.last()
         {
             out.push(Line::default());
-            out.push(Line::from(format!("no item matches {}", find.query)).dim());
+            out.push(Line::from(format!("nothing here matches {}", find.query)).dim());
         }
         for row in &rows {
             match row {
@@ -3425,7 +3459,9 @@ mod tests {
         let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         assert_eq!(view.press(ctrl_f), Key::Stay);
         assert!(view.finding());
-        assert_eq!(text(&mut view).last().unwrap(), "find");
+        // The field is the pane's, under its title, not a row of the list.
+        assert!(!text(&mut view).iter().any(|line| line.starts_with("find")));
+        assert_eq!(view.field(), Some(crate::find::Field::rows("", 3, 3)));
         // Typed, it narrows; the pick to the first match.
         assert_eq!(view.press(key(KeyCode::Char('c'))), Key::Stay);
         assert!(says(&mut view, "round half cents") && says(&mut view, "README"));
@@ -3437,7 +3473,7 @@ mod tests {
         assert!(!says(&mut view, "round half") && says(&mut view, "Caching the CI"));
         assert!(!says(&mut view, "README"), "{:#?}", text(&mut view));
         assert!(picked(&mut view).contains("Caching the CI"));
-        assert_eq!(text(&mut view).last().unwrap(), "find cac");
+        assert_eq!(view.field(), Some(crate::find::Field::rows("cac", 1, 3)));
         // The arrows stay among the threads found.
         view.press(key(KeyCode::Up));
         assert!(picked(&mut view).contains("Caching the CI"));
@@ -3457,7 +3493,7 @@ mod tests {
         assert!(!view.finding() && !view.paste("zz"));
         assert!(picked(&mut view).contains("README"));
         assert!(says(&mut view, "README") && says(&mut view, "round half"));
-        assert!(!text(&mut view).last().unwrap().contains("find"));
+        assert_eq!(view.field(), None);
         assert_eq!(view.press(key(KeyCode::Esc)), Key::Close);
         let _ = std::fs::remove_dir_all(home);
     }

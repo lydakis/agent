@@ -6234,6 +6234,16 @@ impl Watch {
             && self.stop.is_none()
     }
 
+    /// The find field over the rows, while finding in them: how many
+    /// agents say what is typed, of how many.
+    fn field(&self) -> Option<find::Field> {
+        let find = self.finding.as_ref().filter(|_| self.rows_shown())?;
+        let left = (self.rows.iter())
+            .filter(|row| status::says(row, &find.query))
+            .count();
+        Some(find::Field::rows(&find.query, left, self.rows.len()))
+    }
+
     /// What is typed to find, once anything is.
     fn query(&self) -> Option<&str> {
         (self.finding.as_ref())
@@ -15155,12 +15165,14 @@ impl App {
     /// The project's agents on one card, from the daemon and Rex alone,
     /// in the pane beside the conversation, live until Esc.
     /// Whether a find is under way in the pane's view: `/status`,
-    /// `/background` or `/commons`.
+    /// `/background`, `/commons`, `/memory` or `/audit`.
     fn view_finding(&self) -> bool {
         self.watch.as_ref().is_some_and(|watch| {
             (watch.finding.is_some() && watch.rows_shown())
                 || (watch.background.as_ref()).is_some_and(|view| view.finding())
                 || (watch.commons.as_ref()).is_some_and(|view| view.finding())
+                || (watch.memory.as_ref()).is_some_and(|view| view.finding())
+                || (watch.audit.as_ref()).is_some_and(|view| view.finding())
         })
     }
 
@@ -16655,11 +16667,27 @@ impl App {
             {
                 return true;
             }
-            // And in `/commons`.
+            // And in `/commons`, `/memory` and `/audit`.
             Event::Paste(text)
                 if self.pane_keys
                     && self.finding.is_none()
                     && let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut())
+                    && view.paste(text) =>
+            {
+                return true;
+            }
+            Event::Paste(text)
+                if self.pane_keys
+                    && self.finding.is_none()
+                    && let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut())
+                    && view.paste(text) =>
+            {
+                return true;
+            }
+            Event::Paste(text)
+                if self.pane_keys
+                    && self.finding.is_none()
+                    && let Some(view) = self.watch.as_mut().and_then(|w| w.audit.as_mut())
                     && view.paste(text) =>
             {
                 return true;
@@ -16958,6 +16986,7 @@ impl App {
                         watch.picked = None;
                         return true;
                     }
+                    find::Typed::Held => return true,
                     find::Typed::Other => {}
                 },
                 None if find::opens(key) => {
@@ -17221,7 +17250,9 @@ impl App {
                         self.copied(&text);
                     }
                     KeyCode::PageUp => pane.screen.page(true),
-                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
+                    KeyCode::PageDown => pane.screen.page(false),
+                    // A space typed into a find is a letter.
+                    KeyCode::Char(' ') if !view.finding() => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
                     // Nothing in `/audit` opens or closes.
@@ -22128,6 +22159,11 @@ impl App {
                 }
             }
         }
+        // The find field is the view's that finds now, set anew each
+        // frame: none where nothing finds.
+        if let Some(pane) = &mut self.pane {
+            pane.find = None;
+        }
         if let (Some(watch), Some(pane)) = (&mut self.watch, &mut self.pane)
             && pane.is_card()
         {
@@ -22185,6 +22221,7 @@ impl App {
                     .collect();
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
+                pane.find = view.field();
                 // A new pick is scrolled to, with the two rows under it; a
                 // page just opened starts at its top; a page whose link
                 // scrolled out of view, so none is picked, stays where the
@@ -22199,6 +22236,7 @@ impl App {
                 }
             } else if let Some(view) = &mut watch.memory {
                 view.drain();
+                pane.find = view.field();
                 // A page open: the title's ‹ goes back from it.
                 pane.page = view.on_page();
                 // Drawn anew only when something changed, as a long list
@@ -22256,6 +22294,7 @@ impl App {
                 marks.extend((links.into_iter()).map(|(row, b)| (row, screen::Mark::Buttons(b))));
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
+                pane.find = view.field();
                 let at = card.at;
                 if view.reading() {
                     // A thread just opened starts at its top, after the
@@ -22282,6 +22321,7 @@ impl App {
                 marks.extend(agent_marks(view.agents()));
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = None;
+                pane.find = view.field();
                 // A new pick is scrolled to, with the two rows under it.
                 if let Some(at) = view.picked_row()
                     && watch.picked != Some(at)
@@ -22387,6 +22427,7 @@ impl App {
                         .text();
                 }
                 pane.foot = asked.map(workflow::view::stop_question);
+                pane.find = watch.field();
                 pane.set_card_marked(lines, marks, &keys);
                 // Scrolled to once, as a new pick, so the page keys still
                 // move away from it; after the card, whose swap would
@@ -22525,6 +22566,20 @@ impl App {
                     .view
                     .lines(page.width as usize, page.height as usize, now_ms());
                 frame.render_widget(Paragraph::new(lines), page);
+                // The find field, on the row under its title, as every
+                // pane view has it.
+                if let Some(field) = open.view.field()
+                    && page.height > 1
+                {
+                    let row = Rect {
+                        x: page.x + 1,
+                        y: page.y + 1,
+                        width: page.width.saturating_sub(1),
+                        height: 1,
+                    };
+                    let cursor = find::draw(&field, row, frame.buffer_mut());
+                    frame.set_cursor_position(cursor);
+                }
             }
             let history = ratatui::layout::Rect {
                 y: history.bottom().saturating_sub(rows as u16),
@@ -22595,30 +22650,19 @@ impl App {
                 // Over the rows above the composer's band.
                 over(frame, list::lines(&items, pick, width, gap.y as usize), gap);
             }
-            // Finding in **Projects**: what is typed, where the
-            // conversation's find has it.
-            if let Some(query) = (self.projects.as_ref())
-                .and_then(|open| open.view.finding.as_ref())
-                .map(|find| find.query.clone())
-            {
-                let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
-                frame.render_widget(Paragraph::new(line), composer);
-                frame.set_cursor_position((composer.x + 5 + query.width() as u16, composer.y));
-                return;
-            }
+            // The conversation's find, above the composer, as built: the
+            // same field every view draws, its place among the places at
+            // its right end, and its keys under it.
             if let Some(query) = &self.finding {
-                let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
-                frame.render_widget(Paragraph::new(line), composer);
-                frame.set_cursor_position((composer.x + 5 + query.width() as u16, composer.y));
-                let place = match self.screen.found() {
-                    _ if self.find_step.is_some() => "  looking further · ".to_owned(),
-                    Some((_, 0)) if !query.is_empty() => "  not found · ".to_owned(),
-                    Some((at, count)) if count > 0 => format!("  {at} of {count} · "),
-                    _ => "  ".to_owned(),
-                };
-                let mut keys = vec![Span::raw(place)];
+                let mut field = find::Field::text(query, self.screen.found());
+                if self.find_step.is_some() {
+                    field.said = "looking further".into();
+                }
+                let cursor = find::draw(&field, composer, frame.buffer_mut());
+                frame.set_cursor_position(cursor);
                 let search =
                     (hint::Keys::new().key("↑", "older").key("↓", "newer")).esc(hint::Esc::Close);
+                let mut keys = vec![Span::raw("  ")];
                 keys.extend(hint::spans(&search.text()));
                 let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
@@ -23989,7 +24033,7 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
         card[0] = status::head(&watch.project, &watch.rows);
         if rows.is_empty() {
             card.push(Line::default());
-            card.push(Line::from(format!("no agent matches {query}")).dim());
+            card.push(Line::from(format!("nothing here matches {query}")).dim());
         }
     }
     // Each agent a row names, a row waits on or a window sits beside,
@@ -24014,11 +24058,6 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
         (below(at), screen::Mark::Link(link))
     }));
     marks.extend(named_agents);
-    // The find row, the view's last.
-    if let Some(find) = &watch.finding {
-        card.push(Line::default());
-        card.push(find::line(&find.query));
-    }
     let lines = card
         .into_iter()
         .map(|line| {
@@ -38580,8 +38619,15 @@ mod tests {
         app.key(ctrl_f.clone()).await;
         assert!(app.watch.as_ref().unwrap().finding.is_some());
         assert!(app.input.is_empty() && app.finding.is_none());
-        // The find row is the view's last.
-        assert_eq!(card(&app).last().unwrap(), " find");
+        // The field is the pane's, under its title, not a row of the card:
+        // every agent there, before anything is typed.
+        assert!(
+            !card(&app)
+                .iter()
+                .any(|line| line.trim_start().starts_with("find"))
+        );
+        let field = |app: &App| app.watch.as_ref().and_then(Watch::field);
+        assert_eq!(field(&app), Some(find::Field::rows("", 5, 5)));
         for c in "sums".chars() {
             app.key(key(KeyCode::Char(c))).await;
         }
@@ -38590,7 +38636,7 @@ mod tests {
         assert!(says(&app, "Fix the sums"), "{:#?}", card(&app));
         assert!(!says(&app, "Round half") && !says(&app, "Working"));
         assert!(!says(&app, "Needs you") && !says(&app, "Idle"));
-        assert_eq!(card(&app).last().unwrap(), " find sums");
+        assert_eq!(field(&app), Some(find::Field::rows("sums", 1, 5)));
         // The pick on the first match.
         assert_eq!(picked(&app), Some(Picked::Agent("calc.old".into())));
         // A fold opened or shut while finding is put back with the rest.
@@ -38620,7 +38666,12 @@ mod tests {
         assert_eq!(picked(&app), Some(Picked::Agent("calc.halves".into())));
         // Nothing found says so.
         app.key(key(KeyCode::Char('z'))).await;
-        assert!(says(&app, "no agent matches halvesz"), "{:#?}", card(&app));
+        assert!(
+            says(&app, "nothing here matches halvesz"),
+            "{:#?}",
+            card(&app)
+        );
+        assert_eq!(field(&app), Some(find::Field::rows("halvesz", 0, 5)));
         assert_eq!(picked(&app), None);
         // Finding reads nothing more from the daemon.
         assert_eq!(asked.load(Ordering::SeqCst), before);
@@ -38632,7 +38683,7 @@ mod tests {
         assert_eq!(watch.pick, Some(1));
         assert!(says(&app, "Round half") && says(&app, "Check the README"));
         assert!(!says(&app, "Fix the sums"), "the done fold shut again");
-        assert!(!card(&app).last().unwrap().contains("find"));
+        assert_eq!(field(&app), None);
         assert!(app.pane.is_some());
         // The next `esc` closes the view.
         app.key(key(KeyCode::Esc)).await;
@@ -38936,6 +38987,342 @@ mod tests {
         assert_eq!(watch.helpers, ["calc.errors"]);
     }
 
+    /// A terminal a test draws the whole window on, as a screen would.
+    struct Shot(ratatui::backend::TestBackend);
+
+    impl Backend for Shot {
+        type Error = std::io::Error;
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.0.draw(content).map_err(|never| match never {})
+        }
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.0.hide_cursor().map_err(|never| match never {})
+        }
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.0.show_cursor().map_err(|never| match never {})
+        }
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            self.0.get_cursor_position().map_err(|never| match never {})
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.0
+                .set_cursor_position(position)
+                .map_err(|never| match never {})
+        }
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.0.clear().map_err(|never| match never {})
+        }
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+            self.0
+                .clear_region(clear_type)
+                .map_err(|never| match never {})
+        }
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            self.0.size().map_err(|never| match never {})
+        }
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            self.0.window_size().map_err(|never| match never {})
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Backend::flush(&mut self.0).map_err(|never| match never {})
+        }
+        fn scroll_region_up(
+            &mut self,
+            region: std::ops::Range<u16>,
+            lines: u16,
+        ) -> std::io::Result<()> {
+            self.0
+                .scroll_region_up(region, lines)
+                .map_err(|never| match never {})
+        }
+        fn scroll_region_down(
+            &mut self,
+            region: std::ops::Range<u16>,
+            lines: u16,
+        ) -> std::io::Result<()> {
+            self.0
+                .scroll_region_down(region, lines)
+                .map_err(|never| match never {})
+        }
+    }
+
+    impl std::io::Write for Shot {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `/status` for `project`, nothing else open over it.
+    fn watch_of(project: &str) -> Watch {
+        Watch {
+            project: project.into(),
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+            listed: true,
+            drawn: Default::default(),
+            finding: None,
+        }
+    }
+
+    /// The window drawn: the row `at` rows under the top of `area` from
+    /// its left to its edge, and where the terminal's cursor is.
+    fn drawn_row(terminal: &mut Terminal<Shot>, area: Rect, at: u16) -> (String, (u16, u16)) {
+        let buffer = terminal.backend().0.buffer();
+        let row = (area.x..area.right())
+            .map(|x| buffer[(x, area.y + at)].symbol().to_owned())
+            .collect();
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        (row, (cursor.x, cursor.y))
+    }
+
+    #[tokio::test]
+    async fn the_find_field_is_the_row_under_the_title_in_every_view() {
+        let ctrl_f = Event::Key(event::KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+        let key = |c| Event::Key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let commons = board_view::tests::commons("field-row");
+        let memory = memory::tests::long("field-row", 20);
+        let memory = std::cell::RefCell::new(Some(memory));
+        // Beside the conversation, and alone in a narrow window; each list
+        // longer than the pane.
+        for (width, height) in [(150, 12), (44, 12)] {
+            for (view, typed) in [
+                ("status", "Task 7"),
+                ("background", "nightly-7"),
+                ("commons", "enum"),
+                ("memory", "fact-7"),
+                ("audit", "tool-7"),
+            ] {
+                let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let counted = asked.clone();
+                let mut app = app(daemon_answering(move |_| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    json!({})
+                })
+                .await);
+                let mut watch = watch_of("calc");
+                match view {
+                    "status" => {
+                        watch.rows = (0..30)
+                            .map(|at| status::Row {
+                                name: format!("task-{at}"),
+                                bot: format!("calc.task-{at}"),
+                                title: format!("Task {at}"),
+                                state: "working".into(),
+                                group: status::Group::Working,
+                                ..Default::default()
+                            })
+                            .collect();
+                    }
+                    "background" => watch.background = Some(background::tests::long(20)),
+                    "commons" => watch.commons = Some(commons::View::open(&commons, "shop".into())),
+                    "memory" => {
+                        // Read once, and given to each window in turn.
+                        watch.memory = memory.borrow_mut().take();
+                    }
+                    _ => {
+                        let mut audit = audit::View::new(background::Scope {
+                            project: "calc".into(),
+                            lead: "calc.lead".into(),
+                            glob: "calc.*".into(),
+                        });
+                        let rows: Vec<Value> = (0..40)
+                            .map(|at| {
+                                json!({"bot": "calc.lead", "tool": format!("tool-{at}"),
+                                    "kind": "shell", "place": "sandbox", "approved": "nobody",
+                                    "outcome": "completed", "at_ms": 0, "preview": "ls"})
+                            })
+                            .collect();
+                        audit.loaded(Ok(json!({ "rows": rows })));
+                        watch.audit = Some(audit);
+                    }
+                }
+                app.open_pane(pane::Pane::card(view, PICK_KEYS));
+                app.pane_keys = true;
+                app.watch = Some(watch);
+                let mut terminal =
+                    Terminal::new(Shot(ratatui::backend::TestBackend::new(width, height))).unwrap();
+                app.draw(&mut terminal).unwrap();
+                let area = app.pane.as_ref().unwrap().area;
+                let at = format!("{view} at {width}");
+                // At rest the row under the title is empty, and the list
+                // is longer than the pane.
+                let (under, _) = drawn_row(&mut terminal, area, 1);
+                assert_eq!(under.trim(), "", "{at}");
+                let (first, _) = drawn_row(&mut terminal, area, 2);
+                let (last, _) = drawn_row(&mut terminal, area, area.height - 1);
+                assert!(!last.trim().is_empty(), "{at}: the list fills the pane");
+                let before = asked.load(std::sync::atomic::Ordering::SeqCst);
+                // Opened with nothing typed: the field, the cursor in it, a
+                // muted prompt after it and every row's count; nothing moves.
+                app.key(ctrl_f.clone()).await;
+                app.draw(&mut terminal).unwrap();
+                let (under, cursor) = drawn_row(&mut terminal, area, 1);
+                assert!(under.starts_with(" find type to narrow"), "{at}: {under:?}");
+                assert_eq!(cursor, (area.x + 6, area.y + 1), "{at}");
+                let field = app.pane.as_ref().unwrap().find.clone().unwrap();
+                let every = field.said.clone();
+                assert!(under.trim_end().ends_with(&every), "{at}: {under:?}");
+                assert_eq!(drawn_row(&mut terminal, area, 2).0, first, "{at}");
+                // Typed: the words in the field, the cursor after them, the
+                // rows narrowed under it, how many are left at its end.
+                for c in typed.chars() {
+                    app.key(key(c)).await;
+                }
+                app.draw(&mut terminal).unwrap();
+                let (under, cursor) = drawn_row(&mut terminal, area, 1);
+                assert!(
+                    under.starts_with(&format!(" find {typed}")),
+                    "{at}: {under:?}"
+                );
+                assert_eq!(
+                    cursor,
+                    (area.x + 6 + typed.len() as u16, area.y + 1),
+                    "{at}"
+                );
+                let field = app.pane.as_ref().unwrap().find.clone().unwrap();
+                assert_eq!(field.query, typed, "{at}");
+                assert_ne!(field.said, every, "{at}: it narrowed");
+                assert!(under.trim_end().ends_with(&field.said), "{at}: {under:?}");
+                // Backspace with nothing typed does nothing; esc drops the
+                // find and the row is empty again; nothing read meanwhile.
+                for _ in 0..typed.len() + 2 {
+                    app.key(Event::Key(event::KeyEvent::new(
+                        KeyCode::Backspace,
+                        KeyModifiers::NONE,
+                    )))
+                    .await;
+                }
+                app.draw(&mut terminal).unwrap();
+                assert!(
+                    drawn_row(&mut terminal, area, 1)
+                        .0
+                        .starts_with(" find type to narrow")
+                );
+                assert!(app.pane.is_some(), "{at}: still open");
+                app.key(Event::Key(event::KeyEvent::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                )))
+                .await;
+                app.draw(&mut terminal).unwrap();
+                assert_eq!(drawn_row(&mut terminal, area, 1).0.trim(), "", "{at}");
+                assert!(app.pane.is_some(), "{at}: esc dropped the find first");
+                assert_eq!(
+                    asked.load(std::sync::atomic::Ordering::SeqCst),
+                    before,
+                    "{at}"
+                );
+                // The memory view goes on to the next window.
+                if view == "memory" {
+                    *memory.borrow_mut() = app.watch.take().and_then(|watch| watch.memory);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&commons);
+    }
+
+    #[tokio::test]
+    async fn projects_has_the_find_field_on_the_row_under_its_title() {
+        let mut view = projects::View::new("p0.lead");
+        let now = now_ms();
+        let listed = (0..30)
+            .map(|at| projects::Project {
+                lead: format!("p{at}.lead"),
+                name: format!("p{at}"),
+                title: format!("Project {at}"),
+                folder: format!("/work/p{at}"),
+                state: "working".into(),
+                last: now,
+                ..Default::default()
+            })
+            .collect();
+        view.set(listed, now);
+        for (width, height) in [(150, 12), (44, 12)] {
+            let mut app = app(daemon_answering(|_| json!({})).await);
+            app.projects = Some(Box::new(ProjectsOpen {
+                view: projects::View::new("p0.lead"),
+                job: None,
+                read_at: Some(Instant::now()),
+                state: ProjectsState::default(),
+                whole: true,
+                waiting: Default::default(),
+                version: None,
+                page: Rect::default(),
+                side: Rect::default(),
+            }));
+            let open = app.projects.as_mut().unwrap();
+            open.view.set(view.projects().to_vec(), now);
+            let mut terminal =
+                Terminal::new(Shot(ratatui::backend::TestBackend::new(width, height))).unwrap();
+            app.draw(&mut terminal).unwrap();
+            let page = app.projects.as_ref().unwrap().page;
+            let at = format!("projects at {width}");
+            let (title, _) = drawn_row(&mut terminal, page, 0);
+            assert!(title.starts_with(" projects"), "{at}: {title:?}");
+            assert_eq!(drawn_row(&mut terminal, page, 1).0.trim(), "", "{at}");
+            let (head, _) = drawn_row(&mut terminal, page, 2);
+            app.key(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::CONTROL,
+            )))
+            .await;
+            app.draw(&mut terminal).unwrap();
+            let (under, cursor) = drawn_row(&mut terminal, page, 1);
+            assert!(under.starts_with(" find type to narrow"), "{at}: {under:?}");
+            assert!(under.trim_end().ends_with("30 of 30"), "{at}: {under:?}");
+            assert_eq!(cursor, (page.x + 6, page.y + 1), "{at}");
+            assert_eq!(
+                drawn_row(&mut terminal, page, 2).0,
+                head,
+                "{at}: nothing moved"
+            );
+            for c in "Project 7".chars() {
+                app.key(Event::Key(event::KeyEvent::new(
+                    KeyCode::Char(c),
+                    KeyModifiers::NONE,
+                )))
+                .await;
+            }
+            app.draw(&mut terminal).unwrap();
+            let (under, cursor) = drawn_row(&mut terminal, page, 1);
+            assert!(under.starts_with(" find Project 7"), "{at}: {under:?}");
+            assert!(under.trim_end().ends_with("1 of 30"), "{at}: {under:?}");
+            assert_eq!(cursor, (page.x + 15, page.y + 1), "{at}");
+            // The composer never holds it.
+            let composer = (0..height)
+                .map(|y| drawn_row(&mut terminal, Rect::new(0, 0, width, height), y).0)
+                .filter(|row| row.contains("find"))
+                .count();
+            assert_eq!(composer, 1, "{at}: one field");
+        }
+    }
+
     #[tokio::test]
     async fn h_j_k_l_typed_into_the_commons_find_are_letters() {
         let mut app = app(daemon_answering(|_| json!({})).await);
@@ -38973,11 +39360,7 @@ mod tests {
         let view = (app.watch.as_mut())
             .and_then(|w| w.commons.as_mut())
             .unwrap();
-        let (lines, _) = view.card(80);
-        let last: String = (lines.last().unwrap().spans.iter())
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(last, "find shjkl");
+        assert_eq!(view.field().map(|field| field.query), Some("shjkl".into()));
         let _ = std::fs::remove_dir_all(&home);
     }
 
