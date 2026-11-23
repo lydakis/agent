@@ -926,7 +926,13 @@ impl Screen {
     /// above a change in it or under it, and on the newest rows when it
     /// was there.
     fn relay(&mut self, row: usize, shown: Option<usize>) {
-        self.selection = None;
+        // A selection above the rows laid out again stays, as one above a
+        // streamed line does (`unlay`): only one reaching them is let go.
+        if (self.selection.as_ref())
+            .is_some_and(|s| shown.is_some_and(|at| s.anchor.0.max(s.head.0) >= at))
+        {
+            self.selection = None;
+        }
         self.linked = None;
         self.laid += 1;
         let Some(at) = shown else {
@@ -3635,6 +3641,41 @@ mod tests {
         let mut other = Screen::default();
         other.push((0..20).map(|n| Line::from(format!("  item {n}"))).collect());
         screen.restyle(other);
+        assert_eq!(screen.selected(), None);
+    }
+
+    /// A group drawn again under a selection keeps it, as a run of calls
+    /// folded into one row grows while the person selects above it; one
+    /// reaching the group is let go, as its rows are laid out anew.
+    #[test]
+    fn a_group_drawn_again_keeps_a_selection_above_it() {
+        let lines: Vec<Line<'static>> =
+            (0..10).map(|n| Line::from(format!("  line {n}"))).collect();
+        let (mut screen, _) = screen(lines, 30, 20);
+        screen.push(vec![Line::from("• Sent t0 ▸")]);
+        screen.mark_last(Mark::Tag(Tag::Group(1)));
+        let area = Rect::new(0, 0, 30, 20);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1));
+        screen.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 8, 3));
+        let selected = screen.selected();
+        assert_eq!(selected.as_deref(), Some("line 1\nline 2\nline 3"));
+        // The group grows by a row under it: the selection stays, and
+        // copies what it did.
+        let grown = vec![Line::from("• Sent t0, t1 ▸"), Line::from("  more")];
+        assert!(screen.replace_tagged(Tag::Group(1), grown, Vec::new()));
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(screen.selected(), selected);
+        let copied = screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 8, 3));
+        assert_eq!(copied, selected.map(Action::Copy));
+        assert_eq!(row(&buf, 10).trim_end(), "• Sent t0, t1 ▸");
+        // One that reaches the group is let go when it is drawn again.
+        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 9));
+        screen.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 6, 10));
+        assert!(screen.selected().is_some());
+        let again = vec![Line::from("• Sent t0, t1, t2 ▸")];
+        assert!(screen.replace_tagged(Tag::Group(1), again, Vec::new()));
         assert_eq!(screen.selected(), None);
     }
 
