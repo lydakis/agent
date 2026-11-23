@@ -14028,10 +14028,26 @@ impl App {
     fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
         let mut drawn = self.staged_drawn.borrow_mut();
         let folder = std::path::Path::new(&self.workspace);
-        // Kept for those still waiting alone, at the width drawn now.
-        drawn.retain(|((turn, at, _), _)| {
-            *at == width && self.staged.iter().any(|(staged, _)| staged == turn)
+        // Kept for those still waiting alone, at the width drawn now, and
+        // while their code is still being colored: a message is colored
+        // once at a time, however often the window is resized.
+        drawn.retain(|staged| {
+            let (turn, at, _) = staged.key;
+            self.staged.iter().any(|(staged, _)| *staged == turn)
+                && (at == width || staged.coloring.is_some())
         });
+        // Their code colored beside the loop, in place once it is.
+        for staged in drawn.iter_mut() {
+            let landed = staged.coloring.as_ref().map(|job| job.try_recv());
+            match landed {
+                Some(Ok(colored)) => staged.rows = colored,
+                // Not colored, and left plain.
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {}
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => continue,
+            }
+            staged.coloring = None;
+            staged.plain = false;
+        }
         let mut rows: Vec<Line<'static>> = self
             .staged
             .iter()
@@ -14045,15 +14061,38 @@ impl App {
                     _ => None,
                 };
                 let key = (*turn, width, waits);
-                let shown = drawn
-                    .iter()
-                    .find(|(at, _)| *at == key)
-                    .map(|(_, rows)| rows.clone())
-                    .unwrap_or_else(|| {
-                        let rows = staged_body(prompt, width, waits, folder);
-                        drawn.push((key, rows.clone()));
-                        rows
+                let at = match drawn.iter().position(|staged| staged.key == key) {
+                    Some(at) => at,
+                    None => {
+                        // Code is colored beside the loop, a long paste of it
+                        // taking long: its words show at once, plain.
+                        let plain = prompt.contains("```") || prompt.contains("~~~");
+                        let rows = staged_body(prompt, width, waits, folder, !plain);
+                        drawn.push(StagedDrawn {
+                            key,
+                            rows,
+                            plain,
+                            coloring: None,
+                        });
+                        drawn.len() - 1
+                    }
+                };
+                // Colored when no coloring of it runs, the one that does
+                // done first.
+                let coloring =
+                    (drawn.iter()).any(|staged| staged.key.0 == *turn && staged.coloring.is_some());
+                if drawn[at].plain && !coloring {
+                    let (prompt, folder) = (prompt.clone(), folder.to_owned());
+                    let (colored, coloring) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rows = staged_body(&prompt, width, waits, &folder, true);
+                        if colored.send(rows).is_ok() {
+                            crate::drawing::ring();
+                        }
                     });
+                    drawn[at].coloring = Some(coloring);
+                }
+                let shown = drawn[at].rows.clone();
                 std::iter::once(Line::default()).chain(shown)
             })
             .collect();
@@ -15172,7 +15211,8 @@ impl App {
                 let (_, prompt) = self.staged.remove(at);
                 if data["status"] == "failed" {
                     let width = self.prose();
-                    let mut lines = staged_body(&prompt, width, None, Path::new(&self.workspace));
+                    let mut lines =
+                        staged_body(&prompt, width, None, Path::new(&self.workspace), true);
                     lines.push(Line::default());
                     let why = data["detail"].as_str().or(data["error"].as_str());
                     lines.push(transcript::finished("not run", why.unwrap_or(""), None));
@@ -25648,8 +25688,15 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
 }
 
 /// A staged message's rows by its turn, the width and the mark it
-/// waits with ([`App::staged_drawn`]).
-type StagedDrawn = ((i64, usize, Option<char>), Vec<Line<'static>>);
+/// waits with ([`App::staged_drawn`]), and the same rows with its code
+/// colored while they are made beside the loop, one at a time.
+struct StagedDrawn {
+    key: (i64, usize, Option<char>),
+    rows: Vec<Line<'static>>,
+    /// Its code not colored yet.
+    plain: bool,
+    coloring: Option<std::sync::mpsc::Receiver<Vec<Line<'static>>>>,
+}
 
 /// The last `compacted` event's data for compaction `version`, of any
 /// agent: a fork's compaction is its source's, recorded under the source.
@@ -25683,6 +25730,7 @@ fn staged_body(
     width: usize,
     waits: Option<char>,
     folder: &std::path::Path,
+    colored: bool,
 ) -> Vec<Line<'static>> {
     if let Some(ran) = user_shell::read(prompt) {
         return user_shell::header(&ran.command, width, true);
@@ -25696,13 +25744,11 @@ fn staged_body(
         None => (None, prompt),
     };
     let leads = (Line::from(Span::raw(first)), Line::from(rest));
-    // Its pictures' paths start where the landed message's do.
-    let words = transcript::markdown(
-        &mut transcript::Markdown::in_folder(folder),
-        prompt,
-        width,
-        leads,
-    );
+    // Its pictures' paths start where the landed message's do; its code
+    // plain unless `colored`, the same rows.
+    let mut markdown = transcript::Markdown::in_folder(folder);
+    markdown.colored = (!colored).then_some(0);
+    let words = transcript::markdown(&mut markdown, prompt, width, leads);
     asked
         .into_iter()
         .chain(words.into_iter().map(|row| row.dim()))
@@ -31202,7 +31248,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shot.png"), b"not drawn in tests").unwrap();
         let shown = |folder: &std::path::Path| {
-            let rows = staged_body("![A shot](shot.png)", 80, None, folder);
+            let rows = staged_body("![A shot](shot.png)", 80, None, folder, true);
             rows.iter()
                 .map(|row| row.to_string())
                 .collect::<Vec<_>>()
@@ -31244,6 +31290,45 @@ mod tests {
         app.staged.clear();
         app.staged_rows(60);
         assert!(app.staged_drawn.borrow().is_empty());
+        // Code shows at once, plain, and is colored beside the loop: the
+        // same rows, in place once ready.
+        let code = format!(
+            "```rust\n{}```",
+            (0..200)
+                .map(|n| format!("fn f{n}() -> u32 {{ {n} }}\n"))
+                .collect::<String>()
+        );
+        app.staged.push((7, code.clone()));
+        let folder = std::path::Path::new(&app.workspace).to_owned();
+        let first = app.staged_rows(80);
+        // Resized while it is colored, it is colored once at a time.
+        app.staged_rows(60);
+        app.staged_rows(70);
+        let coloring = |app: &App| {
+            (app.staged_drawn.borrow().iter())
+                .filter(|staged| staged.coloring.is_some())
+                .count()
+        };
+        assert!(coloring(&app) <= 1, "one coloring at a time");
+        let colored = staged_body(&code, 80, None, &folder, true);
+        let began = Instant::now();
+        let mut rows = first.clone();
+        while !rows
+            .windows(colored.len())
+            .any(|rows| rows == colored.as_slice())
+        {
+            assert!(began.elapsed() < Duration::from_secs(60), "never colored");
+            std::thread::sleep(Duration::from_millis(5));
+            rows = app.staged_rows(80);
+        }
+        let text = |rows: &[Line<'static>]| rows.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        assert_eq!(text(&first), text(&rows));
+        assert_eq!(app.staged_drawn.borrow().len(), 1);
+        assert!(
+            app.staged_drawn.borrow()[0].coloring.is_none(),
+            "landed once"
+        );
+        assert!(!app.staged_drawn.borrow()[0].plain);
     }
 
     #[tokio::test]
