@@ -741,6 +741,15 @@ struct ProjectRead {
 }
 
 impl App {
+    /// Whether a pane opens beside this window's conversation: always in
+    /// a window of its own; in an agent drawn in another's pane, only
+    /// while it is wide enough for its conversation and the margin side
+    /// by side, as on a large screen, where the margin shows by itself.
+    fn room_beside(&self) -> bool {
+        !self.options.embedded
+            || pane::margin_width(self.full_width, kept(self.full_width)).is_some()
+    }
+
     /// Whether **Projects** shows here: not in zen, in a side chat or in
     /// an agent shown beside, where each keeps the person where they are.
     fn projects_here(&self) -> bool {
@@ -6621,6 +6630,12 @@ struct App {
     /// What is typed goes with the window to the agent it switches to:
     /// `alt+n` works with words typed, which it never drops.
     carry_draft: bool,
+    /// Drawn in another's pane: whether that one was last told this
+    /// window holds work ending it would lose ([`embed::keeps`]).
+    told_keeps: bool,
+    /// A key, a click or a paste read since that one was last told: it
+    /// is told again after each, so it knows the input it sent was read.
+    heard: bool,
     /// The Sonny installed while this window was open, which it reopens on
     /// once it quits ([`update::installed_since`]).
     reopen_on: Option<PathBuf>,
@@ -8898,6 +8913,8 @@ impl App {
             quit: false,
             switch_to: None,
             carry_draft: false,
+            told_keeps: false,
+            heard: false,
             reopen_on: None,
             started: Instant::now(),
             fleet: None,
@@ -9499,6 +9516,8 @@ impl App {
                 }
             }
             self.pane_switched();
+            self.tell_keeps();
+            self.settle_kept();
             self.side_closed();
             self.suggested_now().await;
             self.shell_ran().await;
@@ -11725,6 +11744,12 @@ impl App {
     /// The task `bot` opened in the pane: its own Sonny, to watch it and
     /// talk to it.
     fn open_task(&mut self, bot: &str) {
+        // Drawn in another's pane with no room for one of its own, the
+        // Sonny it is drawn in shows the agent there instead, this one
+        // kept to go back to.
+        if !self.room_beside() {
+            return embed::open_here(bot);
+        }
         let name = (self.tasks.values().flatten())
             .find(|task| task.bot == bot)
             .map_or(bot.to_owned(), |task| task.name.clone());
@@ -11744,6 +11769,44 @@ impl App {
     /// Sonny run with `args` in the pane, on a terminal of its own: a side
     /// chat, or a task opened to watch.
     fn embed(&mut self, title: &str, args: &[String]) -> Result<(), String> {
+        let program = self.spawn_beside(args)?;
+        let pane = pane::Pane::program(title, program);
+        // Opened from `/status`, it goes back there, as a browser goes back;
+        // in place of another agent's, it goes back to that one.
+        match self.pane.take() {
+            Some(shown) if shown.is_card() && self.watch.is_some() => {
+                self.open_pane(pane.after(shown))
+            }
+            Some(shown) if shown.program.is_some() && shown.agent.is_some() => {
+                self.open_pane(pane.after(shown))
+            }
+            shown => {
+                self.pane = shown;
+                self.open_pane(pane);
+            }
+        }
+        Ok(())
+    }
+
+    /// The agent the pane went back or forward to, kept with its Sonny
+    /// ended, shown with it started again; anything else as it is.
+    fn wake(&mut self, pane: pane::Pane) -> Option<pane::Pane> {
+        if !pane.asleep() {
+            return Some(pane);
+        }
+        let bot = pane.agent.clone().unwrap_or_default();
+        let args = ["--no-sound", "--no-layout", "--embedded", "--agent", &bot].map(str::to_owned);
+        match self.spawn_beside(&args) {
+            Ok(program) => Some(pane.woken(program)),
+            Err(error) => {
+                self.notice = Some(format!("could not open {}: {error}", pane.title()));
+                None
+            }
+        }
+    }
+
+    /// Sonny run with `args` on a terminal of its own, sized for the pane.
+    fn spawn_beside(&self, args: &[String]) -> Result<embed::Embedded, String> {
         let me = named::me().map_err(|e| e.to_string())?;
         let mut command = std::process::Command::new(me);
         command
@@ -11754,6 +11817,13 @@ impl App {
             .args(args);
         let mut program = portable_pty::CommandBuilder::new(command.get_program());
         program.args(command.get_args());
+        // A test's pane runs no Sonny: the test program is not one.
+        #[cfg(test)]
+        let mut program = {
+            let mut sleep = portable_pty::CommandBuilder::new("sleep");
+            sleep.arg("30");
+            sleep
+        };
         if let Ok(here) = std::env::current_dir() {
             program.cwd(here);
         }
@@ -11765,23 +11835,7 @@ impl App {
         };
         let woken = self.woken.clone();
         let drawn = move || woken.notify_one();
-        let program = embed::Embedded::spawn(program, height, width, drawn)?;
-        let pane = pane::Pane::program(title, program);
-        // Opened from `/status`, it goes back there, as a browser goes back.
-        match self.pane.take() {
-            Some(shown) if shown.is_card() && self.watch.is_some() => {
-                self.open_pane(pane.after(shown))
-            }
-            // In place of another agent's, its way back kept.
-            Some(shown) if shown.program.is_some() && shown.agent.is_some() => {
-                self.open_pane(pane.instead_of(shown))
-            }
-            shown => {
-                self.pane = shown;
-                self.open_pane(pane);
-            }
-        }
-        Ok(())
+        embed::Embedded::spawn(program, height, width, drawn)
     }
 
     /// The calls folded at `at` drawn again where they are, folded or
@@ -17960,14 +18014,22 @@ impl App {
 
     /// `pane` beside the conversation, with the keys; what was selected
     /// or being found in the conversation let go.
-    fn open_pane(&mut self, mut pane: pane::Pane) {
-        // An agent drawn in another's pane opens none of its own: what
-        // it would show goes, and the person is told where views open.
-        if self.options.embedded {
+    fn open_pane(&mut self, pane: pane::Pane) {
+        // An agent drawn in another's pane with no room for one of its
+        // own opens none: what it would show goes, and the person is told
+        // where views open.
+        if !self.room_beside() {
             self.watch = None;
             self.notice = Some(BESIDE.into());
             return;
         }
+        self.show_pane(pane);
+    }
+
+    /// `pane` beside the conversation, with the keys, room or not: what
+    /// the pane already holds, stepped back or forward through or opened
+    /// again, stays reachable after the window narrows.
+    fn show_pane(&mut self, mut pane: pane::Pane) {
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
         // open goes.
@@ -18021,8 +18083,8 @@ impl App {
     /// so one opened to look at stays, empty or not.
     fn margin_back(&mut self) {
         use agent_client::config::MarginOpens;
-        // Drawn in another's pane, it has no pane for the margin.
-        if self.options.embedded {
+        // Drawn in another's pane with no room, it has none for the margin.
+        if !self.room_beside() {
             return;
         }
         let posted = self.margin.posted();
@@ -18051,7 +18113,7 @@ impl App {
 
     /// `/margin`: the margin shown, with the keys, or closed.
     fn toggle_margin(&mut self) {
-        if self.options.embedded {
+        if !self.room_beside() {
             self.notice = Some(BESIDE.into());
             return;
         }
@@ -18458,7 +18520,7 @@ impl App {
                 if let Some(view) = watch.as_mut().and_then(|w| w.sky.as_mut()) {
                     view.resume();
                 }
-                self.open_pane(pane);
+                self.show_pane(pane);
                 self.watch = watch;
             }
             _ => return false,
@@ -18487,7 +18549,15 @@ impl App {
     /// The pane back (`back`) or forward to what it showed, as it was left.
     fn go(&mut self, back: bool) {
         if let Some(pane) = self.pane.take() {
-            self.open_pane(pane.go(back));
+            // An agent gone back to starts again; one that cannot shows
+            // nothing, the pane closed, rather than an empty Sonny.
+            match self.wake(pane.go(back)) {
+                Some(pane) => self.show_pane(pane),
+                None => {
+                    self.pane = self.under.take();
+                    self.pane_keys = false;
+                }
+            }
         }
     }
 
@@ -18648,6 +18718,7 @@ impl App {
             term::heard(reply);
             return;
         }
+        self.heard = true;
         // A stop or a removal asked for in the pane lives only while the
         // keys stay there: whatever took them away (a click, Ctrl+\, a
         // paste) said no, so the view never waits armed for their return.
@@ -22245,6 +22316,62 @@ impl App {
             return self.close_pane(false);
         }
         self.open_task(&bot);
+    }
+
+    /// Drawn in another's pane, that one told when this window comes to
+    /// hold work ending it would lose, or none now: words not sent, a
+    /// write to the daemon not yet done and applied (a message sent, whose
+    /// words come back here if it is refused), a picture or file still
+    /// being made ready, a command of the person's still running or its
+    /// result not yet shown or sent (it goes to the agent from here, a
+    /// refused one with the next message), a first message or a move
+    /// held for the next message, an effort boost armed for it, a model,
+    /// speed or permissions pick that waits for no turn to run or still has
+    /// to reach the agents it made, or an agent in its own pane, shown, put
+    /// aside or kept to go back to, that holds such. It keeps this Sonny running
+    /// while out of view only then.
+    fn tell_keeps(&mut self) {
+        // A side chat is drawn in its window's pane too (`/side`).
+        if !self.options.embedded && self.options.side.is_none() {
+            return;
+        }
+        let panes = [&self.pane, &self.under].into_iter().flatten();
+        let keeps = !self.input.trim().is_empty()
+            || !self.quotes.is_empty()
+            || self.shell.is_some()
+            || !self.writes.is_empty()
+            || self.sending > 0
+            || !self.preparing.is_empty()
+            || !self.fetching.is_empty()
+            || !self.unsent.is_empty()
+            || !self.shown.is_empty()
+            || self.send_after.is_some()
+            || self.move_to.is_some()
+            || self.boost.is_some()
+            || self.switch.is_some()
+            || self.pace.is_some()
+            || self.gating.is_some()
+            || self.spread.is_some()
+            || panes
+                .chain(self.closed.as_ref().map(|(pane, _)| pane))
+                .any(pane::Pane::keeps);
+        let heard = std::mem::take(&mut self.heard);
+        if keeps != self.told_keeps || heard {
+            self.told_keeps = keeps;
+            embed::keeps(keeps);
+        }
+    }
+
+    /// Agents kept to go back or forward to that held work as they were
+    /// left, and hold none now, end as the rest did ([`pane::Pane::settle`]).
+    fn settle_kept(&mut self) {
+        let closed = self.closed.as_mut().map(|(pane, _)| pane);
+        for pane in [self.pane.as_mut(), self.under.as_mut(), closed]
+            .into_iter()
+            .flatten()
+        {
+            pane.settle();
+        }
     }
 
     /// The pane gone once the side chat in it has ended.
@@ -27070,6 +27197,152 @@ mod tests {
         // Closed, the keys back in the conversation, the task put aside.
         assert!(app.pane.is_none() && !app.pane_keys);
         assert!(app.closed.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_agent_clicked_beside_shows_in_its_place_and_back_goes_to_it() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        // An agent in the pane asks for another, as a click on its name
+        // there does.
+        let mut command = portable_pty::CommandBuilder::new("sh");
+        command.args([
+            "-c",
+            "printf '\\033]7700;open=shop.docs\\033\\\\'; exec sleep 30",
+        ]);
+        let program = embed::Embedded::spawn(command, 5, 20, || {}).unwrap();
+        let mut pane = pane::Pane::program("fix", program);
+        pane.as_agent("shop.fix", false);
+        app.open_pane(pane);
+        let shown = |app: &App| app.pane.as_ref().and_then(|pane| pane.agent.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shown(&app).as_deref() == Some("shop.fix") && std::time::Instant::now() < deadline {
+            app.pane_switched();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // In its place, running, `fix` kept to go back to.
+        assert_eq!(shown(&app).as_deref(), Some("shop.docs"));
+        let pane = app.pane.as_ref().unwrap();
+        assert!(pane.program.is_some() && pane.can_go(true) && !pane.asleep());
+        // Back: `fix` again, its Sonny started again, `docs` ahead.
+        assert!(app.step_pane(true));
+        assert_eq!(shown(&app).as_deref(), Some("shop.fix"));
+        let pane = app.pane.as_ref().unwrap();
+        assert!(pane.program.is_some() && pane.can_go(false) && !pane.can_go(true));
+        assert_eq!(pane.title(), "fix");
+        // And forward to `docs`.
+        assert!(app.step_pane(false));
+        assert_eq!(shown(&app).as_deref(), Some("shop.docs"));
+        assert!(app.pane.as_ref().unwrap().program.is_some());
+    }
+
+    #[tokio::test]
+    async fn drawn_beside_another_it_says_while_it_holds_work_ending_it_would_lose() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        // A window of its own says nothing.
+        app.input.set("half typed");
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // A side chat, drawn in its window's pane, says so too.
+        app.options.side = Some(1);
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.input.clear();
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        app.options.side = None;
+        app.input.set("half typed");
+        // Drawn in another's pane, words not sent keep it; none, not.
+        app.options.embedded = true;
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.input.clear();
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // A write not yet done and applied keeps it, as a message sent
+        // whose words come back if it is refused.
+        app.write(async { Wrote::Said(None) });
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.beside_done().await;
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // So does a command's result the daemon refused, held for the
+        // next message.
+        app.unsent.push("ran: ls".into());
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.unsent.clear();
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // So does a model, speed or permissions pick waiting for the turn
+        // to end.
+        app.switch = Some(("gpt-6.2".into(), None));
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.switch = None;
+        app.boost = Some("xhigh".into());
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.boost = None;
+        app.gating = Some("auto");
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.gating = None;
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // So does an agent in its own pane that holds such work.
+        let mut command = portable_pty::CommandBuilder::new("sh");
+        command.args(["-c", "printf '\\033]7700;keep=1\\033\\\\'; exec sleep 30"]);
+        let program = embed::Embedded::spawn(command, 5, 20, || {}).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !program.keeps() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut pane = pane::Pane::program("docs", program);
+        pane.as_agent("shop.docs", false);
+        app.pane = Some(pane);
+        app.tell_keeps();
+        assert!(app.told_keeps);
+    }
+
+    #[tokio::test]
+    async fn an_agent_clicked_in_another_s_pane_is_asked_of_the_window_it_is_drawn_in() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.options.embedded = true;
+        // With no tab for it, the window this one is drawn in shows it;
+        // this one opens nothing and says nothing.
+        app.open_agent("shop.halves", true);
+        assert!(app.pane.is_none() && app.notice.is_none());
+        assert!(
+            embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.halves".to_owned())
+        );
+        // Wide enough for a pane of its own, as on a large screen, it
+        // opens the agent beside its own conversation.
+        app.full_width = 200;
+        app.open_agent("shop.webhooks", true);
+        assert_eq!(
+            app.pane.as_ref().and_then(|pane| pane.agent.as_deref()),
+            Some("shop.webhooks")
+        );
+        assert!(app.notice.is_none());
+        assert!(
+            !embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.webhooks".to_owned())
+        );
+        // Narrowed with a way back in its pane, back still goes there.
+        app.open_agent("shop.refunds", true);
+        app.full_width = 0;
+        assert!(app.step_pane(true));
+        assert_eq!(
+            app.pane.as_ref().and_then(|pane| pane.agent.as_deref()),
+            Some("shop.webhooks")
+        );
+        assert!(app.pane.as_ref().unwrap().can_go(false));
     }
 
     #[tokio::test]

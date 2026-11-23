@@ -253,19 +253,10 @@ impl Pane {
     pub fn after(mut self, mut before: Pane) -> Self {
         self.back = std::mem::take(&mut before.back);
         before.forward.clear();
-        self.back.push(before);
+        self.back.push(before.leave());
         if self.back.len() > HISTORY {
             self.back.remove(0);
         }
-        self
-    }
-
-    /// Shown in place of `before`, which goes: where it could go back
-    /// and forward to stays this one's, as a browser's tab keeps its
-    /// history when a link opens in it.
-    pub fn instead_of(mut self, mut before: Pane) -> Self {
-        self.back = std::mem::take(&mut before.back);
-        self.forward = std::mem::take(&mut before.forward);
         self
     }
 
@@ -289,10 +280,57 @@ impl Pane {
         next.back = std::mem::take(&mut self.back);
         next.forward = std::mem::take(&mut self.forward);
         match back {
-            true => next.forward.push(self),
-            false => next.back.push(self),
+            true => next.forward.push(self.leave()),
+            false => next.back.push(self.leave()),
         }
         next
+    }
+
+    /// Kept to go back or forward to: an agent's Sonny ends, its name,
+    /// title and tab kept, so only the one in view runs, however far back
+    /// the pane goes; it starts again when gone back to ([`Pane::asleep`]).
+    /// One holding work ending it would lose keeps running
+    /// ([`crate::embed::keeps`]).
+    fn leave(mut self) -> Self {
+        self.end_unless_kept();
+        self
+    }
+
+    /// An agent's Sonny ended unless it holds work ending it would lose.
+    fn end_unless_kept(&mut self) {
+        if self.agent.is_some()
+            && !(self.program.as_ref()).is_some_and(crate::embed::Embedded::keeps)
+        {
+            self.program = None;
+        }
+    }
+
+    /// Agents kept back or forward that held work as they were left, and
+    /// hold none now (sent, or emptied), end as the rest did.
+    pub fn settle(&mut self) {
+        for kept in self.back.iter_mut().chain(&mut self.forward) {
+            kept.end_unless_kept();
+        }
+    }
+
+    /// Whether a program here, shown or kept back or forward, holds work
+    /// ending it would lose.
+    pub fn keeps(&self) -> bool {
+        (self.program.as_ref()).is_some_and(crate::embed::Embedded::keeps)
+            || (self.back.iter().chain(&self.forward)).any(Pane::keeps)
+    }
+
+    /// An agent kept to go back to, whose Sonny ended as it was left: it
+    /// starts again to be shown ([`Pane::woken`]).
+    pub fn asleep(&self) -> bool {
+        self.agent.is_some() && self.program.is_none() && self.card.is_none()
+    }
+
+    /// `program`, the agent's Sonny started again, shown where this kept
+    /// agent was, with its title, its tab and its way back and forward.
+    pub fn woken(mut self, program: crate::embed::Embedded) -> Self {
+        self.program = Some(program);
+        self
     }
 
     /// A folder in its tree opened or closed, if `url` names one; the
@@ -1664,6 +1702,78 @@ mod tests {
         let row: String = (0..80).map(|x| buf[(x, 2)].symbol()).collect();
         assert_eq!(cells.len(), row.trim().width());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_agent_left_behind_ends_and_starts_again_when_gone_back_to() {
+        let agent = |bot: &str| {
+            let mut sleep = portable_pty::CommandBuilder::new("sleep");
+            sleep.arg("30");
+            let program = crate::embed::Embedded::spawn(sleep, 5, 20, || {}).unwrap();
+            let mut pane = Pane::program(bot, program);
+            pane.as_agent(&format!("shop.{bot}"), false);
+            pane
+        };
+        // `fix` shown in place of `docs`: `docs` kept to go back to, its
+        // Sonny ended, its name and title kept.
+        let fix = agent("fix").after(agent("docs"));
+        assert!(!fix.asleep() && fix.can_go(true));
+        assert!(fix.back[0].asleep());
+        assert_eq!(fix.back[0].agent.as_deref(), Some("shop.docs"));
+        // Back to `docs`: `fix` is kept the same way to go forward to.
+        let docs = fix.go(true);
+        assert_eq!(docs.title, "docs");
+        assert!(docs.asleep() && docs.can_go(false));
+        assert!(docs.forward[0].asleep());
+        // Started again, it is shown with its way forward.
+        let mut sleep = portable_pty::CommandBuilder::new("sleep");
+        sleep.arg("30");
+        let program = crate::embed::Embedded::spawn(sleep, 5, 20, || {}).unwrap();
+        let docs = docs.woken(program);
+        assert!(!docs.asleep() && docs.can_go(false));
+        assert_eq!(docs.agent.as_deref(), Some("shop.docs"));
+        // One holding work ending it would lose (words not sent) keeps running.
+        let mut typing = portable_pty::CommandBuilder::new("sh");
+        typing.args(["-c", "printf '\\033]7700;keep=1\\033\\\\'; exec sleep 30"]);
+        let program = crate::embed::Embedded::spawn(typing, 5, 20, || {}).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !program.keeps() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(program.keeps());
+        let mut drafted = Pane::program("docs", program);
+        drafted.as_agent("shop.docs", false);
+        let mut fix = agent("fix").after(drafted);
+        assert!(fix.back[0].program.is_some() && !fix.back[0].asleep());
+        fix.settle();
+        assert!(!fix.back[0].asleep());
+        // Once it holds none (the words sent), it ends as the rest did.
+        let mut sent = portable_pty::CommandBuilder::new("sh");
+        sent.args([
+            "-c",
+            "printf '\\033]7700;keep=1\\033\\\\'; sleep 0.3; \
+             printf '\\033]7700;keep=0\\033\\\\'; exec sleep 30",
+        ]);
+        let program = crate::embed::Embedded::spawn(sent, 5, 20, || {}).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !program.keeps() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(program.keeps());
+        let mut drafted = Pane::program("docs", program);
+        drafted.as_agent("shop.docs", false);
+        let mut fix = agent("fix").after(drafted);
+        let program = fix.back[0].program.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while program.keeps() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!program.keeps());
+        fix.settle();
+        assert!(fix.back[0].asleep());
+        // Anything else left behind is kept as it was.
+        let card = Pane::card("/status", "esc close");
+        assert!(!card.asleep() && !Pane::margin().asleep());
     }
 
     #[test]

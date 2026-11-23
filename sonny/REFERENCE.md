@@ -122,6 +122,7 @@ A folder can host multiple peer leads (`<project>.lead`, `<project>.lead.NAME`) 
 - `/switch` opens a fuzzy picker over the composer (this folder's leads → this project's agents → other leads → remaining agents; agents waiting on you show `? TITLE  NAME  needs you`).
 - `/switch NAME` jumps directly (you can omit the current project prefix).
 - Typing `/switch` inside a task open in the side pane switches only the pane. Click `↗` or press `Ctrl+G` to promote the pane's agent into the main window.
+- Clicking an agent's name inside the side pane opens it beside that agent when the pane is wide enough for a pane of its own (a large screen), else shows it in the pane in its place, `‹` going back to the agent before (in Rex, Herdr or cmux, its tab when it has one).
 
 ![/switch listing every agent, then narrowed by typing fix, in Flexoki dark and light](../docs/sonny/switch-picker.png)
 
@@ -143,14 +144,23 @@ Enter opens the pick in the
 window. `/switch NAME` opens that agent at once (a name in this project may
 leave out the project), or lists what NAME narrows to. The `↗` beside the
 name of an agent open in the pane, or Ctrl+G, moves that agent into the
-window. `/switch` typed in a task's Sonny drawn in the pane swaps the pane
-to the agent picked instead, its title, `↗` and Ctrl+G following it and
-‹ still going back where it went; the main window stays as it is, and
+window. `/switch` typed in a task's Sonny drawn in the pane, or a click
+on an agent's name there with no tab for it, swaps the pane to that agent
+instead, its title, `↗` and Ctrl+G following it and ‹ going back to the
+agent before, as a browser's tab does; only the agent in view runs, one
+gone back from starting again when gone to. An agent drawn in the pane
+that is wide enough for its conversation and the margin side by side opens
+its own pane as a window does: views, its margin, and an agent clicked
+there, beside it. The main window stays as it is, and
 picking the main window's own agent goes back to the conversation, the
 pane put aside for Ctrl+]. A side
 chat keeps to its agent, and `/new` is for the main window only.
 
 ![The pane after /switch tally.docs typed in it: its title docs ↗ with ← back, the docs task's conversation under it](../docs/sonny/pane-switch.png)
+
+![shop.refunds clicked in shop.webhooks in the pane: refunds in its place, ‹ back to webhooks](../docs/sonny/pane-link-in-place.png)
+
+![On a 270-column screen, shop.refunds clicked in shop.webhooks opens beside it](../docs/sonny/pane-link-wide.png)
 
 </details>
 

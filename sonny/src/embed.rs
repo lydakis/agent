@@ -41,6 +41,12 @@ pub struct Embedded {
     left: Arc<AtomicBool>,
     /// The program asked for color-scheme reports (mode 2031).
     follows: Arc<AtomicBool>,
+    /// The program, an agent's Sonny, holds work ending it would lose
+    /// ([`keeps`]).
+    kept: Arc<AtomicBool>,
+    /// A key, a paste or the mouse sent since the program last said
+    /// whether it holds such work: it may hold what was sent, not yet read.
+    unheard: Arc<AtomicBool>,
     /// The light or dark and the colors the program was last told of.
     told: (bool, Theme),
 }
@@ -96,6 +102,10 @@ impl Embedded {
         let leaves = left.clone();
         let follows = Arc::new(AtomicBool::new(false));
         let following = follows.clone();
+        let kept = Arc::new(AtomicBool::new(false));
+        let keeping = kept.clone();
+        let unheard = Arc::new(AtomicBool::new(false));
+        let hearing = unheard.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             // The start of a question a read cut off, kept for the next.
@@ -121,6 +131,10 @@ impl Embedded {
                             crate::term::theme(),
                         )),
                         Piece::Follows(on) => following.store(on, Ordering::Relaxed),
+                        Piece::Keeps(on) => {
+                            keeping.store(on, Ordering::Relaxed);
+                            hearing.store(false, Ordering::Relaxed);
+                        }
                         Piece::Leaves => leaves.store(true, Ordering::Relaxed),
                         Piece::Copied(payload) => {
                             if let Some(text) = copy_text(payload)
@@ -157,6 +171,8 @@ impl Embedded {
             opened,
             left,
             follows,
+            kept,
+            unheard,
             told: (crate::term::light(), crate::term::theme()),
         })
     }
@@ -179,6 +195,13 @@ impl Embedded {
     /// place since last asked ([`open_here`]), if it asked.
     pub fn opened(&self) -> Option<String> {
         self.opened.lock().ok().and_then(|mut opened| opened.take())
+    }
+
+    /// Whether the program, an agent's Sonny, holds work ending it would
+    /// lose, as it last said ([`keeps`]), or was sent a key, a paste or the
+    /// mouse it has not said that of since: it says so after each it reads.
+    pub fn keeps(&self) -> bool {
+        self.kept.load(Ordering::Relaxed) || self.unheard.load(Ordering::Relaxed)
     }
 
     /// Whether the program, an agent's Sonny, gave the keys back since
@@ -204,6 +227,13 @@ impl Embedded {
         let _ = self.writer.send(bytes.to_vec());
     }
 
+    /// The person's input sent: unheard until the program says whether it
+    /// holds work again ([`Embedded::keeps`]).
+    fn input(&self, bytes: &[u8]) {
+        self.unheard.store(true, Ordering::Relaxed);
+        self.send(bytes);
+    }
+
     /// A key, as a terminal sends it.
     pub fn key(&self, key: KeyEvent) {
         let application = self
@@ -211,7 +241,7 @@ impl Embedded {
             .lock()
             .is_ok_and(|p| p.screen().application_cursor());
         if let Some(bytes) = key_bytes(key, application) {
-            self.send(&bytes);
+            self.input(&bytes);
         }
     }
 
@@ -229,7 +259,7 @@ impl Embedded {
         if bracketed {
             bytes.extend_from_slice(b"\x1b[201~");
         }
-        self.send(&bytes);
+        self.input(&bytes);
     }
 
     /// The mouse over the program's screen, whose first cell is at
@@ -278,7 +308,7 @@ impl Embedded {
             MouseEventKind::Up(_) => 'm',
             _ => 'M',
         };
-        self.send(format!("\x1b[<{code};{column};{row}{end}").as_bytes());
+        self.input(format!("\x1b[<{code};{column};{row}{end}").as_bytes());
         true
     }
 
@@ -398,6 +428,8 @@ enum Piece<'a> {
     Opens(&'a [u8]),
     /// [`LEAVE`]: the program gives the keys back.
     Leaves,
+    /// [`KEEPS`]: the program holds work ending it would lose, or none now.
+    Keeps(bool),
 }
 
 /// Where OSC 52, a copy to the clipboard, starts.
@@ -478,6 +510,32 @@ const ASKS: [(&[u8], Query); 11] = [
 /// Color-scheme reports (mode 2031) asked for, and stopped.
 const FOLLOWS: [(&[u8], bool); 2] = [(b"\x1b[?2031h", true), (b"\x1b[?2031l", false)];
 
+/// Sonny's own, which no terminal reads: an agent's Sonny drawn in a pane
+/// holds work ending it would lose, or none now.
+const KEEPS: [(&[u8], bool); 2] = [
+    (b"\x1b]7700;keep=1\x1b\\", true),
+    (b"\x1b]7700;keep=0\x1b\\", false),
+];
+
+/// Tells the Sonny this one is drawn in whether it holds work ending it
+/// would lose (words not sent, a command of the person's running, or an
+/// agent in its own pane that holds such), so the pane keeps it running
+/// while out of view rather than ending it with that; told again after each
+/// key, click or paste read, so that one knows what it sent was read. A
+/// terminal ignores it.
+pub fn keeps(on: bool) {
+    #[cfg(test)]
+    {
+        let _ = on;
+    }
+    #[cfg(not(test))]
+    {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(KEEPS[usize::from(!on)].0);
+        let _ = stdout.flush();
+    }
+}
+
 /// Output cut where it asks the terminal something or copies, so each is
 /// handled after the output before it, as a terminal would; and the end
 /// of it that may be the start of one the next read finishes, held back.
@@ -485,6 +543,7 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
     let starts = || {
         (ASKS.iter().map(|(seq, _)| *seq))
             .chain(FOLLOWS.iter().map(|(seq, _)| *seq))
+            .chain(KEEPS.iter().map(|(seq, _)| *seq))
             .chain([COPY, OPEN, LEAVE])
     };
     let longest = starts().map(<[u8]>::len).max().unwrap_or(0);
@@ -515,6 +574,15 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
                 out.push(Piece::Output(&bytes[from..at]));
             }
             out.push(Piece::Follows(*on));
+            at += seq.len();
+            from = at;
+            continue;
+        }
+        if let Some((seq, on)) = KEEPS.iter().find(|(seq, _)| bytes[at..].starts_with(seq)) {
+            if from < at {
+                out.push(Piece::Output(&bytes[from..at]));
+            }
+            out.push(Piece::Keeps(*on));
             at += seq.len();
             from = at;
             continue;
@@ -768,6 +836,43 @@ mod tests {
             (cut, rest),
             (vec![Piece::Output(b"a")], &b"\x1b]7700;open=sh"[..])
         );
+    }
+
+    #[test]
+    fn a_program_says_whether_it_holds_work_ending_it_would_lose() {
+        let (cut, rest) = pieces(b"a\x1b]7700;keep=1\x1b\\b\x1b]7700;keep=0\x1b\\");
+        assert!(rest.is_empty());
+        assert_eq!(
+            cut,
+            [
+                Piece::Output(b"a"),
+                Piece::Keeps(true),
+                Piece::Output(b"b"),
+                Piece::Keeps(false),
+            ]
+        );
+        // One a read cuts off waits for the rest.
+        let (cut, rest) = pieces(b"a\x1b]7700;kee");
+        assert_eq!(
+            (cut, rest),
+            (vec![Piece::Output(b"a")], &b"\x1b]7700;kee"[..])
+        );
+        // A paste sent and not yet answered for may be held: kept until
+        // the program says, after reading it, that it holds none.
+        let mut command = CommandBuilder::new("sh");
+        command.args([
+            "-c",
+            "read line; printf '\\033]7700;keep=0\\033\\\\'; exec sleep 30",
+        ]);
+        let program = Embedded::spawn(command, 5, 20, || {}).unwrap();
+        assert!(!program.keeps());
+        program.paste("fix the build\n");
+        assert!(program.keeps());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while program.keeps() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!program.keeps());
     }
 
     #[test]
