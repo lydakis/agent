@@ -6655,10 +6655,6 @@ struct App {
     /// numbers: each placeholder is in the composer at once, its picture
     /// behind it once ready ([`App::prepared`]).
     preparing: Vec<(usize, Preparing)>,
-    /// Let go when the picture last given is made, or never will be: the
-    /// next waits for it, so pictures are made one at a time in the order
-    /// they came.
-    made_before: Option<std::sync::mpsc::Receiver<()>>,
     /// The selected words a picture's placeholder went in place of, by its
     /// number: put back if no picture comes.
     replaced: Vec<(usize, String)>,
@@ -8848,7 +8844,6 @@ impl App {
             steering: Vec::new(),
             pictures: Vec::new(),
             preparing: Vec::new(),
-            made_before: None,
             replaced: Vec::new(),
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
@@ -20332,20 +20327,16 @@ impl App {
         // One picture is made at a time, in the order they came, as on the
         // key loop before: a batch of big screenshots is decoded one by
         // one, never all at once.
-        // Each waits for the one given before it to be made, or dropped
-        // unmade, which lets it go as well.
-        let (made, after) = std::sync::mpsc::channel::<()>();
-        let before = self.made_before.replace(after);
+        static MAKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let number = self.placeholder();
         let woken = self.woken.clone();
         let job = tokio::task::spawn_blocking(move || {
-            if let Some(before) = before {
-                let _ = before.recv();
-            }
-            let picture = make();
-            drop(made);
+            let made = {
+                let _one = MAKING.blocking_lock();
+                make()
+            };
             woken.notify_one();
-            picture
+            made
         });
         self.preparing.push((number, job));
     }
