@@ -17930,7 +17930,7 @@ impl App {
 
     /// `pane` beside the conversation, with the keys; what was selected
     /// or being found in the conversation let go.
-    fn open_pane(&mut self, mut pane: pane::Pane) {
+    fn open_pane(&mut self, pane: pane::Pane) {
         // An agent drawn in another's pane with no room for one of its
         // own opens none: what it would show goes, and the person is told
         // where views open.
