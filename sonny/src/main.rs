@@ -8880,7 +8880,7 @@ impl App {
             task_asks_read: None,
             hub_asks: 0,
             follows: Follows::default(),
-            own_closed: resolved::closed(&record),
+            own_closed: resolved::closed(record),
             closed_aside: false,
             kept: Kept::default(),
             task_needs: Default::default(),
