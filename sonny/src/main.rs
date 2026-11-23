@@ -22249,10 +22249,10 @@ impl App {
     /// being made ready, a command of the person's still running or its
     /// result not yet shown or sent (it goes to the agent from here, a
     /// refused one with the next message), a first message or a move
-    /// held for the next message, a model, speed or permissions pick that
-    /// waits for no turn to run or still has to reach the agents it made,
-    /// or an agent in its own pane, shown, put aside or kept to go back to,
-    /// that holds such. It keeps this Sonny running
+    /// held for the next message, an effort boost armed for it, a model,
+    /// speed or permissions pick that waits for no turn to run or still has
+    /// to reach the agents it made, or an agent in its own pane, shown, put
+    /// aside or kept to go back to, that holds such. It keeps this Sonny running
     /// while out of view only then.
     fn tell_keeps(&mut self) {
         if !self.options.embedded {
@@ -22270,6 +22270,7 @@ impl App {
             || !self.shown.is_empty()
             || self.send_after.is_some()
             || self.move_to.is_some()
+            || self.boost.is_some()
             || self.switch.is_some()
             || self.pace.is_some()
             || self.gating.is_some()
@@ -27192,6 +27193,10 @@ mod tests {
         app.tell_keeps();
         assert!(app.told_keeps);
         app.switch = None;
+        app.boost = Some("xhigh".into());
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.boost = None;
         app.gating = Some("auto");
         app.tell_keeps();
         assert!(app.told_keeps);
