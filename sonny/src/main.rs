@@ -23531,7 +23531,12 @@ impl App {
             // Keys in the pane: no cursor where they do not go.
             if !self.pane_keys && self.projects.is_none() {
                 frame.set_cursor_position((
-                    composer.x + (cursor_col as u16).min(composer.width),
+                    // Spaces past a full row's end hang there: the cursor
+                    // among them stays in the band's column past the words.
+                    composer.x
+                        + (cursor_col as u16)
+                            .min(composer.width)
+                            .min(width.min(measure()) as u16),
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
                 ));
             }
