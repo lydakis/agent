@@ -6393,6 +6393,32 @@ impl Search {
     }
 }
 
+/// Whether a picture given to be made is done, or will never be: the
+/// next one given waits for it.
+#[derive(Default)]
+struct Made {
+    done: std::sync::Mutex<bool>,
+    told: std::sync::Condvar,
+}
+
+impl Made {
+    fn wait(&self) {
+        let done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        drop(self.told.wait_while(done, |done| !*done));
+    }
+}
+
+/// Marks its picture done when let go: made, failed, or its job dropped
+/// before it ran, so the next never waits on one that will not come.
+struct MadeOnDrop(Arc<Made>);
+
+impl Drop for MadeOnDrop {
+    fn drop(&mut self) {
+        *self.0.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.told.notify_all();
+    }
+}
+
 /// A picture being read, decoded and scaled beside the loop.
 type Preparing = tokio::task::JoinHandle<Result<Option<attach::Picture>, String>>;
 
@@ -20311,15 +20337,21 @@ impl App {
     ) {
         // One picture is made at a time, in the order they came, as on the
         // key loop before: a batch of big screenshots is decoded one by
-        // one, never all at once.
-        static MAKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        // one, never all at once. Each waits for the one given before it,
+        // its place in line taken here, on the loop, so which thread starts
+        // first never reorders them.
+        static LAST: std::sync::Mutex<Option<Arc<Made>>> = std::sync::Mutex::new(None);
         let number = self.placeholder();
         let woken = self.woken.clone();
+        let mine = Arc::new(Made::default());
+        let before = (LAST.lock().unwrap_or_else(|e| e.into_inner())).replace(mine.clone());
+        let done = MadeOnDrop(mine);
         let job = tokio::task::spawn_blocking(move || {
-            let made = {
-                let _one = MAKING.blocking_lock();
-                make()
-            };
+            if let Some(before) = before {
+                before.wait();
+            }
+            let made = make();
+            drop(done);
             woken.notify_one();
             made
         });
