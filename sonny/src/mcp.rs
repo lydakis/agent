@@ -314,13 +314,19 @@ impl Hub {
                 .await
                 .unwrap_or_else(|_| Err(format!("did not start in {}s", timeout.as_secs())));
             // Its events, when it offers them, listed in a time of their
-            // own: a listing that fails or stalls leaves its tools working.
+            // own: a listing that fails or stalls leaves its tools working,
+            // and its events as last listed on this config.
             if let Ok(live) = &mut started
                 && offers_events(live.client.peer())
-                && let Ok(Ok(events)) =
-                    tokio::time::timeout(timeout, list_events(live.client.peer())).await
             {
-                live.events = events.into();
+                live.events =
+                    match tokio::time::timeout(timeout, list_events(live.client.peer())).await {
+                        Ok(Ok(events)) => events.into(),
+                        _ => self
+                            .cached(slot)
+                            .map(|kept| kept.events)
+                            .unwrap_or_default(),
+                    };
             }
             match started {
                 Ok(started) => {

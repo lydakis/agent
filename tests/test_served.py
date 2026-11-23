@@ -444,11 +444,11 @@ class ServedToolTests(ModelFixture):
         self.assertLessEqual(len(first), time.monotonic() - started + 1, first)
         # Each stands where it was told to, on disk.
         deadline = time.monotonic() + 5
-        while json.loads((self.path / 'mcp.test/cursors.json').read_text()).get('ci.failed') != '1':
+        cursors = lambda: json.loads((self.path / 'mcp.test/cursors.json').read_text())['cursors']
+        while not (self.path / 'mcp.test/cursors.json').exists() or cursors().get('ci.failed') != '1':
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.05)
-        self.assertEqual(json.loads((self.path / 'mcp.test/cursors.json').read_text()),
-                         {'ci.failed': '1', 'comment.created {"document_id":"D1"}': 's1-D1'})
+        self.assertEqual(cursors(), {'ci.failed': '1', 'comment.created {"document_id":"D1"}': 's1-D1'})
         stop()
         # Run again, it goes on from there: what came meanwhile, not again what was told.
         with open(self.path / 'events', 'a') as f:

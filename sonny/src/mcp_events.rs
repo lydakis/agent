@@ -311,6 +311,9 @@ pub fn check_follow(add: &Value) -> Result<(), String> {
 #[derive(Clone)]
 struct Cursors {
     file: PathBuf,
+    /// The server's config they were given on (`mcp::config_named`): a
+    /// server configured anew starts from now, never from another's.
+    config: String,
     held: Arc<Mutex<Held>>,
 }
 
@@ -329,14 +332,16 @@ struct Held {
 const TRAIL: Duration = Duration::from_secs(1);
 
 impl Cursors {
-    fn read(dir: &Path) -> Cursors {
+    fn read(dir: &Path, config: &str) -> Cursors {
         let file = dir.join("cursors.json");
         let kept = (std::fs::read(&file).ok())
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|kept| kept.as_object().cloned())
+            .filter(|kept| kept["config"] == config)
+            .and_then(|kept| kept["cursors"].as_object().cloned())
             .unwrap_or_default();
         Cursors {
             file,
+            config: config.to_owned(),
             held: Arc::new(Mutex::new(Held {
                 kept,
                 ..Held::default()
@@ -389,7 +394,7 @@ impl Cursors {
             if !changed {
                 return Ok(());
             }
-            Value::Object(kept.clone()).to_string()
+            json!({"config": self.config, "cursors": kept}).to_string()
         };
         let partial = self.file.with_extension("partial");
         std::fs::write(&partial, text)
@@ -545,7 +550,7 @@ async fn run(server: &str, named: Option<&str>) -> Result<(), String> {
     for refusal in &refusals {
         print(&unasked(server, refusal));
     }
-    let cursors = Cursors::read(&dir);
+    let cursors = Cursors::read(&dir, &crate::mcp::config_named(config));
     let delivery = |asked: &Asked| -> Vec<String> {
         let event = offered
             .iter()
@@ -930,7 +935,7 @@ mod tests {
             name: "ci.failed".into(),
             arguments: Map::new(),
         };
-        let cursors = Cursors::read(&dir);
+        let cursors = Cursors::read(&dir, "a");
         assert_eq!(cursors.of(&asked), Value::Null);
         cursors.set(&asked, &json!("c1")).unwrap();
         // A cursor that is not one leaves it where it was.
@@ -938,13 +943,15 @@ mod tests {
         assert_eq!(cursors.of(&asked), json!("c1"));
         // On disk only once it stood there a while, so what was printed
         // before it is read again after a stop.
-        assert_eq!(Cursors::read(&dir).of(&asked), Value::Null);
+        assert_eq!(Cursors::read(&dir, "a").of(&asked), Value::Null);
         std::thread::sleep(TRAIL);
         cursors.set(&asked, &json!("c2")).unwrap();
-        assert_eq!(Cursors::read(&dir).of(&asked), json!("c1"));
+        assert_eq!(Cursors::read(&dir, "a").of(&asked), json!("c1"));
         std::thread::sleep(TRAIL);
         cursors.keep().unwrap();
-        assert_eq!(Cursors::read(&dir).of(&asked), json!("c2"));
+        assert_eq!(Cursors::read(&dir, "a").of(&asked), json!("c2"));
+        // Another config of the server's starts from now.
+        assert_eq!(Cursors::read(&dir, "b").of(&asked), Value::Null);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
