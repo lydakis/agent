@@ -245,15 +245,24 @@ async fn reach(
     let host = host.to_ascii_lowercase();
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     allowed(domains, &host)?;
+    // A local address only by its own name allowed, as written: no
+    // pattern lets one through.
+    let named = (domains.iter())
+        .filter(|(_, access)| **access == Access::Allow)
+        .any(|(pattern, _)| {
+            pattern.eq_ignore_ascii_case(&host) || pattern.eq_ignore_ascii_case(bare)
+        });
     if let Ok(ip) = bare.parse::<IpAddr>() {
-        // A literal, allowed by its own name.
+        if local(ip) && !named {
+            return Err(Blocked::Local);
+        }
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let found: Vec<SocketAddr> = tokio::net::lookup_host((bare, port))
         .await
         .map(Iterator::collect)
         .unwrap_or_default();
-    let named_local = bare == "localhost";
+    let named_local = bare == "localhost" && named;
     if found.iter().any(|addr| local(addr.ip())) && !named_local {
         return Err(Blocked::Local);
     }
@@ -419,6 +428,9 @@ where
         () = &mut answering => return,
         () = &mut sending => {}
     }
+    // Its grace starts when the client is done, not before.
+    let now = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
+    heard.fetch_max(now, Relaxed);
     loop {
         tokio::select! {
             () = &mut answering => return,
@@ -577,6 +589,24 @@ mod tests {
         far_client.shutdown().await.unwrap();
         tokio::time::sleep(DRAINING + std::time::Duration::from_secs(1)).await;
         assert!(relaying.is_finished());
+        // A client that sent for longer than the grace still gets it whole
+        // once done.
+        let (client, mut far_client) = tokio::io::duplex(1024);
+        let (upstream, mut far_upstream) = tokio::io::duplex(1024);
+        let relaying = tokio::spawn(relay(client, upstream));
+        far_client.write_all(b"up").await.unwrap();
+        tokio::time::sleep(DRAINING * 2).await;
+        far_client.shutdown().await.unwrap();
+        tokio::time::sleep(DRAINING / 2).await;
+        assert!(!relaying.is_finished());
+        let mut sent = [0; 2];
+        far_upstream.read_exact(&mut sent).await.unwrap();
+        far_upstream.write_all(b"ok").await.unwrap();
+        drop(far_upstream);
+        let mut heard = Vec::new();
+        far_client.read_to_end(&mut heard).await.unwrap();
+        assert_eq!(heard, b"ok");
+        relaying.await.unwrap();
         // An upstream still talking is heard out.
         let (client, mut far_client) = tokio::io::duplex(1024);
         let (upstream, mut far_upstream) = tokio::io::duplex(1024);
@@ -650,6 +680,18 @@ mod tests {
         );
         let named = domains(&[("localhost", Access::Allow)]);
         assert!(reach(&named, "localhost", 80).await.is_ok());
+        // A pattern that matches an address is not its own name.
+        let any = domains(&[("*.*.*.*", Access::Allow), ("**.localhost", Access::Allow)]);
+        assert_eq!(reach(&any, "127.0.0.1", 80).await, Err(Blocked::Local));
+        assert_eq!(
+            reach(&any, "169.254.169.254", 80).await,
+            Err(Blocked::Local)
+        );
+        assert_eq!(reach(&any, "localhost", 80).await, Err(Blocked::Local));
+        assert_eq!(
+            reach(&any, "8.8.8.8", 443).await,
+            Ok(vec!["8.8.8.8:443".parse().unwrap()])
+        );
         let v6 = domains(&[("::1", Access::Allow)]);
         assert_eq!(
             reach(&v6, "[::1]", 80).await,
