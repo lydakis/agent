@@ -564,10 +564,15 @@ fn wrap(
                     return;
                 }
             }
-            // A word wider than a row is cut where the row ends.
+            // A word wider than a row is cut where the row ends. The
+            // spaces after a word stay on its row, past its end if it
+            // filled it, so the next row starts with the next word, as
+            // it does once sent.
+            let body = word.trim_end().len();
             for (i, g) in word.grapheme_indices(true) {
                 let w = g.width();
-                if used + w > room && used > 0 {
+                let after = body > 0 && i >= body;
+                if used + w > room && used > 0 && !after {
                     let at = word_start + i;
                     rows.push(Row { start, end: at });
                     start = at;
@@ -1162,6 +1167,16 @@ mod tests {
         assert_eq!(prompt.at, prompt.len());
         prompt.backspace();
         assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn the_space_after_a_word_that_fills_a_row_stays_on_it() {
+        // Eight columns of text a row at width 11: the word fills one.
+        let prompt = typed("aaaaaaaa bb cc");
+        let rows = prompt.layout(11);
+        let shown: Vec<_> = rows.iter().map(|r| &prompt[r.start..r.end]).collect();
+        assert_eq!(shown, ["aaaaaaaa ", "bb cc"]);
+        assert_eq!(prompt.cursor(&rows), (1, LEAD + 5));
     }
 
     #[test]
