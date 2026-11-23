@@ -1074,20 +1074,71 @@ impl Draw<'_> {
     }
 
     /// A line of code: wrapped rows hang two columns in, under its text.
+    /// The line wraps by its text alone and takes its colors after, so a
+    /// line wraps the same colored or plain: colors landing never move a
+    /// row.
     fn words_hung(&mut self, spans: Vec<Span<'static>>) {
         let (first, rest) = self.leads();
         let mut hang = vec![Span::raw("  ")];
         hang.extend(rest);
         hang.push(Span::raw("  "));
+        let leads: String = first.iter().map(|span| span.content.as_ref()).collect();
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        // Where each color starts and ends in the text, past the leads.
+        let mut colors = Vec::with_capacity(spans.len());
+        let mut end = leads.len();
+        for span in &spans {
+            colors.push((end..end + span.content.len(), span.style));
+            end += span.content.len();
+        }
+        let whole = leads + &text;
         let mut line = first;
-        line.extend(spans);
-        let rows = wrap_lines(
+        line.push(Span::raw(text));
+        let wrapped = wrap_lines(
             Line::from(line),
             self.width,
             Line::from("  "),
-            Line::from(hang),
+            Line::from(hang.clone()),
         );
-        self.rows.extend(rows);
+        // Each row's own spans past its lead come in the text's order; a
+        // row's leading spaces may be left out, so each is found from
+        // where the last ended.
+        let mut at = 0;
+        let rows = wrapped.into_iter().enumerate().map(|(row, wrapped)| {
+            let lead = 1 + if row == 0 { 1 } else { hang.len() };
+            let mut spans = Vec::with_capacity(wrapped.spans.len());
+            for (i, span) in wrapped.spans.into_iter().enumerate() {
+                if i < lead || span.content.is_empty() {
+                    spans.push(span);
+                    continue;
+                }
+                match whole[at..].find(span.content.as_ref()) {
+                    Some(skip) => at += skip,
+                    None => {
+                        spans.push(span);
+                        continue;
+                    }
+                }
+                let piece = at..at + span.content.len();
+                at = piece.end;
+                let colored = (colors.iter())
+                    .filter(|(range, _)| range.start < piece.end && piece.start < range.end);
+                let mut any = false;
+                for (range, style) in colored {
+                    any = true;
+                    let (from, to) = (range.start.max(piece.start), range.end.min(piece.end));
+                    spans.push(Span::styled(
+                        whole[from..to].to_owned(),
+                        span.style.patch(*style),
+                    ));
+                }
+                if !any {
+                    spans.push(span);
+                }
+            }
+            Line { spans, ..wrapped }
+        });
+        self.rows.extend(rows.collect::<Vec<_>>());
         self.mark();
     }
 
@@ -3245,22 +3296,28 @@ mod tests {
                 "fn f{n}(x: u32) -> u32 {{ x * {n} + 1 }} // a long line to wrap\n"
             ));
         }
+        // A line wider than a row with no spaces, its words only colors
+        // apart: it wraps where its plain text does.
+        text.push_str("    value=self.alpha.beta.gamma(first_argument,second_argument).delta();\n");
         text.push_str("```\n\n> ```rust\n> let quoted = 1;\n> ```\n");
-        let colored = rows(&Markdown::default(), &text, 40);
-        for lines in [0, 5, 12, 1000] {
-            let markdown = Markdown {
-                colored: Some(lines),
-                ..Markdown::default()
-            };
-            let plain = rows(&markdown, &text, 40);
-            assert_eq!(plain.len(), colored.len());
-            for ((line, row), (_, colored)) in plain.iter().zip(&colored) {
-                assert_eq!(row.to_string(), colored.to_string());
-                if *line < lines {
-                    assert_eq!(row, colored, "line {line} is colored");
+        for width in [40, 17] {
+            let colored = rows(&Markdown::default(), &text, width);
+            for lines in [0, 5, 12, 1000] {
+                let markdown = Markdown {
+                    colored: Some(lines),
+                    ..Markdown::default()
+                };
+                let plain = rows(&markdown, &text, width);
+                assert_eq!(plain.len(), colored.len());
+                for ((line, row), (_, colored)) in plain.iter().zip(&colored) {
+                    assert_eq!(row.to_string(), colored.to_string());
+                    if *line < lines {
+                        assert_eq!(row, colored, "line {line} is colored");
+                    }
                 }
             }
         }
+        let colored = rows(&Markdown::default(), &text, 40);
         // None colored: every row of code plain, as an unknown language.
         let markdown = Markdown {
             colored: Some(0),
