@@ -420,8 +420,8 @@ class ServedToolTests(ModelFixture):
         got = [lines.get(timeout=10) for _ in range(3)]
         by_id = {line.get('id'): line for line in got}
         # Pushed at once, on its topic, with the arguments it came by.
-        self.assertEqual(by_id['c-D1 {"document_id":"D1"}'],
-                         {'id': 'c-D1 {"document_id":"D1"}', 'topic': 'comment.created',
+        self.assertEqual(by_id['c-D1 comment.created {"document_id":"D1"}'],
+                         {'id': 'c-D1 comment.created {"document_id":"D1"}', 'topic': 'comment.created',
                           'arguments': {'document_id': 'D1'}, 'at': '2026-11-23T03:00:00Z',
                           'data': {'document_id': 'D1', 'text': 'looks good'}})
         # What the server refused, said on its topic.
@@ -437,7 +437,7 @@ class ServedToolTests(ModelFixture):
         with open(self.path / 'events', 'a') as f:
             f.write(json.dumps({'eventId': 'e1', 'data': {'run': 7}}) + '\n')
         self.assertEqual(lines.get(timeout=10),
-                         {'id': 'e1', 'topic': 'ci.failed', 'at': '2026-11-23T03:00:00Z', 'data': {'run': 7}})
+                         {'id': 'e1 ci.failed', 'topic': 'ci.failed', 'at': '2026-11-23T03:00:00Z', 'data': {'run': 7}})
         first = [json.loads(line) for line in (self.path / 'polls').read_text().splitlines()]
         self.assertEqual(first[0], {'name': 'ci.failed', 'arguments': {}, 'cursor': None})
         # Polls a second apart at least, however soon the server says.
@@ -455,7 +455,7 @@ class ServedToolTests(ModelFixture):
             f.write(json.dumps({'eventId': 'e2', 'data': {'run': 8}}) + '\n')
         (self.path / 'polls').unlink()
         run, lines, stop = self.events_command(follows[:1])
-        self.assertEqual(lines.get(timeout=10)['id'], 'e2')
+        self.assertEqual(lines.get(timeout=10)['id'], 'e2 ci.failed')
         again = json.loads((self.path / 'polls').read_text().splitlines()[0])
         self.assertEqual(again['cursor'], '1')
         stop()

@@ -24,8 +24,8 @@
 //! of the past.
 //!
 //! Each event is one line, with no `text`, so a follower reads it whole:
-//! `id` (the server's own, and the arguments when there are any, as two
-//! subscriptions may share one), `topic` (the event's name), `at`, `data`
+//! `id` (the server's own, then the event's name and the arguments when
+//! there are any, as the server's IDs are each subscription's own), `topic` (the event's name), `at`, `data`
 //! and `arguments`; one too long for the lookout goes without its data,
 //! saying so. A follow the `follows` tool can tell is wrong is refused
 //! there (`check_follow`). A subscription the server refuses is a line on
@@ -88,12 +88,11 @@ impl Asked {
     }
 
     /// An event the server sent for it, as a line: none without an ID.
+    /// Its ID is the server's and this subscription's key, as the server
+    /// scopes its IDs to a subscription and the lookout passes an ID of
+    /// the source's on once.
     fn event(&self, event: &Value) -> Option<Value> {
-        let id = event["eventId"].as_str()?;
-        let id = match self.arguments.is_empty() {
-            true => id.to_owned(),
-            false => format!("{id} {}", Value::Object(self.arguments.clone())),
-        };
+        let id = format!("{} {}", event["eventId"].as_str()?, self.key());
         Some(self.line(json!({"id": id, "at": event["timestamp"], "data": event["data"]})))
     }
 }
@@ -212,7 +211,7 @@ fn enough(event: &Value, arguments: &Map<String, Value>) -> Result<(), String> {
 /// argument at most, so a follow subscribes to no more than the values
 /// it lists, not to every pairing of two lists.
 fn argued(filter: &Value) -> Result<Vec<Map<String, Value>>, String> {
-    let plain = |value: &Value| value.is_string() || value.is_number() || value.is_boolean();
+    let plain = |value: &Value| !value.is_object() && !value.is_array();
     let exact: Vec<(&String, &Vec<Value>)> = (filter["arguments"].as_object().into_iter())
         .flatten()
         .filter_map(|(key, values)| Some((key, values.as_array()?)))
@@ -456,11 +455,16 @@ fn unasked(server: &str, (name, why): &Refusal) -> Value {
     }
 }
 
-/// Why a request failed: the server's own refusal, which ends only that
-/// subscription, or the connection's, which ends them all.
+/// Why a request failed: the server's refusal of it, which ends only that
+/// subscription, or a failure, its own internal error or the
+/// connection's, which ends the run for the lookout to run again.
 fn failed(error: rmcp::ServiceError) -> Result<String, String> {
     match error {
-        rmcp::ServiceError::McpError(error) => Ok(error.message.to_string()),
+        rmcp::ServiceError::McpError(error)
+            if error.code != rmcp::model::ErrorCode::INTERNAL_ERROR =>
+        {
+            Ok(error.message.to_string())
+        }
         other => Err(other.to_string()),
     }
 }
@@ -841,14 +845,20 @@ mod tests {
     #[test]
     fn a_filter_s_arguments_are_only_its_exact_values() {
         let sets = argued(
-            &json!({"arguments": {"a": [1, 2], "b": [{"prefix": "x"}], "c": [], "d": [true]}}),
+            &json!({"arguments": {"a": [1, 2], "b": [{"prefix": "x"}], "c": [], "d": [true], "e": [null]}}),
         )
         .unwrap();
         assert_eq!(
             sets,
             [
-                json!({"a": 1, "d": true}).as_object().unwrap().clone(),
-                json!({"a": 2, "d": true}).as_object().unwrap().clone()
+                json!({"a": 1, "d": true, "e": null})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                json!({"a": 2, "d": true, "e": null})
+                    .as_object()
+                    .unwrap()
+                    .clone()
             ]
         );
         assert_eq!(argued(&Value::Null).unwrap(), [Map::new()]);
@@ -872,14 +882,23 @@ mod tests {
             "data": {"run": 7}, "cursor": "c1"});
         assert_eq!(
             plain.event(&event).unwrap(),
-            json!({"id": "e1", "topic": "ci.failed", "at": "2026-11-23T03:00:00Z", "data": {"run": 7}})
+            json!({"id": "e1 ci.failed", "topic": "ci.failed", "at": "2026-11-23T03:00:00Z", "data": {"run": 7}})
         );
         let argued = Asked {
             name: "ci.failed".into(),
             arguments: json!({"repo": "web"}).as_object().unwrap().clone(),
         };
         let line = argued.event(&event).unwrap();
-        assert_eq!(line["id"], r#"e1 {"repo":"web"}"#);
+        assert_eq!(line["id"], r#"e1 ci.failed {"repo":"web"}"#);
+        // Another event of the same ID is another line.
+        let other = Asked {
+            name: "ci.passed".into(),
+            arguments: Map::new(),
+        };
+        assert_ne!(
+            other.event(&event).unwrap()["id"],
+            plain.event(&event).unwrap()["id"]
+        );
         assert_eq!(line["arguments"], json!({"repo": "web"}));
         assert!(line.get("text").is_none());
         // One without an ID is no event.
