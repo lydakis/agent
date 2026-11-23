@@ -391,8 +391,9 @@ pub async fn serve<S>(
 /// waited on past it.
 const DRAINING: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Bytes both ways until either end is done: the upstream closing, or the
-/// client done sending and the upstream then silent for [`DRAINING`].
+/// Bytes both ways until either end is done: the upstream closing or taking
+/// nothing sent to it for [`DRAINING`], or the client done sending and the
+/// upstream then silent for [`DRAINING`].
 async fn relay<C, U>(client: C, upstream: U)
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -405,9 +406,26 @@ where
     let since = tokio::time::Instant::now();
     let heard = std::sync::atomic::AtomicU64::new(0);
     let last = || since + std::time::Duration::from_millis(heard.load(Relaxed));
+    // Whether the client's bytes all went: an upstream that takes none of
+    // them for [`DRAINING`] is let go, so a stalled upload never holds the
+    // connection past its client.
     let sending = async {
-        let _ = tokio::io::copy(&mut from_client, &mut to_upstream).await;
+        let mut chunk = vec![0; 16 * 1024];
+        loop {
+            let read = match from_client.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let mut sent = 0;
+            while sent < read {
+                match tokio::time::timeout(DRAINING, to_upstream.write(&chunk[sent..read])).await {
+                    Ok(Ok(written)) if written > 0 => sent += written,
+                    _ => return false,
+                }
+            }
+        }
         let _ = to_upstream.shutdown().await;
+        true
     };
     let answering = async {
         let mut chunk = vec![0; 16 * 1024];
@@ -428,7 +446,9 @@ where
     tokio::pin!(sending, answering);
     tokio::select! {
         () = &mut answering => return,
-        () = &mut sending => {}
+        whole = &mut sending => if !whole {
+            return;
+        }
     }
     // Its grace starts when the client is done, not before.
     let now = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -587,6 +607,20 @@ mod tests {
         cells();
         assert_eq!(allowed(&given, &host), Ok(()));
         assert!(cells() <= bound);
+    }
+
+    /// A client gone while its upload waits on an upstream that reads
+    /// nothing is let go, not held writing for good.
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_an_upstream_never_reads_is_let_go() {
+        let (client, mut far_client) = tokio::io::duplex(1024);
+        let (upstream, _deaf) = tokio::io::duplex(1024);
+        let relaying = tokio::spawn(relay(client, upstream));
+        // As much as both buffers hold: the upstream takes half, then none.
+        far_client.write_all(&[0; 2048]).await.unwrap();
+        drop(far_client);
+        tokio::time::sleep(DRAINING + std::time::Duration::from_secs(1)).await;
+        assert!(relaying.is_finished());
     }
 
     /// A client done sending whose upstream then says nothing is let go
