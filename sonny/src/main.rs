@@ -6632,8 +6632,8 @@ struct App {
     /// `alt+n` works with words typed, which it never drops.
     carry_draft: bool,
     /// Drawn in another's pane: whether that one was last told this
-    /// composer holds words not sent ([`embed::drafts`]).
-    told_drafted: bool,
+    /// window holds work ending it would lose ([`embed::keeps`]).
+    told_keeps: bool,
     /// The Sonny installed while this window was open, which it reopens on
     /// once it quits ([`update::installed_since`]).
     reopen_on: Option<PathBuf>,
@@ -8868,7 +8868,7 @@ impl App {
             quit: false,
             switch_to: None,
             carry_draft: false,
-            told_drafted: false,
+            told_keeps: false,
             reopen_on: None,
             started: Instant::now(),
             fleet: None,
@@ -9467,7 +9467,7 @@ impl App {
                 }
             }
             self.pane_switched();
-            self.tell_drafted();
+            self.tell_keeps();
             self.side_closed();
             self.suggested_now().await;
             self.shell_ran().await;
@@ -22236,14 +22236,26 @@ impl App {
         self.open_task(&bot);
     }
 
-    /// Drawn in another's pane, that one told when words not sent come
-    /// into this composer or leave it: it keeps this Sonny running while
-    /// out of view only then.
-    fn tell_drafted(&mut self) {
-        let drafted = !self.input.trim().is_empty() || !self.quotes.is_empty();
-        if self.options.embedded && drafted != self.told_drafted {
-            self.told_drafted = drafted;
-            embed::drafts(drafted);
+    /// Drawn in another's pane, that one told when this window comes to
+    /// hold work ending it would lose, or none now: words not sent, a
+    /// command of the person's still running (its result goes to the
+    /// agent from here), or an agent in its own pane, shown, put aside or
+    /// kept to go back to, that holds such. It keeps this Sonny running
+    /// while out of view only then.
+    fn tell_keeps(&mut self) {
+        if !self.options.embedded {
+            return;
+        }
+        let panes = [&self.pane, &self.under].into_iter().flatten();
+        let keeps = !self.input.trim().is_empty()
+            || !self.quotes.is_empty()
+            || self.shell.is_some()
+            || panes
+                .chain(self.closed.as_ref().map(|(pane, _)| pane))
+                .any(pane::Pane::keeps);
+        if keeps != self.told_keeps {
+            self.told_keeps = keeps;
+            embed::keeps(keeps);
         }
     }
 
@@ -27105,6 +27117,35 @@ mod tests {
         assert!(app.step_pane(false));
         assert_eq!(shown(&app).as_deref(), Some("shop.docs"));
         assert!(app.pane.as_ref().unwrap().program.is_some());
+    }
+
+    #[tokio::test]
+    async fn drawn_beside_another_it_says_while_it_holds_work_ending_it_would_lose() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        // A window of its own says nothing.
+        app.input.set("half typed");
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // Drawn in another's pane, words not sent keep it; none, not.
+        app.options.embedded = true;
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.input.clear();
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // So does an agent in its own pane that holds such work.
+        let mut command = portable_pty::CommandBuilder::new("sh");
+        command.args(["-c", "printf '\\033]7700;keep=1\\033\\\\'; exec sleep 30"]);
+        let program = embed::Embedded::spawn(command, 5, 20, || {}).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !program.keeps() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut pane = pane::Pane::program("docs", program);
+        pane.as_agent("shop.docs", false);
+        app.pane = Some(pane);
+        app.tell_keeps();
+        assert!(app.told_keeps);
     }
 
     #[tokio::test]

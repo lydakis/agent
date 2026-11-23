@@ -41,8 +41,9 @@ pub struct Embedded {
     left: Arc<AtomicBool>,
     /// The program asked for color-scheme reports (mode 2031).
     follows: Arc<AtomicBool>,
-    /// The program, an agent's Sonny, holds words not sent ([`drafts`]).
-    drafted: Arc<AtomicBool>,
+    /// The program, an agent's Sonny, holds work ending it would lose
+    /// ([`keeps`]).
+    kept: Arc<AtomicBool>,
     /// The light or dark and the colors the program was last told of.
     told: (bool, Theme),
 }
@@ -98,8 +99,8 @@ impl Embedded {
         let leaves = left.clone();
         let follows = Arc::new(AtomicBool::new(false));
         let following = follows.clone();
-        let drafted = Arc::new(AtomicBool::new(false));
-        let drafting = drafted.clone();
+        let kept = Arc::new(AtomicBool::new(false));
+        let keeping = kept.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             // The start of a question a read cut off, kept for the next.
@@ -125,7 +126,7 @@ impl Embedded {
                             crate::term::theme(),
                         )),
                         Piece::Follows(on) => following.store(on, Ordering::Relaxed),
-                        Piece::Drafts(on) => drafting.store(on, Ordering::Relaxed),
+                        Piece::Keeps(on) => keeping.store(on, Ordering::Relaxed),
                         Piece::Leaves => leaves.store(true, Ordering::Relaxed),
                         Piece::Copied(payload) => {
                             if let Some(text) = copy_text(payload)
@@ -162,7 +163,7 @@ impl Embedded {
             opened,
             left,
             follows,
-            drafted,
+            kept,
             told: (crate::term::light(), crate::term::theme()),
         })
     }
@@ -187,10 +188,10 @@ impl Embedded {
         self.opened.lock().ok().and_then(|mut opened| opened.take())
     }
 
-    /// Whether the program, an agent's Sonny, holds words not sent, as it
-    /// last said ([`drafts`]): ending it would lose them.
-    pub fn drafted(&self) -> bool {
-        self.drafted.load(Ordering::Relaxed)
+    /// Whether the program, an agent's Sonny, holds work ending it would
+    /// lose, as it last said ([`keeps`]).
+    pub fn keeps(&self) -> bool {
+        self.kept.load(Ordering::Relaxed)
     }
 
     /// Whether the program, an agent's Sonny, gave the keys back since
@@ -410,8 +411,8 @@ enum Piece<'a> {
     Opens(&'a [u8]),
     /// [`LEAVE`]: the program gives the keys back.
     Leaves,
-    /// [`DRAFTS`]: the program holds words not sent, or none now.
-    Drafts(bool),
+    /// [`KEEPS`]: the program holds work ending it would lose, or none now.
+    Keeps(bool),
 }
 
 /// Where OSC 52, a copy to the clipboard, starts.
@@ -493,16 +494,17 @@ const ASKS: [(&[u8], Query); 11] = [
 const FOLLOWS: [(&[u8], bool); 2] = [(b"\x1b[?2031h", true), (b"\x1b[?2031l", false)];
 
 /// Sonny's own, which no terminal reads: an agent's Sonny drawn in a pane
-/// holds words not sent, or none now.
-const DRAFTS: [(&[u8], bool); 2] = [
-    (b"\x1b]7700;draft=1\x1b\\", true),
-    (b"\x1b]7700;draft=0\x1b\\", false),
+/// holds work ending it would lose, or none now.
+const KEEPS: [(&[u8], bool); 2] = [
+    (b"\x1b]7700;keep=1\x1b\\", true),
+    (b"\x1b]7700;keep=0\x1b\\", false),
 ];
 
-/// Tells the Sonny this one is drawn in whether words not sent are in its
-/// composer, so the pane keeps it running while it is out of view rather
-/// than ending it with them. A terminal ignores it.
-pub fn drafts(on: bool) {
+/// Tells the Sonny this one is drawn in whether it holds work ending it
+/// would lose (words not sent, a command of the person's running, or an
+/// agent in its own pane that holds such), so the pane keeps it running
+/// while out of view rather than ending it with that. A terminal ignores it.
+pub fn keeps(on: bool) {
     #[cfg(test)]
     {
         let _ = on;
@@ -510,7 +512,7 @@ pub fn drafts(on: bool) {
     #[cfg(not(test))]
     {
         let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(DRAFTS[usize::from(!on)].0);
+        let _ = stdout.write_all(KEEPS[usize::from(!on)].0);
         let _ = stdout.flush();
     }
 }
@@ -522,7 +524,7 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
     let starts = || {
         (ASKS.iter().map(|(seq, _)| *seq))
             .chain(FOLLOWS.iter().map(|(seq, _)| *seq))
-            .chain(DRAFTS.iter().map(|(seq, _)| *seq))
+            .chain(KEEPS.iter().map(|(seq, _)| *seq))
             .chain([COPY, OPEN, LEAVE])
     };
     let longest = starts().map(<[u8]>::len).max().unwrap_or(0);
@@ -557,11 +559,11 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
             from = at;
             continue;
         }
-        if let Some((seq, on)) = DRAFTS.iter().find(|(seq, _)| bytes[at..].starts_with(seq)) {
+        if let Some((seq, on)) = KEEPS.iter().find(|(seq, _)| bytes[at..].starts_with(seq)) {
             if from < at {
                 out.push(Piece::Output(&bytes[from..at]));
             }
-            out.push(Piece::Drafts(*on));
+            out.push(Piece::Keeps(*on));
             at += seq.len();
             from = at;
             continue;
@@ -818,23 +820,23 @@ mod tests {
     }
 
     #[test]
-    fn a_program_says_whether_it_holds_words_not_sent() {
-        let (cut, rest) = pieces(b"a\x1b]7700;draft=1\x1b\\b\x1b]7700;draft=0\x1b\\");
+    fn a_program_says_whether_it_holds_work_ending_it_would_lose() {
+        let (cut, rest) = pieces(b"a\x1b]7700;keep=1\x1b\\b\x1b]7700;keep=0\x1b\\");
         assert!(rest.is_empty());
         assert_eq!(
             cut,
             [
                 Piece::Output(b"a"),
-                Piece::Drafts(true),
+                Piece::Keeps(true),
                 Piece::Output(b"b"),
-                Piece::Drafts(false),
+                Piece::Keeps(false),
             ]
         );
         // One a read cuts off waits for the rest.
-        let (cut, rest) = pieces(b"a\x1b]7700;dra");
+        let (cut, rest) = pieces(b"a\x1b]7700;kee");
         assert_eq!(
             (cut, rest),
-            (vec![Piece::Output(b"a")], &b"\x1b]7700;dra"[..])
+            (vec![Piece::Output(b"a")], &b"\x1b]7700;kee"[..])
         );
     }
 

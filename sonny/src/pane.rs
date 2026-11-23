@@ -289,14 +289,22 @@ impl Pane {
     /// Kept to go back or forward to: an agent's Sonny ends, its name,
     /// title and tab kept, so only the one in view runs, however far back
     /// the pane goes; it starts again when gone back to ([`Pane::asleep`]).
-    /// One holding words not sent keeps running, so none are lost.
+    /// One holding work ending it would lose keeps running
+    /// ([`crate::embed::keeps`]).
     fn leave(mut self) -> Self {
         if self.agent.is_some()
-            && !(self.program.as_ref()).is_some_and(crate::embed::Embedded::drafted)
+            && !(self.program.as_ref()).is_some_and(crate::embed::Embedded::keeps)
         {
             self.program = None;
         }
         self
+    }
+
+    /// Whether a program here, shown or kept back or forward, holds work
+    /// ending it would lose.
+    pub fn keeps(&self) -> bool {
+        (self.program.as_ref()).is_some_and(crate::embed::Embedded::keeps)
+            || (self.back.iter().chain(&self.forward)).any(Pane::keeps)
     }
 
     /// An agent kept to go back to, whose Sonny ended as it was left: it
@@ -1711,15 +1719,15 @@ mod tests {
         let docs = docs.woken(program);
         assert!(!docs.asleep() && docs.can_go(false));
         assert_eq!(docs.agent.as_deref(), Some("shop.docs"));
-        // One holding words not sent keeps running, so none are lost.
+        // One holding work ending it would lose (words not sent) keeps running.
         let mut typing = portable_pty::CommandBuilder::new("sh");
-        typing.args(["-c", "printf '\\033]7700;draft=1\\033\\\\'; exec sleep 30"]);
+        typing.args(["-c", "printf '\\033]7700;keep=1\\033\\\\'; exec sleep 30"]);
         let program = crate::embed::Embedded::spawn(typing, 5, 20, || {}).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !program.drafted() && std::time::Instant::now() < deadline {
+        while !program.keeps() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(program.drafted());
+        assert!(program.keeps());
         let mut drafted = Pane::program("docs", program);
         drafted.as_agent("shop.docs", false);
         let fix = agent("fix").after(drafted);
