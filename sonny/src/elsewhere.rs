@@ -524,13 +524,25 @@ async fn lead(socket: &Path, store: &Path, told: &Path, tell: &watch::Sender<Sha
     tokio::pin!(rows);
     let mine = rows_here(&book, here);
     tokio::pin!(mine);
+    // What needs the person, written out once each time it changes and
+    // that line sent to every window, not written out again for each.
+    let mut shared = tell.subscribe();
+    let (lines, _) = watch::channel(waiting_line(&shared.borrow_and_update()));
+    let writing = async {
+        while shared.changed().await.is_ok() {
+            let line = waiting_line(&shared.borrow_and_update());
+            lines.send_replace(line);
+        }
+    };
+    tokio::pin!(writing);
     loop {
         tokio::select! {
             () = &mut following => return,
             () = &mut rows => return,
             () = &mut mine => return,
+            () = &mut writing => return,
             Ok((stream, _)) = async { listener.as_ref().unwrap().accept().await }, if listener.is_some() => {
-                hearing.spawn(tell_on(stream, tell.subscribe(), book.clone()));
+                hearing.spawn(tell_on(stream, lines.subscribe(), book.clone()));
             }
             Some(_) = hearing.join_next(), if !hearing.is_empty() => {}
         }
@@ -653,9 +665,16 @@ async fn write_line(write: &mut tokio::net::unix::OwnedWriteHalf, line: &Line) -
         .is_ok()
 }
 
+/// What needs the person as the line a window that connected is told.
+fn waiting_line(shared: &Shared) -> Arc<str> {
+    let line = serde_json::to_string(&Line::Waiting(shared.clone())).unwrap_or_default();
+    format!("{line}\n").into()
+}
+
 /// What needs the person, to a window that connected: now, and again each
-/// time it changes, one line each; and every agent's row while it asks.
-async fn tell_on(stream: UnixStream, mut shared: watch::Receiver<Shared>, book: Arc<Book>) {
+/// time it changes, one line each ([`waiting_line`]); and every agent's
+/// row while it asks.
+async fn tell_on(stream: UnixStream, mut shared: watch::Receiver<Arc<str>>, book: Arc<Book>) {
     let (read, mut write) = stream.into_split();
     let mut asks = BufReader::new(read).lines();
     let mut rows: Option<(Asking<'_>, broadcast::Receiver<Arc<Moved>>, u64)> = None;
@@ -663,8 +682,8 @@ async fn tell_on(stream: UnixStream, mut shared: watch::Receiver<Shared>, book: 
     loop {
         if !told {
             told = true;
-            let line = Line::Waiting(shared.borrow_and_update().clone());
-            if !write_line(&mut write, &line).await {
+            let line = shared.borrow_and_update().clone();
+            if write.write_all(line.as_bytes()).await.is_err() {
                 return;
             }
         }

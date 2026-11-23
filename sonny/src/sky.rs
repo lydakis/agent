@@ -2932,8 +2932,12 @@ impl View {
                 // The person is a node too, next to the leads they made.
                 let you = count;
                 let mut near: Vec<Vec<usize>> = vec![Vec::new(); count + 1];
+                // Each link both ways, twice over if named twice: the
+                // lists are sorted and their repeats let go after, not
+                // searched at each link, which a lead with thousands of
+                // agents made thousands of times thousands.
                 let mut link = |a: usize, b: usize| {
-                    if a != b && !near[a].contains(&b) {
+                    if a != b {
                         near[a].push(b);
                         near[b].push(a);
                     }
@@ -2954,7 +2958,8 @@ impl View {
                     None => (String::new(), 1),
                 };
                 for list in &mut near {
-                    list.sort_by_key(name);
+                    list.sort_by_cached_key(|at| (name(at), *at));
+                    list.dedup();
                 }
                 // Breadth first from the centre: each ring one hop further.
                 let mut kids: Vec<Vec<usize>> = vec![Vec::new(); count + 1];
@@ -9495,6 +9500,32 @@ mod scale {
             let list = start.elapsed();
             eprintln!(
                 "{count:>6} agents: first frame {first:?}, then {frame:?} a frame; list {list:?}"
+            );
+        }
+    }
+
+    /// One lead with thousands of agents, the sky centred on it: `cargo
+    /// test -p sonny --release a_crowd_round -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn a_crowd_round_its_lead_lays_out_fast() {
+        for count in [1_000usize, 10_000, 30_000] {
+            let (send, feed) = Feeder::new();
+            let mut view = View::with(PathBuf::new(), feed, tokio::spawn(async {}));
+            let mut bots = vec![json!({"name": "p.lead", "bot_id": 1})];
+            for n in 0..count {
+                bots.push(json!({"name": format!("p.a{n}"), "created_by": "p.lead",
+                    "bot_id": 2 + n}));
+            }
+            send.send(Feed::Roll(bots)).unwrap();
+            send.send(Feed::Ready).unwrap();
+            view.drain();
+            view.centre = Some("p.lead".to_owned());
+            let start = Instant::now();
+            view.card(200, 56);
+            eprintln!(
+                "{count:>6} agents round one lead: first frame {:?}",
+                start.elapsed()
             );
         }
     }
