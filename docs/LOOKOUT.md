@@ -32,7 +32,7 @@ steer = { status = ["failed"] }
 [ci · main · 10:31]
 deploy failed on prod
 [lookout]
-This note is news for you, unseen by the person. Reply when it bears on what the person is doing now or is urgent; otherwise end your turn with an empty reply.
+This note is news for you, unseen by the person. Reply only with what is worth interrupting them; otherwise end your turn with an empty reply.
 ```
 
 In Sonny's window, lookout notes fold into one quiet line (`↳ Lookout · calc.fix completed · ▲ ci`) and stay silent if the agent decides there's nothing to report.
@@ -332,7 +332,7 @@ deploy failed on prod
 lunch?
 https://example.slack.com/archives/C1/p2
 [lookout]
-This note is news for you, unseen by the person. Reply when it bears on what the person is doing now or is urgent; otherwise end your turn with an empty reply.
+This note is news for you, unseen by the person. Reply only with what is worth interrupting them; otherwise end your turn with an empty reply.
 
 [Message calc.lead/41, sent by lookout.]
 
@@ -345,7 +345,7 @@ Use tabs.
 - **Size limits:** A note holds at most 192 KiB and 64 quotes, and always one event; the rest wait for the next, which it says under a `[lookout]` header with how many wait and when the lookout heard the first of them (`12 more events wait for the next note, the first heard 10:31`).
 - **One at a time:** What comes while a note is under way waits for its answer, then goes. A note the daemon refuses goes again after 2 minutes; one lost with the connection goes again at once.
 - **Queue cap:** Up to 1,024 events wait per follower (`[sonny] lookout_waiting`, `0` for no limit), on disk with the rest of what the follower is to be told, so a restart loses none. Past that, a newer event is not kept; one that steers takes the place of the newest waiting event that does not. The next note says how many were not kept, from which sources and when, under `[lookout]`, for example `40 more events from chat and ci came between 9 minutes ago and 1 minute ago, and they were not kept: 1024 were waiting for you already`, and its row shows `40 not kept`. Until a note with that line lands, the count is kept and told again. The log names each event that was not kept, with its source and ID, and `/status` shows how many wait and how many were not kept today. George chose this over dropping the oldest (11-02): keeping every ask is what "nothing fell through" needs, and a source's own history cannot bring back an event dropped from a script source.
-- **Trailer:** Every note ends with the trailer, under a `[lookout]` header: one setting, `[sonny] lookout_trailer`, the same for every follower and every source, read as each note goes, and `""` for none. By default it says when to reply: when the news bears on what the person is doing now or is urgent, and otherwise with an empty reply, so the person sees nothing. Agents forget what their role says when news comes in a turn of its own (George, 11-17), so it comes with every note. The lookout adds nothing else: the events stay as their sources said them. What the lead tells the person is its role's call (lead.md).
+- **Trailer:** Every note ends with the trailer, under a `[lookout]` header: one setting, `[sonny] lookout_trailer`, the same for every follower and every source, read as each note goes, and `""` for none. By default it says when to reply: only with what is worth interrupting the person, the role's own rule, and otherwise with an empty reply, so the person sees nothing. Agents forget what their role says when news comes in a turn of its own (George, 11-17), so it comes with every note. The lookout adds nothing else: the events stay as their sources said them. What the lead tells the person is its role's call (lead.md).
 - **Display:** Sonny shows a note folded, one quiet row named by what it tells: `↳ Lookout · calc.fix completed · you wrote in calc.docs · ▲ ci`, each task's event in a few words and each other source's counted, marked by its icon. A turn it started that ends with an empty reply stays there: no line under it and no sound. Anything the lead does write shows as any reply.
 
 ![A lead's window: the lookout's note folded to one row, ↳ Lookout · calc.fix-avg completed, then the lead's reply](sonny/lookout-note-folded.png)

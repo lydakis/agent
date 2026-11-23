@@ -180,11 +180,13 @@ CASES = [
      ]},
     {'id': 'small-fix', 'area': 'coding',
      'steps': [{'say': role_eval.SMALL[0]['say']}],
+     # The lead merges only when the person asks, and this ask does not,
+     # so the fix counts on main or on a branch the lead names.
      'main': {'warning gone': NO_WARNING},
+     'branches': {'warning gone': NO_WARNING},
      'checks': [
-         check('does it itself, starting no agent', lambda v: v.started() == 0),
-         check('the warning is gone on main', lambda v: v.main('warning gone')),
-         check('the tests pass on main', lambda v: v.suite()),
+         check('the warning is gone on main or a branch it names', lambda v: bool(v.fixed_on('warning gone'))),
+         check('the tests pass there', lambda v: any(v.suite_on(ref) for ref in v.fixed_on('warning gone'))),
      ]},
     {'id': 'two-tasks', 'area': 'tasks',
      'steps': [{'say': f"Two separate things for today: {SIGN_OUT}, find out why and fix it; and add a CSV "
@@ -257,8 +259,8 @@ CASES = [
                        "conversation, and meanwhile look at shop/audit.py yourself. Then tell me what each of "
                        "you found."}],
      'checks': [
+         # A fresh agent by either tool: which one is the lead's call.
          check('hands the review to another agent', lambda v: v.started() > 0),
-         check('with spawn_agent', lambda v: v.calls('spawn_agent') > 0, needs='spawn_agent'),
          check('reports both', lambda v: v.says(r'orders') and v.says(r'audit|utcnow')),
          check('changes no file', lambda v: not v.lead_edits() and v.untouched()),
      ]},
@@ -376,6 +378,16 @@ def collect(case, root):
     found['main'] = {name: burst_ledger.checked(agent, repo, env, 'main', code)
                      for name, code in case.get('main', {}).items()}
     found['suite'] = burst_ledger.suite_passes(agent, repo, env, 'main')
+    # Every other branch of the repository, for a case whose work may stay
+    # on a task's branch: each one's checks and whether its suite passes.
+    if case.get('branches'):
+        heads = burst_ledger.confined(agent, env, ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads'],
+                                      repo, text=True)
+        found['branches'] = {
+            ref: {'checks': {name: burst_ledger.checked(agent, repo, env, ref, code)
+                             for name, code in case['branches'].items()},
+                  'suite': burst_ledger.suite_passes(agent, repo, env, ref)}
+            for ref in (heads.stdout.split() if heads.returncode == 0 else []) if ref != 'main'}
     refs = burst_ledger.confined(agent, env, ['git', 'for-each-ref', '--format=%(refname)', 'refs/heads'],
                                  root / 'origin.git', text=True)
     found['origin'] = sorted(refs.stdout.split()) if refs.returncode == 0 else None
@@ -598,6 +610,20 @@ class View:
 
     def suite(self):
         return self.evidence.get('suite')
+
+    def fixed_on(self, name):
+        """Where check `name` passes: main, and each other branch the
+        lead named, whole or by its last part."""
+        found = ['main'] if self.main(name) else []
+        for ref, got in (self.evidence.get('branches') or {}).items():
+            if got['checks'].get(name) and (self.says(re.escape(ref)) or self.says(re.escape(ref.rsplit('/', 1)[-1]))):
+                found.append(ref)
+        return found
+
+    def suite_on(self, ref):
+        if ref == 'main':
+            return self.suite()
+        return (self.evidence.get('branches') or {}).get(ref, {}).get('suite')
 
     def origin(self):
         """The branches on origin at the end."""

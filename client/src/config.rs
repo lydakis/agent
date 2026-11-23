@@ -965,8 +965,8 @@ pub const MARGIN_NOTE_LINES: u64 = 40;
 /// What ends every lookout note unless `lookout_trailer` says otherwise:
 /// when to reply to it, since an agent hears the person's news in its own
 /// turn, which the person sees only if it replies.
-pub const LOOKOUT_TRAILER: &str = "This note is news for you, unseen by the person. Reply when it bears on \
-     what the person is doing now or is urgent; otherwise end your turn with an empty reply.";
+pub const LOOKOUT_TRAILER: &str = "This note is news for you, unseen by the person. Reply only with what \
+     is worth interrupting them; otherwise end your turn with an empty reply.";
 
 /// The narrowest `text_width` other than 0, the margin's own least width:
 /// a narrower column wraps a path or a line of code at every turn.

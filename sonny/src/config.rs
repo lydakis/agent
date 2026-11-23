@@ -496,7 +496,7 @@ pub const SETTINGS: &[Setting] = &[
         group: "Agents",
         name: "lookout trailer",
         label: "what ends every lookout note: when to reply to it",
-        about: "what ends every note the lookout sends an agent, under a `[lookout]` header, read as each note goes; by default when to reply: when the news bears on what the person is doing now or is urgent, and otherwise an empty reply; `none` for none",
+        about: "what ends every note the lookout sends an agent, under a `[lookout]` header, read as each note goes; by default when to reply: only with what is worth interrupting the person, and otherwise an empty reply; `none` for none",
         values: &[],
         default: "when to reply",
     },
