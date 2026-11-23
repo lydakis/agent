@@ -8692,7 +8692,15 @@ impl Fleet {
                 self.settle(bot, waits);
             }
             match kind {
-                "closed" => _ = self.closed.insert(bot.to_owned()),
+                "closed" => {
+                    self.closed.insert(bot.to_owned());
+                    // At rest, it is done: what it asked is set aside.
+                    if self.activity.get(bot) != Some(&"working") {
+                        self.needs.asked(bot, None);
+                        let waits = self.needs.waits(bot);
+                        self.settle(bot, waits);
+                    }
+                }
                 "accepted" => {
                     self.closed.remove(bot);
                     if bot == self.lead {
@@ -38619,6 +38627,24 @@ mod tests {
         assert_eq!(fleet.doing["calc.ask"], "idle");
         assert_eq!(fleet.doing["calc.new"], "needs you");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_task_closed_at_rest_from_elsewhere_asks_nothing_more() {
+        let (client, events) = project_waiting().await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        fleet.reconcile().await;
+        while !fleet.unread.is_empty() {
+            fleet.rescan_through().await;
+        }
+        assert_eq!(fleet.doing["calc.new"], "needs you");
+        let asking = |fleet: &Fleet| fleet.needs.asks().any(|(bot, _)| bot == "calc.new");
+        assert!(asking(&fleet));
+        // Closed by the person, its history unmoved: done, its question
+        // set aside at once.
+        fleet.event(&json!({"event": "closed", "bot": "calc.new", "data": {}}));
+        assert!(!asking(&fleet));
+        assert_ne!(fleet.doing["calc.new"], "needs you");
     }
 
     #[tokio::test]
