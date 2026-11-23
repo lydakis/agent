@@ -365,7 +365,7 @@ fn model_values(
         false => Span::raw(shown.to_owned()),
     };
     let mut pairs = vec![(
-        [Span::raw("  effort ").dim(), value(effort, !on_speed)],
+        [Span::raw("effort ").dim(), value(effort, !on_speed)],
         models::Click::Effort,
     )];
     if let Some(speed) = speed {
@@ -383,7 +383,7 @@ fn model_values(
             .content
             .trim_start_matches([' ', '·'])
             .to_owned();
-        pairs[0].0[0] = Span::raw(format!("  {name}")).dim();
+        pairs[0].0[0] = Span::raw(name).dim();
     }
     pairs
 }
@@ -4640,17 +4640,29 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
         frame.render_widget(Paragraph::new(rule), Rect { width, ..gap });
         return;
     }
-    let before = u16::from(composer.x > 0);
-    let after = u16::from(composer.x + width < frame.area().right());
     let band = Rect {
-        x: composer.x - before,
         y: gap.y,
         height: pad.bottom().saturating_sub(gap.y),
-        width: width + before + after,
+        ..banded(frame.area(), composer)
     };
     frame
         .buffer_mut()
         .set_style(band, Style::default().bg(look::BAND));
+}
+
+/// The columns the band takes beside rows laid in `area`, in a window
+/// `whole`: the conversation's width, and a column past it at each end
+/// where the window has one, as the composer's and a sent message's band
+/// reach.
+fn banded(whole: Rect, area: Rect) -> Rect {
+    let width = area.width.min(measure() as u16);
+    let before = u16::from(area.x > whole.x);
+    let after = u16::from(area.x + width < whole.right());
+    Rect {
+        x: area.x - before,
+        width: width + before + after,
+        ..area
+    }
 }
 
 /// The width the composer's text is laid at, for a conversation
@@ -23271,7 +23283,7 @@ impl App {
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans(
-                    "  ↑↓ pick · enter read, again allow one retry · esc close",
+                    "↑↓ pick · enter read, again allow one retry · esc close",
                 ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -23343,13 +23355,7 @@ impl App {
                     composer.width as usize,
                     composer.y.saturating_sub(frame.area().y) as usize,
                 );
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(rows.len() as u16),
-                    height: rows.len() as u16,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, rows, composer);
                 let (line, cursor) = view.line();
                 frame.render_widget(Paragraph::new(line), composer);
                 if let Some(column) = cursor {
@@ -23375,10 +23381,14 @@ impl App {
                 let mut rows = list::lines(&items, search.pick, width, room);
                 if items.is_empty() && room > 1 {
                     rows.push(
-                        Line::from(match search.prompts.is_empty() {
-                            true => "    no prompts sent yet",
-                            false => "    no prompt matches",
-                        })
+                        Line::from(format!(
+                            "{}{}",
+                            " ".repeat(list::INDENT),
+                            match search.prompts.is_empty() {
+                                true => "no prompts sent yet",
+                                false => "no prompt matches",
+                            }
+                        ))
                         .dim(),
                     );
                 }
@@ -23449,7 +23459,7 @@ impl App {
                 {
                     let why = Span::raw(refused.clone());
                     rows.push(Line::from(vec![
-                        Span::raw("    "),
+                        Span::raw(" ".repeat(list::INDENT)),
                         Span::raw("✗ ").fg(Color::Red),
                         if alone { why } else { why.dim() },
                     ]));
@@ -23507,6 +23517,7 @@ impl App {
                     pick = pick.key("tab", if on_speed { "effort" } else { "speed" });
                 }
                 let pick = pick.esc(hint::Esc::Close);
+                keys.push(Span::raw("  "));
                 let room =
                     usize::from(footer.width).saturating_sub(Line::from(keys.clone()).width());
                 keys.extend(hint::under(&pick, room));
@@ -24409,14 +24420,21 @@ fn card_width(wide: u16) -> usize {
         .saturating_sub(1)
 }
 
-/// `rows` drawn over what is right above `below`, cleared first.
+/// `rows` drawn over what is right above `below`, cleared first, the
+/// band's column past each end too, where a sent message's band reaches.
 fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::layout::Rect) {
     let area = ratatui::layout::Rect {
         y: below.y.saturating_sub(rows.len() as u16),
         height: (rows.len() as u16).min(below.y),
         ..below
     };
-    frame.render_widget(ratatui::widgets::Clear, area);
+    let band = banded(frame.area(), area);
+    let cleared = Rect {
+        x: band.x,
+        width: band.right().max(area.right()) - band.x,
+        ..area
+    };
+    frame.render_widget(ratatui::widgets::Clear, cleared);
     frame.render_widget(Paragraph::new(rows), area);
 }
 
@@ -34428,18 +34446,18 @@ mod tests {
                 .collect()
         };
         let wide = model_values("default", Some("standard"), false, 60);
-        assert_eq!(said(wide), "  effort ‹ default › · speed standard");
+        assert_eq!(said(wide), "effort ‹ default › · speed standard");
         // At 44 columns both and `esc close` do not fit: the one ← and →
         // move stays, by its name.
         let narrow = model_values("default", Some("standard"), false, 44);
-        assert_eq!(said(narrow), "  effort ‹ default ›");
+        assert_eq!(said(narrow), "effort ‹ default ›");
         let narrow = model_values("default", Some("fast"), true, 40);
-        assert_eq!(said(narrow.clone()), "  speed ‹ fast ›");
+        assert_eq!(said(narrow.clone()), "speed ‹ fast ›");
         assert_eq!(narrow[0].1, models::Click::Speed);
         // One value alone stays whatever the width.
         assert_eq!(
             said(model_values("high", None, false, 10)),
-            "  effort ‹ high ›"
+            "effort ‹ high ›"
         );
     }
 
@@ -34493,6 +34511,30 @@ mod tests {
         assert_eq!(row(&app), Some(("standard", true)));
         app.key(click(5)).await;
         assert_eq!(row(&app), Some(("standard", false)));
+        // As drawn: the values from the footer's first column, under the
+        // `›`, each click range on the words and arrows it names.
+        let mut terminal = Terminal::new(Shot(ratatui::backend::TestBackend::new(80, 24))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        let buffer = terminal.backend().0.buffer().clone();
+        let at = |(y, columns, _): &(u16, std::ops::Range<u16>, models::Click)| {
+            buffer[(columns.start, *y)].symbol().to_owned()
+        };
+        let drawn: Vec<(models::Click, String)> =
+            (app.model_at.iter()).map(|hit| (hit.2, at(hit))).collect();
+        assert!(
+            drawn.contains(&(models::Click::Effort, "e".into())),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn.contains(&(models::Click::Less, "‹".into())),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn.contains(&(models::Click::More, "›".into())),
+            "{drawn:?}"
+        );
+        let effort_at = (app.model_at.iter()).find(|hit| hit.2 == models::Click::Effort);
+        assert_eq!(effort_at.map(|hit| hit.1.start), Some(2));
         let effort = |app: &App| {
             app.picker
                 .as_ref()
@@ -39978,6 +40020,74 @@ mod tests {
         }
         // Nothing on the reply's rows.
         assert!((0..40).all(|x| buffer[(x, at)].bg != band));
+    }
+
+    #[tokio::test]
+    async fn a_list_over_the_composer_keeps_the_conversation_s_two_columns() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        // A 60-column window's conversation is 56 wide, from its third
+        // column; the band reaches a column past it at each end.
+        let (wide, high) = (60u16, 24u16);
+        let mut terminal =
+            Terminal::new(Shot(ratatui::backend::TestBackend::new(wide, high))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        app.land(
+            5,
+            ("check the totals\nand the halves", ""),
+            (None, false),
+            false,
+        );
+        app.draw(&mut terminal).unwrap();
+        let band = look::band();
+        let banded: Vec<u16> = {
+            let buffer = terminal.backend().0.buffer();
+            (0..high).filter(|&y| buffer[(1, y)].bg == band).collect()
+        };
+        app.input.set("/co");
+        app.draw(&mut terminal).unwrap();
+        let buffer = terminal.backend().0.buffer().clone();
+        let row = |y: u16| -> String { (0..wide).map(|x| buffer[(x, y)].symbol()).collect() };
+        let all = || (0..high).map(row).collect::<Vec<_>>();
+        let lead = |y: u16| (0..wide).find(|&x| buffer[(x, y)].symbol() != " ");
+        let typed = (0..high).find(|&y| row(y).trim() == "› /co");
+        let typed = typed.unwrap_or_else(|| panic!("{:?}", all()));
+        // What is typed and the commands listed start in one column, the
+        // words' column, two past the `›`.
+        let listed: Vec<u16> = (0..typed)
+            .filter(|&y| row(y).trim_start().starts_with("/co"))
+            .collect();
+        assert!(listed.len() > 1, "{:?}", all());
+        for &y in &listed {
+            assert_eq!(lead(y), Some(4), "{:?}", all());
+        }
+        assert_eq!(buffer[(2, typed)].symbol(), "›");
+        assert_eq!(buffer[(4, typed)].symbol(), "/");
+        // The keys under it start where the footer does, under the `›`.
+        let keys = (typed..high).find(|&y| row(y).contains("esc close"));
+        let keys = keys.unwrap_or_else(|| panic!("{:?}", all()));
+        assert_eq!(lead(keys), Some(2), "{}", row(keys));
+        // No cell of the sent message's band beside the rows it covers.
+        let top = listed[0] - 1;
+        let covered: Vec<u16> = (banded.iter().copied())
+            .filter(|&y| y >= top && y < listed[listed.len() - 1] + 1)
+            .collect();
+        assert!(!covered.is_empty(), "{banded:?} {:?}", all());
+        for y in covered {
+            assert_ne!(buffer[(1, y)].bg, band, "{}", row(y));
+            assert_ne!(buffer[(wide - 2, y)].bg, band, "{}", row(y));
+        }
+        // The one in effect has its `•` under the `›`.
+        app.input.set("/permissions");
+        app.submit().await;
+        app.beside_done().await;
+        app.draw(&mut terminal).unwrap();
+        let buffer = terminal.backend().0.buffer().clone();
+        let row = |y: u16| -> String { (0..wide).map(|x| buffer[(x, y)].symbol()).collect() };
+        let all = || (0..high).map(row).collect::<Vec<_>>();
+        let marked = (0..high).find(|&y| row(y).trim_start().starts_with('•'));
+        let marked = marked.unwrap_or_else(|| panic!("{:?}", all()));
+        assert_eq!(buffer[(2, marked)].symbol(), "•", "{:?}", all());
+        assert_ne!(buffer[(4, marked)].symbol(), " ", "{}", row(marked));
     }
 
     #[tokio::test]

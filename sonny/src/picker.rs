@@ -381,17 +381,17 @@ mod tests {
         // In by the list's indent, the rest muted; no truecolor, no `›`.
         assert_eq!(
             row_line(&row, 12, 80, false),
-            "    Claude Opus \x1b[2m  anthropic/claude-a  recommended\x1b[0m"
+            "  Claude Opus \x1b[2m  anthropic/claude-a  recommended\x1b[0m"
         );
         // Picked: reversed from the name to a column past its last word.
         assert_eq!(
             row_line(&row, 12, 80, true),
-            "    \x1b[7mClaude Opus   anthropic/claude-a  recommended \x1b[0m"
+            "  \x1b[7mClaude Opus   anthropic/claude-a  recommended \x1b[0m"
         );
         // A narrow terminal drops the badge, then cuts the detail.
         assert_eq!(
-            row_line(&row, 12, 28, false),
-            "    Claude Opus \x1b[2m  anthropi\u{2026}\x1b[0m"
+            row_line(&row, 12, 26, false),
+            "  Claude Opus \x1b[2m  anthropi\u{2026}\x1b[0m"
         );
     }
 

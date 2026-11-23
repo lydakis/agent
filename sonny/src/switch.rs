@@ -376,7 +376,7 @@ mod tests {
         // column before the names of the lead and the helpers.
         assert_eq!(rows.len(), 7);
         for (row, (agent, _)) in rows.iter().zip(picker.rows()) {
-            let past_sign: String = row.chars().skip(6).collect();
+            let past_sign: String = row.chars().skip(4).collect();
             assert_eq!(past_sign.split(' ').next(), Some(agent.name.as_str()));
         }
         assert!(rows[4].ends_with("shop.fix       Round half cents to even · working"));

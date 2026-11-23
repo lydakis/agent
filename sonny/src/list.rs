@@ -2,7 +2,9 @@
 //! popups with one component: at most `ROWS` rows scrolled to keep the pick
 //! in view, a blank row between it and the conversation, the pick in
 //! reverse video, `•` before what is in effect now, and the letters typed
-//! to narrow it in bold, as Codex marks them.
+//! to narrow it in bold, as Codex marks them. It keeps the conversation's
+//! two columns, as Codex's popup does: the `•` in the first, under the
+//! composer's `›`, and the names in the words' column, under what is typed.
 use ratatui::{
     style::Stylize,
     text::{Line, Span},
@@ -12,8 +14,9 @@ use unicode_width::UnicodeWidthStr;
 /// Rows shown at most, as Codex's `MAX_POPUP_ROWS`.
 pub const ROWS: usize = 8;
 
-/// Where a row's name starts, past the mark of the one in effect.
-pub const INDENT: usize = 4;
+/// Where a row's name starts, past the mark of the one in effect: the
+/// words' column, where what is typed starts after the composer's `› `.
+pub const INDENT: usize = 2;
 
 /// One row: its name, what it is (muted), whether it is in effect, and
 /// where in its name the letters typed are.
@@ -82,8 +85,8 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
     let mut out = vec![Line::default()];
     for (at, item) in items.iter().enumerate().skip(first).take(shown) {
         let mark = match item.current {
-            true => "  • ",
-            false => "    ",
+            true => "• ",
+            false => "  ",
         };
         // Padded by columns, as `wide` is measured: a wide character
         // takes two.
@@ -430,27 +433,28 @@ mod tests {
                 .collect()
         };
         let wide = text(80);
-        // No column of titles: every name starts where the others do.
-        assert_eq!(wide[1], "    ○ tally.lead");
+        // No column of titles: every name starts where the others do,
+        // the state's mark in the words' column and the name after it.
+        assert_eq!(wide[1], "  ○ tally.lead");
         assert_eq!(
             wide[2],
-            "    ● tally.halves  Round half cents to even · working"
+            "  ● tally.halves  Round half cents to even · working"
         );
-        assert_eq!(wide[3], "    ○ tally.sums    Check the totals");
-        assert_eq!(wide[4], "    ■ notes         interrupted · ~/notes");
+        assert_eq!(wide[3], "  ○ tally.sums    Check the totals");
+        assert_eq!(wide[4], "  ■ notes         interrupted · ~/notes");
         // The title is muted, as what it is doing is.
         let row = &lines(&items, 0, 80, 10)[2];
         let muted = row.spans.last().unwrap();
         assert_eq!(muted.content, "  Round half cents to even · working");
         assert!(muted.style.add_modifier.contains(Modifier::DIM));
         // Narrow: the title is cut at a word, what it is doing kept whole.
-        assert_eq!(text(48)[2], "    ● tally.halves  Round half… · working");
+        assert_eq!(text(46)[2], "  ● tally.halves  Round half… · working");
         // No room for a word of it: no title, what it is doing kept.
-        assert_eq!(text(36)[2], "    ● tally.halves  working");
-        assert_eq!(text(36)[3], "    ○ tally.sums    Check the…");
+        assert_eq!(text(34)[2], "  ● tally.halves  working");
+        assert_eq!(text(34)[3], "  ○ tally.sums    Check the…");
         // Then that gives way, and the name stays whole.
-        assert_eq!(text(28)[2], "    ● tally.halves  worki…");
-        assert_eq!(text(21)[2], "    ● tally.halves");
+        assert_eq!(text(26)[2], "  ● tally.halves  worki…");
+        assert_eq!(text(19)[2], "  ● tally.halves");
     }
 
     #[test]
@@ -474,6 +478,9 @@ mod tests {
 
     #[test]
     fn a_long_list_shows_eight_rows_around_the_pick_under_a_blank_one() {
+        // Names in the words' column, two in, under what is typed after
+        // the composer's `› `; the one in effect has its `•` in the first
+        // column, under the `›`.
         let items: Vec<Item> = (0..21)
             .map(|n| Item::new(format!("/c{n}"), "does").current(n == 3))
             .collect();
@@ -483,16 +490,16 @@ mod tests {
         let top = text(lines(&items, 3, 40, 20));
         assert_eq!(top.len(), 9);
         assert_eq!(top[0], "");
-        assert_eq!(top[1], "    /c0   does");
-        assert_eq!(top[4], "  • /c3   does ");
+        assert_eq!(top[1], "  /c0   does");
+        assert_eq!(top[4], "• /c3   does ");
         let end = text(lines(&items, 20, 40, 20));
-        assert_eq!(end[8], "    /c20  does ");
-        assert_eq!(end[1], "    /c13  does");
+        assert_eq!(end[8], "  /c20  does ");
+        assert_eq!(end[1], "  /c13  does");
         // With four rows free above the composer, three items show, the
         // pick among them.
         let short = text(lines(&items, 20, 40, 4));
         assert_eq!(short.len(), 4);
-        assert_eq!(short[3], "    /c20  does ");
+        assert_eq!(short[3], "  /c20  does ");
     }
 
     #[test]
@@ -514,8 +521,8 @@ mod tests {
         assert_eq!(bold[1], ("/".into(), false));
         assert_eq!(bold[2], ("com".into(), true));
         assert_eq!(bold[3], ("mons".into(), false));
-        assert_eq!(rows[1].to_string(), "    /commons  read");
-        assert_eq!(rows[2].to_string(), "    /compact  go ");
+        assert_eq!(rows[1].to_string(), "  /commons  read");
+        assert_eq!(rows[2].to_string(), "  /compact  go ");
     }
 
     fn picker(names: &[&str]) -> Picker {

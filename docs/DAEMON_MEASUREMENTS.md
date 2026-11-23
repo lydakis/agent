@@ -13042,6 +13042,92 @@ A burst costs the agent one request: messages that arrive before its next
 request goes all go in that request, and those arriving while one runs go
 in the next. Nothing to change.
 
+## Release 0.10.5 against 0.10.4
+
+This measures every change since 0.10.4 together: v0.10.4 (2056365) against
+the release commit b542220. The protocol is 100 on both, and each side runs
+its own daemon with its own Sonny. Release builds (glibc) on one 4-core Linux
+container, base and head alternated. The benchmark ran after the tag: 0.10.5
+shipped on its pull requests' own Perf screens.
+
+The benchmark is `bench/ends.py` at the low end (10 agents, one window) and
+the high end (10,000 stored agents, 30 busy, 8 scripts, 20 s, 32 and 100
+windows spread over folders), two rounds each, then three rounds of the Perf
+workflow's screens.
+
+### Low end
+
+| Measure | 0.10.4 | 0.10.5 |
+| --- | ---: | ---: |
+| window start, s | 0.048 / 0.05 | 0.051 / 0.048 |
+| key p99, ms | 1.34 / 1.03 | 1.16 / 1.04 |
+| turn p50, ms | 47.97 / 47.98 | 47.57 / 47.88 |
+| turn p99, ms | 52.96 / 51.42 | 51.07 / 57.71 |
+| idle daemon PSS, MiB | 19.7 / 19.8 | 20.5 / 20.7 |
+| idle window PSS, MiB | 18.2 / 17.5 | 17.5 / 17.8 |
+| idle window wakeups, /s | 4.6 / 4.6 | 4.6 / 4.5 |
+
+- **The daemon's PSS at rest is 0.8 MiB higher here, all in its code pages.**
+  Its text is 78 KB larger (`agent tool`, the providers pass, effort marks).
+  A daemon started on an empty store, page cache dropped before each of four
+  alternating runs, holds 2.11 MiB anonymous on 0.10.4 and 2.11 to 2.12 on
+  0.10.5, with total PSS 12.4 to 12.9 MiB on both. The footprint screen's
+  idle RSS and RSS after a turn each are even.
+
+### High end
+
+| Measure | 0.10.4 | 0.10.5 |
+| --- | ---: | ---: |
+| 32 windows: windows CPU, % | 4.34 / 4.39 | 4.64 / 4.54 |
+| windows PSS, MiB | 190.3 / 190.0 | 190.3 / 190.9 |
+| daemon CPU, % | 134.76 / 136.66 | 134.43 / 136.09 |
+| daemon PSS, MiB | 37.3 / 37.8 | 38.7 / 38.0 |
+| key p99, ms | 10.96 / 14.79 | 8.75 / 12.13 |
+| worst key, ms | 15.14 / 42.08 | 14.72 / 19.97 |
+| turns finished | 8901 / 9005 | 8702 / 8732 |
+| scripts finished | 1095 / 1106 | 1068 / 1052 |
+| 100 windows: windows CPU, % | 10.4 / 11.18 | 10.44 / 11.14 |
+| windows PSS, MiB | 503.1 / 502.9 | 502.7 / 501.1 |
+| daemon CPU, % | 130.63 / 135.72 | 135.03 / 136.27 |
+| daemon PSS, MiB | 38.3 / 38.8 | 38.7 / 38.8 |
+| key p99, ms | 22.78 / 12.16 | 16.38 / 11.75 |
+| worst key, ms | 50.76 / 27.68 | 23.04 / 16.07 |
+| turns finished | 8718 / 8934 | 8787 / 8470 |
+| scripts finished | 1075 / 1098 | 1067 / 1017 |
+
+- **Keys are even or better**, and no key took 100 ms on either side.
+- Turns finished at 32 windows read 2 to 3% fewer on 0.10.5 in both rounds;
+  at 100 windows the rounds overlap (8,470 to 8,787 against 8,718 to 8,934).
+  The admission and completion screens below are even, so this is worth one
+  more look at 32 windows before 0.10.6, not a known regression.
+
+### Daemon and Sonny screens
+
+Three alternating rounds. No row moves past the gate's 15%. The lifecycle
+screen did not run here (its output folder is missing in this rig).
+
+| Bench | Measure | 0.10.4 | 0.10.5 | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 36.471 | 38.148 | +4.6% |
+| admission | burst submit p99, ms | 5.297 | 5.37 | +1.4% |
+| completion | release to terminal p99, ms | 12.79 | 11.732 | -8.3% |
+| footprint | idle RSS, MiB | 17.588 | 17.672 | +0.5% |
+| footprint | per idle bot, KiB | 1.698 | 1.76 | +3.7% |
+| footprint | RSS after a turn each, MiB | 33.648 | 33.289 | -1.1% |
+| footprint | CPU per turn, ms | 0.896 | 0.863 | -3.6% |
+| footprint | written to disk per turn, KiB | 42.98 | 43.568 | +1.4% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 37.5 | 37.5 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 7.5 | 7.5 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.38 | 4.38 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 6.25 | 6.25 | +0.0% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2150 | 2140 | -0.5% |
+| sonny | lookout note p95 at 100x10, ms | 2215 | 2292 | +3.5% |
+| sonny | quiet window CPU, ms/s | 0.75 | 0.75 | +0.0% |
+| sonny | quiet window RSS, MiB | 31.5 | 31.8 | +1.0% |
+| sonny | sky replay CPU per 1k lines, ms | 11.74 | 11.51 | -2.0% |
+| sonny | sky replay RSS, MiB | 78.5 | 81.0 | +3.2% |
+
 ## A network domain allowlist (#1334)
 
 2026-11-23. A bot with `domains` reaches the network only through a proxy

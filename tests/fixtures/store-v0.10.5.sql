@@ -1,10 +1,10 @@
-PRAGMA user_version=111;
+PRAGMA user_version=113;
 BEGIN TRANSACTION;
 CREATE TABLE answers(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, tag TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL,
                 expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0, paused_ms INTEGER,
                 parts TEXT, taken_ms INTEGER, process INTEGER, yielded INTEGER NOT NULL DEFAULT 0);
-INSERT INTO "answers" VALUES(2,4,'exec-1','sonny','exec','{"input":"await yield_control()"}',1795182212585,NULL,0,NULL,NULL,NULL,NULL,0);
+INSERT INTO "answers" VALUES(2,4,'exec-1','sonny','exec','{"input":"await yield_control()"}',1795412103679,NULL,0,NULL,NULL,NULL,NULL,0);
 CREATE TABLE approval_tags(approval INTEGER NOT NULL REFERENCES approvals(id) ON DELETE CASCADE,
                 tag TEXT NOT NULL, turn INTEGER NOT NULL, PRIMARY KEY(approval,tag)) WITHOUT ROWID;
 CREATE TABLE approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
@@ -18,9 +18,9 @@ CREATE TABLE audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at_ms INTEGER NOT NULL,
                 bot_id INTEGER NOT NULL, bot TEXT NOT NULL, turn INTEGER NOT NULL, call_id TEXT NOT NULL,
                 step TEXT, tool TEXT NOT NULL, kind TEXT, place TEXT, approved TEXT NOT NULL,
                 access TEXT NOT NULL, ms INTEGER, outcome TEXT NOT NULL, preview TEXT NOT NULL);
-INSERT INTO "audit" VALUES(1,1795178612332,1,'Lead',1,'exec-1',NULL,'exec','mcp',NULL,'nobody','unknown',6,'completed','{"input":"text(\"ok\")"}');
-INSERT INTO "audit" VALUES(2,1795178612485,3,'Helper',3,'echo-1',NULL,'echo','agents',NULL,'nobody','read',1,'completed','{"text": "hi"}');
-INSERT INTO "audit" VALUES(3,1795178612585,1,'Lead',4,'exec-1',NULL,'exec','mcp',NULL,'nobody','unknown',NULL,'unknown','{"input":"await yield_control()"}');
+INSERT INTO "audit" VALUES(1,1795408503433,1,'Lead',1,'exec-1',NULL,'exec','mcp',NULL,'nobody','unknown',3,'completed','{"input":"text(\"ok\")"}');
+INSERT INTO "audit" VALUES(2,1795408503583,3,'Helper',3,'echo-1',NULL,'echo','agents',NULL,'nobody','read',1,'completed','{"text": "hi"}');
+INSERT INTO "audit" VALUES(3,1795408503679,1,'Lead',4,'exec-1',NULL,'exec','mcp',NULL,'nobody','unknown',NULL,'unknown','{"input":"await yield_control()"}');
 CREATE TABLE bot_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
                 instructions TEXT NOT NULL, compaction_instructions TEXT);
 INSERT INTO "bot_instructions" VALUES(1,'Test agent.',NULL);
@@ -61,9 +61,9 @@ CREATE TABLE bots(name TEXT PRIMARY KEY, head INTEGER REFERENCES nodes(id),
                 last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT,
                 configure_pending TEXT, refused_summary TEXT, closed_ms INTEGER, profile TEXT,
                 family_start INTEGER);
-INSERT INTO "bots" VALUES('Lead',12,1,'/tmp/agent-store-fixture','waiting',4,'openai','responses','synthetic-model',NULL,NULL,330,1,0,'echo,shell',300,0,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,0,0,0,NULL,NULL,11,1,NULL,'{"approval_hold_ms":0,"steps_only":["*"]}',NULL,NULL,NULL,1255,100,0,'53e7ee2a6cf37f4f7c7a86c210c8d215fa4d271b1060a9975699d3c2b88756a4',145,12,NULL,0,1795178612537,'{"answer":"sonny","call_id":"exec-1","deadline_ms":1795182212585}',1,'completed',1795178612326,1795178612385,NULL,NULL,NULL,NULL,NULL,NULL);
-INSERT INTO "bots" VALUES('Lead.task',6,2,'/tmp/agent-store-fixture','completed',NULL,'openai','responses','synthetic-model',NULL,NULL,110,5,0,'echo,shell',100,0,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,0,0,0,NULL,NULL,NULL,NULL,NULL,'{"steps_only":["*"]}',NULL,NULL,NULL,382,100,0,'32cbdb278b2241c179783b18902ea244c5792fffc4ab0a2c846fb70e44faee30',110,6,NULL,0,NULL,NULL,2,'completed',1795178612387,1795178612433,NULL,NULL,NULL,NULL,NULL,NULL);
-INSERT INTO "bots" VALUES('Helper',10,3,'/tmp/agent-store-fixture','completed',NULL,'openai','responses','synthetic-model',NULL,NULL,220,7,0,'echo,shell',200,0,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,0,0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,3039,100,0,NULL,122,10,NULL,0,NULL,NULL,3,'completed',1795178612435,1795178612532,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "bots" VALUES('Lead',12,1,'/tmp/agent-store-fixture','waiting',4,'openai','responses','synthetic-model',NULL,NULL,330,1,0,'echo,shell',300,0,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,0,0,0,NULL,NULL,11,1,NULL,'{"approval_hold_ms":0,"steps_only":["*"]}',NULL,NULL,NULL,1255,100,0,'53e7ee2a6cf37f4f7c7a86c210c8d215fa4d271b1060a9975699d3c2b88756a4',145,12,NULL,0,1795408503634,'{"answer":"sonny","call_id":"exec-1","deadline_ms":1795412103679}',1,'completed',1795408503428,1795408503483,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "bots" VALUES('Lead.task',6,2,'/tmp/agent-store-fixture','completed',NULL,'openai','responses','synthetic-model',NULL,NULL,110,5,0,'echo,shell',100,0,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,0,0,0,NULL,NULL,NULL,NULL,NULL,'{"steps_only":["*"]}',NULL,NULL,NULL,382,100,0,'32cbdb278b2241c179783b18902ea244c5792fffc4ab0a2c846fb70e44faee30',110,6,NULL,0,NULL,NULL,2,'completed',1795408503486,1795408503535,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "bots" VALUES('Helper',10,3,'/tmp/agent-store-fixture','completed',NULL,'openai','responses','synthetic-model',NULL,NULL,220,7,0,'echo,shell',200,0,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,0,0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,3039,100,0,NULL,122,10,NULL,0,NULL,NULL,3,'completed',1795408503537,1795408503631,NULL,NULL,NULL,NULL,NULL,NULL);
 INSERT INTO "bots" VALUES('Helper.fork',10,4,'/tmp/agent-store-fixture','idle',NULL,'openai','responses','synthetic-model',NULL,NULL,0,7,0,'echo,shell',0,0,NULL,NULL,NULL,NULL,3,NULL,0,NULL,NULL,0,0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,0,10,NULL,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
 CREATE TABLE checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
@@ -89,38 +89,38 @@ CREATE TABLE event_retention(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
 INSERT INTO "event_retention" VALUES(1,0);
 CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL, written_ms INTEGER, message INTEGER);
-INSERT INTO "events" VALUES(1,'Lead',NULL,'created','{"bot_id":1,"created_by":null,"created_by_id":null,"depth":0,"effort":null,"last":null,"model":"synthetic-model","provider":"openai","running_turn":null,"started_ms":null,"status":"idle","waiting_on":null,"workspace":"/tmp/agent-store-fixture"}',1795178612319,NULL);
-INSERT INTO "events" VALUES(2,'Lead.task',NULL,'created','{"bot_id":2,"created_by":null,"created_by_id":null,"depth":0,"effort":null,"last":null,"model":"synthetic-model","provider":"openai","running_turn":null,"started_ms":null,"status":"idle","waiting_on":null,"workspace":"/tmp/agent-store-fixture"}',1795178612321,NULL);
-INSERT INTO "events" VALUES(3,'Helper',NULL,'created','{"bot_id":3,"created_by":null,"created_by_id":null,"depth":0,"effort":null,"last":null,"model":"synthetic-model","provider":"openai","running_turn":null,"started_ms":null,"status":"idle","waiting_on":null,"workspace":"/tmp/agent-store-fixture"}',1795178612323,NULL);
-INSERT INTO "events" VALUES(4,'Lead',1,'accepted','{"effort":null,"model":"openai/synthetic-model","node":1,"request_id":"script","workspace":"/tmp/agent-store-fixture"}',1795178612326,1);
-INSERT INTO "events" VALUES(5,'Lead',1,'message','{"node":2}',1795178612330,NULL);
-INSERT INTO "events" VALUES(6,'Lead',1,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":1,"first_token_ms":1,"input_tokens":100,"model_ms":1,"output_tokens":10,"sent_ms":1795178612329,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":110}',1795178612330,NULL);
-INSERT INTO "events" VALUES(7,'Lead',1,'tool_started','{"answered_by":"sonny","arguments":"{\"input\":\"text(\\\"ok\\\")\"}","arguments_truncated":false,"call_id":"exec-1","expires_ms":1795182212332,"name":"exec"}',1795178612332,NULL);
-INSERT INTO "events" VALUES(8,'Lead',1,'turn_waiting','{"answer":"sonny","call_id":"exec-1","deadline_ms":1795182212332}',1795178612335,NULL);
-INSERT INTO "events" VALUES(9,'Lead',1,'turn_resumed','{"call_id":"exec-1"}',1795178612337,NULL);
-INSERT INTO "events" VALUES(10,'Lead',1,'tool_completed','{"artifacts":[],"call_id":"exec-1","node":3}',1795178612338,NULL);
-INSERT INTO "events" VALUES(11,'Lead',1,'message','{"node":4}',1795178612383,NULL);
-INSERT INTO "events" VALUES(12,'Lead',1,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":1,"first_token_ms":43,"input_tokens":100,"model_ms":43,"output_tokens":10,"sent_ms":1795178612340,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":16}',1795178612383,NULL);
-INSERT INTO "events" VALUES(13,'Lead',1,'turn_finished','{"checkpoint":4,"detail":null,"error":null,"status":"completed"}',1795178612385,NULL);
-INSERT INTO "events" VALUES(14,'Lead.task',2,'accepted','{"effort":null,"model":"openai/synthetic-model","node":5,"request_id":"hello","workspace":"/tmp/agent-store-fixture"}',1795178612387,2);
-INSERT INTO "events" VALUES(15,'Lead.task',2,'message','{"node":6}',1795178612431,NULL);
-INSERT INTO "events" VALUES(16,'Lead.task',2,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":1,"first_token_ms":41,"input_tokens":100,"model_ms":41,"output_tokens":10,"sent_ms":1795178612390,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":110}',1795178612431,NULL);
-INSERT INTO "events" VALUES(17,'Lead.task',2,'turn_finished','{"checkpoint":6,"detail":null,"error":null,"status":"completed"}',1795178612433,NULL);
-INSERT INTO "events" VALUES(18,'Helper',3,'accepted','{"effort":null,"model":"openai/synthetic-model","node":7,"request_id":"echo","workspace":"/tmp/agent-store-fixture"}',1795178612435,3);
-INSERT INTO "events" VALUES(19,'Helper',3,'message','{"node":8}',1795178612483,NULL);
-INSERT INTO "events" VALUES(20,'Helper',3,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":1,"first_token_ms":44,"input_tokens":100,"model_ms":44,"output_tokens":10,"sent_ms":1795178612439,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":110}',1795178612483,NULL);
-INSERT INTO "events" VALUES(21,'Helper',3,'tool_started','{"arguments":"{\"text\": \"hi\"}","arguments_truncated":false,"call_id":"echo-1","name":"echo"}',1795178612485,NULL);
-INSERT INTO "events" VALUES(22,'Helper',3,'tool_completed','{"artifacts":[],"call_id":"echo-1","node":9}',1795178612486,NULL);
-INSERT INTO "events" VALUES(23,'Helper',3,'message','{"node":10}',1795178612531,NULL);
-INSERT INTO "events" VALUES(24,'Helper',3,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":1,"first_token_ms":43,"input_tokens":100,"model_ms":43,"output_tokens":10,"sent_ms":1795178612488,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":12}',1795178612531,NULL);
-INSERT INTO "events" VALUES(25,'Helper',3,'turn_finished','{"checkpoint":10,"detail":null,"error":null,"status":"completed"}',1795178612533,NULL);
-INSERT INTO "events" VALUES(26,'Helper.fork',NULL,'forked','{"bot_id":4,"checkpoint":10,"created_by":null,"created_by_id":null,"depth":0,"effort":null,"last":null,"model":"synthetic-model","node":10,"provider":"openai","running_turn":null,"source":"Helper","started_ms":null,"status":"idle","waiting_on":null,"workspace":"/tmp/agent-store-fixture"}',1795178612535,NULL);
-INSERT INTO "events" VALUES(27,'Lead',4,'accepted','{"effort":null,"model":"openai/synthetic-model","node":11,"request_id":"park","workspace":"/tmp/agent-store-fixture"}',1795178612537,4);
-INSERT INTO "events" VALUES(28,'Lead',4,'message','{"node":12}',1795178612583,NULL);
-INSERT INTO "events" VALUES(29,'Lead',4,'usage','{"cached_input_tokens":0,"context_window":200000,"first_token_ms":43,"input_tokens":100,"model_ms":43,"output_tokens":10,"sent_ms":1795178612540,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":19}',1795178612583,NULL);
-INSERT INTO "events" VALUES(30,'Lead',4,'tool_started','{"answered_by":"sonny","arguments":"{\"input\":\"await yield_control()\"}","arguments_truncated":false,"call_id":"exec-1","expires_ms":1795182212585,"name":"exec"}',1795178612585,NULL);
-INSERT INTO "events" VALUES(31,'Lead',4,'turn_waiting','{"answer":"sonny","call_id":"exec-1","deadline_ms":1795182212585}',1795178612586,NULL);
-INSERT INTO "events" VALUES(32,'Lead',NULL,'queued','{"delivery":"queue","effort":null,"model":"openai/synthetic-model","request_id":"queued","status":"queued","workspace":"/tmp/agent-store-fixture"}',1795178612587,5);
+INSERT INTO "events" VALUES(1,'Lead',NULL,'created','{"bot_id":1,"created_by":null,"created_by_id":null,"depth":0,"effort":null,"last":null,"model":"synthetic-model","provider":"openai","running_turn":null,"started_ms":null,"status":"idle","waiting_on":null,"workspace":"/tmp/agent-store-fixture"}',1795408503422,NULL);
+INSERT INTO "events" VALUES(2,'Lead.task',NULL,'created','{"bot_id":2,"created_by":null,"created_by_id":null,"depth":0,"effort":null,"last":null,"model":"synthetic-model","provider":"openai","running_turn":null,"started_ms":null,"status":"idle","waiting_on":null,"workspace":"/tmp/agent-store-fixture"}',1795408503424,NULL);
+INSERT INTO "events" VALUES(3,'Helper',NULL,'created','{"bot_id":3,"created_by":null,"created_by_id":null,"depth":0,"effort":null,"last":null,"model":"synthetic-model","provider":"openai","running_turn":null,"started_ms":null,"status":"idle","waiting_on":null,"workspace":"/tmp/agent-store-fixture"}',1795408503426,NULL);
+INSERT INTO "events" VALUES(4,'Lead',1,'accepted','{"effort":null,"model":"openai/synthetic-model","node":1,"request_id":"script","workspace":"/tmp/agent-store-fixture"}',1795408503428,1);
+INSERT INTO "events" VALUES(5,'Lead',1,'message','{"node":2}',1795408503432,NULL);
+INSERT INTO "events" VALUES(6,'Lead',1,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":1,"first_token_ms":1,"input_tokens":100,"model_ms":1,"output_tokens":10,"sent_ms":1795408503431,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":110}',1795408503432,NULL);
+INSERT INTO "events" VALUES(7,'Lead',1,'tool_started','{"answered_by":"sonny","arguments":"{\"input\":\"text(\\\"ok\\\")\"}","arguments_truncated":false,"call_id":"exec-1","expires_ms":1795412103433,"name":"exec"}',1795408503433,NULL);
+INSERT INTO "events" VALUES(8,'Lead',1,'turn_waiting','{"answer":"sonny","call_id":"exec-1","deadline_ms":1795412103433}',1795408503434,NULL);
+INSERT INTO "events" VALUES(9,'Lead',1,'turn_resumed','{"call_id":"exec-1"}',1795408503435,NULL);
+INSERT INTO "events" VALUES(10,'Lead',1,'tool_completed','{"artifacts":[],"call_id":"exec-1","node":3}',1795408503436,NULL);
+INSERT INTO "events" VALUES(11,'Lead',1,'message','{"node":4}',1795408503481,NULL);
+INSERT INTO "events" VALUES(12,'Lead',1,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":1,"first_token_ms":43,"input_tokens":100,"model_ms":43,"output_tokens":10,"sent_ms":1795408503438,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":16}',1795408503481,NULL);
+INSERT INTO "events" VALUES(13,'Lead',1,'turn_finished','{"checkpoint":4,"detail":null,"error":null,"status":"completed"}',1795408503484,NULL);
+INSERT INTO "events" VALUES(14,'Lead.task',2,'accepted','{"effort":null,"model":"openai/synthetic-model","node":5,"request_id":"hello","workspace":"/tmp/agent-store-fixture"}',1795408503486,2);
+INSERT INTO "events" VALUES(15,'Lead.task',2,'message','{"node":6}',1795408503533,NULL);
+INSERT INTO "events" VALUES(16,'Lead.task',2,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":1,"first_token_ms":43,"input_tokens":100,"model_ms":43,"output_tokens":10,"sent_ms":1795408503490,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":110}',1795408503533,NULL);
+INSERT INTO "events" VALUES(17,'Lead.task',2,'turn_finished','{"checkpoint":6,"detail":null,"error":null,"status":"completed"}',1795408503535,NULL);
+INSERT INTO "events" VALUES(18,'Helper',3,'accepted','{"effort":null,"model":"openai/synthetic-model","node":7,"request_id":"echo","workspace":"/tmp/agent-store-fixture"}',1795408503537,3);
+INSERT INTO "events" VALUES(19,'Helper',3,'message','{"node":8}',1795408503581,NULL);
+INSERT INTO "events" VALUES(20,'Helper',3,'usage','{"cached_input_tokens":0,"context_window":200000,"first_token_ms":41,"input_tokens":100,"model_ms":42,"output_tokens":10,"sent_ms":1795408503539,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":110}',1795408503581,NULL);
+INSERT INTO "events" VALUES(21,'Helper',3,'tool_started','{"arguments":"{\"text\": \"hi\"}","arguments_truncated":false,"call_id":"echo-1","name":"echo"}',1795408503583,NULL);
+INSERT INTO "events" VALUES(22,'Helper',3,'tool_completed','{"artifacts":[],"call_id":"echo-1","node":9}',1795408503584,NULL);
+INSERT INTO "events" VALUES(23,'Helper',3,'message','{"node":10}',1795408503629,NULL);
+INSERT INTO "events" VALUES(24,'Helper',3,'usage','{"cached_input_tokens":0,"context_window":200000,"daemon_ms":2,"first_token_ms":43,"input_tokens":100,"model_ms":43,"output_tokens":10,"sent_ms":1795408503586,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":12}',1795408503629,NULL);
+INSERT INTO "events" VALUES(25,'Helper',3,'turn_finished','{"checkpoint":10,"detail":null,"error":null,"status":"completed"}',1795408503631,NULL);
+INSERT INTO "events" VALUES(26,'Helper.fork',NULL,'forked','{"bot_id":4,"checkpoint":10,"created_by":null,"created_by_id":null,"depth":0,"effort":null,"last":null,"model":"synthetic-model","node":10,"provider":"openai","running_turn":null,"source":"Helper","started_ms":null,"status":"idle","waiting_on":null,"workspace":"/tmp/agent-store-fixture"}',1795408503632,NULL);
+INSERT INTO "events" VALUES(27,'Lead',4,'accepted','{"effort":null,"model":"openai/synthetic-model","node":11,"request_id":"park","workspace":"/tmp/agent-store-fixture"}',1795408503634,4);
+INSERT INTO "events" VALUES(28,'Lead',4,'message','{"node":12}',1795408503677,NULL);
+INSERT INTO "events" VALUES(29,'Lead',4,'usage','{"cached_input_tokens":0,"context_window":200000,"first_token_ms":41,"input_tokens":100,"model_ms":41,"output_tokens":10,"sent_ms":1795408503636,"served_model":"synthetic-model-2026-09-26","speed":"standard","work_tokens":19}',1795408503677,NULL);
+INSERT INTO "events" VALUES(30,'Lead',4,'tool_started','{"answered_by":"sonny","arguments":"{\"input\":\"await yield_control()\"}","arguments_truncated":false,"call_id":"exec-1","expires_ms":1795412103679,"name":"exec"}',1795408503679,NULL);
+INSERT INTO "events" VALUES(31,'Lead',4,'turn_waiting','{"answer":"sonny","call_id":"exec-1","deadline_ms":1795412103679}',1795408503680,NULL);
+INSERT INTO "events" VALUES(32,'Lead',NULL,'queued','{"delivery":"queue","effort":null,"model":"openai/synthetic-model","request_id":"queued","status":"queued","workspace":"/tmp/agent-store-fixture"}',1795408503682,5);
 CREATE TABLE lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
 INSERT INTO "lineage" VALUES(1,NULL,1,NULL,1);
@@ -147,11 +147,11 @@ CREATE TABLE messages(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(
                 output_schema TEXT, wait_ms INTEGER, due_ms INTEGER, held TEXT,
                 sent_ms INTEGER, taken_ms INTEGER,
                 UNIQUE(bot,request_id));
-INSERT INTO "messages" VALUES(1,'Lead','script','reject','taken',1,1,'run a script',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795178612325,1795178612325);
-INSERT INTO "messages" VALUES(2,'Lead.task','hello','reject','taken',2,5,'hello',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795178612387,1795178612387);
-INSERT INTO "messages" VALUES(3,'Helper','echo','reject','taken',3,7,'calls:[["echo", {"text": "hi"}]]',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795178612435,1795178612435);
-INSERT INTO "messages" VALUES(4,'Lead','park','reject','taken',4,11,'wait on a script',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795178612537,1795178612537);
-INSERT INTO "messages" VALUES(5,'Lead','queued','queue','queued',NULL,NULL,'after the script',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795178612587,NULL);
+INSERT INTO "messages" VALUES(1,'Lead','script','reject','taken',1,1,'run a script',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795408503427,1795408503427);
+INSERT INTO "messages" VALUES(2,'Lead.task','hello','reject','taken',2,5,'hello',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795408503486,1795408503486);
+INSERT INTO "messages" VALUES(3,'Helper','echo','reject','taken',3,7,'calls:[["echo", {"text": "hi"}]]',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795408503537,1795408503537);
+INSERT INTO "messages" VALUES(4,'Lead','park','reject','taken',4,11,'wait on a script',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795408503634,1795408503634);
+INSERT INTO "messages" VALUES(5,'Lead','queued','queue','queued',NULL,NULL,'after the script',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1795408503682,NULL);
 CREATE TABLE node_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
 INSERT INTO "node_sequence" VALUES(1,0);
@@ -160,19 +160,20 @@ CREATE TABLE nodes(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES nodes(id),
                 turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
                 elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
                 total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0,
-                pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER, message INTEGER);
-INSERT INTO "nodes" VALUES(1,NULL,X'7B22636F6E74656E74223A5B7B2274657874223A2272756E206120736372697074222C2274797065223A22696E7075745F74657874227D2C7B2274657874223A225B4D657373616765204C6561642F312E5D222C2274797065223A22696E7075745F74657874227D5D2C22726F6C65223A2275736572227D',120,1,1,1,0,0,0,0,0,0,1795178612325,1);
-INSERT INTO "nodes" VALUES(2,1,X'7B2274797065223A2022637573746F6D5F746F6F6C5F63616C6C222C20226E616D65223A202265786563222C202263616C6C5F6964223A2022657865632D31222C2022696E707574223A202274657874285C226F6B5C2229227D',210,2,NULL,NULL,0,0,0,0,0,0,1795178612330,NULL);
-INSERT INTO "nodes" VALUES(3,2,X'7B2263616C6C5F6964223A22657865632D31222C226F7574707574223A226F6B222C2274797065223A22637573746F6D5F746F6F6C5F63616C6C5F6F7574707574227D',277,3,NULL,NULL,0,0,0,0,0,0,1795178612338,NULL);
-INSERT INTO "nodes" VALUES(4,3,X'7B2274797065223A20226D657373616765222C2022726F6C65223A2022617373697374616E74222C2022636F6E74656E74223A205B7B2274797065223A20226F75747075745F74657874222C202274657874223A2022746865207363726970742073616964206F6B227D5D7D',385,4,NULL,NULL,0,0,0,0,0,0,1795178612383,NULL);
-INSERT INTO "nodes" VALUES(5,NULL,X'7B22636F6E74656E74223A5B7B2274657874223A2268656C6C6F222C2274797065223A22696E7075745F74657874227D2C7B2274657874223A225B4D657373616765204C6561642E7461736B2F322E5D222C2274797065223A22696E7075745F74657874227D5D2C22726F6C65223A2275736572227D',118,1,2,1,0,0,0,0,0,0,1795178612387,2);
-INSERT INTO "nodes" VALUES(6,5,X'7B2274797065223A20226D657373616765222C2022726F6C65223A2022617373697374616E74222C2022636F6E74656E74223A205B7B2274797065223A20226F75747075745F74657874222C202274657874223A202268656172643A2068656C6C6F227D5D7D',220,2,NULL,NULL,0,0,0,0,0,0,1795178612431,NULL);
-INSERT INTO "nodes" VALUES(7,NULL,X'7B22636F6E74656E74223A5B7B2274657874223A2263616C6C733A5B5B5C226563686F5C222C207B5C22746578745C223A205C2268695C227D5D5D222C2274797065223A22696E7075745F74657874227D2C7B2274657874223A225B4D6573736167652048656C7065722F332E5D222C2274797065223A22696E7075745F74657874227D5D2C22726F6C65223A2275736572227D',148,1,3,1,0,0,0,0,0,0,1795178612435,3);
-INSERT INTO "nodes" VALUES(8,7,X'7B2274797065223A202266756E6374696F6E5F63616C6C222C20226E616D65223A20226563686F222C202263616C6C5F6964223A20226563686F2D31222C2022617267756D656E7473223A20227B5C22746578745C223A205C2268695C227D227D',245,2,NULL,NULL,0,0,0,0,0,0,1795178612483,NULL);
-INSERT INTO "nodes" VALUES(9,8,X'7B2263616C6C5F6964223A226563686F2D31222C226F7574707574223A226869222C2274797065223A2266756E6374696F6E5F63616C6C5F6F7574707574227D',309,3,NULL,NULL,0,0,0,0,0,0,1795178612486,NULL);
-INSERT INTO "nodes" VALUES(10,9,X'7B226964223A20226D73675F6563686F222C202274797065223A20226D657373616765222C2022726F6C65223A2022617373697374616E74222C2022636F6E74656E74223A205B7B2274797065223A20226F75747075745F74657874222C202274657874223A20226563686F3A6869227D5D7D',424,4,NULL,NULL,0,0,0,0,0,0,1795178612531,NULL);
-INSERT INTO "nodes" VALUES(11,4,X'7B22636F6E74656E74223A5B7B2274657874223A2277616974206F6E206120736372697074222C2274797065223A22696E7075745F74657874227D2C7B2274657874223A225B4D657373616765204C6561642F342E5D222C2274797065223A22696E7075745F74657874227D5D2C22726F6C65223A2275736572227D',509,5,4,2,0,0,0,0,0,0,1795178612537,4);
-INSERT INTO "nodes" VALUES(12,11,X'7B2274797065223A2022637573746F6D5F746F6F6C5F63616C6C222C20226E616D65223A202265786563222C202263616C6C5F6964223A2022657865632D31222C2022696E707574223A20226177616974207969656C645F636F6E74726F6C2829227D',608,6,NULL,NULL,0,0,0,0,0,0,1795178612583,NULL);
+                pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER, message INTEGER,
+                effort TEXT);
+INSERT INTO "nodes" VALUES(1,NULL,X'7B22636F6E74656E74223A5B7B2274657874223A2272756E206120736372697074222C2274797065223A22696E7075745F74657874227D2C7B2274657874223A225B4D657373616765204C6561642F312E5D222C2274797065223A22696E7075745F74657874227D5D2C22726F6C65223A2275736572227D',120,1,1,1,0,0,0,0,0,0,1795408503427,1,NULL);
+INSERT INTO "nodes" VALUES(2,1,X'7B2274797065223A2022637573746F6D5F746F6F6C5F63616C6C222C20226E616D65223A202265786563222C202263616C6C5F6964223A2022657865632D31222C2022696E707574223A202274657874285C226F6B5C2229227D',210,2,NULL,NULL,0,0,0,0,0,0,1795408503432,NULL,NULL);
+INSERT INTO "nodes" VALUES(3,2,X'7B2263616C6C5F6964223A22657865632D31222C226F7574707574223A226F6B222C2274797065223A22637573746F6D5F746F6F6C5F63616C6C5F6F7574707574227D',277,3,NULL,NULL,0,0,0,0,0,0,1795408503436,NULL,NULL);
+INSERT INTO "nodes" VALUES(4,3,X'7B2274797065223A20226D657373616765222C2022726F6C65223A2022617373697374616E74222C2022636F6E74656E74223A205B7B2274797065223A20226F75747075745F74657874222C202274657874223A2022746865207363726970742073616964206F6B227D5D7D',385,4,NULL,NULL,0,0,0,0,0,0,1795408503481,NULL,NULL);
+INSERT INTO "nodes" VALUES(5,NULL,X'7B22636F6E74656E74223A5B7B2274657874223A2268656C6C6F222C2274797065223A22696E7075745F74657874227D2C7B2274657874223A225B4D657373616765204C6561642E7461736B2F322E5D222C2274797065223A22696E7075745F74657874227D5D2C22726F6C65223A2275736572227D',118,1,2,1,0,0,0,0,0,0,1795408503486,2,NULL);
+INSERT INTO "nodes" VALUES(6,5,X'7B2274797065223A20226D657373616765222C2022726F6C65223A2022617373697374616E74222C2022636F6E74656E74223A205B7B2274797065223A20226F75747075745F74657874222C202274657874223A202268656172643A2068656C6C6F227D5D7D',220,2,NULL,NULL,0,0,0,0,0,0,1795408503533,NULL,NULL);
+INSERT INTO "nodes" VALUES(7,NULL,X'7B22636F6E74656E74223A5B7B2274657874223A2263616C6C733A5B5B5C226563686F5C222C207B5C22746578745C223A205C2268695C227D5D5D222C2274797065223A22696E7075745F74657874227D2C7B2274657874223A225B4D6573736167652048656C7065722F332E5D222C2274797065223A22696E7075745F74657874227D5D2C22726F6C65223A2275736572227D',148,1,3,1,0,0,0,0,0,0,1795408503537,3,NULL);
+INSERT INTO "nodes" VALUES(8,7,X'7B2274797065223A202266756E6374696F6E5F63616C6C222C20226E616D65223A20226563686F222C202263616C6C5F6964223A20226563686F2D31222C2022617267756D656E7473223A20227B5C22746578745C223A205C2268695C227D227D',245,2,NULL,NULL,0,0,0,0,0,0,1795408503581,NULL,NULL);
+INSERT INTO "nodes" VALUES(9,8,X'7B2263616C6C5F6964223A226563686F2D31222C226F7574707574223A226869222C2274797065223A2266756E6374696F6E5F63616C6C5F6F7574707574227D',309,3,NULL,NULL,0,0,0,0,0,0,1795408503584,NULL,NULL);
+INSERT INTO "nodes" VALUES(10,9,X'7B226964223A20226D73675F6563686F222C202274797065223A20226D657373616765222C2022726F6C65223A2022617373697374616E74222C2022636F6E74656E74223A205B7B2274797065223A20226F75747075745F74657874222C202274657874223A20226563686F3A6869227D5D7D',424,4,NULL,NULL,0,0,0,0,0,0,1795408503629,NULL,NULL);
+INSERT INTO "nodes" VALUES(11,4,X'7B22636F6E74656E74223A5B7B2274657874223A2277616974206F6E206120736372697074222C2274797065223A22696E7075745F74657874227D2C7B2274657874223A225B4D657373616765204C6561642F342E5D222C2274797065223A22696E7075745F74657874227D5D2C22726F6C65223A2275736572227D',509,5,4,2,0,0,0,0,0,0,1795408503634,4,NULL);
+INSERT INTO "nodes" VALUES(12,11,X'7B2274797065223A2022637573746F6D5F746F6F6C5F63616C6C222C20226E616D65223A202265786563222C202263616C6C5F6964223A2022657865632D31222C2022696E707574223A20226177616974207969656C645F636F6E74726F6C2829227D',608,6,NULL,NULL,0,0,0,0,0,0,1795408503677,NULL,NULL);
 CREATE TABLE openings(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 text TEXT, chars INTEGER);
 INSERT INTO "openings" VALUES(1,'run a script',12);
@@ -201,7 +202,7 @@ CREATE TABLE steps(turn INTEGER NOT NULL, call_id TEXT NOT NULL,
                 ended_ms INTEGER, PRIMARY KEY(turn,call_id)) WITHOUT ROWID;
 CREATE TABLE store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 identity INTEGER NOT NULL);
-INSERT INTO "store" VALUES(1,1770024581889010813);
+INSERT INTO "store" VALUES(1,5028818856137673632);
 CREATE TABLE stubs(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
 CREATE TABLE switches(id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,9 +230,9 @@ CREATE TABLE turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CA
                 model_ms INTEGER NOT NULL DEFAULT 0, first_token_ms INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(turn,model,speed)) WITHOUT ROWID;
 INSERT INTO "turn_models" VALUES(1,'openai/synthetic-model','standard',200,0,0,0,20,2,20,44,44);
-INSERT INTO "turn_models" VALUES(2,'openai/synthetic-model','standard',100,0,0,0,10,1,10,41,41);
-INSERT INTO "turn_models" VALUES(3,'openai/synthetic-model','standard',200,0,0,0,20,2,20,87,87);
-INSERT INTO "turn_models" VALUES(4,'openai/synthetic-model','standard',100,0,0,0,10,1,10,43,43);
+INSERT INTO "turn_models" VALUES(2,'openai/synthetic-model','standard',100,0,0,0,10,1,10,43,43);
+INSERT INTO "turn_models" VALUES(3,'openai/synthetic-model','standard',200,0,0,0,20,2,20,85,84);
+INSERT INTO "turn_models" VALUES(4,'openai/synthetic-model','standard',100,0,0,0,10,1,10,41,41);
 CREATE TABLE turns(id INTEGER PRIMARY KEY REFERENCES messages(id),
                 bot TEXT NOT NULL REFERENCES bots(name), status TEXT NOT NULL,
                 workspace TEXT, model TEXT, reasoning TEXT, bot_model TEXT, bot_reasoning TEXT,
@@ -247,11 +248,12 @@ CREATE TABLE turns(id INTEGER PRIMARY KEY REFERENCES messages(id),
                 tool_calls INTEGER NOT NULL DEFAULT 0, tool_ms INTEGER NOT NULL DEFAULT 0,
                 tools_until_ms INTEGER, timed_rounds INTEGER NOT NULL DEFAULT 0,
                 timed_output_tokens INTEGER NOT NULL DEFAULT 0, model_ms INTEGER NOT NULL DEFAULT 0,
-                first_token_ms INTEGER NOT NULL DEFAULT 0);
-INSERT INTO "turns" VALUES(1,'Lead','completed','/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,2,1,200,20,0,1795178612326,1795178612385,0,0,0,4,126,NULL,0,NULL,2,1,6,1795178612338,2,20,44,44);
-INSERT INTO "turns" VALUES(2,'Lead.task','completed','/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1,1,100,10,0,1795178612387,1795178612433,0,0,0,6,110,NULL,0,NULL,1,0,0,NULL,1,10,41,41);
-INSERT INTO "turns" VALUES(3,'Helper','completed','/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,2,1,200,20,0,1795178612435,1795178612532,0,0,0,10,122,NULL,0,NULL,2,1,1,1795178612486,2,20,87,87);
-INSERT INTO "turns" VALUES(4,'Lead','waiting','/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,'{"turn":4,"bot":"Lead","call_id":"exec-1","handles":[],"deadline_ms":1795182212585,"any":false,"pending":[],"paced_since_ms":null,"call_attempts":0,"call_spent_ms":0,"compaction":false,"answer":"sonny"}',1,1,100,10,0,1795178612537,NULL,0,0,0,NULL,19,NULL,0,NULL,0,0,0,NULL,1,10,43,43);
+                first_token_ms INTEGER NOT NULL DEFAULT 0,
+                restarts INTEGER NOT NULL DEFAULT 0, restart_head INTEGER);
+INSERT INTO "turns" VALUES(1,'Lead','completed','/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,2,1,200,20,0,1795408503428,1795408503483,0,0,0,4,126,NULL,0,NULL,2,1,3,1795408503436,2,20,44,44,0,NULL);
+INSERT INTO "turns" VALUES(2,'Lead.task','completed','/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1,1,100,10,0,1795408503486,1795408503535,0,0,0,6,110,NULL,0,NULL,1,0,0,NULL,1,10,43,43,0,NULL);
+INSERT INTO "turns" VALUES(3,'Helper','completed','/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,2,1,200,20,0,1795408503537,1795408503631,0,0,0,10,122,NULL,0,NULL,2,1,1,1795408503584,2,20,85,84,0,NULL);
+INSERT INTO "turns" VALUES(4,'Lead','waiting','/tmp/agent-store-fixture',NULL,NULL,NULL,NULL,NULL,NULL,NULL,'{"turn":4,"bot":"Lead","call_id":"exec-1","handles":[],"deadline_ms":1795412103679,"any":false,"pending":[],"paced_since_ms":null,"call_attempts":0,"call_spent_ms":0,"compaction":false,"answer":"sonny"}',1,1,100,10,0,1795408503634,NULL,0,0,0,NULL,19,NULL,0,NULL,0,0,0,NULL,1,10,41,41,0,NULL);
 CREATE TABLE worded(node INTEGER PRIMARY KEY, item BLOB NOT NULL);
 CREATE INDEX nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
 CREATE INDEX nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
