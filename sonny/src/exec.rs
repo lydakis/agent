@@ -201,6 +201,13 @@ pub fn tool(escalates: bool) -> Option<Value> {
     if servers.is_empty() && machines.is_empty() && !code_mode {
         return None;
     }
+    // Those that run the agent's own shell and file tools.
+    let shells: Vec<crate::link::Machine> = match code_mode {
+        true => (crate::link::machines().into_iter())
+            .filter(|machine| machine.shell.is_some())
+            .collect(),
+        false => Vec::new(),
+    };
     let cache = crate::mcp::cache_dir();
     let known: BTreeMap<String, Known> = servers
         .iter()
@@ -213,7 +220,7 @@ pub fn tool(escalates: bool) -> Option<Value> {
         .collect();
     Some(json!({
         "name": NAME,
-        "description": description(&servers, &known, &machines, code_mode, escalates),
+        "description": description(&servers, &known, &machines, &shells, code_mode, escalates),
         "parameters": {
             "type": "object",
             "properties": {"input": {"type": "string",
@@ -238,6 +245,7 @@ fn description(
     servers: &Servers,
     known: &BTreeMap<String, Known>,
     machines: &[crate::link::Machine],
+    shells: &[crate::link::Machine],
     code_mode: bool,
     escalates: bool,
 ) -> String {
@@ -248,6 +256,9 @@ fn description(
             false => SHELL,
         };
         sections.push(DAEMON_TOOLS.replace("{SHELL}", shell));
+        if !shells.is_empty() {
+            sections.push(elsewhere(shells));
+        }
     }
     let mut left = DECLARATIONS;
     let mut omitted = 0;
@@ -291,6 +302,30 @@ fn description(
     }
     sections.extend(collided);
     sections.join("\n\n")
+}
+
+/// What [`DAEMON_TOOLS`] adds for `shells`, the machines linked here that
+/// run the agent's own shell and file tools.
+fn elsewhere(shells: &[crate::link::Machine]) -> String {
+    let mut section = "# On other machines\n`tools.shell`, `tools.read`, `tools.write`, `tools.edit` and `tools.apply_patch` also take `machine`, the name of another machine of the person's, to run the call there: decided here as the same call would be, then run in that machine's sandbox, in the foreground, never leaving it. Paths are that machine's; relative ones start where it says. A machine answers only while it is connected.".to_owned();
+    for machine in shells {
+        let Some(shell) = &machine.shell else {
+            continue;
+        };
+        let writes = match shell.writable.is_empty() {
+            true => "reads only, writing nothing".to_owned(),
+            false => format!("writes only {}", shell.writable.join(", ")),
+        };
+        let network = match shell.network {
+            true => "commands reach the network",
+            false => "commands reach no network",
+        };
+        section.push_str(&format!(
+            "\n- `{}`: starts in {}, {writes}; {network}.",
+            machine.name, shell.start
+        ));
+    }
+    section
 }
 
 /// Each of `servers` with its tools' declarations while `left` holds them,
@@ -763,6 +798,22 @@ fn mcp_access(annotations: &Value) -> Option<&'static str> {
     }
 }
 
+/// A step's reply, `{"output", "failed", "parts"?}`, as the MCP
+/// `CallToolResult` a script reads.
+fn stepped(reply: &Value) -> crate::mcp::Called {
+    let mut content = vec![json!({"type": "text", "text": reply["output"]})];
+    for part in reply["parts"].as_array().into_iter().flatten() {
+        content.push(match part["type"].as_str() {
+            Some("image") => json!({"type": "image", "data": part["data"],
+                "mimeType": part["media_type"]}),
+            _ => json!({"type": "text", "text": part["text"]}),
+        });
+    }
+    let is_error = reply["failed"] == true;
+    let json = json!({"content": content, "isError": is_error}).to_string();
+    crate::mcp::Called { json, is_error }
+}
+
 /// Calls answered in this process, so two answerings of one call differ.
 static ANSWERINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -894,17 +945,63 @@ impl Steps {
             "step": step, "name": name, "arguments": arguments});
         let reply = (client.request("run_step", asked).await)
             .map_err(|error| format!("tools.{name} did not run: {error}"))?;
-        let mut content = vec![json!({"type": "text", "text": reply["output"]})];
-        for part in reply["parts"].as_array().into_iter().flatten() {
-            content.push(match part["type"].as_str() {
-                Some("image") => json!({"type": "image", "data": part["data"],
-                    "mimeType": part["media_type"]}),
-                _ => json!({"type": "text", "text": part["text"]}),
-            });
+        Ok(stepped(&reply))
+    }
+
+    /// Run the agent's own tool `name` on `machine`, another of the
+    /// person's linked here: put to the agent's gate as the same call on
+    /// this machine would be, then run there, in its sandbox, and told
+    /// how it ended. Only a call of this machine's daemon goes.
+    pub async fn run_on(
+        &self,
+        machine: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<crate::mcp::Called, String> {
+        if !matches!(self.via, Via::Daemon { .. }) {
+            return Err(format!(
+                "tools.{name} runs on another machine only from this one"
+            ));
         }
-        let is_error = reply["failed"] == true;
-        let json = json!({"content": content, "isError": is_error}).to_string();
-        Ok(crate::mcp::Called { json, is_error })
+        if !crate::link::LENT_TOOLS.contains(&name) {
+            return Err(format!(
+                "tools.{name} runs only here: {} run on another machine",
+                crate::link::LENT_TOOLS.join(", ")
+            ));
+        }
+        let facts = Facts {
+            kind: if name == "shell" { "shell" } else { "file" },
+            place: Some("external"),
+            access: Some(if name == "read" { "read" } else { "write" }),
+        };
+        // The gate sees where it runs; the machine's tool, only the call.
+        let step = self
+            .ask(
+                name,
+                &format!("tools.{name}"),
+                arguments.clone(),
+                facts,
+                true,
+            )
+            .await?;
+        let mut arguments = arguments;
+        if let Some(fields) = arguments.as_object_mut() {
+            fields.remove("machine");
+        }
+        // A command with a time of its own ends there by then; one with
+        // none runs to its end, as here.
+        let left = (arguments["timeout_ms"].as_u64()).map_or(CALL_BOUND, |ms| {
+            Duration::from_millis(ms) + Duration::from_secs(60)
+        });
+        let payload = json!({"name": name, "arguments": arguments,
+            "timeout_ms": left.as_millis() as u64});
+        let ran = crate::link::call(machine, crate::link::TOOL, payload, None).await;
+        let called = ran
+            .map(|reply| stepped(&reply))
+            .map_err(|(code, detail)| format!("tools.{name} on {machine}: {code}: {detail}"));
+        self.ran(step, !matches!(&called, Ok(called) if !called.is_error))
+            .await;
+        called
     }
 
     /// Hand the call back to the agent's model with `output`, what the
@@ -2828,10 +2925,13 @@ impl Caller {
             // script's time stops meanwhile, as while a server's tool waits
             // on its gate.
             let stopped = self.clock.stop();
-            let ran = Abort(
-                self.host
-                    .spawn(async move { steps.run(&id, arguments).await }),
-            )
+            let machine = arguments["machine"].as_str().map(str::to_owned);
+            let ran = Abort(self.host.spawn(async move {
+                match machine {
+                    Some(machine) => steps.run_on(&machine, &id, arguments).await,
+                    None => steps.run(&id, arguments).await,
+                }
+            }))
             .await;
             drop(stopped);
             return ran.map_err(|e| e.to_string())?;
@@ -3234,7 +3334,7 @@ mod tests {
             },
         )]
         .into();
-        let text = description(&servers, &known, &[], false, false);
+        let text = description(&servers, &known, &[], &[], false, false);
         assert!(text.contains("## test\nTest tools"));
         assert!(text.contains("declare const tools: { mcp__test__tool0(args: { [key: string]: unknown; }): Promise<CallToolResult>; };"));
         let declared = text.matches("### `mcp__test__").count();
@@ -3242,7 +3342,9 @@ mod tests {
         assert!(text.ends_with(&format!("{} more tools are in `ALL_TOOLS`.", 40 - declared)));
         // A server not listed yet is still named.
         let unlisted: BTreeMap<String, Known> = [("test".to_owned(), Known::default())].into();
-        assert!(description(&servers, &unlisted, &[], false, false).contains("once it starts"));
+        assert!(
+            description(&servers, &unlisted, &[], &[], false, false).contains("once it starts")
+        );
     }
 
     /// In code mode, `tools.shell` shows the fields for leaving the
@@ -3251,21 +3353,54 @@ mod tests {
     #[test]
     fn only_an_agent_in_a_sandbox_is_shown_the_shell_s_fields_for_leaving_it() {
         let none = (Servers::new(), BTreeMap::new());
-        let confined = description(&none.0, &none.1, &[], true, true);
+        let confined = description(&none.0, &none.1, &[], &[], true, true);
         assert!(confined.contains(r#"sandbox_permissions?: "use_default" | "require_escalated";"#));
         assert!(confined.contains("// Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."));
         assert!(confined.contains("justification?: string;"));
         assert!(confined.contains("// Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox."));
         assert!(confined.contains("prefix_rule?: string[];"));
         assert!(confined.contains("// Reusable approval prefix for `command`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"]."));
-        let free = description(&none.0, &none.1, &[], true, false);
+        let free = description(&none.0, &none.1, &[], &[], true, false);
         assert!(free.contains("shell(args: { command: string; workdir?: string; timeout_ms?: number; background?: boolean; detach?: boolean; tty?: boolean; yield_time_ms?: number }): Promise<CallToolResult>;"));
         assert!(free.contains("write_stdin(args: { handle: string; chars?: string; yield_time_ms?: number; kill?: boolean }): Promise<CallToolResult>;"));
         for field in ["sandbox_permissions", "justification", "prefix_rule"] {
             assert!(!free.contains(field), "{field}");
         }
         // Out of code mode, no agent's tools are declared there at all.
-        assert!(!description(&none.0, &none.1, &[], false, true).contains("tools.shell"));
+        assert!(!description(&none.0, &none.1, &[], &[], false, true).contains("tools.shell"));
+    }
+
+    /// A machine linked here that runs the agent's own tools is named
+    /// among them in code mode, with where it starts and what it writes.
+    #[test]
+    fn the_machines_that_run_the_agent_s_own_tools_are_named_with_what_they_write() {
+        let none = (Servers::new(), BTreeMap::new());
+        let shell = |writable: &[&str], network| crate::link::Machine {
+            name: "mac".into(),
+            shell: Some(crate::link::Shell {
+                writable: writable.iter().map(|folder| folder.to_string()).collect(),
+                start: writable.first().unwrap_or(&"/Users/me").to_string(),
+                network,
+            }),
+            ..Default::default()
+        };
+        let writes = description(
+            &none.0,
+            &none.1,
+            &[],
+            &[shell(&["/Users/me/code"], true)],
+            true,
+            false,
+        );
+        assert!(writes.contains("also take `machine`"), "{writes}");
+        assert!(writes.contains("- `mac`: starts in /Users/me/code, writes only /Users/me/code; commands reach the network."));
+        let reads = description(&none.0, &none.1, &[], &[shell(&[], false)], true, false);
+        assert!(reads.contains(
+            "- `mac`: starts in /Users/me, reads only, writing nothing; commands reach no network."
+        ));
+        assert!(
+            !description(&none.0, &none.1, &[], &[], true, false).contains("also take `machine`")
+        );
     }
 
     #[test]
@@ -3300,7 +3435,14 @@ mod tests {
         )]
         .into();
         let known: BTreeMap<String, Known> = [("notes".to_owned(), Known::default())].into();
-        let text = description(&own, &known, std::slice::from_ref(&machine), false, false);
+        let text = description(
+            &own,
+            &known,
+            std::slice::from_ref(&machine),
+            &[],
+            false,
+            false,
+        );
         let fixed = DESCRIPTION.len() + TYPES.len();
         // Headers and the machine's own paragraph are small and fixed.
         assert!(text.len() <= fixed + DECLARATIONS + 2_000, "{}", text.len());
@@ -3433,6 +3575,60 @@ mod tests {
         });
         let (client, _events) = Client::connect(&socket).await.unwrap();
         (client, steps)
+    }
+
+    /// A call of the agent's own tool on another machine is put to its
+    /// gate as the same call here would be, where it runs, before it
+    /// goes; how it ended is told, a machine not linked a failure.
+    #[tokio::test]
+    async fn a_call_on_another_machine_is_asked_here_first_and_told_how_it_ended() {
+        let dir = scratch("elsewhere");
+        let (client, mut asked) = gate(&dir, Duration::ZERO, None).await;
+        let steps = Steps::new(client, "shop.lead".into(), 7, "c1".into());
+        let arguments = json!({"command": "ls", "machine": "nowhere-linked"});
+        let ran = steps
+            .run_on("nowhere-linked", "shell", arguments.clone())
+            .await;
+        let Err(error) = ran else {
+            panic!("ran on no machine")
+        };
+        assert!(
+            error.contains("tools.shell on nowhere-linked: no_machine"),
+            "{error}"
+        );
+        let approve = asked.recv().await.unwrap();
+        assert_eq!(
+            (
+                &approve["op"],
+                &approve["name"],
+                &approve["arguments"],
+                &approve["record"]
+            ),
+            (
+                &json!("approve_step"),
+                &json!("shell"),
+                &arguments,
+                &json!(false)
+            )
+        );
+        assert_eq!(
+            (&approve["kind"], &approve["place"]),
+            (&json!("shell"), &json!("external"))
+        );
+        let told = asked.recv().await.unwrap();
+        assert_eq!(
+            (&told["op"], &told["step"], &told["failed"]),
+            (&json!("step_result"), &approve["step"], &json!(true))
+        );
+        // Only the shell and file tools go, asked nothing first.
+        let refused = steps
+            .run_on("mac", "web_fetch", json!({"url": "https://example.com"}))
+            .await;
+        let Err(error) = refused else {
+            panic!("web_fetch went")
+        };
+        assert!(error.contains("runs only here"), "{error}");
+        assert!(asked.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -4046,7 +4242,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
                 )
             })
             .collect();
-        let described = description(&servers, &known, &[], false, false);
+        let described = description(&servers, &known, &[], &[], false, false);
         assert!(
             !described.contains("### `mcp__my_server__echo`"),
             "{described}"

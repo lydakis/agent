@@ -151,6 +151,9 @@ fn run() -> Result<i32> {
             Ok(SANDBOX_FAILED)
         });
     }
+    if args[0] == "tool" {
+        return tool(&args[1..]);
+    }
     if args[0] == "serve" {
         SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
         // Before the runtime's threads: every one shares the limit.
@@ -182,7 +185,7 @@ fn run() -> Result<i32> {
 /// than the bot could. Its own failure exits 125, as `env` and `timeout`
 /// say theirs, the command's exit status otherwise.
 fn sandboxed(args: &[String]) -> Result<i32> {
-    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    use agent_runtime::sandbox::{Mode, Policy};
     let split = args
         .iter()
         .position(|arg| arg == "--")
@@ -255,6 +258,20 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         drop(lent);
         return status;
     }
+    let daemon = own_daemon()?;
+    agent_runtime::sandbox::available()?;
+    let mode = match writable.is_empty() {
+        true => Mode::ReadOnly,
+        false => Mode::WorkspaceWrite,
+    };
+    let policy = Policy::new(Some(mode), None, &writable, false, &daemon)?
+        .ok_or(Error::new("sandbox_unavailable"))?;
+    run_in(Some(&policy), program, &rest, None)
+}
+
+/// What a sandbox this CLI builds with no daemon keeps out of reach, as a
+/// daemon it starts would for its bots.
+fn own_daemon() -> Result<agent_runtime::sandbox::Daemon> {
     // What a daemon this CLI starts keeps read-only in every root: a
     // checkout's git folder, agents' settings, cloud keys.
     let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
@@ -262,7 +279,7 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         Some((code, detail)) => Error::with(code, detail),
         None => Error::with("config_invalid", error),
     })?;
-    let daemon = Daemon {
+    Ok(agent_runtime::sandbox::Daemon {
         protected: names(&agent_client::PROTECTED),
         protected_existing: names(&agent_client::PROTECTED_EXISTING),
         // By its real path, which the sandbox sees, kept when it is not
@@ -307,16 +324,150 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         copied_files: agent_client::own_copy_files(),
         // And reaches no daemon's socket and writes no daemon's store.
         known: agent_client::config::daemons(),
-        ..Daemon::default()
+        // And writes through this program, as a daemon's bots write.
+        helper: std::env::current_exe().ok(),
+        ..agent_runtime::sandbox::Daemon::default()
+    })
+}
+
+/// `agent tool [--writable PATH]... [--network] [--workdir DIR] NAME
+/// ARGUMENTS`: one call of a bot's `shell`, `read`, `write`, `edit` or
+/// `apply_patch`, with ARGUMENTS as the model gives them, run by the
+/// daemon's own code in the sandbox `agent sandbox` builds: writing only
+/// the folders named (none: read-only), the network off unless
+/// `--network`, relative paths from DIR (this folder unless named), and a
+/// command with no `timeout_ms` run to its end, as a script's step. For a
+/// client that lends this machine's shell and files to the agents of
+/// another, as Codex's exec server does. Prints `{"output", "failed",
+/// "parts"?}` as a daemon step's reply gives them; a call the tool refuses
+/// is a result too, failed, as the model reads it. Exits 0 once it
+/// printed one; its own failure is an error, exit 1 or 2.
+fn tool(args: &[String]) -> Result<i32> {
+    use agent_runtime::sandbox::{Mode, Policy};
+    use agent_runtime::tools::Prepared;
+    let (mut writable, mut network, mut workdir) = (Vec::new(), false, None);
+    let mut positional = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match (arg.as_str(), arg.starts_with("--")) {
+            ("--network", _) => network = true,
+            ("--writable", _) => {
+                let path = iter
+                    .next()
+                    .ok_or(Error::with("usage", "--writable needs a folder"))?;
+                match std::fs::canonicalize(path)
+                    .ok()
+                    .and_then(|real| real.to_str().map(str::to_owned))
+                {
+                    Some(real) => writable.push(real),
+                    None => {
+                        return fail_with(
+                            "usage",
+                            format!("--writable {path} is not a folder here"),
+                        );
+                    }
+                }
+            }
+            ("--workdir", _) => {
+                let dir = iter
+                    .next()
+                    .ok_or(Error::with("usage", "--workdir needs a folder"))?;
+                workdir = Some(std::fs::canonicalize(dir).map_err(|_| {
+                    Error::with("usage", format!("--workdir {dir} is not a folder here"))
+                })?);
+            }
+            (flag, true) => return fail_with("usage", format!("tool does not accept {flag}")),
+            (_, false) => positional.push(arg.clone()),
+        }
+    }
+    let [name, arguments] = positional.as_slice() else {
+        return fail_with("usage", "tool needs a tool's name and its arguments");
     };
-    agent_runtime::sandbox::available()?;
-    let mode = match writable.is_empty() {
-        true => Mode::ReadOnly,
-        false => Mode::WorkspaceWrite,
+    if !matches!(
+        name.as_str(),
+        "shell" | "read" | "write" | "edit" | "apply_patch"
+    ) {
+        return fail_with(
+            "usage",
+            format!("tool runs shell, read, write, edit or apply_patch, not {name}"),
+        );
+    }
+    let workspace = match workdir {
+        Some(dir) => dir,
+        None => std::env::current_dir()?,
     };
-    let policy = Policy::new(Some(mode), None, &writable, false, &daemon)?
-        .ok_or(Error::new("sandbox_unavailable"))?;
-    run_in(Some(&policy), program, &rest, None)
+    let registry = agent_runtime::tools::Registry::all()?;
+    let daemon = own_daemon()?;
+    let refused = |error: Error| {
+        let output = serde_json::json!({"error":error.code,"detail":error.detail}).to_string();
+        serde_json::json!({"output":output,"failed":true})
+    };
+    // As a script's step: a command with no time of its own runs to its
+    // end, unless its caller stops it.
+    let prepared = registry.prepare(name, arguments).map(|mut prepared| {
+        if let Prepared::Shell { timeout_ms, .. } = &mut prepared
+            && !arguments.contains("\"timeout_ms\"")
+        {
+            *timeout_ms = None;
+        }
+        prepared
+    });
+    let reply = match prepared {
+        Err(error) => refused(error),
+        // What runs past this call is not lent: a command runs to its end.
+        Ok(
+            Prepared::Shell {
+                background: true, ..
+            }
+            | Prepared::Detach { .. }
+            | Prepared::Terminal { .. },
+        ) => refused(Error::with(
+            "tool_refused",
+            "a command on another machine runs in the foreground, to its end",
+        )),
+        // Its sandbox is the machine's: no call leaves it.
+        Ok(Prepared::Shell { .. })
+            if serde_json::from_str::<serde_json::Value>(arguments)
+                .is_ok_and(|given| given["sandbox_permissions"] == "require_escalated") =>
+        {
+            refused(agent_runtime::tools::escalation_refused())
+        }
+        Ok(prepared) => {
+            agent_runtime::sandbox::available()?;
+            let sandbox = match &prepared {
+                // A read happens here, outside any sandbox, kept out of
+                // what no sandboxed bot reads.
+                Prepared::Read { .. } => Policy::reads(&daemon),
+                _ => {
+                    let mode = match writable.is_empty() {
+                        true => Mode::ReadOnly,
+                        false => Mode::WorkspaceWrite,
+                    };
+                    Policy::new(Some(mode), None, &writable, network, &daemon)?
+                        .ok_or(Error::new("sandbox_unavailable"))?
+                }
+            };
+            let ran = runtime()?.block_on(registry.execute(
+                prepared,
+                &workspace,
+                &[],
+                Some(std::sync::Arc::new(sandbox)),
+            ));
+            match ran {
+                Ok(outcome) => {
+                    let mut reply =
+                        serde_json::json!({"output":outcome.output,"failed":outcome.failed});
+                    if !outcome.parts.is_empty() {
+                        reply["parts"] = serde_json::json!(outcome.parts);
+                    }
+                    reply
+                }
+                Err(error) => refused(error),
+            }
+        }
+    };
+    println!("{reply}");
+    Ok(0)
 }
 
 /// `program` with `rest`, in `policy` when one is given, with `environment`

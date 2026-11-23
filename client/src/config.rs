@@ -104,6 +104,8 @@
 //! browser_profile = "Default"   # the Chrome profile their shared browser is copied from once, Default by default, or a folder; "" a fresh one each
 //! calls = 16                    # how many of their calls this machine runs at once, 4 per CPU by default
 //! upgrade = true                # the end behind upgrades when the link connects, so both run one release; on by default
+//! writable = ["~/code/shop"]    # folders their shell and file tools write here, the first their start; none by default, read-only
+//! network = false               # whether their commands here reach the network; off by default
 //! [sonny.workflows]             # the workflow tool: a script an agent writes that runs many fresh agents
 //! enabled = false               # agents go without it, on by default
 //! concurrency = 8               # workers one run has going at once; 0, the default, the CPUs less two, at most 16
@@ -915,6 +917,12 @@ pub struct Link {
     /// one runs behind the other, it runs `sonny upgrade`. On unless set
     /// to false.
     pub upgrade: bool,
+    /// The folders that host's agents' shell and file tools write here,
+    /// as a bot's `writable` names its own; the first is where their
+    /// relative paths start. None: they read and write nothing.
+    pub writable: Vec<String>,
+    /// Whether their commands here reach the network. Off unless set.
+    pub network: bool,
 }
 
 /// The Chrome profile a link's browsers start from unless it says.
@@ -1339,6 +1347,19 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
             "upgrade" => {
                 link.upgrade =
                     (value.as_bool()).ok_or_else(|| format!("{key_at} must be true or false"))?
+            }
+            "network" => {
+                link.network =
+                    (value.as_bool()).ok_or_else(|| format!("{key_at} must be true or false"))?
+            }
+            "writable" => {
+                let invalid = || format!("{key_at} must be a list of paths");
+                link.writable = (value.as_array().ok_or_else(invalid)?.iter())
+                    .map(|path| match path.as_str() {
+                        Some(path) if !path.trim().is_empty() => Ok(path.to_owned()),
+                        _ => Err(invalid()),
+                    })
+                    .collect::<Result<_, _>>()?;
             }
             // "" is a fresh browser, with no profile to start from.
             "browser_profile" => {
@@ -2763,6 +2784,27 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_names_the_folders_its_host_s_agents_write_here_and_their_network() {
+        let config = parse("[sonny.links.box]\nhost = \"box\"\n").unwrap();
+        assert_eq!(
+            (
+                &config.sonny.links["box"].writable,
+                config.sonny.links["box"].network
+            ),
+            (&Vec::<String>::new(), false)
+        );
+        let config = parse(
+            "[sonny.links.box]\nhost = \"box\"\nwritable = [\"~/code\", \"/srv\"]\nnetwork = true\n",
+        )
+        .unwrap();
+        assert_eq!(config.sonny.links["box"].writable, ["~/code", "/srv"]);
+        assert!(config.sonny.links["box"].network);
+        assert!(parse("[sonny.links.box]\nhost = \"box\"\nwritable = \"~/code\"\n").is_err());
+        assert!(parse("[sonny.links.box]\nhost = \"box\"\nwritable = [\"\"]\n").is_err());
+        assert!(parse("[sonny.links.box]\nhost = \"box\"\nnetwork = \"yes\"\n").is_err());
+    }
 
     #[test]
     fn a_link_with_an_empty_browser_profile_starts_a_fresh_browser() {

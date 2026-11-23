@@ -1831,6 +1831,7 @@ sonny link forget laptop       # run on the host to forget a linked machine
 - **Browser (`browser` with `machine: "laptop"`):** Runs tabs in a dedicated shared Chrome instance copied once from your `browser_profile` (default `"Default"`; refreshes cookies and native messaging hosts on start, closes after 30 idle minutes). Screenshots return inline; file outputs (PDF, HAR, recordings up to 30 MiB) stream back to approved host paths.
 - **Desktop (`desktop` with `machine: "laptop"`):** Runs `agent-desktop` on the linked machine with action approvals routed to the host agent's gate.
 - **MCP (`exec`):** Prefix a script with `// @exec: {"machine": "laptop"}` to run against that machine's MCP servers (listed under `# On NAME`).
+- **Shell and files (`tools.shell`, `read`, `write`, `edit`, `apply_patch` with `machine: "laptop"`):** In code mode, a script's call of the agent's own shell or file tool that names a machine is decided on the host as the same call would be (its rules and approvals), then runs on the laptop with `agent tool`, in the laptop's sandbox: read-only unless the link lists `writable` folders, the network off unless `network = true`, in the foreground, never leaving the sandbox.
 - **Opening links & files:** On headless hosts, clicking an `http(s)` URL or large image/PDF in Sonny opens it directly on your connected laptop.
 
 Configuration in `~/.agent/config.toml`:
@@ -1843,6 +1844,8 @@ command = "/home/me/.local/bin/sonny"
 browser_profile = "Default"    # Chrome profile name, path, or "" for fresh browsers
 calls = 16                     # max concurrent remote calls (default: 4 × CPUs)
 upgrade = true                 # the end behind upgrades as the link connects (default: true)
+writable = ["~/code/shop"]     # folders the host's agents' shell and file tools write here; the first is where they start (default: none, read-only)
+network = false                # whether their commands here reach the network (default: false)
 ```
 
 Error codes: `not_connected` (asleep/offline), `tool_outcome_unknown` (link dropped mid-call), `link_busy` (at `calls` cap). Both ends must speak link protocol 1.

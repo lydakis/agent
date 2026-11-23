@@ -3671,6 +3671,18 @@ cannot reach another bot's socket; `bot_id` that is not the bot's is
 was not listening, one bind. It starts the daemon when none runs, as a
 command on the bots does; with `--no-spawn` it is `daemon_unavailable`
 instead.
+`agent tool [--writable PATH]... [--network] [--workdir DIR] NAME ARGUMENTS`
+runs one call of a bot's `shell`, `read`, `write`, `edit` or `apply_patch`
+here, with ARGUMENTS as a model gives them, by the daemon's own code and in
+the sandbox `agent sandbox` builds (no daemon): read-only with no
+`--writable`, the network off unless `--network`, relative paths from DIR.
+It prints `{"output","failed","parts"?}` as a daemon step's reply does,
+and a call the tool refuses is such a result, failed. A command runs in the
+foreground to its end unless its `timeout_ms` says otherwise, as a script's
+step; `background`, `detach`, `tty` and `sandbox_permissions:
+"require_escalated"` are refused. Sonny runs it on a linked machine for the
+host's agents, as Codex's exec server runs an environment's calls.
+
 `agent sandbox` exits as its command does, or 125 when it
 could not run it (a usage error, no sandbox here, the bot not found), as
 `env` and `timeout` do, with the error on stderr.

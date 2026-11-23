@@ -61,7 +61,8 @@ const VIEWED: [&str; 14] = [
 ];
 
 /// The codes a call's error may carry back, as typed here.
-const CODES: [&str; 12] = [
+const CODES: [&str; 13] = [
+    "tool_refused",
     "browser_refused",
     "desktop_refused",
     "exec_refused",
@@ -132,6 +133,19 @@ pub struct Machine {
     pub build: Value,
     /// Whether it upgrades to match this machine, as its link says.
     pub upgrade: bool,
+    /// Whether it runs the agents' shell and file tools sent here, and
+    /// how: none while Agent is not there.
+    pub shell: Option<Shell>,
+}
+
+/// How a machine runs the shell and file tools of the agents linked to
+/// it: in its sandbox, writing only `writable`, from the first of them
+/// (else its home, `start`), reaching the network when `network`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shell {
+    pub writable: Vec<String>,
+    pub start: String,
+    pub network: bool,
 }
 
 /// An MCP server of another machine: what it says of itself, and its tools
@@ -163,6 +177,16 @@ impl Machine {
             servers,
             build: said["build"].clone(),
             upgrade: said["upgrade"] == true,
+            shell: said["shell"].is_object().then(|| Shell {
+                writable: (said["shell"]["writable"].as_array().into_iter().flatten())
+                    .filter_map(|folder| folder.as_str().map(str::to_owned))
+                    .collect(),
+                start: said["shell"]["start"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                network: said["shell"]["network"] == true,
+            }),
         }
     }
 }
@@ -1912,7 +1936,76 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
         "servers": servers,
         "build": build(),
         "upgrade": link.upgrade,
+        "shell": crate::agent_at(&crate::agent_places_here()).ok().map(|_| {
+            let (writable, start) = lent_folders(link);
+            json!({"writable": writable, "start": start, "network": link.network})
+        }),
     })
+}
+
+/// The folders `link`'s agents write here, each by its full path, and the
+/// one their relative paths start from: the first, else the home folder.
+fn lent_folders(link: &agent_client::config::Link) -> (Vec<String>, String) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_owned());
+    let writable: Vec<String> = (link.writable.iter())
+        .map(|folder| match folder.strip_prefix("~/") {
+            Some(rest) => format!("{home}/{rest}"),
+            None if folder == "~" => home.clone(),
+            None => folder.clone(),
+        })
+        .collect();
+    let start = writable.first().cloned().unwrap_or(home);
+    (writable, start)
+}
+
+/// The name a call of the agents' own shell and file tools goes down a
+/// link under.
+pub const TOOL: &str = "tool";
+
+/// The agents' own tools a machine runs for another's agents.
+pub const LENT_TOOLS: [&str; 5] = ["shell", "read", "write", "edit", "apply_patch"];
+
+/// Run one call of `link`'s agents' own shell or file tool here, with
+/// `agent`'s `agent tool`: in this machine's sandbox, writing only the
+/// folders the link names, within `left`. Its result as a step's reply
+/// gives it: `{"output", "failed", "parts"?}`.
+async fn lent_tool(
+    agent: &Path,
+    link: &agent_client::config::Link,
+    payload: &Value,
+    left: Duration,
+) -> Result<Value, Failed> {
+    let name = payload["name"].as_str().unwrap_or_default();
+    if !LENT_TOOLS.contains(&name) {
+        return Err(("tool_refused", format!("{name} is not lent here")));
+    }
+    let (writable, start) = lent_folders(link);
+    let mut command = tokio::process::Command::new(agent);
+    command.arg("tool");
+    for folder in &writable {
+        command.arg("--writable").arg(folder);
+    }
+    if link.network {
+        command.arg("--network");
+    }
+    command
+        .arg("--workdir")
+        .arg(&start)
+        .arg(name)
+        .arg(payload["arguments"].to_string())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let ran = match tokio::time::timeout(left, command.output()).await {
+        Ok(ran) => ran.map_err(|e| ("tool_refused", e.to_string()))?,
+        Err(_) => return Err(("timed_out", format!("{name} ran out of time"))),
+    };
+    match serde_json::from_slice::<Value>(&ran.stdout) {
+        Ok(answer) if ran.status.success() && answer.get("output").is_some() => Ok(answer),
+        _ => Err((
+            "tool_refused",
+            String::from_utf8_lossy(&ran.stderr).trim().to_owned(),
+        )),
+    }
 }
 
 /// Answer `called`, a call of the agents over `link`, with `asker` putting
@@ -1960,6 +2053,10 @@ async fn lend(
                 .await
                 .map_err(|e| ("exec_refused", e))
         }
+        Some(TOOL) => match crate::agent_at(&crate::agent_places_here()) {
+            Ok(agent) => lent_tool(&agent, link, payload, left).await,
+            Err(missing) => Err(("tool_refused", missing)),
+        },
         // Its decoding, writing and marking block, so off the runtime the
         // link's other calls and pings run on.
         Some("open") => {
@@ -2915,5 +3012,112 @@ mod tests {
         assert!(reconnected_in(&dir, &mine).contains(
             &"Linked machine laptop (0.10.4) upgrades to match when it next connects".to_owned()
         ));
+    }
+
+    #[test]
+    fn a_machine_says_how_it_runs_the_agents_shell_and_files() {
+        let said = json!({"shell": {"writable": ["/w"], "start": "/w", "network": true}});
+        assert_eq!(
+            Machine::of("mac", &said).shell,
+            Some(Shell {
+                writable: vec!["/w".into()],
+                start: "/w".into(),
+                network: true
+            })
+        );
+        assert_eq!(Machine::of("mac", &json!({})).shell, None);
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_owned());
+        let link = agent_client::config::Link {
+            writable: vec!["~/code".into(), "/srv".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            lent_folders(&link),
+            (
+                vec![format!("{home}/code"), "/srv".to_owned()],
+                format!("{home}/code")
+            )
+        );
+        assert_eq!(lent_folders(&Default::default()), (Vec::new(), home));
+    }
+
+    /// Agent's binary built beside these tests, when it runs a sandbox
+    /// here, and a folder beside it outside temporary storage.
+    fn sandbox_here(name: &str) -> Option<(PathBuf, PathBuf)> {
+        let me = std::env::current_exe().ok()?;
+        let built = me
+            .ancestors()
+            .find(|dir| dir.join("agent").is_file())?
+            .to_owned();
+        let agent = built.join("agent");
+        let runs = std::process::Command::new(&agent)
+            .args(["sandbox", "--", "true"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let temporary = std::fs::canonicalize(std::env::temp_dir()).ok()?;
+        let built = std::fs::canonicalize(&built).ok()?;
+        if !runs || built.starts_with(&temporary) || built.starts_with("/tmp") {
+            eprintln!("skipped: no sandbox here, or the build is in temporary storage");
+            return None;
+        }
+        let dir = built.join(format!("sonny-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some((agent, std::fs::canonicalize(&dir).ok()?))
+    }
+
+    #[tokio::test]
+    async fn a_lent_call_writes_only_the_folders_its_link_names() {
+        let Some((agent, dir)) = sandbox_here("lent-tool") else {
+            return;
+        };
+        let (lent, kept) = (dir.join("lent"), dir.join("kept"));
+        std::fs::create_dir_all(&lent).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        let link = agent_client::config::Link {
+            writable: vec![lent.display().to_string()],
+            ..Default::default()
+        };
+        let left = Duration::from_secs(30);
+        let call = |name: &str, arguments: Value| json!({"name": name, "arguments": arguments});
+        let wrote = lent_tool(
+            &agent,
+            &link,
+            &call("write", json!({"path": "a.txt", "content": "hi"})),
+            left,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            wrote,
+            json!({"output": "wrote 2 bytes to a.txt", "failed": false})
+        );
+        assert_eq!(std::fs::read_to_string(lent.join("a.txt")).unwrap(), "hi");
+        let path = kept.join("b.txt").display().to_string();
+        let refused = lent_tool(
+            &agent,
+            &link,
+            &call("write", json!({"path": path, "content": "x"})),
+            left,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["failed"], true);
+        assert!(!kept.join("b.txt").exists());
+        let shell = lent_tool(
+            &agent,
+            &link,
+            &call("shell", json!({"command": "pwd"})),
+            left,
+        )
+        .await
+        .unwrap();
+        let ran: Value = serde_json::from_str(shell["output"].as_str().unwrap()).unwrap();
+        assert_eq!(ran["stdout"], format!("{}\n", lent.display()));
+        // Only the agents' own shell and file tools are lent.
+        let other = lent_tool(&agent, &link, &call("spawn_agent", json!({})), left).await;
+        assert_eq!(other.unwrap_err().0, "tool_refused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
