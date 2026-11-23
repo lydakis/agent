@@ -22255,7 +22255,8 @@ impl App {
     /// aside or kept to go back to, that holds such. It keeps this Sonny running
     /// while out of view only then.
     fn tell_keeps(&mut self) {
-        if !self.options.embedded {
+        // A side chat is drawn in its window's pane too (`/side`).
+        if !self.options.embedded && self.options.side.is_none() {
             return;
         }
         let panes = [&self.pane, &self.under].into_iter().flatten();
@@ -27164,6 +27165,15 @@ mod tests {
         app.input.set("half typed");
         app.tell_keeps();
         assert!(!app.told_keeps);
+        // A side chat, drawn in its window's pane, says so too.
+        app.options.side = Some(1);
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.input.clear();
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        app.options.side = None;
+        app.input.set("half typed");
         // Drawn in another's pane, words not sent keep it; none, not.
         app.options.embedded = true;
         app.tell_keeps();
