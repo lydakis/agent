@@ -1323,6 +1323,7 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                 project: project.as_deref(),
                 profile: profile.as_deref(),
                 lead: crate::project::is_lead(&caller),
+                folder: Some(&here),
             };
             let mut said = crate::commons::call_as(&home, &as_caller, arguments, &|holder, id| {
                 crate::task::gone(holder, id)

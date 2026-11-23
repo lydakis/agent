@@ -2738,16 +2738,16 @@ pub fn folds(
 /// Calls folded into one: what they did, said once with whom each did
 /// it to, `▸` to open them; open, the same row with `▾`, and each call's
 /// own rows under it.
-pub fn folded(
+pub fn folded<C: AsRef<[Line<'static>]>>(
     verb: &str,
     whats: &[String],
-    calls: &[Vec<Line<'static>>],
+    calls: &[C],
     open: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
     // One call open is its own rows, its first marked open.
     if let ([_], [call], true) = (whats, calls, open)
-        && let Some((first, rest)) = call.split_first()
+        && let Some((first, rest)) = call.as_ref().split_first()
     {
         let mut first = first.clone();
         first.spans.push(Span::raw(" ▾").dim());
@@ -2775,15 +2775,15 @@ pub fn folded(
         Span::raw("    "),
     );
     if open {
-        out.extend(calls.iter().flatten().cloned());
+        out.extend(calls.iter().flat_map(AsRef::as_ref).cloned());
     }
     out
 }
 
 /// Whether calls folded show more open than shut: more than one, or one
 /// with more to it than the row that says what it did.
-pub fn unfolds(whats: &[String], calls: &[Vec<Line<'static>>]) -> bool {
-    whats.len() > 1 || calls.iter().any(|call| call.len() > 1)
+pub fn unfolds<C: AsRef<[Line<'static>]>>(whats: &[String], calls: &[C]) -> bool {
+    whats.len() > 1 || calls.iter().any(|call| call.as_ref().len() > 1)
 }
 
 fn drawn(

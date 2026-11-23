@@ -421,6 +421,7 @@ mod tests {
             project: Some("shop"),
             profile: None,
             lead: name.ends_with(".lead"),
+            folder: None,
         };
         if let Some(thread) = arguments["reply"]["thread"].as_str() {
             let path = crate::commons::dir(home).join(format!("{thread}.jsonl"));
@@ -534,6 +535,7 @@ mod tests {
                 project: Some("shop"),
                 profile: None,
                 lead: false,
+                folder: None,
             };
             let gone = |_: &str, at: Option<i64>| at != Some(id);
             let path = crate::commons::dir(&home).join("store.jsonl");

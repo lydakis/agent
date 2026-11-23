@@ -126,6 +126,9 @@ pub struct Pane {
     /// again at the width it is drawn at whenever that changes, so a
     /// table or a list is never wrapped into pieces as the pane narrows.
     laid: Option<(PathBuf, usize)>,
+    /// A code file's rows colored beside the loop, past those colored
+    /// before it showed: in place once ready ([`Pane::colored`]).
+    coloring: Option<Coloring>,
     /// `?` pressed while it has the keys: every key its title would name,
     /// one to a row, in place of what it shows, until the next key.
     pub sheet: bool,
@@ -178,6 +181,7 @@ impl Pane {
             _ => path.display().to_string(),
         };
         let mut screen = Screen::default();
+        let mut coloring = None;
         let tree = std::fs::metadata(&path)
             .is_ok_and(|meta| meta.is_dir())
             .then(|| crate::tree::Tree::new(&path));
@@ -193,7 +197,7 @@ impl Pane {
                 }
                 (0, true)
             }
-            None => preview(&path, width, line, &mut screen)?,
+            None => preview(&path, width, line, &mut screen, &mut coloring)?,
         };
         screen.show_row(target, ABOVE);
         let laid =
@@ -238,6 +242,7 @@ impl Pane {
             name_at: None,
             tab: false,
             laid,
+            coloring,
             sheet: false,
             find: None,
         })
@@ -417,6 +422,7 @@ impl Pane {
             name_at: None,
             tab: false,
             laid: None,
+            coloring: None,
             sheet: false,
             find: None,
         }
@@ -454,6 +460,7 @@ impl Pane {
             name_at: None,
             tab: false,
             laid: None,
+            coloring: None,
             sheet: false,
             find: None,
         }
@@ -837,9 +844,13 @@ impl Pane {
         let before = self.screen.height(laid).saturating_sub(height).max(1);
         let through = 1.0 - self.screen.back().min(before) as f64 / before as f64;
         let mut screen = Screen::default();
-        if preview(path, width, None, &mut screen).is_err() {
+        let mut coloring = None;
+        if preview(path, width, None, &mut screen, &mut coloring).is_err() {
             return false;
         }
+        // The rest of a long source shown in place of its drawing comes
+        // colored beside the loop, as when it opened.
+        self.coloring = coloring;
         match going_to {
             Some((row, above)) => screen.show_row(row, above),
             None => {
@@ -848,6 +859,34 @@ impl Pane {
             }
         }
         self.screen = screen;
+        true
+    }
+
+    /// The rows of a code file colored beside the loop, in place once
+    /// ready, the view where it was: whether they were.
+    pub fn colored(&mut self) -> bool {
+        if !(self.coloring.as_ref()).is_some_and(|coloring| coloring.job.is_finished()) {
+            return false;
+        }
+        let Some(coloring) = self.coloring.take() else {
+            return false;
+        };
+        let Ok(rest) = coloring.job.join() else {
+            return false;
+        };
+        // The same words in the same rows, colored: the view, and what is
+        // selected or found in them, stays on them.
+        let mut screen = Screen::default();
+        if !coloring.before.is_empty() {
+            screen.push(coloring.before);
+        }
+        for (at, spans) in coloring.first.into_iter().chain(rest).enumerate() {
+            coloring.numbered.push(&mut screen, at, spans);
+        }
+        if coloring.cut {
+            screen.push(vec![Line::default(), past_shown()]);
+        }
+        self.screen.restyle(screen);
         true
     }
 
@@ -990,6 +1029,7 @@ fn preview(
     width: usize,
     line: Option<usize>,
     screen: &mut Screen,
+    coloring: &mut Option<Coloring>,
 ) -> Result<(usize, bool), String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     // A pipe, socket or device may never end, or never start.
@@ -1003,6 +1043,8 @@ fn preview(
     let extension = (path.extension().and_then(|e| e.to_str()))
         .unwrap_or_default()
         .to_lowercase();
+    // Rows over the code, when a drawing of it failed: why.
+    let mut before = Vec::new();
     if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
         let shown = match crate::term::graphics() {
             true => {
@@ -1083,10 +1125,13 @@ fn preview(
                 screen.push(rows);
                 return Ok((0, false));
             }
-            Some(Err(error)) => screen.push(vec![
-                note(&format!("could not draw it: {error}")),
-                Line::default(),
-            ]),
+            Some(Err(error)) => {
+                before = vec![
+                    note(&format!("could not draw it: {error}")),
+                    Line::default(),
+                ];
+                screen.push(before.clone());
+            }
             None => {}
         }
     }
@@ -1109,31 +1154,112 @@ fn preview(
         let mut code = crate::highlight::Code::file(path, lines.first().unwrap_or(&""));
         // Text no language colors is read as prose.
         prose = code.is_none();
-        let digits = shown.max(1).to_string().len();
-        for (at, text) in lines[..shown].iter().enumerate() {
-            let text = text.replace('\t', "    ");
-            let number = format!("{:>digits$}  ", at + 1);
-            let number = match Some(at) == target {
-                true => Span::raw(number).reversed().bold(),
-                false => Span::raw(number).dim(),
+        let numbered = Numbered {
+            digits: shown.max(1).to_string().len(),
+            target,
+        };
+        // Colored now as far as a screen past the line to show, which is
+        // what opens; the rest, its colors read from the top down, beside
+        // the loop, plain until they are.
+        let now = match code {
+            Some(_) => shown.min(target.unwrap_or(0) + screen_rows()),
+            None => shown,
+        };
+        let text: Vec<String> = (lines[..shown].iter())
+            .map(|text| text.replace('\t', "    "))
+            .collect();
+        let mut first = Vec::with_capacity(now);
+        for (at, text) in text[..now].iter().enumerate() {
+            let spans = match &mut code {
+                Some(code) => code.line(text),
+                None => vec![Span::raw(text.clone())],
             };
-            let mut spans = vec![Span::raw(" "), number];
-            match &mut code {
-                Some(code) => spans.extend(code.line(&text)),
-                None => spans.push(Span::raw(text)),
-            }
-            let rest = Line::from(" ".repeat(digits + 3));
-            screen.push_hanging(Line::from(spans), rest);
+            numbered.push(screen, at, spans.clone());
+            first.push(spans);
+        }
+        let cut = lines.len() > shown || size > MOST_BYTES;
+        for (at, text) in text.iter().enumerate().skip(now) {
+            numbered.push(screen, at, vec![Span::raw(text.clone())]);
+        }
+        if code.is_some() && now < shown {
+            let (path, first_line) = (path.to_owned(), lines[0].to_owned());
+            let job = std::thread::Builder::new()
+                .name("sonny-coloring".into())
+                .spawn(move || {
+                    // Colors are read from the top: what a line leaves
+                    // open (a comment, a string) colors the next.
+                    let mut code = crate::highlight::Code::file(&path, &first_line);
+                    let mut rest = Vec::with_capacity(text.len() - now);
+                    for (at, text) in text.iter().enumerate() {
+                        let spans = match &mut code {
+                            Some(code) => code.line(text),
+                            None => vec![Span::raw(text.clone())],
+                        };
+                        if at >= now {
+                            rest.push(spans);
+                        }
+                    }
+                    crate::drawing::ring();
+                    rest
+                });
+            *coloring = job.ok().map(|job| Coloring {
+                before,
+                numbered,
+                first,
+                cut,
+                job,
+            });
         }
         first_row = target.unwrap_or(0);
     }
     if lines.len() > shown || size > MOST_BYTES {
-        screen.push(vec![
-            Line::default(),
-            note("… the rest is past what a preview shows; click its name to open it"),
-        ]);
+        screen.push(vec![Line::default(), past_shown()]);
     }
     Ok((first_row, prose))
+}
+
+/// The note under a file cut short.
+fn past_shown() -> Line<'static> {
+    note("… the rest is past what a preview shows; click its name to open it")
+}
+
+/// The terminal's rows: as many as a preview opens on.
+fn screen_rows() -> usize {
+    ratatui::crossterm::terminal::size().map_or(50, |(_, rows)| rows as usize)
+}
+
+/// A code file's lines, numbered, the one to show marked.
+#[derive(Clone, Copy)]
+struct Numbered {
+    digits: usize,
+    target: Option<usize>,
+}
+
+impl Numbered {
+    /// Line `at`'s row, its number before `spans`, a wrapped row hanging
+    /// under its text.
+    fn push(&self, screen: &mut Screen, at: usize, spans: Vec<Span<'static>>) {
+        let digits = self.digits;
+        let number = format!("{:>digits$}  ", at + 1);
+        let number = match Some(at) == self.target {
+            true => Span::raw(number).reversed().bold(),
+            false => Span::raw(number).dim(),
+        };
+        let mut row = vec![Span::raw(" "), number];
+        row.extend(spans);
+        screen.push_hanging(Line::from(row), Line::from(" ".repeat(digits + 3)));
+    }
+}
+
+/// A code file's lines past those colored before it showed (`first`),
+/// colored beside the loop; and whether a note says it was cut short.
+struct Coloring {
+    /// The rows over the code (why it could not be drawn), as they were.
+    before: Vec<Line<'static>>,
+    numbered: Numbered,
+    first: Vec<Vec<Span<'static>>>,
+    cut: bool,
+    job: std::thread::JoinHandle<Vec<Vec<Span<'static>>>>,
 }
 
 /// The most the pane keeps to go back to.
@@ -1260,6 +1386,55 @@ mod tests {
         rows(&mut pane, 72, 3);
         assert!(!pane.has_tab());
         assert_eq!(pane.head_button(1), None);
+    }
+
+    /// A long code file opens with a screen of it colored, the rest
+    /// colored beside the loop and put in place with the same words in
+    /// the same rows, the view where it was; a short one is colored whole
+    /// at once.
+    #[test]
+    fn a_long_code_file_opens_at_once_and_is_colored_beside_the_loop() {
+        let dir = std::env::temp_dir().join(format!("sonny-colored-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let long = dir.join("long.rs");
+        let source: String = (0..3000)
+            .map(|n| format!("fn f{n}() -> u32 {{ /* {n} */ {n} }}\n"))
+            .collect();
+        std::fs::write(&long, source).unwrap();
+        let url = format!("file://{}#L2000", long.display());
+        let mut pane = Pane::preview(&url, &dir, 80).unwrap();
+        assert!(
+            pane.coloring.is_some(),
+            "the rest is colored beside the loop"
+        );
+        let (words, going) = (pane.screen.texts(), pane.screen.going_to());
+        let began = std::time::Instant::now();
+        while !pane.colored() {
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(60),
+                "never colored"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(pane.screen.texts(), words);
+        assert_eq!(pane.screen.going_to(), going);
+        assert!(pane.coloring.is_none() && !pane.colored());
+        // Read again, as when a drawing it waited for fails and its source
+        // shows instead: the rest comes colored beside the loop again.
+        assert!(pane.read_again(&long, 80, 80, 24));
+        assert!(pane.coloring.is_some(), "read again, colored again");
+        while !pane.colored() {
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(60),
+                "never colored again"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let short = dir.join("short.rs");
+        std::fs::write(&short, "fn main() {}\n").unwrap();
+        let pane = Pane::preview(&format!("file://{}", short.display()), &dir, 80).unwrap();
+        assert!(pane.coloring.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
