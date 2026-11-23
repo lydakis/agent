@@ -1,6 +1,8 @@
 """The agent command: daemon startup, run/follow/ls, peers, and socket rendezvous."""
 from contextlib import closing
 import fcntl
+import functools
+import http.server
 import shutil
 import sys
 import json
@@ -2244,6 +2246,52 @@ class CliTests(ModelFixture):
         self.assertEqual(big.returncode, 0, big.stderr)
         self.assertFalse(json.loads(big.stdout)['failed'], big.stdout)
         self.assertEqual((lent/'big.txt').read_text(), content)
+
+    @unittest.skipUnless(shutil.which('bwrap') and shutil.which('curl'), 'needs bubblewrap and curl')
+    def test_a_command_reaches_only_the_domains_named_through_the_proxy(self):
+        # Its own network off, a command reaches the hosts --domain lets
+        # through by the proxy its HTTP_PROXY names, and no other, as
+        # Codex's network proxy lets them; a write still runs.
+        work = self.path/'domains-work'
+        served = self.path/'domains-served'
+        for folder in (work, served):
+            folder.mkdir()
+        (served/'page').write_text('through the proxy\n')
+        server = http.server.ThreadingHTTPServer(
+            ('127.0.0.1', 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(served)))
+        server.RequestHandlerClass.log_message = lambda *_: None
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f'http://127.0.0.1:{server.server_port}/page'
+
+        def shell(command, *domains):
+            flags = [arg for domain in domains for arg in ('--domain', domain)]
+            ran = subprocess.run([str(self.binary), 'tool', '--writable', str(work), '--network', *flags,
+                                  '--workdir', str(work), 'shell', json.dumps({'command': command})],
+                                 env=clean_env(), capture_output=True, text=True, timeout=60)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+            return json.loads(json.loads(ran.stdout)['output'])
+
+        # Loopback inside is the sandbox's own: through the proxy, the
+        # machine's, here by its allowed literal.
+        through = f"curl -s -m 5 --noproxy '' {url}"
+        self.assertEqual(shell(through, '127.0.0.1')['stdout'], 'through the proxy\n')
+        refused = shell(f"curl -s -i -m 5 --noproxy '' http://example.com/", '127.0.0.1', '**.example.org')
+        self.assertIn('403 Forbidden', refused['stdout'])
+        self.assertIn('x-proxy-error: blocked-by-allowlist', refused['stdout'])
+        denied = shell(f"curl -s -i -m 5 --noproxy '' {url}", '127.0.0.1', '127.0.0.1=deny')
+        self.assertIn('x-proxy-error: blocked-by-denylist', denied['stdout'])
+        # Past the proxy, nothing: its own network is off.
+        direct = shell(f"curl -s -m 5 --noproxy '*' {url}; echo $?", '127.0.0.1')
+        self.assertEqual(direct['stdout'].strip(), '7')
+        self.assertIn('HTTP_PROXY=http://127.0.0.1:', shell('env', '127.0.0.1')['stdout'])
+        self.assertEqual(shell('echo kept > made; cat made', '127.0.0.1')['stdout'], 'kept\n')
+        bad = subprocess.run([str(self.binary), 'tool', '--writable', str(work), '--domain', 'x.com',
+                              'shell', '{"command":"true"}'], env=clean_env(), capture_output=True, text=True)
+        self.assertEqual((bad.returncode, json.loads(bad.stderr)['error']), (2, 'usage'))
+        every = subprocess.run([str(self.binary), 'tool', '--writable', str(work), '--network', '--domain', '*',
+                                'shell', '{"command":"true"}'], env=clean_env(), capture_output=True, text=True)
+        self.assertEqual(every.returncode, 2, every.stderr)
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_daemon_started_by_a_name_in_sonny_s_programs_still_writes_for_a_sandboxed_bot(self):

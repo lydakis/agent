@@ -126,6 +126,12 @@ vulnerability, whether or not the code's own documentation agrees.
   out inside the sandbox, so a symlink swapped in after the check cannot
   carry it outside; so are a patch's removals and the permissions a
   moved file keeps. A protected folder that is a symlink refuses the call.
+- With `network` and `domains`, a bot's commands have no network of their
+  own and reach only the daemon's HTTP proxy, which lets through the hosts
+  `domains` allow and none deny, and a local or private address only by
+  its own allowed literal, as Codex's network proxy does; `web_fetch`
+  goes by the same proxy. HTTPS is tunneled, never opened, so what is
+  sent to an allowed host is not seen.
 - Network is off unless the bot's `network` is set. Off, a bot is
   neither offered nor runs `web_fetch` or `web_search`, which the daemon
   and the provider answer outside the sandbox, and it reaches

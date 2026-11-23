@@ -299,7 +299,7 @@ impl Tool {
                 "checkpoint":{"type":"integer","minimum":1,"description":"With fork: copy the conversation up to this node, not all of it"},
                 "expire_ms":{"type":"integer","minimum":1000,"maximum":crate::store::HOLD_MAX_MS,"description":"With fork: delete the copy once idle this long"},
                 "workspace":{"type":"string","minLength":1,"description":"Its folder, within what this agent may reach; default this turn's folder"},
-                "settings":{"type":"object","description":"Its settings over this agent's own, never looser: sandbox, writable, network, unix_sockets, approval_policy, speed, cache_ttl, context_bytes, context_items, note_turns, compact_at, compact_keep, compact_tokens, post_turn_compact_percent, keep_turns, max_rounds, max_drops, max_output_tokens, approval_hold_ms, hold_ms, outputs, trailer, quiet_background, rules, env"},
+                "settings":{"type":"object","description":"Its settings over this agent's own, never looser: sandbox, writable, network, unix_sockets, domains, approval_policy, speed, cache_ttl, context_bytes, context_items, note_turns, compact_at, compact_keep, compact_tokens, post_turn_compact_percent, keep_turns, max_rounds, max_drops, max_output_tokens, approval_hold_ms, hold_ms, outputs, trailer, quiet_background, rules, env"},
                 "budget_tokens":{"type":"integer","minimum":1,"description":"Its lifetime token budget"},
                 "budget_counts":{"type":"string","enum":["tokens","work"]},
                 "turn_budget_tokens":{"type":"integer","minimum":1,"description":"The first message's turn's token cap"},
@@ -2783,7 +2783,9 @@ impl Registry {
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
             Prepared::WebFetch(url) => {
-                let page = fetch::fetch(url).await?;
+                let none = Default::default();
+                let domains = sandbox.as_deref().map_or(&none, |policy| &policy.domains);
+                let page = fetch::fetch(url, domains).await?;
                 self.off_runtime(page.text.len(), move |registry| registry.fetched(page))
                     .await
             }

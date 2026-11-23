@@ -26,7 +26,7 @@ Run `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` (`-h` works 
 - Prompts and wait handles are positional operands; a prompt of `-` reads stdin.
 - **Duration flags require units** (`500ms`, `30s`, `5m`, `1h`, `7d`, or bare `0`; a bare number is refused, so no flag guesses a unit): `--timeout`, `--approval-hold`, `--grace`, `--stall-timeout`, `--idle-exit`, `--attach-wait`, `--since`, `--bucket`, `--older-than`, `--hold`. `--stall-timeout` and `--idle-exit` count whole seconds. The protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`).
 - `--after` is an exclusive event cursor for `follow` and an exclusive turn ID for `turns`. `--checkpoint` is a history node ID.
-- Unknown flags, flags belonging to another command, unexpected operands, and repeated singleton flags are usage errors (exit `2`). `--provider`, `--image`, `--writable`, `--unix-socket`, `--quote`, `--shell-exclude`, and `--env` are repeatable.
+- Unknown flags, flags belonging to another command, unexpected operands, and repeated singleton flags are usage errors (exit `2`). `--provider`, `--image`, `--writable`, `--unix-socket`, `--domain`, `--quote`, `--shell-exclude`, and `--env` are repeatable.
 - Listings read only what they print: `--limit N` stops `ls`, `turns`, and `approvals` after N entries, and every filter runs in the daemon.
 
 ## Output and status
@@ -154,7 +154,7 @@ A refused turn says how in `wait` and `turns`: the refusal's `category` and the 
 
 New bots accept per-bot runtime settings; they are not daemon options, and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings) for defaults):
 
-- **Sandbox:** `--sandbox read-only|workspace-write|danger-full-access`, `--writable DIR` (repeatable, made absolute from the current folder), `--network`, `--unix-socket PATH` (repeatable: an absolute socket, or folder of them, its commands reach).
+- **Sandbox:** `--sandbox read-only|workspace-write|danger-full-access`, `--writable DIR` (repeatable, made absolute from the current folder), `--network`, `--unix-socket PATH` (repeatable: an absolute socket, or folder of them, its commands reach), `--domain PATTERN[=deny]` (repeatable, with `--network`: a host its commands and `web_fetch` reach, alone with the others named, by the daemon's proxy).
 - **Context & retention:** `--context-bytes`, `--context-items`, `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`, `--max-output-tokens`, `--cache-ttl`. `--keep-turns N` means the same on `prune` and `run`: keep the newest N turns' records. `prune` applies it once; on `run --new` it is the bot's setting, applied after each of its turns.
 - **Execution:**
   - `--approval-hold DURATION`: How long gated calls wait live for a verdict, and terminal reads for output, before the turn parks (default `2s`; `0` parks at once).

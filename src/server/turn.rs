@@ -6798,7 +6798,7 @@ impl Turn {
             own.insert("sandbox".into(), json!(sandbox));
             // Folders and network go with workspace-write alone.
             if sandbox != "workspace-write" {
-                for key in ["writable", "network", "unix_sockets"] {
+                for key in ["writable", "network", "unix_sockets", "domains"] {
                     own.remove(key);
                 }
             }
@@ -8386,7 +8386,9 @@ pub(super) fn bot_sandbox(
     Ok(policy.map(|policy| Policy {
         capability,
         listening,
-        ..policy.with_sockets(&settings.unix_sockets)
+        ..policy
+            .with_sockets(&settings.unix_sockets)
+            .with_domains(&settings.domains)
     }))
 }
 

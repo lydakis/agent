@@ -125,6 +125,11 @@ fn run() -> Result<i32> {
             agent_runtime::sandbox::patch()?;
             return Ok(0);
         }
+        // A command whose bot names domains, bridged to the proxy, which
+        // the daemon runs in the sandbox.
+        Some(agent_runtime::sandbox::PROXY) => {
+            return agent_runtime::sandbox::bridge(&args[1..]);
+        }
         None => return fail_with("usage", "a command is required; use agent --help"),
         _ => {}
     }
@@ -330,12 +335,13 @@ fn own_daemon() -> Result<agent_runtime::sandbox::Daemon> {
     })
 }
 
-/// `agent tool [--writable PATH]... [--network] [--workdir DIR] NAME
-/// ARGUMENTS`: one call of a bot's `shell`, `read`, `write`, `edit` or
-/// `apply_patch`, with ARGUMENTS as the model gives them, run by the
-/// daemon's own code in the sandbox `agent sandbox` builds: writing only
-/// the folders named (none: read-only), the network off unless
-/// `--network`, relative paths from DIR (this folder unless named), and a
+/// `agent tool [--writable PATH]... [--network] [--domain PATTERN[=deny]]...
+/// [--workdir DIR] NAME ARGUMENTS`: one call of a bot's `shell`, `read`,
+/// `write`, `edit` or `apply_patch`, with ARGUMENTS as the model gives
+/// them, run by the daemon's own code in the sandbox `agent sandbox`
+/// builds: writing only the folders named (none: read-only), the network
+/// off unless `--network`, and then only the hosts `--domain` lets
+/// through if it names any, relative paths from DIR (this folder unless named), and a
 /// command with no `timeout_ms` run to its end, as a script's step. For a
 /// client that lends this machine's shell and files to the agents of
 /// another, as Codex's exec server does. Prints `{"output", "failed",
@@ -346,12 +352,21 @@ fn tool(args: &[String]) -> Result<i32> {
     use agent_runtime::sandbox::{Mode, Policy};
     use agent_runtime::tools::Prepared;
     let (mut writable, mut network, mut workdir, mut held) = (Vec::new(), false, None, false);
+    let mut domains = std::collections::BTreeMap::new();
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match (arg.as_str(), arg.starts_with("--")) {
             ("--network", _) => network = true,
             ("--held", _) => held = true,
+            ("--domain", _) => {
+                let given = iter
+                    .next()
+                    .ok_or(Error::with("usage", "--domain needs a pattern"))?;
+                let (pattern, access) = agent_runtime::sandbox::proxy::flag(given)
+                    .map_err(|why| Error::with("usage", format!("--domain {why}")))?;
+                domains.insert(pattern, access);
+            }
             ("--writable", _) => {
                 let path = iter
                     .next()
@@ -400,6 +415,9 @@ fn tool(args: &[String]) -> Result<i32> {
             "usage",
             "--network goes with --writable, as a sandbox's network goes with workspace-write",
         );
+    }
+    if !domains.is_empty() && !network {
+        return fail_with("usage", "--domain goes with --network");
     }
     if !matches!(
         name.as_str(),
@@ -463,6 +481,7 @@ fn tool(args: &[String]) -> Result<i32> {
                     };
                     Policy::new(Some(mode), None, &writable, network, &daemon)?
                         .ok_or(Error::new("sandbox_unavailable"))?
+                        .with_domains(&domains)
                 }
             };
             let ran = runtime()?.block_on(async {

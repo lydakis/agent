@@ -102,7 +102,6 @@ const HANDED_WAIT_MS: i32 = 5000;
 /// when this command has none, or `socket` is not its daemon's.
 #[cfg(target_os = "linux")]
 pub fn handed(socket: &Path) -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
-    use std::os::fd::FromRawFd;
     let Some(fd) = (std::env::var(HANDED).ok()).and_then(|fd| fd.parse::<i32>().ok()) else {
         return Ok(None);
     };
@@ -126,6 +125,14 @@ pub fn handed(socket: &Path) -> std::io::Result<Option<std::os::unix::net::UnixS
             connected => connected.map(Some),
         };
     }
+    ask(fd).map(Some)
+}
+
+/// A connection asked for on `fd`, a descriptor that answers each byte
+/// with one ([`hand`]): the daemon's, or its proxy's.
+#[cfg(target_os = "linux")]
+pub fn ask(fd: i32) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::FromRawFd;
     // SAFETY: the byte outlives the call.
     let sent = unsafe { libc::send(fd, [0u8].as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
     if sent < 0 {
@@ -157,9 +164,7 @@ pub fn handed(socket: &Path) -> std::io::Result<Option<std::os::unix::net::UnixS
         match received(fd)? {
             Received::Stream(stream) => {
                 // SAFETY: the descriptor came over SCM_RIGHTS and is ours.
-                return Ok(Some(unsafe {
-                    std::os::unix::net::UnixStream::from_raw_fd(stream)
-                }));
+                return Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(stream) });
             }
             Received::Refused => return Err(std::io::ErrorKind::ConnectionRefused.into()),
             Received::Closed => return Err(std::io::ErrorKind::NotConnected.into()),
