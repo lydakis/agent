@@ -89,6 +89,28 @@ impl Prompt {
         self.styled.take();
     }
 
+    /// `with` put in place of `piece` where it first is, the cursor kept on
+    /// the words it was at; whether `piece` was there.
+    pub fn swap(&mut self, piece: &str, with: &str) -> bool {
+        let Some(start) = self.text.find(piece) else {
+            return false;
+        };
+        let gone = start..start + piece.len();
+        self.text.replace_range(gone.clone(), with);
+        self.at = kept(self.at, &gone, with.len());
+        self.anchor = self.anchor.map(|at| kept(at, &gone, with.len()));
+        self.goal = None;
+        self.laid.take();
+        self.styled.take();
+        true
+    }
+
+    /// `with` put in place of `piece`, with a space after it, in what
+    /// Ctrl-Y brings back.
+    pub fn unkill(&mut self, piece: &str, with: &str) {
+        put_back(&mut self.killed, piece, with);
+    }
+
     /// Whether the cursor is before every word, nothing selected.
     pub fn at_start(&self) -> bool {
         self.at == 0 && self.selection().is_none()
@@ -821,6 +843,25 @@ fn inline(
     }
     if plain < line.len() && base != Style::new() {
         marked.push((offset + plain..offset + line.len(), base));
+    }
+}
+
+/// Where `at` lands once the bytes `gone` are taken out.
+/// `with` put in place of `piece`, with a space after it, where it first
+/// is in `text`.
+pub fn put_back(text: &mut String, piece: &str, with: &str) {
+    if let Some(start) = text.find(piece) {
+        let mut end = start + piece.len();
+        end += usize::from(text[end..].starts_with(' '));
+        text.replace_range(start..end, with);
+    }
+}
+
+fn kept(at: usize, gone: &Range<usize>, put: usize) -> usize {
+    if at >= gone.end {
+        at - gone.len() + put
+    } else {
+        at.min(gone.start)
     }
 }
 

@@ -1025,6 +1025,32 @@ impl Screen {
         self.top_row = Some(top);
     }
 
+    /// The same rows again, styled anew (a code file colored once that is
+    /// done): the view, what is selected and what is found stay as they
+    /// were, the words and so the rows they wrap to being the same.
+    pub fn restyle(&mut self, styled: Screen) {
+        debug_assert_eq!(styled.rows.len(), self.rows.len());
+        let was = std::mem::take(&mut self.shown);
+        self.rows = styled.rows;
+        self.wrapped = 0;
+        self.relaid = 0;
+        if self.width != 0 {
+            self.wrap(self.width);
+        }
+        // Words split into other spans can wrap at other places: then what
+        // was selected is let go, as when rows are laid out again, never
+        // moved onto other words.
+        fn text(shown: &Shown) -> impl Iterator<Item = char> + '_ {
+            (shown.line.spans.iter()).flat_map(|span| span.content.chars())
+        }
+        let same = was.len() == self.shown.len()
+            && (was.iter().zip(&self.shown)).all(|(a, b)| text(a).eq(text(b)));
+        if !same {
+            self.selection = None;
+            self.linked = None;
+        }
+    }
+
     /// The view put with the row tagged `tag`, the newest if more are,
     /// `above` drawn rows under its top; whether a row is.
     pub fn show_tagged(&mut self, tag: Tag, above: usize) -> bool {
@@ -3567,6 +3593,49 @@ mod tests {
         let mut cell = buf[(2, 1)].clone();
         crate::look::Look::Muted((200, 200, 200)).cell(&mut cell);
         assert_eq!((cell.symbol(), cell.bg), (" ", crate::look::quote()));
+    }
+
+    /// Rows styled anew under a selection being dragged keep it, and the
+    /// view: a code file colored while the person selects in it.
+    #[test]
+    fn rows_styled_anew_keep_the_selection_and_the_view() {
+        let lines = |styled: bool| -> Vec<Line<'static>> {
+            (0..20)
+                .map(|n| match styled {
+                    true => Line::from(Span::styled(
+                        format!("  line {n}"),
+                        Style::new().fg(Color::Cyan),
+                    )),
+                    false => Line::from(format!("  line {n}")),
+                })
+                .collect()
+        };
+        let (mut screen, _) = screen(lines(false), 30, 4);
+        screen.scroll(3);
+        let back = screen.back();
+        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0));
+        screen.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 20, 1));
+        let selected = screen.selected();
+        assert!(selected.is_some());
+        let mut styled = Screen::default();
+        styled.push(lines(true));
+        screen.restyle(styled);
+        assert_eq!(screen.back(), back);
+        assert_eq!(screen.selected(), selected);
+        // Let go, it copies, as one never styled anew does.
+        let copied = screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 20, 1));
+        assert_eq!(copied, selected.map(Action::Copy));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 4));
+        screen.render(Rect::new(0, 0, 30, 4), &mut buf, |_| None);
+        assert_eq!(row(&buf, 3).trim_end(), "  line 16");
+        let drawn = &screen.shown[screen.top + 3].line;
+        assert_eq!(drawn.spans[0].style.fg, Some(Color::Cyan), "{drawn:?}");
+        // Laid out at other places, what was selected is let go.
+        assert!(screen.selected().is_some());
+        let mut other = Screen::default();
+        other.push((0..20).map(|n| Line::from(format!("  item {n}"))).collect());
+        screen.restyle(other);
+        assert_eq!(screen.selected(), None);
     }
 
     #[test]
