@@ -5139,6 +5139,10 @@ impl Turn {
                     sandbox = Some(Arc::new(Policy::reads(self.registry.daemon())));
                     Ok(prepared)
                 }
+                Ok(prepared @ Prepared::WebFetch(_)) => {
+                    sandbox = fetch_sandbox(&record.settings, self.registry.daemon());
+                    Ok(prepared)
+                }
                 other => other,
             };
             let declared = record.declared(&call.name);
@@ -7408,6 +7412,7 @@ impl Lifts {
             (Ok(Prepared::Read { .. }), _) if bot.sandboxed() => {
                 Some(Arc::new(Policy::reads(self.registry.daemon())))
             }
+            (Ok(Prepared::WebFetch(_)), _) => fetch_sandbox(&bot.settings, self.registry.daemon()),
             (Ok(_), true) => {
                 let (settings, daemon, id, root) = (
                     bot.settings.clone(),
@@ -9137,6 +9142,23 @@ fn priced_at(
         attempt.provider.get_or_insert_with(|| provider.to_owned());
     }
     usage
+}
+
+/// What a bot's `web_fetch` reaches by: the hosts its commands reach,
+/// when its sandbox lets them reach the network and it names domains.
+/// `web_fetch` runs in no command sandbox, so this is its own.
+pub(super) fn fetch_sandbox(
+    settings: &Settings,
+    daemon: &agent_runtime::sandbox::Daemon,
+) -> Option<Arc<Policy>> {
+    let network =
+        settings.network && settings.sandbox == Some(agent_runtime::sandbox::Mode::WorkspaceWrite);
+    let policy = Policy {
+        network,
+        ..Policy::reads(daemon)
+    }
+    .with_domains(&settings.domains);
+    (!policy.domains.is_empty()).then(|| Arc::new(policy))
 }
 
 #[cfg(test)]

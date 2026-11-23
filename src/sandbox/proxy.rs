@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// What a domain pattern lets through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -106,16 +106,30 @@ fn suffix(domain: &str, rest: &str) -> bool {
     }
 }
 
-/// `?` one byte, `*` any run of bytes but a dot; the rest itself.
+/// `?` one byte, `*` any run of bytes but a dot; the rest itself. One
+/// pass of the pattern over a row per text position: time pattern times
+/// text, whatever the pattern, never backtracking.
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some((b'*', rest)) => (0..=text.len())
-            .take_while(|&n| n == 0 || text[n - 1] != b'.')
-            .any(|n| glob(rest, &text[n..])),
-        Some((b'?', rest)) => !text.is_empty() && glob(rest, &text[1..]),
-        Some((byte, rest)) => text.first() == Some(byte) && glob(rest, &text[1..]),
+    // `ends[n]`: the pattern so far matches the text's first `n` bytes.
+    let mut ends = vec![false; text.len() + 1];
+    ends[0] = true;
+    for &byte in pattern {
+        let mut next = vec![false; text.len() + 1];
+        match byte {
+            b'*' => {
+                for n in 0..=text.len() {
+                    next[n] = ends[n] || (n > 0 && next[n - 1] && text[n - 1] != b'.');
+                }
+            }
+            _ => {
+                for n in 1..=text.len() {
+                    next[n] = ends[n - 1] && (byte == b'?' || text[n - 1] == byte);
+                }
+            }
+        }
+        ends = next;
     }
+    ends[text.len()]
 }
 
 /// Why a host is not reached, as the proxy's `x-proxy-error` says it.
@@ -174,10 +188,14 @@ pub fn allowed(
 ) -> Result<(), Blocked> {
     let host = host.to_ascii_lowercase();
     let bare = host.trim_start_matches('[').trim_end_matches(']');
-    decide(domains, &host).or_else(|blocked| match bare == host {
-        true => Err(blocked),
-        false => decide(domains, bare),
-    })
+    let (named, other) = (decide(domains, &host), decide(domains, bare));
+    // Both spellings name one place: a deny of either wins, and an allow
+    // of either lets it through.
+    match (named, other) {
+        (Err(Blocked::Denied), _) | (_, Err(Blocked::Denied)) => Err(Blocked::Denied),
+        (Ok(()), _) | (_, Ok(())) => Ok(()),
+        (Err(blocked), _) => Err(blocked),
+    }
 }
 
 /// Whether `ip` is on this machine or a private network.
@@ -353,7 +371,13 @@ pub async fn serve<S>(
 async fn read_head<S: AsyncRead + Unpin>(client: &mut BufReader<S>) -> Option<String> {
     let mut head = Vec::new();
     loop {
-        let read = client.read_until(b'\n', &mut head).await.ok()?;
+        // Never more than the head may hold, a line without its end too.
+        let left = (HEAD_BYTES + 1).saturating_sub(head.len()) as u64;
+        let read = (&mut *client)
+            .take(left)
+            .read_until(b'\n', &mut head)
+            .await
+            .ok()?;
         if read == 0 || head.len() > HEAD_BYTES {
             return None;
         }
@@ -450,6 +474,49 @@ mod tests {
             decide(&domains(&[("x.com", Access::Deny)]), "y.com"),
             Err(Blocked::NotAllowed)
         );
+    }
+
+    #[test]
+    fn a_pattern_of_many_stars_matches_in_time_bounded_by_its_length() {
+        let pattern = "*a*a*a*a*a*a*a*a*a*a*a*a*ab.example.com";
+        let host = format!("{}.example.com", "a".repeat(60));
+        let started = std::time::Instant::now();
+        assert!(!matches(pattern, &host));
+        assert!(matches(
+            pattern,
+            &format!("{}b.example.com", "a".repeat(60))
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_deny_of_either_spelling_of_a_v6_address_wins() {
+        let bare_allowed = domains(&[("::1", Access::Allow), ("[::1]", Access::Deny)]);
+        assert_eq!(allowed(&bare_allowed, "[::1]"), Err(Blocked::Denied));
+        let bracket_allowed = domains(&[("[::1]", Access::Allow), ("::1", Access::Deny)]);
+        assert_eq!(allowed(&bracket_allowed, "[::1]"), Err(Blocked::Denied));
+        assert_eq!(
+            allowed(&domains(&[("::1", Access::Allow)]), "[::1]"),
+            Ok(())
+        );
+        assert_eq!(
+            allowed(&domains(&[("[::1]", Access::Allow)]), "[::1]"),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_without_a_line_end_is_never_read_past_its_bound() {
+        let (mut sender, receiver) = tokio::io::duplex(1 << 20);
+        // A line with no end, longer than any head, and the sender still open.
+        sender
+            .write_all(&vec![b'x'; HEAD_BYTES + 4096])
+            .await
+            .unwrap();
+        let mut client = BufReader::new(receiver);
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), read_head(&mut client));
+        assert_eq!(read.await.unwrap(), None);
+        drop(sender);
     }
 
     #[tokio::test]
