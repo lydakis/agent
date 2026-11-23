@@ -21,13 +21,14 @@
 //!
 //! Every agent is followed only for the events that can start a wait on
 //! the person ([`WIDE`]): a call held for a verdict, a call starting (a
-//! question is the ask tool's call; `mark_done` marks a task done), a fork
+//! question is the ask tool's call), an agent closed (done, it needs no
+//! one), a fork
 //! made (it keeps its source's history, and any question open in it), and
 //! an agent made (the event names who made it, so who is above whom is
 //! known with nothing read). The
 //! rest of an agent's events, its calls ending and its turn's end, are
-//! followed only while it waits, runs a turn begun before the follow, or
-//! marks a task done ([`NARROW`]), from that event on, so nothing is missed
+//! followed only while it waits or runs a turn begun before the follow
+//! ([`NARROW`]), from that event on, so nothing is missed
 //! between. The daemon has no unfollow: once none of those does any more,
 //! a new connection follows every agent on from the last event, with
 //! nothing read again.
@@ -841,9 +842,6 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         }
         narrow.insert(bot, waited);
     }
-    // The agents a lead's turn marked done, by the lead: read again once
-    // the turn ends, when the mark is beside the store.
-    let mut marked: HashMap<String, Vec<String>> = HashMap::new();
     // The agents closed (those holding a call when the follow started,
     // then those it hears close): a turn still running in one can ask,
     // and needs no one until a message opens it again.
@@ -881,22 +879,18 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
                 made_by.gone(&bot);
             }
             // A wait from an agent closed: only if a message opened it
-            // again since, as `/status` lists it only then.
+            // again since, as `/status` reads it done until then.
             _ if ours && closed.contains(&bot) && waits_from(&event) => {
                 match standing::rows(&client, std::slice::from_ref(&bot)).await {
-                    Ok(rows) if rows.iter().any(|row| row.name == bot) => _ = closed.remove(&bot),
+                    Ok(rows) if rows.iter().any(|row| row.name == bot && !row.closed) => {
+                        _ = closed.remove(&bot)
+                    }
                     _ => ours = false,
                 }
             }
             _ => {}
         }
-        // A side chat needs no one, but it may mark its source done.
-        let side = (!ours).then(|| crate::side_source(&bot)).flatten();
-        let done = marks(&event, &bot, &order).map(|done| match side {
-            Some(source) if done == bot => source.to_owned(),
-            _ => done,
-        });
-        if !ours && done.is_none() && !marked.contains_key(&bot) {
+        if !ours {
             continue;
         }
         // A lead the start did not list: its project is placed after the
@@ -919,7 +913,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             if let Some(seen) = needs::scan(&client, &bot, None).await
                 && needs.stirred(&bot) == stirred
             {
-                let open = seen.clone().open(store, &bot, false);
+                let open = seen.clone().open(closed.contains(&bot), false);
                 forked = open.is_some();
                 if forked {
                     seen_of.insert(bot.clone(), seen);
@@ -928,19 +922,15 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
                 read = forked;
             }
         }
-        // A call held for the person, a question asked or kept, or agents
-        // marked done: its calls and its turn's end from here on, to see
-        // it let go, answered or over.
-        if !narrow.contains_key(&bot) && (ours && (waits_from(&event) || forked) || done.is_some())
-        {
+        // A call held for the person, or a question asked or kept: its
+        // calls and its turn's end from here on, to see it let go,
+        // answered or over.
+        if !narrow.contains_key(&bot) && (waits_from(&event) || forked) {
             let asked = json!({"bot": bot, "after": cursor, "kinds": NARROW});
             if !lanes.follow(&client, asked).await {
                 return;
             }
             narrow.insert(bot.clone(), false);
-        }
-        if let Some(done) = done {
-            marked.entry(bot.clone()).or_default().push(done);
         }
         // A turn ending that would let go a step of a call lifted before
         // the follow started: what the daemon holds of it, read again.
@@ -969,7 +959,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             if let Some(seen) = needs::scan(&client, &due, turn).await
                 && needs.stirred(&due) == stirred
             {
-                let open = seen.clone().open(store, &due, false);
+                let open = seen.clone().open(closed.contains(&due), false);
                 match open.is_some() {
                     true => seen_of.insert(due.clone(), seen),
                     false => seen_of.remove(&due),
@@ -978,31 +968,18 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
                 read = true;
             }
         }
-        // A lead's turn that marked agents done: their questions close.
-        if event["event"] == "turn_finished" {
-            for done in marked.remove(&bot).unwrap_or_default() {
-                if let Some(seen) = seen_of.get(&done) {
-                    let open = seen.clone().open(store, &done, false);
-                    if open.is_none() {
-                        seen_of.remove(&done);
-                    }
-                    needs.asked(&done, open);
-                    read = true;
-                }
-            }
-        }
         if changed || read {
             tell_waiting(&needs, &order, &made_by, tell);
         }
         if let Some(waited) = narrow.get_mut(&bot) {
             *waited |= needs.waits(&bot) || event["event"] == "turn_finished";
         }
-        // None followed narrowly waits, runs, marks any more or is to be
+        // None followed narrowly waits, runs any more or is to be
         // read at its turn's end: their events are no longer wanted, and
         // the daemon has no unfollow. A new connection follows every agent
         // on from where its follow had reached, with nothing read again,
         // once every event heard is applied.
-        if lanes.is_empty() && done_with(&narrow, &needs, &marked) {
+        if lanes.is_empty() && done_with(&narrow, &needs) {
             drop((client, events));
             let Some(again) = follow_wide(socket, wide_from.clone()).await else {
                 return;
@@ -1015,16 +992,10 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
 
 /// Whether none of the agents followed narrowly is wanted any more: each
 /// has waited or run to its turn's end, and none waits now, is to be read
-/// when its turn ends (the person's words went past its question), or
-/// marked another done.
-fn done_with(
-    narrow: &HashMap<String, bool>,
-    needs: &needs::Needs,
-    marked: &HashMap<String, Vec<String>>,
-) -> bool {
+/// when its turn ends (the person's words went past its question).
+fn done_with(narrow: &HashMap<String, bool>, needs: &needs::Needs) -> bool {
     !narrow.is_empty()
         && (narrow.iter()).all(|(bot, waited)| *waited && !needs.waits(bot) && !needs.unsure(bot))
-        && marked.is_empty()
 }
 
 /// A connection of its own following every agent for [`WIDE`], from
@@ -1163,9 +1134,12 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
         .map(|bot| bot.name.clone())
         .collect();
     let theirs = |bot: &str| other(bot, &named_as_sides);
-    // A call held by an agent closed needs no one, as `/status` lists it
-    // no more: the listing has only the open, in the order of their names.
-    let open = |bot: &str| (listed.binary_search_by(|row| row.name.as_str().cmp(bot))).is_ok();
+    // A call held by an agent closed needs no one: it is done. The listing
+    // is in the order of the names.
+    let open = |bot: &str| {
+        (listed.binary_search_by(|row| row.name.as_str().cmp(bot)))
+            .is_ok_and(|at| !listed[at].closed)
+    };
     let mut closed: HashSet<String> = (held.iter())
         .filter(|held| theirs(&held.bot) && !open(&held.bot))
         .map(|held| held.bot.clone())
@@ -1179,7 +1153,7 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     let kept = crate::kept_seen(store, identity.as_deref());
     let mut read: HashMap<String, (i64, Seen)> = HashMap::new();
     for bot in &listed {
-        if !theirs(&bot.name) || bot.head.is_none() {
+        if !theirs(&bot.name) || bot.head.is_none() || bot.closed {
             continue;
         }
         // Its turn runs: what it asked, read once the turn ends.
@@ -1194,7 +1168,7 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
             let Some(seen) = needs::scan(client, &bot.name, None).await else {
                 continue;
             };
-            let open = seen.clone().open(store, &bot.name, false);
+            let open = seen.clone().open(false, false);
             if open.is_some() {
                 seen_of.insert(bot.name.clone(), seen);
             }
@@ -1216,7 +1190,7 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
                 seen
             }
         };
-        let open = seen.clone().open(store, &bot.name, false);
+        let open = seen.clone().open(false, false);
         if open.is_some() {
             seen_of.insert(bot.name.clone(), seen);
         }
@@ -1260,22 +1234,6 @@ async fn closed_running(client: &Client) -> Option<Vec<String>> {
             Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
             _ => return Some(closed),
         }
-    }
-}
-
-/// The agent a `mark_done` call starting in `event`, by `bot`, marks done:
-/// `bot` itself, or a task of its project by name.
-fn marks(event: &Value, bot: &str, projects: &HashMap<String, usize>) -> Option<String> {
-    let data = &event["data"];
-    if event["event"] != "tool_started" || data["name"] != crate::resolved::TOOL {
-        return None;
-    }
-    let arguments: Value = (data["arguments"].as_str())
-        .and_then(|arguments| serde_json::from_str(arguments).ok())
-        .unwrap_or(Value::Null);
-    match crate::resolved::itself(&arguments, bot) {
-        true => Some(bot.to_owned()),
-        false => crate::resolved::call(&arguments, project_in(bot, projects)),
     }
 }
 
@@ -1659,24 +1617,6 @@ mod tests {
             std::os::unix::net::SocketAddr::from_pathname(&told).is_ok(),
             "{told:?}"
         );
-    }
-
-    #[test]
-    fn a_lead_marking_a_task_done_names_it_in_full() {
-        let projects: HashMap<String, usize> = [("shop".to_owned(), 0)].into();
-        let started = |arguments: &str| json!({"event": "tool_started", "data": {"name": "mark_done", "arguments": arguments}});
-        let task = started(r#"{"task":"fix"}"#);
-        assert_eq!(
-            marks(&task, "shop.lead", &projects).as_deref(),
-            Some("shop.fix")
-        );
-        let own = started("{}");
-        assert_eq!(
-            marks(&own, "shop.fix", &projects).as_deref(),
-            Some("shop.fix")
-        );
-        let other = json!({"event": "tool_started", "data": {"name": "shell"}});
-        assert_eq!(marks(&other, "shop.lead", &projects), None);
     }
 
     /// Every agent's row is followed only while a window asks for them: a
@@ -2277,17 +2217,16 @@ mod tests {
         let asked = json!({"call_id": "c1", "name": crate::asks::TOOL});
         needs.event(&event("tool_started", asked));
         let narrow: HashMap<String, bool> = [("site.fix".to_owned(), true)].into();
-        let marked = HashMap::new();
-        assert!(!done_with(&narrow, &needs, &marked));
+        assert!(!done_with(&narrow, &needs));
         // A reaction or words of the person's: answered or not, the
         // history says once the turn ends.
         needs.event(&event("accepted", json!({"text": "ok"})));
         assert!(!needs.waits("site.fix"));
-        assert!(!done_with(&narrow, &needs, &marked));
+        assert!(!done_with(&narrow, &needs));
         needs.event(&event("turn_finished", json!({})));
         assert_eq!(needs.due().len(), 1);
         needs.asked("site.fix", None);
-        assert!(done_with(&narrow, &needs, &marked));
+        assert!(done_with(&narrow, &needs));
     }
 
     #[test]

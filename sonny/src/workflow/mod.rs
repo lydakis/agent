@@ -1731,15 +1731,15 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
         // What stays: a branch with work on it, or a worktree not taken
         // away, and why.
         (trees.iter())
-            .filter_map(|tree| {
-                match crate::task::remove(&here, tree, false, (&store, &socket, "")) {
+            .filter_map(
+                |tree| match crate::task::remove(&here, tree, false, (&store, &socket)) {
                     Ok(said) => said.contains("is kept").then_some(said),
                     Err(why) => Some(match crate::task::worktree_of(&here, tree) {
                         Some(path) => format!("{why} (at {})", path.display()),
                         None => why,
                     }),
-                }
-            })
+                },
+            )
             .collect::<Vec<_>>()
     })
     .await

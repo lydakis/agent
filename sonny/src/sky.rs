@@ -55,6 +55,7 @@ const LIVE: &[&str] = &[
     "call_lifted",
     "lifted_ended",
     "configured",
+    "closed",
 ];
 /// How long a spark takes to cross.
 const FLIGHT: Duration = Duration::from_millis(1100);
@@ -533,6 +534,8 @@ struct Agent {
     /// rather than each frame.
     named: String,
     gone: bool,
+    /// Closed, as the daemon lists it: done once no turn of its runs.
+    closed: bool,
     // Laid out: where it is drawn now, gliding from where it was to where
     // the layout puts it.
     at: (f32, f32),
@@ -610,8 +613,7 @@ impl Agent {
 pub struct View {
     /// The daemon's socket, to follow it again after a pause.
     socket: PathBuf,
-    /// The daemon's store, beside which leads keep the tasks they
-    /// resolved, whose questions are set aside.
+    /// The daemon's store, beside which the sky keeps what it read.
     resolved: PathBuf,
     feed: mpsc::UnboundedReceiver<Fed>,
     task: tokio::task::JoinHandle<()>,
@@ -1372,16 +1374,10 @@ impl View {
                         });
                         if let Some((_, seen)) = kept {
                             known.push((name, seen.clone()));
-                        } else if agent.running.is_none()
-                            && crate::resolved::holds(
-                                crate::resolved::read(&self.resolved, &name),
-                                agent.ended,
-                                false,
-                            )
-                        {
-                            // Marked done since its last turn, by itself or
-                            // its lead: no question of its is open, whatever
-                            // its history holds, so it is not read.
+                        } else if crate::resolved::done(agent.closed, agent.running.is_some()) {
+                            // Closed since its last turn, by itself or its
+                            // lead: done, no question of its is open,
+                            // whatever its history holds, so it is not read.
                             let seen = crate::needs::Seen {
                                 turn: agent.ended,
                                 ..Default::default()
@@ -2136,6 +2132,7 @@ impl View {
         agent.made_by_id = bot["created_by_id"].as_i64();
         agent.running = bot["running_turn"].as_i64();
         agent.ended = bot["last"]["turn"].as_i64();
+        agent.closed = crate::resolved::closed(bot);
         agent.set_model(bot["model"].as_str().unwrap_or_default());
         Some(at)
     }
@@ -2212,6 +2209,17 @@ impl View {
                 }
                 return;
             }
+            // Done: by itself, its maker or the person.
+            "closed" => {
+                if let Some(at) = self.agent(name) {
+                    self.agents[at].closed = true;
+                    // At rest, it is done: no question of its is open.
+                    if self.agents[at].running.is_none() {
+                        self.agents[at].waits.asked(name, None);
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         let Some(at) = self.agent_or_copied(name) else {
@@ -2248,6 +2256,8 @@ impl View {
                 if kind == "accepted" && live && own {
                     let agent = &mut self.agents[at];
                     agent.running = Some(turn);
+                    // A turn of its own opens it again.
+                    agent.closed = false;
                     agent.sender = Some(from);
                     // A new turn tries again what failed.
                     agent.failed = false;
@@ -3316,7 +3326,7 @@ impl View {
             && !self.agents[at].waits.unsure(name)
         {
             let running = self.agents[at].running.is_some();
-            let ask = seen.open(&self.resolved, name, running);
+            let ask = seen.open(self.agents[at].closed, running);
             self.agents[at].waits.asked(name, ask);
         }
     }
@@ -8668,23 +8678,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_marked_done_since_its_last_turn_is_not_read_for_its_question() {
-        let dir = std::env::temp_dir().join(format!("sky-done-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = dir.join("state.sqlite");
-        crate::resolved::keep(&store, "done", 5, "c1").unwrap();
-        crate::resolved::keep(&store, "reopened", 5, "c2").unwrap();
-        crate::resolved::keep(&store, "busy", 5, "c3").unwrap();
+    async fn an_agent_closed_since_its_last_turn_is_not_read_for_its_question() {
         let (mut view, send) = view();
-        view.resolved = store.clone();
         let (scans, mut asked) = scans();
         send.send(Feed::Scans(scans)).unwrap();
         send.send(Feed::Roll(vec![
-            json!({"name": "done", "last": {"turn": 5}}),
-            json!({"name": "reopened", "last": {"turn": 6}}),
-            json!({"name": "busy", "running_turn": 6, "last": {"turn": 5}}),
-            json!({"name": "open"}),
+            json!({"name": "done", "closed_ms": 1, "last": {"turn": 5}}),
+            // Closing itself, its turn runs on to its end.
+            json!({"name": "busy", "closed_ms": 1, "running_turn": 6, "last": {"turn": 5}}),
+            json!({"name": "open", "last": {"turn": 5}}),
         ]))
         .unwrap();
         send.send(Feed::Held(Vec::new())).unwrap();
@@ -8695,9 +8697,8 @@ mod tests {
             sent.push(name);
         }
         sent.sort();
-        // Only what a later turn reopened, what runs, and what is unmarked.
-        assert_eq!(sent, ["busy", "open", "reopened"]);
-        std::fs::remove_dir_all(dir).unwrap();
+        // Only what runs, and what is open.
+        assert_eq!(sent, ["busy", "open"]);
     }
 
     #[tokio::test]
@@ -9172,15 +9173,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_question_its_lead_resolved_does_not_need_the_person() {
+    async fn a_question_of_an_agent_closed_does_not_need_the_person() {
         let (mut view, send) = view();
-        let dir = std::env::temp_dir().join(format!("sonny-sky-resolved-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("store.resolved")).unwrap();
-        std::fs::write(dir.join("store.resolved/shop.cart.json"), r#"{"turn": 5}"#).unwrap();
-        view.resolved = dir.join("store");
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead"}),
-            json!({"name": "shop.cart", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead", "closed_ms": 1}),
             json!({"name": "shop.login", "created_by": "shop.lead"}),
         ]))
         .unwrap();
@@ -9193,8 +9190,8 @@ mod tests {
             turn: Some(turn),
             through: None,
         };
-        // Its lead resolved the cart past the turn that asked; the login
-        // still asks, as does the cart once a later turn reopens it.
+        // Its lead closed the cart past the turn that asked; the login
+        // still asks, as does the cart once a later turn opens it again.
         send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(4)))))
             .unwrap();
         send.send(Feed::Asked("shop.login".into(), Some(Box::new(seen(4)))))
@@ -9203,11 +9200,23 @@ mod tests {
         let state = |view: &View, name: &str| view.agents[view.index[name]].state();
         assert_ne!(state(&view, "shop.cart"), Some(State::NeedsYou));
         assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead", "last": {"turn": 6}}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
         send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(6)))))
             .unwrap();
         view.drain();
         assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
-        std::fs::remove_dir_all(dir).unwrap();
+        // Its lead closes the login at rest while the sky is open: the
+        // live follow hears it, and its question no longer needs the person.
+        assert!(LIVE.contains(&"closed"));
+        let closed = json!({"event": "closed", "bot": "shop.login", "data": {}});
+        send.send(Feed::Live(closed)).unwrap();
+        view.drain();
+        assert_ne!(state(&view, "shop.login"), Some(State::NeedsYou));
     }
 
     #[tokio::test]

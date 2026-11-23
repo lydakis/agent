@@ -74,7 +74,8 @@ pub struct Agent {
     pub workspace: Option<String>,
     /// The profile it was made in, which the daemon keeps on it.
     pub profile: Option<String>,
-    /// Whether it is closed (its `closed_ms` set): never kept.
+    /// Whether it is closed (its `closed_ms` set): done, which a window
+    /// lists under Done.
     #[serde(rename = "closed_ms", deserialize_with = "is_set")]
     pub closed: bool,
 }
@@ -113,24 +114,18 @@ impl Agent {
     }
 }
 
-/// Whether a window keeps `agent`, a `bots` row: not once it is closed,
-/// which a window's project leaves out as Codex's thread list leaves
-/// archived threads out, until a message opens it again.
-fn kept(agent: &Agent) -> bool {
-    !agent.closed
-}
-
-/// Every agent `pattern` names but those closed, every page.
+/// Every agent `pattern` names, every page: one closed is done, and a
+/// window lists it under Done.
 pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<Vec<Agent>> {
     let mut listed = Vec::new();
     let mut after: Option<String> = None;
     loop {
-        let mut ask = json!({"name": pattern, "limit": 256, "open": true});
+        let mut ask = json!({"name": pattern, "limit": 256});
         if let Some(after) = &after {
             ask["after"] = json!(after);
         }
         let page: Page = client.request_as("bots", ask).await?;
-        listed.extend(page.bots.into_iter().filter(kept));
+        listed.extend(page.bots);
         match page.next_after {
             Some(next) if after.as_ref() != Some(&next) => after = Some(next),
             _ => return Ok(listed),
@@ -139,7 +134,7 @@ pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<Vec<Ag
 }
 
 /// The rows of `names`, read by name, 256 a request: the agents that
-/// moved. One that is gone, or closed, is not among them.
+/// moved. One that is gone is not among them; one closed is, closed.
 pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec<Agent>> {
     let mut rows = Vec::new();
     for chunk in names.chunks(256) {
@@ -148,8 +143,8 @@ pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec
     Ok(rows)
 }
 
-/// Every page of the `bots` listing `ask` names, each row [`kept`]: a page
-/// ends at its row count or its size, whichever comes first.
+/// Every page of the `bots` listing `ask` names: a page ends at its row
+/// count or its size, whichever comes first.
 pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Agent>> {
     let mut rows = Vec::new();
     let mut after: Option<String> = None;
@@ -159,7 +154,7 @@ pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Agen
             ask["after"] = json!(after);
         }
         let page: Page = client.request_as("bots", ask).await?;
-        rows.extend(page.bots.into_iter().filter(kept));
+        rows.extend(page.bots);
         match page.next_after {
             Some(next) if after.as_ref() != Some(&next) => after = Some(next),
             _ => return Ok(rows),
@@ -508,11 +503,11 @@ mod tests {
         let first = next_snapshot(&follower, &woken).await;
         assert_eq!(first, vec![agent("shop.0", 1)]);
         let snapshot = listings.lock().unwrap()[0].clone();
-        // The snapshot leaves closed agents out, as the follow hears them
-        // close.
+        // The snapshot lists closed agents too, done, as the follow hears
+        // them close.
         assert_eq!(
             snapshot,
-            json!({"id": snapshot["id"], "op": "bots", "name": "shop.*", "limit": 256, "open": true})
+            json!({"id": snapshot["id"], "op": "bots", "name": "shop.*", "limit": 256})
         );
         assert!(KINDS.contains(&"closed"));
         // What the follow brought is its own; the window's agent's events
@@ -584,12 +579,12 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_agent_is_left_out_and_shows_again_once_open() {
+    fn a_closed_agent_is_kept_closed_and_open_once_a_turn_opens_it() {
         let row = |row: Value| serde_json::from_value::<Agent>(row).unwrap();
         let closed = row(json!({"name": "shop.fix", "head": 3, "closed_ms": 1700000000000_i64}));
-        assert!(!kept(&closed));
+        assert!(closed.closed);
         let open = row(json!({"name": "shop.fix", "head": 4, "closed_ms": null, "unread": 2}));
-        assert!(kept(&open));
+        assert!(!open.closed);
         assert_eq!(open, agent("shop.fix", 4));
     }
 }

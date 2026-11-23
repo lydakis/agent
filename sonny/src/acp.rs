@@ -2118,8 +2118,6 @@ impl Session {
         // The tasks followed, by name, each the identity it is now: a
         // follow is by name, and a bot made later under it is not the task.
         let mut watched: HashMap<String, i64> = HashMap::new();
-        let store = agent_client::socket::canonical_store(&agent.options.store)
-            .unwrap_or_else(|_| agent.options.store.clone());
         // Followed before they are read, so none asked between is missed.
         let tasks = tasks_of(&client, lead_id).await?;
         for task in &tasks {
@@ -2130,7 +2128,7 @@ impl Session {
             }
         }
         for task in tasks.iter().filter(|task| lately(task, since)) {
-            self.task_asked(agent, &client, &store, task).await;
+            self.task_asked(agent, &client, task).await;
         }
         // The lead's `start_task` calls started, and the tasks' asks, by
         // task and call.
@@ -2173,7 +2171,7 @@ impl Session {
                         }
                     }
                     // Its questions may have come before it was followed.
-                    self.task_asked(agent, &client, &store, &task).await;
+                    self.task_asked(agent, &client, &task).await;
                 }
                 continue;
             }
@@ -2194,7 +2192,7 @@ impl Session {
                     .await
                 && task["created_by_id"].as_i64() == Some(lead_id)
             {
-                self.task_asked(agent, &client, &store, &task).await;
+                self.task_asked(agent, &client, &task).await;
             }
         }
         client.close().await;
@@ -2203,14 +2201,14 @@ impl Session {
 
     /// The questions `task`, as `bots` or `inspect` gives it, has open,
     /// each put to the person once.
-    async fn task_asked(&self, agent: &Arc<Agent>, client: &Client, store: &Path, task: &Value) {
+    async fn task_asked(&self, agent: &Arc<Agent>, client: &Client, task: &Value) {
         let (Some(bot), Some(bot_id)) = (task["name"].as_str(), task["bot_id"].as_i64()) else {
             return;
         };
-        // One its lead marked done, with no turn since, has nothing open.
+        // One closed, by itself or its lead, with no turn since, is done:
+        // it has nothing open.
         let running = task["running_turn"].as_i64();
-        let newest = running.or(task["last"]["turn"].as_i64());
-        if crate::resolved::holds(crate::resolved::read(store, bot), newest, running.is_some()) {
+        if crate::resolved::done(crate::resolved::closed(task), running.is_some()) {
             return;
         }
         for ask in open_asks(client, bot).await {

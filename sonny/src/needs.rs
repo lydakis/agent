@@ -99,19 +99,12 @@ pub struct Seen {
 }
 
 impl Seen {
-    /// The question still open, as every surface reads it: none for a task
-    /// resolved, by its own call in the turn read or by its lead's mark kept
-    /// beside `store` that no later turn reopened while nothing `running`.
-    /// A lead marked done is resolved as a task is.
-    pub fn open(
-        self,
-        store: &std::path::Path,
-        bot: &str,
-        running: bool,
-    ) -> Option<crate::asks::Ask> {
-        let resolved = self.itself
-            || crate::resolved::holds(crate::resolved::read(store, bot), self.turn, running);
-        if resolved {
+    /// The question still open, as every surface reads it: none for an
+    /// agent done, closed by its own call in the turn read, or `closed`
+    /// as the daemon lists it while nothing `running`. A lead closed is
+    /// done as a task is.
+    pub fn open(self, closed: bool, running: bool) -> Option<crate::asks::Ask> {
+        if self.itself || crate::resolved::done(closed, running) {
             return None;
         }
         self.ask
@@ -132,7 +125,7 @@ pub const READS: u64 = {
 
 /// Bumped when what a question read finds changes outside the files
 /// [`READS`] hashes.
-const READ_AS: u32 = 1;
+const READ_AS: u32 = 2;
 
 /// FNV-1a over `bytes`, going on from `hash`.
 const fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -372,34 +365,8 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
     (items, false)
 }
 
-/// How many of an agent's newest nodes are read for whether its newest
-/// turn marked it done: the call comes near a turn's end.
-const LAST_TURN: usize = 64;
-
-/// Whether `bot`'s turn `turn`, its newest, marked it done, as its history
-/// says before any window kept the mark: read from its newest nodes of
-/// that turn. None when the history can't be read whole: not knowing is
-/// not "not done".
-pub async fn resolved_turn(client: &Client, bot: &str, turn: i64) -> Option<bool> {
-    let asked = json!({"bot": bot, "limit": LAST_TURN});
-    let page = client.request("history_nodes", asked).await.ok()?;
-    let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
-        .filter(|n| n["turn"].as_i64() == Some(turn))
-        .filter_map(|n| n["node"].as_i64())
-        .collect();
-    if nodes.is_empty() {
-        return Some(false);
-    }
-    let (read, short) = items(client, bot, &nodes).await;
-    if short {
-        return None;
-    }
-    let read: Vec<Value> = read.into_iter().map(|(_, item)| item).collect();
-    Some(resolved_itself(&read, bot))
-}
-
-/// Whether `items`, one turn of `bot`'s, hold a `mark_done` call of its
-/// own that resolved itself and was not refused.
+/// Whether `items`, one turn of `bot`'s, hold a `close_agent` call that
+/// closed `bot` itself and was not refused.
 pub fn resolved_itself(items: &[Value], bot: &str) -> bool {
     items.iter().any(|call| {
         call["type"] == "function_call"

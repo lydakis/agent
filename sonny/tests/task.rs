@@ -40,6 +40,7 @@ impl Lab {
              inspect) cat \"$AGENT_LOG.inspect\" 2>/dev/null || exit 1;;\n\
              turns) cat \"$AGENT_LOG.turns\" 2>/dev/null || echo '[]';;\n\
              messages) cat \"$AGENT_LOG.messages\" 2>/dev/null || echo '[]';;\n\
+             close) printf '%s\\n' \"$@\" > \"$AGENT_LOG.close\";;\n\
              rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\nesac\n",
         )
         .unwrap();
@@ -199,13 +200,10 @@ impl Lab {
         self.tool(dir, "remove_task", call, false)
     }
 
-    /// The mark of `task` done, kept beside the store.
-    fn done(&self, task: &str) -> Option<serde_json::Value> {
-        let store = std::fs::canonicalize(&self.scratch)
-            .unwrap()
-            .join("state.sqlite.resolved");
-        let text = std::fs::read_to_string(store.join(format!("{task}.json"))).ok()?;
-        serde_json::from_str(&text).ok()
+    /// How the agent was last closed, as `agent close` was run: its
+    /// arguments, one a line; none when it was not.
+    fn done(&self, _task: &str) -> Option<String> {
+        std::fs::read_to_string(self.scratch.join("run.log.close")).ok()
     }
 
     /// The daemon's store the lookout and these calls name.
@@ -515,7 +513,7 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
 }
 
 #[test]
-fn a_done_worktree_task_is_marked_done_and_its_worktree_removed_with_its_merged_branch() {
+fn a_done_worktree_task_is_closed_and_its_worktree_removed_with_its_merged_branch() {
     let lab = Lab::new("rm-worktree");
     let (ok, said) = lab.task(false, false);
     assert!(ok, "{said}");
@@ -554,21 +552,25 @@ fn a_done_worktree_task_is_marked_done_and_its_worktree_removed_with_its_merged_
     let (ok, err) = lab.remove(&lab.repo, false);
     assert!(!ok && err.contains("its turn 3 has not ended"), "{err}");
     assert!(worktree.exists() && lab.done("demo.fix").is_none());
-    std::fs::write(&ls, r#"[{"name":"demo.fix","running_turn":null}]"#).unwrap();
+    std::fs::write(
+        &ls,
+        r#"[{"name":"demo.fix","bot_id":4,"running_turn":null}]"#,
+    )
+    .unwrap();
     turns(
         serde_json::json!([{"turn": 9, "status": "completed", "finished_ms": 8},
         {"turn": 7, "status": "completed", "finished_ms": 5}]),
     );
     let (ok, said) = lab.remove(&lab.repo, false);
     assert!(ok, "{said}");
-    assert_eq!(said, "Marked demo.fix done and removed its worktree.");
+    assert_eq!(said, "Closed demo.fix and removed its worktree.");
     assert!(!worktree.exists());
     // Its agent and history stay: nothing deletes them.
     assert!(!lab.scratch.join("run.log.rm").exists());
-    // Done up to its newest turn, as mark_done marks it, by this call.
+    // Done: closed, by its identity, as close_agent closes it.
     assert_eq!(
-        lab.done("demo.fix"),
-        Some(serde_json::json!({"turn": 9, "call": "call-1"}))
+        lab.done("demo.fix").as_deref(),
+        Some("close\n--bot\ndemo.fix\n--bot-id\n4\n")
     );
     // Its branch had nothing more than this one, so it went too.
     assert_eq!(
@@ -577,7 +579,7 @@ fn a_done_worktree_task_is_marked_done_and_its_worktree_removed_with_its_merged_
     );
     // Called again, it is done still, with nothing left to tidy.
     let (ok, said) = lab.remove(&lab.repo, false);
-    assert_eq!((ok, said.as_str()), (true, "Marked demo.fix done."));
+    assert_eq!((ok, said.as_str()), (true, "Closed demo.fix."));
     // Its name stays its own: a start of another task of that name is refused.
     std::fs::write(
         lab.scratch.join("run.log.inspect"),
@@ -601,7 +603,7 @@ fn a_task_outside_git_is_removed() {
     let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5, "workspace": workspace}]);
     std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
     let (ok, said) = lab.remove(&workspace, false);
-    assert_eq!((ok, said.as_str()), (true, "Marked demo.fix done."));
+    assert_eq!((ok, said.as_str()), (true, "Closed demo.fix."));
     assert!(lab.done("demo.fix").is_some());
     assert!(!lab.scratch.join("run.log.rm").exists());
     // A name that is no task and left no folder is said to be none.

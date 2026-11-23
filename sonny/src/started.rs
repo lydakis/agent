@@ -39,11 +39,11 @@ pub fn state(turn: &Value) -> String {
 }
 
 /// The state of a task whose turn ended with nothing open: it rests, until
-/// it or the person picks the work up again, or it is marked done.
+/// it or the person picks the work up again, or it is closed, done.
 pub const IDLE: &str = "idle";
 
-/// The state of a task marked done, by itself, its lead or the person:
-/// closed, until new work reopens it.
+/// The state of a task closed, done, by itself, its lead or the person,
+/// until new work reopens it.
 pub const DONE: &str = "done";
 
 /// The state of a task whose turn ended with the model saying nothing: no

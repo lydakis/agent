@@ -6621,20 +6621,10 @@ impl Turn {
                 after,
                 limit,
             } => {
-                // The daemon closes, as this bot: only the bots it made, and
-                // stops the turns they run. This one closes itself by ending
-                // its turn, not with the tool.
-                if name.as_deref() == Some(self.bot.as_str())
-                    || (names.as_deref()).is_some_and(|names| names.contains(&self.bot))
-                {
-                    return Err(Error::with(
-                        "not_permitted",
-                        format!(
-                            "{} was not made by this bot, so this bot may not close it",
-                            self.bot
-                        ),
-                    ));
-                }
+                // The daemon closes, as this bot: the bots it made, whose
+                // turns stop, and itself, named alone, whose turn asking runs
+                // on to its end: it stays closed after, until a turn of its
+                // starts.
                 let mut asked = json!({"op":"close"});
                 let fields = [
                     ("bot", json!(name)),

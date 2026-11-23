@@ -329,7 +329,7 @@ fn noted_models() -> String {
 fn remove() -> Value {
     json!({
         "name": REMOVE,
-        "description": "Clean up a task once the person says it is done: mark it done, as mark_done does, \
+        "description": "Clean up a task once the person says it is done: close it, as close_agent does, \
             and remove the folder Sonny made it, or for a task no longer there the folder it left, which a start \
             lists. Its agent and history stay; a message to it reopens it without that folder. A worktree is \
             removed, its branch kept while it has commits not merged here; a folder of its own is deleted with all \
@@ -1132,7 +1132,7 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
         REMOVE => {
             let line = Line::of(&caller, &here);
             let task = text("task").unwrap_or_default();
-            let task = crate::resolved::call(&json!({"task": task}), &line.project)
+            let task = crate::task::named(&task, &line.project)
                 .ok_or(("invalid_arguments", "a task's name, without /".to_owned()))?;
             // A lead removes any of its project's; another agent only one
             // of its own line, so no task removes its lead's others.
@@ -1142,15 +1142,14 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                     format!("{task} is not a task you or yours started; ask your lead"),
                 ));
             }
-            // Done as `mark_done` marks it, by this call: the mark is a fact
-            // the windows show, kept with no window open.
+            // Closed by this call, as the person closes it: done, as every
+            // window reads it, with no window open.
             let (store, socket) = invocation.daemon().map_err(|e| ("no_store", e))?;
-            let call = invocation.call.clone();
             crate::task::remove(
                 &line.folder,
                 &task,
                 arguments["discard"] == true,
-                (&store, &socket, &call),
+                (&store, &socket),
             )
             .map_err(|e| ("task_not_removed", e))
         }
@@ -1226,21 +1225,6 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
             };
             said.map(|said| said.to_string())
                 .map_err(|e| ("follow_refused", e))
-        }
-        name if name == crate::resolved::TOOL => {
-            let (store, socket) = invocation.daemon().map_err(|e| ("no_store", e))?;
-            let (client, _events) = Client::connect(&socket)
-                .await
-                .map_err(|e| ("not_marked", e.to_string()))?;
-            let by = invocation.call_bot.clone();
-            let turn =
-                (invocation.turn).ok_or(("not_marked", "the call names no turn".to_owned()))?;
-            let call = invocation.call.clone();
-            let marked =
-                crate::resolved::mark(&client, &store, (&caller, &by), (turn, &call), arguments)
-                    .await;
-            client.close().await;
-            marked.map_err(|e| ("not_marked", e))
         }
         name if name == crate::live::TOOL => {
             let template = (arguments["markdown"].as_str())

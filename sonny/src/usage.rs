@@ -1,7 +1,7 @@
 //! `/usage`: the tokens the project's agents spent, or every agent's, in
 //! the last day, week or month: in all, over time as stacked bars, how
 //! the tasks went (how many finished without the person, how often they
-//! stepped in and how, how many were marked done, without them by how long
+//! stepped in and how, how many are done (closed), without them by how long
 //! a task worked and by its role, and that share the period before), by
 //! agent (or project), by model, and by what started the turns: the
 //! commons, a trigger, the margin, or a prompt. Daemon reads each time the
@@ -984,7 +984,7 @@ const LENGTHS: [(u64, &str); 3] = [
 /// workers, leads and Sonny's own left out), how many still work, and of
 /// those that ended, how many finished with nobody stepping in (no
 /// message from the person, no call they decided), how the person stepped into the rest, how many are
-/// marked done, and the share without them by how long a task worked, by
+/// done (closed), and the share without them by how long a task worked, by
 /// its role, and in the period before.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tasks {
@@ -1011,7 +1011,8 @@ struct Made<'a> {
     /// None when a turn went untimed.
     work_ms: Option<u64>,
     running: bool,
-    last_turn: Option<i64>,
+    /// Closed, as the daemon lists it: done once no turn runs.
+    closed: bool,
     messages: u64,
     calls: u64,
     side: bool,
@@ -1027,7 +1028,7 @@ impl<'a> Made<'a> {
             bot,
             work_ms: row["work_ms"].as_u64(),
             running: row["running"] == true,
-            last_turn: row["last_turn"].as_i64(),
+            closed: row["closed"] == true,
             messages: count("person_messages"),
             calls: count("person_calls"),
             side: crate::side_copy(&json!({
@@ -1052,10 +1053,9 @@ impl<'a> Made<'a> {
 }
 
 impl Tasks {
-    /// The tasks among `made`, each one's done mark read by `done` (with
-    /// its last turn and whether one runs), and its role the profile it
-    /// was made in.
-    pub fn tally(made: &[Value], done: impl Fn(&str, Option<i64>, bool) -> bool) -> Self {
+    /// The tasks among `made`, each one done once closed, and its role the
+    /// profile it was made in.
+    pub fn tally(made: &[Value]) -> Self {
         let mut tasks = Self::default();
         for made in made.iter().filter_map(Made::of).filter(Made::task) {
             tasks.worked += 1;
@@ -1068,7 +1068,7 @@ impl Tasks {
             tasks.alone += alone;
             tasks.messages += made.messages;
             tasks.calls += made.calls;
-            tasks.done += done(made.bot, made.last_turn, made.running) as u64;
+            tasks.done += crate::resolved::done(made.closed, made.running) as u64;
             // A task with an untimed turn has no length to count it by.
             if let Some(work_ms) = made.work_ms {
                 let length = (LENGTHS.iter())
@@ -1160,7 +1160,7 @@ impl Tasks {
             let how = format!("  {}", how.join(" · "));
             out.push(Line::from(crate::transcript::cut(&how, width)).dim());
         }
-        out.push(Line::from(share("Marked done", self.done, self.ended, 0)));
+        out.push(Line::from(share("Done", self.done, self.ended, 0)));
         out.push(Line::default());
         out.push(
             Line::from(crate::transcript::cut(
@@ -1316,9 +1316,7 @@ async fn tasks(
         }
         let this = rows(&tasks, &this, &wrote.0, &decided.0, (since, now));
         let last = last.map(|last| rows(&tasks, &last, &wrote.1, &decided.1, (before, since)));
-        let mut tasks = Tasks::tally(&this, |bot, last, running| {
-            crate::resolved::holds(crate::resolved::read(&store, bot), last, running)
-        });
+        let mut tasks = Tasks::tally(&this);
         tasks.before = last.as_deref().map(Tasks::before);
         tasks
     };
@@ -1338,6 +1336,8 @@ struct Listed {
     expire_ms: Value,
     /// The profile it was made in.
     profile: Value,
+    /// Closed, as the daemon lists it.
+    closed: bool,
 }
 
 /// Every agent another made in scope `name` (all of them with none) that
@@ -1374,6 +1374,7 @@ async fn listed(
                 created_by: bot["created_by"].clone(),
                 expire_ms: bot["expire_ms"].clone(),
                 profile: bot["profile"].clone(),
+                closed: crate::resolved::closed(bot),
             });
         }
         match &page["next_after"] {
@@ -1724,7 +1725,7 @@ fn rows(
             "running": running.is_some(), "last_turn": task.last,
             "person_messages": count(wrote), "person_calls": count(decided),
             "created_by": task.created_by, "expire_ms": task.expire_ms,
-            "profile": task.profile,
+            "profile": task.profile, "closed": task.closed,
         }));
     }
     rows
@@ -1790,9 +1791,13 @@ mod tests {
                 row["profile"] = json!("backend");
             }
         }
-        let tasks = Tasks::tally(&rows, |bot, _, _| {
-            bot == "p.fix-login" || bot == "p.migrate"
-        });
+        // Closed, so done.
+        for row in &mut rows {
+            if row["bot"] == "p.fix-login" || row["bot"] == "p.migrate" {
+                row["closed"] = json!(true);
+            }
+        }
+        let tasks = Tasks::tally(&rows);
         assert_eq!((tasks.worked, tasks.working, tasks.ended), (7, 1, 6));
         assert_eq!(tasks.alone, 3);
         // The running task's message is not counted until it ends.
@@ -1817,6 +1822,7 @@ mod tests {
             created_by: json!("p.lead"),
             expire_ms: Value::Null,
             profile: Value::Null,
+            closed: false,
         };
         let tasks = [
             listed("p.a", 1, None),
