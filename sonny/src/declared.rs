@@ -34,9 +34,6 @@ pub fn tools(role: Role) -> Vec<Value> {
         crate::margin::tool(),
         crate::live::tool(),
     ];
-    if role.lead {
-        tools.push(crate::resolved::tool());
-    }
     tools.extend(crate::served::tools(role));
     tools.into_iter().map(kinded).collect()
 }
@@ -120,19 +117,6 @@ pub fn role(record: &Value) -> Role {
     }
 }
 
-/// Whether the bot `record` describes resolves itself: a lead made it, or
-/// another bot made it with `mark_done`, as a task's own helper takes it.
-fn resolves(record: &Value) -> bool {
-    let inherited = || {
-        (record["declared"].as_array().into_iter().flatten())
-            .any(|tool| tool["name"] == crate::resolved::TOOL)
-    };
-    match record["created_by"].as_str() {
-        Some(by) => crate::project::is_lead(by) || inherited(),
-        None => false,
-    }
-}
-
 /// The tools the bot `record` describes, in `role`, should declare: its
 /// own with Sonny's, or `None` when it has those already, or when they
 /// would not fit beside its own ([`too_many`] says so).
@@ -180,10 +164,6 @@ fn too_large(declared: &[Value]) -> String {
 fn wanted(record: &Value, role: Role) -> Option<Vec<Value>> {
     let declared: &[Value] = record["declared"].as_array().map_or(&[], Vec::as_slice);
     let mut ours = tools(role.within(&record["settings"]));
-    // A task resolves itself, as its lead resolves it.
-    if !role.lead && !role.worker && resolves(record) {
-        ours.push(kinded(crate::resolved::tool()));
-    }
     // A gate Sonny did not set, as another client's tag or several, is
     // not one Sonny can add its gated tools to, so that bot goes without
     // them rather than run them unjudged.
@@ -400,14 +380,13 @@ mod tests {
         assert_eq!(declare(&large, a_lead()), None);
         let why = too_many(&large, a_lead()).unwrap();
         assert!(why.contains("bytes an agent takes"), "{why}");
-        // A task that resolves itself, at every size around the cap: what
-        // does not fit is always said, with the tools `declare` would give.
-        let resolving = crate::resolved::tool();
-        let fitted = declare(&json!({"declared": [own(0), resolving.clone()]}), a_task()).unwrap();
+        // A task, at every size around the cap: what does not fit is
+        // always said, with the tools `declare` would give.
+        let fitted = declare(&json!({"declared": [own(0)]}), a_task()).unwrap();
         let base = serde_json::to_vec(&fitted).unwrap().len();
         let edge = DECLARED_BYTES - base;
         for bytes in edge - 300..edge + 300 {
-            let task = json!({"declared": [own(bytes), resolving.clone()]});
+            let task = json!({"declared": [own(bytes)]});
             let skipped = declare(&task, a_task()).is_none();
             assert_eq!(skipped, too_many(&task, a_task()).is_some(), "{bytes}");
         }
@@ -433,7 +412,7 @@ mod tests {
             crate::served::WORKFLOW,
             crate::reactions::TOOL,
             crate::asks::TOOL,
-            crate::resolved::TOOL,
+            "mark_done",
         ] {
             assert!(!worker.contains(&none.to_owned()), "{none}");
         }
@@ -665,43 +644,24 @@ mod tests {
     }
 
     #[test]
-    fn a_lead_and_its_tasks_mark_tasks_done() {
-        let lead = declare(&json!({}), a_lead()).unwrap();
-        assert_eq!(lead, Value::Array(tools(a_lead())));
-        assert!(
-            lead.as_array()
-                .unwrap()
-                .iter()
-                .any(|t| t["name"] == "mark_done")
-        );
-        assert_eq!(declare(&json!({"declared": lead}), a_lead()), None);
-        // A bot no longer a lead gives it up, unless a lead made it: a
-        // task resolves itself.
+    fn no_agent_is_given_mark_done_and_one_that_has_it_gives_it_up() {
+        // Done is closed, with the daemon's close_agent: Sonny declares no
+        // tool of its own for it.
+        for role in [a_lead(), a_task(), a_helper()] {
+            assert!(!tools(role).iter().any(|t| t["name"] == "mark_done"));
+        }
+        let old = json!({"name": "mark_done", "description": "d",
+            "parameters": {"type": "object"}, "answered_by": crate::served::TAG});
+        let mut lead = tools(a_lead());
+        lead.push(old.clone());
         assert_eq!(
-            declare(&json!({"declared": lead}), a_helper()),
+            declare(&json!({"declared": lead}), a_lead()),
+            Some(Value::Array(tools(a_lead())))
+        );
+        let task = json!({"created_by": "calc.lead", "declared": [old]});
+        assert_eq!(
+            declare(&task, a_helper()),
             Some(Value::Array(tools(a_helper())))
         );
-        let task = json!({"created_by": "calc.lead"});
-        let own = declare(&task, a_helper()).unwrap();
-        assert!(
-            own.as_array()
-                .unwrap()
-                .iter()
-                .any(|t| t["name"] == "mark_done")
-        );
-        let mut kept = task.clone();
-        kept["declared"] = own;
-        assert_eq!(declare(&kept, a_helper()), None);
-        // A task's own helper keeps what it took from the task.
-        let helper = json!({"created_by": "calc.fix", "declared": [crate::resolved::tool()]});
-        let kept = declare(&helper, a_helper()).unwrap();
-        assert!(
-            kept.as_array()
-                .unwrap()
-                .iter()
-                .any(|t| t["name"] == "mark_done")
-        );
-        // What a lead declares, a task it starts takes from its first turn.
-        assert!(crate::resolved::tool().get("inherit").is_none());
     }
 }

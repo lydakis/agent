@@ -1,117 +1,65 @@
-//! Tasks marked done, as threads are resolved: a task marks itself done
-//! once nothing is left to do in it, and its lead can mark any of its tasks,
-//! both with the `mark_done` tool Sonny declares, and `/status` files the
-//! task under Done, out of the way. Sonny's tool host answers each call
-//! only once it has kept the mark beside the store ([`mark`]), so a mark
-//! holds whether or not a window is open; windows only show it. A task's
-//! own call is also read from its history: its newest turn resolved it. A
-//! task's newest turn finished by the time its lead marked it is what the
-//! mark covers, so one still running is not resolved. Turns are numbered
-//! across the store, so a task turn numbered after it, new work for the
-//! task or another bot under its name, reopens the task without anyone
-//! taking the mark off.
+//! Done is closed. An agent is done once it is closed, as the daemon
+//! closes it: by itself, naming its own name alone to `close_agent`, which
+//! lets the turn closing it run on to its end; by the agent that made it,
+//! a task by its lead; by `remove_task`; or by the person. Its history
+//! stays, and a message that opens a turn of its own opens it again. Every
+//! surface reads done from the daemon (a row's `closed_ms`), so it holds
+//! with no window open and one word means it everywhere. `/status` files a
+//! closed agent under Done, out of the way, a done lead's automations
+//! pause until a message opens it, and closing ends its follows, so news
+//! does not open it again unasked.
+//!
+//! The `mark_done` tool Sonny once declared is gone: its calls still read
+//! in old histories ([`OLD`]), and the marks it kept beside the store were
+//! made closes once ([`marks_close`]), the marks left where they were.
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// The name of the tool a task or its lead resolves the task with.
-pub const TOOL: &str = "mark_done";
+/// The daemon's tool an agent closes itself or another with.
+pub const TOOL: &str = "close_agent";
 
-/// The `mark_done` tool as Sonny declares it on a lead, which the
-/// tasks it starts take too, and on a task: Sonny's tool host answers it
-/// once the mark is kept ([`mark`]).
-pub fn tool() -> Value {
-    json!({
-        "name": TOOL,
-        "description": "Mark a task done once nothing is left to do in it: its pull request merged, \
-            its answer passed on, or the person dropped the work. As a task, mark yourself, naming no \
-            task, in the turn that finishes the work, and still end that turn with your report: your reply \
-            after this call is what your lead reads. As a lead, name one of your tasks. The person's status \
-            view files it under Done, out of their way, and its window closes once its turn ends. New \
-            work sent to the task reopens it. A task that waits on the person, or on work still to come, is \
-            not done. Once the person says a lead's project is done, the lead marks itself, naming no task, \
-            and an outer lead may name that lead: its automations pause until a message reopens it.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "The task's name, as it was started; none to mark yourself."}
-            },
-            "additionalProperties": false
-        },
-        "answered_by": crate::served::TAG
-    })
-}
-
-/// Mark done what the `mark_done` call `call`, in turn `turn` of `by`,
-/// names, kept beside `store` before the call is answered, so the answer
-/// is true with no window open: `caller` is the agent the call acts as, a
-/// side chat's the agent it copies. A lead or a task naming no task marks
-/// itself, up to that turn. A lead names one of its tasks or another lead,
-/// and a side chat names its agent by naming none, marked up to its newest
-/// turn ended by now. A task marks only itself. What it marked, as the
-/// model reads it.
-pub async fn mark(
-    client: &agent_client::Client,
-    store: &Path,
-    (caller, by): (&str, &str),
-    (turn, call): (i64, &str),
-    arguments: &Value,
-) -> Result<String, String> {
-    let side = by != caller;
-    let lead = crate::project::is_lead(caller);
-    if itself(arguments, caller) && !side {
-        keep(store, caller, turn, call)?;
-        return Ok("Marked done.".into());
-    }
-    let task = match (itself(arguments, caller), lead) {
-        (true, _) => caller.to_owned(),
-        (false, true) => crate::project::lead_project(caller)
-            .and_then(|project| self::call(arguments, project))
-            .ok_or("a task's name, as it was started, without /")?,
-        (false, false) => {
-            return Err(format!(
-                "{caller} marks only itself done; ask your lead to mark another task"
-            ));
-        }
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    let page = client
-        .request("turns", json!({"bot": task, "newest": true, "limit": 16}))
-        .await
-        .map_err(|e| format!("{task}'s turns could not be read, so it is not marked: {e}"))?;
-    let turns = page["turns"].as_array().map_or(&[][..], Vec::as_slice);
-    if turns.is_empty() {
-        return Err(format!(
-            "{task} has no turns: no agent by that name to mark"
-        ));
-    }
-    keep(store, &task, upto(turns, now), call)?;
-    Ok(format!("Marked {task} done."))
-}
-
-/// Whether a `mark_done` call with `arguments`, made by `bot`, resolves
-/// `bot` itself: it names no task, or its own name, whole or past its
-/// project's, which may hold dots too. A lead's name names that lead
-/// only whole: `web.lead` is another project's lead to `shop.web.lead`.
+/// Whether a `close_agent` call with `arguments`, made by `bot`, closes
+/// `bot` itself: its own name, whole, alone, as the daemon closes it.
 pub fn itself(arguments: &Value, bot: &str) -> bool {
-    match arguments["task"].as_str().map(str::trim) {
-        None | Some("") => true,
-        Some(task) if crate::project::is_lead(task) => task == bot,
-        Some(task) => (bot.strip_suffix(task))
-            .is_some_and(|project| project.is_empty() || project.ends_with('.')),
+    match (arguments["name"].as_str(), arguments["names"].as_array()) {
+        (Some(name), None) => name == bot,
+        (None, Some(names)) => names.len() == 1 && names[0] == bot,
+        _ => false,
     }
 }
 
-/// Tasks' turns that resolved the task, followed in the daemon's events:
-/// a call that names no task or its own and did not fail.
+/// The agents a `close_agent` call with `arguments` names one by one,
+/// whole: none for a pattern.
+pub fn named(arguments: &Value) -> Vec<String> {
+    match (arguments["name"].as_str(), arguments["names"].as_array()) {
+        (Some(name), None) if !name.contains(['*', '?', '[']) => vec![name.to_owned()],
+        (None, Some(names)) => (names.iter())
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether an agent is done: closed, and no turn of its runs, as the turn
+/// that closed it runs on to its end.
+pub fn done(closed: bool, running: bool) -> bool {
+    closed && !running
+}
+
+/// Whether the daemon's record or row `record` says the agent is closed.
+pub fn closed(record: &Value) -> bool {
+    !record["closed_ms"].is_null()
+}
+
+/// Agents' turns that closed themselves, followed in the daemon's events:
+/// a `close_agent` call naming its own agent alone that did not fail.
 #[derive(Default)]
 pub struct Own {
     /// Calls under way, by bot and call.
     calls: HashSet<(String, String)>,
-    /// Turns that resolved their bot, by bot and turn.
+    /// Turns that closed their bot, by bot and turn.
     turns: HashSet<(String, i64)>,
 }
 
@@ -143,46 +91,32 @@ impl Own {
         }
     }
 
-    /// Whether `bot`'s turn `turn` resolved it, asked once it ended.
+    /// Whether `bot`'s turn `turn` closed it, asked once it ended.
     pub fn ended(&mut self, bot: &str, turn: i64) -> bool {
         self.turns.remove(&(bot.to_owned(), turn))
     }
 }
 
-/// The task a `mark_done` call with `arguments` names, in full, for
-/// the lead of `project`: a lead's name, which no task has, as it is.
-pub fn call(arguments: &Value, project: &str) -> Option<String> {
-    let task = arguments["task"].as_str()?.trim();
-    if task.is_empty() || task.contains('/') {
-        return None;
-    }
-    Some(
-        match task.starts_with(&format!("{project}.")) || crate::project::is_lead(task) {
-            true => task.to_owned(),
-            false => format!("{project}.{task}"),
-        },
-    )
-}
-
-/// Why a lead's automation does not run now: its newest turn, `newest`,
-/// marked it done (`itself`), or it is marked done, by itself or by its
-/// outer lead, up to `mark`, and no turn of its since reopened it. None
-/// for any other agent.
-pub fn paused(lead: &str, mark: Option<i64>, newest: Option<i64>, itself: bool) -> Option<String> {
-    (crate::project::is_lead(lead) && (itself || holds(mark, newest, false)))
+/// Why a lead's automation does not run now: it is closed, by itself or
+/// by whoever made it, and no turn of its since opened it again. None for
+/// any other agent, or a lead that is open.
+pub fn paused(lead: &str, closed: bool) -> Option<String> {
+    (crate::project::is_lead(lead) && closed)
         .then(|| format!("{lead} is done; its automations run again once a message reopens it"))
 }
 
-/// Where the marks are kept: beside the store, one file per task.
+/// The marks of `mark_done` became closes (after 0.10.5).
+pub const MARKS_CLOSE: &str = "done-marks-close";
+
+/// Where `mark_done` kept its marks: beside the store, one file per task.
 fn file(store: &Path, task: &str) -> PathBuf {
     let mut dir = store.as_os_str().to_owned();
     dir.push(".resolved");
     PathBuf::from(dir).join(format!("{task}.json"))
 }
 
-/// The tasks with a mark kept beside `store`, by name: one look at the
-/// folder, no mark read.
-pub fn marked(store: &Path) -> HashSet<String> {
+/// The tasks with a mark kept beside `store`, by name.
+fn marked(store: &Path) -> HashSet<String> {
     let folder = file(store, "x");
     let entries = folder.parent().and_then(|dir| std::fs::read_dir(dir).ok());
     (entries.into_iter().flatten().flatten())
@@ -193,57 +127,53 @@ pub fn marked(store: &Path) -> HashSet<String> {
         .collect()
 }
 
-/// The newest turn of `task` its resolving covered, if it was resolved.
-pub fn read(store: &Path, task: &str) -> Option<i64> {
-    kept(store, task)?["turn"].as_i64()
+/// The newest turn of `task` its mark covered, if it was marked.
+fn read(store: &Path, task: &str) -> Option<i64> {
+    let kept: Value = serde_json::from_slice(&std::fs::read(file(store, task)).ok()?).ok()?;
+    kept["turn"].as_i64()
 }
 
-fn kept(store: &Path, task: &str) -> Option<Value> {
-    serde_json::from_slice(&std::fs::read(file(store, task)).ok()?).ok()
-}
-
-/// Whether the mark kept for `task` is the one the call `call` made.
-#[cfg(test)]
-pub fn made_by(store: &Path, task: &str, call: &str) -> bool {
-    kept(store, task).is_some_and(|mark| mark["call"] == call)
-}
-
-/// Whether a task resolved up to its turn `mark` still is: none of its
-/// turns, newest `newest`, came after, and none runs.
-pub fn holds(mark: Option<i64>, newest: Option<i64>, running: bool) -> bool {
-    mark.is_some_and(|mark| !running && newest.is_none_or(|turn| turn <= mark))
-}
-
-/// The newest of a task's `turns`, as the daemon lists them, finished by
-/// `at` (ms): what resolving it then covers. A task with none covers 0.
-pub fn upto(turns: &[Value], at: i64) -> i64 {
-    turns
-        .iter()
-        .filter(|turn| {
-            turn["finished_ms"]
-                .as_i64()
-                .is_some_and(|ended| ended <= at)
+/// The agents among `bots`, as the daemon lists them (`name`, `bot_id`,
+/// `running_turn`, `head`, `last`, `closed_ms`), whose mark beside `store`
+/// still held: open, running no turn, and none of their turns came after
+/// the turn it covered. Each mark is left as it was, so a Sonny from
+/// before reads it as ever.
+pub fn still_marked(store: &Path, bots: &[Value]) -> Vec<(String, Option<i64>)> {
+    let marked = marked(store);
+    if marked.is_empty() {
+        return Vec::new();
+    }
+    (bots.iter())
+        .filter(|bot| !closed(bot) && bot["running_turn"].is_null())
+        .filter_map(|bot| {
+            let name = bot["name"].as_str()?;
+            let mark = marked.contains(name).then(|| read(store, name)).flatten()?;
+            let newest = bot["last"]["turn"].as_i64();
+            newest
+                .is_none_or(|turn| turn <= mark)
+                .then(|| (name.to_owned(), bot["bot_id"].as_i64()))
         })
-        .filter_map(|turn| turn["turn"].as_i64())
-        .max()
-        .unwrap_or(0)
+        .collect()
 }
 
-/// Note `task` resolved up to its turn `turn` by the lead's call `call`,
-/// unless it was resolved past that already.
-pub fn keep(store: &Path, task: &str, turn: i64, call: &str) -> Result<(), String> {
-    if read(store, task).is_some_and(|kept| kept >= turn) {
-        return Ok(());
+/// Close each agent [`still_marked`] finds among `bots`, as the person
+/// closes it, by its identity, so one made again under the name stays
+/// open. Whether every close was answered: one that was not is tried again
+/// at the next window's start.
+pub async fn marks_close(client: &agent_client::Client, store: &Path, bots: &[Value]) -> bool {
+    let mut whole = true;
+    for (name, id) in still_marked(store, bots) {
+        let mut asked = json!({"bot": name});
+        if let Some(id) = id {
+            asked["bot_id"] = json!(id);
+        }
+        match client.request("close", asked).await {
+            Ok(_) => {}
+            Err(error) if error.code == "bot_not_found" => {}
+            Err(_) => whole = false,
+        }
     }
-    let path = file(store, task);
-    let failed = |e: std::io::Error| format!("{}: {e}", path.display());
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(failed)?;
-    }
-    // Its own, so two windows never write one file together.
-    let next = path.with_extension(format!("json.{}.next", std::process::id()));
-    std::fs::write(&next, json!({"turn": turn, "call": call}).to_string()).map_err(failed)?;
-    std::fs::rename(&next, &path).map_err(failed)
+    whole
 }
 
 #[cfg(test)]
@@ -251,61 +181,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_task_is_named_in_full_for_its_lead() {
-        let named = |task: &str| call(&json!({"task": task}), "calc");
-        assert_eq!(named("fix"), Some("calc.fix".into()));
-        assert_eq!(named(" calc.fix "), Some("calc.fix".into()));
-        assert_eq!(named(""), None);
-        assert_eq!(named("../x"), None);
-        assert_eq!(call(&json!({}), "calc"), None);
-        // An outer lead names a lead as it is.
-        assert_eq!(named("web.lead"), Some("web.lead".into()));
-        assert_eq!(named("shop.lead.api"), Some("shop.lead.api".into()));
+    fn a_close_names_its_own_agent_only_alone_and_whole() {
+        let by = |arguments: Value| itself(&arguments, "calc.fix");
+        assert!(by(json!({"name": "calc.fix"})));
+        assert!(by(json!({"names": ["calc.fix"]})));
+        assert!(!by(json!({"name": "fix"})));
+        assert!(!by(json!({"names": ["calc.fix", "calc.docs"]})));
+        assert!(!by(json!({"name": "calc.*"})));
+        assert!(!by(json!({})));
+        assert_eq!(named(&json!({"name": "calc.fix"})), ["calc.fix"]);
+        assert_eq!(named(&json!({"names": ["a.b", "a.c"]})), ["a.b", "a.c"]);
+        assert!(named(&json!({"name": "calc.*"})).is_empty());
     }
 
     #[test]
-    fn a_done_lead_s_automations_pause_until_a_turn_reopens_it() {
+    fn a_closed_lead_s_automations_pause_until_a_turn_reopens_it() {
         assert!(
-            paused("web.lead", Some(9), Some(9), false)
+            paused("web.lead", true)
                 .unwrap()
                 .contains("web.lead is done")
         );
-        assert_eq!(paused("web.lead", Some(9), Some(10), false), None);
-        assert_eq!(paused("web.lead", None, Some(9), false), None);
-        // Its newest turn marked it, before any window kept the mark.
-        assert!(paused("web.lead", None, Some(9), true).is_some());
-        // A task marked done is messaged by its automations as ever.
-        assert_eq!(paused("web.fix", Some(9), Some(9), false), None);
-        assert_eq!(paused("web.fix", None, Some(9), true), None);
+        assert_eq!(paused("web.lead", false), None);
+        // A closed task is messaged by its automations as ever.
+        assert_eq!(paused("web.fix", true), None);
     }
 
     #[test]
-    fn a_task_resolves_itself_by_naming_no_task_or_its_own() {
-        let by = |arguments: Value| itself(&arguments, "calc.fix");
-        assert!(by(json!({})));
-        assert!(by(json!({"task": " "})));
-        assert!(by(json!({"task": "fix"})));
-        assert!(by(json!({"task": "calc.fix"})));
-        assert!(!by(json!({"task": "docs"})));
-        assert!(!by(json!({"task": "ix"})));
-        // A project's name may hold dots.
-        assert!(itself(&json!({"task": "fix"}), "shop.web.fix"));
-        // A lead's name names that lead only whole.
-        assert!(itself(&json!({"task": "shop.web.lead"}), "shop.web.lead"));
-        assert!(!itself(&json!({"task": "web.lead"}), "shop.web.lead"));
-        assert!(itself(&json!({"task": "lead.api"}), "shop.lead.api"));
+    fn done_is_closed_once_its_turn_ends() {
+        assert!(done(true, false));
+        assert!(!done(true, true));
+        assert!(!done(false, false));
+        assert!(closed(&json!({"closed_ms": 1})));
+        assert!(!closed(&json!({"closed_ms": null})));
+        assert!(!closed(&json!({})));
     }
 
     #[test]
-    fn a_task_turn_that_resolved_itself_is_followed_in_events() {
+    fn an_agent_turn_that_closed_itself_is_followed_in_events() {
         let mut own = Own::default();
         let ev = |bot: &str, turn: i64, kind: &str, data: Value| json!({"bot": bot, "turn": turn, "event": kind, "data": data});
         let started = |call: &str, arguments: &str| json!({"name": TOOL, "call_id": call, "arguments": arguments});
         for (bot, turn, call, arguments, failed) in [
-            ("calc.fix", 5, "c1", "{}", false),
-            ("calc.docs", 6, "c1", "{\"task\":\"fix\"}", false),
-            ("calc.bench", 7, "c1", "{}", true),
-            ("calc.lead", 8, "c1", "{}", false),
+            ("calc.fix", 5, "c1", "{\"name\":\"calc.fix\"}", false),
+            ("calc.docs", 6, "c1", "{\"name\":\"calc.fix\"}", false),
+            ("calc.bench", 7, "c1", "{\"name\":\"calc.bench\"}", true),
+            ("calc.lead", 8, "c1", "{\"name\":\"calc.lead\"}", false),
         ] {
             own.event(
                 &ev(bot, turn, "tool_started", started(call, arguments)),
@@ -323,52 +243,50 @@ mod tests {
         }
         assert!(own.ended("calc.fix", 5));
         assert!(!own.ended("calc.fix", 5));
-        // Another task named, a failed call, the lead itself: none.
+        // Another agent named, a failed call, the lead itself: none.
         assert!(!own.ended("calc.docs", 6));
         assert!(!own.ended("calc.bench", 7));
         assert!(!own.ended("calc.lead", 8));
     }
 
     #[test]
-    fn a_mark_holds_until_the_task_has_a_turn_after_it() {
-        assert!(holds(Some(10), Some(10), false));
-        assert!(holds(Some(0), None, false));
-        // New work since, running or ended.
-        assert!(!holds(Some(10), Some(12), false));
-        assert!(!holds(Some(10), Some(10), true));
-        assert!(!holds(None, Some(7), false));
-    }
-
-    #[test]
-    fn resolving_covers_the_turns_finished_by_then() {
-        // Newest first; a task the lead waited on in the resolving turn
-        // has a turn numbered after the lead's, finished before the call.
-        let turns = [
-            json!({"turn": 16, "finished_ms": null}),
-            json!({"turn": 14, "finished_ms": 900}),
-            json!({"turn": 9, "finished_ms": 500}),
-        ];
-        assert_eq!(upto(&turns, 950), 14);
-        assert_eq!(upto(&turns, 600), 9);
-        assert_eq!(upto(&turns, 100), 0);
-        assert_eq!(upto(&[], 100), 0);
-    }
-
-    #[test]
-    fn marks_are_kept_beside_the_store_and_only_move_on() {
-        let dir = std::env::temp_dir().join(format!("sonny-resolved-{}", std::process::id()));
+    fn a_mark_that_still_held_is_one_to_close() {
+        let dir = std::env::temp_dir().join(format!("sonny-marks-close-{}", std::process::id()));
         let store = dir.join("state.sqlite");
-        keep(&store, "calc.fix", 9, "r1").unwrap();
-        assert_eq!(read(&store, "calc.fix"), Some(9));
-        assert!(made_by(&store, "calc.fix", "r1"));
-        assert!(dir.join("state.sqlite.resolved/calc.fix.json").exists());
-        // A replay of an older resolve leaves the newer one.
-        keep(&store, "calc.fix", 4, "r0").unwrap();
-        assert_eq!(read(&store, "calc.fix"), Some(9));
-        assert!(!made_by(&store, "calc.fix", "r0"));
-        keep(&store, "calc.fix", 15, "r2").unwrap();
-        assert_eq!(read(&store, "calc.fix"), Some(15));
-        assert_eq!(read(&store, "calc.other"), None);
+        let folder = dir.join("state.sqlite.resolved");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (task, turn) in [
+            ("calc.fix", 9),
+            ("calc.docs", 4),
+            ("calc.busy", 9),
+            ("calc.shut", 9),
+            ("calc.new", 0),
+        ] {
+            std::fs::write(
+                folder.join(format!("{task}.json")),
+                json!({"turn": turn, "call": "c"}).to_string(),
+            )
+            .unwrap();
+        }
+        let bots = [
+            json!({"name": "calc.fix", "bot_id": 1, "last": {"turn": 9}}),
+            // A turn of its came after the mark: it reopened.
+            json!({"name": "calc.docs", "bot_id": 2, "last": {"turn": 7}}),
+            json!({"name": "calc.busy", "bot_id": 3, "running_turn": 12, "last": {"turn": 9}}),
+            json!({"name": "calc.shut", "bot_id": 4, "closed_ms": 5, "last": {"turn": 9}}),
+            json!({"name": "calc.new", "bot_id": 5}),
+            json!({"name": "calc.open", "bot_id": 6, "last": {"turn": 3}}),
+        ];
+        assert_eq!(
+            still_marked(&store, &bots),
+            [
+                ("calc.fix".to_owned(), Some(1)),
+                ("calc.new".to_owned(), Some(5))
+            ]
+        );
+        // The marks stay where they were.
+        assert!(folder.join("calc.fix.json").exists());
+        assert!(still_marked(&dir.join("other.sqlite"), &bots).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

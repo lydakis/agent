@@ -1,7 +1,7 @@
 //! `/status`: the project's agents on one card, read from the daemon and
 //! Rex with no model call. Its agents are grouped by where they stand, as
 //! a thread list is, the lead first in its group: what needs the person,
-//! what works, and, folded away, what sits idle and what is marked done.
+//! what works, and, folded away, what sits idle and what is closed, done.
 //! Each row is one line: what the work is, then who does it (its title,
 //! then the agent's name), its state where its group does not say it, for
 //! how long, and at the right its code reviews; one that needs the person says what for under
@@ -85,7 +85,7 @@ pub enum Group {
     /// pull request it opened shows on its row.
     #[default]
     Idle,
-    /// Marked done, by itself, its lead or the person: nothing left to do,
+    /// Closed, by itself, its lead or the person: nothing left to do now,
     /// until new work reopens it.
     Done,
 }
@@ -141,7 +141,7 @@ impl Group {
 
 /// Where a task stands: `state` as `/status` names it, whether a turn
 /// runs, whether it has a question open for the person, and whether it is
-/// marked done, which only a task with no turn running can be.
+/// closed, done, which only a task with no turn running is.
 pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
     match state {
         _ if done && !running => Group::Done,

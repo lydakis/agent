@@ -715,7 +715,7 @@ first's calls open nothing anywhere and say nothing opened would be seen,
 while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
 project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
-task is marked done. With `task_tabs = "every"`, a task's window
+task is closed, done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -1268,7 +1268,7 @@ Opens the project's agents in the side pane grouped by **Needs you**, **Failed**
 | `◌` | Waiting, queued, rate limited, parked, paused, or starting |
 | `○` | Idle or `no reply` |
 | `■` | Interrupted |
-| `✓` *(green)* | Marked done (`mark_done`) |
+| `✓` *(green)* | Done: closed (`close_agent`) |
 
 - Press `m` to reveal models, profiles, follows, PR links, background counts, and latest step; `→`/`←` fold/unfold groups, helpers, and multi-agent tasks; `Enter` opens the selected agent; `Ctrl+F` filters; `x` stops a workflow.
 - Scriptable via `sonny status [AGENT] [--json]`.
@@ -1585,7 +1585,7 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   parked says `paused`), **Idle** (its turn ended with nothing open,
   `idle`; ended without words, `no reply`; or you ended it,
   `interrupted`; a pull request its last reply linked shows on its row),
-  and **Done** (marked done). One table gives every state its mark, for
+  and **Done** (closed). One table gives every state its mark, for
   the footer, `/status`, the tasks a lead started and `/switch` alike:
   `?` needs you or held, `✗` failed, `●` working, `◌` waiting, queued,
   rate limited, parked, paused or starting, `○` idle or no reply, `■`
@@ -1623,21 +1623,24 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   is one row, as any.
 
   ![A task with four agents in /status, at 150, 120, 60 and 44 columns](../docs/sonny/status-task-agents.png)
- As threads in a claude.ai project are
-  resolved, a task marks itself done with the `mark_done` tool once
-  nothing is left to do in it, such as when its pull request merged or
-  you dropped the work, and the lead can mark any of its tasks done the
-  same way; the lead hears when a task marked itself done, and the task's
-  window closes once its turn ends. One you used since its newest turn
-  began stays, says `✓ done` under its last reply, and closes once you
-  look away from it, unless a message is half typed there. New work sent
-  to the task, or a message you type there, reopens it.
-  A lead is marked done the same way once you say its project is done: it
-  calls `mark_done` naming no task, or an outer lead names it. Its row
-  reads done, its old questions are set aside, and its automations skip
-  their runs (`/background` says `last paused: web.lead is done`) until a
-  message, from you or any agent, reopens it. A run you ask for with
-  `fire` still runs, and reopens it.
+ Done is closed: one tool, `close_agent`, for
+  every agent. A task closes itself, naming its own name alone, once
+  nothing is left for it to do now, such as when its work is handed on
+  or you dropped it; the turn that closes it runs on to its end, so its
+  reply still goes out. Its lead, or whoever made it, can close it the
+  same way, and you can. The lead hears when a task closed itself, and
+  the task's window closes once its turn ends. One you used since its
+  newest turn began stays, says `✓ done` under its last reply, and closes
+  once you look away from it, unless a message is half typed there. New
+  work sent to the task, or a message you type there, reopens it, so a
+  review or a check that comes later still reaches it.
+  A lead is closed the same way once you say its project is done: it
+  closes itself, or an outer lead closes it. Its row reads done, its old
+  questions are set aside, and its automations skip their runs
+  (`/background` says `last paused: web.lead is done`) until a message,
+  from you or any agent, reopens it. A run you ask for with `fire` still
+  runs, and reopens it. A task done before this, by the old `mark_done`
+  tool, and opened by nothing since, is closed once on upgrade.
   Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. Beside its model each agent names the profile it runs
@@ -2069,7 +2072,7 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   that a brief names (through a link too) are turned into the same paths
   in the task's worktree, so the task never writes the lead's folder by
   its full path. The `remove_task` tool (`task`, `discard`) cleans up a
-  task that is done: it marks it done, as `mark_done` does, and removes
+  task that is done: it closes it, as `close_agent` does, and removes
   its worktree, refusing while the task is working or the worktree has
   uncommitted changes. Its branch is kept unless it is merged. The agent
   and its history stay, so a message reopens it; only the person deletes
@@ -2217,7 +2220,7 @@ Renders every agent on the daemon as a live constellation (you at the center, le
 
 Sonny declares tools answered by `sonny-tool-host` ([docs/SONNY.md#tool-host](../docs/SONNY.md#tool-host)):
 
-- **Coordination & UI:** `start_task`, `remove_task`, `new_project` *(leads only)*, `show_agent`, `mark_done`, `ask`, `close_ask`, `plan`, `margin`, `live`, `react`, `follows`.
+- **Coordination & UI:** `start_task`, `remove_task`, `new_project` *(leads only)*, `show_agent`, `ask`, `close_ask`, `plan`, `margin`, `live`, `react`, `follows`.
 - **Knowledge & automation:** `memory`, `automations`, `commons`, `board`.
 - **Execution & external reach:** `exec` (code-mode JS + MCP), `workflow` (multi-agent JS scripts), `browser`, `desktop`.
 
@@ -2234,10 +2237,10 @@ Sonny installs and runs its own integrity-verified copies of `agent-browser` (`0
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
-`mark_done`, `follows`, `show_agent`, `start_task` and
+`follows`, `show_agent`, `start_task` and
 `remove_task`; a lead's own, which its
 tasks never take, is `new_project`. The daemon shows them to
-the model and records each call: `plan` and `mark_done` run nothing,
+the model and records each call: `plan` runs nothing,
 and the rest wait for Sonny's answer, a `react` naming another agent kept
 under the person's newest message there as it is answered. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
@@ -2251,11 +2254,9 @@ you, from Sonny's scheduler, outside any sandbox. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a row in `/permissions`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
-and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. A task's own
-`mark_done` is read from its history: its last turn marked it done. The
-lead's Sonny keeps each task the lead marked done beside the store
-(`state.sqlite.resolved/`), with the task's newest turn finished by then: a
-turn of the task numbered after that one reopens it.
+and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. Done is the daemon's
+`close_agent`, not one of these: the daemon keeps it on the agent, and a
+turn of the agent that starts after reopens it.
 
 ![A lead starting a task, following, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
 

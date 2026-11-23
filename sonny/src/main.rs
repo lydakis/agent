@@ -1193,8 +1193,6 @@ async fn read_projects(
     let mut whole = true;
     let turns = HashMap::new();
     let mut titles = crate::title::Titles::read(&kept);
-    // The done marks kept beside the store, which move no listing.
-    let marked = resolved::marked(store);
     let mut was = std::mem::take(&mut state.each);
     // Whether a project was counted to another mark than it was kept with.
     let mut moved = false;
@@ -1215,8 +1213,8 @@ async fn read_projects(
             continue;
         };
         let theirs: Vec<standing::Agent> = under.remove(&lead.name).unwrap_or_default();
-        // What it is counted from: its agents as listed, those waiting on
-        // the person, their done marks and its file's title. One none of
+        // What it is counted from: its agents as listed, closed ones done,
+        // those waiting on the person and its file's title. One none of
         // which moved is as it was counted, but while one of its agents
         // runs, which moves with no event, or where it holds the window's
         // own agent, whose row reads the window's own questions.
@@ -1225,11 +1223,7 @@ async fn read_projects(
             .map(|bot| bot.name.as_str())
             .collect();
         let titled = titles.named(&lead.name, lead.bot_id, lead.workspace.as_deref());
-        let marks: Vec<(&str, Option<i64>)> = (theirs.iter())
-            .filter(|bot| marked.contains(&bot.name))
-            .map(|bot| (bot.name.as_str(), resolved::read(store, &bot.name)))
-            .collect();
-        let mark = project_mark(&theirs, &asking, &marks, titled.as_deref());
+        let mark = project_mark(&theirs, &asking, titled.as_deref());
         let keeps = !theirs
             .iter()
             .any(|agent| agent.running_turn.is_some() || agent.name == bot);
@@ -1334,15 +1328,9 @@ async fn read_projects(
 }
 
 /// The mark of what a project is counted from ([`ProjectRead`]): every
-/// field of its agents as listed, those waiting on the person, the done
-/// marks kept for them beside the store (an outer lead marking one moves
-/// no listing), and its file's title.
-fn project_mark(
-    agents: &[standing::Agent],
-    asking: &[&str],
-    marks: &[(&str, Option<i64>)],
-    title: Option<&str>,
-) -> u64 {
+/// field of its agents as listed (whether each is closed, done, among
+/// them), those waiting on the person, and its file's title.
+fn project_mark(agents: &[standing::Agent], asking: &[&str], title: Option<&str>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut mark = std::hash::DefaultHasher::new();
     for agent in agents {
@@ -1370,7 +1358,6 @@ fn project_mark(
         (model, provider, workspace, profile, closed).hash(&mut mark);
     }
     asking.hash(&mut mark);
-    marks.hash(&mut mark);
     title.hash(&mut mark);
     mark.finish()
 }
@@ -1501,9 +1488,22 @@ struct Built {
     bots: std::collections::HashSet<String>,
     /// The profiles they were made as.
     profiles: std::collections::HashSet<String>,
+    /// Those of them done (closed), which a board reads as gone.
+    done: std::collections::HashSet<String>,
     /// A mark of each agent's calls waiting on someone, as that count
     /// listed them: an agent whose calls changed is built again.
     held: Option<HashMap<String, u64>>,
+}
+
+impl Built {
+    /// The agents the last count listed that are not done: closed ones
+    /// are listed, under Done.
+    fn open(&self) -> std::collections::HashSet<String> {
+        (self.bots.iter())
+            .filter(|bot| !self.done.contains(*bot))
+            .cloned()
+            .collect()
+    }
 }
 
 /// A key for `name` that costs no copy of it.
@@ -1781,8 +1781,10 @@ async fn read_status_of(
                 ..Default::default()
             },
         };
+        // Done: closed, by itself, its lead or the person, once no turn of
+        // its runs; or its last turn closed it, read before the listing.
         let itself = seen.itself && ran_status == Some("completed");
-        let resolved = itself || resolved::holds(resolved::read(&store, name), turn, running);
+        let resolved = itself || resolved::done(bot.closed, running);
         let open = seen.ask.clone();
         // Whether the store's follow of every project has it waiting on
         // the person (a call held or a question open), where it is asked:
@@ -4371,8 +4373,8 @@ struct Kept {
     /// number once it ended.
     began: Option<Instant>,
     ended: Option<i64>,
-    /// The ended turn the done mark was settled for: shown, left to the
-    /// lead, or closed.
+    /// The ended turn its close, done, was settled for: shown, left to
+    /// the lead, or the window closed.
     settled: Option<i64>,
     /// `✓ done` is shown: the window closes once it loses the focus.
     showing: bool,
@@ -4766,8 +4768,8 @@ pub fn side_copy(record: &Value) -> Option<&str> {
 /// How long `/status` waits, as it opens, for where the windows sit now.
 const PLACES_NOW: Duration = Duration::from_millis(500);
 
-/// Whether a lead's call of tool `name` marks the task it names done:
-/// `mark_done`, and `remove_task`, which marks it as it cleans up.
+/// Whether a call of tool `name` closes the agents it names, done:
+/// `close_agent`, and `remove_task`, which closes its task as it cleans up.
 fn resolves(name: &str) -> bool {
     name == resolved::TOOL || name == served::REMOVE
 }
@@ -5573,7 +5575,6 @@ type Reads = (
 /// task, with what each was doing; and what was known of each before.
 struct TasksAsked {
     client: Arc<Client>,
-    store: PathBuf,
     all: bool,
     bots: Vec<String>,
     others: Vec<String>,
@@ -5611,7 +5612,6 @@ impl TasksAsked {
     async fn read(self) -> TasksRead {
         let TasksAsked {
             client,
-            store,
             all,
             bots,
             others,
@@ -5639,7 +5639,7 @@ impl TasksAsked {
         }
         for bot in others {
             let state = match task_turn_at(&client, &bot).await {
-                Ok((turn, _)) => {
+                Ok((turn, _, closed)) => {
                     let state = started::state(&turn);
                     if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
                         let seen = match seen.get(&bot) {
@@ -5654,7 +5654,7 @@ impl TasksAsked {
                             }
                         };
                         if let Some(seen) = seen {
-                            waiting.asked(&bot, seen.open(&store, &bot, false));
+                            waiting.asked(&bot, seen.open(closed, false));
                         }
                     }
                     match waiting.waits(&bot) {
@@ -5680,10 +5680,10 @@ impl TasksAsked {
         let mut asked = Vec::new();
         let (mut news, mut removed) = (Vec::new(), Vec::new());
         for bot in bots {
-            // Marked done, by itself or its lead, since its newest turn.
+            // Closed, by itself or its lead, since its newest turn: done.
             let mut done = false;
             let state = match task_turn_at(&client, &bot).await {
-                Ok((turn, head)) => {
+                Ok((turn, head, closed)) => {
                     let state = started::state(&turn);
                     // A running task may ask and go on working: read again
                     // now and then, once its history grew since.
@@ -5696,7 +5696,7 @@ impl TasksAsked {
                         // keeping what it asked meanwhile.
                         if let Some(seen) = needs::scan(&client, &bot, None).await {
                             news.push((bot.clone(), head.unwrap_or_default()));
-                            needs.asked(&bot, seen.open(&store, &bot, true));
+                            needs.asked(&bot, seen.open(closed, true));
                             asked.push(bot.clone());
                         }
                     }
@@ -5718,11 +5718,11 @@ impl TasksAsked {
                             }
                         };
                         if let Some(seen) = seen {
-                            // A task's own mark holds once its turn completed.
+                            // Its own close holds once its turn completed.
                             done = (seen.itself && turn["status"] == "completed")
-                                || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
-                            // One the lead resolved set its question aside.
-                            needs.asked(&bot, seen.open(&store, &bot, false));
+                                || resolved::done(closed, false);
+                            // One its lead closed set its question aside.
+                            needs.asked(&bot, seen.open(closed, false));
                             ended.push(bot.clone());
                             asked.push(bot.clone());
                         }
@@ -6074,10 +6074,15 @@ async fn read_alerts(
 async fn task_turn_at(
     client: &Client,
     bot: &str,
-) -> Result<(Value, Option<i64>), agent_client::Error> {
+) -> Result<(Value, Option<i64>, bool), agent_client::Error> {
     let record = client.request("inspect", json!({"bot": bot})).await?;
     let turn = active_turn(client, bot, record["running_turn"].as_i64(), None).await?;
-    Ok((with_error(client, turn).await, record["head"].as_i64()))
+    let closed = resolved::closed(&record);
+    Ok((
+        with_error(client, turn).await,
+        record["head"].as_i64(),
+        closed,
+    ))
 }
 
 /// What the footer's count of the agents found: the mark of where they
@@ -6105,10 +6110,9 @@ struct Counted {
 
 /// A mark of where the agents stand, and of what waits on the person:
 /// their rows' mark ([`rows_mark`]: what decides each one's group, and a
-/// running one's history, whose newest items can hold a question), this
-/// window's own open question and calls, and the done marks beside the
-/// store (a lead elsewhere can mark a task without it moving); and the
-/// calls listed, where the daemon could list them.
+/// running one's history, whose newest items can hold a question, and
+/// whether it is closed, done), and this window's own open question and
+/// calls; and the calls listed, where the daemon could list them.
 async fn standing(client: &Client, rows: u64, local: Local) -> (u64, Option<Vec<needs::Held>>) {
     use std::hash::{Hash, Hasher};
     let mut mark = std::collections::hash_map::DefaultHasher::new();
@@ -6118,10 +6122,8 @@ async fn standing(client: &Client, rows: u64, local: Local) -> (u64, Option<Vec<
     (mark.finish(), held)
 }
 
-/// A window's own question and calls, and when the done marks beside the
-/// store last changed: one look at their folder says whether any did,
-/// however many agents are listed.
-type Local = ((usize, usize), Option<std::time::SystemTime>);
+/// A window's own question and calls.
+type Local = (usize, usize);
 
 /// A mark of where the agents `listed` stand as their rows say it: the
 /// sum of each row's [`row_mark`], so a row that changes changes it by its
@@ -6140,6 +6142,7 @@ fn row_mark(bot: &standing::Agent) -> u64 {
         &bot.status,
         &bot.last,
         bot.expire_ms,
+        bot.closed,
     )
         .hash(&mut mark);
     match &bot.waiting_on {
@@ -6201,15 +6204,6 @@ fn moved_rows(
             }
         }
     }
-}
-
-/// When the marks of tasks resolved beside `store` last changed: a mark is
-/// written to a file of its own and moved into place, which touches the
-/// folder, so one look says whether any changed.
-fn resolved_changed(store: &std::path::Path) -> Option<std::time::SystemTime> {
-    let mut dir = store.as_os_str().to_owned();
-    dir.push(".resolved");
-    std::fs::metadata(dir).and_then(|m| m.modified()).ok()
 }
 
 enum Warming {
@@ -6592,9 +6586,13 @@ struct App {
     /// The leads this window's agent follows: what waits below them waits
     /// here too.
     follows: Follows,
-    /// When a lead's window last read whether another window marked it
-    /// done, which sets its own questions aside here too.
-    done_read: Option<Instant>,
+    /// Whether this window's agent is closed, done, as the daemon said it
+    /// at the start and its events since: closed by itself, its lead or
+    /// the person, until a turn of its opens it again.
+    own_closed: bool,
+    /// Its own questions were set aside for being closed, until a turn of
+    /// its opens it again.
+    closed_aside: bool,
     /// A task's window, kept open by its lead once the task is done
     /// because the person was using it.
     kept: Kept,
@@ -6894,8 +6892,8 @@ struct App {
     /// the agents are counted again only once it changes.
     counted_mark: Option<u64>,
     /// What this window holds that the count reads, when last counted:
-    /// its own question and calls, and when the done marks last changed.
-    counted_local: Option<((usize, usize), Option<std::time::SystemTime>)>,
+    /// its own question and calls.
+    counted_local: Option<Local>,
     /// The rows this window's last count built, which its next keeps for
     /// every idle agent no event moved.
     kept_rows: Built,
@@ -7382,9 +7380,12 @@ struct Fleet {
     closing: Option<tokio::task::JoinHandle<Vec<(String, i64)>>>,
     /// A rescan read beside the loop ([`Fleet::rescan`]).
     rescanning: Option<tokio::task::JoinHandle<Rescanned>>,
-    /// Tasks' turns that resolved them: their window closes once the turn
+    /// Tasks' turns that closed them: their window closes once the turn
     /// completes.
     resolving: resolved::Own,
+    /// The agents below the lead closed, done, as heard or read, until a
+    /// turn of theirs opens them again: no question of theirs is open.
+    closed: std::collections::HashSet<String>,
     /// When each task's newest turn began, as this window heard.
     began: HashMap<String, std::time::SystemTime>,
     /// When the person last used a task's window ([`used::when`]).
@@ -7770,10 +7771,12 @@ impl Naming {
 
 /// The kinds of event a lead's layout acts on (`Fleet::event`, `taken`,
 /// `resolved::Own::event`).
-const FLEET_KINDS: [&str; 14] = [
+const FLEET_KINDS: [&str; 15] = [
     "created",
     "forked",
     "deleted",
+    // Done: a question it left open is set aside.
+    "closed",
     "accepted",
     // The person's words steered into a running turn answer its question.
     "steered",
@@ -7887,6 +7890,7 @@ impl Fleet {
             closing: None,
             rescanning: None,
             resolving: Default::default(),
+            closed: Default::default(),
             began: HashMap::new(),
             used_when: used::when,
             windows: Default::default(),
@@ -7941,6 +7945,7 @@ impl Fleet {
             closing: None,
             rescanning: None,
             resolving: Default::default(),
+            closed: Default::default(),
             began: HashMap::new(),
             used_when: used::when,
             windows: Default::default(),
@@ -7996,6 +8001,11 @@ impl Fleet {
                 continue;
             }
             self.lineage.insert(name.to_owned());
+            // Closed, done, as the listing says: what it asked is set aside.
+            match resolved::closed(bot) {
+                true => _ = self.closed.insert(name.to_owned()),
+                false => _ = self.closed.remove(name),
+            }
             // A turn that ended while away is not known by number, and
             // one that started makes the last ending stale.
             self.ended.remove(name);
@@ -8169,12 +8179,12 @@ impl Fleet {
             .collect()
     }
 
-    /// The question `bot`'s history has open, unless the task is resolved:
-    /// by itself in that turn, or by its lead's mark that no later turn
-    /// reopened, as `/status` files it.
+    /// The question `bot`'s history has open, unless the task is done:
+    /// closed by itself in that turn, or closed since, with no turn of its
+    /// opening it again, as `/status` files it.
     fn open_ask(&self, bot: &str, seen: needs::Seen) -> Option<asks::Ask> {
         let running = self.activity.get(bot) == Some(&"working");
-        seen.open(&self.store, bot, running)
+        seen.open(self.closed.contains(bot), running)
     }
 
     /// What a read elsewhere found of what waits on the person, in place of
@@ -8539,7 +8549,7 @@ impl Fleet {
             // Resolved, a question it left open is set aside.
             self.needs.forget(task);
             self.ended.remove(task);
-            // Kept until new work: marked done again, it is still in use.
+            // Kept until new work: closed again, it is still in use.
             let in_use = (self.began.get(task))
                 .is_some_and(|began| used::since((self.used_when)(task), *began));
             if !in_use {
@@ -8666,7 +8676,13 @@ impl Fleet {
                 self.settle(bot, waits);
             }
             match kind {
-                "accepted" if bot == self.lead => self.doing(bot, "working"),
+                "closed" => _ = self.closed.insert(bot.to_owned()),
+                "accepted" => {
+                    self.closed.remove(bot);
+                    if bot == self.lead {
+                        self.doing(bot, "working");
+                    }
+                }
                 "turn_finished" => {
                     self.doing(
                         bot,
@@ -8840,7 +8856,8 @@ impl App {
             task_asks_read: None,
             hub_asks: 0,
             follows: Follows::default(),
-            done_read: None,
+            own_closed: false,
+            closed_aside: false,
             kept: Kept::default(),
             task_needs: Default::default(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
@@ -9139,13 +9156,16 @@ impl App {
             // opened again on an agent whose turn failed still says so, and
             // keeps its place among the lead's windows.
             // A model that said nothing is no failure, as live.
-            let (failed, ended) = match self.task_turn(&self.bot).await {
-                Ok(last) => (
-                    last["status"] == "failed" && last["error"] != EMPTY,
-                    (last["status"] == "completed" || last["error"] == EMPTY)
-                        .then(|| last["turn"].as_i64())
-                        .flatten(),
-                ),
+            let (failed, ended) = match self.task_turn_at(&self.bot).await {
+                Ok((last, _, closed)) => {
+                    self.own_closed = closed;
+                    (
+                        last["status"] == "failed" && last["error"] != EMPTY,
+                        (last["status"] == "completed" || last["error"] == EMPTY)
+                            .then(|| last["turn"].as_i64())
+                            .flatten(),
+                    )
+                }
                 Err(_) => (false, None),
             };
             self.rest = Some(if failed { "error" } else { "idle" });
@@ -11480,7 +11500,6 @@ impl App {
         others.sort();
         let asked = TasksAsked {
             client: self.client.clone(),
-            store: self.store(),
             all,
             seen: (bots.iter().chain(&others))
                 .filter_map(|bot| Some((bot.clone(), self.asks_seen.get(bot)?.clone())))
@@ -11570,13 +11589,12 @@ impl App {
     }
 
     /// The turn that says what `bot` does, as `/status` reads it
-    /// ([`active_turn`]), a failed one with why it failed.
-    async fn task_turn(&self, bot: &str) -> Result<Value, agent_client::Error> {
-        Ok(self.task_turn_at(bot).await?.0)
-    }
-
-    /// [`App::task_turn`], with the newest node of `bot`'s history.
-    async fn task_turn_at(&self, bot: &str) -> Result<(Value, Option<i64>), agent_client::Error> {
+    /// ([`active_turn`]), a failed one with why it failed, with the newest
+    /// node of `bot`'s history and whether it is closed, done.
+    async fn task_turn_at(
+        &self,
+        bot: &str,
+    ) -> Result<(Value, Option<i64>, bool), agent_client::Error> {
         task_turn_at(&self.client, bot).await
     }
 
@@ -13125,8 +13143,8 @@ impl App {
     /// again only the rows of the agents it moved, and an idle project is
     /// read for nothing. A running agent's row is read again each time,
     /// with the others running, as its history (a question asked partway)
-    /// moves without a change of state; and a task marked done beside the
-    /// store counts too. While `/status` is open, its own reads count them.
+    /// moves without a change of state; and a task closed, done, moves its
+    /// row. While `/status` is open, its own reads count them.
     async fn count_agents(&mut self) {
         if let Some(job) = self.counting.take_if(|job| job.is_finished()) {
             // The next count waits its seconds from this one's end, so a
@@ -13193,9 +13211,7 @@ impl App {
             asks.iter().filter(|ask| ask.task.is_none()).count(),
             approvals.len(),
         );
-        let marks = agent_client::socket::canonical_store(&self.options.store)
-            .unwrap_or_else(|_| self.options.store.clone());
-        let local: Local = (here, resolved_changed(&marks));
+        let local: Local = here;
         let whole = changes.snapshot.is_some();
         let listed = match changes.snapshot {
             Some(snapshot) => snapshot,
@@ -13213,7 +13229,7 @@ impl App {
         }
         // The count holds the listing, and the rows it built last, until it
         // gives them back. Every row is built again from a new snapshot, or
-        // once this window's own question or calls, or a done mark, changed.
+        // once this window's own question or calls changed.
         self.listed = None;
         let mut kept_rows = std::mem::take(&mut self.kept_rows);
         if whole || self.counted_local != Some(local) {
@@ -13369,6 +13385,10 @@ impl App {
                 kept_rows.bots = bots.clone();
                 kept_rows.profiles = status::profiles(&all);
             }
+            kept_rows.done = (all.iter())
+                .filter(|row| row.group == status::Group::Done)
+                .map(|row| row.bot.clone())
+                .collect();
             let agents = status::agents(read.title.as_ref().unwrap_or(&read.project), &all);
             // Its counts are the footer's, as `status::counts` gives them.
             let counts = agents.counts;
@@ -13871,7 +13891,7 @@ impl App {
                             continue;
                         }
                         if resolves(&name) && !failed && !reactions::refused(&item) {
-                            self.resolve(&arguments, turns.get(&node).copied(), false);
+                            self.resolve(&name, &arguments, turns.get(&node).copied(), false);
                         }
                         if name == asks::TOOL && !failed && !reactions::refused(&item) {
                             self.asked(id, turns.get(&node).copied(), &arguments);
@@ -14612,6 +14632,9 @@ impl App {
                 }
             }
             "accepted" => {
+                // A turn of its own opens it again.
+                self.own_closed = false;
+                self.closed_aside = false;
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 self.end_live(Words::Reply);
                 self.live_item = None;
@@ -15109,7 +15132,7 @@ impl App {
                     self.ask_closed(&arguments);
                 }
                 if resolves(&name) && !shown.1 && !reactions::refused(&json!({"output": shown.0})) {
-                    self.resolve(&arguments, turn, true);
+                    self.resolve(&name, &arguments, turn, true);
                 }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
@@ -15355,48 +15378,48 @@ impl App {
                 self.notice = Some(format!("{} was deleted", self.bot));
                 self.running = None;
             }
+            // Done: by itself, its lead or the person. A task at rest
+            // closes its window, as its lead's close does.
+            "closed" => {
+                self.own_closed = true;
+                if self.running.is_none() {
+                    self.done_resting(true);
+                }
+            }
             _ => {}
         }
     }
 
-    /// The store as the daemon names it, which the marks of resolved
-    /// tasks are kept beside.
+    /// The store as the daemon names it.
     fn store(&self) -> PathBuf {
         agent_client::socket::canonical_store(&self.options.store)
             .unwrap_or_else(|_| self.options.store.clone())
     }
 
-    /// Show what a `mark_done` call in `turn` marked: Sonny's tool host
-    /// kept the mark before answering it, so this window only shows it. A
-    /// lead marking itself sets its own questions aside; a task marked
-    /// done `now`, as it happens, has its window closed.
-    fn resolve(&mut self, arguments: &Value, turn: Option<i64>, now: bool) {
-        // A side chat forked from a lead resolves that lead's tasks.
-        let side = (self.options.side.is_some())
-            .then(|| side_source(&self.bot))
-            .flatten()
-            .and_then(project::lead_project);
-        let Some(project) = self.project.as_deref().or(side).map(str::to_owned) else {
-            return;
-        };
-        let side = self.options.side.is_some();
-        let lead = match side {
-            true => side_source(&self.bot).map(str::to_owned),
-            false => Some(self.bot.clone()),
-        };
-        let lead = lead.filter(|lead| project::is_lead(lead) && resolved::itself(arguments, lead));
+    /// Show what a `close_agent` or `remove_task` call (`name`) in `turn`
+    /// closed: the daemon closed it, done, so this window only shows it.
+    /// This agent closing itself sets its own questions aside; a task
+    /// closed `now`, as it happens, has its window closed.
+    fn resolve(&mut self, name: &str, arguments: &Value, turn: Option<i64>, now: bool) {
         if turn.is_none() {
             return;
         }
-        if lead.is_some() && !side {
-            self.set_aside_own(None);
-            return;
-        }
-        let Some(task) = lead.or_else(|| resolved::call(arguments, &project)) else {
-            return;
+        let closed = match name == served::REMOVE {
+            true => (self.project.as_deref())
+                .and_then(|project| crate::task::named(arguments["task"].as_str()?, project))
+                .into_iter()
+                .collect(),
+            false => resolved::named(arguments),
         };
-        if now && let Some(fleet) = &mut self.fleet {
-            fleet.resolved(&task);
+        for agent in closed {
+            // Itself only named alone, as the daemon closes it.
+            if agent == self.bot {
+                if name == served::REMOVE || resolved::itself(arguments, &self.bot) {
+                    self.set_aside_own(None);
+                }
+            } else if now && let Some(fleet) = &mut self.fleet {
+                fleet.resolved(&agent);
+            }
         }
     }
 
@@ -15716,7 +15739,7 @@ impl App {
                 let mut view = commons::View::open(&home, project.clone());
                 view.set_present(board_view::Present {
                     project: project.clone(),
-                    bots: self.kept_rows.bots.clone(),
+                    bots: self.kept_rows.open(),
                     profiles: self.kept_rows.profiles.clone(),
                 });
                 view
@@ -15847,10 +15870,10 @@ impl App {
             && let Some(view) = &mut watch.commons
         {
             // What the window's count already knows of its project's
-            // agents: a holder it no longer lists is closed.
+            // agents: a holder it no longer lists, or lists done, is closed.
             view.set_present(board_view::Present {
                 project: watch.project.clone(),
-                bots: self.kept_rows.bots.clone(),
+                bots: self.kept_rows.open(),
                 profiles: self.kept_rows.profiles.clone(),
             });
             view.reload();
@@ -15871,7 +15894,7 @@ impl App {
             watch.read = Instant::now();
             return;
         }
-        // Where the tasks' done marks and roles are, only for a read due.
+        // Where the tasks' roles are, only for a read due.
         let store = (self.watch.as_ref())
             .and_then(|watch| watch.usage.as_ref())
             .is_some_and(usage::View::due)
@@ -18624,7 +18647,7 @@ impl App {
                     // A message half typed keeps it, until sent or cleared.
                     true if self.blank() => self.close_own(),
                     true => {}
-                    // Marked done by its lead while it rested here.
+                    // Closed by its lead while it rested here.
                     false => self.done_resting(true),
                 }
             }
@@ -21189,7 +21212,7 @@ impl App {
     }
 
     /// This agent's own open questions set aside, as words past them or
-    /// its being marked done leave them, those asked up to its turn
+    /// its being closed leave them, those asked up to its turn
     /// `upto` if named; its tasks' wait on the person still.
     fn set_aside_own(&mut self, upto: Option<i64>) {
         let covered = |ask: &asks::Ask| {
@@ -21219,14 +21242,14 @@ impl App {
             && !project::is_lead(&self.bot)
     }
 
-    /// The task's turn `turn`, its newest, ended: once marked done up to
-    /// it, by itself or its lead, this window shows so and stays while the
+    /// The task's turn `turn`, its newest, ended: once it is closed, by
+    /// itself or its lead, done, this window shows so and stays while the
     /// person uses it ([`Kept`]), or closes, settled once a turn.
     fn done_at(&mut self, turn: i64) {
         if !self.task_window() || self.kept.settled == Some(turn) || self.kept.reopened {
             return;
         }
-        if !resolved::holds(resolved::read(&self.store(), &self.bot), Some(turn), false) {
+        if !self.own_closed {
             return;
         }
         self.kept.settled = Some(turn);
@@ -21241,21 +21264,22 @@ impl App {
     }
 
     /// A task window opened on a task at rest since its turn `ended`: a
-    /// done mark its lead makes from now on is heard ([`App::done_resting`]);
-    /// one it already had is how the person found it, and this window stays
-    /// as any other.
+    /// close its lead makes from now on is heard ([`App::done_resting`]);
+    /// one closed already is how the person found it, and this window
+    /// stays as any other.
     fn rested(&mut self, ended: Option<i64>) {
         let Some(turn) = ended.filter(|_| self.task_window()) else {
             return;
         };
         self.kept.ended = Some(turn);
-        if resolved::holds(resolved::read(&self.store(), &self.bot), Some(turn), false) {
+        if self.own_closed {
             self.kept.settled = Some(turn);
         }
     }
 
-    /// A task at rest marked done by its lead since: read at most every
-    /// two seconds, or `now`, as the person looks away.
+    /// A task at rest closed by its lead since: looked at at most every
+    /// two seconds, or `now`, as the person looks away or the close is
+    /// heard.
     fn done_resting(&mut self, now: bool) {
         let Some(turn) = self.kept.ended else {
             return;
@@ -21296,22 +21320,20 @@ impl App {
         });
     }
 
-    /// A lead marked done from another window, its outer lead's or a
-    /// side chat's: its own questions asked up to the mark set aside here
-    /// too, as its own call sets them aside. Read at most every two
-    /// seconds, and only while one of its own is open.
+    /// A lead closed from elsewhere, by whoever made it or the person:
+    /// done, its own questions set aside here too, as its own close sets
+    /// them aside, once while it stays closed.
     fn done_elsewhere(&mut self) {
         if self.options.side.is_some()
             || !project::is_lead(&self.bot)
+            || !self.own_closed
+            || self.closed_aside
             || !self.asks.iter().any(|ask| ask.task.is_none())
-            || (self.done_read).is_some_and(|at| at.elapsed() < Duration::from_secs(2))
         {
             return;
         }
-        self.done_read = Some(Instant::now());
-        if let Some(mark) = resolved::read(&self.store(), &self.bot) {
-            self.set_aside_own(Some(mark));
-        }
+        self.closed_aside = true;
+        self.set_aside_own(None);
     }
 
     /// The composer's focus on the next open question, or the one
@@ -22024,7 +22046,11 @@ impl App {
         let mut open = Vec::new();
         let shared = (self.other_projects.as_ref()).map(|(open, _)| open.waiting.borrow().clone());
         for (name, turn) in picker.ended() {
-            match (shared.as_ref()).and_then(|shared| shared.waits(name, closed.contains(name))) {
+            // Closed, it is done: no question of its is open.
+            if closed.contains(name) {
+                continue;
+            }
+            match (shared.as_ref()).and_then(|shared| shared.waits(name, false)) {
                 Some(true) => {
                     open.push((name.to_owned(), turn));
                     continue;
@@ -22036,7 +22062,7 @@ impl App {
             match had.into_iter().flatten().find(|(at, _)| *at == turn) {
                 Some((_, seen)) => {
                     read.insert(name.to_owned(), (turn, seen.clone()));
-                    if seen.clone().open(&store, name, false).is_some() {
+                    if seen.clone().open(false, false).is_some() {
                         open.push((name.to_owned(), turn));
                     }
                 }
@@ -22084,7 +22110,6 @@ impl App {
         if self.agents_asked.is_none() {
             return;
         }
-        let store = self.store();
         let Some(told) = &mut self.agents_asked else {
             return;
         };
@@ -22092,7 +22117,7 @@ impl App {
             match told.try_recv() {
                 Ok((name, turn, Some(seen))) => {
                     if let Some(picker) = &mut self.agents
-                        && seen.open(&store, &name, false).is_some()
+                        && seen.open(false, false).is_some()
                     {
                         picker.asks(&name, turn);
                     }
@@ -27489,7 +27514,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
-        resolved::keep(&store, "shop.done", 0, "c1").unwrap();
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let client = daemon_answering(move |ask| {
@@ -27503,6 +27527,7 @@ mod tests {
                         .collect();
                     // Made in a profile, which the daemon keeps on it.
                     bots[2]["profile"] = json!("reviewer");
+                    bots[1]["closed_ms"] = json!(1);
                     json!({"bots": bots, "next_after": null})
                 }
                 "approvals" => json!({"approvals": []}),
@@ -28531,18 +28556,6 @@ mod tests {
             "{read:?}"
         );
         assert_eq!(app.counts, Some(counts(0, 0, 2)));
-        // Marked done by a lead elsewhere, the task itself unmoved: read
-        // again, and counted done.
-        resolved::keep(&dir.join("state.sqlite"), "shop.fix", 4, "call-1").unwrap();
-        counted(&mut app).await;
-        assert_eq!(
-            app.counts,
-            Some(status::Counts {
-                idle: 1,
-                done: 1,
-                ..Default::default()
-            })
-        );
         // A history read that failed keeps no mark: the next count reads
         // again, and once it reads whole, keeps it.
         failing.store(true, Ordering::SeqCst);
@@ -28560,7 +28573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_closed_agent_leaves_the_counts_on_its_close_and_comes_back_with_a_message() {
+    async fn a_closed_agent_counts_done_on_its_close_and_open_again_with_a_message() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let lead = json!({"name": "shop.lead", "bot_id": 1, "head": 1});
         let fix = |closed: bool| {
@@ -28576,7 +28589,8 @@ mod tests {
         let snapshot = json!([fix(false), lead]);
         let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
             "bots" if ask["names"].is_null() && ask["active"].is_null() => {
-                assert_eq!(ask["open"], true, "{ask}");
+                // Closed agents too: done is closed.
+                assert!(ask["open"].is_null(), "{ask}");
                 json!({"bots": snapshot, "cursor": 7, "next_after": null})
             }
             "follow" => json!({"following": ask["bot"]}),
@@ -28617,20 +28631,22 @@ mod tests {
         };
         assert_eq!(names(&app), ["shop.fix", "shop.lead"]);
         assert_eq!(app.counts.as_ref().unwrap().idle, 2);
-        // Closed: the follow's one `closed` event takes it off.
+        // Closed: the follow's one `closed` event counts it done.
         closed.store(true, Ordering::SeqCst);
         let event = json!({"event": "closed", "bot": "shop.fix", "following": "shop.*"});
         assert!(app.follower.as_mut().unwrap().heard(&event));
         counted(&mut app).await;
-        assert_eq!(names(&app), ["shop.lead"]);
+        assert_eq!(names(&app), ["shop.fix", "shop.lead"]);
         assert_eq!(app.counts.as_ref().unwrap().idle, 1);
-        // A message opens it again, and it is back.
+        assert_eq!(app.counts.as_ref().unwrap().done, 1);
+        // A message opens it again, and it is idle again.
         closed.store(false, Ordering::SeqCst);
         let event = json!({"event": "queued", "bot": "shop.fix", "following": "shop.*"});
         assert!(app.follower.as_mut().unwrap().heard(&event));
         counted(&mut app).await;
         assert_eq!(names(&app), ["shop.fix", "shop.lead"]);
         assert_eq!(app.counts.as_ref().unwrap().idle, 2);
+        assert_eq!(app.counts.as_ref().unwrap().done, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29992,10 +30008,10 @@ mod tests {
         page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
         assert_eq!(marks(&state)[0], before[0]);
         assert_ne!(marks(&state)[1], before[1]);
-        // An outer lead marks a quiet project's lead done, which moves no
-        // listing: that project is counted again, and counts it done.
+        // An outer lead closes a quiet project's lead: that project is
+        // counted again, and counts it done.
         let done = state.each["beta.lead"].project.counts.done;
-        resolved::keep(&store, "beta.lead", 1, "call-1").unwrap();
+        Arc::make_mut(&mut listed[2]).closed = true;
         page(&client, &store, &asked, &listed, &["alpha.one"], &mut state).await;
         assert_eq!(state.each["beta.lead"].project.counts.done, done + 1);
         assert_eq!(state.each["alpha.lead"].project.counts.done, 0);
@@ -36219,17 +36235,31 @@ mod tests {
     /// A stand-in daemon holding a project: its lead, a task whose turn
     /// waits on the person's approval, and one at rest on its own question.
     async fn project_waiting() -> (Arc<Client>, Events) {
+        project_waiting_closed(None).await
+    }
+
+    /// [`project_waiting`], with the agent `closed` closed, if one is.
+    async fn project_waiting_closed(closed: Option<&'static str>) -> (Arc<Client>, Events) {
         let asked = json!({"question": "Ship it?", "why": "w", "options": [{"label": "Yes"}]});
         daemon_with_events(json!({}), move |asked_for| {
             let bot = asked_for["bot"].as_str().unwrap_or("");
             match asked_for["op"].as_str().unwrap_or("") {
-                "bots" => json!({"bots": [
-                    {"name": "calc.lead", "bot_id": 1, "head": 3},
-                    {"name": "calc.fix", "bot_id": 2, "created_by": "calc.lead",
-                        "running_turn": 4, "head": 9},
-                    {"name": "calc.ask", "bot_id": 3, "created_by": "calc.lead", "head": 7},
-                    {"name": "calc.new", "bot_id": 4, "created_by": "calc.lead", "head": 8},
-                ]}),
+                "bots" => {
+                    let mut bots = json!([
+                        {"name": "calc.lead", "bot_id": 1, "head": 3},
+                        {"name": "calc.fix", "bot_id": 2, "created_by": "calc.lead",
+                            "running_turn": 4, "head": 9},
+                        {"name": "calc.ask", "bot_id": 3, "created_by": "calc.lead", "head": 7},
+                        {"name": "calc.new", "bot_id": 4, "created_by": "calc.lead", "head": 8},
+                    ]);
+                    for bot in bots.as_array_mut().unwrap() {
+                        if closed.is_some_and(|closed| bot["name"] == closed) {
+                            bot["closed_ms"] = json!(1);
+                        }
+                    }
+                    json!({"bots": bots})
+                }
+                "inspect" if closed == Some(bot) => json!({"name": bot, "closed_ms": 1}),
                 // Gated for the person, and one a reviewer still weighs.
                 "approvals" => json!({"approvals": [
                     {"bot": "calc.fix", "turn": 4, "call_id": "c1", "gates": ["manual"]},
@@ -38358,9 +38388,10 @@ mod tests {
         }
         fleet.layout.settle();
         assert_eq!(windowed(&fleet), ["calc.a", "calc.b"]);
-        // Each marks itself done as its turn ends.
+        // Each closes itself as its turn ends.
         for bot in ["calc.a", "calc.b"] {
-            let call = json!({"call_id": "c1", "name": resolved::TOOL, "arguments": "{}"});
+            let arguments = json!({"name": bot}).to_string();
+            let call = json!({"call_id": "c1", "name": resolved::TOOL, "arguments": arguments});
             fleet.event(&event(bot, "tool_started", call));
             fleet.event(&event(bot, "tool_completed", json!({"call_id": "c1"})));
             fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
@@ -38370,7 +38401,7 @@ mod tests {
         // away; the other closes as it is done.
         assert_eq!(windowed(&fleet), ["calc.a"]);
         assert!(!fleet.doing.contains_key("calc.a"));
-        // Its lead marks it done again: still in use, it stays.
+        // Its lead closes it again: still in use, it stays.
         fleet.resolved("calc.a");
         fleet.layout.settle();
         assert_eq!(windowed(&fleet), ["calc.a"]);
@@ -38389,9 +38420,10 @@ mod tests {
                 .filter(|line| line.trim() == "✓ done")
                 .count()
         };
+        let closed = json!({"event": "closed", "bot": "b", "data": {}});
         // Not used since its turn began: its lead closes it as ever.
         app.daemon(turn_event("accepted", 3, json!({}))).await;
-        resolved::keep(&app.store(), "b", 3, "c1").unwrap();
+        app.daemon(closed.clone()).await;
         app.daemon(finished(3)).await;
         assert_eq!(app.kept.done(), DoneWindow::Lead);
         assert!(!app.kept.showing && !app.kept.closing);
@@ -38401,7 +38433,7 @@ mod tests {
         app.daemon(turn_event("accepted", 5, json!({}))).await;
         app.kept.used = Some(Instant::now());
         app.kept.focused = Some(true);
-        resolved::keep(&app.store(), "b", 5, "c2").unwrap();
+        app.daemon(closed.clone()).await;
         app.daemon(finished(5)).await;
         assert!(app.kept.showing && !app.kept.closing);
         assert_eq!(done(&mut app), 1);
@@ -38421,18 +38453,17 @@ mod tests {
         app.daemon(finished(7)).await;
         assert!(!app.kept.closing);
         assert_eq!(done(&mut app), 1);
-        // Its lead marks it done at rest while the person is away: it
-        // closes as soon as it hears.
+        // Its lead closes it at rest while the person is away: it closes
+        // as soon as it hears.
         app.kept.focused = Some(false);
-        resolved::keep(&app.store(), "b", 7, "c3").unwrap();
-        app.done_resting(true);
+        app.daemon(closed.clone()).await;
         assert!(app.kept.closing);
         assert_eq!(done(&mut app), 1);
-        // One that marked itself done and then failed stays to be looked
-        // at, as its lead leaves it.
+        // One that closed itself and then failed stays to be looked at, as
+        // its lead leaves it.
         app.kept.closing = false;
         app.daemon(turn_event("accepted", 9, json!({}))).await;
-        resolved::keep(&app.store(), "b", 9, "c4").unwrap();
+        app.daemon(closed.clone()).await;
         app.daemon(turn_event(
             "turn_finished",
             9,
@@ -38459,7 +38490,7 @@ mod tests {
         app.done_at(9);
         assert!(!app.kept.closing && app.kept.settled != Some(9));
         app.kept.reopened = false;
-        // Opened on a task at rest: a mark it already had changes nothing,
+        // Opened on a task at rest: a close it already had changes nothing,
         // one its lead makes after is heard.
         app.kept = Kept::default();
         app.rested(Some(9));
@@ -38468,117 +38499,59 @@ mod tests {
         app.done_resting(true);
         assert!(!app.kept.closing);
         app.kept = Kept::default();
+        app.own_closed = false;
         app.rested(Some(13));
         app.kept.used = Some(Instant::now());
         app.kept.focused = Some(false);
-        resolved::keep(&app.store(), "b", 13, "c5").unwrap();
-        app.done_resting(true);
+        app.daemon(closed).await;
         assert!(app.kept.closing);
     }
 
     #[tokio::test]
-    async fn a_lead_marks_itself_done_and_an_outer_lead_names_a_lead() {
-        // The tool host keeps each mark before answering; the windows show
-        // them.
-        let client = daemon_answering(|asked| match asked["op"].as_str() {
-            Some("turns") if asked["bot"] == "web.lead" => {
-                json!({"turns": [{"turn": 7, "status": "completed", "finished_ms": 1}]})
-            }
-            _ => json!({"turns": []}),
-        })
-        .await;
-        let dir = std::env::temp_dir().join(unique("sonny-lead-done"));
-        let store = dir.join("store");
-        let mark = |caller: &'static str, by: &'static str, turn, call, arguments: Value| {
-            let (client, store) = (client.clone(), store.clone());
-            async move { resolved::mark(&client, &store, (caller, by), (turn, call), &arguments).await }
-        };
-        let mut app = app(client.clone());
+    async fn a_lead_closed_by_itself_or_elsewhere_sets_its_questions_aside() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
         app.bot = "calc.lead".into();
         app.project = Some("calc".into());
-        app.options.store = store.clone();
-        // Naming no task, a lead marks itself, up to the turn that marks
-        // it, its own open question set aside.
+        // Closing itself, by its own name alone, a lead sets its own open
+        // question aside.
         app.asked("q1", Some(11), &json!({"question": "Tag it?"}));
         assert_eq!(app.asks.len(), 1);
-        mark("calc.lead", "calc.lead", 12, "c1", json!({}))
-            .await
-            .unwrap();
-        app.resolve(&json!({}), Some(12), true);
-        assert_eq!(resolved::read(&app.store(), "calc.lead"), Some(12));
+        app.resolve(
+            resolved::TOOL,
+            &json!({"name": "calc.lead"}),
+            Some(12),
+            true,
+        );
         assert!(app.asks.is_empty());
         assert_eq!(app.aside.len(), 1);
-        // Another lead's name is that lead, never this one.
-        let said = mark(
-            "shop.web.lead",
-            "shop.web.lead",
-            14,
-            "c4",
-            json!({"task": "web.lead"}),
-        );
-        assert_eq!(said.await.unwrap(), "Marked web.lead done.");
-        assert_eq!(resolved::read(&store, "shop.web.lead"), None);
-        // An outer lead names a lead as it is, up to its newest turn ended,
-        // with no window open.
-        let said = mark(
-            "calc.lead",
-            "calc.lead",
-            13,
-            "c2",
-            json!({"task": "web.lead"}),
-        );
-        assert_eq!(said.await.unwrap(), "Marked web.lead done.");
-        assert_eq!(resolved::read(&store, "web.lead"), Some(7));
-        assert_eq!(resolved::read(&store, "calc.web.lead"), None);
-        // A side chat marks the lead it came from up to that lead's newest
-        // turn ended, not the side chat's own turn.
-        let side = dir.join("side-store");
-        resolved::mark(
-            &client,
-            &side,
-            ("web.lead", "web.lead.side-1a"),
-            (20, "c3"),
-            &json!({}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resolved::read(&side, "web.lead"), Some(7));
-        // A task marks only itself.
-        let other = mark(
-            "calc.fix",
-            "calc.fix",
-            21,
-            "c5",
-            json!({"task": "calc.web"}),
-        );
-        assert!(other.await.unwrap_err().contains("marks only itself"));
-        mark("calc.fix", "calc.fix", 21, "c6", json!({}))
-            .await
-            .unwrap();
-        assert_eq!(resolved::read(&store, "calc.fix"), Some(21));
-        // That lead's own window sets aside its questions the mark covers,
-        // not one asked after.
+        // Closing another, or itself among others, sets none aside.
+        app.asked("q2", Some(13), &json!({"question": "Ship it?"}));
+        app.resolve(resolved::TOOL, &json!({"name": "calc.fix"}), Some(14), true);
+        let both = json!({"names": ["calc.lead", "calc.fix"]});
+        app.resolve(resolved::TOOL, &both, Some(14), true);
+        assert_eq!(app.asks.len(), 1);
+        // Closed elsewhere, by whoever made it: its window sets its
+        // questions aside too, once while it stays closed.
         app.bot = "web.lead".into();
         app.project = Some("web".into());
         app.aside.clear();
-        app.asked("q2", Some(5), &json!({"question": "Ship it?"}));
-        app.asked("q3", Some(9), &json!({"question": "And the docs?"}));
         app.done_elsewhere();
+        assert_eq!(app.asks.len(), 1, "open: nothing set aside");
+        app.daemon(json!({"event": "closed", "bot": "web.lead", "data": {}}))
+            .await;
+        app.done_elsewhere();
+        assert!(app.asks.is_empty());
         assert_eq!(app.aside.len(), 1);
-        assert_eq!(app.asks.len(), 1);
-        assert_eq!(asks::turn_of(&app.asks[0].id), Some(9));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn a_resolved_tasks_old_question_stays_set_aside_after_a_restart() {
-        let (client, events) = project_waiting().await;
+        // The lead closed it after the turn that asked.
+        let (client, events) = project_waiting_closed(Some("calc.ask")).await;
         let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
         let dir = std::env::temp_dir().join(unique("sonny-resolved-needs"));
         fleet.store = dir.join("store");
-        // The lead resolved it past the turn that asked.
-        std::fs::create_dir_all(dir.join("store.resolved")).unwrap();
-        std::fs::write(dir.join("store.resolved/calc.ask.json"), r#"{"turn": 5}"#).unwrap();
         fleet.reconcile().await;
         while !fleet.unread.is_empty() {
             fleet.rescan_through().await;
@@ -38607,7 +38580,7 @@ mod tests {
         let fleet = app.fleet.as_ref().unwrap();
         assert_eq!(fleet.doing["calc.ask"], "idle");
         assert_eq!(fleet.doing["calc.new"], "needs you");
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

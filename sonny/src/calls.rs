@@ -1224,16 +1224,6 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
             }
             Some(said)
         }
-        crate::resolved::TOOL => Some(Said {
-            verb: "Marked".into(),
-            what: match arguments["task"].as_str().map(str::trim) {
-                Some(task) if !task.is_empty() => format!("{task} done"),
-                _ => "this task done".into(),
-            },
-            under: Vec::new(),
-            failed,
-            output: None,
-        }),
         crate::plan::TOOL => {
             let steps: Vec<String> = arguments["steps"]
                 .as_array()?

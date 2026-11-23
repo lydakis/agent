@@ -552,8 +552,14 @@ class AgentToolsTests(ModelFixture):
         self.assertEqual(named['refused'], [{'bot': 'shop.gone', 'error': 'bot_not_found'}])
         self.assertEqual(client.finished(busy)['data']['status'], 'interrupted')
         self.assertNotIn('closed_ms', client.request('inspect', bot='shop.other')['result'])
-        # The tool never closes its own agent, named alone or in a list.
-        self.assertIn('not_permitted', self.output(client, 'shop.lead', 'close_agent-3'))
+        # Its own agent, named alone, is closed, and the turn asking runs
+        # on to its end: closed after it, until a turn of its starts.
+        own = json.loads(self.output(client, 'shop.lead', 'close_agent-3'))['closed'][0]
+        self.assertEqual((own['bot'], own['was_open']), ('shop.lead', True), own)
+        self.assertNotIn('stopped_turn', own)
+        self.assertTrue(client.request('inspect', bot='shop.lead')['result']['closed_ms'])
+        again = client.request('submit', bot='shop.lead', request_id='reopen', prompt='hi')['result']['message']
+        client.finished(again)
         self.assertNotIn('closed_ms', client.request('inspect', bot='shop.lead')['result'])
         # `*` is a pattern: a person's connection closes every open bot.
         every = client.request('close', bot='*')['result']

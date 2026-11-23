@@ -1899,14 +1899,14 @@ fn task_news(task: &str, from: &str) -> String {
         return format!("{from} wrote in {task}");
     };
     if did.starts_with("replied") || did.starts_with("ended") {
-        // "replied to the person, completed, marked done"
+        // "replied to the person, completed, closed itself"
         let mut said = did.split(", ").skip(1);
         let status = said.next().unwrap_or_default();
         let status = match status.split(':').next().unwrap_or_default() {
             "completed" => "finished",
             status => status,
         };
-        return match said.any(|part| part == "marked done") {
+        return match said.any(|part| part == "closed itself") {
             true => format!("{task} {status}, done"),
             false => format!("{task} {status}"),
         };
@@ -4319,7 +4319,7 @@ mod tests {
              (their words are quoted below, from shop.docs/2)\n\
              [tasks · shop.api · shop.fix]\n\
              look at the schema\n\
-             [tasks · shop.web · shop.web replied to the person, completed, marked done]\n\
+             [tasks · shop.web · shop.web replied to the person, completed, closed itself]\n\
              shipped\n\
              [slack · deploys · ana]\n\
              ship it?\n\

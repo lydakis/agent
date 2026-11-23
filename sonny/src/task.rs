@@ -555,10 +555,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         (Some(store), Ok(home)) if made && place.dir.starts_with(home.join(".agent/worktrees")) => {
             let socket = env_of(start, "AGENT_SOCKET").map(PathBuf::from);
             match crate::daemon_paths(Some(store.clone()), socket) {
-                Ok((store, socket)) => {
-                    let call = env_of(start, "AGENT_CALL").unwrap_or_default();
-                    make_room(name, (&store, &socket), keep, &call)
-                }
+                Ok((store, socket)) => make_room(name, (&store, &socket), keep),
                 Err(_) => Vec::new(),
             }
         }
@@ -2091,20 +2088,19 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
-/// A `remove_task` call: mark the task done, as `mark_done` does, and
+/// A `remove_task` call: close the task, done, as `close_agent` does, and
 /// remove the worktree Sonny made it, once its changes are committed, its
 /// branch kept unless merged; a folder of its own only with `discard`, once
 /// the task says its work is pushed. `discard` removes them anyway. The
 /// agent and its history stay: only the person deletes those, by hand. A
 /// task still working is left as it is. For a task no longer there, removes
-/// the folder it left. Says what was done and what was kept; the mark is
-/// kept beside `store`, made by the call `call`, and the daemon asked is
-/// the one at `store` and `socket`.
+/// the folder it left. Says what was done and what was kept; it is closed
+/// first, so it is done, on the daemon at `store` and `socket`.
 pub fn remove(
     here: &Path,
     name: &str,
     discard: bool,
-    (store, socket, call): (&Path, &Path, &str),
+    (store, socket): (&Path, &Path),
 ) -> Result<String, String> {
     let agent = crate::agent_bin_or_missing()?;
     let branch = format!("agent/{name}");
@@ -2176,12 +2172,13 @@ pub fn remove(
         return Err(busy(name, turn["turn"].as_i64().unwrap_or(0)));
     }
     // Done first, so a removal cut short leaves a task done, which a call
-    // again tidies.
-    if let Some(turns) = &turns {
-        crate::resolved::keep(store, name, crate::resolved::upto(turns, i64::MAX), call)?;
+    // again tidies: closed, by its identity, so one made again under the
+    // name is left open.
+    if let Some(bot) = &bot {
+        close(&agent, (store, socket), name, bot["bot_id"].as_i64())?;
     }
     let did = |what: &str| match turns {
-        Some(_) => format!("Marked {name} done and {what} its"),
+        Some(_) => format!("Closed {name} and {what} its"),
         None => format!("{} {name}'s", capitalized(what)),
     };
     if let Some((repo, path)) = &worktree {
@@ -2230,7 +2227,7 @@ pub fn remove(
         return Ok(format!("{} folder.", did("deleted")));
     }
     match turns {
-        Some(_) => Ok(format!("Marked {name} done.")),
+        Some(_) => Ok(format!("Closed {name}.")),
         None => Err(format!("no task or folder of a task is named {name}")),
     }
 }
@@ -2379,12 +2376,12 @@ fn prune(
 /// Room for the folder Sonny just made the task `new`, as Codex's app
 /// keeps its newest worktrees: past `keep` task folders on the daemon at
 /// `store` and `socket`, the least recently active are removed as
-/// `remove_task` removes them, made by the call `call`, until `keep` are
+/// `remove_task` removes them, until `keep` are
 /// left with `new`'s. Never one working, with a call waiting on its
 /// verdict or a question open, with uncommitted
 /// changes or submodules, of its own, or another daemon's: the next is
 /// taken instead, and with none, nothing is. The names removed.
-fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) -> Vec<String> {
+fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64) -> Vec<String> {
     let Ok(home) = home_dir() else {
         return Vec::new();
     };
@@ -2461,7 +2458,7 @@ fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) 
                     }
                     let last = bot["last"]["turn"].as_i64();
                     match runtime.block_on(crate::needs::scan(&client, &task.name, last)) {
-                        Some(seen) => seen.open(store, &task.name, false).is_some(),
+                        Some(seen) => seen.open(crate::resolved::closed(bot), false).is_some(),
                         // Unread, it may be waiting on the person.
                         None => true,
                     }
@@ -2471,7 +2468,7 @@ fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) 
                     let here = (source_of(&task.name))
                         .or_else(|| repository_of_worktree(&path))
                         .ok_or_else(|| format!("{}: no repository", task.name))?;
-                    remove(&here, &task.name, false, (store, socket, call)).map(drop)
+                    remove(&here, &task.name, false, (store, socket)).map(drop)
                 };
                 let removed = prune(found, room, &mut asks, &mut take);
                 runtime.block_on(client.close());
@@ -2611,6 +2608,50 @@ fn messages_of(
             said.trim()
         )),
     }
+}
+
+/// Close `name`, the agent known as `id` when given, as `agent close` at
+/// `daemon` closes it: done, its history kept.
+fn close(
+    agent: &Path,
+    (store, socket): (&Path, &Path),
+    name: &str,
+    id: Option<i64>,
+) -> Result<(), String> {
+    let mut command = Command::new(agent);
+    command.args(["close", "--bot", name]);
+    if let Some(id) = id {
+        command.args(["--bot-id", &id.to_string()]);
+    }
+    let output = command
+        .env("AGENT_STORE", store)
+        .env("AGENT_SOCKET", socket)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", agent.display()))?;
+    match output.status.success() {
+        true => Ok(()),
+        false => Err(format!(
+            "{name} could not be closed, so nothing was removed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// The task `task` names in full, for the lead of `project`: a name past
+/// the project's, or whole, or a lead's, which no task has, as it is. None
+/// for an empty name or one with a `/`.
+pub fn named(task: &str, project: &str) -> Option<String> {
+    let task = task.trim();
+    if task.is_empty() || task.contains('/') {
+        return None;
+    }
+    Some(
+        match task.starts_with(&format!("{project}.")) || crate::project::is_lead(task) {
+            true => task.to_owned(),
+            false => format!("{project}.{task}"),
+        },
+    )
 }
 
 /// `name` as `agent ls` at `daemon` lists it, none when it is not there.

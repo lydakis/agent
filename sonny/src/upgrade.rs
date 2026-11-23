@@ -254,6 +254,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::board::WORK_FOLLOWS_CLOSE,
         retire: "0.12.0",
     },
+    // Done is closed: a task `mark_done` marked, and nothing reopened
+    // since, is closed; the marks stay where they are (after 0.10.5).
+    Migration {
+        id: crate::resolved::MARKS_CLOSE,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -299,9 +305,10 @@ fn migrate_from_listing(
     let left = |record: &Path| {
         let nested = !done(record, crate::approvals::NESTED_GONE);
         let projects = (migrated.as_ref()).is_some_and(|it| !done(it, crate::commons::PROJECTS));
-        (nested, projects)
+        let marks = !done(record, crate::resolved::MARKS_CLOSE);
+        (nested, projects, marks)
     };
-    if left(&record) == (false, false) {
+    if left(&record) == (false, false, false) {
         return None;
     }
     let Ok(Some(held)) = crate::scheduler::locked(&lock(&record)) else {
@@ -309,8 +316,8 @@ fn migrate_from_listing(
     };
     // Read again under the lock: a window that held it may have just
     // finished them.
-    let (nested, projects) = left(&record);
-    if !nested && !projects {
+    let (nested, projects, marks) = left(&record);
+    if !nested && !projects && !marks {
         return None;
     }
     let store = store.to_path_buf();
@@ -337,6 +344,10 @@ fn migrate_from_listing(
         if nested {
             crate::approvals::nested_gone(&client, &bots, &store).await;
         }
+        // A task marked done, and opened by nothing since, is closed.
+        if marks && crate::resolved::marks_close(&client, &store, &bots).await {
+            once(&beside(&store), crate::resolved::MARKS_CLOSE, || true);
+        }
         if let Some(named) = named {
             let _ = named.await;
         }
@@ -344,7 +355,16 @@ fn migrate_from_listing(
 }
 
 /// What the migrations read of each agent the daemon lists.
-const LISTED: [&str; 5] = ["name", "bot_id", "workspace", "created_by", "created_by_id"];
+const LISTED: [&str; 8] = [
+    "name",
+    "bot_id",
+    "workspace",
+    "created_by",
+    "created_by_id",
+    "running_turn",
+    "last",
+    "closed_ms",
+];
 
 /// Every agent the daemon lists, with only what the migrations read of
 /// each ([`LISTED`]), each page let go once read; none when a page could
@@ -536,7 +556,7 @@ mod tests {
         assert_eq!(
             bots[2],
             json!({"name": "p.c", "bot_id": 4, "workspace": "/w", "created_by": "p.lead",
-                "created_by_id": 1})
+                "created_by_id": 1, "last": {"turn": 3, "status": "done"}})
         );
     }
 

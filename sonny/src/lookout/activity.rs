@@ -50,7 +50,10 @@ pub const FIELDS: [(&str, &str); 15] = [
         "status",
         "string, how a turn ended: completed, failed, stopped or interrupted",
     ),
-    ("done", "boolean, the task marked itself done in the turn"),
+    (
+        "done",
+        "boolean, the task closed itself in the turn: it is done",
+    ),
     (
         "asked_by",
         "string, who asked for the turn: \"you\", \"the person\", an agent's name, \"automation\" or a client",
@@ -145,7 +148,7 @@ pub struct Activity {
     /// The node of the subscriber's latest message to each task, until
     /// the person writes to it.
     briefs: HashMap<String, i64>,
-    /// Turns that resolved their task.
+    /// Turns that closed their task.
     resolving: crate::resolved::Own,
     /// Margin calls under way: the note's id and whether it goes.
     margin_calls: HashMap<(String, String), (String, bool)>,
@@ -614,7 +617,7 @@ pub fn built(lead: &str, pending: &Pending, read: Read) -> Option<Event> {
                 from.push_str(&format!(": {error}"));
             }
             if *done {
-                from.push_str(", marked done");
+                from.push_str(", closed itself");
             }
             Some(event(
                 task,
@@ -992,9 +995,10 @@ mod tests {
     }
 
     #[test]
-    fn a_task_marked_done_says_so() {
+    fn a_task_that_closed_itself_says_so() {
         let mut activity = Activity::new("calc.lead");
-        let call = json!({"name": crate::resolved::TOOL, "call_id": "d", "arguments": "{}"});
+        let call = json!({"name": crate::resolved::TOOL, "call_id": "d",
+            "arguments": "{\"name\":\"calc.docs\"}"});
         activity.event(&ev("calc.docs", 3, "tool_started", call), None, 1);
         activity.event(
             &ev("calc.docs", 3, "tool_completed", json!({"call_id": "d"})),
@@ -1022,7 +1026,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             made.from.as_deref(),
-            Some("calc.docs replied, completed, marked done")
+            Some("calc.docs replied, completed, closed itself")
         );
         assert_eq!(made.fields["done"], true);
     }

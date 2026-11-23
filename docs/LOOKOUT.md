@@ -267,7 +267,7 @@ The built-in `tasks` source tells a follower what happens in the bots its follow
 | `type` | When it fires | `from` in header | Text |
 | --- | --- | --- | --- |
 | `wrote` | Someone other than the follower writes in a watched bot | `the person`, or the agent or program that wrote | The person's words, quoted by the daemon under the note; anyone else's as they wrote them |
-| `turn.ended` | A turn ends | `TASK replied to WHO, STATUS`, or `ended` when it said nothing, then `: error` and `, marked done` where so; no `to WHO` when the follower asked | What the task replied |
+| `turn.ended` | A turn ends | `TASK replied to WHO, STATUS`, or `ended` when it said nothing, then `: error` and `, closed itself` where it closed itself; no `to WHO` when the follower asked | What the task replied |
 | `question` | A task asked the person with the `ask` tool, once the call ran | `TASK asked the person` | The question and its numbered options, or the line it asked them to run |
 | `approval` | A call only the person can approve starts to wait, once a turn | `TASK waits for the person's approval` | The command, or the call and its arguments |
 | `margin` | A task put or took away a margin note | `TASK put the margin note "ID"`, or `took … away` | `TASK/ID`, which the margin tool shows |
