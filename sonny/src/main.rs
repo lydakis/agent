@@ -22238,8 +22238,10 @@ impl App {
 
     /// Drawn in another's pane, that one told when this window comes to
     /// hold work ending it would lose, or none now: words not sent, a
-    /// command of the person's still running (its result goes to the
-    /// agent from here), or an agent in its own pane, shown, put aside or
+    /// write to the daemon not yet done and applied (a message sent, whose
+    /// words come back here if it is refused), a picture or file still
+    /// being made ready, a command of the person's still running (its
+    /// result goes to the agent from here), or an agent in its own pane, shown, put aside or
     /// kept to go back to, that holds such. It keeps this Sonny running
     /// while out of view only then.
     fn tell_keeps(&mut self) {
@@ -22250,6 +22252,10 @@ impl App {
         let keeps = !self.input.trim().is_empty()
             || !self.quotes.is_empty()
             || self.shell.is_some()
+            || !self.writes.is_empty()
+            || self.sending > 0
+            || !self.preparing.is_empty()
+            || !self.fetching.is_empty()
             || panes
                 .chain(self.closed.as_ref().map(|(pane, _)| pane))
                 .any(pane::Pane::keeps);
@@ -27131,6 +27137,14 @@ mod tests {
         app.tell_keeps();
         assert!(app.told_keeps);
         app.input.clear();
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // A write not yet done and applied keeps it, as a message sent
+        // whose words come back if it is refused.
+        app.write(async { Wrote::Said(None) });
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.beside_done().await;
         app.tell_keeps();
         assert!(!app.told_keeps);
         // So does an agent in its own pane that holds such work.
