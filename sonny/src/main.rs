@@ -8880,7 +8880,7 @@ impl App {
             task_asks_read: None,
             hub_asks: 0,
             follows: Follows::default(),
-            own_closed: false,
+            own_closed: resolved::closed(&record),
             closed_aside: false,
             kept: Kept::default(),
             task_needs: Default::default(),
@@ -38450,6 +38450,18 @@ mod tests {
         fleet.resolved("calc.a");
         fleet.layout.settle();
         assert_eq!(windowed(&fleet), ["calc.a"]);
+    }
+
+    #[tokio::test]
+    async fn a_window_opened_on_a_task_that_closed_itself_mid_turn_knows_it_is_closed() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut open = app(client.clone());
+        assert!(!open.own_closed);
+        // Its closing turn still runs: the record says closed, and its end
+        // finds it done.
+        let record = json!({"name": "b", "closed_ms": 1, "running_turn": 3});
+        let options = std::mem::replace(&mut open.options, app(client.clone()).options);
+        assert!(App::new(client, "b", &record, options).own_closed);
     }
 
     #[tokio::test]
