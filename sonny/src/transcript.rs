@@ -2084,7 +2084,34 @@ pub fn reply(text: &str, width: usize, folder: &std::path::Path) -> Vec<Line<'st
         true => (Line::from("  "), Line::from("  ")),
         false => (Line::from("• "), Line::from("  ")),
     };
-    markdown(&mut Markdown::in_folder(folder), text, width, leads)
+    let rows = markdown(&mut Markdown::in_folder(folder), text, width, leads);
+    match shows_nothing(&rows) {
+        true => Vec::new(),
+        false => rows,
+    }
+}
+
+/// Whether `c` shows nothing where it is drawn: whitespace, or a format
+/// character such as a zero-width space or joiner, a word joiner, a soft
+/// hyphen or a byte order mark.
+pub fn unseen(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '\u{AD}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
+        )
+}
+
+/// Whether a reply's `rows` show nothing past the two columns each opens
+/// with: what an HTML comment, or characters that show nothing, draw. Such
+/// a reply is no reply, as an empty one is: no `↳` or `└` hangs on nothing.
+pub fn shows_nothing(rows: &[Line<'static>]) -> bool {
+    (rows.iter()).all(|row| {
+        (row.spans.iter())
+            .flat_map(|span| span.content.chars())
+            .skip(2)
+            .all(unseen)
+    })
 }
 
 /// Markdown as every surface draws it, the one way it is drawn: the

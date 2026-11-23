@@ -12771,6 +12771,10 @@ impl App {
     /// The bot's words at `node`, as replayed: a reply's, which a turn's
     /// hints hang on, or a step's, which has none.
     fn commit_words(&mut self, node: i64, lines: Vec<Line<'static>>, reply: bool) {
+        // Words that draw nothing wear no hints, and tag no row of another's.
+        if lines.is_empty() {
+            return;
+        }
         let count = lines.len();
         match reply.then(|| self.came_row()).flatten() {
             Some((came, buttons)) => {
@@ -13762,12 +13766,17 @@ impl App {
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
-                        if !reply.is_empty() && !(aside && self.zen.is_some()) {
-                            let lines = transcript::reply(
+                        // A reply that draws nothing, as an HTML comment,
+                        // is no reply: no `↳` or `└` hangs on nothing.
+                        let lines = match reply.is_empty() || (aside && self.zen.is_some()) {
+                            true => Vec::new(),
+                            false => transcript::reply(
                                 &reply,
                                 self.prose(),
                                 std::path::Path::new(&self.workspace),
-                            );
+                            ),
+                        };
+                        if !lines.is_empty() {
                             said = Some((node, lines));
                             self.dated(node, &item);
                             if !older {
@@ -25824,9 +25833,10 @@ fn quiet_message(text: &str) -> bool {
 /// daemon adds after them naming who sent it and when, or the `[Sent …]`
 /// line an older Sonny stored with them.
 /// Whether `words` are only whitespace, as Codex draws no such reply, or
-/// zero-width spaces, which models send for an empty reply.
+/// zero-width spaces and other characters that show nothing, which models
+/// send for an empty reply.
 fn blank(words: &str) -> bool {
-    words.chars().all(|c| c.is_whitespace() || c == '\u{200B}')
+    words.chars().all(transcript::unseen)
 }
 
 fn text(item: &Value) -> String {
@@ -29433,6 +29443,79 @@ mod tests {
         // The person's message keeps its number too; the reply has none.
         assert_eq!(app.screen.numbered(1).as_deref(), Some("b/1"));
         assert_eq!(app.screen.numbered(2), None);
+    }
+
+    /// Words only, turns another agent started, kept as the daemon keeps
+    /// them: replies that draw nothing (an HTML comment, a word joiner)
+    /// and one that says something, each turn a message from shop.fix.
+    #[tokio::test]
+    async fn a_reply_that_draws_nothing_hangs_no_row_on_nothing() {
+        let replies = [
+            "<!-- nothing new -->",
+            "\u{2060}",
+            "&#8203;",
+            "Shop's build is green.",
+        ];
+        let mut entries = Vec::new();
+        let mut nodes = Vec::new();
+        for (at, reply) in replies.iter().enumerate() {
+            let (turn, asked, said) = (at as i64 + 1, 2 * at as i64 + 1, 2 * at as i64 + 2);
+            entries.push(json!({"node": asked, "from": {"bot": "shop.fix"},
+                "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": format!("Build {turn} is done.")}]}}));
+            entries.push(
+                json!({"node": said, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": reply}]}}),
+            );
+            nodes.push(json!({"node": asked, "turn": turn}));
+            nodes.push(json!({"node": said, "turn": turn}));
+        }
+        nodes.reverse();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": nodes, "next_from": null}),
+            Some("prompts") => json!({"prompts": [{"turn": 1, "text": "Build 1 is done.",
+                "from": {"bot": "shop.fix", "turn": 1}}]}),
+            Some("history_items") => json!({"items": entries.iter()
+                .filter(|entry| asked["nodes"].as_array().into_iter().flatten()
+                    .any(|node| *node == entry["node"]))
+                .cloned()
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 100;
+        app.words_only = true;
+        app.history().await;
+        let rows: Vec<String> = (drawn(&mut app).into_iter())
+            .map(|row| row.trim_end().to_owned())
+            .filter(|row| !row.is_empty())
+            .collect();
+        // Only the reply that says something wears its `↳`.
+        assert_eq!(rows, ["↳ shop.fix", "• Shop's build is green."]);
+    }
+
+    #[test]
+    fn a_reply_of_what_shows_nothing_draws_no_row() {
+        let folder = std::path::Path::new("/");
+        for nothing in [
+            "<!-- nothing new -->",
+            "\u{2060}",
+            "\u{FEFF}\u{200D}",
+            "&#8203;",
+            "<br>",
+        ] {
+            assert!(
+                transcript::reply(nothing, 80, folder).is_empty(),
+                "{nothing:?}"
+            );
+        }
+        // Streamed, characters that show nothing are held as whitespace is.
+        assert!(blank("\u{2060}\u{AD}\u{FEFF}\n"));
+        assert!(!blank("\u{2060}ok"));
+        // A reply of a bullet's worth of words still draws.
+        assert_eq!(transcript::reply("-", 80, folder).len(), 1);
+        assert_eq!(transcript::reply("Ok.", 80, folder).len(), 1);
     }
 
     #[tokio::test]
