@@ -9468,6 +9468,7 @@ impl App {
             }
             self.pane_switched();
             self.tell_keeps();
+            self.settle_kept();
             self.side_closed();
             self.suggested_now().await;
             self.shell_ran().await;
@@ -22243,8 +22244,10 @@ impl App {
     /// being made ready, a command of the person's still running or its
     /// result not yet shown or sent (it goes to the agent from here, a
     /// refused one with the next message), a first message or a move
-    /// held for the next message, or an agent in its own pane, shown, put aside or
-    /// kept to go back to, that holds such. It keeps this Sonny running
+    /// held for the next message, a model, speed or permissions pick that
+    /// waits for no turn to run or still has to reach the agents it made,
+    /// or an agent in its own pane, shown, put aside or kept to go back to,
+    /// that holds such. It keeps this Sonny running
     /// while out of view only then.
     fn tell_keeps(&mut self) {
         if !self.options.embedded {
@@ -22262,12 +22265,28 @@ impl App {
             || !self.shown.is_empty()
             || self.send_after.is_some()
             || self.move_to.is_some()
+            || self.switch.is_some()
+            || self.pace.is_some()
+            || self.gating.is_some()
+            || self.spread.is_some()
             || panes
                 .chain(self.closed.as_ref().map(|(pane, _)| pane))
                 .any(pane::Pane::keeps);
         if keeps != self.told_keeps {
             self.told_keeps = keeps;
             embed::keeps(keeps);
+        }
+    }
+
+    /// Agents kept to go back or forward to that held work as they were
+    /// left, and hold none now, end as the rest did ([`pane::Pane::settle`]).
+    fn settle_kept(&mut self) {
+        let closed = self.closed.as_mut().map(|(pane, _)| pane);
+        for pane in [self.pane.as_mut(), self.under.as_mut(), closed]
+            .into_iter()
+            .flatten()
+        {
+            pane.settle();
         }
     }
 
@@ -27159,6 +27178,18 @@ mod tests {
         app.tell_keeps();
         assert!(app.told_keeps);
         app.unsent.clear();
+        app.tell_keeps();
+        assert!(!app.told_keeps);
+        // So does a model, speed or permissions pick waiting for the turn
+        // to end.
+        app.switch = Some(("gpt-6.2".into(), None));
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.switch = None;
+        app.gating = Some("auto");
+        app.tell_keeps();
+        assert!(app.told_keeps);
+        app.gating = None;
         app.tell_keeps();
         assert!(!app.told_keeps);
         // So does an agent in its own pane that holds such work.

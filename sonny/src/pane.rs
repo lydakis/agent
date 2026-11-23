@@ -292,12 +292,25 @@ impl Pane {
     /// One holding work ending it would lose keeps running
     /// ([`crate::embed::keeps`]).
     fn leave(mut self) -> Self {
+        self.end_unless_kept();
+        self
+    }
+
+    /// An agent's Sonny ended unless it holds work ending it would lose.
+    fn end_unless_kept(&mut self) {
         if self.agent.is_some()
             && !(self.program.as_ref()).is_some_and(crate::embed::Embedded::keeps)
         {
             self.program = None;
         }
-        self
+    }
+
+    /// Agents kept back or forward that held work as they were left, and
+    /// hold none now (sent, or emptied), end as the rest did.
+    pub fn settle(&mut self) {
+        for kept in self.back.iter_mut().chain(&mut self.forward) {
+            kept.end_unless_kept();
+        }
     }
 
     /// Whether a program here, shown or kept back or forward, holds work
@@ -1730,8 +1743,34 @@ mod tests {
         assert!(program.keeps());
         let mut drafted = Pane::program("docs", program);
         drafted.as_agent("shop.docs", false);
-        let fix = agent("fix").after(drafted);
+        let mut fix = agent("fix").after(drafted);
         assert!(fix.back[0].program.is_some() && !fix.back[0].asleep());
+        fix.settle();
+        assert!(!fix.back[0].asleep());
+        // Once it holds none (the words sent), it ends as the rest did.
+        let mut sent = portable_pty::CommandBuilder::new("sh");
+        sent.args([
+            "-c",
+            "printf '\\033]7700;keep=1\\033\\\\'; sleep 0.3; \
+             printf '\\033]7700;keep=0\\033\\\\'; exec sleep 30",
+        ]);
+        let program = crate::embed::Embedded::spawn(sent, 5, 20, || {}).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !program.keeps() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(program.keeps());
+        let mut drafted = Pane::program("docs", program);
+        drafted.as_agent("shop.docs", false);
+        let mut fix = agent("fix").after(drafted);
+        let program = fix.back[0].program.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while program.keeps() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!program.keeps());
+        fix.settle();
+        assert!(fix.back[0].asleep());
         // Anything else left behind is kept as it was.
         let card = Pane::card("/status", "esc close");
         assert!(!card.asleep() && !Pane::margin().asleep());
