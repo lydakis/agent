@@ -216,6 +216,42 @@ class AgentToolsTests(ModelFixture):
                                **{'from': {'bot': 'shop.lead', 'turn': turn}})
         self.assertTrue(again['result']['duplicate'], again)
 
+    def test_a_schema_shapes_the_reply_of_the_turn_a_spawn_or_a_message_starts(self):
+        schema = {'type': 'object', 'properties': {'verdict': {'type': 'string'}},
+                  'required': ['verdict'], 'additionalProperties': False}
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))
+
+        def asked(bot_text):
+            # The first request whose last user words are these.
+            while True:
+                request = self.model.requests.get(timeout=5)
+                users = [i for i in request['input'] if i.get('role') == 'user']
+                if users and users[-1]['content'][0]['text'] == bot_text:
+                    return request
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'review', 'message': 'judge it', 'schema': schema}))
+        made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
+        self.assertEqual(client.finished(int(made['handle'].rsplit('/', 1)[1]))['data']['status'], 'completed')
+        self.assertEqual(asked('judge it')['text']['format'],
+                         {'type': 'json_schema', 'name': 'output', 'schema': schema, 'strict': True})
+        # A message with a schema starts a turn of its own, after the one
+        # running, rather than joining it.
+        busy = client.request('submit', bot='shop.review', request_id='busy', prompt='wait')['result']['message']
+        self.run_calls(client, 'shop.lead', 'again',
+                       ('send_message', {'to': 'shop.review', 'message': 'judge again', 'schema': schema}))
+        sent = json.loads(self.output(client, 'shop.lead', 'send_message-1'))
+        message = int(sent['handle'].rsplit('/', 1)[1])
+        listed = {m['message']: m for m in client.request('messages', bot='shop.review', after=0)['result']['messages']}
+        self.assertEqual(listed[message]['delivery'], 'queue')
+        client.request('interrupt', bot='shop.review', turn=busy)
+        self.assertEqual(client.finished(message)['data']['status'], 'completed')
+        self.assertEqual(asked('judge again')['text']['format']['schema'], schema)
+        # Without one, the reply is free text, and a message steers.
+        self.run_calls(client, 'shop.lead', 'plain',
+                       ('send_message', {'to': 'shop.review', 'message': 'just say'}))
+        self.assertNotIn('text', asked('just say'))
+
     def test_a_whole_name_stays_whole_and_an_effort_asked_for_is_kept(self):
         client = self.client(TOOLS)
         client.request('create', bot='shop.lead', workspace=str(self.path), settings=grouped('shop.lead'))

@@ -355,6 +355,11 @@ class Model(http.server.BaseHTTPRequestHandler):
                             and i['call_id'].startswith('script-')),
                            default=0)
                 text = ''
+                if getattr(self.server, 'hold_script_at', None) == done:
+                    # The results of every round before it are stored; the
+                    # test kills the daemon while this request waits.
+                    self.server.script_held.set()
+                    self.server.script_release.wait(timeout=20)
                 if done < len(self.server.call_script):
                     step = self.server.call_script[done]
                     calls = step if isinstance(step, list) else [step]
@@ -3426,6 +3431,52 @@ class RuntimeTests(ModelFixture):
         outputs = {i['call_id']: i['output'] for i in history if i.get('type') == 'function_call_output'}
         self.assertIn('process_interrupted', outputs['script-0'])
         self.assertIn('after the crash', outputs['script-0.1'])
+
+    def test_each_call_takes_effect_once_whichever_side_of_it_the_daemon_dies(self):
+        # Two kills in one turn, each call appending its receipt: one while
+        # A runs (after its effect, before its result is stored), with B
+        # queued behind it and not started (a background command runs alone,
+        # in order); then one after C's result is stored, while the model
+        # answers. Every receipt must be there exactly once, and the model
+        # hears A's as unknown, B's and C's as they ran.
+        receipts = self.path / 'receipts'
+        self.model.call_script = [[('shell', {'command': 'echo A >> receipts; sleep 5'}),
+                                   ('shell', {'command': 'echo B >> receipts', 'background': True})],
+                                  ('shell', {'command': 'echo C >> receipts'})]
+        self.model.hold_script_at = 2
+        self.model.script_held, self.model.script_release = threading.Event(), threading.Event()
+
+        def lines():
+            return receipts.read_text().split() if receipts.exists() else []
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='receipts', prompt='script')['result']['message']
+        deadline = time.monotonic() + 3
+        while lines() != ['A'] and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(lines(), ['A'])
+        client.close(kill=True)
+        client = self.client('echo,shell')
+        self.assertTrue(self.model.script_held.wait(timeout=15))
+        self.assertEqual(sorted(lines()), ['A', 'B', 'C'])
+        client.close(kill=True)
+        self.model.script_release.set()
+        client = self.client('echo,shell')
+        self.assertEqual(client.finished(turn, timeout=15)['data']['status'], 'completed')
+        self.assertEqual(sorted(lines()), ['A', 'B', 'C'])
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        completed = [e['data'] for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
+        self.assertEqual(sorted(c['call_id'] for c in completed), ['script-0', 'script-0.1', 'script-1'])
+        unknown = {c['call_id'] for c in completed if c.get('outcome_unknown')}
+        self.assertEqual(unknown, {'script-0'})
+        last = None
+        while not self.model.requests.empty():
+            last = self.model.requests.get_nowait()
+        outputs = {i['call_id']: i['output'] for i in last['input'] if i.get('type') == 'function_call_output'}
+        self.assertIn('process_interrupted', outputs['script-0'])
+        self.assertIn('may have had effects', outputs['script-0'])
+        self.assertNotIn('error', json.loads(outputs['script-0.1']))
+        self.assertEqual(json.loads(outputs['script-1'])['exit_code'], 0)
 
     def test_a_crash_during_a_tool_answers_it_and_continues_the_turn(self):
         client = self.client('echo,shell')
