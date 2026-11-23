@@ -13041,3 +13041,35 @@ build):
 A burst costs the agent one request: messages that arrive before its next
 request goes all go in that request, and those arriving while one runs go
 in the next. Nothing to change.
+
+## A network domain allowlist (#1334)
+
+2026-11-23. A bot with `domains` reaches the network only through a proxy
+that checks each host against its allow and deny patterns; a bot without
+them runs exactly as before. The checks sit on the shell and web_fetch
+path: a command or fetch of a bot without `domains` adds one empty-map
+lookup, and one with them adds a pattern match per host (time pattern
+length times host length, hosts past 255 bytes refused unmatched) and a
+loopback proxy shared by every bot naming the same list, held only while
+one of their commands or fetches runs.
+
+### Matched screen (perf gate's benches against main, Perf workflow on 375fdf0)
+
+| Bench | Measure | Main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.463 | 41.166 | -0.7% |
+| admission | burst submit p99, ms | 4.909 | 4.88 | -0.6% |
+| completion | release to terminal p99, ms | 12.296 | 12.628 | +2.7% |
+| footprint | idle RSS, MiB | 17.484 | 18.117 | +3.6% |
+| footprint | per idle bot, KiB | 1.814 | 1.816 | +0.1% |
+| footprint | RSS after a turn each, MiB | 36.65 | 36.162 | -1.3% |
+| footprint | CPU per turn, ms | 1.082 | 1.071 | -1.0% |
+| footprint | written to disk per turn, KiB | 51.598 | 50.988 | -1.2% |
+| lifecycle | CPU, s | 0.62 | 0.62 | +0.0% |
+| lifecycle | p95 turn, ms | 637.25 | 581.088 | -8.8% |
+| lifecycle | peak RSS, MiB | 27.084 | 27.223 | +0.5% |
+
+Store work per turn is unchanged, and every CPU, latency and memory
+measure is within the runner's noise. The 0.6 MiB of idle RSS is the
+larger binary (the proxy and its HTTP parsing); per idle bot is flat, so
+it does not grow with the fleet. Sonny's screens moved within noise too.
