@@ -140,6 +140,24 @@ pub const PROXY: &str = "--agent-run-as-proxy";
 /// connections on.
 pub const PROXY_FD: &str = "AGENT_PROXY_FD";
 
+/// Point `command`, a command run under `policy`, at its proxy when its
+/// domains name any, over any variable its bot's environment set: on
+/// macOS nothing runs between the sandbox and the command to set them
+/// last, and Seatbelt lets it reach the proxy alone, so an inherited
+/// `NO_PROXY` would leave a client no way out. On Linux the bridge sets
+/// them as the command starts.
+pub fn through_proxy(policy: &Policy, command: &mut tokio::process::Command) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if !policy.domains.is_empty() {
+        let port = loopback_proxy(&policy.domains)?;
+        command.envs(proxy_env(&format!("http://127.0.0.1:{port}")));
+        command.env_remove("NO_PROXY").env_remove("no_proxy");
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (policy, command);
+    Ok(())
+}
+
 /// The variables that point a command's HTTP clients at `proxy`, as Codex
 /// sets them.
 pub fn proxy_env(proxy: &str) -> Vec<(&'static str, String)> {
@@ -2612,7 +2630,7 @@ mod macos {
         if !policy.domains.is_empty() {
             let port = super::loopback_proxy(&policy.domains)?;
             profile = super::proxied(profile, port);
-            command.envs(super::proxy_env(&format!("http://127.0.0.1:{port}")));
+            super::through_proxy(policy, &mut command)?;
         }
         command.arg("-p").arg(profile);
         for (key, value) in params {
@@ -2899,6 +2917,32 @@ mod tests {
         let set = proxy_env("http://127.0.0.1:4321");
         assert!(set.contains(&("HTTPS_PROXY", "http://127.0.0.1:4321".to_owned())));
         assert!(set.contains(&("https_proxy", "http://127.0.0.1:4321".to_owned())));
+    }
+
+    /// On macOS a command's bot can't point it past its proxy: the proxy's
+    /// variables are set over its own, and no exclusion is kept.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_command_s_own_no_proxy_never_sends_it_past_its_proxy() {
+        let domains: BTreeMap<String, proxy::Access> =
+            [("only.example".to_owned(), proxy::Access::Allow)].into();
+        let daemon = Daemon::default();
+        let policy = Policy::new(Some(Mode::WorkspaceWrite), None, &[], true, &daemon)
+            .unwrap()
+            .unwrap()
+            .with_domains(&domains);
+        let mut command = tokio::process::Command::new("true");
+        command
+            .env("NO_PROXY", "*")
+            .env("HTTPS_PROXY", "http://elsewhere:1");
+        through_proxy(&policy, &mut command).unwrap();
+        let envs: BTreeMap<_, _> = command.as_std().get_envs().collect();
+        assert_eq!(envs[std::ffi::OsStr::new("NO_PROXY")], None);
+        let port = loopback_proxy(&domains).unwrap();
+        assert_eq!(
+            envs[std::ffi::OsStr::new("HTTPS_PROXY")],
+            Some(std::ffi::OsStr::new(&format!("http://127.0.0.1:{port}")))
+        );
     }
 
     /// The proxy on loopback serves one list, the same port each time.

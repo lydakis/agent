@@ -4678,6 +4678,9 @@ fn sh(
     for (name, value) in set {
         process.env(name, value);
     }
+    if let Some(policy) = sandbox {
+        crate::sandbox::through_proxy(policy, &mut process)?;
+    }
     // A sandboxed command reaches the daemon through its bot's own socket.
     if let Some(own) = sandbox.and_then(Policy::reach) {
         process.env("AGENT_SOCKET", own);

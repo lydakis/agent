@@ -34,6 +34,9 @@ pub const DOMAINS: usize = 256;
 /// The longest request head the proxy reads.
 const HEAD_BYTES: usize = 64 * 1024;
 
+/// The longest host name DNS has, `[` and `]` around an address aside.
+const HOST_BYTES: usize = 255;
+
 /// Whether `pattern` is one a bot may name, or why not.
 pub fn check(pattern: &str) -> std::result::Result<(), String> {
     let host = pattern
@@ -166,6 +169,11 @@ pub fn decide(
     domains: &std::collections::BTreeMap<String, Access>,
     host: &str,
 ) -> Result<(), Blocked> {
+    // No name past DNS's longest is matched: none could be reached, and
+    // matching one costs its length again for each of its labels.
+    if host.len() > HOST_BYTES {
+        return Err(Blocked::NotAllowed);
+    }
     let hit = |access| {
         (domains.iter())
             .filter(|(_, given)| **given == access)
@@ -487,6 +495,16 @@ mod tests {
             &format!("{}b.example.com", "a".repeat(60))
         ));
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_host_longer_than_any_name_is_refused_without_matching() {
+        let given = domains(&[("*.example.com", Access::Allow)]);
+        let host = format!("{}example.com", "a.".repeat(30_000));
+        let started = std::time::Instant::now();
+        assert_eq!(allowed(&given, &host), Err(Blocked::NotAllowed));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(allowed(&given, "a.example.com"), Ok(()));
     }
 
     #[test]
