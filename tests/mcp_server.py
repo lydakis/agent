@@ -10,7 +10,9 @@ whose events are the lines of the file $MCP_EVENTS names, the cursor how many
 it read (each poll's params appended to $MCP_POLLS when set); and
 `comment.created`, pushed, which takes a `document_id` and tells one comment
 on it at once (`bad` is refused). A request of the extension that does not
-say the client takes it is refused, as the extension says."""
+say the client takes it is refused, as the extension says. With
+$MCP_NO_TOOLS set too it offers events alone: no tools, and `tools/list`
+refused."""
 import json
 import os
 import sys
@@ -78,7 +80,7 @@ for line in sys.stdin:
     if request is None:
         continue
     if method == 'initialize':
-        capabilities = {'tools': {}}
+        capabilities = {} if os.environ.get('MCP_NO_TOOLS') else {'tools': {}}
         if EVENTS:
             capabilities['extensions'] = {EXTENSION: {}}
         send({'jsonrpc': '2.0', 'id': request, 'result': {
@@ -116,6 +118,8 @@ for line in sys.stdin:
                 'eventId': f'c-{document}', 'name': 'comment.created', 'timestamp': '2026-11-23T03:00:00Z',
                 'data': {'document_id': document, 'text': 'looks good'}, 'cursor': f's1-{document}',
                 '_meta': meta}})
+    elif method == 'tools/list' and os.environ.get('MCP_NO_TOOLS'):
+        send({'jsonrpc': '2.0', 'id': request, 'error': {'code': -32601, 'message': 'Method not found'}})
     elif method == 'tools/list':
         send({'jsonrpc': '2.0', 'id': request, 'result': {'tools': TOOLS}})
     elif method == 'tools/call':

@@ -36,7 +36,7 @@ use tokio::sync::mpsc::Sender;
 /// How long after a source's command exits it runs again, unless it says.
 const EVERY: Duration = Duration::from_secs(60);
 /// The longest line read from a source; the rest of a longer one is skipped.
-const LINE_BYTES: u64 = 64 * 1024;
+pub(crate) const LINE_BYTES: u64 = 64 * 1024;
 /// How much of an event's text a note carries, in characters, kept at
 /// both ends, the same for every source: the whole of almost any task's
 /// reply, so the subscriber need not read the turn again.

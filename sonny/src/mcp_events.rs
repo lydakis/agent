@@ -18,21 +18,25 @@
 //! apart at least, as the extension advises. Webhooks are not taken:
 //! they need an address the server can reach, which a laptop has not.
 //! Where each subscription stands, its cursor, is kept in
-//! `$SONNY_SOURCE_DIR`, so a restart misses nothing the server still
-//! holds; a new one starts from now, and tells nothing of the past.
+//! `$SONNY_SOURCE_DIR` a second behind, so a restart misses nothing the
+//! server still holds, and says again what the lookout may not have read,
+//! which it drops if it did; a new one starts from now, and tells nothing
+//! of the past.
 //!
 //! Each event is one line, with no `text`, so a follower reads it whole:
 //! `id` (the server's own, and the arguments when there are any, as two
 //! subscriptions may share one), `topic` (the event's name), `at`, `data`
-//! and `arguments`. A subscription the server refuses is a line on its
-//! topic saying why; one that says it skipped events is a line saying so.
+//! and `arguments`; one too long for the lookout goes without its data,
+//! saying so. A follow the `follows` tool can tell is wrong is refused
+//! there (`check_follow`). A subscription the server refuses is a line on
+//! its topic saying why; one that says it skipped events is a line saying so.
 //! A connection that breaks or a subscription the server ends stops the
 //! command with why, and the lookout runs it again, from where it stood.
 use crate::mcp::SOURCE;
 use rmcp::model::{ClientRequest, CustomNotification, CustomRequest};
 use rmcp::service::{NotificationContext, PeerRequestOptions, RoleClient};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -93,69 +97,139 @@ impl Asked {
     }
 }
 
+/// What a follow asks that cannot be subscribed to: the event's name,
+/// none for a follow of the source alone, and why.
+type Refusal = (Option<String>, String);
+
 /// What the follows in `wants` ask of the events `offered`: each
-/// subscription once, sorted by its key, and the events they name that
-/// the server does not offer.
-fn asked(wants: &Value, offered: &[Value]) -> (Vec<Asked>, Vec<String>) {
+/// subscription once, sorted by its key, and what they ask that cannot
+/// be, each once.
+fn asked(wants: &Value, offered: &[Value]) -> (Vec<Asked>, Vec<Refusal>) {
     let mut asked: BTreeMap<String, Asked> = BTreeMap::new();
-    let mut unknown: Vec<String> = Vec::new();
+    let mut refused: Vec<Refusal> = Vec::new();
     let offered: HashMap<&str, &Value> = (offered.iter())
         .filter_map(|event| Some((event["name"].as_str()?, event)))
         .collect();
     for follow in wants["follows"].as_array().into_iter().flatten() {
-        for arguments in argued(&follow["filter"]) {
-            let named: Vec<(String, Map<String, Value>)> = match follow["topics"].as_array() {
+        let topics: Option<Vec<&str>> = (follow["topics"].as_array())
+            .map(|topics| topics.iter().filter_map(Value::as_str).collect());
+        let sets = match argued(&follow["filter"]) {
+            Ok(sets) => sets,
+            Err(why) => {
+                match &topics {
+                    Some(topics) => (topics.iter())
+                        .for_each(|name| refused.push((Some((*name).to_owned()), why.clone()))),
+                    None => refused.push((None, why)),
+                }
+                continue;
+            }
+        };
+        for arguments in sets {
+            match &topics {
                 // Each event it names, with the arguments it names.
-                Some(topics) => (topics.iter())
-                    .filter_map(Value::as_str)
-                    .map(|name| (name.to_owned(), arguments.clone()))
-                    .collect(),
+                Some(topics) => {
+                    for name in topics {
+                        let Some(event) = offered.get(name) else {
+                            let why = "it offers no such event".to_owned();
+                            refused.push((Some((*name).to_owned()), why));
+                            continue;
+                        };
+                        if let Err(why) = (taken(event)).and(enough(event, &arguments)) {
+                            refused.push((Some((*name).to_owned()), why));
+                            continue;
+                        }
+                        let one = Asked {
+                            name: (*name).to_owned(),
+                            arguments: arguments.clone(),
+                        };
+                        asked.entry(one.key()).or_insert(one);
+                    }
+                }
                 // Every event its arguments are enough for, with those of
                 // them the event takes.
-                None => (offered.iter())
-                    .filter_map(|(name, event)| {
-                        let schema = &event["inputSchema"];
-                        let takes = |key: &str| schema["properties"].get(key).is_some();
+                None => {
+                    for (name, event) in &offered {
+                        let takes =
+                            |key: &str| event["inputSchema"]["properties"].get(key).is_some();
                         let given: Map<String, Value> = (arguments.iter())
                             .filter(|(key, _)| takes(key))
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect();
-                        let required = schema["required"].as_array();
-                        let enough = (required.into_iter().flatten())
-                            .filter_map(Value::as_str)
-                            .all(|key| given.contains_key(key));
-                        enough.then(|| ((*name).to_owned(), given))
-                    })
-                    .collect(),
-            };
-            for (name, arguments) in named {
-                if !offered.contains_key(name.as_str()) {
-                    unknown.push(name);
-                    continue;
+                        if taken(event).and(enough(event, &given)).is_err() {
+                            continue;
+                        }
+                        let one = Asked {
+                            name: (*name).to_owned(),
+                            arguments: given,
+                        };
+                        asked.entry(one.key()).or_insert(one);
+                    }
                 }
-                let one = Asked { name, arguments };
-                asked.entry(one.key()).or_insert(one);
             }
         }
     }
-    unknown.sort();
-    unknown.dedup();
-    (asked.into_values().collect(), unknown)
+    refused.sort();
+    refused.dedup();
+    (asked.into_values().collect(), refused)
 }
 
-/// The arguments a follow's `filter` names: one set for each choice of the
-/// exact values it lists under `arguments`, a key it matches otherwise
-/// being no argument; one empty set when it names none.
-fn argued(filter: &Value) -> Vec<Map<String, Value>> {
+/// Whether Sonny can take `event` as its server delivers it: by push or
+/// by poll, not by webhook alone.
+fn taken(event: &Value) -> Result<(), String> {
+    let modes = event["delivery"].as_array().into_iter().flatten();
+    match modes
+        .filter_map(Value::as_str)
+        .any(|mode| mode == "push" || mode == "poll")
+    {
+        true => Ok(()),
+        false => Err("the server delivers it only by webhook, which Sonny does not take".into()),
+    }
+}
+
+/// Whether `arguments` give every argument `event` requires.
+fn enough(event: &Value, arguments: &Map<String, Value>) -> Result<(), String> {
+    let required = event["inputSchema"]["required"]
+        .as_array()
+        .into_iter()
+        .flatten();
+    let missing: Vec<&str> = (required.filter_map(Value::as_str))
+        .filter(|key| !arguments.contains_key(*key))
+        .collect();
+    match missing.is_empty() {
+        true => Ok(()),
+        false => Err(format!(
+            "it takes {}: name the values in the filter, as {{\"arguments\": {{\"{}\": [\"VALUE\"]}}}}",
+            missing.join(", "),
+            missing[0]
+        )),
+    }
+}
+
+/// The arguments a follow's `filter` names: one set for each exact value
+/// it lists under `arguments`, a key it matches otherwise being no
+/// argument; one empty set when it names none. Several values go for one
+/// argument at most, so a follow subscribes to no more than the values
+/// it lists, not to every pairing of two lists.
+fn argued(filter: &Value) -> Result<Vec<Map<String, Value>>, String> {
+    let plain = |value: &Value| value.is_string() || value.is_number() || value.is_boolean();
+    let exact: Vec<(&String, &Vec<Value>)> = (filter["arguments"].as_object().into_iter())
+        .flatten()
+        .filter_map(|(key, values)| Some((key, values.as_array()?)))
+        .filter(|(_, values)| !values.is_empty() && values.iter().all(plain))
+        .collect();
+    let several: Vec<&str> = (exact.iter())
+        .filter(|(_, values)| values.len() > 1)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    if several.len() > 1 {
+        return Err(format!(
+            "the filter lists several values for {}: one argument at most takes several, \
+             or the follow would subscribe to every pairing of them; follow again for the others",
+            several.join(" and ")
+        ));
+    }
     let mut sets = vec![Map::new()];
-    for (key, values) in filter["arguments"].as_object().into_iter().flatten() {
-        let Some(values) = values.as_array() else {
-            continue;
-        };
-        let plain = |value: &Value| value.is_string() || value.is_number() || value.is_boolean();
-        if values.is_empty() || !values.iter().all(plain) {
-            continue;
-        }
+    for (key, values) in exact {
         sets = (sets.iter())
             .flat_map(|set| {
                 values.iter().map(move |value| {
@@ -166,15 +240,93 @@ fn argued(filter: &Value) -> Vec<Map<String, Value>> {
             })
             .collect();
     }
-    sets
+    Ok(sets)
 }
 
-/// Where each subscription stands, kept on disk as it moves.
+/// Whether a follow `add` may ask what it asks of the MCP servers' events
+/// it names, as far as each server's kept listing tells: why not, else.
+/// A server not yet listed is let be: its source says what it refuses.
+pub fn check_follow(add: &Value) -> Result<(), String> {
+    let mut asking: BTreeMap<&str, Option<Vec<Value>>> = BTreeMap::new();
+    for name in add["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let (source, topic) = crate::lookout::sources::named(name);
+        let Some(server) = server_of(source) else {
+            continue;
+        };
+        let topics = asking.entry(server).or_insert_with(|| Some(Vec::new()));
+        match (topic, topics.as_mut()) {
+            (Some(topic), Some(topics)) => topics.push(json!(topic)),
+            _ => *topics = None,
+        }
+    }
+    if asking.is_empty() {
+        return Ok(());
+    }
+    let Ok(config) = crate::kept::config() else {
+        return Ok(());
+    };
+    for (server, topics) in asking {
+        let Some(config) = config.sonny.mcp_servers.get(server) else {
+            continue;
+        };
+        let Some(known) =
+            (crate::mcp::cache_dir()).and_then(|cache| crate::mcp::kept(&cache, server, config))
+        else {
+            continue;
+        };
+        let wants = json!({"follows": [{"topics": topics, "filter": add["filter"]}]});
+        let (asked, refused) = asked(&wants, &known.events);
+        if let Some((name, why)) = refused.into_iter().next() {
+            return Err(match name {
+                Some(name) => format!("{SOURCE}{server}:{name}: {why}"),
+                None => format!("{SOURCE}{server}: {why}"),
+            });
+        }
+        if asked.is_empty() {
+            let offered: Vec<&str> = (known.events.iter())
+                .filter_map(|event| event["name"].as_str())
+                .collect();
+            return Err(format!(
+                "{SOURCE}{server} offers no event its filter's arguments are enough for; \
+                 it offers {}",
+                match offered.is_empty() {
+                    true => "none".to_owned(),
+                    false => offered.join(", "),
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where each subscription stands: in memory as it moves, and on disk
+/// `TRAIL` behind, so a run stopped before the lookout read the last
+/// lines it printed prints them again, and the lookout, which passes on
+/// an ID once, drops those it had.
 #[derive(Clone)]
 struct Cursors {
     file: PathBuf,
-    kept: Arc<Mutex<Map<String, Value>>>,
+    held: Arc<Mutex<Held>>,
 }
+
+#[derive(Default)]
+struct Held {
+    /// On disk.
+    kept: Map<String, Value>,
+    /// Where each stands now.
+    now: HashMap<String, Value>,
+    /// Where each moved to lately, and when, until it is kept.
+    moved: HashMap<String, VecDeque<(Instant, Value)>>,
+}
+
+/// How long a subscription stands at a cursor before it is kept: time for
+/// the lookout to read what was printed before it moved there.
+const TRAIL: Duration = Duration::from_secs(1);
 
 impl Cursors {
     fn read(dir: &Path) -> Cursors {
@@ -185,14 +337,20 @@ impl Cursors {
             .unwrap_or_default();
         Cursors {
             file,
-            kept: Arc::new(Mutex::new(kept)),
+            held: Arc::new(Mutex::new(Held {
+                kept,
+                ..Held::default()
+            })),
         }
     }
 
     /// Where `asked` stands: none to start from now.
     fn of(&self, asked: &Asked) -> Value {
-        let kept = self.kept.lock().unwrap();
-        kept.get(&asked.key()).cloned().unwrap_or(Value::Null)
+        let held = self.held.lock().unwrap();
+        let key = asked.key();
+        (held.now.get(&key).or_else(|| held.kept.get(&key)))
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 
     /// `asked` stands at `cursor` now, once what came before it is
@@ -201,12 +359,36 @@ impl Cursors {
         if !cursor.is_string() {
             return Ok(());
         }
-        let text = {
-            let mut kept = self.kept.lock().unwrap();
-            if kept.get(&asked.key()) == Some(cursor) {
+        {
+            let mut held = self.held.lock().unwrap();
+            let key = asked.key();
+            if held.now.get(&key) == Some(cursor) {
                 return Ok(());
             }
-            kept.insert(asked.key(), cursor.clone());
+            held.now.insert(key.clone(), cursor.clone());
+            (held.moved.entry(key).or_default()).push_back((Instant::now(), cursor.clone()));
+        }
+        self.keep()
+    }
+
+    /// Keep on disk where each subscription has stood `TRAIL` at least.
+    fn keep(&self) -> Result<(), String> {
+        let text = {
+            let mut held = self.held.lock().unwrap();
+            let Held { kept, moved, .. } = &mut *held;
+            let mut changed = false;
+            for (key, moves) in moved.iter_mut() {
+                while let Some((at, _)) = moves.front()
+                    && at.elapsed() >= TRAIL
+                {
+                    let (_, cursor) = moves.pop_front().unwrap();
+                    changed |= kept.insert(key.clone(), cursor.clone()).as_ref() != Some(&cursor);
+                }
+            }
+            moved.retain(|_, moves| !moves.is_empty());
+            if !changed {
+                return Ok(());
+            }
             Value::Object(kept.clone()).to_string()
         };
         let partial = self.file.with_extension("partial");
@@ -216,9 +398,28 @@ impl Cursors {
     }
 }
 
-/// Print `line` for the lookout, one event a line.
+/// Print `line` for the lookout, one event a line: one longer than the
+/// lookout reads goes without its `data`, and says so.
 fn print(line: &Value) {
-    println!("{line}");
+    println!("{}", fitted(line));
+}
+
+/// `line` as printed: without its `data` when it is too long for the
+/// lookout to read, saying so.
+fn fitted(line: &Value) -> String {
+    let text = line.to_string();
+    // The lookout reads a line and its newline in LINE_BYTES.
+    let most = crate::lookout::sources::LINE_BYTES as usize - 1;
+    if text.len() <= most || line.get("data").is_none() {
+        return text;
+    }
+    let mut cut = line.clone();
+    cut["data"] = Value::Null;
+    cut["cut"] = json!(format!(
+        "its data was {} bytes, more than a line holds; read it with the server's tools",
+        text.len()
+    ));
+    cut.to_string()
 }
 
 /// A line on `asked`'s topic saying the server skipped events it had.
@@ -236,6 +437,22 @@ fn refused(server: &str, asked: &Asked, why: &str) -> Value {
     asked.line(json!({"id": id, "text": format!(
         "{SOURCE}{server} refused to subscribe to {}: {why}", asked.key()
     )}))
+}
+
+/// A line saying a follow asks what cannot be subscribed to, and why: on
+/// the event's topic, or the source's when it names none.
+fn unasked(server: &str, (name, why): &Refusal) -> Value {
+    match name {
+        Some(name) => {
+            let asked = Asked {
+                name: name.clone(),
+                arguments: Map::new(),
+            };
+            refused(server, &asked, why)
+        }
+        None => json!({"id": format!("refused {why}"),
+            "text": format!("{SOURCE}{server} subscribes to nothing for a follow: {why}")}),
+    }
 }
 
 /// Why a request failed: the server's own refusal, which ends only that
@@ -299,19 +516,24 @@ async fn run(server: &str) -> Result<(), String> {
     let (said, mut heard) = tokio::sync::mpsc::unbounded_channel();
     // In this command's process group, so it stops when the lookout
     // stops the command.
-    let (client, _group, _stderr) = crate::mcp::open(config, Listener { said }, false).await?;
-    let peer = client.peer().clone();
-    if !crate::mcp::offers_events(&peer) {
-        return Err(format!("{server} offers no events"));
-    }
-    let offered = crate::mcp::list_events(&peer).await?;
-    let (asked, unknown) = asked(&wants, &offered);
-    for name in unknown {
-        let asked = Asked {
-            name,
-            arguments: Map::new(),
-        };
-        print(&refused(server, &asked, "it offers no such event"));
+    // Started and listed in the time the server is given to start, as
+    // the tool host starts it, so one that stalls fails the run.
+    let timeout = crate::mcp::start_timeout(config);
+    let started = async {
+        let (client, group, stderr) = crate::mcp::open(config, Listener { said }, false).await?;
+        let peer = client.peer().clone();
+        if !crate::mcp::offers_events(&peer) {
+            return Err(format!("{server} offers no events"));
+        }
+        let offered = crate::mcp::list_events(&peer).await?;
+        Ok(((client, group, stderr), peer, offered))
+    };
+    let ((client, _group, _stderr), peer, offered) = tokio::time::timeout(timeout, started)
+        .await
+        .map_err(|_| format!("{server} did not start in {}s", timeout.as_secs()))??;
+    let (asked, refusals) = asked(&wants, &offered);
+    for refusal in &refusals {
+        print(&unasked(server, refusal));
     }
     let cursors = Cursors::read(&dir);
     let delivery = |asked: &Asked| -> Vec<String> {
@@ -357,11 +579,9 @@ async fn run(server: &str) -> Result<(), String> {
                     heartbeat: None,
                 },
             );
-        } else if modes.iter().any(|mode| mode == "poll") {
-            polls.spawn(poll(server.to_owned(), peer.clone(), one, cursors.clone()));
         } else {
-            let why = "the server delivers it only by webhook, which Sonny does not take";
-            print(&refused(server, &one, why));
+            // `asked` took only what is pushed or polled.
+            polls.spawn(poll(server.to_owned(), peer.clone(), one, cursors.clone()));
         }
     }
     if streams.is_empty() && polls.is_empty() {
@@ -396,6 +616,7 @@ async fn run(server: &str) -> Result<(), String> {
                 }
             }
             _ = tick.tick() => {
+                cursors.keep()?;
                 for stream in streams.values() {
                     let Some(beat) = stream.heartbeat else {
                         continue;
@@ -562,8 +783,12 @@ mod tests {
             // A second follow of the same is one subscription.
             {"topics": ["comment.created"], "filter": {"arguments": {"document_id": ["D1"]}}},
             {"topics": ["nope"], "filter": null},
+            // Its required argument not given.
+            {"topics": ["comment.created"], "filter": null},
+            // Several values for two arguments.
+            {"topics": ["ci.failed"], "filter": {"arguments": {"repo": ["a", "b"], "branch": ["x", "y"]}}},
         ]});
-        let (asked, unknown) = asked(&wants, &offered());
+        let (asked, refused) = asked(&wants, &offered());
         let keys: Vec<String> = asked.iter().map(Asked::key).collect();
         assert_eq!(
             keys,
@@ -572,7 +797,17 @@ mod tests {
                 r#"comment.created {"document_id":"D2"}"#
             ]
         );
-        assert_eq!(unknown, ["nope"]);
+        let refused: Vec<(Option<&str>, &str)> = (refused.iter())
+            .map(|(name, why)| (name.as_deref(), &why[..why.len().min(14)]))
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                (Some("ci.failed"), "the filter lis"),
+                (Some("comment.created"), "it takes docum"),
+                (Some("nope"), "it offers no s")
+            ]
+        );
     }
 
     #[test]
@@ -599,15 +834,26 @@ mod tests {
 
     #[test]
     fn a_filter_s_arguments_are_only_its_exact_values() {
-        let sets = argued(&json!({"arguments": {"a": [1, 2], "b": [{"prefix": "x"}], "c": []}}));
+        let sets = argued(
+            &json!({"arguments": {"a": [1, 2], "b": [{"prefix": "x"}], "c": [], "d": [true]}}),
+        )
+        .unwrap();
         assert_eq!(
             sets,
             [
-                json!({"a": 1}).as_object().unwrap().clone(),
-                json!({"a": 2}).as_object().unwrap().clone()
+                json!({"a": 1, "d": true}).as_object().unwrap().clone(),
+                json!({"a": 2, "d": true}).as_object().unwrap().clone()
             ]
         );
-        assert_eq!(argued(&Value::Null), [Map::new()]);
+        assert_eq!(argued(&Value::Null).unwrap(), [Map::new()]);
+        // No more subscriptions than values listed: several values for
+        // two arguments would be every pairing.
+        let wide = json!({"arguments": {"a": [1, 2], "b": [3, 4]}});
+        assert!(
+            argued(&wide)
+                .unwrap_err()
+                .contains("several values for a and b")
+        );
     }
 
     #[test]
@@ -635,6 +881,22 @@ mod tests {
     }
 
     #[test]
+    fn an_event_too_long_for_the_lookout_goes_without_its_data_saying_so() {
+        let line = json!({"id": "e1", "topic": "t", "data": {"text": "x".repeat(70_000)}});
+        let printed: Value = serde_json::from_str(&fitted(&line)).unwrap();
+        assert_eq!(printed["id"], "e1");
+        assert_eq!(printed["data"], Value::Null);
+        assert!(
+            printed["cut"]
+                .as_str()
+                .unwrap()
+                .contains("more than a line holds")
+        );
+        let short = json!({"id": "e2", "data": {"text": "x"}});
+        assert_eq!(fitted(&short), short.to_string());
+    }
+
+    #[test]
     fn a_cursor_is_kept_on_disk_and_read_again() {
         let dir = std::env::temp_dir().join(format!("mcp-events-cursors-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -648,7 +910,16 @@ mod tests {
         cursors.set(&asked, &json!("c1")).unwrap();
         // A cursor that is not one leaves it where it was.
         cursors.set(&asked, &Value::Null).unwrap();
+        assert_eq!(cursors.of(&asked), json!("c1"));
+        // On disk only once it stood there a while, so what was printed
+        // before it is read again after a stop.
+        assert_eq!(Cursors::read(&dir).of(&asked), Value::Null);
+        std::thread::sleep(TRAIL);
+        cursors.set(&asked, &json!("c2")).unwrap();
         assert_eq!(Cursors::read(&dir).of(&asked), json!("c1"));
+        std::thread::sleep(TRAIL);
+        cursors.keep().unwrap();
+        assert_eq!(Cursors::read(&dir).of(&asked), json!("c2"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

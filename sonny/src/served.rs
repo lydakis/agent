@@ -1202,6 +1202,10 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                     })
                     .map_err(|e| ("follow_refused", e));
             }
+            // What an MCP server's events cannot be followed by, said now.
+            if let Some(add) = arguments.get("add") {
+                crate::mcp_events::check_follow(add).map_err(|e| ("follow_refused", e))?;
+            }
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {
                     return Err(("follow_refused", "test tries an add".into()));

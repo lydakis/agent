@@ -369,14 +369,16 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(refused['error'], 'exec_refused')
         self.assertIn('`wait`', refused['detail'])
 
-    def events_server(self):
-        """The test server, offering events, as the person's server `test`."""
+    def events_server(self, tools=True):
+        """The test server, offering events, and its tools unless not
+        `tools`, as the person's server `test`."""
         server = Path(__file__).with_name('mcp_server.py')
         (self.path / '.agent').mkdir(exist_ok=True)
+        alone = '' if tools else ', MCP_NO_TOOLS = "1"'
         (self.path / '.agent/config.toml').write_text(
             f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n'
             f'env = {{ MCP_EVENTS = {json.dumps(str(self.path / "events"))}, '
-            f'MCP_POLLS = {json.dumps(str(self.path / "polls"))} }}\n')
+            f'MCP_POLLS = {json.dumps(str(self.path / "polls"))}{alone} }}\n')
 
     def events_command(self, follows):
         """`sonny mcp events test` as the lookout runs it for the source
@@ -481,6 +483,24 @@ class ServedToolTests(ModelFixture):
             'name': 'docs', 'sources': ['mcp.test:comment.created'],
             'filter': {'arguments': {'document_id': ['D1']}}}}))
         self.assertNotIn('error', added)
+        # What the server's listing says cannot be followed is refused at once.
+        for add, why in [({'sources': ['mcp.test:nope']}, 'mcp.test:nope: it offers no such event'),
+                         ({'sources': ['mcp.test:comment.created']}, 'it takes document_id'),
+                         ({'sources': ['mcp.test'], 'filter': {'arguments': {'document_id': ['D1', 'D2'],
+                                                                            'repo': ['a', 'b']}}},
+                          'several values for document_id and repo')]:
+            refused = self.call('calc.lead', 'follows', {'add': {'name': 'no', **add}})
+            self.assertIn(why, refused)
+
+    def test_a_server_that_offers_events_alone_is_listed_with_no_tools(self):
+        self.events_server(tools=False)
+        env = {**clean_env(), 'HOME': str(self.path)}
+        listed = json.loads(subprocess.run([str(self.sonny), 'mcp', 'list', '--json'], env=env, check=True,
+                                           capture_output=True, text=True).stdout)
+        self.assertEqual(listed[0]['tools'], [], listed)
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env=env,
+                                           check=True, capture_output=True, text=True).stdout)
+        self.assertIn(': ci.failed, comment.created.', script['description'])
 
     def test_in_code_mode_an_agent_s_script_runs_its_shell_as_steps_of_the_call(self):
         # The tool as Sonny gives it in code mode, its default: no servers

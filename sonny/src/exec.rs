@@ -357,7 +357,8 @@ fn declare(
                 section.push_str(&about);
             }
         }
-        if known.tools.is_empty() {
+        // Not listed yet: one that offers events alone was.
+        if known.tools.is_empty() && known.events.is_empty() {
             section.push_str("\nIts tools are listed in `ALL_TOOLS` once it starts.");
         }
         let events = offered(name, &known.events);

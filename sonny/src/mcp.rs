@@ -309,7 +309,7 @@ impl Hub {
             gone.stop().await;
         }
         if live.is_none() {
-            let timeout = seconds(slot.config.startup_timeout_sec).unwrap_or(START);
+            let timeout = start_timeout(&slot.config);
             let started = tokio::time::timeout(timeout, connect(&slot.config))
                 .await
                 .unwrap_or_else(|_| Err(format!("did not start in {}s", timeout.as_secs())));
@@ -458,6 +458,12 @@ pub fn allowed(config: &McpServer, tool: &str) -> bool {
         && !config.disabled_tools.iter().any(|t| t == tool)
 }
 
+/// How long a server may take to start: its `startup_timeout_sec`, else
+/// `START`.
+pub(crate) fn start_timeout(config: &McpServer) -> Duration {
+    seconds(config.startup_timeout_sec).unwrap_or(START)
+}
+
 fn seconds(value: Option<f64>) -> Option<Duration> {
     value.map(Duration::from_secs_f64)
 }
@@ -588,9 +594,13 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
     let instructions = client
         .peer_info()
         .and_then(|info| info.instructions.clone());
+    // A server that says it has no tools, one that offers only events,
+    // say, and will not list them, has none.
+    let says_tools = (client.peer_info()).is_some_and(|info| info.capabilities.tools.is_some());
     let listed = client.list_all_tools().await;
     let tools = match listed {
         Ok(tools) => tools,
+        Err(_) if !says_tools => Vec::new(),
         Err(error) => {
             let live = Live {
                 client,
