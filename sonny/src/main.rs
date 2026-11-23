@@ -6631,6 +6631,9 @@ struct App {
     /// What is typed goes with the window to the agent it switches to:
     /// `alt+n` works with words typed, which it never drops.
     carry_draft: bool,
+    /// Drawn in another's pane: whether that one was last told this
+    /// composer holds words not sent ([`embed::drafts`]).
+    told_drafted: bool,
     /// The Sonny installed while this window was open, which it reopens on
     /// once it quits ([`update::installed_since`]).
     reopen_on: Option<PathBuf>,
@@ -8865,6 +8868,7 @@ impl App {
             quit: false,
             switch_to: None,
             carry_draft: false,
+            told_drafted: false,
             reopen_on: None,
             started: Instant::now(),
             fleet: None,
@@ -9463,6 +9467,7 @@ impl App {
                 }
             }
             self.pane_switched();
+            self.tell_drafted();
             self.side_closed();
             self.suggested_now().await;
             self.shell_ran().await;
@@ -22229,6 +22234,17 @@ impl App {
             return self.close_pane(false);
         }
         self.open_task(&bot);
+    }
+
+    /// Drawn in another's pane, that one told when words not sent come
+    /// into this composer or leave it: it keeps this Sonny running while
+    /// out of view only then.
+    fn tell_drafted(&mut self) {
+        let drafted = !self.input.trim().is_empty() || !self.quotes.is_empty();
+        if self.options.embedded && drafted != self.told_drafted {
+            self.told_drafted = drafted;
+            embed::drafts(drafted);
+        }
     }
 
     /// The pane gone once the side chat in it has ended.

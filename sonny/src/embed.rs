@@ -41,6 +41,8 @@ pub struct Embedded {
     left: Arc<AtomicBool>,
     /// The program asked for color-scheme reports (mode 2031).
     follows: Arc<AtomicBool>,
+    /// The program, an agent's Sonny, holds words not sent ([`drafts`]).
+    drafted: Arc<AtomicBool>,
     /// The light or dark and the colors the program was last told of.
     told: (bool, Theme),
 }
@@ -96,6 +98,8 @@ impl Embedded {
         let leaves = left.clone();
         let follows = Arc::new(AtomicBool::new(false));
         let following = follows.clone();
+        let drafted = Arc::new(AtomicBool::new(false));
+        let drafting = drafted.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             // The start of a question a read cut off, kept for the next.
@@ -121,6 +125,7 @@ impl Embedded {
                             crate::term::theme(),
                         )),
                         Piece::Follows(on) => following.store(on, Ordering::Relaxed),
+                        Piece::Drafts(on) => drafting.store(on, Ordering::Relaxed),
                         Piece::Leaves => leaves.store(true, Ordering::Relaxed),
                         Piece::Copied(payload) => {
                             if let Some(text) = copy_text(payload)
@@ -157,6 +162,7 @@ impl Embedded {
             opened,
             left,
             follows,
+            drafted,
             told: (crate::term::light(), crate::term::theme()),
         })
     }
@@ -179,6 +185,12 @@ impl Embedded {
     /// place since last asked ([`open_here`]), if it asked.
     pub fn opened(&self) -> Option<String> {
         self.opened.lock().ok().and_then(|mut opened| opened.take())
+    }
+
+    /// Whether the program, an agent's Sonny, holds words not sent, as it
+    /// last said ([`drafts`]): ending it would lose them.
+    pub fn drafted(&self) -> bool {
+        self.drafted.load(Ordering::Relaxed)
     }
 
     /// Whether the program, an agent's Sonny, gave the keys back since
@@ -398,6 +410,8 @@ enum Piece<'a> {
     Opens(&'a [u8]),
     /// [`LEAVE`]: the program gives the keys back.
     Leaves,
+    /// [`DRAFTS`]: the program holds words not sent, or none now.
+    Drafts(bool),
 }
 
 /// Where OSC 52, a copy to the clipboard, starts.
@@ -478,6 +492,29 @@ const ASKS: [(&[u8], Query); 11] = [
 /// Color-scheme reports (mode 2031) asked for, and stopped.
 const FOLLOWS: [(&[u8], bool); 2] = [(b"\x1b[?2031h", true), (b"\x1b[?2031l", false)];
 
+/// Sonny's own, which no terminal reads: an agent's Sonny drawn in a pane
+/// holds words not sent, or none now.
+const DRAFTS: [(&[u8], bool); 2] = [
+    (b"\x1b]7700;draft=1\x1b\\", true),
+    (b"\x1b]7700;draft=0\x1b\\", false),
+];
+
+/// Tells the Sonny this one is drawn in whether words not sent are in its
+/// composer, so the pane keeps it running while it is out of view rather
+/// than ending it with them. A terminal ignores it.
+pub fn drafts(on: bool) {
+    #[cfg(test)]
+    {
+        let _ = on;
+    }
+    #[cfg(not(test))]
+    {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(DRAFTS[usize::from(!on)].0);
+        let _ = stdout.flush();
+    }
+}
+
 /// Output cut where it asks the terminal something or copies, so each is
 /// handled after the output before it, as a terminal would; and the end
 /// of it that may be the start of one the next read finishes, held back.
@@ -485,6 +522,7 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
     let starts = || {
         (ASKS.iter().map(|(seq, _)| *seq))
             .chain(FOLLOWS.iter().map(|(seq, _)| *seq))
+            .chain(DRAFTS.iter().map(|(seq, _)| *seq))
             .chain([COPY, OPEN, LEAVE])
     };
     let longest = starts().map(<[u8]>::len).max().unwrap_or(0);
@@ -515,6 +553,15 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
                 out.push(Piece::Output(&bytes[from..at]));
             }
             out.push(Piece::Follows(*on));
+            at += seq.len();
+            from = at;
+            continue;
+        }
+        if let Some((seq, on)) = DRAFTS.iter().find(|(seq, _)| bytes[at..].starts_with(seq)) {
+            if from < at {
+                out.push(Piece::Output(&bytes[from..at]));
+            }
+            out.push(Piece::Drafts(*on));
             at += seq.len();
             from = at;
             continue;
@@ -767,6 +814,27 @@ mod tests {
         assert_eq!(
             (cut, rest),
             (vec![Piece::Output(b"a")], &b"\x1b]7700;open=sh"[..])
+        );
+    }
+
+    #[test]
+    fn a_program_says_whether_it_holds_words_not_sent() {
+        let (cut, rest) = pieces(b"a\x1b]7700;draft=1\x1b\\b\x1b]7700;draft=0\x1b\\");
+        assert!(rest.is_empty());
+        assert_eq!(
+            cut,
+            [
+                Piece::Output(b"a"),
+                Piece::Drafts(true),
+                Piece::Output(b"b"),
+                Piece::Drafts(false),
+            ]
+        );
+        // One a read cuts off waits for the rest.
+        let (cut, rest) = pieces(b"a\x1b]7700;dra");
+        assert_eq!(
+            (cut, rest),
+            (vec![Piece::Output(b"a")], &b"\x1b]7700;dra"[..])
         );
     }
 

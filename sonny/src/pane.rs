@@ -289,8 +289,11 @@ impl Pane {
     /// Kept to go back or forward to: an agent's Sonny ends, its name,
     /// title and tab kept, so only the one in view runs, however far back
     /// the pane goes; it starts again when gone back to ([`Pane::asleep`]).
+    /// One holding words not sent keeps running, so none are lost.
     fn leave(mut self) -> Self {
-        if self.agent.is_some() {
+        if self.agent.is_some()
+            && !(self.program.as_ref()).is_some_and(crate::embed::Embedded::drafted)
+        {
             self.program = None;
         }
         self
@@ -1708,6 +1711,19 @@ mod tests {
         let docs = docs.woken(program);
         assert!(!docs.asleep() && docs.can_go(false));
         assert_eq!(docs.agent.as_deref(), Some("shop.docs"));
+        // One holding words not sent keeps running, so none are lost.
+        let mut typing = portable_pty::CommandBuilder::new("sh");
+        typing.args(["-c", "printf '\\033]7700;draft=1\\033\\\\'; exec sleep 30"]);
+        let program = crate::embed::Embedded::spawn(typing, 5, 20, || {}).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !program.drafted() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(program.drafted());
+        let mut drafted = Pane::program("docs", program);
+        drafted.as_agent("shop.docs", false);
+        let fix = agent("fix").after(drafted);
+        assert!(fix.back[0].program.is_some() && !fix.back[0].asleep());
         // Anything else left behind is kept as it was.
         let card = Pane::card("/status", "esc close");
         assert!(!card.asleep() && !Pane::margin().asleep());
