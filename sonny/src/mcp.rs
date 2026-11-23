@@ -310,9 +310,18 @@ impl Hub {
         }
         if live.is_none() {
             let timeout = start_timeout(&slot.config);
-            let started = tokio::time::timeout(timeout, connect(&slot.config))
+            let mut started = tokio::time::timeout(timeout, connect(&slot.config))
                 .await
                 .unwrap_or_else(|_| Err(format!("did not start in {}s", timeout.as_secs())));
+            // Its events, when it offers them, listed in a time of their
+            // own: a listing that fails or stalls leaves its tools working.
+            if let Ok(live) = &mut started
+                && offers_events(live.client.peer())
+                && let Ok(Ok(events)) =
+                    tokio::time::timeout(timeout, list_events(live.client.peer())).await
+            {
+                live.events = events.into();
+            }
             match started {
                 Ok(started) => {
                     let listed = (&started.tools[..], &started.events[..]);
@@ -623,18 +632,10 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
         .filter(|tool| allowed(config, &tool.name))
         .filter_map(|tool| serde_json::to_value(tool).ok())
         .collect();
-    // Its events, when it offers them; a listing that fails leaves its
-    // tools as they are.
-    let events = match offers_events(client.peer()) {
-        true => (list_events(client.peer()).await)
-            .map(Vec::into)
-            .unwrap_or_default(),
-        false => Arc::default(),
-    };
     Ok(Live {
         client,
         tools,
-        events,
+        events: Arc::default(),
         instructions,
         group: group.keep(),
     })
