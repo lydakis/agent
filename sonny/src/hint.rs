@@ -218,10 +218,11 @@ pub fn fit(keys: &str, room: usize) -> String {
     fitted(said, room)
 }
 
-/// The line under a list over the composer, `width` wide: its keys two
-/// columns in, fitted as [`Keys::fit`] fits them.
+/// The line under a list over the composer, `width` wide: its keys from
+/// the first column, where the footer starts and the list's `•` is,
+/// fitted as [`Keys::fit`] fits them.
 pub fn under(keys: &Keys, width: usize) -> Vec<Span<'static>> {
-    spans(&format!("  {}", keys.fit(width.saturating_sub(2))))
+    spans(&keys.fit(width))
 }
 
 /// `keys`, pairs of a key and what it does with ` · ` between them, as

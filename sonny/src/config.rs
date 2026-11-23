@@ -1154,7 +1154,8 @@ impl View {
             let setting = &SETTINGS[at];
             if grouped && setting.group != group {
                 group = setting.group;
-                lines.push(Line::from(format!("  {group}")).bold());
+                // In the first column, its rows in the words' column.
+                lines.push(Line::from(group.to_owned()).bold());
             }
             let typed = (i == pick).then_some(self.typing.as_ref()).flatten();
             let shown = match typed {
@@ -1451,7 +1452,8 @@ mod tests {
         let rows = view.rows(100, 40);
         assert_eq!(rows.len(), 1 + crate::list::ROWS, "{:?}", text(&rows));
         assert_eq!(rows[0].to_string(), "");
-        assert_eq!(rows[1].to_string(), "  Models");
+        // The group's name in the first column, its rows in the words'.
+        assert_eq!(rows[1].to_string(), "Models");
         assert!(
             rows[1]
                 .style
@@ -1461,7 +1463,7 @@ mod tests {
         // The pick reversed; a value set in ink, a default muted.
         let model = rows[2].to_string();
         assert!(
-            model.starts_with("    model  ") && model.contains("openai/gpt"),
+            model.starts_with("  model  ") && model.contains("openai/gpt"),
             "{model}"
         );
         assert!(rows[2].spans.iter().skip(1).all(|s| {
@@ -1513,11 +1515,8 @@ mod tests {
         }
         assert_eq!(view.picked().map(|at| SETTINGS[at].key), Some("sonny.view"));
         let rows = text(&view.rows(100, 40));
-        assert!(rows[1].starts_with("    view "), "{rows:?}");
-        assert!(
-            rows.iter().all(|row| !row.starts_with("  View")),
-            "{rows:?}"
-        );
+        assert!(rows[1].starts_with("  view "), "{rows:?}");
+        assert!(rows.iter().all(|row| !row.starts_with("View")), "{rows:?}");
         assert_eq!(view.line().0.to_string(), "› view");
         // Backspace takes a letter back; Esc closes.
         press(&mut view, KeyCode::Backspace);
@@ -1531,15 +1530,15 @@ mod tests {
         assert_eq!(view.line().0.to_string(), "› find a setting");
         assert_eq!(
             view.keys(80).to_string(),
-            "  ↑↓ pick · enter choose · esc close  /nowhere/config.toml"
+            "↑↓ pick · enter choose · esc close  /nowhere/config.toml"
         );
         // Short of room, the file goes whole, then the keys as every
         // key line's do: no word is cut.
         assert_eq!(
             view.keys(50).to_string(),
-            "  ↑↓ pick · enter choose · esc close"
+            "↑↓ pick · enter choose · esc close"
         );
-        assert_eq!(view.keys(30).to_string(), "  enter choose · esc close");
+        assert_eq!(view.keys(30).to_string(), "enter choose · esc close");
     }
 
     #[test]
