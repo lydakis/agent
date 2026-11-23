@@ -6634,6 +6634,9 @@ struct App {
     /// Drawn in another's pane: whether that one was last told this
     /// window holds work ending it would lose ([`embed::keeps`]).
     told_keeps: bool,
+    /// A key, a click or a paste read since that one was last told: it
+    /// is told again after each, so it knows the input it sent was read.
+    heard: bool,
     /// The Sonny installed while this window was open, which it reopens on
     /// once it quits ([`update::installed_since`]).
     reopen_on: Option<PathBuf>,
@@ -8869,6 +8872,7 @@ impl App {
             switch_to: None,
             carry_draft: false,
             told_keeps: false,
+            heard: false,
             reopen_on: None,
             started: Instant::now(),
             fleet: None,
@@ -18640,6 +18644,7 @@ impl App {
             term::heard(reply);
             return;
         }
+        self.heard = true;
         // A stop or a removal asked for in the pane lives only while the
         // keys stay there: whatever took them away (a click, Ctrl+\, a
         // paste) said no, so the view never waits armed for their return.
@@ -22272,7 +22277,8 @@ impl App {
             || panes
                 .chain(self.closed.as_ref().map(|(pane, _)| pane))
                 .any(pane::Pane::keeps);
-        if keeps != self.told_keeps {
+        let heard = std::mem::take(&mut self.heard);
+        if keeps != self.told_keeps || heard {
             self.told_keeps = keeps;
             embed::keeps(keeps);
         }
