@@ -20439,12 +20439,10 @@ impl App {
                 }
                 attach::Dropped::Here(path) => {
                     let path = path.to_string_lossy();
-                    self.input
-                        .insert(&format!("{} ", attach::shell_quoted(&path)));
+                    self.input.insert_word(&attach::shell_quoted(&path));
                 }
                 attach::Dropped::Unread(path, why) => {
-                    self.input
-                        .insert(&format!("{} ", attach::shell_quoted(&path)));
+                    self.input.insert_word(&attach::shell_quoted(&path));
                     said = Some(unread(&path, &why));
                 }
                 attach::Dropped::Elsewhere(path) => {
@@ -20461,7 +20459,7 @@ impl App {
                         });
                         continue;
                     }
-                    self.input.insert(&format!("{words} "));
+                    self.input.insert_word(&words);
                     if !handing {
                         // A path pasted as words is words; dropped over
                         // SSH, it names a file on the person's machine.

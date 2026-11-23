@@ -203,6 +203,15 @@ impl Prompt {
         self.settle();
     }
 
+    /// `word` put in as words of its own, as [`Prompt::insert`] puts text:
+    /// a space before it when the words before the cursor run up to it,
+    /// and one after it.
+    pub fn insert_word(&mut self, word: &str) {
+        let from = self.selection().map_or(self.at, |selected| selected.start);
+        let apart = self.text[..from].ends_with(|c: char| !c.is_whitespace());
+        self.insert(&format!("{}{word} ", if apart { " " } else { "" }));
+    }
+
     pub fn backspace(&mut self) {
         self.goal = None;
         if self.cut() {
@@ -959,6 +968,17 @@ mod tests {
         prompt.set("/a/x.pdf2");
         assert!(!prompt.replace_word("/a/x.pdf", "/b"));
         assert_eq!(&*prompt, "/a/x.pdf2");
+    }
+
+    #[test]
+    fn a_word_put_in_stands_apart_from_the_words_before_it() {
+        let mut prompt = Prompt::default();
+        prompt.set("Read:");
+        prompt.insert_word("/a/report.pdf");
+        assert_eq!(&*prompt, "Read: /a/report.pdf ");
+        prompt.insert_word("/a/b.txt");
+        assert_eq!(&*prompt, "Read: /a/report.pdf /a/b.txt ");
+        assert!(prompt.replace_word("/a/report.pdf", "/c/copy.pdf"));
     }
 
     #[test]
