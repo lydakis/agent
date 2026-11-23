@@ -1103,7 +1103,7 @@ impl Draw<'_> {
         // Each row's own spans past its lead come in the text's order; a
         // row's leading spaces may be left out, so each is found from
         // where the last ended.
-        let mut at = 0;
+        let (mut at, mut color) = (0, 0);
         let rows = wrapped.into_iter().enumerate().map(|(row, wrapped)| {
             let lead = 1 + if row == 0 { 1 } else { hang.len() };
             let mut spans = Vec::with_capacity(wrapped.spans.len());
@@ -1121,8 +1121,17 @@ impl Draw<'_> {
                 }
                 let piece = at..at + span.content.len();
                 at = piece.end;
-                let colored = (colors.iter())
-                    .filter(|(range, _)| range.start < piece.end && piece.start < range.end);
+                // The colors are in the text's order too: each is passed
+                // once, not once a row.
+                while colors
+                    .get(color)
+                    .is_some_and(|(range, _)| range.end <= piece.start)
+                {
+                    color += 1;
+                }
+                let colored = (colors[color..].iter())
+                    .take_while(|(range, _)| range.start < piece.end)
+                    .filter(|(range, _)| !range.is_empty());
                 let mut any = false;
                 for (range, style) in colored {
                     any = true;
