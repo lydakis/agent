@@ -66,6 +66,7 @@ mod margin;
 mod markdown;
 mod math;
 mod mcp;
+mod mcp_events;
 mod mcp_import;
 mod memory;
 mod mermaid;

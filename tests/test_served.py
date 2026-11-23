@@ -369,6 +369,139 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(refused['error'], 'exec_refused')
         self.assertIn('`wait`', refused['detail'])
 
+    def events_server(self, tools=True):
+        """The test server, offering events, and its tools unless not
+        `tools`, as the person's server `test`."""
+        server = Path(__file__).with_name('mcp_server.py')
+        (self.path / '.agent').mkdir(exist_ok=True)
+        alone = '' if tools else ', MCP_NO_TOOLS = "1"'
+        (self.path / '.agent/config.toml').write_text(
+            f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n'
+            f'env = {{ MCP_EVENTS = {json.dumps(str(self.path / "events"))}, '
+            f'MCP_POLLS = {json.dumps(str(self.path / "polls"))}{alone} }}\n')
+
+    def events_command(self, follows):
+        """`sonny mcp events test` as the lookout runs it for the source
+        `mcp.test`, asked by `follows`: the process, and a queue of the
+        lines it prints, each read as JSON."""
+        folder = self.path / 'mcp.test'
+        folder.mkdir(exist_ok=True)
+        (folder / '.wants.json').write_text(json.dumps(
+            {'field': 'topic', 'all': False, 'values': [], 'follows': follows}))
+        env = {**clean_env(), 'HOME': str(self.path), 'SONNY_SOURCE': 'mcp.test',
+               'SONNY_SOURCE_DIR': str(folder), 'SONNY_SOURCE_WANTS': str(folder / '.wants.json')}
+        # In a group of its own, as the lookout runs a source's command.
+        run = subprocess.Popen([str(self.sonny), 'mcp', 'events', 'test'], env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+        def stop():
+            if run.poll() is None:
+                os.killpg(run.pid, 15)
+            run.wait(timeout=5)
+            run.stdout.close()
+            run.stderr.close()
+        self.addCleanup(stop)
+        lines = queue.Queue()
+
+        def read():
+            for line in run.stdout:
+                lines.put(json.loads(line))
+        import threading
+        threading.Thread(target=read, daemon=True).start()
+        return run, lines, stop
+
+    def test_an_mcp_server_s_events_are_printed_as_a_source_s_lines_from_where_each_stood(self):
+        self.events_server()
+        follows = [{'topics': ['ci.failed'], 'filter': None},
+                   {'topics': ['comment.created'], 'filter': {'arguments': {'document_id': ['D1', 'bad']}}},
+                   {'topics': ['nope'], 'filter': None}]
+        started = time.monotonic()
+        run, lines, stop = self.events_command(follows)
+        got = [lines.get(timeout=10) for _ in range(3)]
+        by_id = {line.get('id'): line for line in got}
+        # Pushed at once, on its topic, with the arguments it came by.
+        self.assertEqual(by_id['c-D1 comment.created {"document_id":"D1"}'],
+                         {'id': 'c-D1 comment.created {"document_id":"D1"}', 'topic': 'comment.created',
+                          'arguments': {'document_id': 'D1'}, 'at': '2026-11-23T03:00:00Z',
+                          'data': {'document_id': 'D1', 'text': 'looks good'}})
+        # What the server refused, said on its topic.
+        said = sorted(line['text'] for line in got if 'text' in line)
+        self.assertEqual(len(said), 2, got)
+        self.assertIn('refused to subscribe to comment.created {"document_id":"bad"}: no such document', said[0])
+        self.assertIn('refused to subscribe to nope: it offers no such event', said[1])
+        # Polled from now: what comes after its first poll is news.
+        deadline = time.monotonic() + 10
+        while not (self.path / 'polls').exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        with open(self.path / 'events', 'a') as f:
+            f.write(json.dumps({'eventId': 'e1', 'data': {'run': 7}}) + '\n')
+        self.assertEqual(lines.get(timeout=10),
+                         {'id': 'e1 ci.failed', 'topic': 'ci.failed', 'at': '2026-11-23T03:00:00Z', 'data': {'run': 7}})
+        first = [json.loads(line) for line in (self.path / 'polls').read_text().splitlines()]
+        self.assertEqual(first[0], {'name': 'ci.failed', 'arguments': {}, 'cursor': None})
+        # Polls a second apart at least, however soon the server says.
+        self.assertLessEqual(len(first), time.monotonic() - started + 1, first)
+        # Each stands where it was told to, on disk.
+        deadline = time.monotonic() + 5
+        cursors = lambda: json.loads((self.path / 'mcp.test/cursors.json').read_text())['cursors']
+        while not (self.path / 'mcp.test/cursors.json').exists() or cursors().get('ci.failed') != '1':
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.assertEqual(cursors(), {'ci.failed': '1', 'comment.created {"document_id":"D1"}': 's1-D1'})
+        stop()
+        # Run again, it goes on from there: what came meanwhile, not again what was told.
+        with open(self.path / 'events', 'a') as f:
+            f.write(json.dumps({'eventId': 'e2', 'data': {'run': 8}}) + '\n')
+        (self.path / 'polls').unlink()
+        run, lines, stop = self.events_command(follows[:1])
+        self.assertEqual(lines.get(timeout=10)['id'], 'e2 ci.failed')
+        again = json.loads((self.path / 'polls').read_text().splitlines()[0])
+        self.assertEqual(again['cursor'], '1')
+        stop()
+
+    def test_an_mcp_server_s_events_are_a_source_agents_follow_and_are_told_of_beside_its_tools(self):
+        self.events_server()
+        env = {**clean_env(), 'HOME': str(self.path)}
+        # Listed, as `sonny mcp add` lists a server: its events are kept with its tools.
+        listed = subprocess.run([str(self.sonny), 'mcp', 'list'], env=env, check=True, capture_output=True, text=True)
+        self.assertIn('test', listed.stdout)
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env=env,
+                                           check=True, capture_output=True, text=True).stdout)
+        self.assertIn('Its events, heard by following `mcp.test:EVENT` with the `follows` tool', script['description'])
+        self.assertIn(': ci.failed, comment.created.', script['description'])
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('follows', inherit=False)])
+        self.host()
+        sources = [s['name'] for s in json.loads(self.call('calc.lead', 'follows', {}))['sources']]
+        self.assertIn('mcp.test', sources)
+        shown = json.loads(self.call('calc.lead', 'follows', {'source': 'mcp.test'}))
+        self.assertEqual([e['name'] for e in shown['source']['offers']], ['ci.failed', 'comment.created'])
+        self.assertEqual(shown['source']['offers'][1]['arguments']['required'], ['document_id'])
+        self.assertIn('as {"arguments": {"KEY": ["VALUE"]}}', shown['offers'])
+        added = json.loads(self.call('calc.lead', 'follows', {'add': {
+            'name': 'docs', 'sources': ['mcp.test:comment.created'],
+            'filter': {'arguments': {'document_id': ['D1']}}}}))
+        self.assertNotIn('error', added)
+        # What the server's listing says cannot be followed is refused at once.
+        for add, why in [({'sources': ['mcp.test:nope']}, 'mcp.test:nope: it offers no such event'),
+                         ({'sources': ['mcp.test:comment.created']}, 'it takes document_id'),
+                         ({'sources': ['mcp.test'], 'filter': {'arguments': {'document_id': ['D1', 'D2'],
+                                                                            'repo': ['a', 'b']}}},
+                          'several values for document_id and repo')]:
+            refused = self.call('calc.lead', 'follows', {'add': {'name': 'no', **add}})
+            self.assertIn(why, refused)
+
+    def test_a_server_that_offers_events_alone_is_listed_with_no_tools(self):
+        self.events_server(tools=False)
+        env = {**clean_env(), 'HOME': str(self.path)}
+        listed = json.loads(subprocess.run([str(self.sonny), 'mcp', 'list', '--json'], env=env, check=True,
+                                           capture_output=True, text=True).stdout)
+        self.assertEqual(listed[0]['tools'], [], listed)
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env=env,
+                                           check=True, capture_output=True, text=True).stdout)
+        self.assertIn(': ci.failed, comment.created.', script['description'])
+
     def test_in_code_mode_an_agent_s_script_runs_its_shell_as_steps_of_the_call(self):
         # The tool as Sonny gives it in code mode, its default: no servers
         # needed, and the agent's own tools shown only on `tools`.

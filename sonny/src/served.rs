@@ -1197,9 +1197,14 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                 return crate::lookout::subs::source(&store, &caller, caller_id, name, &sources)
                     .map(|mut read| {
                         crate::lookout::sources::say_wants(&mut read);
+                        crate::mcp_events::say_events(&mut read);
                         read.to_string()
                     })
                     .map_err(|e| ("follow_refused", e));
+            }
+            // What an MCP server's events cannot be followed by, said now.
+            if let Some(add) = arguments.get("add") {
+                crate::mcp_events::check_follow(add).map_err(|e| ("follow_refused", e))?;
             }
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {

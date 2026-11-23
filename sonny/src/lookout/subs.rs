@@ -504,6 +504,37 @@ pub fn wanted<'a>(
     (all, values)
 }
 
+/// Each subscription of `source` as it asks: the topics it names, or
+/// `null` for every one, and its filter, sorted and once each. A source
+/// whose subscriptions say more than one field can (an MCP server's
+/// events, asked for with arguments) reads them whole.
+pub fn asking<'a>(subs: impl IntoIterator<Item = &'a Sub>, source: &str) -> Vec<Value> {
+    let mut asking: Vec<Value> = Vec::new();
+    for sub in subs {
+        let naming: Vec<Option<&str>> = (sub.sources.iter())
+            .map(|name| super::sources::named(name))
+            .filter(|(of, _)| *of == source)
+            .map(|(_, topic)| topic)
+            .collect();
+        if naming.is_empty() {
+            continue;
+        }
+        let topics = match naming.iter().all(Option::is_some) {
+            true => {
+                let mut topics: Vec<&str> = naming.into_iter().flatten().collect();
+                topics.sort_unstable();
+                topics.dedup();
+                json!(topics)
+            }
+            false => Value::Null,
+        };
+        asking.push(json!({"topics": topics, "filter": sub.filter}));
+    }
+    asking.sort_by_key(Value::to_string);
+    asking.dedup();
+    asking
+}
+
 /// Whether `pattern` lets through only events whose field at `path` is one
 /// of exact values, which it adds to `values`: a list of plain values
 /// there, or every branch of its `$or` so.

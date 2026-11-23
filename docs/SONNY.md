@@ -1697,6 +1697,17 @@ servers are started with and `bearer_token_env_var` names, never to
 is left to the environment, and the import says when that variable is not
 set. Servers on the old SSE transport are named and left out.
 
+A server that offers the [MCP events extension](https://modelcontextprotocol.io/extensions/events/overview)
+(it tells what happens on it, as a CI run failing or a comment posted)
+has its events listed with its tools, and they are a lookout source,
+`mcp.NAME`, that agents follow with the `follows` tool as any other:
+`mcp.docs:comment.created`, the event's arguments as exact values in the
+filter (`{"arguments": {"document_id": ["D1"]}}`). The lookout runs
+`sonny mcp events NAME` while a follow asks for one: one subscription for
+each event and arguments, however many agents follow it, streamed where the
+server pushes and polled where it does not, from where each stood when it
+last ran ([Lookout](LOOKOUT.md#mcp-servers-events)).
+
 Agents do not get a tool per MCP tool. In code mode, and otherwise while
 any server is on, every agent Sonny opens has one tool, `exec`, with
 Codex's code mode contract

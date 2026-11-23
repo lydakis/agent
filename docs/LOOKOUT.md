@@ -153,7 +153,7 @@ The lookout writes, to the file `$SONNY_SOURCE_WANTS` names (in the source's fol
 {"field": "id", "all": false, "values": ["CR-12", "CR-14"]}
 ```
 
-`all` is true while any follow of it names no exact values (a `prefix` or a bare follow, say), so the command fetches everything. The file is written before the command first runs, and again whenever the follows' wants change, which starts the command again on them, as an edited script does. So an agent that follows with `{"filter": {"id": ["CR-12"]}}` has the source fetch CR-12: the follow is the setup, with no setup step that drifts from it. The `follows` listing marks such a source with its `wants`, and says once what that means.
+`all` is true while any follow of it names no exact values (a `prefix` or a bare follow, say), so the command fetches everything. The file also holds each follow of it as it asks, `follows`: the topics it names (`null` for every one) and its filter whole, for a source whose follows say more than one field can, as an [MCP server's events](#mcp-servers-events) are asked for with arguments. The file is written before the command first runs, and again whenever the follows' wants change, which starts the command again on them, as an edited script does. So an agent that follows with `{"filter": {"id": ["CR-12"]}}` has the source fetch CR-12: the follow is the setup, with no setup step that drifts from it. The `follows` listing marks such a source with its `wants`, and says once what that means.
 
 ### Built-in sources
 
@@ -175,6 +175,26 @@ Tags are pushed from the Mac; cloud can't push tags.
 [links · laptop]
 not connected, last heard 1 min ago
 ```
+
+### MCP servers' events
+
+An MCP server of the person's that offers the [MCP events extension](https://modelcontextprotocol.io/extensions/events/overview) (SEP-3415) is a source too, `mcp.NAME`, once its listing (kept when Sonny starts it, as `sonny mcp add` or `list` does) names events. Its events are its topics, and the `exec` tool's description names them beside the server's tools; `follows` with `source` `mcp.NAME` shows each under `offers`, with the arguments it takes and the data it carries. A follow asks for an event by naming it, and gives the arguments it subscribes with as exact values under `arguments` in its filter:
+
+```json
+{"add": {"name": "review", "sources": ["mcp.docs:comment.created"],
+         "filter": {"arguments": {"document_id": ["D1"]}}}}
+```
+
+A follow of `mcp.docs` alone asks for every event its arguments are enough for. Several values may go for one argument, not for two, since that would subscribe to every pairing of them; a second follow asks for the others. What the server's listing shows cannot be followed (an event it does not offer, one offered only by webhook, a required argument with no value, several values for two arguments) the `follows` tool refuses at once. The source wants `topic`, and its command is Sonny's own, `sonny mcp events NAME CONFIG`, CONFIG naming the server's config by a digest, so a server configured anew is a changed source the lookout starts again; it reads the follows from its wants file: one subscription for each event and arguments, however many follow it, so five thousand agents on one event are one subscription. Until a follow asks, it waits and starts no server. An event the server pushes is streamed (`events/stream`), the others polled (`events/poll`) as often as the server says, a second apart at least; webhooks need an address the server can reach, which a laptop has not, so an event offered only so is refused. Each subscription's cursor is kept in `STORE.sources/mcp.NAME/cursors.json`, with the server's config it was given on (a server configured anew starts from now), once it has stood there a second, so a restart goes on from where it stood and prints again what the lookout may not have read before it stopped, which the lookout, passing an ID on once, drops if it had; a new one starts from now and tells nothing of the past. A server that offers events and no tools is listed with none.
+
+Each event is a line with no `text`, read whole, its `id` the server's with the event's name and the arguments, when there are any (the server's IDs are each subscription's own), its `topic` the event, `at`, `data`, and `arguments`, which is what a follow's filter matches it by. One longer than a line the lookout reads goes with `data` null and `cut` saying how long it was:
+
+```text
+[mcp.docs · comment.created · 03:00]
+{"arguments":{"document_id":"D1"},"at":"2026-11-23T03:00:00Z","data":{"by":"ana","text":"looks good"},"id":"c7 comment.created {\"document_id\":\"D1\"}","topic":"comment.created"}
+```
+
+A subscription the server refuses when asked (arguments it does not take) is a line on its topic saying why, and one it says skipped events is a line saying so. A connection that breaks, a server's internal error (`-32603`), a stream silent for three of its heartbeats, or a subscription the server ends stops the command with why, and the lookout runs it again a minute later, from where it stood; three such runs in a row and its follows hear it is down.
 
 ### Source shapes
 

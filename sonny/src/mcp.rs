@@ -3,10 +3,14 @@
 //! agent, started by the first call and stopped after ten idle minutes, as
 //! Codex and Pi keep theirs beside the agent loop rather than in its
 //! sandbox. Each server's tools are kept on disk once listed, so they are
-//! known without starting it.
+//! known without starting it, with the events it offers, when it offers
+//! the MCP events extension: those are a lookout source, `mcp.NAME`,
+//! which `sonny mcp events NAME` reads ([`crate::mcp_events`]).
 use agent_client::config::McpServer;
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, ClientConfig};
+use rmcp::model::{
+    CallToolRequestParams, ClientConfig, ClientRequest, CustomRequest, ServerResult,
+};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
@@ -34,6 +38,14 @@ const STDERR_LINE: usize = 1024;
 pub const RESULT_BYTES: usize = 16 << 20;
 
 pub type Servers = BTreeMap<String, McpServer>;
+
+/// The MCP events extension (SEP-3415): a server that offers it tells
+/// what happens on it, as events its clients subscribe to.
+pub const EVENTS: &str = "io.modelcontextprotocol/events";
+
+/// What an MCP server's events are as a lookout source: `mcp.NAME`, a
+/// name no source the person sets up can take, as theirs hold no dot.
+pub const SOURCE: &str = "mcp.";
 
 /// The servers, each connected while used.
 #[derive(Clone)]
@@ -75,6 +87,8 @@ fn stamp(path: &Path) -> Option<Stamp> {
 struct Live {
     client: RunningService<RoleClient, ClientConfig>,
     tools: Arc<[Value]>,
+    /// The events it offers, as `events/list` gives them.
+    events: Arc<[Value]>,
     instructions: Option<String>,
     /// A stdio server's process group, stopped with it.
     group: Option<u32>,
@@ -87,6 +101,9 @@ pub struct Known {
     /// Shared, not copied, by whoever reads them, so a listing that did
     /// not change is the same one.
     pub tools: Arc<[Value]>,
+    /// The events it offers, as `events/list` gives them: each with its
+    /// `name`, `description`, `delivery`, `inputSchema` and `payloadSchema`.
+    pub events: Arc<[Value]>,
     pub instructions: Option<String>,
     pub error: Option<String>,
     pub live: bool,
@@ -186,6 +203,7 @@ impl Hub {
         if let Some(live) = slot.live.lock().await.as_ref() {
             return Ok(Known {
                 tools: live.tools.clone(),
+                events: live.events.clone(),
                 instructions: live.instructions.clone(),
                 error: None,
                 live: true,
@@ -291,19 +309,36 @@ impl Hub {
             gone.stop().await;
         }
         if live.is_none() {
-            let timeout = seconds(slot.config.startup_timeout_sec).unwrap_or(START);
-            let started = tokio::time::timeout(timeout, connect(&slot.config))
+            let timeout = start_timeout(&slot.config);
+            let mut started = tokio::time::timeout(timeout, connect(&slot.config))
                 .await
                 .unwrap_or_else(|_| Err(format!("did not start in {}s", timeout.as_secs())));
+            // Its events, when it offers them, listed in a time of their
+            // own: a listing that fails or stalls leaves its tools working,
+            // and its events as last listed on this config.
+            if let Ok(live) = &mut started
+                && offers_events(live.client.peer())
+            {
+                live.events =
+                    match tokio::time::timeout(timeout, list_events(live.client.peer())).await {
+                        Ok(Ok(events)) => events.into(),
+                        _ => self
+                            .cached(slot)
+                            .map(|kept| kept.events)
+                            .unwrap_or_default(),
+                    };
+            }
             match started {
                 Ok(started) => {
-                    self.keep(slot, &started.tools, &started.instructions, None);
+                    let listed = (&started.tools[..], &started.events[..]);
+                    self.keep(slot, listed, &started.instructions, None);
                     *live = Some(started);
                 }
                 Err(error) => {
                     let error = format!("{} did not start: {error}", slot.name);
                     let kept = self.cached(slot).unwrap_or_default();
-                    self.keep(slot, &kept.tools, &kept.instructions, Some(&error));
+                    let listed = (&kept.tools[..], &kept.events[..]);
+                    self.keep(slot, listed, &kept.instructions, Some(&error));
                     return Err(error);
                 }
             }
@@ -339,7 +374,7 @@ impl Hub {
     fn keep(
         &self,
         slot: &Slot,
-        tools: &[Value],
+        (tools, events): (&[Value], &[Value]),
         instructions: &Option<String>,
         error: Option<&str>,
     ) {
@@ -347,7 +382,7 @@ impl Hub {
             return;
         };
         let kept = json!({"config": fingerprint(&slot.config), "tools": tools,
-            "instructions": instructions, "error": error});
+            "events": events, "instructions": instructions, "error": error});
         let _ = write(&file, &kept.to_string());
     }
 }
@@ -400,9 +435,12 @@ pub fn kept(cache: &Path, server: &str, config: &McpServer) -> Option<Known> {
 
 fn parse_kept(bytes: &[u8], config: &McpServer) -> Option<Known> {
     let kept: Value = serde_json::from_slice(bytes).ok()?;
+    let listed = |key: &str| -> Arc<[Value]> {
+        (kept[key].as_array()).map_or_else(Arc::default, |listed| listed.as_slice().into())
+    };
     (kept["config"] == fingerprint(config)).then(|| Known {
-        tools: (kept["tools"].as_array())
-            .map_or_else(Arc::default, |tools| tools.as_slice().into()),
+        tools: listed("tools"),
+        events: listed("events"),
         instructions: kept["instructions"].as_str().map(str::to_owned),
         error: kept["error"].as_str().map(str::to_owned),
         live: false,
@@ -435,6 +473,12 @@ pub fn allowed(config: &McpServer, tool: &str) -> bool {
         && !config.disabled_tools.iter().any(|t| t == tool)
 }
 
+/// How long a server may take to start: its `startup_timeout_sec`, else
+/// `START`.
+pub(crate) fn start_timeout(config: &McpServer) -> Duration {
+    seconds(config.startup_timeout_sec).unwrap_or(START)
+}
+
 fn seconds(value: Option<f64>) -> Option<Duration> {
     value.map(Duration::from_secs_f64)
 }
@@ -442,6 +486,12 @@ fn seconds(value: Option<f64>) -> Option<Duration> {
 /// What a listing was made with, so a changed config lists again: a
 /// digest, since the config holds the server's env and headers, secrets
 /// among them.
+/// How the events command names the config it is run on: the start of
+/// its fingerprint.
+pub(crate) fn config_named(config: &McpServer) -> String {
+    fingerprint(config)[..16].to_owned()
+}
+
 fn fingerprint(config: &McpServer) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{config:?}"));
@@ -470,15 +520,33 @@ fn write(file: &Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&staged, file)
 }
 
-fn client_info() -> ClientConfig {
+/// Who Sonny is to a server, and that it takes the events extension.
+pub(crate) fn client_info() -> ClientConfig {
     let mut info = ClientConfig::default();
     info.client_info.name = "sonny".into();
     info.client_info.version = env!("CARGO_PKG_VERSION").into();
+    info.capabilities.extensions = Some(BTreeMap::from([(EVENTS.to_owned(), Default::default())]));
     info
 }
 
-async fn connect(config: &McpServer) -> Result<Live, String> {
-    let (client, group, stderr) = match (&config.command, &config.url) {
+/// A running connection to a server, as `handler` hears it: the stdio
+/// server's process group while it starts, and its last stderr lines.
+type Opened<H> = (
+    RunningService<RoleClient, H>,
+    Group,
+    Arc<Mutex<VecDeque<String>>>,
+);
+
+/// Connect to the server `config` names, `handler` hearing what it says
+/// unasked. A stdio server runs in a process group of its own, stopped
+/// with it, unless `grouped` is false: then it is in the caller's, and
+/// stops with the caller's, as a source's command is.
+pub(crate) async fn open<H: rmcp::ClientHandler>(
+    config: &McpServer,
+    handler: H,
+    grouped: bool,
+) -> Result<Opened<H>, String> {
+    match (&config.command, &config.url) {
         (Some(command), _) => {
             let mut process = tokio::process::Command::new(command);
             // Under the server's own env, ~/.agent/keys/env as it is now, where
@@ -486,11 +554,10 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
             let kept = agent_client::env_file::path()
                 .and_then(|file| agent_client::env_file::read(&file).ok())
                 .unwrap_or_default();
-            process
-                .args(&config.args)
-                .envs(kept)
-                .envs(&config.env)
-                .process_group(0);
+            process.args(&config.args).envs(kept).envs(&config.env);
+            if grouped {
+                process.process_group(0);
+            }
             if let Some(cwd) = config.cwd.as_ref().map(|cwd| home_relative(cwd)) {
                 process.current_dir(cwd);
             }
@@ -498,22 +565,25 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("{command}: {e}"))?;
-            let group = Group::of(transport.id());
+            let group = match grouped {
+                true => Group::of(transport.id()),
+                false => Group(None),
+            };
             let tail = Arc::new(Mutex::new(VecDeque::new()));
             if let Some(stderr) = stderr {
                 tokio::spawn(collect(stderr, Arc::clone(&tail)));
             }
-            match client_info().serve(transport).await {
-                Ok(client) => (client, group, tail),
+            match handler.serve(transport).await {
+                Ok(client) => Ok((client, group, tail)),
                 Err(error) => {
                     drop(group);
                     // Its last words, if it said why.
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     let said: Vec<String> = tail.lock().unwrap().iter().cloned().collect();
-                    return Err(match said.is_empty() {
+                    Err(match said.is_empty() {
                         true => error.to_string(),
                         false => format!("{error}: {}", said.join(" / ")),
-                    });
+                    })
                 }
             }
         }
@@ -532,25 +602,31 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
                 transport.custom_headers.insert(name, value);
             }
             let transport = StreamableHttpClientTransport::from_config(transport);
-            let client = client_info()
-                .serve(transport)
-                .await
-                .map_err(|e| e.to_string())?;
-            (client, Group(None), Arc::default())
+            let client = handler.serve(transport).await.map_err(|e| e.to_string())?;
+            Ok((client, Group(None), Arc::default()))
         }
-        (None, None) => return Err("no command or url".into()),
-    };
+        (None, None) => Err("no command or url".into()),
+    }
+}
+
+async fn connect(config: &McpServer) -> Result<Live, String> {
+    let (client, group, stderr) = open(config, client_info(), true).await?;
     drop(stderr);
     let instructions = client
         .peer_info()
         .and_then(|info| info.instructions.clone());
+    // A server that says it has no tools, one that offers only events,
+    // say, and will not list them, has none.
+    let says_tools = (client.peer_info()).is_some_and(|info| info.capabilities.tools.is_some());
     let listed = client.list_all_tools().await;
     let tools = match listed {
         Ok(tools) => tools,
+        Err(_) if !says_tools => Vec::new(),
         Err(error) => {
             let live = Live {
                 client,
                 tools: Arc::default(),
+                events: Arc::default(),
                 instructions: None,
                 group: group.keep(),
             };
@@ -565,15 +641,108 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
     Ok(Live {
         client,
         tools,
+        events: Arc::default(),
         instructions,
         group: group.keep(),
     })
 }
 
+/// Whether the server says it offers the events extension.
+pub(crate) fn offers_events(peer: &rmcp::Peer<RoleClient>) -> bool {
+    (peer.peer_info())
+        .and_then(|info| info.capabilities.extensions.clone())
+        .is_some_and(|extensions| extensions.contains_key(EVENTS))
+}
+
+/// Ask the server `method` of the events extension with `params`, which
+/// say that Sonny takes the extension, as each request of it does: its
+/// result as JSON.
+pub(crate) async fn ask(
+    peer: &rmcp::Peer<RoleClient>,
+    method: &str,
+    params: Value,
+) -> Result<Value, rmcp::ServiceError> {
+    let request = CustomRequest::new(method, Some(with_meta(params)));
+    result(
+        peer.send_request(ClientRequest::CustomRequest(request))
+            .await?,
+    )
+}
+
+/// A result of the events extension's as JSON: one read as another kind
+/// of result first says the same as JSON.
+pub(crate) fn result(result: ServerResult) -> Result<Value, rmcp::ServiceError> {
+    match result {
+        ServerResult::CustomResult(result) => Ok(result.0),
+        other => serde_json::to_value(other).map_err(|_| rmcp::ServiceError::UnexpectedResponse),
+    }
+}
+
+/// `params` with the `_meta` that says Sonny takes the events extension.
+pub(crate) fn with_meta(mut params: Value) -> Value {
+    params["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+        json!({"extensions": {EVENTS: {}}});
+    params
+}
+
+/// Every event the server offers, page by page.
+pub(crate) async fn list_events(peer: &rmcp::Peer<RoleClient>) -> Result<Vec<Value>, String> {
+    let mut events = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let params = match &cursor {
+            Some(cursor) => json!({"cursor": cursor}),
+            None => json!({}),
+        };
+        let page = (ask(peer, "events/list", params).await)
+            .map_err(|error| format!("events/list: {error}"))?;
+        events.extend(page["events"].as_array().cloned().unwrap_or_default());
+        match page["nextCursor"].as_str() {
+            // A server that names the page it gave again ends the listing.
+            Some(next) if cursor.as_deref() != Some(next) => cursor = Some(next.to_owned()),
+            _ => return Ok(events),
+        }
+    }
+}
+
+/// The lookout sources the person's servers make: `mcp.NAME` for each one
+/// on whose last listing events are offered, read by `sonny mcp events
+/// NAME`, which subscribes to what its follows name (`wants`).
+pub fn sources(servers: &Servers) -> Vec<agent_client::config::Source> {
+    let Some(cache) = cache_dir() else {
+        return Vec::new();
+    };
+    let sonny = std::env::current_exe()
+        .map(|exe| exe.display().to_string())
+        .unwrap_or_else(|_| "sonny".into());
+    (servers.iter())
+        .filter(|(_, config)| config.enabled)
+        .filter(|(name, config)| {
+            kept(&cache, name, config).is_some_and(|known| !known.events.is_empty())
+        })
+        // The config it runs on is named in its command, so a server
+        // configured anew is a changed source the lookout starts again.
+        .map(|(name, config)| agent_client::config::Source {
+            name: format!("{SOURCE}{name}"),
+            command: format!(
+                "{} mcp events {name} {}",
+                shlex::try_quote(&sonny).unwrap_or_default(),
+                config_named(config)
+            ),
+            every: None,
+            digest: None,
+            steer: None,
+            watch: Vec::new(),
+            icon: None,
+            wants: Some("topic".into()),
+        })
+        .collect()
+}
+
 /// A stdio server's process group while it starts, stopped if it never
 /// does: when it fails, and when its start is given up, as a script whose
 /// time runs out gives it up.
-struct Group(Option<u32>);
+pub(crate) struct Group(Option<u32>);
 
 impl Group {
     fn of(group: Option<u32>) -> Group {
@@ -755,7 +924,8 @@ sonny mcp add NAME [--env KEY=VALUE]... [--description TEXT] -- COMMAND [ARG]...
 sonny mcp add NAME --url URL [--bearer-token-env-var VAR] [--description TEXT]
 sonny mcp remove NAME
 sonny mcp import [--yes | --json]
-sonny mcp tool";
+sonny mcp tool
+sonny mcp events NAME [CONFIG]";
 
 /// `sonny mcp`: the person's servers, as `codex mcp` keeps Codex's, in
 /// `[sonny.mcp_servers]` of ~/.agent/config.toml.
@@ -839,6 +1009,11 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             }
             None => Err("no MCP servers on, so agents get no exec tool".into()),
         },
+        // The events of a server that offers them, as the lookout source
+        // `mcp.NAME` runs it.
+        Some((verb, [name, config @ ..])) if verb == "events" && config.len() <= 1 => {
+            crate::mcp_events::cli(name, config.first().map(String::as_str))
+        }
         Some((verb, [name])) if verb == "remove" => {
             let servers = agent_client::config::read(&path)?.sonny.mcp_servers;
             if !servers.contains_key(name) {
@@ -976,19 +1151,25 @@ mod tests {
             busy: AtomicUsize::new(0),
             kept: Mutex::default(),
         };
-        hub.keep(&slot, &[json!({"name": "t"})], &None, None);
+        let events = [json!({"name": "e"})];
+        hub.keep(&slot, (&[json!({"name": "t"})], &events), &None, None);
         let file = dir.join("mcp/s.json");
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(!text.contains("secret"), "{text}");
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!((mode(&file), mode(&dir.join("mcp"))), (0o600, 0o700));
-        assert_eq!(kept(&dir.join("mcp"), "s", &config).unwrap().tools.len(), 1);
+        let known = kept(&dir.join("mcp"), "s", &config).unwrap();
+        assert_eq!((known.tools.len(), &known.events[..]), (1, &events[..]));
         // Another secret is another config, listed again.
         let changed = McpServer {
             env: [("TOKEN".to_owned(), "other".to_owned())].into(),
-            ..config
+            ..config.clone()
         };
         assert_eq!(kept(&dir.join("mcp"), "s", &changed), None);
+        // And its events source's command changes, so the lookout starts
+        // it again on the new one, never naming the secret.
+        assert_ne!(config_named(&config), config_named(&changed));
+        assert!(!config_named(&config).contains("secret"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1026,13 +1207,13 @@ mod tests {
             kept: Mutex::default(),
         };
         assert_eq!(hub.cached(&slot), None);
-        hub.keep(&slot, &[json!({"name": "t"})], &None, None);
+        hub.keep(&slot, (&[json!({"name": "t"})], &[]), &None, None);
         let (first, again) = (hub.cached(&slot).unwrap(), hub.cached(&slot).unwrap());
         assert!(Arc::ptr_eq(&first.tools, &again.tools));
         // Written again, by this process or another, it is read again.
         hub.keep(
             &slot,
-            &[json!({"name": "t"}), json!({"name": "u"})],
+            (&[json!({"name": "t"}), json!({"name": "u"})], &[]),
             &None,
             None,
         );

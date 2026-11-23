@@ -357,8 +357,14 @@ fn declare(
                 section.push_str(&about);
             }
         }
-        if known.tools.is_empty() {
+        // Not listed yet: one that offers events alone was.
+        if known.tools.is_empty() && known.events.is_empty() {
             section.push_str("\nIts tools are listed in `ALL_TOOLS` once it starts.");
+        }
+        let events = offered(name, &known.events);
+        if !events.is_empty() && events.len() <= *left {
+            *left -= events.len();
+            section.push_str(&events);
         }
         sections.push(section);
         for tool in known.tools.iter() {
@@ -376,6 +382,21 @@ fn declare(
         }
     }
     collided.into_values().collect()
+}
+
+/// What a server's section says of the events it offers: their names,
+/// and how an agent hears them; nothing when it offers none.
+fn offered(server: &str, events: &[Value]) -> String {
+    let names: Vec<&str> = events.iter().filter_map(|e| e["name"].as_str()).collect();
+    match names.is_empty() {
+        true => String::new(),
+        false => format!(
+            "\nIts events, heard by following `{source}:EVENT` with the `follows` tool, which \
+             says what each takes as `{{\"source\": \"{source}\"}}`: {}.",
+            names.join(", "),
+            source = format_args!("{}{server}", crate::mcp::SOURCE),
+        ),
+    }
 }
 
 /// `text` within `most` bytes: whole, or cut at a character and marked so.
