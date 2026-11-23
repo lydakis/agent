@@ -78,46 +78,42 @@ pub fn flag(given: &str) -> std::result::Result<(String, Access), String> {
     Ok((pattern.to_ascii_lowercase(), access))
 }
 
-/// Whether `host`, lowercase, matches `pattern`.
+/// Whether `host`, lowercase, matches `pattern`: one pass of the pattern
+/// over the host, `*.` and `**.` included.
 pub fn matches(pattern: &str, host: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     if let Some(domain) = pattern.strip_prefix("**.") {
-        return glob(domain.as_bytes(), host.as_bytes())
-            || host
-                .split_once('.')
-                .is_some_and(|(_, rest)| suffix(domain, rest));
+        return glob(domain.as_bytes(), host.as_bytes(), Labels::AnyOrNone);
     }
     if let Some(domain) = pattern.strip_prefix("*.") {
-        return host
-            .split_once('.')
-            .is_some_and(|(_, rest)| suffix(domain, rest));
+        return glob(domain.as_bytes(), host.as_bytes(), Labels::Some);
     }
-    glob(pattern.as_bytes(), host.as_bytes())
+    glob(pattern.as_bytes(), host.as_bytes(), Labels::None)
 }
 
-/// Whether `domain` matches `rest` or one of its parent domains.
-fn suffix(domain: &str, rest: &str) -> bool {
-    let mut rest = rest;
-    loop {
-        if glob(domain.as_bytes(), rest.as_bytes()) {
-            return true;
-        }
-        match rest.split_once('.') {
-            Some((_, parent)) => rest = parent,
-            None => return false,
-        }
-    }
+/// What comes before the rest of a pattern: nothing, one or more labels
+/// (`*.`), or either (`**.`).
+#[derive(Clone, Copy)]
+enum Labels {
+    None,
+    Some,
+    AnyOrNone,
 }
 
-/// `?` one byte, `*` any run of bytes but a dot; the rest itself. One
-/// pass of the pattern over a row per text position: time pattern times
-/// text, whatever the pattern, never backtracking.
-fn glob(pattern: &[u8], text: &[u8]) -> bool {
+/// `?` one byte, `*` any run of bytes but a dot; the rest itself, after
+/// `labels`. One pass of the pattern over a row per text position: time
+/// pattern times text, whatever the pattern, never backtracking.
+fn glob(pattern: &[u8], text: &[u8], labels: Labels) -> bool {
     // `ends[n]`: the pattern so far matches the text's first `n` bytes.
-    let mut ends = vec![false; text.len() + 1];
-    ends[0] = true;
+    let mut ends: Vec<bool> = (0..=text.len())
+        .map(|n| match labels {
+            Labels::None => n == 0,
+            Labels::Some => n > 0 && text[n - 1] == b'.',
+            Labels::AnyOrNone => n == 0 || text[n - 1] == b'.',
+        })
+        .collect();
+    let mut next = vec![false; text.len() + 1];
     for &byte in pattern {
-        let mut next = vec![false; text.len() + 1];
         match byte {
             b'*' => {
                 for n in 0..=text.len() {
@@ -125,12 +121,13 @@ fn glob(pattern: &[u8], text: &[u8]) -> bool {
                 }
             }
             _ => {
+                next[0] = false;
                 for n in 1..=text.len() {
                     next[n] = ends[n - 1] && (byte == b'?' || text[n - 1] == byte);
                 }
             }
         }
-        ends = next;
+        std::mem::swap(&mut ends, &mut next);
     }
     ends[text.len()]
 }
@@ -196,7 +193,11 @@ pub fn allowed(
 ) -> Result<(), Blocked> {
     let host = host.to_ascii_lowercase();
     let bare = host.trim_start_matches('[').trim_end_matches(']');
-    let (named, other) = (decide(domains, &host), decide(domains, bare));
+    let named = decide(domains, &host);
+    if bare == host {
+        return named;
+    }
+    let other = decide(domains, bare);
     // Both spellings name one place: a deny of either wins, and an allow
     // of either lets it through.
     match (named, other) {
@@ -371,8 +372,63 @@ pub async fn serve<S>(
     if !early.is_empty() && upstream.write_all(&early).await.is_err() {
         return;
     }
-    let mut client = client.into_inner();
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    relay(client.into_inner(), upstream).await;
+}
+
+/// How long an upstream may stay silent once its client has sent all it
+/// will: a client gone, its command ended or its fetch given up, is never
+/// waited on past it.
+const DRAINING: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bytes both ways until either end is done: the upstream closing, or the
+/// client done sending and the upstream then silent for [`DRAINING`].
+async fn relay<C, U>(client: C, upstream: U)
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut from_client, mut to_client) = tokio::io::split(client);
+    let (mut from_upstream, mut to_upstream) = tokio::io::split(upstream);
+    // When the upstream was last heard, as milliseconds from `since`.
+    let since = tokio::time::Instant::now();
+    let heard = std::sync::atomic::AtomicU64::new(0);
+    let last = || since + std::time::Duration::from_millis(heard.load(Relaxed));
+    let sending = async {
+        let _ = tokio::io::copy(&mut from_client, &mut to_upstream).await;
+        let _ = to_upstream.shutdown().await;
+    };
+    let answering = async {
+        let mut chunk = vec![0; 16 * 1024];
+        loop {
+            match from_upstream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let now = since.elapsed().as_millis();
+                    heard.store(u64::try_from(now).unwrap_or(u64::MAX), Relaxed);
+                    if to_client.write_all(&chunk[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = to_client.shutdown().await;
+    };
+    tokio::pin!(sending, answering);
+    tokio::select! {
+        () = &mut answering => return,
+        () = &mut sending => {}
+    }
+    loop {
+        tokio::select! {
+            () = &mut answering => return,
+            () = tokio::time::sleep_until(last() + DRAINING) => {
+                if last() + DRAINING <= tokio::time::Instant::now() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// The request's head up to its blank line, or none past [`HEAD_BYTES`].
@@ -495,6 +551,47 @@ mod tests {
             &format!("{}b.example.com", "a".repeat(60))
         ));
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_long_policy_of_wildcards_over_the_longest_name_matches_quickly() {
+        let mut given: BTreeMap<String, Access> = (0..60)
+            .map(|n| (format!("*.{}{n:03}", "a".repeat(244)), Access::Deny))
+            .collect();
+        let host = format!("{}x", "a.".repeat(126));
+        given.insert(host.clone(), Access::Allow);
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            assert_eq!(allowed(&given, &host), Ok(()));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    /// A client done sending whose upstream then says nothing is let go
+    /// after a while, not held for good.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_upstream_is_let_go_once_its_client_is_done() {
+        let (client, mut far_client) = tokio::io::duplex(1024);
+        let (upstream, _silent) = tokio::io::duplex(1024);
+        let relaying = tokio::spawn(relay(client, upstream));
+        far_client.shutdown().await.unwrap();
+        tokio::time::sleep(DRAINING + std::time::Duration::from_secs(1)).await;
+        assert!(relaying.is_finished());
+        // An upstream still talking is heard out.
+        let (client, mut far_client) = tokio::io::duplex(1024);
+        let (upstream, mut far_upstream) = tokio::io::duplex(1024);
+        let relaying = tokio::spawn(relay(client, upstream));
+        far_client.shutdown().await.unwrap();
+        for _ in 0..3 {
+            tokio::time::sleep(DRAINING / 2).await;
+            far_upstream.write_all(b"more").await.unwrap();
+        }
+        assert!(!relaying.is_finished());
+        drop(far_upstream);
+        let mut heard = Vec::new();
+        far_client.read_to_end(&mut heard).await.unwrap();
+        assert_eq!(heard, b"moremoremore");
+        relaying.await.unwrap();
     }
 
     #[test]
