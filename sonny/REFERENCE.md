@@ -2040,7 +2040,10 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   on), links it to the host's agents over SSH while it is connected.
   `browser` with `machine` drives that machine's browser, signed in as you;
   an `exec` script whose options line names the machine runs against its
-  MCP servers; and a link or picture the host's Sonny can't open opens
+  MCP servers; a script's `tools.shell`, `read`, `write`, `edit` or
+  `apply_patch` call with `machine` runs there, in its sandbox, writing
+  only the link's `writable` folders (none by default); and a link or
+  picture the host's Sonny can't open opens
   there. Anything that needs approval is asked in your Sonny on the host
   ([docs/SONNY.md](../docs/SONNY.md#links)).
 - Every task works in a git worktree of its own, at the last commit on

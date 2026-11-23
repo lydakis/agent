@@ -1831,6 +1831,7 @@ sonny link forget laptop       # run on the host to forget a linked machine
 - **Browser (`browser` with `machine: "laptop"`):** Runs tabs in a dedicated shared Chrome instance copied once from your `browser_profile` (default `"Default"`; refreshes cookies and native messaging hosts on start, closes after 30 idle minutes). Screenshots return inline; file outputs (PDF, HAR, recordings up to 30 MiB) stream back to approved host paths.
 - **Desktop (`desktop` with `machine: "laptop"`):** Runs `agent-desktop` on the linked machine with action approvals routed to the host agent's gate.
 - **MCP (`exec`):** Prefix a script with `// @exec: {"machine": "laptop"}` to run against that machine's MCP servers (listed under `# On NAME`).
+- **Shell and files (`tools.shell`, `read`, `write`, `edit`, `apply_patch` with `machine: "laptop"`):** In code mode, a script's call of the agent's own shell or file tool that names a machine is decided on the host as the same call would be (its rules and approvals), then runs on the laptop with `agent tool`, in the laptop's sandbox: read-only unless the link lists `writable` folders, the network off unless `network = true` with them, in the foreground, never leaving the sandbox. A call stopped on the host stops its commands on the laptop too; output past what the model sees is kept whole in a file there, named in the result for a `read` on the laptop; and commands get none of the laptop's `[shell_environment_policy] exclude` variables, `~/.agent/keys/env` keys or provider keys.
 - **Opening links & files:** On headless hosts, clicking an `http(s)` URL or large image/PDF in Sonny opens it directly on your connected laptop.
 - **Dropped files & clipboard:** Drop a file from your laptop on a Sonny window you reached over SSH and the host's Sonny fetches it over the link: a picture attaches as `[Image #n]` (HEIC and other Mac formats converted there), any other file is copied to `~/.agent/sonny/dropped` and the composer names the copy. Ctrl+V over SSH takes the picture on the laptop's clipboard. With several machines linked, the one your SSH session comes from is asked first, and alone for its clipboard; a link that is busy is asked again for up to a minute.
 
@@ -1844,6 +1845,8 @@ command = "/home/me/.local/bin/sonny"
 browser_profile = "Default"    # Chrome profile name, path, or "" for fresh browsers
 calls = 16                     # max concurrent remote calls (default: 4 × CPUs)
 upgrade = true                 # the end behind upgrades as the link connects (default: true)
+writable = ["~/code/shop"]     # folders the host's agents' shell and file tools write here; the first is where they start (default: none, read-only)
+network = false                # whether their commands here reach the network, with writable folders (default: false)
 ```
 
 Error codes: `not_connected` (asleep/offline), `tool_outcome_unknown` (link dropped mid-call), `link_busy` (at `calls` cap). Both ends must speak link protocol 1.

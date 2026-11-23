@@ -2943,7 +2943,7 @@ fn agent_bin_or_missing() -> Result<PathBuf, String> {
 }
 
 /// Where [`agent_bin`] looks, in order.
-fn agent_places_here() -> Vec<PathBuf> {
+pub(crate) fn agent_places_here() -> Vec<PathBuf> {
     let given = std::env::var_os("AGENT_BIN").map(PathBuf::from);
     agent_places(given, named::me().ok().as_deref())
 }

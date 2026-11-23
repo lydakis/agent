@@ -13024,3 +13024,20 @@ The two tool definitions grow by 542 bytes together, sent once per model
 call to bots that have the tools; the tool lists stay stored once by their
 digest. A call without a schema sends the same `submit` as before. The pull
 request's Perf screen is the matched comparison.
+
+## A burst of messages to one agent
+
+`bench/burst_messages.py` sends one agent 100 messages as steers, as 100
+helpers ending together would with `send_message`, against a synthetic model
+that answers each request in 300 ms (2026-11-23, Linux cloud box, release
+build):
+
+| How they came | Model requests | Input sent | Until a request read all 100 |
+|---|---:|---:|---:|
+| All at once | 1 | 40.4 KiB, 101 items | 16 ms |
+| Over one second, while its turns ran | 4 | 81.0 KiB, 207 items | 1,012 ms |
+| One at a time, each after its last turn ended | 100 | 2,525.2 KiB, 10,100 items | 46,991 ms |
+
+A burst costs the agent one request: messages that arrive before its next
+request goes all go in that request, and those arriving while one runs go
+in the next. Nothing to change.

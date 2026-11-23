@@ -13,7 +13,7 @@ All named bots use the same flat verbs. There is no parent/child command hierarc
 | **Run & converse** | `run`, `fork`, `follow`, `wait`, `interrupt` |
 | **Inspect & audit** | `ls`, `inspect`, `turns`, `usage`, `audit`, `ps`, `stop`, `held`, `retry`, `models`, `stats` |
 | **Approvals** | `approvals`, `answer` |
-| **Lifecycle & daemon** | `rm`, `prune`, `companion`, `start`, `shutdown`, `serve`, `sandbox`, `login` |
+| **Lifecycle & daemon** | `rm`, `prune`, `companion`, `start`, `shutdown`, `serve`, `sandbox`, `tool`, `login` |
 
 Run `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` (`-h` works too). `agent --help` gives each command in one line; a command's own help lists its flags, and `run --help` lists a new bot's settings apart, after the everyday flags. Help writes to stdout and exits `0` without opening a store or connecting to a daemon.
 

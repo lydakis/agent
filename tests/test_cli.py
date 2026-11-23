@@ -2155,6 +2155,97 @@ class CliTests(ModelFixture):
             self.assertEqual(program.read_text(), '#!/bin/sh\necho pinned\n')
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_tool_runs_one_call_of_a_bot_s_shell_or_files_here_in_a_sandbox(self):
+        # What a machine lends another's agents: the daemon's own shell and
+        # file tools, writing only the folders named, the rest read-only.
+        home, work = self.path/'tool-home', self.path/'tool-work'
+        lent, kept = work/'lent', work/'kept'
+        for folder in (home, lent, kept):
+            folder.mkdir(parents=True)
+        (kept/'notes.txt').write_text('kept\n')
+        env = {**clean_env(), 'HOME': str(home)}
+
+        def call(*args):
+            ran = subprocess.run([str(self.binary), 'tool', *args[:-2], args[-2], json.dumps(args[-1])],
+                                 env=env, capture_output=True, text=True, timeout=30, cwd=work)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+            return json.loads(ran.stdout)
+
+        def ran(reply):
+            return json.loads(reply['output'])
+
+        writing = ('--writable', str(lent), '--workdir', str(lent))
+        shell = call(*writing, 'shell', {'command': 'echo hi > made; cat made; touch ../kept/no'})
+        self.assertEqual(ran(shell)['stdout'], 'hi\n')
+        self.assertTrue((lent/'made').exists())
+        self.assertFalse((kept/'no').exists())
+        self.assertEqual(call(*writing, 'write', {'path': 'a.txt', 'content': 'one'}),
+                         {'output': 'wrote 3 bytes to a.txt', 'failed': False})
+        self.assertFalse(call(*writing, 'edit', {'path': 'a.txt', 'old': 'one', 'new': 'two'})['failed'])
+        patched = call(*writing, 'apply_patch', {'input': '*** Begin Patch\n*** Add File: b.txt\n+three\n*** End Patch\n'})
+        self.assertFalse(patched['failed'], patched)
+        self.assertEqual(((lent/'a.txt').read_text(), (lent/'b.txt').read_text()), ('two', 'three\n'))
+        # Named nowhere, a folder is read and never written.
+        self.assertIn('kept', call('--workdir', str(kept), 'read', {'path': 'notes.txt'})['output'])
+        refused = call('--workdir', str(kept), 'write', {'path': 'notes.txt', 'content': 'x'})
+        self.assertEqual((refused['failed'], ran(refused)['error']), (True, 'write_denied'))
+        self.assertEqual((kept/'notes.txt').read_text(), 'kept\n')
+        # Nothing leaves the sandbox or outlives the call; a tool's own
+        # refusal is a result, as the model reads it.
+        self.assertEqual(ran(call(*writing, 'shell', {'command': 'ls', 'sandbox_permissions': 'require_escalated'}))['error'],
+                         'escalation_refused')
+        self.assertEqual(ran(call(*writing, 'shell', {'command': 'sleep 1', 'background': True}))['error'], 'tool_refused')
+        self.assertEqual(ran(call('shell', {'nope': 1}))['error'], 'invalid_tool_arguments')
+        other = subprocess.run([str(self.binary), 'tool', 'spawn_agent', '{}'], env=env,
+                               capture_output=True, text=True, timeout=30, cwd=work)
+        self.assertEqual((other.returncode, json.loads(other.stderr)['error']), (2, 'usage'))
+        # The network goes with folders to write, as a sandbox's does.
+        alone = subprocess.run([str(self.binary), 'tool', '--network', 'shell', '{"command":"true"}'], env=env,
+                               capture_output=True, text=True, timeout=30, cwd=work)
+        self.assertEqual((alone.returncode, json.loads(alone.stderr)['error']), (2, 'usage'))
+        # What a command printed past what it shows is kept whole in a file
+        # of the agent's own, named in its result, as there is no store.
+        long = ran(call(*writing, 'shell', {'command': 'seq 1 40000'}))
+        (kept_file,) = long['files']
+        self.assertTrue(kept_file.startswith(str(home/'.agent'/'outputs'/'tool')))
+        self.assertEqual(Path(kept_file).read_text(), ''.join(f'{n}\n' for n in range(1, 40001)))
+        self.assertEqual(Path(kept_file).stat().st_mode & 0o777, 0o600)
+        # Held, its stdin closing stops the call and every command it
+        # started, as the daemon stops a call.
+        stopped = subprocess.Popen([str(self.binary), 'tool', '--held', *writing, 'shell', json.dumps(
+            {'command': '(sleep 3; touch late) & sleep 3; touch later'})], env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=work)
+        time.sleep(1)
+        stopped.stdin.close()
+        stopped.wait(timeout=30)
+        err = stopped.stderr.read()
+        stopped.stdout.close()
+        stopped.stderr.close()
+        self.assertEqual((stopped.returncode, json.loads(err)['error']), (1, 'stopped'))
+        time.sleep(3)
+        self.assertFalse((lent/'late').exists() or (lent/'later').exists())
+        # Nor are the variables the person keeps from shells given to one.
+        (home/'.agent').mkdir(exist_ok=True)
+        (home/'.agent'/'config.toml').write_text('[shell_environment_policy]\nexclude = ["SECRET_*"]\n')
+        env['SECRET_TOKEN'] = 'hidden-value'
+        self.assertEqual(ran(call(*writing, 'shell', {'command': 'echo "[$SECRET_TOKEN]"'}))['stdout'], '[]\n')
+        # Nor a provider's key, whatever the policy says, and its value is
+        # cut from what the call prints.
+        (home/'.agent'/'config.toml').write_text('')
+        env['OPENAI_API_KEY'] = 'sk-lent-machine-key-0123456789'
+        shown = ran(call(*writing, 'shell', {'command': 'echo "[$OPENAI_API_KEY]"; echo sk-lent-machine-key-0123456789'}))
+        self.assertNotIn('sk-lent-machine-key-0123456789', shown['stdout'])
+        self.assertTrue(shown['stdout'].startswith('[]\n'), shown)
+        # Arguments past what one argument of a command holds come on stdin.
+        content = 'x' * (300 << 10)
+        big = subprocess.run([str(self.binary), 'tool', *writing, 'write', '-'], env=env, cwd=work, timeout=30,
+                             input=json.dumps({'path': 'big.txt', 'content': content}) + '\n',
+                             capture_output=True, text=True)
+        self.assertEqual(big.returncode, 0, big.stderr)
+        self.assertFalse(json.loads(big.stdout)['failed'], big.stdout)
+        self.assertEqual((lent/'big.txt').read_text(), content)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_daemon_started_by_a_name_in_sonny_s_programs_still_writes_for_a_sandboxed_bot(self):
         # Sonny starts the daemon by a name in its programs folder, kept
         # from every sandbox: a sandboxed bot's write runs Agent by the

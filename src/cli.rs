@@ -266,6 +266,14 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "tool",
+        about: "Run one call of a bot's shell, read, write, edit or apply_patch here, in a sandbox: for a client that lends this machine to another's agents",
+        usage: "tool [--writable PATH]... [--network] [--held] [--workdir DIR] NAME (ARGUMENTS | -)",
+        flags: "--writable --network --held --workdir",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
@@ -590,6 +598,10 @@ fn print_flags(flags: &str) {
                 "Another folder a workspace-write bot, or a sandboxed command, may change; repeat for more",
             ),
             "--network" => ("", "A workspace-write bot's commands may use the network"),
+            "--held" => (
+                "",
+                "Run while stdin stays open: once it closes, the call stops, its commands with it",
+            ),
             "--outputs" => (
                 "PATH",
                 "Where a new bot's tool outputs cut for the model are written whole, one file per stream; default the outputs folder beside the store",
@@ -867,6 +879,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--no-compaction"
                 | "--agents"
                 | "--network"
+                | "--held"
                 | "--quiet-background"
                 | "--discover"
         ) {
@@ -970,6 +983,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     } else if c.name == "sandbox" {
         if positional == 0 {
             return fail_with("usage", "sandbox needs a command after --");
+        }
+    } else if c.name == "tool" {
+        if positional != 2 {
+            return fail_with("usage", "tool needs a tool's name and its arguments");
         }
     } else if c.name == "audit" && positional != 0 {
         // `audit trim` deletes what it names and nothing else.
