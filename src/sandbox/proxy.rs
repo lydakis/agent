@@ -114,6 +114,8 @@ fn glob(pattern: &[u8], text: &[u8], labels: Labels) -> bool {
         .collect();
     let mut next = vec![false; text.len() + 1];
     for &byte in pattern {
+        #[cfg(test)]
+        tests::CELLS.with(|cells| cells.set(cells.get() + text.len() + 1));
         match byte {
             b'*' => {
                 for n in 0..=text.len() {
@@ -502,6 +504,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    thread_local! {
+        /// Cells of `glob`'s rows filled on this thread: its work, counted
+        /// the same on any machine.
+        pub(super) static CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The cells filled since the last call.
+    fn cells() -> usize {
+        CELLS.with(|cells| cells.replace(0))
+    }
+
     fn domains(given: &[(&str, Access)]) -> BTreeMap<String, Access> {
         given.iter().map(|(p, a)| (p.to_string(), *a)).collect()
     }
@@ -556,13 +569,10 @@ mod tests {
     fn a_pattern_of_many_stars_matches_in_time_bounded_by_its_length() {
         let pattern = "*a*a*a*a*a*a*a*a*a*a*a*a*ab.example.com";
         let host = format!("{}.example.com", "a".repeat(60));
-        let started = std::time::Instant::now();
+        let longer = format!("{}b.example.com", "a".repeat(60));
         assert!(!matches(pattern, &host));
-        assert!(matches(
-            pattern,
-            &format!("{}b.example.com", "a".repeat(60))
-        ));
-        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert!(matches(pattern, &longer));
+        assert!(cells() <= pattern.len() * (host.len() + 1 + longer.len() + 1));
     }
 
     #[test]
@@ -572,11 +582,11 @@ mod tests {
             .collect();
         let host = format!("{}x", "a.".repeat(126));
         given.insert(host.clone(), Access::Allow);
-        let started = std::time::Instant::now();
-        for _ in 0..10 {
-            assert_eq!(allowed(&given, &host), Ok(()));
-        }
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let bound: usize =
+            given.keys().map(|pattern| pattern.len()).sum::<usize>() * (host.len() + 1);
+        cells();
+        assert_eq!(allowed(&given, &host), Ok(()));
+        assert!(cells() <= bound);
     }
 
     /// A client done sending whose upstream then says nothing is let go
