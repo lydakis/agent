@@ -48,13 +48,14 @@ const POLL_FLOOR: Duration = Duration::from_secs(1);
 /// to is gone, as the extension says.
 const HEARTBEATS: u32 = 3;
 
-/// `sonny mcp events NAME`, as the lookout runs it.
-pub fn cli(name: &str) -> Result<(), String> {
+/// `sonny mcp events NAME [CONFIG]`, as the lookout runs it: CONFIG
+/// names the server's config it was started for (`mcp::config_named`).
+pub fn cli(name: &str, config: Option<&str>) -> Result<(), String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
-        .block_on(run(name))
+        .block_on(run(name, config))
 }
 
 /// One subscription: an event, by name, with its arguments.
@@ -496,11 +497,16 @@ impl rmcp::ClientHandler for Listener {
     }
 }
 
-async fn run(server: &str) -> Result<(), String> {
+async fn run(server: &str, named: Option<&str>) -> Result<(), String> {
     let servers = agent_client::config::load()?.sonny.mcp_servers;
     let config = (servers.get(server))
         .filter(|config| config.enabled)
         .ok_or_else(|| format!("no MCP server {server} on"))?;
+    // Never on a config other than the one it was started for: the
+    // lookout starts it again on the new one.
+    if named.is_some_and(|named| named != crate::mcp::config_named(config)) {
+        return Err(format!("{server} was configured anew since this started"));
+    }
     let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
     let dir =
         var("SONNY_SOURCE_DIR").ok_or("SONNY_SOURCE_DIR is not set: the lookout runs this")?;

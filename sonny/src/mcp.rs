@@ -471,6 +471,12 @@ fn seconds(value: Option<f64>) -> Option<Duration> {
 /// What a listing was made with, so a changed config lists again: a
 /// digest, since the config holds the server's env and headers, secrets
 /// among them.
+/// How the events command names the config it is run on: the start of
+/// its fingerprint.
+pub(crate) fn config_named(config: &McpServer) -> String {
+    fingerprint(config)[..16].to_owned()
+}
+
 fn fingerprint(config: &McpServer) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{config:?}"));
@@ -707,11 +713,14 @@ pub fn sources(servers: &Servers) -> Vec<agent_client::config::Source> {
         .filter(|(name, config)| {
             kept(&cache, name, config).is_some_and(|known| !known.events.is_empty())
         })
-        .map(|(name, _)| agent_client::config::Source {
+        // The config it runs on is named in its command, so a server
+        // configured anew is a changed source the lookout starts again.
+        .map(|(name, config)| agent_client::config::Source {
             name: format!("{SOURCE}{name}"),
             command: format!(
-                "{} mcp events {name}",
-                shlex::try_quote(&sonny).unwrap_or_default()
+                "{} mcp events {name} {}",
+                shlex::try_quote(&sonny).unwrap_or_default(),
+                config_named(config)
             ),
             every: None,
             digest: None,
@@ -909,7 +918,7 @@ sonny mcp add NAME --url URL [--bearer-token-env-var VAR] [--description TEXT]
 sonny mcp remove NAME
 sonny mcp import [--yes | --json]
 sonny mcp tool
-sonny mcp events NAME";
+sonny mcp events NAME [CONFIG]";
 
 /// `sonny mcp`: the person's servers, as `codex mcp` keeps Codex's, in
 /// `[sonny.mcp_servers]` of ~/.agent/config.toml.
@@ -995,7 +1004,9 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         },
         // The events of a server that offers them, as the lookout source
         // `mcp.NAME` runs it.
-        Some((verb, [name])) if verb == "events" => crate::mcp_events::cli(name),
+        Some((verb, [name, config @ ..])) if verb == "events" && config.len() <= 1 => {
+            crate::mcp_events::cli(name, config.first().map(String::as_str))
+        }
         Some((verb, [name])) if verb == "remove" => {
             let servers = agent_client::config::read(&path)?.sonny.mcp_servers;
             if !servers.contains_key(name) {
@@ -1145,9 +1156,13 @@ mod tests {
         // Another secret is another config, listed again.
         let changed = McpServer {
             env: [("TOKEN".to_owned(), "other".to_owned())].into(),
-            ..config
+            ..config.clone()
         };
         assert_eq!(kept(&dir.join("mcp"), "s", &changed), None);
+        // And its events source's command changes, so the lookout starts
+        // it again on the new one, never naming the secret.
+        assert_ne!(config_named(&config), config_named(&changed));
+        assert!(!config_named(&config).contains("secret"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
