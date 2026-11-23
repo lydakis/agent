@@ -826,6 +826,7 @@ pub(crate) mod tests {
             project: Some(project),
             profile: None,
             lead: name.ends_with(".lead"),
+            folder: None,
         };
         crate::commons::call_as(home, &caller, &arguments, &|_, _| false).unwrap()
     }
@@ -1435,6 +1436,7 @@ pub(crate) mod tests {
             project: Some("shop"),
             profile: None,
             lead: false,
+            folder: None,
         };
         let posts = crate::commons::posts(&crate::commons::dir(home).join("api.jsonl")).unwrap();
         crate::commons::told(
