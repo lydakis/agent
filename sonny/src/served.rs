@@ -1197,6 +1197,7 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                 return crate::lookout::subs::source(&store, &caller, caller_id, name, &sources)
                     .map(|mut read| {
                         crate::lookout::sources::say_wants(&mut read);
+                        crate::mcp_events::say_events(&mut read);
                         read.to_string()
                     })
                     .map_err(|e| ("follow_refused", e));

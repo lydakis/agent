@@ -125,13 +125,15 @@ pub fn names() -> Vec<String> {
     names
 }
 
-/// The sources the person set up, and Sonny's own: memory, the linked
+/// The sources the person set up, the events of their MCP servers that
+/// offer events (`mcp.NAME`), and Sonny's own: memory, the linked
 /// machines, and the commons while agents have it. A source with no
 /// command is Sonny's own.
 pub fn configured() -> Result<Vec<Source>, String> {
     let config = crate::kept::config()?.sonny;
     let commons = config.commons;
     let mut sources = config.sources;
+    sources.extend(crate::mcp::sources(&config.mcp_servers));
     let own = (config.own_sources.into_iter())
         .filter(|source| commons || source.name != agent_client::config::COMMONS_SOURCE)
         .map(|source| Source {
@@ -623,8 +625,9 @@ impl Runner {
             // What subscriptions want of it is on disk before it runs; one
             // not written leaves it stopped, to try again at the next reread.
             if let Some(field) = &source.wants {
-                let wants = (self.wants.get(&source.name).cloned())
-                    .unwrap_or_else(|| json!({"field": field, "all": false, "values": []}));
+                let wants = (self.wants.get(&source.name).cloned()).unwrap_or_else(
+                    || json!({"field": field, "all": false, "values": [], "follows": []}),
+                );
                 let file = wants_file(&dir);
                 let written = super::make_dir(&dir).and_then(|()| {
                     super::write_moved(
@@ -689,9 +692,10 @@ impl Runner {
             let Some(field) = &source.wants else {
                 continue;
             };
-            let subs = subscribers.values().flatten();
-            let (all, values) = super::subs::wanted(subs, &source.name, field);
-            let wants = json!({"field": field, "all": all, "values": values});
+            let subs = || subscribers.values().flatten();
+            let (all, values) = super::subs::wanted(subs(), &source.name, field);
+            let follows = super::subs::asking(subs(), &source.name);
+            let wants = json!({"field": field, "all": all, "values": values, "follows": follows});
             if self.wants.get(&source.name) != Some(&wants) {
                 self.wants.insert(source.name.clone(), wants);
                 changed.push(source.name.clone());
@@ -3228,7 +3232,10 @@ mod tests {
             serde_json::from_str(text.strip_prefix("wants ").unwrap()).unwrap()
         };
         let first = wants(next_event(&mut got).await.text);
-        assert_eq!(first, json!({"field": "id", "all": false, "values": []}));
+        assert_eq!(
+            first,
+            json!({"field": "id", "all": false, "values": [], "follows": []})
+        );
         let sub = |name: &str, filter: Value| super::super::subs::Sub {
             name: name.into(),
             tasks_of: Vec::new(),
@@ -3252,6 +3259,11 @@ mod tests {
         runner.wanted_by(&subscribers);
         let wanted = wants(next_event(&mut got).await.text);
         assert_eq!(wanted["values"], json!(["CR-12", "CR-14"]));
+        // And each follow of it as it is, for what a field cannot say.
+        assert_eq!(
+            wanted["follows"],
+            json!([{"topics": null, "filter": {"id": ["CR-12", "CR-14"]}}])
+        );
         // The same wants start nothing again.
         runner.wanted_by(&subscribers);
         assert!(
