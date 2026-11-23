@@ -4622,12 +4622,12 @@ fn nowhere_to_open(var: &dyn Fn(&str) -> Option<std::ffi::OsString>, mac: bool) 
 /// row above it to the row below, the conversation's width, as Codex
 /// draws its composer and the user's messages on one shade: what was
 /// written and what is being written read as one thing, the words in the
-/// middle of it, and the composer's limits show in any theme. A free
-/// column each end, as their sent messages have: the band starts in the
-/// blank column before the lead, and what is typed wraps a column short
-/// of its end, the column the cursor takes at a full row's end. Without
-/// color (`NO_COLOR`) a muted rule above it, from the lead to the
-/// column's edge.
+/// middle of it, and the composer's limits show in any theme. A column
+/// past the conversation at each end, as their sent messages have: the
+/// blank columns beside it, so the words keep the conversation's width
+/// and never sit on its edge; the cursor at a full row's end takes the
+/// last. Without color (`NO_COLOR`) a muted rule above it, from the lead
+/// to the column's edge.
 fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
     let width = composer.width.min(measure() as u16);
     if look::no_color() {
@@ -4636,15 +4636,24 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
         return;
     }
     let before = u16::from(composer.x > 0);
+    let after = u16::from(composer.x + width < frame.area().right());
     let band = Rect {
         x: composer.x - before,
         y: gap.y,
         height: pad.bottom().saturating_sub(gap.y),
-        width: width + before,
+        width: width + before + after,
     };
     frame
         .buffer_mut()
         .set_style(band, Style::default().bg(look::BAND));
+}
+
+/// The width the composer's text is laid at, for a conversation
+/// `column` wide: the column, and the band's column past it, where the
+/// cursor goes at a full row's end, as [`prompt::Input::layout`] keeps
+/// the last column for it. What is typed wraps where it will once sent.
+fn typed(column: usize) -> usize {
+    column + 1
 }
 
 /// The viewport's rows, top to bottom: the reply's open line (`live`
@@ -19052,19 +19061,19 @@ impl App {
                     // shell's history; past the last, back to the newest
                     // and what was being written.
                     KeyCode::Up => {
-                        if !self.input.up(self.prose())
+                        if !self.input.up(typed(self.prose()))
                             && let Some(text) = self.recalled(recall::Recall::older)
                         {
                             self.input.set(&text);
                             // One of several rows starts at its top, so Up
                             // keeps going back.
-                            if self.input.layout(self.prose()).len() > 1 {
+                            if self.input.layout(typed(self.prose())).len() > 1 {
                                 self.input.top();
                             }
                         }
                     }
                     KeyCode::Down => {
-                        if !self.input.down(self.prose())
+                        if !self.input.down(typed(self.prose()))
                             && let Some(text) = self.recalled(recall::Recall::newer)
                         {
                             self.input.set(&text);
@@ -22338,9 +22347,7 @@ impl App {
         let room = (size.height as usize).saturating_sub(VIEWPORT as usize - 1);
         // What is typed to answer a question has the question over it,
         // as a reply in a chat has what it replies to.
-        // A column short of the composer's band, as the person's words
-        // are once sent.
-        let heading = transcript::on_band(width.min(measure()));
+        let heading = width.min(measure());
         let mut headings = self.quoting_over(heading);
         headings.extend(self.answering_over(heading));
         // The newest over the words, the room kept for one row of them.
@@ -22353,7 +22360,7 @@ impl App {
         let first_row = match &self.composing {
             Some((_, (_, first, _))) => Some(*first),
             None => (!self.input.is_empty()).then(|| {
-                let layout = self.input.layout(width.min(measure()));
+                let layout = self.input.layout(typed(width.min(measure())));
                 self.input.cursor(&layout).0 - cursor_row
             }),
         };
@@ -23268,16 +23275,17 @@ impl App {
                 height: composer.height - over,
                 ..composer
             };
-            composer_at = first_row.map(|first| (text, first, width.min(measure())));
+            composer_at = first_row.map(|first| (text, first, typed(width.min(measure()))));
             // Keys in the pane: no cursor where they do not go.
             if !self.pane_keys && self.projects.is_none() {
                 frame.set_cursor_position((
-                    composer.x + (cursor_col as u16).min(composer.width.saturating_sub(1)),
+                    composer.x + (cursor_col as u16).min(composer.width),
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
                 ));
             }
-            // Under the composer's band and no wider: one column, its
-            // right edge where the band's is.
+            // Under the composer's band, the conversation's width: from
+            // its first column, under the `›`, to where its words end;
+            // not the band's column past either end.
             // The menu's keys while it is open, as every list over the
             // composer has them, saying what Enter does with the pick.
             let (line, opens) = match menu_keys(&menu, self.pick, self.menu_moved, &self.input) {
@@ -23358,12 +23366,10 @@ impl App {
     /// column. A list or picker open over the composer keeps it to the
     /// cursor's row.
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
-        // What is typed is laid with the band's last column free, where the
-        // cursor goes at a full row's end ([`prompt::Input::layout`]), so
-        // it wraps as it will read once sent; a guess or a hint leaves it
-        // free too ([`transcript::on_band`]).
-        let typed = width;
-        let width = transcript::on_band(width);
+        // What is typed wraps at the conversation's edge, as it will read
+        // once sent; the cursor at a full row's end goes in the band's
+        // column past it ([`typed`]).
+        let typed = typed(width);
         // What is sent answers the open question in focus.
         let answering = self.asking();
         // The guess at the next message, for Tab to take.
@@ -24017,7 +24023,7 @@ impl App {
                 format!(" {}", "↑".repeat(steps))
             });
             let marked = boost.as_ref().map_or(0, |boost| boost.width());
-            let room = width.saturating_sub(4 + needs + marked + "zen · ".len());
+            let room = width.saturating_sub(needs + marked + "zen · ".len());
             // As much of its first line as the row holds: the footer's own
             // width, not a glance's.
             let mut line = focus.lines().next().unwrap_or("").to_owned();
@@ -30132,7 +30138,7 @@ mod tests {
         assert!(app.repaint && app.input.is_empty());
         let footer = app.footer_line(100).to_string();
         assert!(
-            footer.starts_with("  zen · the receipts' currency"),
+            footer.starts_with("zen · the receipts' currency"),
             "{footer}"
         );
         assert!(!footer.contains("zen-test.lead"), "{footer}");
@@ -30141,7 +30147,7 @@ mod tests {
         app.boost = Some("xhigh".into());
         let footer = app.footer_line(100).to_string();
         assert!(
-            footer.starts_with("  zen · the receipts' currency ↑") && !footer.contains("xhigh"),
+            footer.starts_with("zen · the receipts' currency ↑") && !footer.contains("xhigh"),
             "{footer}"
         );
         // A long focus runs to the row's end, not to a glance's length.
@@ -30209,8 +30215,8 @@ mod tests {
         });
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
-        assert!(footer.starts_with("  zen · the rounding"), "{footer}");
-        assert!(footer.ends_with("? 1  "), "{footer}");
+        assert!(footer.starts_with("zen · the rounding"), "{footer}");
+        assert!(footer.ends_with("? 1"), "{footer}");
         assert_eq!(footer.width(), 60);
         let [(counter, "status")] = &counter[..] else {
             panic!("{counter:?}")
@@ -30224,8 +30230,8 @@ mod tests {
         // its number, not a word after them.
         app.zen = Some("a long focus that cannot fit".into());
         let footer = app.footer(30).0.to_string();
-        assert!(footer.starts_with("  zen · a long focus"), "{footer}");
-        assert!(footer.ends_with("? 1  "), "{footer}");
+        assert!(footer.starts_with("zen · a long focus"), "{footer}");
+        assert!(footer.ends_with("? 1"), "{footer}");
         assert!(footer.width() <= 30, "{footer}");
     }
 
@@ -38385,7 +38391,7 @@ mod tests {
             ]
         );
         // The agent's name is the composer's to say, not the footer's.
-        assert!(text.ends_with("  ? 2  ● 3  ○ 13  "), "{text}");
+        assert!(text.ends_with("  ? 2  ● 3  ○ 13"), "{text}");
         assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
         // Narrow, idle goes first; what needs the person stays.
@@ -38436,7 +38442,7 @@ mod tests {
         app.failed = 1;
         let (line, opens) = app.footer(100);
         let text = line.to_string();
-        assert!(text.ends_with("  ? 1  ✗ 3  ● 1  "), "{text}");
+        assert!(text.ends_with("  ? 1  ✗ 3  ● 1"), "{text}");
         // A click on `✗` opens /status, which lists the agents and says
         // what failed in the background.
         assert_eq!(
@@ -38446,7 +38452,7 @@ mod tests {
         // Only background failures: still one `✗`, still /status.
         app.counts = Some(status::Counts::default());
         let (line, opens) = app.footer(100);
-        assert!(line.to_string().ends_with("  ✗ 1  "), "{line}");
+        assert!(line.to_string().ends_with("  ✗ 1"), "{line}");
         assert_eq!(
             opens.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["status"]
@@ -38805,7 +38811,7 @@ mod tests {
         let full = app.footer(100).0;
         assert!(
             full.to_string()
-                .starts_with("  ⏵⏵ full access · Opus · /work"),
+                .starts_with("⏵⏵ full access · Opus · /work"),
             "{full}"
         );
         let mark = full.spans.iter().find(|span| span.content == "⏵⏵").unwrap();
@@ -39615,34 +39621,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_band_has_a_free_column_at_each_end() {
+    async fn the_band_reaches_a_column_past_the_conversation_at_each_end() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        // 34 columns of words: one row at the column's 36, two at 35.
-        let said = format!("{} bb", "a".repeat(31));
+        // A 40-column window's conversation is 36 wide, from its third
+        // column: 36 columns of words after the lead take two rows of it.
+        let said = format!("{} bb", "a".repeat(33));
         let mut terminal = Terminal::new(Shot(ratatui::backend::TestBackend::new(40, 20))).unwrap();
         app.draw(&mut terminal).unwrap();
         app.land(5, (&said, ""), (None, false), false);
+        // The same words as a reply, laid as the conversation lays one.
+        let reply = transcript::reply(&said, app.prose(), Path::new("/"));
+        app.pending.extend(reply);
         app.input.set(&said);
         app.draw(&mut terminal).unwrap();
         let buffer = terminal.backend().0.buffer().clone();
         let band = look::band();
         let row = |y: u16| -> String { (0..40).map(|x| buffer[(x, y)].symbol()).collect() };
-        let words = format!("  › {}", "a".repeat(31));
-        let opens: Vec<u16> = (0..20).filter(|&y| row(y).starts_with(&words)).collect();
-        // The sent message, then the composer: each `›` in the column's
-        // first cell, under a reply's `•`.
-        assert_eq!(opens.len(), 2, "{:?}", (0..20).map(row).collect::<Vec<_>>());
+        let all = || (0..20).map(row).collect::<Vec<_>>();
+        // The reply, the sent message and the composer all wrap at the
+        // conversation's edge, each lead in its first column.
+        let replied = format!("  • {}", "a".repeat(33));
+        let at = (0..20).find(|&y| row(y).trim_end() == replied);
+        let at = at.unwrap_or_else(|| panic!("{:?}", all()));
+        assert_eq!(row(at + 1).trim_end(), "    bb");
+        let words = format!("  › {}", "a".repeat(33));
+        let opens: Vec<u16> = (0..20).filter(|&y| row(y).trim_end() == words).collect();
+        assert_eq!(opens.len(), 2, "{:?}", all());
         for y in opens {
             assert_eq!(row(y + 1).trim_end(), "    bb", "{}", row(y + 1));
             for y in [y, y + 1] {
                 // The band from the blank column before the `›` to the
-                // column's edge, its last column free of words.
+                // blank column after the conversation's edge.
                 assert_ne!(buffer[(0, y)].bg, band, "{}", row(y));
-                assert!((1..38).all(|x| buffer[(x, y)].bg == band), "{}", row(y));
-                assert_eq!(buffer[(37, y)].symbol(), " ");
-                assert_ne!(buffer[(38, y)].bg, band, "{}", row(y));
+                assert!((1..39).all(|x| buffer[(x, y)].bg == band), "{}", row(y));
+                assert_eq!(buffer[(38, y)].symbol(), " ");
+                assert_ne!(buffer[(39, y)].bg, band, "{}", row(y));
             }
         }
+        // Nothing on the reply's rows.
+        assert!((0..40).all(|x| buffer[(x, at)].bg != band));
     }
 
     #[tokio::test]
