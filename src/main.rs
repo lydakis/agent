@@ -485,6 +485,10 @@ fn tool(args: &[String]) -> Result<i32> {
                 }
             };
             let ran = runtime()?.block_on(async {
+                let sandbox = match sandbox.served() {
+                    Ok(sandbox) => sandbox,
+                    Err(error) => return Some(Err(error)),
+                };
                 let ran = registry.execute(
                     prepared,
                     &workspace,
@@ -653,6 +657,9 @@ fn run_in(
             given(&mut command);
             return command.status().await.map_err(Error::from);
         };
+        // Its proxy, on macOS, held here while the command runs.
+        let served = policy.clone().served()?;
+        let policy = &served;
         // What the sandbox holds in place stays held while the command
         // runs, and what it left in place for it is gone before this exits,
         // as for a bot's command. A lent sandbox's the daemon holds, in the

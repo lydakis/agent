@@ -8388,13 +8388,18 @@ pub(super) fn bot_sandbox(
         settings.network,
         daemon,
     )?;
-    Ok(policy.map(|policy| Policy {
-        capability,
-        listening,
-        ..policy
-            .with_sockets(&settings.unix_sockets)
-            .with_domains(&settings.domains)
-    }))
+    policy
+        .map(|policy| {
+            Policy {
+                capability,
+                listening,
+                ..policy
+                    .with_sockets(&settings.unix_sockets)
+                    .with_domains(&settings.domains)
+            }
+            .served()
+        })
+        .transpose()
 }
 
 #[cfg(test)]

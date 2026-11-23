@@ -1155,9 +1155,10 @@ pub fn with_sandbox(
     if mine < held || theirs.is_none() {
         settings.insert("sandbox".into(), sandbox.into());
     }
-    // Read-only reaches no socket its maker's settings named either.
+    // Read-only reaches no socket or domain its maker's settings named
+    // either.
     if sandbox == "read-only" {
-        for key in ["writable", "network", "unix_sockets"] {
+        for key in ["writable", "network", "unix_sockets", "domains"] {
             settings.remove(key);
         }
     }
@@ -1789,7 +1790,8 @@ mod tests {
         let settings = |value: serde_json::Value| value.as_object().unwrap().clone();
         // Stricter than the maker's: read-only drops what it can't use.
         let mut held = settings(serde_json::json!({"sandbox": "workspace-write",
-            "writable": ["/r/.git"], "network": true, "unix_sockets": ["/d.sock"], "speed": "fast"}));
+            "writable": ["/r/.git"], "network": true, "unix_sockets": ["/d.sock"],
+            "domains": {"example.com": "allow"}, "speed": "fast"}));
         with_sandbox(&mut held, "read-only").unwrap();
         assert_eq!(
             serde_json::Value::Object(held),

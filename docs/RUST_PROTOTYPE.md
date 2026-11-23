@@ -3722,8 +3722,8 @@ under a bridge, the agent binary (`--agent-run-as-proxy`), that listens on
 the sandbox's own loopback and hands each connection to the proxy by a
 descriptor, as the bot's socket is handed; loopback stays the sandbox's
 own (`NO_PROXY`). On macOS the proxy listens on one loopback port per
-list for as long as the daemon runs, and Seatbelt lets the command reach
-that port and nothing else. `web_fetch` goes by the same proxy, its
+list while a command or fetch of a bot naming it runs, and Seatbelt lets
+the command reach that port and nothing else. `web_fetch` goes by the same proxy, its
 redirects too; `web_search`, which the provider answers, is offered as
 with the network on. A confined write reaches no network. `agent tool`
 takes `--domain` too.

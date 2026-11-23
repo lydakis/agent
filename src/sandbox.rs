@@ -149,7 +149,7 @@ pub const PROXY_FD: &str = "AGENT_PROXY_FD";
 pub fn through_proxy(policy: &Policy, command: &mut tokio::process::Command) -> Result<()> {
     #[cfg(target_os = "macos")]
     if !policy.domains.is_empty() {
-        let port = loopback_proxy(&policy.domains)?;
+        let port = loopback_proxy(&policy.domains)?.port;
         command.envs(proxy_env(&format!("http://127.0.0.1:{port}")));
         command.env_remove("NO_PROXY").env_remove("no_proxy");
     }
@@ -322,6 +322,23 @@ impl Policy {
             self.domains = domains.clone();
         }
         self
+    }
+
+    /// This policy, holding on macOS the loopback proxy its commands reach
+    /// while it, or a command's [`Hold`] of it, lives, as it holds its
+    /// bot's socket. Elsewhere, or with no domains, itself. On the
+    /// runtime that answers the proxy.
+    pub fn served(self) -> Result<Policy> {
+        #[cfg(target_os = "macos")]
+        if !self.domains.is_empty() {
+            let proxy = loopback_proxy(&self.domains)?;
+            let held = std::sync::Arc::new((self.listening.clone(), proxy));
+            return Ok(Policy {
+                listening: Some(Listening(held)),
+                ..self
+            });
+        }
+        Ok(self)
     }
 
     /// Whether a command in this sandbox may write `path`, an absolute
@@ -2628,7 +2645,7 @@ mod macos {
         let (mut profile, params) = super::seatbelt(policy);
         let mut command = tokio::process::Command::new(SANDBOX_EXEC);
         if !policy.domains.is_empty() {
-            let port = super::loopback_proxy(&policy.domains)?;
+            let port = super::loopback_proxy(&policy.domains)?.port;
             profile = super::proxied(profile, port);
             super::through_proxy(policy, &mut command)?;
         }
@@ -2641,20 +2658,41 @@ mod macos {
     }
 }
 
-/// The port on this machine's loopback where the proxy serves the
-/// commands whose bots name `domains`, as Codex's runs on one: on macOS,
-/// where Seatbelt lets a command reach that port and nothing else. One for
-/// each list, for as long as the daemon runs. Others that reach loopback
-/// reach it too, and with it no more than the list lets through.
-pub fn loopback_proxy(domains: &BTreeMap<String, proxy::Access>) -> Result<u16> {
-    type Listeners = std::sync::Mutex<BTreeMap<BTreeMap<String, proxy::Access>, u16>>;
+/// The proxy on this machine's loopback for one list of domains. It
+/// listens while anything holds it, and its port closes with the last.
+pub struct Loopback {
+    pub port: u16,
+    /// The client the daemon's own `web_fetch` reaches through it.
+    pub client: std::sync::OnceLock<reqwest::Client>,
+    accepting: tokio::task::AbortHandle,
+}
+
+impl Drop for Loopback {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
+}
+
+/// The proxy on this machine's loopback that serves the commands whose
+/// bots name `domains`, as Codex's runs on one: on macOS, where Seatbelt
+/// lets a command reach its port and nothing else, and for the daemon's
+/// own `web_fetch`. One for each list while anything holds it: a policy,
+/// a command's [`Hold`], a fetch. Others that reach loopback reach it too,
+/// and with it no more than the list lets through.
+pub fn loopback_proxy(
+    domains: &BTreeMap<String, proxy::Access>,
+) -> Result<std::sync::Arc<Loopback>> {
+    type Listeners =
+        std::sync::Mutex<BTreeMap<BTreeMap<String, proxy::Access>, std::sync::Weak<Loopback>>>;
     static LISTENING: std::sync::LazyLock<Listeners> = std::sync::LazyLock::new(Default::default);
     let mut listening = LISTENING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(port) = listening.get(domains) {
-        return Ok(*port);
+    if let Some(live) = listening.get(domains).and_then(std::sync::Weak::upgrade) {
+        return Ok(live);
     }
+    // The lists nothing holds any more are let go.
+    listening.retain(|_, held| held.strong_count() > 0);
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
         crate::Error::with(
             "sandbox_unavailable",
@@ -2665,18 +2703,25 @@ pub fn loopback_proxy(domains: &BTreeMap<String, proxy::Access>) -> Result<u16> 
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let given = std::sync::Arc::new(domains.clone());
-    runtime.spawn(async move {
-        let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
-            return;
-        };
-        loop {
-            if let Ok((client, _)) = listener.accept().await {
-                tokio::spawn(proxy::serve(client, given.clone()));
+    let accepting = runtime
+        .spawn(async move {
+            let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+                return;
+            };
+            loop {
+                if let Ok((client, _)) = listener.accept().await {
+                    tokio::spawn(proxy::serve(client, given.clone()));
+                }
             }
-        }
+        })
+        .abort_handle();
+    let loopback = std::sync::Arc::new(Loopback {
+        port,
+        client: std::sync::OnceLock::new(),
+        accepting,
     });
-    listening.insert(domains.clone(), port);
-    Ok(port)
+    listening.insert(domains.clone(), std::sync::Arc::downgrade(&loopback));
+    Ok(loopback)
 }
 
 /// `profile`, its commands also reaching the proxy at `port` on loopback,
@@ -2925,12 +2970,14 @@ mod tests {
     #[tokio::test]
     async fn a_command_s_own_no_proxy_never_sends_it_past_its_proxy() {
         let domains: BTreeMap<String, proxy::Access> =
-            [("only.example".to_owned(), proxy::Access::Allow)].into();
+            [("unproxied.example".to_owned(), proxy::Access::Allow)].into();
         let daemon = Daemon::default();
         let policy = Policy::new(Some(Mode::WorkspaceWrite), None, &[], true, &daemon)
             .unwrap()
             .unwrap()
-            .with_domains(&domains);
+            .with_domains(&domains)
+            .served()
+            .unwrap();
         let mut command = tokio::process::Command::new("true");
         command
             .env("NO_PROXY", "*")
@@ -2938,21 +2985,42 @@ mod tests {
         through_proxy(&policy, &mut command).unwrap();
         let envs: BTreeMap<_, _> = command.as_std().get_envs().collect();
         assert_eq!(envs[std::ffi::OsStr::new("NO_PROXY")], None);
-        let port = loopback_proxy(&domains).unwrap();
+        let port = loopback_proxy(&domains).unwrap().port;
         assert_eq!(
             envs[std::ffi::OsStr::new("HTTPS_PROXY")],
             Some(std::ffi::OsStr::new(&format!("http://127.0.0.1:{port}")))
         );
     }
 
-    /// The proxy on loopback serves one list, the same port each time.
+    /// The proxy on loopback serves one list, the same port while held,
+    /// and its port closes once nothing holds it. Its lists are its own: a
+    /// proxy runs on the runtime of the test that started it.
     #[tokio::test]
-    async fn one_loopback_proxy_serves_each_list() {
+    async fn one_loopback_proxy_serves_each_list_while_held() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let domains: BTreeMap<String, proxy::Access> =
             [("only.example".to_owned(), proxy::Access::Allow)].into();
-        let port = loopback_proxy(&domains).unwrap();
-        assert_eq!(loopback_proxy(&domains).unwrap(), port);
+        let held = loopback_proxy(&domains).unwrap();
+        let port = held.port;
+        assert_eq!(loopback_proxy(&domains).unwrap().port, port);
+        let other: BTreeMap<String, proxy::Access> =
+            [("other.example".to_owned(), proxy::Access::Allow)].into();
+        let gone = loopback_proxy(&other).unwrap().port;
+        // Let go, its listener stops: nothing answers on its port.
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", gone))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", gone))
+                .await
+                .is_err()
+        );
         let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();

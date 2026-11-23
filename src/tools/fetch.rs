@@ -53,18 +53,16 @@ fn client() -> Result<&'static reqwest::Client> {
 /// The client that reaches only what `domains` let through, by the proxy
 /// a sandboxed command with them reaches it by, so a redirect, and a name
 /// that resolves to a local address, are held to them too.
+/// The proxy is held while its fetch runs, and goes with its client once
+/// nothing holds it.
 fn proxied(
     domains: &std::collections::BTreeMap<String, crate::sandbox::proxy::Access>,
-) -> Result<reqwest::Client> {
-    static CLIENTS: std::sync::Mutex<std::collections::BTreeMap<u16, reqwest::Client>> =
-        std::sync::Mutex::new(std::collections::BTreeMap::new());
-    let port = crate::sandbox::loopback_proxy(domains)?;
-    let mut clients = CLIENTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(client) = clients.get(&port) {
-        return Ok(client.clone());
+) -> Result<(reqwest::Client, std::sync::Arc<crate::sandbox::Loopback>)> {
+    let loopback = crate::sandbox::loopback_proxy(domains)?;
+    if let Some(client) = loopback.client.get() {
+        return Ok((client.clone(), loopback));
     }
+    let port = loopback.port;
     let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
         .map_err(|_| Error::new("http_client_init"))?;
     let client = reqwest::Client::builder()
@@ -76,8 +74,8 @@ fn proxied(
         .pool_max_idle_per_host(4)
         .build()
         .map_err(|_| Error::new("http_client_init"))?;
-    clients.insert(port, client.clone());
-    Ok(client)
+    let client = loopback.client.get_or_init(|| client).clone();
+    Ok((client, loopback))
 }
 
 /// `url`'s page, reaching only what `domains` let through when it names
@@ -86,14 +84,15 @@ pub async fn fetch(
     url: Url,
     domains: &std::collections::BTreeMap<String, crate::sandbox::proxy::Access>,
 ) -> Result<Page> {
-    let client = match domains.is_empty() {
-        true => client()?.clone(),
+    let (client, _held) = match domains.is_empty() {
+        true => (client()?.clone(), None),
         false => {
             let host = url.host_str().unwrap_or_default();
             if let Err(blocked) = crate::sandbox::proxy::allowed(domains, host) {
                 return fail_with("domain_blocked", blocked.why(host));
             }
-            proxied(domains)?
+            let (client, held) = proxied(domains)?;
+            (client, Some(held))
         }
     };
     let mut response = client
