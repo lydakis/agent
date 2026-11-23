@@ -17939,6 +17939,13 @@ impl App {
             self.notice = Some(BESIDE.into());
             return;
         }
+        self.show_pane(pane);
+    }
+
+    /// `pane` beside the conversation, with the keys, room or not: what
+    /// the pane already holds, stepped back or forward through or opened
+    /// again, stays reachable after the window narrows.
+    fn show_pane(&mut self, mut pane: pane::Pane) {
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
         // open goes.
@@ -18429,7 +18436,7 @@ impl App {
                 if let Some(view) = watch.as_mut().and_then(|w| w.sky.as_mut()) {
                     view.resume();
                 }
-                self.open_pane(pane);
+                self.show_pane(pane);
                 self.watch = watch;
             }
             _ => return false,
@@ -18461,7 +18468,7 @@ impl App {
             // An agent gone back to starts again; one that cannot shows
             // nothing, the pane closed, rather than an empty Sonny.
             match self.wake(pane.go(back)) {
-                Some(pane) => self.open_pane(pane),
+                Some(pane) => self.show_pane(pane),
                 None => {
                     self.pane = self.under.take();
                     self.pane_keys = false;
@@ -27113,6 +27120,15 @@ mod tests {
                 .unwrap()
                 .contains(&"shop.webhooks".to_owned())
         );
+        // Narrowed with a way back in its pane, back still goes there.
+        app.open_agent("shop.refunds", true);
+        app.full_width = 0;
+        assert!(app.step_pane(true));
+        assert_eq!(
+            app.pane.as_ref().and_then(|pane| pane.agent.as_deref()),
+            Some("shop.webhooks")
+        );
+        assert!(app.pane.as_ref().unwrap().can_go(false));
     }
 
     #[tokio::test]
