@@ -3182,8 +3182,10 @@ message reads as that turn's (`from`), never another's; it steers, joining
 the running turn at its next step or starting one, as Codex's agent mail
 joins the running turn, and takes no `delivery`; `interrupt` stops a
 running turn only of the caller or a bot it made, and the message then
-waits for a turn of its own (`queue`); and `pause_agents` names the caller
-as who pulled the cord. A message's `request_id` is the call's own unless
+waits for a turn of its own (`queue`); a `schema` is sent as the message's
+`output_schema`, so the reply of the turn it starts is JSON that follows
+it, and such a message too waits for a turn of its own; and `pause_agents`
+names the caller as who pulled the cord. A message's `request_id` is the call's own unless
 the model names one, so a call made again after a restart sends nothing
 new. `list_agents` lists the caller's namespace's bots by default (its
 `namespace` setting, then `.*`; every bot when it has none), and with `approvals` the calls waiting on a
@@ -3200,7 +3202,9 @@ the caller's folder (this turn's, or the `workspace` it names), in its
 sandbox and under its gates, never more loosely (see `Settings::under`),
 with the caller's tools and settings (its speed among them) unless a
 profile names its tools and `settings` others, and sends it `message` as its first, with
-`quote` and `turn_budget_tokens` as `submit` takes them. A `name` with no
+`quote`, `turn_budget_tokens` and `schema` (as `output_schema`) as `submit`
+takes them, so a `schema` makes its first reply JSON that follows it, as
+nanocode's subagent output contracts and Sonny's workflow `agent()` do. A `name` with no
 dot is put in the caller's project (`review` from `shop.lead` is
 `shop.review`). Its instructions are those `run --new` gives: the preamble
 alone; with `agents`, those a client composes for the folder (its
