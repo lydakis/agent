@@ -1218,6 +1218,9 @@ async fn run(
             false if bot.sandboxed() && matches!(prepared, Prepared::Read { .. }) => Some(
                 Arc::new(agent_runtime::sandbox::Policy::reads(registry.daemon())),
             ),
+            false if matches!(prepared, Prepared::WebFetch(_)) => {
+                turn::fetch_sandbox(&bot.settings, registry.daemon())
+            }
             false => None,
         })
     };

@@ -476,6 +476,15 @@ pub struct Settings {
     /// ([`crate::sandbox::Policy::sockets`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unix_sockets: Vec<String>,
+    /// With `network`, the hosts its commands and `web_fetch` reach, each
+    /// pattern `allow` or `deny`, through the daemon's proxy, as Codex's
+    /// network proxy takes its `domains`: `example.com`, `*.example.com`
+    /// (its subdomains), `**.example.com` (both); a deny wins, and a local
+    /// address is reached only by its own allowed name
+    /// ([`crate::sandbox::proxy`]). None: every host. A bot made by
+    /// another whose creator names some reaches only those.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub domains: std::collections::BTreeMap<String, crate::sandbox::proxy::Access>,
     /// The command rules its shell calls go by, as its client read them
     /// ([`crate::rules`]); a bot made by another goes by its creator's.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -660,6 +669,7 @@ impl Settings {
             self.writable = creator.writable.clone();
             self.network = creator.network;
             self.unix_sockets = creator.unix_sockets.clone();
+            self.domains = creator.domains.clone();
         }
         self.unix_sockets
             .retain(|path| creator.unix_sockets.contains(path));
@@ -669,6 +679,13 @@ impl Settings {
             self.network = false;
         }
         self.network &= creator.network;
+        // Its creator's hosts, if its creator keeps to some.
+        if !creator.domains.is_empty() {
+            self.domains = creator.domains.clone();
+        }
+        if !self.network {
+            self.domains.clear();
+        }
         self
     }
     /// What of these settings, asked for a bot that a bot with
@@ -701,6 +718,8 @@ impl Settings {
             )
         } else if !self.unix_sockets.is_empty() && held.unix_sockets != self.unix_sockets {
             "unix_sockets: a bot made by another reaches only the sockets its creator does".into()
+        } else if !self.domains.is_empty() && held.domains != self.domains {
+            "domains: a bot made by another reaches only the hosts its creator does".into()
         } else {
             return None;
         };
@@ -780,6 +799,19 @@ impl Settings {
         );
         if !sandboxed && !self.unix_sockets.is_empty() {
             return refuse("unix_sockets goes with sandbox read-only or workspace-write");
+        }
+        if !self.domains.is_empty() && !self.network {
+            return refuse("domains go with network");
+        }
+        if self.domains.len() > crate::sandbox::proxy::DOMAINS
+            || crate::output::encoded_len(&self.domains).unwrap_or(usize::MAX) > ENV_JSON
+        {
+            return refuse("domains names at most 256 patterns, 16 KiB in all");
+        }
+        if let Some(why) =
+            (self.domains.keys()).find_map(|pattern| crate::sandbox::proxy::check(pattern).err())
+        {
+            return refuse(&format!("domains: {why}"));
         }
         if self.unix_sockets.len() > 64
             || crate::output::encoded_len(&self.unix_sockets).unwrap_or(usize::MAX) > FOLDERS_JSON
@@ -880,7 +912,7 @@ impl Settings {
             "outputs":self.outputs,
             "trailer":self.trailer(),"quiet_background":self.quiet_background,
             "hold_ms":self.hold_ms(),
-            "unix_sockets":self.unix_sockets,
+            "unix_sockets":self.unix_sockets,"domains":self.domains,
             "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy,
             "steps_only":self.steps_only,"speeds":self.speeds,
             "context_windows":self.context_windows,"namespace":self.namespace})
@@ -895,7 +927,7 @@ impl Settings {
 /// and that go to the bots it made when they change.
 const INHERITED: [&str; 2] = ["rules", "env"];
 /// The settings that make a bot's sandbox, which change together.
-pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
+pub const SANDBOX: [&str; 5] = ["sandbox", "writable", "network", "unix_sockets", "domains"];
 
 /// Whether the daemon's tool `name` reaches the web past a bot's sandbox:
 /// `web_fetch`, which the daemon answers, and `web_search`, which the
@@ -904,7 +936,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 30] = [
+pub const SETTINGS: [&str; 31] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -928,6 +960,7 @@ pub const SETTINGS: [&str; 30] = [
     "max_drops",
     "max_restarts",
     "unix_sockets",
+    "domains",
     "rules",
     "env",
     "approval_policy",
@@ -24110,6 +24143,43 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_another_makes_reaches_only_the_hosts_its_creator_does() {
+        let table = |set: Value| serde_json::from_value::<Settings>(set).unwrap();
+        let creator = table(json!({"sandbox": "workspace-write", "network": true,
+            "domains": {"**.github.com": "allow", "gist.github.com": "deny"}}));
+        assert!(creator.validate().is_ok());
+        // Unasked, or asking for the network alone, it takes its creator's.
+        for asked in [
+            json!({}),
+            json!({"sandbox": "workspace-write", "network": true}),
+        ] {
+            let child = table(asked.clone()).under(&creator);
+            assert_eq!(child.domains, creator.domains, "{asked}");
+            assert!(table(asked).beyond(&creator).is_none());
+        }
+        // Others are refused, not quietly swapped; off the network, none.
+        let other = table(json!({"sandbox": "workspace-write", "network": true,
+            "domains": {"example.com": "allow"}}));
+        assert!(other.beyond(&creator).unwrap().starts_with("domains:"));
+        let off = table(json!({"sandbox": "read-only"})).under(&creator);
+        assert!(off.domains.is_empty() && !off.network);
+        // A creator on the whole network leaves a bot its own.
+        let open = table(json!({"sandbox": "workspace-write", "network": true}));
+        assert_eq!(other.clone().under(&open).domains, other.domains);
+        // Named only with the network, and only as patterns go.
+        for wrong in [
+            json!({"sandbox": "workspace-write", "domains": {"a.com": "allow"}}),
+            json!({"sandbox": "workspace-write", "network": true, "domains": {"*": "allow"}}),
+            json!({"sandbox": "workspace-write", "network": true, "domains": {"a b": "allow"}}),
+        ] {
+            assert!(table(wrong.clone()).validate().is_err(), "{wrong}");
+        }
+        assert!(
+            serde_json::from_value::<Settings>(json!({"domains": {"a.com": "maybe"}})).is_err()
+        );
+    }
+
+    #[test]
     fn a_bot_another_makes_takes_its_creator_s_speeds_and_windows_unless_given() {
         let table = |set: Value| serde_json::from_value::<Settings>(set).unwrap();
         let creator = table(json!({"speeds": {"a/*": ["fast"]}, "context_windows": {"a/b": 4096}}));
@@ -24169,6 +24239,7 @@ mod tests {
             max_drops: Some(1),
             max_restarts: Some(1),
             unix_sockets: vec!["/".into()],
+            domains: [("a.com".to_owned(), crate::sandbox::proxy::Access::Allow)].into(),
             rules: Some(crate::rules::Policy {
                 invalid: Some("x".into()),
                 ..Default::default()

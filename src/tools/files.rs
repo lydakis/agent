@@ -165,6 +165,18 @@ async fn helper(
     let Some(helper) = policy.helper.as_deref().and_then(Path::to_str) else {
         return fail("sandbox_unavailable");
     };
+    // A write reaches no network: not bridged to the proxy either.
+    let unbridged;
+    let policy = match policy.domains.is_empty() {
+        true => policy,
+        false => {
+            unbridged = Policy {
+                domains: Default::default(),
+                ..policy.clone()
+            };
+            &unbridged
+        }
+    };
     let (mut command, ended) = crate::sandbox::command(policy, helper, args, false)?;
     command
         .env_clear()

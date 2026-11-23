@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 pub mod known;
+pub mod proxy;
 
 /// How a bot's commands are confined, by Codex's `sandbox_mode` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +120,60 @@ pub struct Policy {
     /// rename, and the `read` tool doesn't read for it
     /// ([`Daemon::unreadable`]).
     pub unreadable: Vec<PathBuf>,
+    /// With the network off, the hosts its commands still reach, by
+    /// pattern, through the daemon's proxy ([`proxy`]): its bot's
+    /// `domains`, as Codex's network proxy takes them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub domains: BTreeMap<String, proxy::Access>,
+}
+
+use std::collections::BTreeMap;
+
+/// The argument that makes the agent binary the bridge a command with
+/// `domains` reaches the proxy by, on Linux: it listens on the sandbox's
+/// own loopback, hands each connection to the proxy by the descriptor
+/// [`PROXY_FD`] names, and runs the command that follows `--`, pointed at
+/// it, exiting as it does.
+pub const PROXY: &str = "--agent-run-as-proxy";
+
+/// The variable naming the descriptor the bridge asks the proxy for
+/// connections on.
+pub const PROXY_FD: &str = "AGENT_PROXY_FD";
+
+/// Point `command`, a command run under `policy`, at its proxy when its
+/// domains name any, over any variable its bot's environment set: on
+/// macOS nothing runs between the sandbox and the command to set them
+/// last, and Seatbelt lets it reach the proxy alone, so an inherited
+/// `NO_PROXY` would leave a client no way out. On Linux the bridge sets
+/// them as the command starts.
+pub fn through_proxy(policy: &Policy, command: &mut tokio::process::Command) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if !policy.domains.is_empty() {
+        let port = loopback_proxy(&policy.domains)?.port;
+        command.envs(proxy_env(&format!("http://127.0.0.1:{port}")));
+        command.env_remove("NO_PROXY").env_remove("no_proxy");
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (policy, command);
+    Ok(())
+}
+
+/// The variables that point a command's HTTP clients at `proxy`, as Codex
+/// sets them.
+pub fn proxy_env(proxy: &str) -> Vec<(&'static str, String)> {
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "WS_PROXY",
+        "WSS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ws_proxy",
+        "wss_proxy",
+    ]
+    .into_iter()
+    .map(|name| (name, proxy.to_owned()))
+    .collect()
 }
 
 impl Policy {
@@ -226,6 +281,7 @@ impl Policy {
                     }
                     kept
                 }),
+            domains: BTreeMap::new(),
         }))
     }
 
@@ -248,12 +304,41 @@ impl Policy {
             daemons: Vec::new(),
             owned: Vec::new(),
             unreadable: daemon.unreadable.clone(),
+            domains: BTreeMap::new(),
         }
     }
 
     pub fn with_sockets(mut self, paths: &[String]) -> Policy {
         self.sockets.extend(paths.iter().map(PathBuf::from));
         self
+    }
+
+    /// This policy, its commands reaching the network only at the hosts
+    /// `domains` let through, by the proxy, when it reaches the network
+    /// at all: with none named, every host, as before.
+    pub fn with_domains(mut self, domains: &BTreeMap<String, proxy::Access>) -> Policy {
+        if self.network && !domains.is_empty() {
+            self.network = false;
+            self.domains = domains.clone();
+        }
+        self
+    }
+
+    /// This policy, holding on macOS the loopback proxy its commands reach
+    /// while it, or a command's [`Hold`] of it, lives, as it holds its
+    /// bot's socket. Elsewhere, or with no domains, itself. On the
+    /// runtime that answers the proxy.
+    pub fn served(self) -> Result<Policy> {
+        #[cfg(target_os = "macos")]
+        if !self.domains.is_empty() {
+            let proxy = loopback_proxy(&self.domains)?;
+            let held = std::sync::Arc::new((self.listening.clone(), proxy));
+            return Ok(Policy {
+                listening: Some(Listening(held)),
+                ..self
+            });
+        }
+        Ok(self)
     }
 
     /// Whether a command in this sandbox may write `path`, an absolute
@@ -484,6 +569,81 @@ fn denied(path: &Path, error: std::io::Error) -> crate::Error {
         }
         _ => crate::Error::with("io_error", error.to_string()),
     }
+}
+
+/// The bridge [`PROXY`] asks for, run inside the sandbox: `args` is `--`
+/// and the command, which it runs pointed at a port on the sandbox's own
+/// loopback whose every connection goes to the proxy, and exits as it
+/// does. Loopback stays the sandbox's own, reached directly
+/// (`NO_PROXY`).
+#[cfg(target_os = "linux")]
+pub fn bridge(args: &[String]) -> Result<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    let [dashes, program, rest @ ..] = args else {
+        return crate::fail_with("usage", format!("{PROXY} -- PROGRAM [ARGS]..."));
+    };
+    if dashes != "--" {
+        return crate::fail_with("usage", format!("{PROXY} -- PROGRAM [ARGS]..."));
+    }
+    let fd = (std::env::var(PROXY_FD).ok())
+        .and_then(|fd| fd.parse::<i32>().ok())
+        .ok_or_else(|| crate::Error::with("usage", format!("{PROXY} needs {PROXY_FD}")))?;
+    // The command's way out is the port, not the descriptor.
+    // SAFETY: fcntl on a descriptor number, which fails if it isn't open.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    std::thread::Builder::new()
+        .name("proxy-bridge".into())
+        .spawn(move || {
+            for client in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    if let Ok(proxy) = agent_client::socket::ask(fd) {
+                        join(client, proxy);
+                    }
+                });
+            }
+        })?;
+    let proxy = format!("http://127.0.0.1:{port}");
+    let status = std::process::Command::new(program)
+        .args(rest)
+        .env_remove(PROXY_FD)
+        .envs(proxy_env(&proxy))
+        .env("NO_PROXY", "localhost,127.0.0.1,::1")
+        .env("no_proxy", "localhost,127.0.0.1,::1")
+        .status()?;
+    if let Some(signal) = status.signal() {
+        // Ended by a signal, as the command was.
+        // SAFETY: signal and kill on this process alone.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::kill(libc::getpid(), signal);
+        }
+        return Ok(128 + signal);
+    }
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn bridge(_args: &[String]) -> Result<i32> {
+    crate::fail_with("sandbox_unavailable", "the proxy bridge runs on Linux")
+}
+
+/// Copy each way between a command's connection and the proxy's until
+/// both ends close.
+#[cfg(target_os = "linux")]
+fn join(client: std::net::TcpStream, proxy: std::os::unix::net::UnixStream) {
+    let (Ok(mut client_in), Ok(mut proxy_in)) = (client.try_clone(), proxy.try_clone()) else {
+        return;
+    };
+    let (mut client_out, mut proxy_out) = (client, proxy);
+    let up = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut client_in, &mut proxy_out);
+        let _ = proxy_out.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = std::io::copy(&mut proxy_in, &mut client_out);
+    let _ = client_out.shutdown(std::net::Shutdown::Write);
+    let _ = up.join();
 }
 
 /// The confined write [`WRITE`] asks for, run inside the sandbox: make the
@@ -1565,14 +1725,60 @@ mod linux {
             .arg("--sync-fd")
             .arg(sync.as_raw_fd().to_string());
         let mut kept = vec![filter, sync];
-        if let Some(handing) = (policy.capability.as_deref().map(handing).transpose()?).flatten() {
-            command.env(
-                agent_client::socket::HANDED,
-                handing.as_raw_fd().to_string(),
-            );
-            kept.push(handing);
+        if let Some(own) = &policy.capability {
+            let own = own.clone();
+            let connect = move || {
+                let own = own.clone();
+                async move {
+                    // Handed blocking, as a connection made in the command
+                    // would be: the description is shared, and its flags
+                    // with it.
+                    (tokio::net::UnixStream::connect(&own).await)
+                        .and_then(tokio::net::UnixStream::into_std)
+                        .and_then(|stream| stream.set_nonblocking(false).map(|()| stream))
+                        .ok()
+                }
+            };
+            if let Some(handing) = handing(connect)? {
+                command.env(
+                    agent_client::socket::HANDED,
+                    handing.as_raw_fd().to_string(),
+                );
+                kept.push(handing);
+            }
         }
-        command.arg("--").arg(program).args(rest);
+        command.arg("--");
+        if !policy.domains.is_empty() {
+            // Its own network is off: the bridge, the agent binary, is the
+            // way out, to the proxy alone.
+            let helper = (policy.helper.as_deref()).ok_or_else(|| {
+                Error::with(
+                    "sandbox_unavailable",
+                    "domains need the agent binary, to bridge commands to the proxy",
+                )
+            })?;
+            let domains = std::sync::Arc::new(policy.domains.clone());
+            let proxied = move || {
+                let domains = domains.clone();
+                async move {
+                    let (ours, theirs) = std::os::unix::net::UnixStream::pair().ok()?;
+                    ours.set_nonblocking(true).ok()?;
+                    let ours = tokio::net::UnixStream::from_std(ours).ok()?;
+                    tokio::spawn(super::proxy::serve(ours, domains));
+                    Some(theirs)
+                }
+            };
+            let handing = handing(proxied)?.ok_or_else(|| {
+                Error::with(
+                    "sandbox_unavailable",
+                    "domains need the daemon's runtime, which answers the proxy",
+                )
+            })?;
+            command.env(super::PROXY_FD, handing.as_raw_fd().to_string());
+            kept.push(handing);
+            command.arg(helper).arg(super::PROXY).arg("--");
+        }
+        command.arg(program).args(rest);
         // SAFETY: fcntl is async-signal-safe; it only lets the descriptors
         // through exec, into bubblewrap and the command.
         unsafe {
@@ -1705,10 +1911,14 @@ mod linux {
 
     /// The descriptor a command asks the daemon for connections on, as
     /// [`agent_client::socket::handed`] does: each request is answered
-    /// with a connection the daemon opens to the bot's own socket, `own`,
-    /// for as long as any process of the command holds it. Without a
-    /// runtime to answer on, none.
-    fn handing(own: &Path) -> Result<Option<std::os::fd::OwnedFd>> {
+    /// with the connection `answer` opens, to the bot's own socket or to
+    /// the proxy, for as long as any process of the command holds it.
+    /// Without a runtime to answer on, none.
+    fn handing<F, Answer>(answer: F) -> Result<Option<std::os::fd::OwnedFd>>
+    where
+        F: Fn() -> Answer + Send + 'static,
+        Answer: std::future::Future<Output = Option<std::os::unix::net::UnixStream>> + Send,
+    {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return Ok(None);
@@ -1739,7 +1949,6 @@ mod linux {
         // until the AsyncFd that owns it drops.
         let ours =
             unsafe { tokio::io::unix::AsyncFd::register(ours) }.map_err(std::io::Error::from)?;
-        let own = own.to_owned();
         runtime.spawn(async move {
             let mut byte = [0u8; 1];
             loop {
@@ -1768,12 +1977,7 @@ mod linux {
                     }
                     _ => {}
                 }
-                // Handed blocking, as a connection made in the command
-                // would be: the description is shared, and its flags with it.
-                let stream = (tokio::net::UnixStream::connect(&own).await)
-                    .and_then(tokio::net::UnixStream::into_std)
-                    .and_then(|stream| stream.set_nonblocking(false).map(|()| stream))
-                    .ok();
+                let stream = answer().await;
                 let fd = ours.get_ref().as_raw_fd();
                 let _ = agent_client::socket::hand(fd, stream.as_ref().map(|s| s.as_raw_fd()));
             }
@@ -2438,8 +2642,13 @@ mod macos {
         program: &str,
         rest: &[&str],
     ) -> Result<tokio::process::Command> {
-        let (profile, params) = super::seatbelt(policy);
+        let (mut profile, params) = super::seatbelt(policy);
         let mut command = tokio::process::Command::new(SANDBOX_EXEC);
+        if !policy.domains.is_empty() {
+            let port = super::loopback_proxy(&policy.domains)?.port;
+            profile = super::proxied(profile, port);
+            super::through_proxy(policy, &mut command)?;
+        }
         command.arg("-p").arg(profile);
         for (key, value) in params {
             command.arg(format!("-D{key}={}", value.to_string_lossy()));
@@ -2447,6 +2656,81 @@ mod macos {
         command.arg("--").arg(program).args(rest);
         Ok(command)
     }
+}
+
+/// The proxy on this machine's loopback for one list of domains. It
+/// listens while anything holds it, and its port closes with the last.
+pub struct Loopback {
+    pub port: u16,
+    /// The client the daemon's own `web_fetch` reaches through it.
+    pub client: std::sync::OnceLock<reqwest::Client>,
+    accepting: tokio::task::AbortHandle,
+}
+
+impl Drop for Loopback {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
+}
+
+/// The proxy on this machine's loopback that serves the commands whose
+/// bots name `domains`, as Codex's runs on one: on macOS, where Seatbelt
+/// lets a command reach its port and nothing else, and for the daemon's
+/// own `web_fetch`. One for each list while anything holds it: a policy,
+/// a command's [`Hold`], a fetch. Others that reach loopback reach it too,
+/// and with it no more than the list lets through.
+pub fn loopback_proxy(
+    domains: &BTreeMap<String, proxy::Access>,
+) -> Result<std::sync::Arc<Loopback>> {
+    type Listeners =
+        std::sync::Mutex<BTreeMap<BTreeMap<String, proxy::Access>, std::sync::Weak<Loopback>>>;
+    static LISTENING: std::sync::LazyLock<Listeners> = std::sync::LazyLock::new(Default::default);
+    let mut listening = LISTENING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(live) = listening.get(domains).and_then(std::sync::Weak::upgrade) {
+        return Ok(live);
+    }
+    // The lists nothing holds any more are let go.
+    listening.retain(|_, held| held.strong_count() > 0);
+    let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+        crate::Error::with(
+            "sandbox_unavailable",
+            "domains need the daemon's runtime, which answers the proxy",
+        )
+    })?;
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let given = std::sync::Arc::new(domains.clone());
+    let accepting = runtime
+        .spawn(async move {
+            let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+                return;
+            };
+            loop {
+                if let Ok((client, _)) = listener.accept().await {
+                    tokio::spawn(proxy::serve(client, given.clone()));
+                }
+            }
+        })
+        .abort_handle();
+    let loopback = std::sync::Arc::new(Loopback {
+        port,
+        client: std::sync::OnceLock::new(),
+        accepting,
+    });
+    listening.insert(domains.clone(), std::sync::Arc::downgrade(&loopback));
+    Ok(loopback)
+}
+
+/// `profile`, its commands also reaching the proxy at `port` on loopback,
+/// and the services a TLS client asks to trust what it reaches there.
+pub fn proxied(profile: String, port: u16) -> String {
+    format!(
+        "{profile}\n(allow network-outbound (remote ip \"localhost:{port}\"))\n\
+         {SEATBELT_NETWORK}{SEATBELT_TLS_TRUST}"
+    )
 }
 
 /// Codex's Seatbelt policy pieces, as Codex ships them.
@@ -2648,6 +2932,109 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn domains_turn_the_network_off_but_for_the_proxy() {
+        let domains: BTreeMap<String, proxy::Access> =
+            [("**.example.com".to_owned(), proxy::Access::Allow)].into();
+        let daemon = Daemon::default();
+        let open = || {
+            Policy::new(Some(Mode::WorkspaceWrite), None, &[], true, &daemon)
+                .unwrap()
+                .unwrap()
+        };
+        let proxied = open().with_domains(&domains);
+        assert!(!proxied.network);
+        assert_eq!(proxied.domains, domains);
+        // None named: the whole network, as before; off, it stays off.
+        assert!(open().with_domains(&BTreeMap::new()).network);
+        let off = Policy::new(Some(Mode::WorkspaceWrite), None, &[], false, &daemon)
+            .unwrap()
+            .unwrap()
+            .with_domains(&domains);
+        assert!(!off.network && off.domains.is_empty());
+        // On macOS its commands reach the proxy's port, and only it.
+        let (profile, _) = seatbelt(&proxied);
+        assert!(!profile.contains("(allow network-outbound)"));
+        let profile = super::proxied(profile, 4321);
+        assert!(profile.contains("(allow network-outbound (remote ip \"localhost:4321\"))"));
+        assert!(!profile.contains("(allow network-outbound)\n"));
+        let set = proxy_env("http://127.0.0.1:4321");
+        assert!(set.contains(&("HTTPS_PROXY", "http://127.0.0.1:4321".to_owned())));
+        assert!(set.contains(&("https_proxy", "http://127.0.0.1:4321".to_owned())));
+    }
+
+    /// On macOS a command's bot can't point it past its proxy: the proxy's
+    /// variables are set over its own, and no exclusion is kept.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_command_s_own_no_proxy_never_sends_it_past_its_proxy() {
+        let domains: BTreeMap<String, proxy::Access> =
+            [("unproxied.example".to_owned(), proxy::Access::Allow)].into();
+        let daemon = Daemon::default();
+        let policy = Policy::new(Some(Mode::WorkspaceWrite), None, &[], true, &daemon)
+            .unwrap()
+            .unwrap()
+            .with_domains(&domains)
+            .served()
+            .unwrap();
+        let mut command = tokio::process::Command::new("true");
+        command
+            .env("NO_PROXY", "*")
+            .env("HTTPS_PROXY", "http://elsewhere:1");
+        through_proxy(&policy, &mut command).unwrap();
+        let envs: BTreeMap<_, _> = command.as_std().get_envs().collect();
+        assert_eq!(envs[std::ffi::OsStr::new("NO_PROXY")], None);
+        let port = loopback_proxy(&domains).unwrap().port;
+        assert_eq!(
+            envs[std::ffi::OsStr::new("HTTPS_PROXY")],
+            Some(std::ffi::OsStr::new(&format!("http://127.0.0.1:{port}")))
+        );
+    }
+
+    /// The proxy on loopback serves one list, the same port while held,
+    /// and its port closes once nothing holds it. Its lists are its own: a
+    /// proxy runs on the runtime of the test that started it.
+    #[tokio::test]
+    async fn one_loopback_proxy_serves_each_list_while_held() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let domains: BTreeMap<String, proxy::Access> =
+            [("only.example".to_owned(), proxy::Access::Allow)].into();
+        let held = loopback_proxy(&domains).unwrap();
+        let port = held.port;
+        assert_eq!(loopback_proxy(&domains).unwrap().port, port);
+        let other: BTreeMap<String, proxy::Access> =
+            [("other.example".to_owned(), proxy::Access::Allow)].into();
+        let gone = loopback_proxy(&other).unwrap().port;
+        // Let go, its listener stops: nothing answers on its port.
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", gone))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", gone))
+                .await
+                .is_err()
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"CONNECT elsewhere.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).await.unwrap();
+        assert!(
+            answer.contains("x-proxy-error: blocked-by-allowlist"),
+            "{answer}"
+        );
+    }
 
     #[test]
     fn temporary_room_reads_each_temporary_file_system_once() {
@@ -3710,6 +4097,7 @@ mod tests {
             owned: Vec::new(),
             daemons: Vec::new(),
             unreadable: Vec::new(),
+            domains: BTreeMap::new(),
         };
         let (profile, params) = seatbelt(&policy);
         let size = profile.len()

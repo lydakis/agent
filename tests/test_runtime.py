@@ -1990,6 +1990,23 @@ class RuntimeTests(ModelFixture):
         offered = self.model.requests.get(timeout=3)
         self.assertEqual([t['name'] for t in offered['tools']], ['echo', 'shell', 'web_fetch'])
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_bot_s_web_fetch_reaches_only_the_domains_it_names(self):
+        client = self.client('echo,shell,web_fetch')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'shell', 'web_fetch'],
+                       settings={'sandbox': 'workspace-write', 'network': True,
+                                 'domains': {'allowed.test': 'allow', 'evil.allowed.test': 'deny'}})
+        prompt = 'calls:' + json.dumps([['web_fetch', {'url': 'https://example.test/'}],
+                                        ['web_fetch', {'url': 'https://evil.allowed.test/'}]])
+        turn = client.request('submit', bot='Bob', request_id='f', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+        done = [e for e in events if e['event'] == 'tool_completed']
+        self.assertEqual(len(done), 2)
+        for event in done:
+            output = node_item(client, 'Bob', event['data']['node'])['result']['output']
+            self.assertEqual(json.loads(output)['error'], 'domain_blocked', output)
+
     def test_detached_shell_releases_its_daemon_slot_after_exit(self):
         client = self.client('shell', extra=('--max-lasting', '1'))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])

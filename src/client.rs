@@ -545,6 +545,20 @@ fn parse(args: &[String]) -> Result<Options> {
                             options.settings_flags.push(flag.to_owned());
                         }
                     }
+                    "--domain" => {
+                        let (pattern, access) = agent_runtime::sandbox::proxy::flag(&value)
+                            .map_err(|why| Error::with("usage", format!("--domain {why}")))?;
+                        let domains = options
+                            .settings
+                            .entry("domains".to_owned())
+                            .or_insert_with(|| json!({}));
+                        if let Value::Object(domains) = domains {
+                            domains.insert(pattern, json!(access));
+                        }
+                        if !options.settings_flags.iter().any(|f| f == flag) {
+                            options.settings_flags.push(flag.to_owned());
+                        }
+                    }
                     "--cache-ttl" => {
                         if !matches!(value.as_str(), "5m" | "1h" | "12h") {
                             return fail_with("usage", "--cache-ttl needs 5m, 1h or 12h");

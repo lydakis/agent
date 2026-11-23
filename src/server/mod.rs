@@ -191,10 +191,13 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             // creator's rules and variables, and a sandboxed one's folders.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON + ENV_JSON,
+                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON + 2 * ENV_JSON,
                     None => {
                         (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
+                            + output::encoded_len(&settings.domains)
+                                .unwrap_or(ENV_JSON)
+                                .min(ENV_JSON)
                             + (settings.rules.as_ref())
                                 .map_or(0, |rules| output::encoded_len(rules).unwrap_or(RULES_JSON))
                                 .min(RULES_JSON)
@@ -446,8 +449,8 @@ enum Command {
         declare: Option<Declare>,
         /// `create`'s settings, by its names: each one given replaces the
         /// bot's, `null` puts it back to its default, and the rest stay.
-        /// `sandbox` given puts `writable`, `network` and `unix_sockets`
-        /// back to theirs unless they are given too.
+        /// `sandbox` given puts `writable`, `network`, `unix_sockets` and
+        /// `domains` back to theirs unless they are given too.
         settings: Option<serde_json::Map<String, Value>>,
         /// As `create` takes them; `null` removes the bot's.
         #[serde(default, deserialize_with = "present")]

@@ -719,6 +719,7 @@ when it sets either.
 | `quiet_background` (`--quiet-background`) | The end of a background command no wait collected is left for a wait, untold (see [deferred tool results](#deferred-tool-results)): for a client that collects results itself. Protocol 46. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
+| `domains` (`--domain PATTERN[=deny]`, repeatable) | With `network`, the hosts its commands and `web_fetch` reach, each pattern `allow` or `deny`, through the daemon's proxy (see [domains](#domains)), as Codex's network proxy takes its `domains`: `example.com`, `*.example.com` (its subdomains), `**.example.com` (both). A bot another made whose creator names some reaches only those. At most 256, 16 KiB as JSON. Protocol 101. | none: every host |
 | `rules` (none) | The bot's [command rules](#command-rules), as its client read them: `prefix_rules`, `host_executables`, or `invalid` with why they couldn't be read. A bot another made takes its creator's, always. At most 256 KiB as JSON. | none |
 | `namespace` (`--namespace`) | The group its client puts the bot in: its daemon tools list `NAMESPACE.*` when they name no bots, and `spawn_agent` names a bot it makes `NAMESPACE.NAME` when the name has no dot. 1 to 128 of `A-Z a-z 0-9 . _ -`, as a bot name. A bot made by another takes its creator's unless its client sets one; a fork keeps its source's. Sonny sets each agent's to its name up to the first dot. Schema 108 gives every bot made before its name up to the first dot, the group the daemon used to read from the name. Protocol 96. | none: those tools list every bot and take names whole |
 | `env` (none) | Variables its commands get beside the daemon's environment, as a map of name to value, as Codex's `shell_environment_policy.set` sets them for every shell: a client names a fact for its bots' shells, such as Sonny's `SONNY_STATE`. Names are a letter or `_`, then letters, digits and `_`; `AGENT_` ones are the daemon's own and refused. A bot another made takes its creator's, always, and a change reaches the bots it made, as `rules` do, so no bot plants a variable (`PATH`, `LD_PRELOAD`) that changes what a command approved to leave its sandbox runs. `inspect` shows the values, so they hold no secrets. At most 16 KiB as JSON. Protocol 53. | none |
@@ -1804,8 +1805,8 @@ settings take, by the same names and with the same checks, against the
 bot's settings with them applied: each one given replaces the bot's,
 `null` puts it back to its default, and the rest stay (a name `create`
 doesn't take is `invalid_setting`). `sandbox` given puts `writable`,
-`network` and `unix_sockets` back to none, off and none unless they are
-given too; a bot another bot made keeps no weaker a sandbox than its
+`network`, `unix_sockets` and `domains` back to none, off, none and none
+unless they are given too; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
 at all. `rules` may not be configured on a bot another made, which goes by
 its creator's, and a change to them reaches every bot made under it
@@ -3671,7 +3672,7 @@ cannot reach another bot's socket; `bot_id` that is not the bot's is
 was not listening, one bind. It starts the daemon when none runs, as a
 command on the bots does; with `--no-spawn` it is `daemon_unavailable`
 instead.
-`agent tool [--writable PATH]... [--network] [--held] [--workdir DIR] NAME (ARGUMENTS | -)`
+`agent tool [--writable PATH]... [--network] [--domain PATTERN[=deny]]... [--held] [--workdir DIR] NAME (ARGUMENTS | -)`
 runs one call of a bot's `shell`, `read`, `write`, `edit` or `apply_patch`
 here, with ARGUMENTS as a model gives them, by the daemon's own code and in
 the sandbox `agent sandbox` builds (no daemon): read-only with no
@@ -3698,6 +3699,34 @@ calls.
 `agent sandbox` exits as its command does, or 125 when it
 could not run it (a usage error, no sandbox here, the bot not found), as
 `env` and `timeout` do, with the error on stderr.
+
+### Domains
+
+A bot with `network` and `domains` reaches only the hosts they let
+through, as Codex's network proxy lets them: a deny wins over every allow,
+with no allow nothing goes, and a pattern is an exact host, `*.example.com`
+(its subdomains), `**.example.com` (the domain and its subdomains), with
+`?` one byte and `*` inside a label any run of its bytes; a lone `*` is
+refused. A local or private address is reached only by its own literal
+(`127.0.0.1`, `[::1]`) or `localhost` allowed, and a name that resolves to
+one never is. Its commands run as with the network off (no network of
+their own, only the Unix sockets `unix_sockets` names) and reach the
+daemon's HTTP proxy alone: their `HTTP_PROXY`, `HTTPS_PROXY`, `WS_PROXY`
+and `WSS_PROXY` (and lowercase) name it. The proxy forwards `http://`
+requests and tunnels the rest with `CONNECT`, never opening them, and
+answers a host the list keeps out with `403` and `x-proxy-error`
+(`blocked-by-allowlist`, `blocked-by-denylist`,
+`blocked-by-local-network`). It connects to the addresses it checked, so a
+name resolved again can't take it elsewhere. On Linux the command runs
+under a bridge, the agent binary (`--agent-run-as-proxy`), that listens on
+the sandbox's own loopback and hands each connection to the proxy by a
+descriptor, as the bot's socket is handed; loopback stays the sandbox's
+own (`NO_PROXY`). On macOS the proxy listens on one loopback port per
+list while a command or fetch of a bot naming it runs, and Seatbelt lets
+the command reach that port and nothing else. `web_fetch` goes by the same proxy, its
+redirects too; `web_search`, which the provider answers, is offered as
+with the network on. A confined write reaches no network. `agent tool`
+takes `--domain` too.
 
 ### Command rules
 

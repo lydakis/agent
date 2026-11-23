@@ -50,8 +50,52 @@ fn client() -> Result<&'static reqwest::Client> {
     Ok(CLIENT.get_or_init(|| client))
 }
 
-pub async fn fetch(url: Url) -> Result<Page> {
-    let mut response = client()?
+/// The client that reaches only what `domains` let through, by the proxy
+/// a sandboxed command with them reaches it by, so a redirect, and a name
+/// that resolves to a local address, are held to them too.
+/// The proxy is held while its fetch runs, and goes with its client once
+/// nothing holds it.
+fn proxied(
+    domains: &std::collections::BTreeMap<String, crate::sandbox::proxy::Access>,
+) -> Result<(reqwest::Client, std::sync::Arc<crate::sandbox::Loopback>)> {
+    let loopback = crate::sandbox::loopback_proxy(domains)?;
+    if let Some(client) = loopback.client.get() {
+        return Ok((client.clone(), loopback));
+    }
+    let port = loopback.port;
+    let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
+        .map_err(|_| Error::new("http_client_init"))?;
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("agent-runtime/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .proxy(proxy)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(TIMEOUT)
+        .pool_max_idle_per_host(4)
+        .build()
+        .map_err(|_| Error::new("http_client_init"))?;
+    let client = loopback.client.get_or_init(|| client).clone();
+    Ok((client, loopback))
+}
+
+/// `url`'s page, reaching only what `domains` let through when it names
+/// any, as its bot's commands do.
+pub async fn fetch(
+    url: Url,
+    domains: &std::collections::BTreeMap<String, crate::sandbox::proxy::Access>,
+) -> Result<Page> {
+    let (client, _held) = match domains.is_empty() {
+        true => (client()?.clone(), None),
+        false => {
+            let host = url.host_str().unwrap_or_default();
+            if let Err(blocked) = crate::sandbox::proxy::allowed(domains, host) {
+                return fail_with("domain_blocked", blocked.why(host));
+            }
+            let (client, held) = proxied(domains)?;
+            (client, Some(held))
+        }
+    };
+    let mut response = client
         .get(url)
         .header(
             reqwest::header::ACCEPT,

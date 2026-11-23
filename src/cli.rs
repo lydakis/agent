@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --replaces --agents --profile --profile-name --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --max-restarts --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs --namespace",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --post-turn-compact-percent --max-rounds --max-drops --max-restarts --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --domain --outputs --namespace",
         startup: true,
     },
     Command {
@@ -268,8 +268,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "tool",
         about: "Run one call of a bot's shell, read, write, edit or apply_patch here, in a sandbox: for a client that lends this machine to another's agents",
-        usage: "tool [--writable PATH]... [--network] [--held] [--workdir DIR] NAME (ARGUMENTS | -)",
-        flags: "--writable --network --held --workdir",
+        usage: "tool [--writable PATH]... [--network] [--domain PATTERN[=deny]]... [--held] [--workdir DIR] NAME (ARGUMENTS | -)",
+        flags: "--writable --network --domain --held --workdir",
         settings: "",
         startup: false,
     },
@@ -626,6 +626,10 @@ fn print_flags(flags: &str) {
                 "PATH",
                 "A Unix socket, or a folder of them, the only ones a sandboxed bot's commands reach; repeat for more",
             ),
+            "--domain" => (
+                "PATTERN[=deny]",
+                "With --network, a host the commands reach, alone with the others named, by the daemon's proxy: example.com, *.example.com (its subdomains) or **.example.com (both); =deny never; repeat for more",
+            ),
             "--fallback" => (
                 "PROVIDER/MODEL",
                 "A new bot's model for a request a safety classifier declined, that request alone, over the daemon's [fallbacks]; default none",
@@ -848,6 +852,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--quote"
                     | "--writable"
                     | "--unix-socket"
+                    | "--domain"
                     | "--env"
                     | "--shell-exclude"
                     | "--protect"
@@ -1054,6 +1059,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--hold",
             "--namespace",
             "--unix-socket",
+            "--domain",
             "--approval",
             "--approve",
             "--no-compaction",

@@ -222,6 +222,16 @@ class DaemonStepTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_web_fetch_step_reaches_only_the_domains_its_bot_names(self):
+        client, turn = self.script(tools='echo,shell,web_fetch',
+                                   settings={'sandbox': 'workspace-write', 'network': True,
+                                             'domains': {'allowed.test': 'allow'}})
+        fetched = self.step(client, turn, name='web_fetch', arguments={'url': 'https://example.test/'})
+        self.assertIn('domain_blocked', json.dumps(fetched), fetched)
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_turn_s_steps_keep_writing_its_own_folder_after_a_steer_moves_the_bot(self):
         client, turn = self.script(tools='echo,shell,write', settings={'sandbox': 'workspace-write'})
         elsewhere = self.path.parent / f'{self.path.name}-elsewhere'
