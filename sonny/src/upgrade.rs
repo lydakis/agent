@@ -323,6 +323,9 @@ fn migrate_from_listing(
     let store = store.to_path_buf();
     Some(tokio::spawn(async move {
         let _held = held;
+        let listed_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as i64);
         let Some(bots) = listing(&client).await else {
             return;
         };
@@ -345,7 +348,7 @@ fn migrate_from_listing(
             crate::approvals::nested_gone(&client, &bots, &store).await;
         }
         // A task marked done, and opened by nothing since, is closed.
-        if marks && crate::resolved::marks_close(&client, &store, &bots).await {
+        if marks && crate::resolved::marks_close(&client, &store, &bots, listed_ms).await {
             once(&beside(&store), crate::resolved::MARKS_CLOSE, || true);
         }
         if let Some(named) = named {

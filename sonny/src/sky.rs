@@ -55,6 +55,7 @@ const LIVE: &[&str] = &[
     "call_lifted",
     "lifted_ended",
     "configured",
+    "closed",
 ];
 /// How long a spark takes to cross.
 const FLIGHT: Duration = Duration::from_millis(1100);
@@ -2212,6 +2213,10 @@ impl View {
             "closed" => {
                 if let Some(at) = self.agent(name) {
                     self.agents[at].closed = true;
+                    // At rest, it is done: no question of its is open.
+                    if self.agents[at].running.is_none() {
+                        self.agents[at].waits.asked(name, None);
+                    }
                 }
                 return;
             }
@@ -9205,6 +9210,13 @@ mod tests {
             .unwrap();
         view.drain();
         assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
+        // Its lead closes the login at rest while the sky is open: the
+        // live follow hears it, and its question no longer needs the person.
+        assert!(LIVE.contains(&"closed"));
+        let closed = json!({"event": "closed", "bot": "shop.login", "data": {}});
+        send.send(Feed::Live(closed)).unwrap();
+        view.drain();
+        assert_ne!(state(&view, "shop.login"), Some(State::NeedsYou));
     }
 
     #[tokio::test]

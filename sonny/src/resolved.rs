@@ -29,17 +29,13 @@ pub fn itself(arguments: &Value, bot: &str) -> bool {
     }
 }
 
-/// The agents a `close_agent` call with `arguments` names one by one,
-/// whole: none for a pattern.
-pub fn named(arguments: &Value) -> Vec<String> {
-    match (arguments["name"].as_str(), arguments["names"].as_array()) {
-        (Some(name), None) if !name.contains(['*', '?', '[']) => vec![name.to_owned()],
-        (None, Some(names)) => (names.iter())
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
-        _ => Vec::new(),
-    }
+/// The agents a `close_agent` call's `output` says it closed, each by its
+/// name: those it refused stay open.
+pub fn closed_by(output: &str) -> Vec<String> {
+    let output: Value = serde_json::from_str(output).unwrap_or_default();
+    (output["closed"].as_array().into_iter().flatten())
+        .filter_map(|closed| Some(closed["bot"].as_str()?.to_owned()))
+        .collect()
 }
 
 /// Whether an agent is done: closed, and no turn of its runs, as the turn
@@ -133,12 +129,12 @@ fn read(store: &Path, task: &str) -> Option<i64> {
     kept["turn"].as_i64()
 }
 
-/// The agents among `bots`, as the daemon lists them (`name`, `bot_id`,
-/// `running_turn`, `head`, `last`, `closed_ms`), whose mark beside `store`
+/// The agents among `bots`, as the daemon lists them (`name`,
+/// `running_turn`, `last`, `closed_ms`), whose mark beside `store`
 /// still held: open, running no turn, and none of their turns came after
 /// the turn it covered. Each mark is left as it was, so a Sonny from
 /// before reads it as ever.
-pub fn still_marked(store: &Path, bots: &[Value]) -> Vec<(String, Option<i64>)> {
+pub fn still_marked(store: &Path, bots: &[Value]) -> Vec<String> {
     let marked = marked(store);
     if marked.is_empty() {
         return Vec::new();
@@ -151,26 +147,36 @@ pub fn still_marked(store: &Path, bots: &[Value]) -> Vec<(String, Option<i64>)> 
             let newest = bot["last"]["turn"].as_i64();
             newest
                 .is_none_or(|turn| turn <= mark)
-                .then(|| (name.to_owned(), bot["bot_id"].as_i64()))
+                .then(|| name.to_owned())
         })
         .collect()
 }
 
-/// Close each agent [`still_marked`] finds among `bots`, as the person
-/// closes it, by its identity, so one made again under the name stays
-/// open. Whether every close was answered: one that was not is tried again
-/// at the next window's start.
-pub async fn marks_close(client: &agent_client::Client, store: &Path, bots: &[Value]) -> bool {
+/// A pattern that names `name` alone: its last character as a set of one,
+/// as names hold no character a pattern reads otherwise.
+fn alone(name: &str) -> String {
+    match name.char_indices().last() {
+        Some((at, last)) => format!("{}[{last}]", &name[..at]),
+        None => String::new(),
+    }
+}
+
+/// Close each agent [`still_marked`] finds among `bots`, listed at
+/// `listed_ms`, as the person closes it: only if it runs no turn and ran
+/// none since it was listed, which the daemon checks as it closes, so work
+/// that came meanwhile goes on. Whether every close was answered: one that
+/// was not is tried again at the next window's start.
+pub async fn marks_close(
+    client: &agent_client::Client,
+    store: &Path,
+    bots: &[Value],
+    listed_ms: i64,
+) -> bool {
     let mut whole = true;
-    for (name, id) in still_marked(store, bots) {
-        let mut asked = json!({"bot": name});
-        if let Some(id) = id {
-            asked["bot_id"] = json!(id);
-        }
-        match client.request("close", asked).await {
-            Ok(_) => {}
-            Err(error) if error.code == "bot_not_found" => {}
-            Err(_) => whole = false,
+    for name in still_marked(store, bots) {
+        let asked = json!({"bot": alone(&name), "no_turn_since_ms": listed_ms, "limit": 1});
+        if client.request("close", asked).await.is_err() {
+            whole = false;
         }
     }
     whole
@@ -189,9 +195,11 @@ mod tests {
         assert!(!by(json!({"names": ["calc.fix", "calc.docs"]})));
         assert!(!by(json!({"name": "calc.*"})));
         assert!(!by(json!({})));
-        assert_eq!(named(&json!({"name": "calc.fix"})), ["calc.fix"]);
-        assert_eq!(named(&json!({"names": ["a.b", "a.c"]})), ["a.b", "a.c"]);
-        assert!(named(&json!({"name": "calc.*"})).is_empty());
+        // What a call closed is what its output says, not what it named.
+        let output = json!({"closed": [{"bot": "calc.fix", "was_open": true}],
+            "refused": [{"bot": "calc.fix.help", "error": "not_permitted"}]});
+        assert_eq!(closed_by(&output.to_string()), ["calc.fix"]);
+        assert!(closed_by("not json").is_empty());
     }
 
     #[test]
@@ -277,13 +285,9 @@ mod tests {
             json!({"name": "calc.new", "bot_id": 5}),
             json!({"name": "calc.open", "bot_id": 6, "last": {"turn": 3}}),
         ];
-        assert_eq!(
-            still_marked(&store, &bots),
-            [
-                ("calc.fix".to_owned(), Some(1)),
-                ("calc.new".to_owned(), Some(5))
-            ]
-        );
+        assert_eq!(still_marked(&store, &bots), ["calc.fix", "calc.new"]);
+        // Closed by a pattern that names it alone.
+        assert_eq!(alone("calc.fix"), "calc.fi[x]");
         // The marks stay where they were.
         assert!(folder.join("calc.fix.json").exists());
         assert!(still_marked(&dir.join("other.sqlite"), &bots).is_empty());

@@ -7241,8 +7241,11 @@ struct Followed {
     raised: std::collections::HashSet<String>,
     /// Their bots with no turn running.
     sure: Vec<String>,
-    /// Their bots, with the head each is at.
+    /// Their bots, with the head each is at and whether it is closed: a
+    /// close read again what it asked.
     heads: Vec<(String, Value)>,
+    /// Their bots closed, done.
+    closed: std::collections::HashSet<String>,
     /// The bots raised now that were not, or whose calls were not listed.
     new: std::collections::HashSet<String>,
     /// What waits on the person, listed for those new ones.
@@ -7255,6 +7258,7 @@ impl Following {
     async fn read(self, client: &Client) -> Result<Followed, Box<Following>> {
         let mut raised = std::collections::HashSet::new();
         let (mut sure, mut heads) = (Vec::new(), Vec::new());
+        let mut closed = std::collections::HashSet::new();
         for lead in &self.followed {
             let Some(project) = project::lead_project(lead) else {
                 continue;
@@ -7268,7 +7272,11 @@ impl Following {
                     if bot["running_turn"].is_null() {
                         sure.push(name.to_owned());
                     }
-                    heads.push((name.to_owned(), json!([bot["bot_id"], bot["head"]])));
+                    let shut = resolved::closed(bot);
+                    if shut {
+                        closed.insert(name.to_owned());
+                    }
+                    heads.push((name.to_owned(), json!([bot["bot_id"], bot["head"], shut])));
                 }
             }
             raised.extend(theirs);
@@ -7286,6 +7294,7 @@ impl Following {
             raised,
             sure,
             heads,
+            closed,
             new,
             held,
         })
@@ -8163,6 +8172,13 @@ impl Fleet {
         for gone in self.raised.difference(&raised) {
             self.needs.forget(gone);
             self.scanned.remove(gone);
+        }
+        // Theirs closed, done, as listed: what they asked is set aside.
+        for bot in &raised {
+            match read.closed.contains(bot) {
+                true => _ = self.closed.insert(bot.clone()),
+                false => _ = self.closed.remove(bot),
+            }
         }
         self.raised = raised;
         self.followed = read.followed;
@@ -10738,6 +10754,12 @@ impl App {
         // A compaction asked for may have run, or been asked for, while
         // away: the record says which.
         self.compact_next = record["compaction_requested"] == true;
+        // Closed or opened while away, as the record says now: a close
+        // missed sets its questions aside, below, as one heard would.
+        self.own_closed = resolved::closed(&record);
+        if !self.own_closed {
+            self.closed_aside = false;
+        }
         // What happened while away is not known turn by turn: a kept
         // done window stays open from here on, as any other.
         self.kept.showing = false;
@@ -13891,7 +13913,13 @@ impl App {
                             continue;
                         }
                         if resolves(&name) && !failed && !reactions::refused(&item) {
-                            self.resolve(&name, &arguments, turns.get(&node).copied(), false);
+                            self.resolve(
+                                &name,
+                                &arguments,
+                                &output,
+                                turns.get(&node).copied(),
+                                false,
+                            );
                         }
                         if name == asks::TOOL && !failed && !reactions::refused(&item) {
                             self.asked(id, turns.get(&node).copied(), &arguments);
@@ -15132,7 +15160,7 @@ impl App {
                     self.ask_closed(&arguments);
                 }
                 if resolves(&name) && !shown.1 && !reactions::refused(&json!({"output": shown.0})) {
-                    self.resolve(&name, &arguments, turn, true);
+                    self.resolve(&name, &arguments, &shown.0, turn, true);
                 }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
@@ -15397,10 +15425,18 @@ impl App {
     }
 
     /// Show what a `close_agent` or `remove_task` call (`name`) in `turn`
-    /// closed: the daemon closed it, done, so this window only shows it.
-    /// This agent closing itself sets its own questions aside; a task
-    /// closed `now`, as it happens, has its window closed.
-    fn resolve(&mut self, name: &str, arguments: &Value, turn: Option<i64>, now: bool) {
+    /// closed, as its `output` says: the daemon closed it, done, so this
+    /// window only shows it. This agent closing itself sets its own
+    /// questions aside; a task closed `now`, as it happens, has its window
+    /// closed.
+    fn resolve(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        output: &str,
+        turn: Option<i64>,
+        now: bool,
+    ) {
         if turn.is_none() {
             return;
         }
@@ -15409,14 +15445,11 @@ impl App {
                 .and_then(|project| crate::task::named(arguments["task"].as_str()?, project))
                 .into_iter()
                 .collect(),
-            false => resolved::named(arguments),
+            false => resolved::closed_by(output),
         };
         for agent in closed {
-            // Itself only named alone, as the daemon closes it.
             if agent == self.bot {
-                if name == served::REMOVE || resolved::itself(arguments, &self.bot) {
-                    self.set_aside_own(None);
-                }
+                self.set_aside_own(None);
             } else if now && let Some(fleet) = &mut self.fleet {
                 fleet.resolved(&agent);
             }
@@ -36521,7 +36554,9 @@ mod tests {
                             "created_by": "shop.lead", "running_turn": 5}),
                     ];
                     if listed.load(std::sync::atomic::Ordering::SeqCst) {
-                        bots.push(json!({"name": "shop.loose", "bot_id": 3, "head": 3}));
+                        // Closed, done: what it asked is set aside here.
+                        bots.push(json!({"name": "shop.loose", "bot_id": 3, "head": 3,
+                            "closed_ms": 1}));
                     }
                     json!({"bots": bots})
                 }
@@ -36544,6 +36579,8 @@ mod tests {
         let unread = fleet.follow_leads(false).await;
         assert!(fleet.raised.contains("shop.loose"));
         assert!(unread.iter().any(|(bot, _)| bot == "shop.loose"));
+        assert!(fleet.closed.contains("shop.loose"));
+        assert!(!fleet.closed.contains("shop.lead"));
         // A read that lands after the events since it was asked for keeps
         // what they changed: a task made and one deleted meanwhile.
         let asked = fleet.follow_due(true).expect("asked now");
@@ -38517,19 +38554,20 @@ mod tests {
         // question aside.
         app.asked("q1", Some(11), &json!({"question": "Tag it?"}));
         assert_eq!(app.asks.len(), 1);
-        app.resolve(
-            resolved::TOOL,
-            &json!({"name": "calc.lead"}),
-            Some(12),
-            true,
-        );
+        let closed = |bot: &str| json!({"closed": [{"bot": bot, "was_open": true}]}).to_string();
+        let lead = json!({"name": "calc.lead"});
+        app.resolve(resolved::TOOL, &lead, &closed("calc.lead"), Some(12), true);
         assert!(app.asks.is_empty());
         assert_eq!(app.aside.len(), 1);
-        // Closing another, or itself among others, sets none aside.
+        // Closing another sets none aside, nor does itself among others,
+        // which the daemon refuses: what the output says it closed counts.
         app.asked("q2", Some(13), &json!({"question": "Ship it?"}));
-        app.resolve(resolved::TOOL, &json!({"name": "calc.fix"}), Some(14), true);
+        let fix = json!({"name": "calc.fix"});
+        app.resolve(resolved::TOOL, &fix, &closed("calc.fix"), Some(14), true);
         let both = json!({"names": ["calc.lead", "calc.fix"]});
-        app.resolve(resolved::TOOL, &both, Some(14), true);
+        let refused = json!({"closed": [{"bot": "calc.fix"}],
+            "refused": [{"bot": "calc.lead", "error": "not_permitted"}]});
+        app.resolve(resolved::TOOL, &both, &refused.to_string(), Some(14), true);
         assert_eq!(app.asks.len(), 1);
         // Closed elsewhere, by whoever made it: its window sets its
         // questions aside too, once while it stays closed.
