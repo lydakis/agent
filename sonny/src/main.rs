@@ -23243,8 +23243,9 @@ impl App {
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
                 ));
             }
-            // Under the composer's band and no wider: one column, its
-            // right edge where the band's is.
+            // Under the composer's band, the conversation's width: from
+            // its first column, under the `›`, to where its words end;
+            // not the band's column past either end.
             // The menu's keys while it is open, as every list over the
             // composer has them, saying what Enter does with the pick.
             let (line, opens) = match menu_keys(&menu, self.pick, self.menu_moved, &self.input) {
@@ -23982,7 +23983,7 @@ impl App {
                 format!(" {}", "↑".repeat(steps))
             });
             let marked = boost.as_ref().map_or(0, |boost| boost.width());
-            let room = width.saturating_sub(4 + needs + marked + "zen · ".len());
+            let room = width.saturating_sub(needs + marked + "zen · ".len());
             // As much of its first line as the row holds: the footer's own
             // width, not a glance's.
             let mut line = focus.lines().next().unwrap_or("").to_owned();
@@ -30091,7 +30092,7 @@ mod tests {
         assert!(app.repaint && app.input.is_empty());
         let footer = app.footer_line(100).to_string();
         assert!(
-            footer.starts_with("  zen · the receipts' currency"),
+            footer.starts_with("zen · the receipts' currency"),
             "{footer}"
         );
         assert!(!footer.contains("zen-test.lead"), "{footer}");
@@ -30100,7 +30101,7 @@ mod tests {
         app.boost = Some("xhigh".into());
         let footer = app.footer_line(100).to_string();
         assert!(
-            footer.starts_with("  zen · the receipts' currency ↑") && !footer.contains("xhigh"),
+            footer.starts_with("zen · the receipts' currency ↑") && !footer.contains("xhigh"),
             "{footer}"
         );
         // A long focus runs to the row's end, not to a glance's length.
@@ -30168,8 +30169,8 @@ mod tests {
         });
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
-        assert!(footer.starts_with("  zen · the rounding"), "{footer}");
-        assert!(footer.ends_with("? 1  "), "{footer}");
+        assert!(footer.starts_with("zen · the rounding"), "{footer}");
+        assert!(footer.ends_with("? 1"), "{footer}");
         assert_eq!(footer.width(), 60);
         let [(counter, "status")] = &counter[..] else {
             panic!("{counter:?}")
@@ -30183,8 +30184,8 @@ mod tests {
         // its number, not a word after them.
         app.zen = Some("a long focus that cannot fit".into());
         let footer = app.footer(30).0.to_string();
-        assert!(footer.starts_with("  zen · a long focus"), "{footer}");
-        assert!(footer.ends_with("? 1  "), "{footer}");
+        assert!(footer.starts_with("zen · a long focus"), "{footer}");
+        assert!(footer.ends_with("? 1"), "{footer}");
         assert!(footer.width() <= 30, "{footer}");
     }
 
@@ -38305,7 +38306,7 @@ mod tests {
             ]
         );
         // The agent's name is the composer's to say, not the footer's.
-        assert!(text.ends_with("  ? 2  ● 3  ○ 13  "), "{text}");
+        assert!(text.ends_with("  ? 2  ● 3  ○ 13"), "{text}");
         assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
         // Narrow, idle goes first; what needs the person stays.
@@ -38356,7 +38357,7 @@ mod tests {
         app.failed = 1;
         let (line, opens) = app.footer(100);
         let text = line.to_string();
-        assert!(text.ends_with("  ? 1  ✗ 3  ● 1  "), "{text}");
+        assert!(text.ends_with("  ? 1  ✗ 3  ● 1"), "{text}");
         // A click on `✗` opens /status, which lists the agents and says
         // what failed in the background.
         assert_eq!(
@@ -38366,7 +38367,7 @@ mod tests {
         // Only background failures: still one `✗`, still /status.
         app.counts = Some(status::Counts::default());
         let (line, opens) = app.footer(100);
-        assert!(line.to_string().ends_with("  ✗ 1  "), "{line}");
+        assert!(line.to_string().ends_with("  ✗ 1"), "{line}");
         assert_eq!(
             opens.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["status"]
@@ -38725,7 +38726,7 @@ mod tests {
         let full = app.footer(100).0;
         assert!(
             full.to_string()
-                .starts_with("  ⏵⏵ full access · Opus · /work"),
+                .starts_with("⏵⏵ full access · Opus · /work"),
             "{full}"
         );
         let mark = full.spans.iter().find(|span| span.content == "⏵⏵").unwrap();

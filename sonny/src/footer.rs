@@ -139,12 +139,13 @@ fn width(spans: &[Span]) -> usize {
     spans.iter().map(|span| span.content.width()).sum()
 }
 
-/// The row at `width`, both ends inset two columns, and the columns each
-/// item with somewhere to open covers, with what it opens.
+/// The row at `width`, the conversation's: from its first column, under
+/// the `›` and a reply's `•`, to where its words end, and the columns
+/// each item with somewhere to open covers, with what it opens.
 pub fn lay(mut items: Vec<Item>, width: usize) -> (Line<'static>, Vec<(Range<u16>, &'static str)>) {
     items.sort_by_key(|item| item.slot);
     let mut at = vec![0; items.len()];
-    let room = width.saturating_sub(4);
+    let room = width;
     let mut steps = LADDER.iter();
     loop {
         let (left, right) = sides(&items, &at);
@@ -166,8 +167,7 @@ pub fn lay(mut items: Vec<Item>, width: usize) -> (Line<'static>, Vec<(Range<u16
             true => 0,
             false => 2,
         });
-    let mut spans = vec![Span::raw("  ")];
-    spans.extend(left);
+    let mut spans = left;
     spans.push(Span::raw(" ".repeat(fill)));
     // Where each linked item lands, counted as the spans are laid.
     let mut opens = Vec::new();
@@ -190,7 +190,6 @@ pub fn lay(mut items: Vec<Item>, width: usize) -> (Line<'static>, Vec<(Range<u16
         column += w;
         spans.extend(shown.iter().cloned());
     }
-    spans.push(Span::raw("  "));
     (Line::from(spans), opens)
 }
 
@@ -291,7 +290,9 @@ mod tests {
 
     #[test]
     fn a_busy_row_gives_way_by_the_ladder_and_keeps_what_needs_you() {
-        let rows: Vec<String> = [100, 80, 60, 44].map(|w| row(busy(), w)).into();
+        // The widths whose rows had these items when both ends were inset
+        // two columns, four wider: the ladder's steps are the same.
+        let rows: Vec<String> = [96, 76, 56, 40].map(|w| row(busy(), w)).into();
         // The counts are their marks and numbers alone, at every width.
         assert_eq!(
             rows[0].trim(),
@@ -306,9 +307,10 @@ mod tests {
             "⏵⏵ GPT 6.1 Sol high · agent on main   ? 1  ✗ 1  ● 2  37%"
         );
         assert_eq!(rows[3].trim(), "⏵⏵ GPT 6.1 Sol high   ? 1  ✗ 1  ● 2  37%");
-        for (row, w) in rows.iter().zip([100, 80, 60, 44]) {
+        for (row, w) in rows.iter().zip([96, 76, 56, 40]) {
             assert_eq!(row.width(), w, "{row}");
-            assert!(row.starts_with("  ⏵⏵") && row.ends_with("  "), "{row}");
+            // From the conversation's first column to its last.
+            assert!(row.starts_with("⏵⏵") && !row.ends_with(' '), "{row}");
         }
     }
 
@@ -321,24 +323,24 @@ mod tests {
             items.push(Item::new(Slot::Elsewhere, forms).opens("projects"));
             items
         };
-        let rows: Vec<String> = [120, 100, 44, 38].map(|w| row(with_elsewhere(), w)).into();
+        let rows: Vec<String> = [116, 96, 40, 34].map(|w| row(with_elsewhere(), w)).into();
         assert!(
-            rows[0].ends_with("? 1  ✗ 1  ● 2  ○ 4  ← ? 3  37% left  "),
+            rows[0].ends_with("? 1  ✗ 1  ● 2  ○ 4  ← ? 3  37% left"),
             "{}",
             rows[0]
         );
         // The idle count goes first, then the working one, then it, whole.
         assert!(
-            rows[1].ends_with("? 1  ✗ 1  ● 2  ← ? 3  37% left  "),
+            rows[1].ends_with("? 1  ✗ 1  ● 2  ← ? 3  37% left"),
             "{}",
             rows[1]
         );
-        assert!(rows[2].ends_with("? 1  ✗ 1  ← ? 3  37%  "), "{}", rows[2]);
-        assert!(rows[3].ends_with("? 1  ✗ 1  37%  "), "{}", rows[3]);
-        for (row, w) in rows.iter().zip([120, 100, 44, 38]) {
+        assert!(rows[2].ends_with("? 1  ✗ 1  ← ? 3  37%"), "{}", rows[2]);
+        assert!(rows[3].ends_with("? 1  ✗ 1  37%"), "{}", rows[3]);
+        for (row, w) in rows.iter().zip([116, 96, 40, 34]) {
             assert_eq!(row.width(), w, "{row}");
         }
-        let (_, opens) = lay(with_elsewhere(), 120);
+        let (_, opens) = lay(with_elsewhere(), 116);
         assert_eq!(opens.last().map(|(_, link)| *link), Some("projects"));
     }
 
@@ -366,10 +368,10 @@ mod tests {
         ];
         let line = row(items, 100);
         assert!(
-            line.starts_with("  ⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main  "),
+            line.starts_with("⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main  "),
             "{line}"
         );
-        assert!(line.ends_with("  37% left  "), "{line}");
+        assert!(line.ends_with("  37% left"), "{line}");
     }
 
     #[test]
