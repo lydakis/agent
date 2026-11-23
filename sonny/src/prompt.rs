@@ -105,6 +105,29 @@ impl Prompt {
         true
     }
 
+    /// `piece` swapped for `with` where it stands as words of its own, with
+    /// nothing but whitespace or the text's ends beside it, the cursor kept
+    /// on the words it was at; whether it stood so exactly once, and was
+    /// swapped.
+    pub fn replace_word(&mut self, piece: &str, with: &str) -> bool {
+        let alone = |&(start, _): &(usize, &str)| {
+            let end = start + piece.len();
+            !self.text[..start].ends_with(|c: char| !c.is_whitespace())
+                && !self.text[end..].starts_with(|c: char| !c.is_whitespace())
+        };
+        let mut found = self.text.match_indices(piece).filter(alone);
+        let (Some((start, _)), None) = (found.next(), found.next()) else {
+            return false;
+        };
+        let swapped = start..start + piece.len();
+        self.at = kept(self.at, &swapped, with.len());
+        self.anchor = (self.anchor).map(|at| kept(at, &swapped, with.len()));
+        self.goal = None;
+        self.splice(swapped, with);
+        self.laid.take();
+        true
+    }
+
     /// `with` put in place of `piece`, with a space after it, in what
     /// Ctrl-Y brings back.
     pub fn unkill(&mut self, piece: &str, with: &str) {
@@ -178,6 +201,15 @@ impl Prompt {
         self.splice(self.at..self.at, text);
         self.at += text.len();
         self.settle();
+    }
+
+    /// `word` put in as words of its own, as [`Prompt::insert`] puts text:
+    /// a space before it when the words before the cursor run up to it,
+    /// and one after it.
+    pub fn insert_word(&mut self, word: &str) {
+        let from = self.selection().map_or(self.at, |selected| selected.start);
+        let apart = self.text[..from].ends_with(|c: char| !c.is_whitespace());
+        self.insert(&format!("{}{word} ", if apart { " " } else { "" }));
     }
 
     pub fn backspace(&mut self) {
@@ -928,6 +960,30 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn a_word_is_replaced_only_where_it_stands_alone_and_once() {
+        let mut prompt = Prompt::default();
+        prompt.set("see /a/report.pdf.bak and /a/report.pdf now");
+        assert!(prompt.replace_word("/a/report.pdf", "/b/copy.pdf"));
+        assert_eq!(&*prompt, "see /a/report.pdf.bak and /b/copy.pdf now");
+        prompt.set("/a/x.pdf then /a/x.pdf");
+        assert!(!prompt.replace_word("/a/x.pdf", "/b"));
+        prompt.set("/a/x.pdf2");
+        assert!(!prompt.replace_word("/a/x.pdf", "/b"));
+        assert_eq!(&*prompt, "/a/x.pdf2");
+    }
+
+    #[test]
+    fn a_word_put_in_stands_apart_from_the_words_before_it() {
+        let mut prompt = Prompt::default();
+        prompt.set("Read:");
+        prompt.insert_word("/a/report.pdf");
+        assert_eq!(&*prompt, "Read: /a/report.pdf ");
+        prompt.insert_word("/a/b.txt");
+        assert_eq!(&*prompt, "Read: /a/report.pdf /a/b.txt ");
+        assert!(prompt.replace_word("/a/report.pdf", "/c/copy.pdf"));
     }
 
     #[test]

@@ -6393,8 +6393,38 @@ impl Search {
     }
 }
 
+/// Whether a picture given to be made is done, or will never be: the
+/// next one given waits for it.
+#[derive(Default)]
+struct Made {
+    done: std::sync::Mutex<bool>,
+    told: std::sync::Condvar,
+}
+
+impl Made {
+    fn wait(&self) {
+        let done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        drop(self.told.wait_while(done, |done| !*done));
+    }
+}
+
+/// Marks its picture done when let go: made, failed, or its job dropped
+/// before it ran, so the next never waits on one that will not come.
+struct MadeOnDrop(Arc<Made>);
+
+impl Drop for MadeOnDrop {
+    fn drop(&mut self) {
+        *self.0.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.told.notify_all();
+    }
+}
+
 /// A picture being read, decoded and scaled beside the loop.
 type Preparing = tokio::task::JoinHandle<Result<Option<attach::Picture>, String>>;
+
+/// A file dropped from another machine, being copied here over its link:
+/// the path of the copy, for the agent to read.
+type Fetching = tokio::task::JoinHandle<Result<std::path::PathBuf, String>>;
 
 struct App {
     client: Arc<Client>,
@@ -6655,9 +6685,17 @@ struct App {
     /// numbers: each placeholder is in the composer at once, its picture
     /// behind it once ready ([`App::prepared`]).
     preparing: Vec<(usize, Preparing)>,
+    /// Files dropped from the machine the person is at, when that is not
+    /// this one, being fetched over its link: each by the words standing
+    /// for it in the composer until it is here ([`App::fetched`]).
+    fetching: Vec<(String, Fetching)>,
     /// The selected words a picture's placeholder went in place of, by its
     /// number: put back if no picture comes.
     replaced: Vec<(usize, String)>,
+    /// A message sent while a picture or file it shows was still on its
+    /// way, sent once all are here (with `queue`, as [`App::submit_as`]
+    /// takes it): the keys go on meanwhile.
+    send_waiting: Option<bool>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The slash commands the person ran, for the menu to rank.
@@ -8844,7 +8882,9 @@ impl App {
             steering: Vec::new(),
             pictures: Vec::new(),
             preparing: Vec::new(),
+            fetching: Vec::new(),
             replaced: Vec::new(),
+            send_waiting: None,
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
             picks_kept: false,
@@ -18883,14 +18923,10 @@ impl App {
         }
         match event {
             // Terminals send a pasted line break as a carriage return.
-            // Image files dropped on the terminal arrive as their paths.
+            // Files dropped on the terminal arrive as their paths.
             Event::Paste(text) => {
-                match attach::paths(&text, std::path::Path::new(&self.workspace)) {
-                    Some(paths) => {
-                        for path in paths {
-                            self.prepare(move || attach::load(&path).map(Some));
-                        }
-                    }
+                match attach::dropped(&text, std::path::Path::new(&self.workspace)) {
+                    Some(dropped) => self.drop_files(dropped),
                     None => self
                         .input
                         .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
@@ -18966,7 +19002,7 @@ impl App {
                     KeyCode::Char('j') if ctrl => self.input.insert("\n"),
                     // A picture on the clipboard, as Codex and Claude Code
                     // take one: terminals paste only text.
-                    KeyCode::Char('v') if ctrl => self.prepare(attach::clipboard),
+                    KeyCode::Char('v') if ctrl => self.prepare(attach::pasted),
                     // With nothing typed, the agent above or below in the
                     // pane's list of the project's agents. A terminal that
                     // sends alt+← as alt+b is taken at its word.
@@ -19153,8 +19189,13 @@ impl App {
         &mut self,
         step: impl FnOnce(&mut recall::Recall<Attached>, &str, &mut Attached) -> Option<String>,
     ) -> Option<String> {
-        // A picture still being made ready is waited for: it goes with the
-        // draft it is in, whether that stays or is swapped away and back.
+        // A picture or file still on its way goes with the draft it is in,
+        // whether that stays or is swapped away and back: the draft stays
+        // until all are here, the keys going on meanwhile.
+        if self.arriving() {
+            self.notice = Some("a dropped picture or file is still on its way".into());
+            return None;
+        }
         self.all_ready().await;
         let mut attached = (
             std::mem::take(&mut self.pictures),
@@ -19265,8 +19306,16 @@ impl App {
     /// Send what is written: a message to a busy bot joins its running
     /// turn, or with `queue` runs after it.
     async fn submit_as(&mut self, queue: bool) {
-        // The pictures still being made ready go with it: what is sent is
-        // what the composer shows.
+        // The pictures and files still on their way go with it: what is
+        // sent is what the composer shows. It goes once they are here,
+        // the keys going on meanwhile, as a file over a link may take a
+        // while.
+        if self.arriving() {
+            self.send_waiting = Some(queue);
+            self.notice = Some("sends once what was dropped is here".into());
+            return;
+        }
+        self.send_waiting = None;
         self.all_ready().await;
         let prompt = self.input.trim().to_owned();
         // A quote alone is a message, as it was typed into the words.
@@ -19676,7 +19725,9 @@ impl App {
         self.input.clear();
         self.pictures.clear();
         self.preparing.clear();
+        self.fetching.clear();
         self.replaced.clear();
+        self.send_waiting = None;
         self.quotes.clear();
     }
 
@@ -20286,15 +20337,21 @@ impl App {
     ) {
         // One picture is made at a time, in the order they came, as on the
         // key loop before: a batch of big screenshots is decoded one by
-        // one, never all at once.
-        static MAKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        // one, never all at once. Each waits for the one given before it,
+        // its place in line taken here, on the loop, so which thread starts
+        // first never reorders them.
+        static LAST: std::sync::Mutex<Option<Arc<Made>>> = std::sync::Mutex::new(None);
         let number = self.placeholder();
         let woken = self.woken.clone();
+        let mine = Arc::new(Made::default());
+        let before = (LAST.lock().unwrap_or_else(|e| e.into_inner())).replace(mine.clone());
+        let done = MadeOnDrop(mine);
         let job = tokio::task::spawn_blocking(move || {
-            let made = {
-                let _one = MAKING.blocking_lock();
-                make()
-            };
+            if let Some(before) = before {
+                before.wait();
+            }
+            let made = make();
+            drop(done);
             woken.notify_one();
             made
         });
@@ -20335,15 +20392,113 @@ impl App {
             self.ready(number, got);
             any = true;
         }
+        while (self.fetching.first()).is_some_and(|(_, job)| job.is_finished()) {
+            let (words, job) = self.fetching.remove(0);
+            let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
+            self.fetched(&words, got);
+            any = true;
+        }
+        // A message sent while they were on their way goes now.
+        if let Some(queue) = self.send_waiting.filter(|_| !self.arriving()) {
+            Box::pin(self.submit_as(queue)).await;
+            any = true;
+        }
         any
     }
 
+    /// Whether a picture or file is still on its way to the composer.
+    fn arriving(&self) -> bool {
+        (self.preparing.iter()).any(|(_, job)| !job.is_finished())
+            || (self.fetching.iter()).any(|(_, job)| !job.is_finished())
+    }
+
     /// Every picture still being made ready, waited for and put behind its
-    /// placeholder.
+    /// placeholder, and every file still being fetched, here.
     async fn all_ready(&mut self) {
         for (number, job) in std::mem::take(&mut self.preparing) {
             let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
             self.ready(number, got);
+        }
+        for (words, job) in std::mem::take(&mut self.fetching) {
+            let got = job.await.unwrap_or_else(|error| Err(error.to_string()));
+            self.fetched(&words, got);
+        }
+    }
+
+    /// Files dropped on the terminal, as their paths named them: a picture
+    /// here behind a placeholder, made ready beside the loop; another file
+    /// or folder here as its path; one on the machine the person is at,
+    /// not this one, fetched over its link while its path stands in the
+    /// composer, then a picture or this machine's copy of it.
+    fn drop_files(&mut self, dropped: Vec<attach::Dropped>) {
+        let mut said = None;
+        for word in dropped {
+            match word {
+                attach::Dropped::Picture(path) => {
+                    self.prepare(move || attach::load(&path).map(Some));
+                }
+                attach::Dropped::Here(path) => {
+                    let path = path.to_string_lossy();
+                    self.input.insert_word(&attach::shell_quoted(&path));
+                }
+                attach::Dropped::Unread(path, why) => {
+                    self.input.insert_word(&attach::shell_quoted(&path));
+                    said = Some(unread(&path, &why));
+                }
+                attach::Dropped::Elsewhere(path) => {
+                    let words = attach::shell_quoted(&path);
+                    let handing = link::handing();
+                    // A picture goes behind its placeholder at once, as
+                    // one read here does; another file's path stands until
+                    // the copy is here.
+                    if handing && attach::is_picture(std::path::Path::new(&path)) {
+                        self.prepare(move || {
+                            let got = link::picture(&path);
+                            got.map(Some)
+                                .map_err(|why| format!("{}: {why}", file_name(&path)))
+                        });
+                        continue;
+                    }
+                    self.input.insert_word(&words);
+                    if !handing {
+                        // A path pasted as words is words; dropped over
+                        // SSH, it names a file on the person's machine.
+                        if attach::over_ssh() {
+                            said = Some(format!(
+                                "{} is not on this machine; link the one it is on with \
+                                 `sonny link` to drop files from it",
+                                file_name(&path)
+                            ));
+                        }
+                        continue;
+                    }
+                    let woken = self.woken.clone();
+                    let job = tokio::task::spawn_blocking(move || {
+                        let to = link::kept_as(&path).ok_or("HOME is not set")?;
+                        let got = link::copy(&path, &to).map(|()| to);
+                        woken.notify_one();
+                        got.map_err(|why| format!("{}: {why}", file_name(&path)))
+                    });
+                    self.fetching.push((words, job));
+                }
+            }
+        }
+        self.notice = said.or(self.notice.take());
+    }
+
+    /// A file dropped from another machine, copied here: its path's words
+    /// in the composer become the copy's path, where they stand alone and
+    /// once; words the person changed or repeated meanwhile stay, and where
+    /// the copy is is said. Not had, why is said.
+    fn fetched(&mut self, words: &str, got: Result<std::path::PathBuf, String>) {
+        match got {
+            Ok(path) => {
+                let path = attach::shell_quoted(&path.to_string_lossy());
+                if !self.input.replace_word(words, &path) {
+                    self.notice = Some(format!("{} is copied here as {path}", file_name(words)));
+                }
+            }
+            Err(why) => self.notice = Some(why),
         }
     }
 
@@ -25014,6 +25169,27 @@ struct Pick {
     ask: asks::Ask,
     held: bool,
     verdict: Option<repick::Verdict>,
+}
+
+/// A file's name, from its path.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+}
+
+/// Why a dropped file could not be looked at here, said so it can be
+/// mended: on a Mac, a folder macOS keeps from the terminal Sonny runs in
+/// until it is let in.
+fn unread(path: &str, why: &str) -> String {
+    let name = file_name(path);
+    match cfg!(target_os = "macos") && why.contains("not permitted") {
+        true => format!(
+            "{name}: macOS keeps its folder from this terminal; let the terminal in under \
+             System Settings, Privacy & Security, Files and Folders"
+        ),
+        false => format!("{name}: {why}"),
+    }
 }
 
 /// What is being written, as a window keeps it for the one it becomes
@@ -40561,6 +40737,107 @@ mod tests {
         assert_eq!(kept, [false, false, false, false, true, true]);
     }
 
+    /// Files dropped on the window: a picture behind its placeholder,
+    /// another file as its path; one from another machine stands as its
+    /// path while it is fetched, then is a picture or this machine's copy,
+    /// and a message sent meanwhile waits for it.
+    #[tokio::test]
+    async fn dropped_files_are_pictures_or_paths_and_ones_from_elsewhere_are_fetched() {
+        let client = daemon_answering(|_: &Value| json!({"message": 2})).await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(format!("sonny-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = resvg::tiny_skia::Pixmap::new(2, 2)
+            .unwrap()
+            .encode_png()
+            .unwrap();
+        std::fs::write(dir.join("shot (1).png"), &png).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"n").unwrap();
+        app.workspace = dir.display().to_string();
+        app.key(Event::Paste("shot\\ \\(1\\).png notes.txt".into()))
+            .await;
+        app.all_ready().await;
+        let notes = attach::shell_quoted(&dir.join("notes.txt").to_string_lossy());
+        assert_eq!(*app.input, format!("[Image #1] {notes} "));
+        assert_eq!(app.placed(&app.input).len(), 1);
+        // Another file from another machine is this machine's copy, put
+        // where its path alone stands; one not had stays its path.
+        app.input.clear();
+        let report = "/Users/someone/report.pdf";
+        let copy = dir.join("dropped").join("ab12cd34-report.pdf");
+        app.input.insert(&format!(
+            "see {report}.bak and {report} /Users/someone/gone.txt"
+        ));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let kept = copy.clone();
+        app.fetching.push((
+            report.into(),
+            tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+                Ok(kept)
+            }),
+        ));
+        app.fetching.push((
+            "/Users/someone/gone.txt".into(),
+            tokio::task::spawn_blocking(|| Err("gone.txt: not on mac".into())),
+        ));
+        assert!(!app.prepared().await);
+        go.send(()).unwrap();
+        app.all_ready().await;
+        assert_eq!(
+            *app.input,
+            format!(
+                "see {report}.bak and {} /Users/someone/gone.txt",
+                copy.display()
+            )
+        );
+        assert_eq!(app.notice.as_deref(), Some("gone.txt: not on mac"));
+        // Changed while it was fetched, the words stay, and the copy is said.
+        app.input.set("/Users/someone/report2.pdf");
+        let kept = copy.clone();
+        app.fetching
+            .push((report.into(), tokio::task::spawn_blocking(move || Ok(kept))));
+        app.all_ready().await;
+        assert_eq!(&*app.input, "/Users/someone/report2.pdf");
+        assert_eq!(
+            app.notice,
+            Some(format!("report.pdf is copied here as {}", copy.display()))
+        );
+        // Sent while one is still on its way, it goes once it is here,
+        // the keys going on meanwhile; the draft stays till then.
+        app.input.set(&format!("read {report}"));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let kept = copy.clone();
+        app.fetching.push((
+            report.into(),
+            tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+                Ok(kept)
+            }),
+        ));
+        app.submit().await;
+        assert_eq!(app.send_waiting, Some(false));
+        assert_eq!(*app.input, format!("read {report}"));
+        assert!(
+            app.recalled(|_, _, _| Some("earlier".into()))
+                .await
+                .is_none()
+        );
+        go.send(()).unwrap();
+        while app.send_waiting.is_some() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(app.input.is_empty() && app.fetching.is_empty());
+        // A path from another machine with none linked is words.
+        app.input.clear();
+        app.key(Event::Paste("/Users/someone/elsewhere.pdf".into()))
+            .await;
+        assert!(app.fetching.is_empty() || link::handing());
+        assert_eq!(&*app.input, "/Users/someone/elsewhere.pdf ");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A picture is made ready beside the loop: its placeholder shows at
     /// once and the keys go on while it is read; once ready it is behind
     /// its placeholder, and a message sent before then waits for it.
@@ -40619,6 +40896,11 @@ mod tests {
             let _ = go.send(());
         });
         app.submit().await;
+        assert_eq!(app.send_waiting, Some(false), "it waits, the keys going on");
+        while app.send_waiting.is_some() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         app.beside_done().await;
         assert!(app.preparing.is_empty() && app.input.is_empty());
         let submitted = (asked.lock().unwrap().iter())
@@ -40670,6 +40952,10 @@ mod tests {
             let _ = go.send(());
         });
         app.key(press(KeyCode::Down, KeyModifiers::NONE)).await;
+        while !app.preparing.is_empty() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
         // Two that fit alone but not together: the first given is kept.
         // They are made one at a time, in the order given.
