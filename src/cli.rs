@@ -268,7 +268,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "tool",
         about: "Run one call of a bot's shell, read, write, edit or apply_patch here, in a sandbox: for a client that lends this machine to another's agents",
-        usage: "tool [--writable PATH]... [--network] [--held] [--workdir DIR] NAME ARGUMENTS",
+        usage: "tool [--writable PATH]... [--network] [--held] [--workdir DIR] NAME (ARGUMENTS | -)",
         flags: "--writable --network --held --workdir",
         settings: "",
         startup: false,

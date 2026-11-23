@@ -1998,14 +1998,23 @@ async fn lent_tool(
         .arg("--workdir")
         .arg(&start)
         .arg(name)
-        .arg(payload["arguments"].to_string())
+        // On stdin, as a file's whole content may pass what one argument
+        // of a command holds.
+        .arg("-")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_refused", e.to_string()))?;
-    let _held = child.stdin.take();
+    let mut held = child.stdin.take();
+    if let Some(stdin) = &mut held {
+        use tokio::io::AsyncWriteExt;
+        let line = format!("{}\n", payload["arguments"]);
+        if let Err(error) = stdin.write_all(line.as_bytes()).await {
+            return Err(("tool_refused", error.to_string()));
+        }
+    }
     let ran = match tokio::time::timeout(left, child.wait_with_output()).await {
         Ok(ran) => ran.map_err(|e| ("tool_refused", e.to_string()))?,
         Err(_) => return Err(("timed_out", format!("{name} ran out of time"))),

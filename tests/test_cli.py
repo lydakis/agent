@@ -2226,6 +2226,21 @@ class CliTests(ModelFixture):
         (home/'.agent'/'config.toml').write_text('[shell_environment_policy]\nexclude = ["SECRET_*"]\n')
         env['SECRET_TOKEN'] = 'hidden-value'
         self.assertEqual(ran(call(*writing, 'shell', {'command': 'echo "[$SECRET_TOKEN]"'}))['stdout'], '[]\n')
+        # Nor a provider's key, whatever the policy says, and its value is
+        # cut from what the call prints.
+        (home/'.agent'/'config.toml').write_text('')
+        env['OPENAI_API_KEY'] = 'sk-lent-machine-key-0123456789'
+        shown = ran(call(*writing, 'shell', {'command': 'echo "[$OPENAI_API_KEY]"; echo sk-lent-machine-key-0123456789'}))
+        self.assertNotIn('sk-lent-machine-key-0123456789', shown['stdout'])
+        self.assertTrue(shown['stdout'].startswith('[]\n'), shown)
+        # Arguments past what one argument of a command holds come on stdin.
+        content = 'x' * (300 << 10)
+        big = subprocess.run([str(self.binary), 'tool', *writing, 'write', '-'], env=env, cwd=work, timeout=30,
+                             input=json.dumps({'path': 'big.txt', 'content': content}) + '\n',
+                             capture_output=True, text=True)
+        self.assertEqual(big.returncode, 0, big.stderr)
+        self.assertFalse(json.loads(big.stdout)['failed'], big.stdout)
+        self.assertEqual((lent/'big.txt').read_text(), content)
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_daemon_started_by_a_name_in_sonny_s_programs_still_writes_for_a_sandboxed_bot(self):

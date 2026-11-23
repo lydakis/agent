@@ -384,6 +384,17 @@ fn tool(args: &[String]) -> Result<i32> {
     let [name, arguments] = positional.as_slice() else {
         return fail_with("usage", "tool needs a tool's name and its arguments");
     };
+    // `-`: the arguments are stdin's first line, past what one argument
+    // of a command may hold; the rest of stdin, under --held, holds it.
+    let arguments = match arguments.as_str() {
+        "-" => {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)?;
+            line.trim_end_matches('\n').to_owned()
+        }
+        given => given.to_owned(),
+    };
+    let arguments = &arguments;
     if network && writable.is_empty() {
         return fail_with(
             "usage",
@@ -499,8 +510,8 @@ fn tool(args: &[String]) -> Result<i32> {
 
 /// What no command `agent tool` runs is given, as a daemon this CLI starts
 /// gives none: the variables `[shell_environment_policy] exclude` names,
-/// and the keys of `~/.agent/keys/env`, whose values are cut from what it
-/// prints too.
+/// the keys of `~/.agent/keys/env` and its providers' keys, whose values
+/// are cut from what it prints too.
 fn withheld() -> Result<agent_runtime::tools::Credentials> {
     let credentials = agent_runtime::tools::Credentials::default();
     let file =
@@ -516,6 +527,29 @@ fn withheld() -> Result<agent_runtime::tools::Credentials> {
     for (name, value) in agent_client::env_file::for_daemon().unwrap_or_default() {
         credentials.withhold(&name);
         credentials.set(&name, &value);
+    }
+    // And each provider's key here, as a daemon withholds its providers':
+    // the ones it knows by name, and those the person names.
+    let named = client::environment_providers(&|name| std::env::var(name).ok(), &|| {
+        Ok(file.provider.clone())
+    })
+    .unwrap_or_default();
+    let keys = (named.iter())
+        .filter_map(|spec| server::ProviderSpec::parse(spec).ok()?.key_env)
+        .chain(
+            [
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "OPENROUTER_API_KEY",
+                "AWS_BEARER_TOKEN_BEDROCK",
+            ]
+            .map(String::from),
+        );
+    for name in keys {
+        if let Ok(value) = std::env::var(&name) {
+            credentials.withhold(&name);
+            credentials.set(&name, &value);
+        }
     }
     Ok(credentials)
 }

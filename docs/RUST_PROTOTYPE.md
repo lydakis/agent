@@ -3671,16 +3671,18 @@ cannot reach another bot's socket; `bot_id` that is not the bot's is
 was not listening, one bind. It starts the daemon when none runs, as a
 command on the bots does; with `--no-spawn` it is `daemon_unavailable`
 instead.
-`agent tool [--writable PATH]... [--network] [--held] [--workdir DIR] NAME ARGUMENTS`
+`agent tool [--writable PATH]... [--network] [--held] [--workdir DIR] NAME (ARGUMENTS | -)`
 runs one call of a bot's `shell`, `read`, `write`, `edit` or `apply_patch`
 here, with ARGUMENTS as a model gives them, by the daemon's own code and in
 the sandbox `agent sandbox` builds (no daemon): read-only with no
 `--writable`, the network off unless `--network` (which goes with
 `--writable`, as a sandbox's network goes with `workspace-write`), relative
-paths from DIR. Its commands get none of the variables
-`[shell_environment_policy] exclude` names nor the keys of
-`~/.agent/keys/env`, whose values are cut from what it prints, as with a
-daemon the CLI starts. It prints `{"output","failed","parts"?}` as a
+paths from DIR; ARGUMENTS `-` reads them from stdin's first line, past
+what one argument of a command holds. Its commands get none of the
+variables `[shell_environment_policy] exclude` names nor the keys of
+`~/.agent/keys/env` or its providers (`OPENAI_API_KEY` and the like, and
+the `KEY_ENV` a provider the person names reads), whose values are cut
+from what it prints, as with a daemon the CLI starts. It prints `{"output","failed","parts"?}` as a
 daemon step's reply does, and a call the tool refuses is such a result,
 failed; a stream cut past what it shows is written whole to a new
 owner-only file under `~/.agent/outputs/tool`, which its output's `files`
