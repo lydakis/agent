@@ -687,6 +687,9 @@ struct ProjectsState {
     took_kept: bool,
     /// What the last read keeps beside the store, being written.
     writing: Option<tokio::task::JoinHandle<()>>,
+    /// The mark of every project as last kept beside the store, those
+    /// counted again at each read among them: kept again once it moves.
+    shown: u64,
 }
 
 /// What **Projects** counted, kept by the window once the page closes: the
@@ -780,13 +783,16 @@ impl App {
                 }
                 *kept
             }
-            // The projects as any window last counted them show at once,
-            // those another build counted too: this one counts each again.
+            // The projects as any window last showed them show at once,
+            // every one, those another build counted too: this one counts
+            // again each that may have moved since.
             None => {
                 let store = self.store();
-                let (mut each, this_build) = take_projects(&store, self.client.identity());
-                let shown: Vec<projects::Project> =
-                    (each.values()).map(|read| read.project.clone()).collect();
+                let (mut each, mut shown, this_build) =
+                    take_projects(&store, self.client.identity());
+                if shown.is_empty() {
+                    shown = (each.values()).map(|read| read.project.clone()).collect();
+                }
                 if !shown.is_empty() {
                     view.set(shown, now_ms());
                 }
@@ -1184,7 +1190,7 @@ async fn read_projects(
     // here: each one that moved since is counted again.
     if !state.took_kept {
         state.took_kept = true;
-        if let (each, true) = take_projects(&kept, identity) {
+        if let (each, _, true) = take_projects(&kept, identity) {
             for (lead, read) in each {
                 state.each.entry(lead).or_insert(read);
             }
@@ -1205,6 +1211,9 @@ async fn read_projects(
     let mut was = std::mem::take(&mut state.each);
     // Whether a project was counted to another mark than it was kept with.
     let mut moved = false;
+    // Every project's mark, those counted again at every read among them:
+    // what the page showed, kept beside the store once it moves.
+    let mut shown = std::hash::DefaultHasher::new();
     // Each agent under the lead it answers to, so a folder with two leads
     // counts each agent in one row: counted once for every project.
     let makers: HashMap<&str, &str> = (listed.iter())
@@ -1233,6 +1242,7 @@ async fn read_projects(
             .collect();
         let titled = titles.named(&lead.name, lead.bot_id, lead.workspace.as_deref());
         let mark = project_mark(&theirs, &asking, titled.as_deref());
+        std::hash::Hash::hash(&(&lead.name, mark), &mut shown);
         let keeps = !theirs
             .iter()
             .any(|agent| agent.running_turn.is_some() || agent.name == bot);
@@ -1325,12 +1335,20 @@ async fn read_projects(
         }
     }
     // The projects as counted, for the next page in any window, once one
-    // moved or went, written beside the page, which shows them at once.
-    if moved || !was.is_empty() {
+    // moved or went, written beside the page, which shows them at once:
+    // every one as shown, those it counts again too (one that works, the
+    // window's own), so the next page opens whole.
+    let shown = std::hash::Hasher::finish(&shown);
+    let showing = whole && shown != state.shown;
+    if moved || !was.is_empty() || showing {
+        if whole {
+            state.shown = shown;
+        }
         let each = state.each.clone();
         let identity = identity.map(str::to_owned);
+        let found = found.clone();
         state.writing = Some(tokio::task::spawn_blocking(move || {
-            keep_projects(&kept, identity.as_deref(), &each);
+            keep_projects(&kept, identity.as_deref(), &each, &found);
         }));
     }
     Some((found, whole))
@@ -1378,39 +1396,48 @@ fn projects_file(store: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The projects as **Projects** last read them in any window, by lead,
-/// from the daemon's store `identity` names, and whether this build read
-/// them ([`reads_build`]): another build's are shown, not reused, as it
-/// may read a project otherwise.
+/// from the daemon's store `identity` names; every project as it last
+/// showed them, those counted again at every read among them; and
+/// whether this build read them ([`reads_build`]): another build's are
+/// shown, not reused, as it may read a project otherwise.
 fn take_projects(
     store: &std::path::Path,
     identity: Option<&str>,
-) -> (HashMap<String, ProjectRead>, bool) {
+) -> (HashMap<String, ProjectRead>, Vec<projects::Project>, bool) {
     #[derive(serde::Deserialize)]
     struct Kept {
         build: String,
         store: String,
         each: HashMap<String, ProjectRead>,
+        #[serde(default)]
+        shown: Vec<projects::Project>,
     }
     std::fs::read(projects_file(store))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
         .filter(|kept| kept.store == identity.unwrap_or(""))
-        .map(|kept| (kept.each, kept.build == reads_build(identity)))
+        .map(|kept| {
+            let this_build = kept.build == reads_build(identity);
+            (kept.each, kept.shown, this_build)
+        })
         .unwrap_or_default()
 }
 
-/// Keep the projects as read for the next page, in any window: all but
-/// those a workflow's run shows in, whose strip is read live.
+/// Keep the projects as read for the next page, in any window: to reuse,
+/// all but those a workflow's run shows in, whose strip is read live; to
+/// show until the next read lands, every one as `shown`.
 fn keep_projects(
     store: &std::path::Path,
     identity: Option<&str>,
     each: &HashMap<String, ProjectRead>,
+    shown: &[projects::Project],
 ) {
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
         store: &'a str,
         each: HashMap<&'a String, &'a ProjectRead>,
+        shown: &'a [projects::Project],
     }
     let kept = Kept {
         build: reads_build(identity),
@@ -1420,6 +1447,7 @@ fn keep_projects(
                 (read.project.agents.listed.iter()).all(|agent| agent.run.is_none())
             })
             .collect(),
+        shown,
     };
     if let Ok(bytes) = serde_json::to_vec(&kept) {
         keep_beside(&projects_file(store), &bytes);
@@ -30423,8 +30451,12 @@ mod tests {
         let found = page(&client, &store, &asked, &listed, &["alpha.one"], &mut fresh).await;
         assert_eq!(found, ["alpha.lead"]);
         assert_eq!(fresh.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
-        let (kept, this_build) = take_projects(&store, client.identity());
+        let (kept, shown, this_build) = take_projects(&store, client.identity());
         assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        assert_eq!(
+            shown.iter().map(|p| &p.lead).collect::<Vec<_>>(),
+            ["alpha.lead"]
+        );
         assert!(this_build);
         // Another build's projects show, but are not reused; another
         // store's are not taken.
@@ -30432,7 +30464,7 @@ mod tests {
         let mut written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         written["build"] = json!("0.0.0 older");
         std::fs::write(&file, written.to_string()).unwrap();
-        let (kept, this_build) = take_projects(&store, client.identity());
+        let (kept, _, this_build) = take_projects(&store, client.identity());
         assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
         assert!(!this_build);
         let mut other = ProjectsState::default();
@@ -30441,6 +30473,96 @@ mod tests {
         written["store"] = json!("another store");
         std::fs::write(&file, written.to_string()).unwrap();
         assert!(take_projects(&store, client.identity()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_next_window_shows_every_project_at_once_those_working_and_its_own_too() {
+        let client = daemon_answering(|_| json!({"approvals": [], "nodes": [], "items": []})).await;
+        let home = std::env::temp_dir().join(unique("projects-shown"));
+        let store = home.join("state.sqlite");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = |name: &str, id: i64, maker: Option<&str>, running: bool| {
+            Arc::new(standing::Agent {
+                name: name.into(),
+                bot_id: Some(id),
+                head: Some(1),
+                running_turn: running.then_some(1),
+                created_by: maker.map(str::to_owned),
+                workspace: Some(
+                    home.join(name.split('.').next().unwrap())
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            })
+        };
+        // The window's own project, one whose task works and a quiet one.
+        let mut listed = vec![
+            agent("own.lead", 1, None, false),
+            agent("busy.lead", 2, None, false),
+            agent("busy.one", 3, Some("busy.lead"), true),
+            agent("quiet.lead", 4, None, false),
+        ];
+        let waiting = Default::default();
+        let mut state = ProjectsState::default();
+        read_projects(
+            &client,
+            &store,
+            &listed,
+            "own.lead",
+            &[],
+            &[],
+            &waiting,
+            &mut state,
+        )
+        .await
+        .unwrap();
+        state.writing.take().unwrap().await.unwrap();
+        // Only the quiet one is reused; every one shows.
+        let (each, shown, _) = take_projects(&store, client.identity());
+        assert_eq!(each.keys().collect::<Vec<_>>(), ["quiet.lead"]);
+        let mut leads: Vec<&str> = shown.iter().map(|p| p.lead.as_str()).collect();
+        leads.sort();
+        assert_eq!(leads, ["busy.lead", "own.lead", "quiet.lead"]);
+        let busy = shown.iter().find(|p| p.lead == "busy.lead").unwrap();
+        assert_eq!(busy.counts.of(status::Group::Working), 1);
+        // Read again with nothing moved: nothing is written again.
+        read_projects(
+            &client,
+            &store,
+            &listed,
+            "own.lead",
+            &[],
+            &[],
+            &waiting,
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(state.writing.is_none());
+        // The task ends: what shows is kept again.
+        Arc::make_mut(&mut listed[2]).running_turn = None;
+        read_projects(
+            &client,
+            &store,
+            &listed,
+            "own.lead",
+            &[],
+            &[],
+            &waiting,
+            &mut state,
+        )
+        .await
+        .unwrap();
+        state.writing.take().unwrap().await.unwrap();
+        let (_, shown, _) = take_projects(&store, client.identity());
+        let busy = shown.iter().find(|p| p.lead == "busy.lead").unwrap();
+        assert_eq!(busy.counts.of(status::Group::Working), 0);
+        // A new window's page opens on them all before any read.
+        let mut app = app(client.clone());
+        app.options.store = store.clone();
+        app.open_projects().await;
+        assert_eq!(app.projects.as_ref().unwrap().view.projects().len(), 3);
     }
 
     #[tokio::test]
