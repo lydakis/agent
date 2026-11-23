@@ -268,8 +268,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "tool",
         about: "Run one call of a bot's shell, read, write, edit or apply_patch here, in a sandbox: for a client that lends this machine to another's agents",
-        usage: "tool [--writable PATH]... [--network] [--workdir DIR] NAME ARGUMENTS",
-        flags: "--writable --network --workdir",
+        usage: "tool [--writable PATH]... [--network] [--held] [--workdir DIR] NAME ARGUMENTS",
+        flags: "--writable --network --held --workdir",
         settings: "",
         startup: false,
     },
@@ -598,6 +598,10 @@ fn print_flags(flags: &str) {
                 "Another folder a workspace-write bot, or a sandboxed command, may change; repeat for more",
             ),
             "--network" => ("", "A workspace-write bot's commands may use the network"),
+            "--held" => (
+                "",
+                "Run while stdin stays open: once it closes, the call stops, its commands with it",
+            ),
             "--outputs" => (
                 "PATH",
                 "Where a new bot's tool outputs cut for the model are written whole, one file per stream; default the outputs folder beside the store",
@@ -875,6 +879,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--no-compaction"
                 | "--agents"
                 | "--network"
+                | "--held"
                 | "--quiet-background"
                 | "--discover"
         ) {

@@ -2199,6 +2199,33 @@ class CliTests(ModelFixture):
         other = subprocess.run([str(self.binary), 'tool', 'spawn_agent', '{}'], env=env,
                                capture_output=True, text=True, timeout=30, cwd=work)
         self.assertEqual((other.returncode, json.loads(other.stderr)['error']), (2, 'usage'))
+        # The network goes with folders to write, as a sandbox's does.
+        alone = subprocess.run([str(self.binary), 'tool', '--network', 'shell', '{"command":"true"}'], env=env,
+                               capture_output=True, text=True, timeout=30, cwd=work)
+        self.assertEqual((alone.returncode, json.loads(alone.stderr)['error']), (2, 'usage'))
+        # What a command printed past what it shows is kept whole in a file
+        # of the agent's own, named in its result, as there is no store.
+        long = ran(call(*writing, 'shell', {'command': 'seq 1 40000'}))
+        (kept_file,) = long['files']
+        self.assertTrue(kept_file.startswith(str(home/'.agent'/'outputs'/'tool')))
+        self.assertEqual(Path(kept_file).read_text(), ''.join(f'{n}\n' for n in range(1, 40001)))
+        self.assertEqual(Path(kept_file).stat().st_mode & 0o777, 0o600)
+        # Held, its stdin closing stops the call and every command it
+        # started, as the daemon stops a call.
+        stopped = subprocess.Popen([str(self.binary), 'tool', '--held', *writing, 'shell', json.dumps(
+            {'command': '(sleep 3; touch late) & sleep 3; touch later'})], env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=work)
+        time.sleep(1)
+        stopped.stdin.close()
+        _, err = stopped.communicate(timeout=30)
+        self.assertEqual((stopped.returncode, json.loads(err)['error']), (1, 'stopped'))
+        time.sleep(3)
+        self.assertFalse((lent/'late').exists() or (lent/'later').exists())
+        # Nor are the variables the person keeps from shells given to one.
+        (home/'.agent').mkdir(exist_ok=True)
+        (home/'.agent'/'config.toml').write_text('[shell_environment_policy]\nexclude = ["SECRET_*"]\n')
+        env['SECRET_TOKEN'] = 'hidden-value'
+        self.assertEqual(ran(call(*writing, 'shell', {'command': 'echo "[$SECRET_TOKEN]"'}))['stdout'], '[]\n')
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_daemon_started_by_a_name_in_sonny_s_programs_still_writes_for_a_sandboxed_bot(self):

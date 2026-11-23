@@ -921,7 +921,8 @@ pub struct Link {
     /// as a bot's `writable` names its own; the first is where their
     /// relative paths start. None: they read and write nothing.
     pub writable: Vec<String>,
-    /// Whether their commands here reach the network. Off unless set.
+    /// Whether their commands here reach the network, which goes with
+    /// `writable` folders, as a sandbox's network does. Off unless set.
     pub network: bool,
 }
 

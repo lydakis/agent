@@ -1938,7 +1938,9 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
         "upgrade": link.upgrade,
         "shell": crate::agent_at(&crate::agent_places_here()).ok().map(|_| {
             let (writable, start) = lent_folders(link);
-            json!({"writable": writable, "start": start, "network": link.network})
+            // The network goes with folders to write, as a sandbox's does.
+            let network = link.network && !writable.is_empty();
+            json!({"writable": writable, "start": start, "network": network})
         }),
     })
 }
@@ -1985,17 +1987,26 @@ async fn lent_tool(
     for folder in &writable {
         command.arg("--writable").arg(folder);
     }
-    if link.network {
+    if link.network && !writable.is_empty() {
         command.arg("--network");
     }
+    // It runs while its stdin is open: a call stopped here, or this
+    // process gone, closes it, and the call's commands stop with it, as
+    // the daemon stops them, where a kill would leave them running.
     command
+        .arg("--held")
         .arg("--workdir")
         .arg(&start)
         .arg(name)
         .arg(payload["arguments"].to_string())
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let ran = match tokio::time::timeout(left, command.output()).await {
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| ("tool_refused", e.to_string()))?;
+    let _held = child.stdin.take();
+    let ran = match tokio::time::timeout(left, child.wait_with_output()).await {
         Ok(ran) => ran.map_err(|e| ("tool_refused", e.to_string()))?,
         Err(_) => return Err(("timed_out", format!("{name} ran out of time"))),
     };

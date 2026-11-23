@@ -345,12 +345,13 @@ fn own_daemon() -> Result<agent_runtime::sandbox::Daemon> {
 fn tool(args: &[String]) -> Result<i32> {
     use agent_runtime::sandbox::{Mode, Policy};
     use agent_runtime::tools::Prepared;
-    let (mut writable, mut network, mut workdir) = (Vec::new(), false, None);
+    let (mut writable, mut network, mut workdir, mut held) = (Vec::new(), false, None, false);
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match (arg.as_str(), arg.starts_with("--")) {
             ("--network", _) => network = true,
+            ("--held", _) => held = true,
             ("--writable", _) => {
                 let path = iter
                     .next()
@@ -383,6 +384,12 @@ fn tool(args: &[String]) -> Result<i32> {
     let [name, arguments] = positional.as_slice() else {
         return fail_with("usage", "tool needs a tool's name and its arguments");
     };
+    if network && writable.is_empty() {
+        return fail_with(
+            "usage",
+            "--network goes with --writable, as a sandbox's network goes with workspace-write",
+        );
+    }
     if !matches!(
         name.as_str(),
         "shell" | "read" | "write" | "edit" | "apply_patch"
@@ -396,7 +403,7 @@ fn tool(args: &[String]) -> Result<i32> {
         Some(dir) => dir,
         None => std::env::current_dir()?,
     };
-    let registry = agent_runtime::tools::Registry::all()?;
+    let registry = agent_runtime::tools::Registry::all()?.with_credentials(withheld()?);
     let daemon = own_daemon()?;
     let refused = |error: Error| {
         let output = serde_json::json!({"error":error.code,"detail":error.detail}).to_string();
@@ -447,14 +454,34 @@ fn tool(args: &[String]) -> Result<i32> {
                         .ok_or(Error::new("sandbox_unavailable"))?
                 }
             };
-            let ran = runtime()?.block_on(registry.execute(
-                prepared,
-                &workspace,
-                &[],
-                Some(std::sync::Arc::new(sandbox)),
-            ));
+            let ran = runtime()?.block_on(async {
+                let ran = registry.execute(
+                    prepared,
+                    &workspace,
+                    &[],
+                    Some(std::sync::Arc::new(sandbox)),
+                );
+                if !held {
+                    return Some(ran.await);
+                }
+                // Its stdin closed, the call is stopped: dropped, as the
+                // daemon drops a call it stops, its commands with it.
+                let (closed, closing) = tokio::sync::oneshot::channel::<()>();
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                    let _ = closed.send(());
+                });
+                tokio::select! {
+                    ran = ran => Some(ran),
+                    _ = closing => None,
+                }
+            });
+            let Some(ran) = ran else {
+                return fail_with("stopped", "the call was stopped: its caller let it go");
+            };
             match ran {
-                Ok(outcome) => {
+                Ok(mut outcome) => {
+                    kept_whole(&mut outcome);
                     let mut reply =
                         serde_json::json!({"output":outcome.output,"failed":outcome.failed});
                     if !outcome.parts.is_empty() {
@@ -468,6 +495,82 @@ fn tool(args: &[String]) -> Result<i32> {
     };
     println!("{reply}");
     Ok(0)
+}
+
+/// What no command `agent tool` runs is given, as a daemon this CLI starts
+/// gives none: the variables `[shell_environment_policy] exclude` names,
+/// and the keys of `~/.agent/keys/env`, whose values are cut from what it
+/// prints too.
+fn withheld() -> Result<agent_runtime::tools::Credentials> {
+    let credentials = agent_runtime::tools::Credentials::default();
+    let file =
+        agent_client::config::load().map_err(|error| Error::with("config_invalid", error))?;
+    let excludes = file.shell_environment_policy.excludes();
+    for (name, _) in std::env::vars_os() {
+        if let Some(name) = name.to_str()
+            && (excludes.iter()).any(|pattern| agent_runtime::tools::name_matches(pattern, name))
+        {
+            credentials.withhold(name);
+        }
+    }
+    for (name, value) in agent_client::env_file::for_daemon().unwrap_or_default() {
+        credentials.withhold(&name);
+        credentials.set(&name, &value);
+    }
+    Ok(credentials)
+}
+
+/// Each stream `outcome` retained past what it shows, written whole to a
+/// new file of its own, owner-only, in a new folder of the agent's own
+/// (`~/.agent/outputs/tool`), which no sandbox writes, and named in its
+/// output's `files`: there is no store here to keep it in, and the caller
+/// reads it with `read` on this machine. One that can't be written is
+/// left out.
+fn kept_whole(outcome: &mut agent_runtime::tools::Outcome) {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let artifacts = std::mem::take(&mut outcome.artifacts);
+    let Some(home) = agent_client::config::home().filter(|_| !artifacts.is_empty()) else {
+        return;
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let folder = home
+        .join("outputs/tool")
+        .join(format!("{stamp}-{}", std::process::id()));
+    let made = (std::fs::DirBuilder::new().recursive(true).mode(0o700))
+        .create(folder.parent().unwrap_or(&folder))
+        .and_then(|()| std::fs::DirBuilder::new().mode(0o700).create(&folder));
+    if made.is_err() {
+        return;
+    }
+    let mut files = Vec::new();
+    for (stream, data) in &artifacts {
+        let Some(whole) = data.whole() else {
+            continue;
+        };
+        let path = folder.join(stream);
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, whole));
+        if written.is_ok()
+            && let Some(path) = path.to_str()
+        {
+            files.push(path.to_owned());
+        }
+    }
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&outcome.output)
+        && value.is_object()
+        && !files.is_empty()
+    {
+        value["files"] = serde_json::json!(files);
+        outcome.output = value.to_string();
+    }
 }
 
 /// `program` with `rest`, in `policy` when one is given, with `environment`
