@@ -6666,6 +6666,10 @@ struct App {
     /// The selected words a picture's placeholder went in place of, by its
     /// number: put back if no picture comes.
     replaced: Vec<(usize, String)>,
+    /// A message sent while a picture or file it shows was still on its
+    /// way, sent once all are here (with `queue`, as [`App::submit_as`]
+    /// takes it): the keys go on meanwhile.
+    send_waiting: Option<bool>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The slash commands the person ran, for the menu to rank.
@@ -8854,6 +8858,7 @@ impl App {
             preparing: Vec::new(),
             fetching: Vec::new(),
             replaced: Vec::new(),
+            send_waiting: None,
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
             picks_kept: false,
@@ -19158,8 +19163,13 @@ impl App {
         &mut self,
         step: impl FnOnce(&mut recall::Recall<Attached>, &str, &mut Attached) -> Option<String>,
     ) -> Option<String> {
-        // A picture still being made ready is waited for: it goes with the
-        // draft it is in, whether that stays or is swapped away and back.
+        // A picture or file still on its way goes with the draft it is in,
+        // whether that stays or is swapped away and back: the draft stays
+        // until all are here, the keys going on meanwhile.
+        if self.arriving() {
+            self.notice = Some("a dropped picture or file is still on its way".into());
+            return None;
+        }
         self.all_ready().await;
         let mut attached = (
             std::mem::take(&mut self.pictures),
@@ -19270,8 +19280,16 @@ impl App {
     /// Send what is written: a message to a busy bot joins its running
     /// turn, or with `queue` runs after it.
     async fn submit_as(&mut self, queue: bool) {
-        // The pictures still being made ready go with it: what is sent is
-        // what the composer shows.
+        // The pictures and files still on their way go with it: what is
+        // sent is what the composer shows. It goes once they are here,
+        // the keys going on meanwhile, as a file over a link may take a
+        // while.
+        if self.arriving() {
+            self.send_waiting = Some(queue);
+            self.notice = Some("sends once what was dropped is here".into());
+            return;
+        }
+        self.send_waiting = None;
         self.all_ready().await;
         let prompt = self.input.trim().to_owned();
         // A quote alone is a message, as it was typed into the words.
@@ -19683,6 +19701,7 @@ impl App {
         self.preparing.clear();
         self.fetching.clear();
         self.replaced.clear();
+        self.send_waiting = None;
         self.quotes.clear();
     }
 
@@ -20347,7 +20366,18 @@ impl App {
             self.fetched(&words, got);
             any = true;
         }
+        // A message sent while they were on their way goes now.
+        if let Some(queue) = self.send_waiting.filter(|_| !self.arriving()) {
+            Box::pin(self.submit_as(queue)).await;
+            any = true;
+        }
         any
+    }
+
+    /// Whether a picture or file is still on its way to the composer.
+    fn arriving(&self) -> bool {
+        (self.preparing.iter()).any(|(_, job)| !job.is_finished())
+            || (self.fetching.iter()).any(|(_, job)| !job.is_finished())
     }
 
     /// Every picture still being made ready, waited for and put behind its
@@ -40738,6 +40768,32 @@ mod tests {
             app.notice,
             Some(format!("report.pdf is copied here as {}", copy.display()))
         );
+        // Sent while one is still on its way, it goes once it is here,
+        // the keys going on meanwhile; the draft stays till then.
+        app.input.set(&format!("read {report}"));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let kept = copy.clone();
+        app.fetching.push((
+            report.into(),
+            tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+                Ok(kept)
+            }),
+        ));
+        app.submit().await;
+        assert_eq!(app.send_waiting, Some(false));
+        assert_eq!(*app.input, format!("read {report}"));
+        assert!(
+            app.recalled(|_, _, _| Some("earlier".into()))
+                .await
+                .is_none()
+        );
+        go.send(()).unwrap();
+        while app.send_waiting.is_some() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(app.input.is_empty() && app.fetching.is_empty());
         // A path from another machine with none linked is words.
         app.input.clear();
         app.key(Event::Paste("/Users/someone/elsewhere.pdf".into()))
@@ -40805,6 +40861,11 @@ mod tests {
             let _ = go.send(());
         });
         app.submit().await;
+        assert_eq!(app.send_waiting, Some(false), "it waits, the keys going on");
+        while app.send_waiting.is_some() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         app.beside_done().await;
         assert!(app.preparing.is_empty() && app.input.is_empty());
         let submitted = (asked.lock().unwrap().iter())
@@ -40856,6 +40917,10 @@ mod tests {
             let _ = go.send(());
         });
         app.key(press(KeyCode::Down, KeyModifiers::NONE)).await;
+        while !app.preparing.is_empty() {
+            app.prepared().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(app.placed(&app.input).len(), 1, "{:?}", &*app.input);
         // Two that fit alone but not together: the first given is kept.
         // They are made one at a time, in the order given.
