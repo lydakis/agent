@@ -257,11 +257,12 @@ impl Tool {
             // ([`Agents`]): what its shell's `agent` would send, held to
             // what the bot's own socket allows.
             Tool::SendMessage => (
-                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. The message joins the bot's running turn at its next step, or starts a turn when none runs. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote lists the messages, one or several, whose words the daemon copies after the message in that order, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with, such as [\"shop.lead/12\",\"shop.lead/15\"]. replaces, the handle BOT/N of a message this bot sent to the same bot, withdraws that message if it still waits in line and sends this one in its place (the result says replaced: BOT/N), or, once that message was taken in, sends this one after it (the result says taken: BOT/N, with taken_turn, the turn that took it in). A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
+                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. The message joins the bot's running turn at its next step, or starts a turn when none runs. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote lists the messages, one or several, whose words the daemon copies after the message in that order, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with, such as [\"shop.lead/12\",\"shop.lead/15\"]. replaces, the handle BOT/N of a message this bot sent to the same bot, withdraws that message if it still waits in line and sends this one in its place (the result says replaced: BOT/N), or, once that message was taken in, sends this one after it (the result says taken: BOT/N, with taken_turn, the turn that took it in). A request_id sent again starts nothing new; without one, the call's own is used. schema, a JSON Schema object, makes the reply of the turn the message starts JSON that follows it, as the provider's structured output; such a message starts a turn of its own after any running one, rather than joining it. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
                 json!({"type":"object","properties":{
                 "to":{"type":"string","minLength":1,"maxLength":128},
                 "message":{"type":"string","minLength":1},
                 "interrupt":{"type":"boolean"},
+                "schema":{"type":"object","description":"JSON Schema the reply of the turn this message starts follows"},
                 "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16},
                 "replaces":{"type":"string","minLength":3,"maxLength":256},
                 "request_id":{"type":"string","minLength":1,"maxLength":128}},
@@ -285,7 +286,7 @@ impl Tool {
                 "required":["reason"],"additionalProperties":false}),
             ),
             Tool::SpawnAgent => (
-                "Start a new agent, made by this one, on work of its own: it works in this agent's folder, in its sandbox and under its approval gates, never more loosely, with this agent's tools, and the message is its first. name is the new agent's whole name, or, with no dot, a name in this agent's namespace, the group its client puts it in: review from shop.lead, in namespace shop, names shop.review. It starts fresh, told the preamble every new agent is told; with agents=true, also the folder's AGENTS.md files, skills and memory; with profile, those in the role its file .agents/agents/PROFILE.md describes, in the folder or the home folder, with the role's model, tools and sandbox; or with instructions, exactly that text instead, which takes neither agents nor profile. model (PROVIDER/MODEL) and effort default to this agent's, or to the profile's model. With fork=true it starts instead from a copy of this agent's conversation so far, with its instructions, tools and model, and takes no instructions, agents, profile, model or effort. A request_id sent again starts nothing new; without one, the call's own is used. Returns the new agent's name and the handle of its first message, BOT/N, which wait and history take; close it with close_agent once its work is done.",
+                "Start a new agent, made by this one, on work of its own: it works in this agent's folder, in its sandbox and under its approval gates, never more loosely, with this agent's tools, and the message is its first. name is the new agent's whole name, or, with no dot, a name in this agent's namespace, the group its client puts it in: review from shop.lead, in namespace shop, names shop.review. It starts fresh, told the preamble every new agent is told; with agents=true, also the folder's AGENTS.md files, skills and memory; with profile, those in the role its file .agents/agents/PROFILE.md describes, in the folder or the home folder, with the role's model, tools and sandbox; or with instructions, exactly that text instead, which takes neither agents nor profile. model (PROVIDER/MODEL) and effort default to this agent's, or to the profile's model. With fork=true it starts instead from a copy of this agent's conversation so far, with its instructions, tools and model, and takes no instructions, agents, profile, model or effort. A request_id sent again starts nothing new; without one, the call's own is used. schema, a JSON Schema object, makes the reply of its first turn JSON that follows it, as the provider's structured output. Returns the new agent's name and the handle of its first message, BOT/N, which wait and history take; close it with close_agent once its work is done.",
                 json!({"type":"object","properties":{
                 "name":{"type":"string","minLength":1,"maxLength":128},
                 "message":{"type":"string","minLength":1},
@@ -309,6 +310,7 @@ impl Tool {
                 "approver":{"type":"string","minLength":1,"maxLength":128},
                 "approve_expire_ms":{"type":"integer","minimum":1,"maximum":86400000},
                 "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16,"description":"Messages copied after the first message, as send_message's quote"},
+                "schema":{"type":"object","description":"JSON Schema the reply of its first turn follows"},
                 "request_id":{"type":"string","minLength":1,"maxLength":128}},
                 "required":["name","message"],"additionalProperties":false}),
             ),
@@ -1241,6 +1243,8 @@ pub enum Agents {
         /// The number of a message this bot sent `to` that this one
         /// replaces.
         replaces: Option<i64>,
+        /// The JSON Schema the reply of the turn it starts follows.
+        schema: Option<serde_json::Value>,
         request_id: Option<String>,
     },
     /// Agents by name, or the calls waiting on an approval.
@@ -1279,6 +1283,8 @@ pub enum Agents {
         quotes: Vec<serde_json::Value>,
         /// The first turn's token cap.
         turn_budget_tokens: Option<u64>,
+        /// The JSON Schema the reply of its first turn follows.
+        schema: Option<serde_json::Value>,
         request_id: Option<String>,
     },
     /// Close agents this one made: by name, by names, or a pattern's.
@@ -2416,6 +2422,7 @@ impl Registry {
                     #[serde(default)]
                     quote: Vec<String>,
                     replaces: Option<String>,
+                    schema: Option<serde_json::Value>,
                     request_id: Option<String>,
                 }
                 let args: Send = serde_json::from_str(args).map_err(invalid)?;
@@ -2458,6 +2465,7 @@ impl Registry {
                     interrupt: args.interrupt,
                     quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
                     replaces,
+                    schema: args.schema,
                     request_id: args.request_id,
                 })
             }
@@ -2539,6 +2547,7 @@ impl Registry {
                     approve_expire_ms: Option<u64>,
                     #[serde(default)]
                     quote: Vec<String>,
+                    schema: Option<serde_json::Value>,
                     request_id: Option<String>,
                 }
                 let args: Spawn = serde_json::from_str(args).map_err(invalid)?;
@@ -2623,6 +2632,7 @@ impl Registry {
                     settings: args.settings,
                     quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
                     turn_budget_tokens: args.turn_budget_tokens,
+                    schema: args.schema,
                     request_id: args.request_id,
                 })
             }

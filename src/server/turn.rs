@@ -6305,12 +6305,14 @@ impl Turn {
                 interrupt,
                 quotes,
                 replaces,
+                schema,
                 request_id,
             } => {
                 // A message to another bot steers, as Codex's agent mail
-                // joins the running turn; only an interrupt's message
-                // waits, for the turn after the one it stopped.
-                let mut delivery = "steer";
+                // joins the running turn; only an interrupt's message, and
+                // one whose schema shapes the reply of the turn it starts,
+                // wait, for a turn of their own.
+                let mut delivery = if schema.is_some() { "queue" } else { "steer" };
                 // The turn to stop, of a bot this one made, read before the
                 // message goes; it is stopped only once the message is in
                 // line, so a retried call, which sends nothing new, stops
@@ -6336,7 +6338,8 @@ impl Turn {
                 let sent = request(json!({"op":"submit","bot":to,"request_id":request_id,
                     "prompt":message,"delivery":delivery,
                     "from":{"bot":self.bot,"turn":self.turn},
-                    "quotes":(!quotes.is_empty()).then_some(quotes),"replaces":replaces}))
+                    "quotes":(!quotes.is_empty()).then_some(quotes),"replaces":replaces,
+                    "output_schema":schema}))
                 .await?;
                 let mut interrupted = Value::Null;
                 if let Some(turn) = running
@@ -6465,6 +6468,7 @@ impl Turn {
                 settings,
                 quotes,
                 turn_budget_tokens,
+                schema,
                 request_id,
             } => {
                 let name = self.spawned_name(&name);
@@ -6595,7 +6599,7 @@ impl Turn {
                     "prompt":message,"delivery":"queue",
                     "from":{"bot":self.bot,"turn":self.turn},
                     "quotes":(!quotes.is_empty()).then_some(quotes),
-                    "budget_tokens":turn_budget_tokens}))
+                    "budget_tokens":turn_budget_tokens,"output_schema":schema}))
                 .await?;
                 let mut answer = json!({"name":name,"status":sent["status"]});
                 if let Some(message) = sent["message"].as_i64() {

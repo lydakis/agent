@@ -13015,3 +13015,12 @@ group commit folds turns together: `bench.footprint`'s 200 turns at once
 wrote 41.8 KiB a turn against 39.2 KiB of growth. `bench.footprint` now
 reports `written_kib_per_turn` and the Perf screen compares it, as a timing,
 since how turns fall into group commits moves with the runner.
+## A schema on spawn_agent and send_message
+
+2026-11-23. `spawn_agent` and `send_message` take `schema`, passed to the
+`submit` they already make as its `output_schema`, which the daemon has
+stored and sent since protocol 51. Nothing new is stored or kept per bot.
+The two tool definitions grow by 542 bytes together, sent once per model
+call to bots that have the tools; the tool lists stay stored once by their
+digest. A call without a schema sends the same `submit` as before. The pull
+request's Perf screen is the matched comparison.
