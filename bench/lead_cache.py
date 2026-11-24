@@ -355,7 +355,7 @@ every = "{every}s"
         # The CPU each of the build's processes used, the tool host's too.
         procs = subprocess.run(['ps', '-eo', 'pid,time,rss,args'], capture_output=True, text=True)
         (out / 'procs.txt').write_text(''.join(line + '\n' for line in procs.stdout.splitlines()
-                                               if str(own) in line))
+                                               if str(root) in line))
         if acp:
             acp.close()
         if shown:
