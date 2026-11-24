@@ -59,6 +59,9 @@ struct Inner {
     catalogs: Mutex<Vec<Arc<crate::exec::Catalog>>>,
     /// Which write of the config file the servers were last read from.
     config: Mutex<Option<Option<Stamp>>>,
+    /// Whether a stdio server runs in a process group of its own, stopped
+    /// with it, or in this process's, stopping with it.
+    grouped: bool,
 }
 
 struct Slot {
@@ -117,6 +120,20 @@ impl Hub {
             cache,
             catalogs: Mutex::default(),
             config: Mutex::default(),
+            grouped: true,
+        }))
+    }
+
+    /// The person's servers for a command, `sonny mcp exec`: each stdio
+    /// server in the command's own process group, so whatever stops the
+    /// command stops them, as a source's command is stopped by its group.
+    pub fn for_command() -> Hub {
+        Hub(Arc::new(Inner {
+            slots: Mutex::default(),
+            cache: cache_dir(),
+            catalogs: Mutex::default(),
+            config: Mutex::default(),
+            grouped: false,
         }))
     }
 
@@ -310,7 +327,7 @@ impl Hub {
         }
         if live.is_none() {
             let timeout = start_timeout(&slot.config);
-            let mut started = tokio::time::timeout(timeout, connect(&slot.config))
+            let mut started = tokio::time::timeout(timeout, connect(&slot.config, self.0.grouped))
                 .await
                 .unwrap_or_else(|_| Err(format!("did not start in {}s", timeout.as_secs())));
             // Its events, when it offers them, listed in a time of their
@@ -609,8 +626,8 @@ pub(crate) async fn open<H: rmcp::ClientHandler>(
     }
 }
 
-async fn connect(config: &McpServer) -> Result<Live, String> {
-    let (client, group, stderr) = open(config, client_info(), true).await?;
+async fn connect(config: &McpServer, grouped: bool) -> Result<Live, String> {
+    let (client, group, stderr) = open(config, client_info(), grouped).await?;
     drop(stderr);
     let instructions = client
         .peer_info()
@@ -1033,7 +1050,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
                 .build()
                 .map_err(|e| e.to_string())?
                 .block_on(async {
-                    let hub = Hub::for_person();
+                    let hub = Hub::for_command();
                     let ran = crate::exec::printed(&hub, &script).await;
                     hub.stop().await;
                     ran

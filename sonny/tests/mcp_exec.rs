@@ -88,3 +88,127 @@ do {
     let _ = server.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `home` with `config` as its Sonny config.
+fn home_with(name: &str, config: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!("sonny-mcp-exec-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".agent")).unwrap();
+    std::fs::write(home.join(".agent/config.toml"), config).unwrap();
+    home
+}
+
+/// `sonny mcp exec -` under `home`, `script` on stdin, in a process
+/// group of its own, as the lookout starts a source's command.
+fn started(home: &Path, script: &str, stdout: Stdio) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sonny"))
+        .args(["mcp", "exec", "-"])
+        .env("HOME", home)
+        .env("AGENT_TEST_HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    (child.stdin.take().unwrap())
+        .write_all(script.as_bytes())
+        .unwrap();
+    child
+}
+
+#[test]
+fn a_script_whose_output_cannot_go_out_fails() {
+    let home = home_with("closed", "");
+    // Its stdout's reader gone before it says a word.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let child = started(&home, "text('one');\ntext('two');", Stdio::from(writer));
+    let ran = child.wait_with_output().unwrap();
+    assert!(!ran.status.success(), "{ran:?}");
+    let said = String::from_utf8_lossy(&ran.stderr);
+    assert!(said.contains("its output could not be written"), "{said}");
+    // So does one that catches the error and goes on.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let child = started(
+        &home,
+        "try { text('one'); } catch (e) {}",
+        Stdio::from(writer),
+    );
+    let ran = child.wait_with_output().unwrap();
+    assert!(!ran.status.success(), "{ran:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_stdio_server_stops_with_the_command_s_process_group() {
+    let dir = std::env::temp_dir().join(format!("sonny-mcp-exec-group-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let starts = dir.join("starts");
+    let config = format!(
+        "[sonny.mcp_servers.test]\ncommand = \"python3\"\nargs = [\"{}\"]\nenv = {{ MCP_STARTS = \"{}\" }}\n",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/mcp_server.py"),
+        starts.display()
+    );
+    let home = home_with("group", &config);
+    let never = dir.join("never");
+    let child = started(
+        &home,
+        &format!(
+            "await tools.mcp__test__slow({{until: {:?}}});",
+            never.display().to_string()
+        ),
+        Stdio::null(),
+    );
+    let started_at = std::time::Instant::now();
+    let server = loop {
+        if let Some(pid) = std::fs::read_to_string(&starts)
+            .ok()
+            .and_then(|pids| pids.lines().next().map(str::to_owned))
+        {
+            break pid;
+        }
+        assert!(
+            started_at.elapsed().as_secs() < 30,
+            "the server never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // In the command's group, as the lookout's SIGTERM to a source's group
+    // reaches every process of it.
+    let pgid = |pid: &str| {
+        let out = Command::new("ps")
+            .args(["-o", "pgid=", "-p", pid])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let group = child.id().to_string();
+    assert_eq!(pgid(&server), group);
+    Command::new("kill")
+        .args(["-TERM", "--", &format!("-{group}")])
+        .status()
+        .unwrap();
+    let _ = child.wait_with_output();
+    let gone_at = std::time::Instant::now();
+    while Command::new("kill")
+        .args(["-0", &server])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+    {
+        assert!(
+            gone_at.elapsed().as_secs() < 10,
+            "the server outlived its command"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&dir);
+}

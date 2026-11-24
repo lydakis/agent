@@ -1825,6 +1825,9 @@ fn said(
     mut output: Output,
 ) -> (String, Option<String>) {
     let status = match ended {
+        // A script that caught the error of a line it could not print
+        // still failed: what it said did not all go out.
+        Ended::Completed if output.broken.is_some() => "Script failed".to_owned(),
         Ended::Completed => "Script completed".to_owned(),
         Ended::Failed(_) => "Script failed".to_owned(),
         Ended::Terminated(why) => format!("Script terminated: {why}"),
@@ -1841,7 +1844,9 @@ fn said(
         head.push_str(&format!("Calls: {}\n", each.join(", ")));
     }
     head.push_str("Output:\n");
-    if let (Ended::Failed(error), Sink::Printed) = (ended, &output.sink) {
+    if let (Ended::Completed, Some(broken)) = (ended, &output.broken) {
+        head.push_str(&format!("Script error:\n{broken}"));
+    } else if let (Ended::Failed(error), Sink::Printed) = (ended, &output.sink) {
         head.push_str(&format!("Script error:\n{error}"));
     } else if let Ended::Failed(error) = ended {
         if output.total > 0 {
@@ -1866,6 +1871,8 @@ struct Output {
     /// it is cut once per half rather than on every line.
     tail: String,
     lines: usize,
+    /// Why what is said can no longer be printed: stdout closed or full.
+    broken: Option<String>,
     /// Every byte printed.
     total: u64,
     sink: Sink,
@@ -1989,6 +1996,7 @@ impl Output {
             head: String::new(),
             tail: String::new(),
             lines: 0,
+            broken: None,
             total: 0,
             sink,
         }
@@ -2001,8 +2009,14 @@ impl Output {
                 return;
             }
             use std::io::Write;
+            if self.broken.is_some() {
+                return;
+            }
             let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "{text}").and_then(|_| out.flush());
+            if let Err(error) = writeln!(out, "{text}").and_then(|_| out.flush()) {
+                self.broken = Some(format!("its output could not be written: {error}"));
+                return;
+            }
             self.lines += 1;
             self.total += text.len() as u64 + 1;
             return;
@@ -2530,7 +2544,7 @@ const PRELUDE: &str = r#"(() => {
       return async (args) => said(await call(key, JSON.stringify(args ?? {})));
     },
   });
-  globalThis.text = (value) => { host.text(show(value)); };
+  globalThis.text = (value) => { const broken = host.text(show(value)); if (broken != null) throw new Error(broken); };
   globalThis.image = (item) => { said(host.image(JSON.stringify(item))); };
   globalThis.store = (key, value) => { said(host.store(String(key), JSON.stringify(value) ?? "null")); };
   globalThis.load = (key) => { const kept = host.load(String(key)); return kept == null ? undefined : JSON.parse(kept); };
@@ -2811,7 +2825,10 @@ impl Run {
         globals.set(
             "__text",
             Function::new(ctx.clone(), move |text: String| {
-                said.lock().unwrap().push(&text.replace([OPEN, CLOSE], ""))
+                let mut said = said.lock().unwrap();
+                said.push(&text.replace([OPEN, CLOSE], ""));
+                // Said where it cannot go: the script stops on it.
+                said.broken.clone()
             })?,
         )?;
         let shared = Arc::clone(&self.shared);
