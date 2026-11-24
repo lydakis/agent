@@ -1,4 +1,25 @@
 use super::{artifact, audit};
+/// SQL for a node's item as it was written: a packed one (`packed` holds
+/// its length) unpacked, a plain one as it is. `unpacked!(n)` reads the
+/// node aliased `n`.
+macro_rules! unpacked {
+    () => {
+        "CASE WHEN packed IS NULL THEN item ELSE unpack(item,packed) END"
+    };
+    ($n:ident) => {
+        concat!(
+            "CASE WHEN ",
+            stringify!($n),
+            ".packed IS NULL THEN ",
+            stringify!($n),
+            ".item ELSE unpack(",
+            stringify!($n),
+            ".item,",
+            stringify!($n),
+            ".packed) END"
+        )
+    };
+}
 use crate::rules::{Rules, Ruling};
 use crate::{
     Error, Result,
@@ -3357,8 +3378,12 @@ const MESSAGE_FROM: &str = "messages m JOIN bots b ON b.name=m.bot LEFT JOIN tur
 const TURN_VIEW_COLUMNS: usize = 31;
 /// A message's words, from `messages m` joined by `MESSAGE_NODE`: kept on
 /// the message, or once 4 KiB or more were taken in, read from its node.
-const MESSAGE_TEXT: &str = "CASE WHEN n.id IS NULL THEN m.text
-    ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END";
+const MESSAGE_TEXT: &str = concat!(
+    "CASE WHEN n.id IS NULL THEN m.text
+    ELSE json_extract(CAST(COALESCE(d.item,",
+    unpacked!(n),
+    ") AS TEXT),'$.content[0].text') END"
+);
 /// A message's words previewed and their length, from `messages m` joined
 /// by `PREVIEW_NODE`: kept on the message, or read from its node's
 /// opening, which a whole read never needs.
@@ -3681,17 +3706,133 @@ fn budget_exhausted(bot: &Bot, budget: u64) -> Error {
 /// A new bot's instructions and compaction instructions, in a table of
 /// their own: a bot's row stays a few hundred bytes, so a listing never
 /// reads them and a write to the row never rewrites them.
+/// Each is kept once in `texts`, however many bots hold the same, and the
+/// row names it by digest.
 fn instruct(
     conn: &Connection,
     id: i64,
     instructions: &str,
     compaction_instructions: Option<&str>,
 ) -> Result<()> {
+    let instructions = keep_text(conn, instructions)?;
+    let compaction_instructions = compaction_instructions
+        .map(|text| keep_text(conn, text))
+        .transpose()?;
     conn.prepare_cached(
         "INSERT INTO bot_instructions(id,instructions,compaction_instructions) VALUES (?,?,?)",
     )?
-    .execute(params![id, instructions, compaction_instructions])?;
+    .execute(params![
+        id,
+        &*instructions,
+        compaction_instructions.as_deref()
+    ])?;
     Ok(())
+}
+/// Keep `text` in the store once, whoever holds it, and give the digest
+/// that names it: SHA-256 of its bytes, as a tool list's.
+fn keep_text(conn: &Connection, text: &str) -> Result<Box<str>> {
+    let digest = crate::tools::digest_of(text);
+    conn.prepare_cached("INSERT OR IGNORE INTO texts(digest,text) VALUES (?,?)")?
+        .execute([&*digest, text])?;
+    Ok(digest)
+}
+/// The text the store keeps under `digest`.
+fn kept_text(conn: &Connection, digest: &str) -> Result<String> {
+    conn.prepare_cached("SELECT text FROM texts WHERE digest=?")?
+        .query_row([digest], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| Error::with("store_text_unknown", digest))
+}
+/// Let go of the text `digest` names once nothing names it: no bot's
+/// instructions or compaction instructions, and no event of a kept
+/// `configure` (see [`holding`]).
+fn drop_text(conn: &Connection, digest: Option<&str>) -> Result<()> {
+    if let Some(digest) = digest {
+        conn.prepare_cached(
+            "DELETE FROM texts WHERE digest=?1
+              AND NOT EXISTS(SELECT 1 FROM bot_instructions WHERE instructions=?1)
+              AND NOT EXISTS(SELECT 1 FROM bot_instructions WHERE compaction_instructions=?1)
+              AND NOT EXISTS(SELECT 1 FROM events
+                  WHERE kind IN ('configure_pending','configure_failed') AND instr(data,?1)>0)",
+        )?
+        .execute([digest])?;
+    }
+    Ok(())
+}
+/// The events whose kept `configure` holds its texts once, in `texts`.
+const HOLDING: [&str; 2] = ["configure_pending", "configure_failed"];
+/// What of a kept `configure` its event holds by digest: the instructions,
+/// the compaction instructions, and tools declared whole, as JSON. Each is
+/// about as large as a whole configure, and the same ones come again in
+/// every agent's event when a client changes them all.
+const HELD: [&str; 3] = ["instructions", "compaction_instructions", "declare"];
+/// `data`, the event of a kept `configure`, as stored: each text of
+/// [`HELD`] it carries kept once in `texts`, and named under `texts` by
+/// digest in its place. [`spelled`] puts each back where it was.
+fn holding(conn: &Connection, mut data: Value) -> Result<Value> {
+    let mut held = serde_json::Map::new();
+    if let Some(pending) = data
+        .get_mut("configure_pending")
+        .and_then(Value::as_object_mut)
+    {
+        for field in HELD {
+            let text = match pending.get(field) {
+                Some(Value::String(text)) if field != "declare" => text.clone(),
+                Some(tools @ Value::Array(_)) if field == "declare" => tools.to_string(),
+                _ => continue,
+            };
+            pending.remove(field);
+            held.insert(field.into(), json!(&*keep_text(conn, &text)?));
+        }
+    }
+    if !held.is_empty() {
+        data["texts"] = Value::Object(held);
+    }
+    Ok(data)
+}
+/// A stored event's `data` as it was given: what [`holding`] kept in
+/// `texts` put back in place. Objects keep their keys in order, so the
+/// event reads as the same JSON.
+fn spelled(conn: &Connection, kind: &str, mut data: Value) -> Result<Value> {
+    if !HOLDING.contains(&kind) {
+        return Ok(data);
+    }
+    let Some(Value::Object(held)) = data.as_object_mut().and_then(|data| data.remove("texts"))
+    else {
+        return Ok(data);
+    };
+    for (field, digest) in held {
+        let digest = digest
+            .as_str()
+            .ok_or_else(|| Error::new("store_text_unknown"))?;
+        let text = kept_text(conn, digest)?;
+        data["configure_pending"][field.as_str()] = match field.as_str() {
+            "declare" => serde_json::from_str(&text)?,
+            _ => Value::String(text),
+        };
+    }
+    Ok(data)
+}
+/// The digests the kept `configure`s of `bot`'s events hold.
+fn held_by(conn: &Connection, bot: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT h.value FROM events e, json_each(e.data,'$.texts') h
+         WHERE e.kind IN ('configure_pending','configure_failed') AND e.bot=?",
+    )?;
+    let held = statement
+        .query_map([bot], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(held)
+}
+/// Delete every event of `bot`, letting go of the texts only they held;
+/// how many went.
+fn delete_events(conn: &Connection, bot: &str) -> Result<i64> {
+    let held = held_by(conn, bot)?;
+    let events = conn.execute("DELETE FROM events WHERE bot=?", [bot])? as i64;
+    for digest in held {
+        drop_text(conn, Some(&digest))?;
+    }
+    Ok(events)
 }
 fn instructions_key(instructions: &str) -> String {
     let hash = instructions
@@ -3797,6 +3938,22 @@ fn stored_entry(
     event
 }
 
+/// What packing does next (see [`Database::to_pack`]).
+pub enum Pack {
+    /// Items to pack.
+    Batch(Packing),
+    /// Nothing to pack until then, in epoch ms.
+    Due(i64),
+}
+/// A bot's items, read plain and packed, for [`Database::packed`] to keep:
+/// its history's nodes after `after` through `through`.
+pub struct Packing {
+    bot_id: i64,
+    after: i64,
+    through: i64,
+    /// Each node's id, its item as read, and that item packed.
+    items: Vec<(i64, Vec<u8>, Vec<u8>)>,
+}
 /// What a process row runs: a background command, a terminal, or a
 /// detached command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3859,7 +4016,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 113;
+    pub const SCHEMA: i32 = 114;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3886,6 +4043,7 @@ impl Database {
     pub fn reader(conn: Connection, shared: Arc<Shared>) -> Result<Self> {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
+        super::pack::unpacking(&conn)?;
         conn.execute_batch(&format!(
             "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA synchronous=FULL;
             PRAGMA checkpoint_fullfsync=ON;
@@ -4070,6 +4228,7 @@ impl Database {
         // when the job ends, bounded by the pages one job changes.
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
+        super::pack::unpacking(&conn)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
@@ -4090,6 +4249,11 @@ impl Database {
             // foreign keys off, as SQLite's rebuild steps ask, and checks
             // them itself before it commits. Off only outside a transaction.
             conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        }
+        // A new store gives the pages it frees back to the disk as packing
+        // asks (`incremental_vacuum`); the mode is set before its first table.
+        if version == 0 && !has_tables {
+            conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         }
         // Initialize a fresh store atomically; existing stores must match.
         let tx = conn.unchecked_transaction()?;
@@ -4116,7 +4280,7 @@ impl Database {
                 elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
                 total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0,
                 pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER, message INTEGER,
-                effort TEXT);
+                effort TEXT, packed INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE TABLE IF NOT EXISTS lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
@@ -4190,10 +4354,14 @@ impl Database {
                 started_ms INTEGER, waiting_on TEXT, last_turn INTEGER, last_status TEXT,
                 last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT,
                 configure_pending TEXT, refused_summary TEXT, closed_ms INTEGER, profile TEXT,
-                family_start INTEGER);
+                family_start INTEGER, packed_node INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
+            CREATE TABLE IF NOT EXISTS texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS bot_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
                 instructions TEXT NOT NULL, compaction_instructions TEXT);
+            CREATE INDEX IF NOT EXISTS bot_instructions_text ON bot_instructions(instructions);
+            CREATE INDEX IF NOT EXISTS bot_instructions_compaction
+                ON bot_instructions(compaction_instructions) WHERE compaction_instructions IS NOT NULL;
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
             CREATE INDEX IF NOT EXISTS bots_elision ON bots(elision);
             CREATE INDEX IF NOT EXISTS bots_configure_pending ON bots(name)
@@ -4341,6 +4509,7 @@ impl Database {
         }
         tx.commit()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        incremental(&conn)?;
         // Background command ownership is lost across daemon restart. This
         // does not prove the OS process stopped; never reuse its handle. A
         // call a message lifted, still waiting on its verdict or answer, is
@@ -4667,13 +4836,18 @@ impl Database {
             let mut delivered = 0;
             while let Some(row) = rows.next()? {
                 let cursor: i64 = row.get(0)?;
-                let data: Value = serde_json::from_str(&row.get::<_, String>(4)?)?;
+                let kind: String = row.get(3)?;
+                let data = spelled(
+                    &self.conn,
+                    &kind,
+                    serde_json::from_str(&row.get::<_, String>(4)?)?,
+                )?;
                 let event = stored_entry(
                     cursor,
                     &row.get::<_, String>(1)?,
                     row.get(2)?,
                     row.get(6)?,
-                    &row.get::<_, String>(3)?,
+                    &kind,
                     data,
                     row.get(5)?,
                 );
@@ -4919,7 +5093,11 @@ impl Database {
     pub fn tool_list(&self, digest: &str) -> Result<ToolList> {
         tool_list(&self.conn, digest)
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending,closed_ms,profile";
+    /// A bot's row and its instructions, read from `texts`.
+    const FROM: &str = "bots JOIN bot_instructions i USING(id)
+        JOIN texts it ON it.digest=i.instructions
+        LEFT JOIN texts ct ON ct.digest=i.compaction_instructions";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,it.text,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,compaction,ct.text,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending,closed_ms,profile";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     /// Its id and depth, read in the same query.
@@ -5038,8 +5216,9 @@ impl Database {
             // Cached: parsing this many columns costs more than the read.
             self.conn
                 .prepare_cached(&format!(
-                    "SELECT {} FROM bots JOIN bot_instructions USING(id) WHERE id=?",
-                    Self::COLUMNS
+                    "SELECT {} FROM {} WHERE id=?",
+                    Self::COLUMNS,
+                    Self::FROM
                 ))?
                 .query_row([id], Self::row_held)
                 .optional()?
@@ -5062,8 +5241,9 @@ impl Database {
             // Cached: parsing this many columns costs more than the read.
             self.conn
                 .prepare_cached(&format!(
-                    "SELECT {} FROM bots JOIN bot_instructions USING(id) WHERE name=?",
-                    Self::COLUMNS
+                    "SELECT {} FROM {} WHERE name=?",
+                    Self::COLUMNS,
+                    Self::FROM
                 ))?
                 .query_row([name], Self::row_held)
                 .optional()?
@@ -5109,11 +5289,18 @@ impl Database {
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let tx = self.conn.savepoint()?;
-        let changed = tx.execute(
-            "UPDATE bot_instructions SET instructions=? WHERE id=? AND instructions<>?",
-            params![instructions, id, instructions],
-        )? == 1;
+        let before: String = tx
+            .prepare_cached("SELECT instructions FROM bot_instructions WHERE id=?")?
+            .query_row([id], |r| r.get(0))?;
+        let digest = crate::tools::digest_of(instructions);
+        let changed = *digest != *before;
         if changed {
+            keep_text(&tx, instructions)?;
+            tx.execute(
+                "UPDATE bot_instructions SET instructions=? WHERE id=?",
+                params![&*digest, id],
+            )?;
+            drop_text(&tx, Some(&before))?;
             tx.execute(
                 "UPDATE bots SET cache_bot=NULL, thinking_prefix=NULL WHERE id=?",
                 [id],
@@ -5976,13 +6163,24 @@ impl Database {
     ) -> Result<Vec<&'static str>> {
         let id = self.identity(name, bot_id)?;
         let mut changed = Vec::new();
-        if let Some(instructions) = instructions
-            && self.conn.execute(
-                "UPDATE bot_instructions SET compaction_instructions=? WHERE id=? AND compaction_instructions IS NOT ?",
-                params![instructions, id, instructions],
-            )? == 1
-        {
-            changed.push("compaction_instructions");
+        if let Some(instructions) = instructions {
+            let tx = self.conn.savepoint()?;
+            let before: Option<String> = tx
+                .prepare_cached("SELECT compaction_instructions FROM bot_instructions WHERE id=?")?
+                .query_row([id], |r| r.get(0))?;
+            let digest = instructions.map(crate::tools::digest_of);
+            if digest.as_deref() != before.as_deref() {
+                if let Some(text) = instructions {
+                    keep_text(&tx, text)?;
+                }
+                tx.execute(
+                    "UPDATE bot_instructions SET compaction_instructions=? WHERE id=?",
+                    params![digest.as_deref(), id],
+                )?;
+                drop_text(&tx, before.as_deref())?;
+                changed.push("compaction_instructions");
+            }
+            tx.commit()?;
         }
         if let Some(model) = model
             && self.conn.execute(
@@ -6985,9 +7183,9 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         // The newest model output: results after it are still unanswered.
         // A result with a stub is a result, so only the others are read.
-        let mut item = self
-            .conn
-            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut item =
+            self.conn
+                .prepare_cached(concat!("SELECT ", unpacked!(), " FROM nodes WHERE id=?"))?;
         let mut answered = None;
         for (index, &(id, _, saves, ..)) in rows.iter().enumerate() {
             if saves == 0
@@ -7322,9 +7520,9 @@ impl Database {
         // absorbed steer, so no call is parted from its result and a steer
         // is kept whole. Only items near the boundary are read.
         let newest_prompt = rows.iter().position(|r| r.3.is_some());
-        let mut item = self
-            .conn
-            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut item =
+            self.conn
+                .prepare_cached(concat!("SELECT ", unpacked!(), " FROM nodes WHERE id=?"))?;
         let mut results: Vec<Option<bool>> = vec![None; rows.len()];
         let mut result = |index: usize| -> Result<bool> {
             if let Some(result) = results[index] {
@@ -7565,9 +7763,9 @@ impl Database {
                     && total - thinking - (before - thinking_before) + items <= span_bytes
             })
             .count();
-        let mut item = self
-            .conn
-            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut item =
+            self.conn
+                .prepare_cached(concat!("SELECT ", unpacked!(), " FROM nodes WHERE id=?"))?;
         let mut result = |id: i64| -> Result<bool> {
             Ok(item.query_row([id], |r| {
                 Ok(super::context::is_tool_result(r.get_ref(0)?.as_blob()?))
@@ -7645,9 +7843,11 @@ impl Database {
     /// back from `head` no further than `stop`. Rounds are short, so the
     /// walk reads a few items.
     fn newest_round(&self, head: i64, stop: i64) -> Result<Option<i64>> {
-        let mut node = self
-            .conn
-            .prepare_cached("SELECT parent,item FROM nodes WHERE id=?")?;
+        let mut node = self.conn.prepare_cached(concat!(
+            "SELECT parent,",
+            unpacked!(),
+            " FROM nodes WHERE id=?"
+        ))?;
         let (mut id, mut start) = (head, None);
         while id != stop {
             let (parent, is_result) = node.query_row([id], |r| {
@@ -8064,11 +8264,11 @@ impl Database {
     /// neither the model's output nor a tool result. Read when a cut inside
     /// a turn is made, over the span it covers.
     fn turn_messages(&self, cut: i64, bound: i64) -> Result<Vec<i64>> {
-        let mut statement = self.conn.prepare_cached(
+        let mut statement = self.conn.prepare_cached(concat!(
             "WITH RECURSIVE chain(id,parent) AS (
                 SELECT id,parent FROM nodes WHERE id=(SELECT parent FROM nodes WHERE id=?1) AND id>?2
                 UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>?2)
-             SELECT c.id,n.item FROM chain c JOIN nodes n ON n.id=c.id ORDER BY c.id",
+             SELECT c.id,", unpacked!(n), " FROM chain c JOIN nodes n ON n.id=c.id ORDER BY c.id"),
         )?;
         let mut rows = statement.query(params![cut, bound])?;
         let mut messages = Vec::new();
@@ -8232,9 +8432,11 @@ impl Database {
         marks: &[(i64, bytes::Bytes)],
         joined: &mut Joined,
     ) -> Result<Vec<u8>> {
-        let mut statement = self
-            .conn
-            .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?;
+        let mut statement = self.conn.prepare_cached(concat!(
+            "SELECT ",
+            unpacked!(),
+            ",thinking FROM nodes WHERE id=?"
+        ))?;
         // A stub replaces its result without the result's row being read.
         let mut stubs = self
             .conn
@@ -8407,9 +8609,9 @@ impl Database {
     /// names and that is a reasoning item, left out whole with its
     /// separator; 0 for the rest.
     pub fn reasoning_of(&self, ids: &[i64], strip: Strip) -> Result<Vec<u32>> {
-        let mut statement = self
-            .conn
-            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut statement =
+            self.conn
+                .prepare_cached(concat!("SELECT ", unpacked!(), " FROM nodes WHERE id=?"))?;
         ids.iter()
             .map(|id| {
                 if !strip.strips(*id) {
@@ -8700,10 +8902,10 @@ impl Database {
         // Already single-line items need no rewrite (escaped newlines are fine).
         // Pictures go without their bytes, as other history reads return them.
         let mut length = self.conn.prepare_cached(&format!(
-            "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
+            "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM (SELECT COALESCE(d.item,{N_ITEM}) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut slice = self.conn.prepare_cached(&format!(
-            "SELECT substr({READING_ITEM},?,?) FROM (SELECT {PICTURELESS} AS item FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
+            "SELECT substr({READING_ITEM},?,?) FROM (SELECT {PICTURELESS} AS item FROM (SELECT COALESCE(d.item,{N_ITEM}) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut text = String::new();
         let mut position = 0_u64;
@@ -8793,25 +8995,27 @@ impl Database {
         // root, so a search that finds enough stops early.
         let mut chain = self.conn.prepare_cached(
             "WITH RECURSIVE chain(id,parent,depth,turn_seq,size) AS (
-                SELECT id,parent,depth,turn_seq,COALESCE(length(item),0) FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.depth,n.turn_seq,COALESCE(length(n.item),0)
+                SELECT id,parent,depth,turn_seq,COALESCE(packed,length(item),0) FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.turn_seq,COALESCE(n.packed,length(n.item),0)
                 FROM nodes n JOIN chain c ON n.id=c.parent ORDER BY 3 DESC)
              SELECT id,turn_seq,size FROM chain",
         )?;
         // SQLite's lower() folds ASCII only, as to_ascii_lowercase does. A
         // multiline item reads with its whitespace compacted, so text the
         // view has may not be in the item as stored: the view decides.
-        let mut contains = self.conn.prepare_cached(
+        let mut contains = self.conn.prepare_cached(concat!(
             "SELECT instr(item,x'0a')>0 OR instr(item,x'0d')>0
                 OR instr(lower(CAST(item AS TEXT)),?2)>0
-             FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)",
-        )?;
+             FROM (SELECT COALESCE(d.item,",
+            unpacked!(n),
+            ") AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)"
+        ))?;
         // The raw item may match only in what the view leaves out, such as
         // a picture's bytes, so a match counts once the view has it too.
         let mut reading = self.conn.prepare_cached(&format!(
             "SELECT CAST({READING_ITEM} AS TEXT),json_extract(CAST(item AS TEXT),'$.type')
              FROM (SELECT {PICTURELESS} AS item FROM
-                (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
+                (SELECT COALESCE(d.item,{N_ITEM}) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut rows = chain.query(params![head])?;
         let mut skipping = own || before.is_some();
@@ -8925,7 +9129,7 @@ impl Database {
         }
         // It reads no item.
         let mut node = self.conn.prepare_cached(
-            "SELECT parent,turn,turn_seq,COALESCE(length(item),0) FROM nodes WHERE id=?",
+            "SELECT parent,turn,turn_seq,COALESCE(packed,length(item),0) FROM nodes WHERE id=?",
         )?;
         let mut read = |id: i64| -> Result<Node> {
             Ok(node.query_row([id], |r| {
@@ -8949,15 +9153,17 @@ impl Database {
         let mut found: Vec<Found> = vec![Vec::new(); bots.len()];
         let needle = query.to_ascii_lowercase();
         // As `history_search` reads: the view decides what matches.
-        let mut contains = self.conn.prepare_cached(
+        let mut contains = self.conn.prepare_cached(concat!(
             "SELECT instr(item,x'0a')>0 OR instr(item,x'0d')>0
                 OR instr(lower(CAST(item AS TEXT)),?2)>0
-             FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)",
-        )?;
+             FROM (SELECT COALESCE(d.item,",
+            unpacked!(n),
+            ") AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)"
+        ))?;
         let mut reading = self.conn.prepare_cached(&format!(
             "SELECT CAST({READING_ITEM} AS TEXT),json_extract(CAST(item AS TEXT),'$.type')
              FROM (SELECT {PICTURELESS} AS item FROM
-                (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
+                (SELECT COALESCE(d.item,{N_ITEM}) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         // A walk at a turn's start names the turn of the matches it found
         // since; those of the turn being searched are dropped.
@@ -9214,10 +9420,11 @@ impl Database {
             if saved.is_empty()
                 && let Some(node) = node
             {
-                saved = self.conn.prepare_cached(
-                    "SELECT json_extract(CAST(COALESCE((SELECT item FROM declined WHERE node=?1),item) AS TEXT),
-                        '$.content[0].text') FROM nodes WHERE id=?1"
-                )?.query_row([node], |r| r.get::<_, Option<String>>(0))?.unwrap_or_default();
+                saved = self.conn.prepare_cached(concat!(
+                    "SELECT json_extract(CAST(COALESCE((SELECT item FROM declined WHERE node=?1),",
+                    unpacked!(),
+                    ") AS TEXT),'$.content[0].text') FROM nodes WHERE id=?1"
+                ))?.query_row([node], |r| r.get::<_, Option<String>>(0))?.unwrap_or_default();
             }
             // A turn records the folder it runs in; a retry that names none
             // means wherever the first attempt went.
@@ -10459,12 +10666,13 @@ impl Database {
         if kept == 0 {
             return Ok(answer);
         }
+        let data = json!({"bot_id":id,"running_turn":running,"configure_pending":pending});
         event(
             &self.conn,
             name,
             None,
             "configure_pending",
-            json!({"bot_id":id,"running_turn":running,"configure_pending":pending}),
+            holding(&self.conn, data)?,
         )?;
         Ok(answer)
     }
@@ -10521,8 +10729,11 @@ impl Database {
             name,
             None,
             "configure_failed",
-            json!({"bot_id":id,"configure_pending":pending,"code":error.code,
-                "detail":error.detail}),
+            holding(
+                &self.conn,
+                json!({"bot_id":id,"configure_pending":pending,"code":error.code,
+                    "detail":error.detail}),
+            )?,
         )?;
         Ok(())
     }
@@ -13476,9 +13687,11 @@ impl Database {
     fn reply_text(&self, turn: i64) -> Result<Option<String>> {
         let item: Option<Vec<u8>> = self
             .conn
-            .prepare_cached(
-                "SELECT n.item FROM turns t JOIN nodes n ON n.id=t.reply_node WHERE t.id=?",
-            )?
+            .prepare_cached(concat!(
+                "SELECT ",
+                unpacked!(n),
+                " FROM turns t JOIN nodes n ON n.id=t.reply_node WHERE t.id=?"
+            ))?
             .query_row([turn], |r| r.get(0))
             .optional()?;
         match item {
@@ -13917,10 +14130,12 @@ impl Database {
     /// The newest text a turn streamed between two events: calls and
     /// reasoning stream as messages too, and say nothing a person answers.
     fn said(&self, turn: i64, after: i64, before: i64) -> Result<Option<String>> {
-        let mut items = self.conn.prepare_cached(
-            "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
-             WHERE e.turn=? AND e.kind='message' AND e.id>? AND e.id<? ORDER BY e.id DESC",
-        )?;
+        let mut items = self.conn.prepare_cached(concat!(
+            "SELECT ",
+            unpacked!(n),
+            " FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+             WHERE e.turn=? AND e.kind='message' AND e.id>? AND e.id<? ORDER BY e.id DESC"
+        ))?;
         let mut rows = items.query(params![turn, after, before])?;
         while let Some(r) = rows.next()? {
             let text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
@@ -14363,7 +14578,7 @@ impl Database {
                 left_out += 1;
                 tx.prepare_cached("INSERT OR IGNORE INTO declined(node,item) VALUES (?,?)")?
                     .execute(params![id, item])?;
-                tx.prepare_cached("UPDATE nodes SET item=? WHERE id=?")?
+                tx.prepare_cached("UPDATE nodes SET item=?,packed=NULL WHERE id=?")?
                     .execute(params![note, id])?;
                 // A prompt's opening says what the model is now sent.
                 if tx
@@ -15097,10 +15312,12 @@ impl Database {
         // Written in the turn: not its prompt, under it.
         let (prompt, owner, item): (Option<i64>, Option<i64>, Vec<u8>) = self
             .conn
-            .prepare_cached(
-                "SELECT n.turn,s.turn,n.item FROM nodes n LEFT JOIN lineage l ON l.node=n.id
-                 LEFT JOIN nodes s ON s.id=l.start WHERE n.id=?",
-            )?
+            .prepare_cached(concat!(
+                "SELECT n.turn,s.turn,",
+                unpacked!(n),
+                " FROM nodes n LEFT JOIN lineage l ON l.node=n.id
+                 LEFT JOIN nodes s ON s.id=l.start WHERE n.id=?"
+            ))?
             .query_row([head], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         if prompt.is_some() || owner != Some(turn) {
             return Ok(false);
@@ -15511,9 +15728,11 @@ impl Database {
             .and_then(|data| data["node"].as_i64());
         let text = match last {
             Some(node) => {
-                let item: Vec<u8> =
-                    self.conn
-                        .query_row("SELECT item FROM nodes WHERE id=?", [node], |r| r.get(0))?;
+                let item: Vec<u8> = self.conn.query_row(
+                    concat!("SELECT ", unpacked!(), " FROM nodes WHERE id=?"),
+                    [node],
+                    |r| r.get(0),
+                )?;
                 let item: Value = serde_json::from_slice(&item)?;
                 assistant_text(&item)
             }
@@ -15533,10 +15752,12 @@ impl Database {
             )
             .optional()?;
         if let Some(steered) = steered {
-            let mut items = self.conn.prepare_cached(
-                "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
-                 WHERE e.turn=? AND e.kind='message' AND e.id<? ORDER BY e.id DESC",
-            )?;
+            let mut items = self.conn.prepare_cached(concat!(
+                "SELECT ",
+                unpacked!(n),
+                " FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+                 WHERE e.turn=? AND e.kind='message' AND e.id<? ORDER BY e.id DESC"
+            ))?;
             let mut rows = items.query(params![turn, steered])?;
             let mut before = String::new();
             while before.trim().is_empty() {
@@ -15926,6 +16147,118 @@ impl Database {
             update.execute(params![node, id])?;
         }
         Ok(())
+    }
+    /// What packing does next, read and packed on a reader: the next
+    /// items still plain in the history of the first bot with no turn
+    /// running and none ended in [`super::pack::IDLE_MS`] before `now_ms`,
+    /// oldest first, until [`super::pack::BATCH_BYTES`] are read. A bot's
+    /// items are those of its history (its head and the nodes above it)
+    /// from its first turn on: what it forked from is its parent's. With
+    /// none, when the next bot will have been idle that long; with no bot
+    /// left to pack, when one idle from now would be. Each item is packed
+    /// only when that is smaller; [`Self::packed`] writes them.
+    pub fn to_pack(&self, now_ms: i64) -> Result<Pack> {
+        let cutoff = now_ms - super::pack::IDLE_MS;
+        let due: Option<(i64, String, i64, i64)> = self
+            .conn
+            .prepare_cached(
+                "SELECT id,name,COALESCE(packed_node,0),head FROM bots
+                 WHERE running_turn IS NULL AND status!='deleting'
+                   AND head>COALESCE(packed_node,0) AND COALESCE(last_finished_ms,0)<=?1
+                 ORDER BY id LIMIT 1",
+            )?
+            .query_row([cutoff], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?;
+        let Some((bot_id, name, after, head)) = due else {
+            let next: Option<i64> = self.conn.query_row(
+                "SELECT MIN(CASE WHEN running_turn IS NULL THEN COALESCE(last_finished_ms,0) ELSE ?1 END)
+                 FROM bots WHERE status!='deleting' AND head>COALESCE(packed_node,0)",
+                [now_ms],
+                |r| r.get(0),
+            )?;
+            return Ok(Pack::Due(next.unwrap_or(now_ms) + super::pack::IDLE_MS));
+        };
+        let mut batch = Packing {
+            bot_id,
+            after,
+            through: head,
+            items: Vec::new(),
+        };
+        // Its first turn's first node: a fork's history above it is the
+        // parent's, packed, if ever, with the parent.
+        let first: Option<i64> = self.conn.query_row(
+            "SELECT MIN(n.id) FROM turns t JOIN nodes n ON n.turn=t.id WHERE t.bot=?",
+            [&name],
+            |r| r.get(0),
+        )?;
+        let Some(first) = first else {
+            return Ok(Pack::Batch(batch));
+        };
+        // A child is written after its parent: ids fall toward the root.
+        let mut chain: Vec<i64> = self
+            .conn
+            .prepare_cached(
+                "WITH RECURSIVE chain(id) AS (SELECT ?1 WHERE ?1>?2
+                    UNION ALL SELECT n.parent FROM nodes n JOIN chain c ON n.id=c.id
+                    WHERE n.parent>?2)
+                 SELECT id FROM chain",
+            )?
+            .query_map(params![head, after.max(first - 1)], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        chain.reverse();
+        let mut item = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=? AND packed IS NULL")?;
+        let mut packer = super::pack::packer()?;
+        let mut read = 0;
+        for id in chain {
+            if read >= super::pack::BATCH_BYTES {
+                break;
+            }
+            if let Some(plain) = item
+                .query_row([id], |r| r.get::<_, Vec<u8>>(0))
+                .optional()?
+            {
+                read += plain.len();
+                if let Some(packed) = super::pack::pack(&mut packer, &plain)? {
+                    batch.items.push((id, plain, packed));
+                }
+            }
+            batch.through = id;
+        }
+        Ok(Pack::Batch(batch))
+    }
+    /// Write what [`Self::to_pack`] packed: each item still as it was read
+    /// is kept packed, with its length, and the bot's history through the
+    /// batch's last node counts as packed. The pages it frees go back to
+    /// the disk. Whether the batch still applied: a bot that packing found
+    /// another way meanwhile (deleted, or packed by another pass) is left.
+    pub fn packed(&mut self, batch: Packing) -> Result<bool> {
+        let tx = self.conn.savepoint()?;
+        let held = tx
+            .prepare_cached(
+                "UPDATE bots SET packed_node=?3 WHERE id=?1 AND COALESCE(packed_node,0)=?2",
+            )?
+            .execute(params![batch.bot_id, batch.after, batch.through])?
+            == 1;
+        if held {
+            let mut update = tx.prepare_cached(
+                "UPDATE nodes SET item=?2,packed=?3 WHERE id=?1 AND packed IS NULL AND item=?4",
+            )?;
+            for (id, item, packed) in &batch.items {
+                update.execute(params![id, packed, item.len() as i64, item])?;
+            }
+        }
+        // It frees a page a step.
+        let mut vacuum = tx.prepare_cached("PRAGMA incremental_vacuum")?;
+        let mut freed = vacuum.query([])?;
+        while freed.next()?.is_some() {}
+        drop(freed);
+        drop(vacuum);
+        tx.commit()?;
+        Ok(held)
     }
     /// How many commands run now: a call a message lifted that still
     /// waits for its verdict or its client's answer runs nothing here, and
@@ -16483,17 +16816,23 @@ impl Database {
     /// Even old checkpoints must not end on an unpaired reasoning item.
     fn validate_fork_point(&self, node: i64) -> Result<()> {
         let reasoning: bool = self.conn.query_row(
-            "SELECT COALESCE(json_extract(item,'$.type')='reasoning',0) FROM nodes WHERE id=?",
+            concat!(
+                "SELECT COALESCE(json_extract(",
+                unpacked!(),
+                ",'$.type')='reasoning',0) FROM nodes WHERE id=?"
+            ),
             [node],
             |row| row.get(0),
         )?;
         if reasoning {
             return fail("fork_point_splits_reasoning");
         }
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(concat!(
             "SELECT parent, CASE WHEN EXISTS(SELECT 1 FROM checkpoints WHERE head=nodes.id)
-             THEN NULL ELSE item END FROM nodes WHERE id=?",
-        )?;
+             THEN NULL ELSE ",
+            unpacked!(),
+            " END FROM nodes WHERE id=?"
+        ))?;
         let mut next = Some(node);
         let mut answered = std::collections::HashSet::new();
         while let Some(id) = next {
@@ -16906,13 +17245,14 @@ impl Database {
             let next: i64 = row.get(0)?;
             let data: String = row.get(3)?;
             let bot: String = row.get(4)?;
+            let kind: String = row.get(2)?;
             let item = stored_entry(
                 next,
                 &bot,
                 row.get::<_, Option<i64>>(1)?,
                 row.get(6)?,
-                &row.get::<_, String>(2)?,
-                serde_json::from_str::<Value>(&data)?,
+                &kind,
+                spelled(&self.conn, &kind, serde_json::from_str::<Value>(&data)?)?,
                 row.get(5)?,
             );
             let size = crate::output::encoded_len(&item)? + 1;
@@ -17319,7 +17659,7 @@ impl Database {
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM messages WHERE bot=?)")?
             .query_row([name], |r| r.get(0))?;
         if has_messages {
-            let events = tx.execute("DELETE FROM events WHERE bot=?", [name])? as i64;
+            let events = delete_events(&tx, name)?;
             out["events"] = json!(out["events"].as_i64().unwrap_or(0) + events);
             let turns = tx.execute("DELETE FROM turns WHERE bot=?", [name])?;
             out["turns"] = json!(turns);
@@ -17385,7 +17725,7 @@ impl Database {
                 break;
             }
         }
-        tx.execute("DELETE FROM events WHERE bot=?", [name])?;
+        delete_events(&tx, name)?;
         // The identity's name and creation key outlive it, so a resent
         // delete is told apart from a delete of some other identity, and a
         // resent creation never makes the bot again.
@@ -17398,12 +17738,24 @@ impl Database {
             tx.query_row("SELECT declared FROM bots WHERE name=?", [name], |r| {
                 r.get(0)
             })?;
+        let texts: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT instructions,compaction_instructions FROM bot_instructions
+                 WHERE id=(SELECT id FROM bots WHERE name=?)",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
         tx.execute(
             "DELETE FROM bot_instructions WHERE id=(SELECT id FROM bots WHERE name=?)",
             [name],
         )?;
         tx.execute("DELETE FROM bots WHERE name=?", [name])?;
         drop_list(&tx, declared.as_deref())?;
+        if let Some((instructions, compaction_instructions)) = texts {
+            drop_text(&tx, Some(&instructions))?;
+            drop_text(&tx, compaction_instructions.as_deref())?;
+        }
         out["nodes"] = json!(freed);
         out["done"] = json!(true);
         // Whether anything waits for `switch_reclaim`: what switches let go
@@ -17858,7 +18210,7 @@ impl Database {
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin,
                 s.person,s.quotes,n.written_ms,s.attached,n.message,m.bot
              FROM (SELECT id,{PICTURELESS} AS item,written_ms,message FROM
-                (SELECT n.id,COALESCE(d.item,n.item) AS item,n.written_ms,n.message FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
+                (SELECT n.id,COALESCE(d.item,{N_ITEM}) AS item,n.written_ms,n.message FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
              LEFT JOIN senders s ON s.node=n.id LEFT JOIN messages m ON m.id=n.message"
         ))?;
         for &node in wanted {
@@ -18118,8 +18470,12 @@ impl Database {
         let kinds = senders.clause();
         let (text, text_node) = match words {
             true => (
-                ",CASE WHEN n.id IS NULL THEN m.text
-                    ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END",
+                concat!(
+                    ",CASE WHEN n.id IS NULL THEN m.text
+                    ELSE json_extract(CAST(COALESCE(d.item,",
+                    unpacked!(n),
+                    ") AS TEXT),'$.content[0].text') END"
+                ),
                 " LEFT JOIN nodes n ON n.id=m.node AND m.text=''",
             ),
             false => ("", ""),
@@ -18540,7 +18896,7 @@ impl Database {
     fn lineage_holds_output(&self, head: i64, turn: i64, call_id: &str) -> Result<bool> {
         Ok(self
             .conn
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "WITH RECURSIVE chain(id,parent,turn) AS (
                     SELECT id,parent,turn FROM nodes WHERE id=?1
                     UNION ALL SELECT n.id,n.parent,n.turn FROM nodes n JOIN chain c ON n.id=c.parent
@@ -18548,13 +18904,13 @@ impl Database {
                  SELECT 1 FROM chain c JOIN nodes n ON n.id=c.id
                  WHERE c.id>(SELECT id FROM chain WHERE turn=?2)
                    AND c.id<COALESCE((SELECT MIN(id) FROM chain WHERE turn>?2),9223372036854775807)
-                   AND ((json_extract(CAST(n.item AS TEXT),'$.type')
+                   AND ((json_extract(CAST({N_ITEM} AS TEXT),'$.type')
                             IN ('function_call_output','custom_tool_call_output')
-                         AND json_extract(CAST(n.item AS TEXT),'$.call_id')=?3)
-                     OR EXISTS(SELECT 1 FROM json_each(CAST(n.item AS TEXT),'$.content')
+                         AND json_extract(CAST({N_ITEM} AS TEXT),'$.call_id')=?3)
+                     OR EXISTS(SELECT 1 FROM json_each(CAST({N_ITEM} AS TEXT),'$.content')
                         WHERE json_extract(value,'$.type')='tool_result'
-                        AND json_extract(value,'$.tool_use_id')=?3)) LIMIT 1",
-            )?
+                        AND json_extract(value,'$.tool_use_id')=?3)) LIMIT 1"
+            ))?
             .exists(params![head, turn, call_id])?)
     }
     /// The turn is the caller's to read, and no stream is stored for the call.
@@ -18625,9 +18981,11 @@ impl Database {
                 .query_row([node], |r| r.get(0))
                 .optional()?)
         };
-        let mut item = read(
-            "SELECT COALESCE(d.item,n.item) FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
-        )?
+        let mut item = read(concat!(
+            "SELECT COALESCE(d.item,",
+            unpacked!(n),
+            ") FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?"
+        ))?
         .ok_or(Error::new("result_not_found"))?;
         if super::context::tool_result(&item).is_none()
             && let Some(source) = read("SELECT item FROM worded WHERE node=?")?
@@ -18684,13 +19042,18 @@ impl Database {
 /// calls and reasoning, which stream as messages too, are passed over. A
 /// turn's last message is nearly always its reply, so the search reads one
 /// node, through the events index, once per turn.
-const REPLY_NODE: &str = "(SELECT n.id FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+macro_rules! reply_node {
+    ($item:expr) => {
+        concat!("(SELECT n.id FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
     WHERE e.turn=turns.id AND e.kind='message'
-    AND EXISTS(SELECT 1 FROM json_each(CAST(n.item AS TEXT),'$.content') c
+    AND EXISTS(SELECT 1 FROM json_each(CAST(", $item, " AS TEXT),'$.content') c
         WHERE CASE c.type WHEN 'object' THEN json_extract(c.value,'$.type') IN ('output_text','text')
             AND json_type(c.value,'$.text')='text'
             AND trim(json_extract(c.value,'$.text'),' '||char(9,10,13))!='' END)
-    ORDER BY e.id DESC LIMIT 1)";
+    ORDER BY e.id DESC LIMIT 1)")
+    };
+}
+const REPLY_NODE: &str = reply_node!(unpacked!(n));
 
 /// Text of an assistant item in either family encoding; other content is skipped.
 fn assistant_text(item: &Value) -> String {
@@ -19715,7 +20078,11 @@ fn kept(tx: &Connection, bot: &Bot, turn: i64) -> Result<Unfinished> {
         && found.len() < planned.len()
     {
         let (parent, item, prompt): (Option<i64>, Vec<u8>, Option<i64>) = tx
-            .prepare_cached("SELECT parent,item,turn FROM nodes WHERE id=?")?
+            .prepare_cached(concat!(
+                "SELECT parent,",
+                unpacked!(),
+                ",turn FROM nodes WHERE id=?"
+            ))?
             .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         if prompt.is_some() {
             break;
@@ -20285,12 +20652,14 @@ fn quoted(conn: &Connection, quotes: Option<&str>, cap: usize) -> Result<Vec<Val
         parts.entry(node).or_default().push(part);
     }
     let mut texts = HashMap::new();
-    let mut read = conn.prepare_cached(
+    let mut read = conn.prepare_cached(concat!(
         "SELECT c.key, substr(CAST(json_extract(c.value,'$.text') AS BLOB),1,?2) FROM nodes n
          LEFT JOIN declined d ON d.node=n.id,
-         json_each(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content') c
-         WHERE n.id=?1 AND c.key IN (SELECT value FROM json_each(?3))",
-    )?;
+         json_each(CAST(COALESCE(d.item,",
+        unpacked!(n),
+        ") AS TEXT),'$.content') c
+         WHERE n.id=?1 AND c.key IN (SELECT value FROM json_each(?3))"
+    ))?;
     for (node, wanted) in &parts {
         let mut rows = read.query(params![node, cap as i64, json!(wanted).to_string()])?;
         while let Some(r) = rows.next()? {
@@ -20453,6 +20822,8 @@ fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> R
 /// content; a thinking block's signature, a redacted one's data, a web
 /// search result's encrypted content). Applied to `item`, which
 /// `PICTURELESS` provides.
+/// [`unpacked!`] for the node aliased `n`, for `format!`.
+const N_ITEM: &str = unpacked!(n);
 const READING_ITEM: &str = "CASE
     WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
      AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
@@ -21491,8 +21862,10 @@ fn migrate_by_columns(conn: &Connection, from: i32) -> Result<()> {
     )? {
         conn.execute_batch(&format!(
             "ALTER TABLE turns ADD COLUMN reply_node INTEGER;
-             UPDATE turns SET reply_node={REPLY_NODE}
-             WHERE started_ms IS NOT NULL AND finished_ms IS NOT NULL;"
+             UPDATE turns SET reply_node={}
+             WHERE started_ms IS NOT NULL AND finished_ms IS NOT NULL;",
+            // Nothing is packed before schema 114, nor has a `packed` column.
+            reply_node!("n.item")
         ))?;
     }
     // 70 -> 71: a prompt that rode along on a call (`attach`) says so with
@@ -22212,7 +22585,76 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
             )?;
         }
     }
+    if from < 114 {
+        migrate_texts_once(conn)?;
+    }
 
+    Ok(())
+}
+
+/// 113 -> 114: each text bots hold kept once, by digest, in `texts`:
+/// every bot's instructions and compaction instructions, and what the
+/// events of kept `configure`s carry (see [`holding`]). Nodes may be packed
+/// (`packed`, their unpacked length) and a bot records the newest node of
+/// its history packing has been through (`packed_node`); none is yet. One row at a time, so
+/// memory holds one text however many there are. release/store_down.py
+/// takes it back.
+fn migrate_texts_once(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL);
+         ALTER TABLE nodes ADD COLUMN packed INTEGER;
+         ALTER TABLE bots ADD COLUMN packed_node INTEGER;",
+    )?;
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM bot_instructions ORDER BY id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in ids {
+        let (instructions, compaction): (String, Option<String>) = conn.query_row(
+            "SELECT instructions,compaction_instructions FROM bot_instructions WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let instructions = keep_text(conn, &instructions)?;
+        let compaction = compaction.map(|text| keep_text(conn, &text)).transpose()?;
+        conn.execute(
+            "UPDATE bot_instructions SET instructions=?,compaction_instructions=? WHERE id=?",
+            params![&*instructions, compaction.as_deref(), id],
+        )?;
+    }
+    let events: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM events WHERE kind IN ('configure_pending','configure_failed') ORDER BY id",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in events {
+        let data: String =
+            conn.query_row("SELECT data FROM events WHERE id=?", [id], |r| r.get(0))?;
+        let held = holding(conn, serde_json::from_str(&data)?)?;
+        if held.get("texts").is_some() {
+            conn.execute(
+                "UPDATE events SET data=? WHERE id=?",
+                params![held.to_string(), id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The store gives back to the disk the pages it frees, as packing asks
+/// (`incremental_vacuum`): SQLite's INCREMENTAL auto_vacuum. A store made
+/// before is rewritten once into it (`VACUUM`) as it opens, its temporary
+/// copy on disk rather than in memory, and the log it wrote emptied.
+fn incremental(conn: &Connection) -> Result<()> {
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    if mode == 2 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA temp_store=FILE; VACUUM; PRAGMA temp_store=MEMORY;",
+    )?;
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
     Ok(())
 }
 
@@ -23165,7 +23607,11 @@ fn declined_span(
     let (mut node, mut child) = (head, None::<i64>);
     while let Some(id) = node {
         let (parent, item, first): (Option<i64>, Vec<u8>, Option<i64>) = conn
-            .prepare_cached("SELECT parent,item,turn FROM nodes WHERE id=?")?
+            .prepare_cached(concat!(
+                "SELECT parent,",
+                unpacked!(),
+                ",turn FROM nodes WHERE id=?"
+            ))?
             .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         if super::context::model_output(&item) {
             break;
@@ -23495,24 +23941,26 @@ impl Translation {
                 Option<String>,
             );
             let (item, turn, message, extra, count, stub, declined, written_ms, effort): Row = conn
-            .prepare_cached(
-                "SELECT n.item,n.turn,n.message,n.pictured,n.pictures,s.item,d.item,n.written_ms,n.effort
+                .prepare_cached(concat!(
+                    "SELECT ",
+                    unpacked!(n),
+                    ",n.turn,n.message,n.pictured,n.pictures,s.item,d.item,n.written_ms,n.effort
                  FROM nodes n
-                 LEFT JOIN stubs s ON s.node=n.id LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
-            )?
-            .query_row([old], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                ))
-            })?;
+                 LEFT JOIN stubs s ON s.node=n.id LEFT JOIN declined d ON d.node=n.id WHERE n.id=?"
+                ))?
+                .query_row([old], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                })?;
             // A result's stub and declined form are the same result: they
             // read the calls as the result itself found them.
             let calls = (stub.is_some() || declined.is_some()).then(|| translator.calls());
@@ -24294,7 +24742,10 @@ mod tests {
             .execute_batch(
                 "INSERT INTO bots(name,id,status,provider,family,model)
                  VALUES ('Bob',7,'idle','openai','responses','m');
-                 INSERT INTO bot_instructions(id,instructions) VALUES (7,'')",
+                 INSERT INTO texts VALUES
+                    ('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','');
+                 INSERT INTO bot_instructions(id,instructions)
+                    VALUES (7,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')",
             )
             .unwrap();
         let read = |db: &Database| Arc::new(Identity::from(db.inspect_id(7).unwrap()));

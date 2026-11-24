@@ -3226,6 +3226,11 @@ pub async fn run(config: Configuration) -> Result<()> {
             tokio::time::Instant,
             Vec<std::sync::Weak<agent_runtime::provider::pace::Pace>>,
         >::new();
+        // Packing (see `Database::to_pack`): a pass as the daemon starts,
+        // and again when the next idle bot is due; one pass at a time, its
+        // work on the store's threads.
+        let mut pack_due = Some(tokio::time::Instant::now());
+        let mut packing = tokio::task::JoinSet::<Result<i64>>::new();
         loop {
             if service.draining() && service.active.is_empty() && service.claims.is_empty() {
                 break;
@@ -3255,6 +3260,21 @@ pub async fn run(config: Configuration) -> Result<()> {
                     service.chores.count("reload", chore);
                 }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
+                _ = tokio::time::sleep_until(pack_due.unwrap_or_else(tokio::time::Instant::now)), if pack_due.is_some() && packing.is_empty() && !service.draining() => {
+                    pack_due = None;
+                    packing.spawn(pack(service.store.clone()));
+                }
+                // A pass that failed, counted in the store's stats, is
+                // tried again when a turn ending now would be due.
+                Some(packed) = packing.join_next(), if !packing.is_empty() => {
+                    let now = handles::now_ms() as i64;
+                    let due = match packed {
+                        Ok(Ok(due)) => due,
+                        _ => now + agent_runtime::store::PACK_IDLE_MS,
+                    };
+                    pack_due = Some(tokio::time::Instant::now()
+                        + std::time::Duration::from_millis((due - now).max(0) as u64));
+                }
                 Some(done) = service.switching.finished.recv() => {
                     let chore = std::time::Instant::now();
                     service.switched(done).await?;
@@ -8648,6 +8668,21 @@ fn custom_tools(
             )
             .collect(),
         false => Default::default(),
+    }
+}
+
+/// One packing pass: batches until none is left, each read and packed on
+/// a reader and written by the worker; when the next pass is due, in epoch
+/// ms.
+async fn pack(store: Store) -> Result<i64> {
+    loop {
+        let now = now_ms() as i64;
+        match store.read("to_pack", move |db| db.to_pack(now)).await? {
+            agent_runtime::store::Pack::Due(at) => return Ok(at),
+            agent_runtime::store::Pack::Batch(batch) => {
+                store.op("packed", move |db| db.packed(batch)).await?;
+            }
+        }
     }
 }
 

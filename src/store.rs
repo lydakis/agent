@@ -14,8 +14,10 @@ use tokio::sync::{mpsc, oneshot};
 mod artifact;
 pub use artifact::Retained;
 pub mod audit;
+pub use pack::IDLE_MS as PACK_IDLE_MS;
 mod context;
 mod db;
+mod pack;
 pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, without_thinking};
 pub use db::{
     Absorbed, AfterTurn, Answered, ApprovalPolicy, ArtifactLines, Binding, Blocked, Bot, CacheTtl,
@@ -23,11 +25,11 @@ pub use db::{
     Counts, DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, Durability, ENV_JSON,
     EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, HOLD_MAX_MS, Halt, Halted,
     Identity, Joined, Kept, Lapsed, Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS,
-    PROCESSES_PAGE, ParkedFallback, Plan, Planning, ProcessKind, ProcessesPage, Publication,
-    QuoteRef, RESTART_LIMIT, RULES_JSON, Reclaim, Replaced, Resumed, Room, SANDBOX, SETTINGS,
-    Served, Settings, Shared, Spend, Started, Step, StepAsk, StepOpened, Stepped, Strip, Switch,
-    TRAILER, TURN_VIEW_ACCOUNTING, Trailer, Translation, TurnBudget, TurnOptions, UsageQuery,
-    Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
+    PROCESSES_PAGE, Pack, Packing, ParkedFallback, Plan, Planning, ProcessKind, ProcessesPage,
+    Publication, QuoteRef, RESTART_LIMIT, RULES_JSON, Reclaim, Replaced, Resumed, Room, SANDBOX,
+    SETTINGS, Served, Settings, Shared, Spend, Started, Step, StepAsk, StepOpened, Stepped, Strip,
+    Switch, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, Translation, TurnBudget, TurnOptions,
+    UsageQuery, Waiting, Wake, Window, Work, cache_hit, glob, listed_command, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
@@ -2020,12 +2022,13 @@ mod tests {
                 seen = count("checkpoint");
             }
         };
-        // About 8,900 pages, in commits of 11. Asks at about 1,000, 2,000
+        // About 8,800 pages, in commits of 12 or 13 (11 of rows, and the
+        // pointer-map pages a store that gives pages back keeps). Asks at about 1,000, 2,000
         // and 3,000 pages; the second copies nothing new, so the next waits
         // for 2,000 more, then 4,000. The writer tries itself at 4,000,
         // finds the log pinned, and tries again at 6,000, then 10,000, not
         // every 1,000.
-        pages(800).await;
+        pages(700).await;
         settle().await;
         assert_eq!(count("writer_checkpoint"), 2);
         assert!(
@@ -2049,8 +2052,8 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
             .unwrap();
-        // Some 1,650 pages came after the reader let go, on top of the
-        // 8,900 it held.
+        // Some 1,900 pages came after the reader let go, on top of the
+        // 8,800 it held.
         assert!(frames < 2000, "the WAL went on from {frames} frames");
     }
 

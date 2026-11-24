@@ -4,13 +4,30 @@
 
 use rusqlite::Connection;
 
+macro_rules! before_114 {
+    () => {
+        "UPDATE bot_instructions SET
+            instructions=(SELECT text FROM texts WHERE digest=bot_instructions.instructions),
+            compaction_instructions=(SELECT text FROM texts
+                WHERE digest=bot_instructions.compaction_instructions);
+        DROP INDEX bot_instructions_text;
+        DROP INDEX bot_instructions_compaction;
+        DROP TABLE texts;
+        ALTER TABLE nodes DROP COLUMN packed;
+        ALTER TABLE bots DROP COLUMN packed_node;"
+    };
+}
+/// Puts each bot's instructions back in `bot_instructions` whole, and
+/// takes away what packing keeps: the shape of schemas 107 to 113.
+pub const BEFORE_114: &str = before_114!();
+
 macro_rules! instructions_in_row {
     () => {
-        "ALTER TABLE bots ADD COLUMN instructions TEXT NOT NULL DEFAULT '';
+        concat!(before_114!(), "ALTER TABLE bots ADD COLUMN instructions TEXT NOT NULL DEFAULT '';
         ALTER TABLE bots ADD COLUMN compaction_instructions TEXT;
         UPDATE bots SET (instructions,compaction_instructions)=
             (SELECT instructions,compaction_instructions FROM bot_instructions i WHERE i.id=bots.id);
-        DROP TABLE bot_instructions;"
+        DROP TABLE bot_instructions;")
     };
 }
 /// Puts each bot's instructions and compaction instructions back in its
@@ -126,6 +143,9 @@ pub trait Older {
     /// shape of the schemas from 90 to 106, where each bot's row held its
     /// instructions.
     fn before_107(&self, sql: &str) -> rusqlite::Result<()>;
+    /// An older store's changes, made to a store first put back in the
+    /// shape of the schemas from 107 to 113.
+    fn before_114(&self, sql: &str) -> rusqlite::Result<()>;
 }
 impl Older for Connection {
     fn older(&self, sql: &str) -> rusqlite::Result<()> {
@@ -134,6 +154,10 @@ impl Older for Connection {
     }
     fn before_107(&self, sql: &str) -> rusqlite::Result<()> {
         self.execute_batch(INSTRUCTIONS_IN_ROW)?;
+        self.execute_batch(sql)
+    }
+    fn before_114(&self, sql: &str) -> rusqlite::Result<()> {
+        self.execute_batch(BEFORE_114)?;
         self.execute_batch(sql)
     }
 }

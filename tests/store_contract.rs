@@ -5,8 +5,8 @@ use agent_runtime::{
     store::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Joined, Lifted,
-        Limit, Planning, ProcessKind, QuoteRef, Reclaim, Retained, Settings, Strip, Switch,
-        Trailer, TurnBudget, TurnOptions, Waiting, Wake,
+        Limit, PACK_IDLE_MS, Pack, Planning, ProcessKind, QuoteRef, Reclaim, Retained, Settings,
+        Strip, Switch, Trailer, TurnBudget, TurnOptions, Waiting, Wake,
     },
     tools::{Declared, Inherit, Outcome, ToolList},
 };
@@ -13904,7 +13904,7 @@ fn schema_112_counts_cut_offs_and_ends_what_an_older_daemon_left_running() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .before_114(
             "ALTER TABLE turns DROP COLUMN restarts; ALTER TABLE turns DROP COLUMN restart_head;
              PRAGMA user_version=111;",
         )
@@ -13954,7 +13954,7 @@ fn schema_113_keeps_each_prompts_effort_and_a_running_turns_own() {
     // A store from before 113, its turn still running.
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE nodes DROP COLUMN effort; PRAGMA user_version=112;")
+        .before_114("ALTER TABLE nodes DROP COLUMN effort; PRAGMA user_version=112;")
         .unwrap();
     drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
     let effort: Option<String> = Connection::open(&path)
@@ -24675,7 +24675,7 @@ fn schema_108_keeps_each_bots_first_dot_group_as_its_namespace() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .before_114(
             "UPDATE bots SET settings=json_remove(settings,'$.namespace') WHERE name<>'shop.web';
              PRAGMA user_version=107;",
         )
@@ -24755,7 +24755,7 @@ fn schema_109_names_a_lifted_tool_yields() {
         [kept.to_string()],
     )
     .unwrap();
-    old.execute_batch("PRAGMA user_version=108;").unwrap();
+    old.before_114("PRAGMA user_version=108;").unwrap();
     drop(old);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     for name in ["lead", "lead.task"] {
@@ -25556,7 +25556,7 @@ fn a_store_from_109_takes_profiles_with_none_on_its_bots() {
     // The store as 109 wrote it: what store_down.py's step leaves.
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE bots DROP COLUMN profile; PRAGMA user_version=109;")
+        .before_114("ALTER TABLE bots DROP COLUMN profile; PRAGMA user_version=109;")
         .unwrap();
     let has_column = || {
         count(
@@ -25574,4 +25574,286 @@ fn a_store_from_109_takes_profiles_with_none_on_its_bots() {
     assert_eq!(db.inspect("shop.fix").unwrap().profile, None);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every pass packing makes at `now_ms`, until nothing is due; how many
+/// batches it wrote.
+fn pack_all(db: &mut Database, now_ms: i64) -> usize {
+    let mut batches = 0;
+    while let Pack::Batch(batch) = db.to_pack(now_ms).unwrap() {
+        assert!(db.packed(batch).unwrap());
+        batches += 1;
+    }
+    batches
+}
+
+/// What a client reads of a bot's history, every way it can.
+fn every_read(db: &mut Database, name: &str, turns: &[i64]) -> Vec<Value> {
+    let mut reads = vec![json!(stored(db, name))];
+    for seq in 1..=turns.len() as i64 {
+        reads.push(db.history_read(name, seq, 0, 65536).unwrap());
+    }
+    reads.push(db.history_search(name, "repeats", None, false).unwrap());
+    let nodes = db.history_nodes(name, None, 400, None, true).unwrap();
+    let ids: Vec<i64> = nodes["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|node| node["node"].as_i64())
+        .collect();
+    reads.push(nodes);
+    reads.push(db.history_items(name, &ids).unwrap());
+    for turn in turns {
+        reads.push(db.turn_view(name, *turn).unwrap());
+    }
+    reads
+}
+
+/// Codex packs a rollout nobody touched for a week: a bot with no turn in
+/// a week has its items packed, each only when that is smaller, and every
+/// read gives back what was written, byte for byte. A bot still at work
+/// stays plain, and one packed works on.
+#[test]
+fn an_idle_bots_items_are_packed_and_read_back_as_written() {
+    let path = std::env::temp_dir().join(format!("agent-pack-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let words = "an answer that repeats itself. ".repeat(300);
+    // Words of 4 KiB or more live only in the node they became.
+    let long_prompt = "a long prompt that repeats. ".repeat(200);
+    let mut turns = Vec::new();
+    for (index, prompt) in ["short", long_prompt.as_str(), "tiny"].iter().enumerate() {
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("r{index}"),
+                prompt,
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(
+            turn,
+            vec![assistant(&format!("{index} {words}")), assistant("ok")],
+            &[],
+            None,
+        )
+        .unwrap();
+        db.finish(turn, None).unwrap();
+        turns.push(turn);
+    }
+    let carol = db
+        .begin(
+            "Carol",
+            "c",
+            "hello",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(carol, vec![assistant(&words)], &[], None)
+        .unwrap();
+    let before = every_read(&mut db, "Bob", &turns);
+    let packed = || -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM nodes WHERE packed IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    // Within the week nothing is packed, and the next pass is due when
+    // Bob's last turn is a week old.
+    let now = epoch_now() as i64;
+    let Pack::Due(due) = db.to_pack(now).unwrap() else {
+        panic!("nothing is due yet");
+    };
+    assert!(due > now && due <= now + PACK_IDLE_MS);
+    assert_eq!(packed(), 0);
+    let later = now + PACK_IDLE_MS + 1_000;
+    assert!(pack_all(&mut db, later) > 0);
+    // The prompts and long answers are packed; "ok" would grow, so it
+    // stays plain.
+    assert_eq!(packed(), 6);
+    let plain_ok: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM nodes WHERE packed IS NULL AND instr(item,'\"ok\"')>0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(plain_ok, 3);
+    assert_eq!(every_read(&mut db, "Bob", &turns), before);
+    // Carol's turn runs: none of hers is packed, then or after it ends,
+    // until she too has been idle a week.
+    assert_eq!(pack_all(&mut db, later), 0);
+    db.finish(carol, None).unwrap();
+    assert_eq!(pack_all(&mut db, epoch_now() as i64), 0);
+    assert_eq!(packed(), 6);
+    // A fork of a packed history reads it whole, and Bob goes on.
+    db.fork("Bob", "Ben", Fork::default()).unwrap();
+    assert_eq!(stored(&mut db, "Ben"), stored(&mut db, "Bob"));
+    let next = db
+        .begin(
+            "Bob",
+            "r9",
+            "again",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(next, vec![assistant("again")], &[], None)
+        .unwrap();
+    db.finish(next, None).unwrap();
+    let mut all = before[0].as_array().unwrap().clone();
+    all.extend([
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"again"}]}),
+        serde_json::from_slice(&assistant("again")).unwrap(),
+    ]);
+    assert_eq!(stored(&mut db, "Bob").len(), all.len());
+    // A week after their last turns, Bob's new turn and Carol's are
+    // packed; Ben, who has had no turn, holds nothing of his own to pack.
+    assert_eq!(pack_all(&mut db, later + PACK_IDLE_MS), 3);
+    assert_eq!(packed(), 10);
+    assert_eq!(stored(&mut db, "Bob").len(), all.len());
+    assert_eq!(
+        stored(&mut db, "Ben"),
+        before[0].as_array().unwrap().clone()
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A text many bots hold is kept once: instructions, and what the events
+/// of kept configures carry, which read back as they were given. A text
+/// goes once nothing holds it.
+#[test]
+fn texts_bots_hold_are_kept_once_and_read_back_whole() {
+    let mut db = db();
+    let rules = "rule ".repeat(4_000);
+    let tools =
+        json!([{"name":"exec","description":"d".repeat(2_000),"parameters":{"type":"object"}}]);
+    let mut ids = Vec::new();
+    for name in ["Bob", "Carol", "Dave"] {
+        let mut bot = binding();
+        bot.instructions = &rules;
+        ids.push(db.create(name, Some("/synthetic"), bot).unwrap().0.bot_id);
+    }
+    let kept = json!({"instructions": "new rules", "declare": tools,
+        "compaction_instructions": "keep it", "settings": {"speed": null}});
+    for (name, id) in ["Bob", "Carol"].iter().zip(&ids) {
+        db.keep_configure(name, *id, 7, &kept).unwrap();
+    }
+    db.configure_failed("Bob", &Error::with("provider_unavailable", "gone"))
+        .unwrap();
+    let events = db
+        .events_of_kinds(&["configure_pending", "configure_failed"], 0, 256)
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(events.len(), 3);
+    for event in &events {
+        assert_eq!(event["data"]["configure_pending"], kept, "{event}");
+        assert!(event["data"].get("texts").is_none());
+    }
+    assert_eq!(
+        db.events("Carol", 0, 256).unwrap()["events"][1]["data"]["configure_pending"],
+        kept
+    );
+    assert_eq!(db.inspect("Dave").unwrap().instructions, rules);
+    // A bot's instructions changed and changed back read whole; the old
+    // text stays while another bot holds it.
+    assert!(db.set_instructions("Dave", None, "mine").unwrap());
+    assert_eq!(db.inspect("Dave").unwrap().instructions, "mine");
+    assert_eq!(db.inspect("Bob").unwrap().instructions, rules);
+    assert!(!db.set_instructions("Dave", None, "mine").unwrap());
+    assert_eq!(
+        db.set_compaction("Dave", None, Some(Some("short")), None)
+            .unwrap(),
+        vec!["compaction_instructions"]
+    );
+    assert_eq!(
+        db.inspect("Dave")
+            .unwrap()
+            .compaction_instructions
+            .as_deref(),
+        Some("short")
+    );
+    // Deleting a bot lets go of what only it held; what Carol's event
+    // holds stays readable.
+    db.delete_bot("Bob").unwrap();
+    db.delete_bot("Dave").unwrap();
+    let events = db.events_of_kinds(&["configure_pending"], 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["data"]["configure_pending"], kept);
+    assert_eq!(db.inspect("Carol").unwrap().instructions, rules);
+}
+
+/// Schema 114 keeps the texts bots hold once: a store from 113 reads the
+/// same after, and release/store_down.py takes it back.
+#[test]
+fn schema_114_keeps_texts_once() {
+    let path = std::env::temp_dir().join(format!("agent-schema114-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let rules = "rule ".repeat(4_000);
+    let kept = json!({"instructions": "new rules", "declare": [{"name":"exec"}]});
+    let (before, events) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        for name in ["Bob", "Carol"] {
+            let mut bot = binding();
+            bot.instructions = &rules;
+            bot.compaction_instructions = Some("keep decisions");
+            db.create(name, Some("/synthetic"), bot).unwrap();
+        }
+        let id = db.inspect("Bob").unwrap().bot_id;
+        db.keep_configure("Bob", id, 7, &kept).unwrap();
+        let events = db.events("Bob", 0, 256).unwrap()["events"].clone();
+        (db.inspect("Carol").unwrap(), events)
+    };
+    // As 113 wrote it: texts whole in their rows and events.
+    let old = Connection::open(&path).unwrap();
+    old.before_114(&format!(
+        "UPDATE events SET data=json_set(json_remove(data,'$.texts'),
+            '$.configure_pending',json('{}')) WHERE kind='configure_pending';
+         PRAGMA user_version=113;",
+        kept
+    ))
+    .unwrap();
+    drop(old);
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let after = db.inspect("Carol").unwrap();
+    assert_eq!(after.instructions, before.instructions);
+    assert_eq!(
+        after.compaction_instructions,
+        before.compaction_instructions
+    );
+    assert_eq!(db.events("Bob", 0, 256).unwrap()["events"], events);
+    let conn = Connection::open(&path).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    // Two bots' rules and compaction instructions, and the event's two.
+    assert_eq!(count("SELECT count(*) FROM texts"), 4);
+    assert_eq!(
+        count("SELECT count(*) FROM events WHERE json_type(data,'$.texts') IS NOT NULL"),
+        1
+    );
+    // The store gives freed pages back to the disk from then on.
+    assert_eq!(count("PRAGMA auto_vacuum"), 2);
+    drop(db);
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
 }
