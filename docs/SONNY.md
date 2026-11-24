@@ -1658,6 +1658,7 @@ Instead of dumping dozens of individual MCP tool schemas into every model prompt
 - **Code mode (`[sonny] code_mode = true`, default):** Exposes the agent's built-in tools (`tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch`, `tools.web_fetch`) inside `exec` as well, hiding raw tool schemas via `steps_only`.
 - **Tool discovery & limits:** `ALL_TOOLS` and `tools.tool_search(query)` find tools beyond the 3,000-token TypeScript header; `store`/`load` persist small values between scripts. Limits: 256 MiB heap, 10m timeout (overridable with `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}`), 10k-token return (full output saved to disk up to 1 GiB for 7 days), 8 concurrent in-script calls, 16 MiB per call result.
 - **Shared server pool:** `sonny-tool-host` maintains one connection per server across all agents (started on first call, stopped after 10 idle minutes) and caches tool schemas in `~/.agent/sonny/mcp`.
+- **Outside agents (`sonny mcp exec SCRIPT`, or `-` for stdin):** Runs one such script as the person, each `text()` a line on stdout as it is said, every call on one connection to each server for the whole script, so a lookout source pages a server that keeps cursors per session ([Lookout](LOOKOUT.md#sources-that-call-mcp-tools)).
 
 ![The every-tool-call view: a lead's script ran shell once as a step of its exec call, its result under the row](sonny/code-mode-script.png)
 

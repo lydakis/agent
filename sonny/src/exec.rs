@@ -1102,6 +1102,9 @@ pub enum Whole<'a> {
     /// Handed back to the machine that called over a link, under the name
     /// of the file there it is saved to.
     Sent(&'a Path, &'a Mutex<Option<String>>),
+    /// Printed to stdout, each `text()` a line as it is said, for
+    /// `sonny mcp exec`: nothing is cut, nothing kept.
+    Printed,
 }
 
 /// Answer the `exec` call `bot` of another machine made over a link, as
@@ -1157,6 +1160,38 @@ pub fn save_whole(file: &Path, text: &str) -> std::io::Result<()> {
         .mode(0o600)
         .open(file)?
         .write_all(text.as_bytes())
+}
+
+/// What `sonny mcp exec` runs a script as.
+const PRINTING: &str = "mcp-exec";
+
+/// `sonny mcp exec`: run `input`, a script as `exec` takes one, against
+/// the servers `hub` serves, outside any agent: each `text()` printed to
+/// stdout as a line as it is said, and the script's failure its error.
+/// The process's one connection to each server carries every call of the
+/// script, so a server that keeps state per session, as a cursor it gave,
+/// is asked within that session, as a source that pages one is.
+pub async fn printed(hub: &Hub, input: &str) -> Result<(), String> {
+    hub.follow_config().await?;
+    let answer = run_keeping(
+        hub,
+        None,
+        &Whole::Printed,
+        PRINTING,
+        input,
+        TIMEOUT,
+        None,
+        None,
+    )
+    .await?;
+    let said = match &answer {
+        Value::String(text) => text.as_str(),
+        parts => parts[0]["text"].as_str().unwrap_or_default(),
+    };
+    match said.starts_with("Script completed") {
+        true => Ok(()),
+        false => Err(said.trim_end().to_owned()),
+    }
 }
 
 /// Run a script against the servers `hub` serves, keeping what it saves
@@ -1790,6 +1825,9 @@ fn said(
     mut output: Output,
 ) -> (String, Option<String>) {
     let status = match ended {
+        // A script that caught the error of a line it could not print
+        // still failed: what it said did not all go out.
+        Ended::Completed if output.broken.is_some() => "Script failed".to_owned(),
         Ended::Completed => "Script completed".to_owned(),
         Ended::Failed(_) => "Script failed".to_owned(),
         Ended::Terminated(why) => format!("Script terminated: {why}"),
@@ -1806,7 +1844,11 @@ fn said(
         head.push_str(&format!("Calls: {}\n", each.join(", ")));
     }
     head.push_str("Output:\n");
-    if let Ended::Failed(error) = ended {
+    if let (Ended::Completed, Some(broken)) = (ended, &output.broken) {
+        head.push_str(&format!("Script error:\n{broken}"));
+    } else if let (Ended::Failed(error), Sink::Printed) = (ended, &output.sink) {
+        head.push_str(&format!("Script error:\n{error}"));
+    } else if let Ended::Failed(error) = ended {
         if output.total > 0 {
             output.add("\n");
         }
@@ -1829,6 +1871,8 @@ struct Output {
     /// it is cut once per half rather than on every line.
     tail: String,
     lines: usize,
+    /// Why what is said can no longer be printed: stdout closed or full.
+    broken: Option<String>,
     /// Every byte printed.
     total: u64,
     sink: Sink,
@@ -1847,6 +1891,8 @@ enum Sink {
     /// that bound: past it nothing more is kept, so the kept bytes stay the
     /// output's start.
     Sent(PathBuf, Option<String>, bool),
+    /// To stdout as it is said, a line for each `text()`.
+    Printed,
 }
 
 /// The most of an output a saved file holds: a sanity bound on a script
@@ -1943,18 +1989,38 @@ impl Output {
             Whole::Saved(Some(dir)) => Sink::File(dir.join("output"), None),
             Whole::Saved(None) => Sink::Dropped,
             Whole::Sent(named, _) => Sink::Sent(named.to_path_buf(), None, false),
+            Whole::Printed => Sink::Printed,
         };
         Output {
             window: tokens.saturating_mul(4).min(OUTPUT_BYTES),
             head: String::new(),
             tail: String::new(),
             lines: 0,
+            broken: None,
             total: 0,
             sink,
         }
     }
 
     fn push(&mut self, text: &str) {
+        if let Sink::Printed = self.sink {
+            // An image has nowhere to go on stdout: its mark prints nothing.
+            if text.starts_with(OPEN) {
+                return;
+            }
+            use std::io::Write;
+            if self.broken.is_some() {
+                return;
+            }
+            let mut out = std::io::stdout().lock();
+            if let Err(error) = writeln!(out, "{text}").and_then(|_| out.flush()) {
+                self.broken = Some(format!("its output could not be written: {error}"));
+                return;
+            }
+            self.lines += 1;
+            self.total += text.len() as u64 + 1;
+            return;
+        }
         if self.lines > 0 {
             self.add("\n");
         }
@@ -2012,6 +2078,7 @@ impl Output {
                 *saving = Some(opened);
             }
             Sink::Sent(_, whole, _) => *whole = Some(head.to_owned()),
+            Sink::Printed => {}
         }
     }
 
@@ -2027,7 +2094,7 @@ impl Output {
                 }
                 whole.push_str(&text[..floor(text, room.min(text.len()))]);
             }
-            Sink::Sent(..) => {}
+            Sink::Sent(..) | Sink::Printed => {}
         }
     }
 
@@ -2055,7 +2122,8 @@ impl Output {
             sink,
             ..
         } = self;
-        if total as usize == head.len() {
+        // Printed as it was said, it holds nothing more to show.
+        if total as usize == head.len() || matches!(sink, Sink::Printed) {
             return (head, None);
         }
         let half = window / 2;
@@ -2065,7 +2133,7 @@ impl Output {
         }
         let cut = (total - (head.len() + tail.len()) as u64).div_ceil(4);
         let (whole, sent) = match sink {
-            Sink::Dropped => (String::new(), None),
+            Sink::Dropped | Sink::Printed => (String::new(), None),
             Sink::File(_, Some(Ok(saving))) => (saving.said(total), None),
             Sink::File(_, Some(Err(error))) => (format!("; it could not be saved: {error}"), None),
             Sink::File(_, None) => (String::new(), None),
@@ -2476,7 +2544,7 @@ const PRELUDE: &str = r#"(() => {
       return async (args) => said(await call(key, JSON.stringify(args ?? {})));
     },
   });
-  globalThis.text = (value) => { host.text(show(value)); };
+  globalThis.text = (value) => { const broken = host.text(show(value)); if (broken != null) throw new Error(broken); };
   globalThis.image = (item) => { said(host.image(JSON.stringify(item))); };
   globalThis.store = (key, value) => { said(host.store(String(key), JSON.stringify(value) ?? "null")); };
   globalThis.load = (key) => { const kept = host.load(String(key)); return kept == null ? undefined : JSON.parse(kept); };
@@ -2757,7 +2825,10 @@ impl Run {
         globals.set(
             "__text",
             Function::new(ctx.clone(), move |text: String| {
-                said.lock().unwrap().push(&text.replace([OPEN, CLOSE], ""))
+                let mut said = said.lock().unwrap();
+                said.push(&text.replace([OPEN, CLOSE], ""));
+                // Said where it cannot go: the script stops on it.
+                said.broken.clone()
             })?,
         )?;
         let shared = Arc::clone(&self.shared);
@@ -4847,5 +4918,60 @@ text((await tools.mcp__test__echo({text: "two"})).content[0].text);"#;
             "{again}"
         );
         hub.stop().await;
+    }
+
+    /// The log server keeps each page's cursor in the session that was
+    /// given it, as MCP lets a server keep state per session; started on
+    /// a free port, which it prints.
+    fn log_server(dir: &Path) -> (std::process::Child, McpServer) {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tests/mcp_http_server.py"
+            ))
+            .env("MCP_SESSIONS", dir.join("sessions"))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut port = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut port)
+            .unwrap();
+        let server = McpServer {
+            url: Some(format!("http://127.0.0.1:{}/mcp", port.trim())),
+            enabled: true,
+            ..McpServer::default()
+        };
+        (child, server)
+    }
+
+    #[tokio::test]
+    async fn a_script_pages_a_server_s_cursors_on_one_session_and_so_does_the_next() {
+        let dir = scratch("one-session");
+        let (mut child, server) = log_server(&dir);
+        let hub = Hub::new(Some(dir.join("mcp")));
+        hub.configure(&[("log".to_owned(), server)].into()).await;
+        let paging = r#"let cursor, pages = [];
+do {
+  const r = await tools.mcp__log__page(cursor ? {cursor} : {});
+  if (r.isError) { text(r.content[0].text); break; }
+  pages.push(r.structuredContent.page);
+  cursor = r.structuredContent.cursor;
+} while (cursor);
+text(pages.join(","));"#;
+        for _ in 0..2 {
+            let said = ran(&hub, &dir, paging).await;
+            assert!(said.ends_with("Output:\n1,2,3,4,5"), "{said}");
+        }
+        // Two scripts at once page too, each its own cursors, on the one
+        // session both share.
+        let (one, two) = tokio::join!(ran(&hub, &dir, paging), ran(&hub, &dir, paging));
+        assert!(one.ends_with("Output:\n1,2,3,4,5"), "{one}");
+        assert!(two.ends_with("Output:\n1,2,3,4,5"), "{two}");
+        let sessions = std::fs::read_to_string(dir.join("sessions")).unwrap();
+        assert_eq!(sessions.lines().count(), 1, "{sessions}");
+        hub.stop().await;
+        let _ = child.kill();
     }
 }

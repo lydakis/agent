@@ -59,6 +59,9 @@ struct Inner {
     catalogs: Mutex<Vec<Arc<crate::exec::Catalog>>>,
     /// Which write of the config file the servers were last read from.
     config: Mutex<Option<Option<Stamp>>>,
+    /// Whether a stdio server runs in a process group of its own, stopped
+    /// with it, or in this process's, stopping with it.
+    grouped: bool,
 }
 
 struct Slot {
@@ -117,6 +120,20 @@ impl Hub {
             cache,
             catalogs: Mutex::default(),
             config: Mutex::default(),
+            grouped: true,
+        }))
+    }
+
+    /// The person's servers for a command, `sonny mcp exec`: each stdio
+    /// server in the command's own process group, so whatever stops the
+    /// command stops them, as a source's command is stopped by its group.
+    pub fn for_command() -> Hub {
+        Hub(Arc::new(Inner {
+            slots: Mutex::default(),
+            cache: cache_dir(),
+            catalogs: Mutex::default(),
+            config: Mutex::default(),
+            grouped: false,
         }))
     }
 
@@ -310,7 +327,7 @@ impl Hub {
         }
         if live.is_none() {
             let timeout = start_timeout(&slot.config);
-            let mut started = tokio::time::timeout(timeout, connect(&slot.config))
+            let mut started = tokio::time::timeout(timeout, connect(&slot.config, self.0.grouped))
                 .await
                 .unwrap_or_else(|_| Err(format!("did not start in {}s", timeout.as_secs())));
             // Its events, when it offers them, listed in a time of their
@@ -609,8 +626,8 @@ pub(crate) async fn open<H: rmcp::ClientHandler>(
     }
 }
 
-async fn connect(config: &McpServer) -> Result<Live, String> {
-    let (client, group, stderr) = open(config, client_info(), true).await?;
+async fn connect(config: &McpServer, grouped: bool) -> Result<Live, String> {
+    let (client, group, stderr) = open(config, client_info(), grouped).await?;
     drop(stderr);
     let instructions = client
         .peer_info()
@@ -925,6 +942,7 @@ sonny mcp add NAME --url URL [--bearer-token-env-var VAR] [--description TEXT]
 sonny mcp remove NAME
 sonny mcp import [--yes | --json]
 sonny mcp tool
+sonny mcp exec (SCRIPT | -)
 sonny mcp events NAME [CONFIG]";
 
 /// `sonny mcp`: the person's servers, as `codex mcp` keeps Codex's, in
@@ -1013,6 +1031,30 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         // `mcp.NAME` runs it.
         Some((verb, [name, config @ ..])) if verb == "events" && config.len() <= 1 => {
             crate::mcp_events::cli(name, config.first().map(String::as_str))
+        }
+        // A script against the servers, outside any agent, as a source's
+        // command runs one: each server on one connection for the whole
+        // script. From stdin when it is `-`.
+        Some((verb, [script])) if verb == "exec" => {
+            let script = match script.as_str() {
+                "-" => {
+                    let mut read = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut read)
+                        .map_err(|e| format!("reading the script: {e}"))?;
+                    read
+                }
+                script => script.to_owned(),
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(async {
+                    let hub = Hub::for_command();
+                    let ran = crate::exec::printed(&hub, &script).await;
+                    hub.stop().await;
+                    ran
+                })
         }
         Some((verb, [name])) if verb == "remove" => {
             let servers = agent_client::config::read(&path)?.sonny.mcp_servers;
