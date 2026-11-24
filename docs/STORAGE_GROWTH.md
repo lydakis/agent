@@ -225,6 +225,55 @@ the baseline is the unchanged daemon hash below. LZ4 component results are in
 the same directory's `varied-lz4`, `entropy-lz4`, and `artifacts-lz4` directories.
 No paid provider calls or commits were made for this slice.
 
+## Texts kept once, idle agents packed (schema 114)
+
+2026-11-24. Everything stays, byte for byte; what changes is how it is
+kept. Nothing is cut, summarized, expired, or left out.
+
+- **Texts kept once.** A bot's instructions and compaction instructions,
+  and what the events of kept configures carry (instructions, compaction
+  instructions, declared tools), live once in `texts` under their SHA-256
+  digest, as tool lists already did. Every read gives the whole text back.
+  A digest is 64 bytes, so this saves only when a text is long and shared;
+  a short one costs a little.
+- **Idle agents packed.** As Codex packs a session nobody touched for seven
+  days (`codex-rs/rollout`: zstd level 3, a background worker, unpacked
+  when resumed), a bot with no turn running and its last ended a week ago
+  has the items of its history from its first turn on kept as zstd level 3
+  frames, each only when that is smaller (`nodes.packed` holds the plain
+  length; `bots.packed_node` how far its history is packed). Every read
+  decodes through the SQL function `unpack`. Packing waits for a moment
+  with no turn running, one 1 MiB batch at a time, so it never slows a
+  conversation. A bot that works again is unpacked in the background at
+  once, newest first, and packed again a week after its last turn. A
+  fork's inherited history is its parent's, packed and unpacked with it.
+- **The file shrinks as it packs.** A new store gives freed pages back to
+  the disk (`auto_vacuum=INCREMENTAL`, set before WAL writes the header);
+  an existing one is rewritten into that mode once, at its first start
+  after the upgrade. Each packing batch gives back what it freed.
+- **Down.** `release/store_down.py` unpacks every item and writes the
+  texts back in place.
+
+### A 2.1 GB store from main
+
+A synthetic store grown by main to real shapes (40,000 turns over 2,008
+agents: prose prompts from the docs, `cat` of source files as tool output,
+random base64 reasoning that does not compress), every agent's last turn
+moved back eight days, then opened by this change:
+
+| Measure | Main | Schema 114 |
+| --- | ---: | ---: |
+| Item bytes | 1,348 MB | 514 MB (2.62x smaller) |
+| File | 2,139 MiB | 1,443 MiB |
+| First start after the upgrade | 0.02 s | 22 s, once (backup and VACUUM; VACUUM alone about 7 s per GB) |
+| Starts after | 0.02 s | 0.02 s |
+| Packing, no turn running | | about 30 s in the background, 2,334 batches of 1 MiB |
+
+All 200,157 items read back byte for byte against main's store, and all
+2,008 instructions. `bench/store_packing.py` estimated the same bytes
+before anything ran. Turn latency, CPU and memory against main are in
+[DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#texts-kept-once-idle-agents-packed-1349).
+
 ## Reproduction and provenance
 
 Commands are in [BENCHMARKS.md](BENCHMARKS.md#storage-attribution-and-codec-screen).
