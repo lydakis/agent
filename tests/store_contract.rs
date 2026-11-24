@@ -25610,10 +25610,6 @@ fn every_read(db: &mut Database, name: &str, turns: &[i64]) -> Vec<Value> {
     reads
 }
 
-/// Codex packs a rollout nobody touched for a week: a bot with no turn in
-/// a week has its items packed, each only when that is smaller, and every
-/// read gives back what was written, byte for byte. A bot still at work
-/// stays plain, and one packed works on.
 #[test]
 fn a_new_store_gives_freed_pages_back_from_its_first_write() {
     let path = std::env::temp_dir().join(format!("agent-new-store-{}.sqlite", std::process::id()));
@@ -25635,6 +25631,11 @@ fn a_new_store_gives_freed_pages_back_from_its_first_write() {
     }
 }
 
+/// Codex packs a rollout nobody touched for a week, and unpacks one it
+/// resumes: a bot with no turn in a week has its items packed, each only
+/// when that is smaller, and every read gives back what was written, byte
+/// for byte. A bot still at work stays plain; one packed that works again
+/// is unpacked, and packed again a week after.
 #[test]
 fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     let path = std::env::temp_dir().join(format!("agent-pack-{}.sqlite", std::process::id()));
@@ -25682,15 +25683,19 @@ fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     db.append(carol, vec![assistant(&words)], &[], None)
         .unwrap();
     let before = every_read(&mut db, "Bob", &turns);
-    let packed = || -> i64 {
-        Connection::open(&path)
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM nodes WHERE packed IS NOT NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap()
+    let conn = Connection::open(&path).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    let packed = || count("SELECT count(*) FROM nodes WHERE packed IS NOT NULL");
+    // A week passes for those named: their last turns move back.
+    let age = |names: &str| {
+        conn.execute(
+            &format!(
+                "UPDATE bots SET last_finished_ms=last_finished_ms-{} WHERE name IN ({names})",
+                PACK_IDLE_MS + 1_000
+            ),
+            [],
+        )
+        .unwrap();
     };
     // Within the week nothing is packed, and the next pass is due when
     // Bob's last turn is a week old.
@@ -25700,30 +25705,41 @@ fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     };
     assert!(due > now && due <= now + PACK_IDLE_MS);
     assert_eq!(packed(), 0);
-    let later = now + PACK_IDLE_MS + 1_000;
-    assert!(pack_all(&mut db, later) > 0);
+    age("'Bob'");
+    assert!(pack_all(&mut db, now) > 0);
     // The prompts and long answers are packed; "ok" would grow, so it
     // stays plain.
     assert_eq!(packed(), 6);
-    let plain_ok: i64 = Connection::open(&path)
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM nodes WHERE packed IS NULL AND instr(item,'\"ok\"')>0",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(plain_ok, 3);
+    assert_eq!(
+        count("SELECT count(*) FROM nodes WHERE packed IS NULL AND instr(item,'\"ok\"')>0"),
+        3
+    );
     assert_eq!(every_read(&mut db, "Bob", &turns), before);
     // Carol's turn runs: none of hers is packed, then or after it ends,
     // until she too has been idle a week.
-    assert_eq!(pack_all(&mut db, later), 0);
+    assert_eq!(pack_all(&mut db, now), 0);
+    // A turn that ends tells packing only when the bot has packed items.
+    let shared = db.shared();
+    let told = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_millis(10), shared.woken())
+                    .await
+                    .is_ok()
+            })
+    };
     db.finish(carol, None).unwrap();
-    assert_eq!(pack_all(&mut db, epoch_now() as i64), 0);
+    assert!(!told());
+    assert_eq!(pack_all(&mut db, now), 0);
     assert_eq!(packed(), 6);
-    // A fork of a packed history reads it whole, and Bob goes on.
+    // A fork of a packed history reads it whole.
     db.fork("Bob", "Ben", Fork::default()).unwrap();
     assert_eq!(stored(&mut db, "Ben"), stored(&mut db, "Bob"));
+    // Bob works again: the turn reads his packed history, and once it
+    // ends the next pass, due at once, unpacks it.
     let next = db
         .begin(
             "Bob",
@@ -25738,21 +25754,100 @@ fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     db.append(next, vec![assistant("again")], &[], None)
         .unwrap();
     db.finish(next, None).unwrap();
-    let mut all = before[0].as_array().unwrap().clone();
-    all.extend([
-        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"again"}]}),
-        serde_json::from_slice(&assistant("again")).unwrap(),
-    ]);
-    assert_eq!(stored(&mut db, "Bob").len(), all.len());
-    // A week after their last turns, Bob's new turn and Carol's are
-    // packed; Ben, who has had no turn, holds nothing of his own to pack.
-    assert_eq!(pack_all(&mut db, later + PACK_IDLE_MS), 3);
+    assert!(told());
+    let all = stored(&mut db, "Bob");
+    assert_eq!(
+        all[..before[0].as_array().unwrap().len()],
+        before[0].as_array().unwrap()[..]
+    );
+    assert_eq!(all.len(), before[0].as_array().unwrap().len() + 2);
+    let woke = every_read(&mut db, "Bob", &turns);
+    let Pack::Due(due) = db.to_pack(now, i64::MAX).unwrap() else {
+        panic!("a pass from the start finds Bob");
+    };
+    assert!(due <= now);
+    assert!(pack_all(&mut db, now) > 0);
+    assert_eq!(packed(), 0);
+    assert_eq!(
+        count("SELECT count(*) FROM bots WHERE packed_node IS NOT NULL AND name='Bob'"),
+        0
+    );
+    assert_eq!(stored(&mut db, "Bob"), all);
+    assert_eq!(every_read(&mut db, "Bob", &turns), woke);
+    // A week after their last turns, Bob's whole history and Carol's are
+    // packed again; Ben, who has had no turn, holds nothing of his own
+    // (the pass that unpacked Bob found that).
+    age("'Bob','Carol'");
+    assert_eq!(pack_all(&mut db, now), 2);
     assert_eq!(packed(), 10);
-    assert_eq!(stored(&mut db, "Bob").len(), all.len());
+    assert_eq!(stored(&mut db, "Bob"), all);
     assert_eq!(
         stored(&mut db, "Ben"),
         before[0].as_array().unwrap().clone()
     );
+    drop(conn);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A history longer than a batch packs and unpacks a stretch at a time,
+/// each pass going on where the last ended, and reads back whole between.
+#[test]
+fn a_long_history_packs_and_unpacks_a_stretch_at_a_time() {
+    let path = std::env::temp_dir().join(format!("agent-pack-long-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut turns = Vec::new();
+    for index in 0..4 {
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("r{index}"),
+                &format!("turn {index}"),
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let words = format!("{index} words that come back. ").repeat(24_000);
+        db.append(turn, vec![assistant(&words)], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+        turns.push(turn);
+    }
+    let before = every_read(&mut db, "Bob", &turns);
+    let conn = Connection::open(&path).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    conn.execute(
+        &format!(
+            "UPDATE bots SET last_finished_ms=last_finished_ms-{}",
+            PACK_IDLE_MS + 1_000
+        ),
+        [],
+    )
+    .unwrap();
+    let now = epoch_now() as i64;
+    assert!(pack_all(&mut db, now) >= 2);
+    assert_eq!(
+        count("SELECT count(*) FROM nodes WHERE packed IS NOT NULL"),
+        8
+    );
+    assert_eq!(every_read(&mut db, "Bob", &turns), before);
+    // It works again (a turn just ended): unpacked a stretch at a time too.
+    conn.execute("UPDATE bots SET last_finished_ms=?", [now])
+        .unwrap();
+    assert!(pack_all(&mut db, now) >= 2);
+    assert_eq!(
+        count("SELECT count(*) FROM nodes WHERE packed IS NOT NULL"),
+        0
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM bots WHERE packed_node IS NOT NULL"),
+        0
+    );
+    assert_eq!(every_read(&mut db, "Bob", &turns), before);
+    drop(conn);
     drop(db);
     let _ = std::fs::remove_file(&path);
 }

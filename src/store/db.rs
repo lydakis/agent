@@ -3158,6 +3158,8 @@ pub type CallEnds = Box<dyn Fn(i64, String) + Send>;
 pub struct Shared {
     held: std::sync::Mutex<Arc<HashMap<i64, Held>>>,
     identities: std::sync::Mutex<Identities>,
+    /// A turn of a bot with packed items ended: packing unpacks them.
+    woken: tokio::sync::Notify,
 }
 /// One running turn's verdicts and answers the worker holds, as `Live`
 /// keeps them.
@@ -3183,6 +3185,11 @@ struct Identities {
 /// read again, which is what every request did before.
 const IDENTITIES: usize = 8192;
 impl Shared {
+    /// Until a turn of a bot with packed items ends (at once if one has
+    /// since this was last awaited).
+    pub async fn woken(&self) {
+        self.woken.notified().await
+    }
     /// The verdicts held as of the last commit.
     fn held(&self) -> Arc<HashMap<i64, Held>> {
         self.held.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -3945,18 +3952,22 @@ fn stored_entry(
 
 /// What packing does next (see [`Database::to_pack`]).
 pub enum Pack {
-    /// Items to pack.
+    /// Items to pack, or to unpack.
     Batch(Packing),
     /// Nothing to pack until then, in epoch ms.
     Due(i64),
 }
-/// A bot's items, read plain and packed, for [`Database::packed`] to keep:
-/// its history's nodes after `after` through `through`.
+/// A bot's items, read and packed or unpacked, for [`Database::packed`]
+/// to keep. Packing: its history's nodes after `after` through `through`,
+/// which its history then counts as packed through. Unpacking: its
+/// history's nodes after `through` through `after`, and it then counts as
+/// packed through `through` (0: none).
 pub struct Packing {
     bot_id: i64,
     after: i64,
     through: i64,
-    /// Each node's id, its item as read, and that item packed.
+    unpack: bool,
+    /// Each node's id, its item as read, and that item as it is kept.
     items: Vec<(i64, Vec<u8>, Vec<u8>)>,
 }
 impl Packing {
@@ -14658,8 +14669,9 @@ impl Database {
         // failed in line while this one ran.
         // One statement, as before this kept the ending: each CASE reads
         // the row as it was.
-        tx.prepare_cached(
-            "UPDATE bots SET head=?1,running_turn=NULL,closed=NULL,open_calls=NULL,
+        let packed: Option<i64> = tx
+            .prepare_cached(
+                "UPDATE bots SET head=?1,running_turn=NULL,closed=NULL,open_calls=NULL,
                 started_ms=NULL,waiting_on=NULL,expires_at=?2+expire_ms,
                 status=CASE WHEN last_turn>?4 THEN last_status ELSE ?5 END,
                 last_status=CASE WHEN last_turn>?4 THEN last_status ELSE ?5 END,
@@ -14667,11 +14679,16 @@ impl Database {
                 last_finished_ms=CASE WHEN last_turn>?4 THEN last_finished_ms ELSE ?2 END,
                 last_error=CASE WHEN last_turn>?4 THEN last_error ELSE ?7 END,
                 last_turn=CASE WHEN last_turn>?4 THEN last_turn ELSE ?4 END
-             WHERE name=?3",
-        )?
-        .execute(params![
-            head, finished, bot.name, turn, status, started, code
-        ])?;
+             WHERE name=?3 RETURNING packed_node",
+            )?
+            .query_row(
+                params![head, finished, bot.name, turn, status, started, code],
+                |r| r.get(0),
+            )?;
+        // A bot with packed items worked again: they are unpacked.
+        if packed.is_some() {
+            self.shared.woken.notify_one();
+        }
         promote(&tx, &bot.name)?;
         if status == "completed" {
             tx.prepare_cached("INSERT INTO checkpoints VALUES (?,?)")?
@@ -16183,25 +16200,26 @@ impl Database {
         // One snapshot for the whole batch: a bot deleted meanwhile is
         // read as it was, and `packed` finds it gone.
         let _snapshot = self.conn.unchecked_transaction()?;
-        let due: Option<(i64, String, i64, i64)> = self
+        let due: Option<(i64, String, i64, i64, bool)> = self
             .conn
-            .prepare_cached(
-                "SELECT id,name,COALESCE(packed_node,0),head FROM bots
-                 WHERE id>=?2 AND running_turn IS NULL AND status!='deleting'
-                   AND head>COALESCE(packed_node,0) AND COALESCE(last_finished_ms,0)<=?1
-                 ORDER BY id LIMIT 1",
-            )?
+            .prepare_cached(&format!(
+                "SELECT id,name,COALESCE(packed_node,0),head,{WOKEN} FROM bots
+                 WHERE id>=?2 AND status!='deleting' AND ({WOKEN} OR (running_turn IS NULL
+                   AND head>COALESCE(packed_node,0) AND COALESCE(last_finished_ms,0)<=?1))
+                 ORDER BY id LIMIT 1"
+            ))?
             .query_row(params![cutoff, from], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .optional()?;
-        let Some((bot_id, name, after, head)) = due else {
+        let Some((bot_id, name, after, head, woken)) = due else {
             return Ok(Pack::Due(self.pack_due(now_ms)?));
         };
         let mut batch = Packing {
             bot_id,
             after,
             through: head,
+            unpack: woken,
             items: Vec::new(),
         };
         // Its first turn's first node: a fork's history above it is the
@@ -16216,8 +16234,14 @@ impl Database {
             )
             .optional()?;
         let Some(first) = first else {
+            if woken {
+                batch.through = 0;
+            }
             return Ok(Pack::Batch(batch));
         };
+        if woken {
+            return self.to_unpack(batch, first);
+        }
         // The batch is a stretch of its history, found by depth through
         // skip pointers (`ancestor`) so no step walks the whole history: it
         // starts at the shallowest node written after `floor` (a child is
@@ -16293,15 +16317,53 @@ impl Database {
         }
         Ok(Pack::Batch(batch))
     }
-    /// When packing next has work, in epoch ms: when the bot that will
-    /// have been idle longest reaches [`super::pack::IDLE_MS`] (at or
-    /// before `now_ms` when one has), or, with no bot left to pack, when
-    /// one idle from now would.
+    /// A woken bot's packed items, newest first from where its history
+    /// counts as packed through (`batch.after`) down to its first turn,
+    /// unpacked, until [`super::pack::BATCH_BYTES`] are read: Codex
+    /// unpacks a session it resumes, so a conversation going on reads its
+    /// items plain. `batch.through` is where the next batch starts, or 0
+    /// when this one reaches its first turn.
+    fn to_unpack(&self, mut batch: Packing, first: i64) -> Result<Pack> {
+        let mut item = self
+            .conn
+            .prepare_cached("SELECT item,packed FROM nodes WHERE id=?")?;
+        let (mut node, mut read) = (Some(batch.after), 0);
+        while let Some(id) = node.filter(|id| *id >= first) {
+            let (stored, packed): (Vec<u8>, Option<i64>) =
+                item.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            match packed {
+                Some(len) => {
+                    let plain = super::pack::unpack(&stored, len as usize)?;
+                    read += plain.len();
+                    batch.items.push((id, stored, plain));
+                }
+                None => read += stored.len(),
+            }
+            node = place(&self.conn, id)?
+                .ok_or_else(|| Error::new("storage_error"))?
+                .parent;
+            if read >= super::pack::BATCH_BYTES {
+                break;
+            }
+        }
+        batch.through = node.filter(|id| *id >= first).unwrap_or(0);
+        Ok(Pack::Batch(batch))
+    }
+    /// When packing next has work, in epoch ms: now when a woken bot has
+    /// items to unpack; else when the bot that will have been idle
+    /// longest reaches [`super::pack::IDLE_MS`] (at or before `now_ms`
+    /// when one has), or, with no bot left to pack, when one idle from
+    /// now would.
     pub fn pack_due(&self, now_ms: i64) -> Result<i64> {
+        let cutoff = now_ms - super::pack::IDLE_MS;
         let next: Option<i64> = self.conn.query_row(
-            "SELECT MIN(CASE WHEN running_turn IS NULL THEN COALESCE(last_finished_ms,0) ELSE ?1 END)
-             FROM bots WHERE status!='deleting' AND head>COALESCE(packed_node,0)",
-            [now_ms],
+            &format!(
+                "SELECT MIN(CASE WHEN {WOKEN} THEN ?1
+                   WHEN head<=COALESCE(packed_node,0) THEN NULL
+                   WHEN running_turn IS NULL THEN COALESCE(last_finished_ms,0) ELSE ?2 END)
+                 FROM bots WHERE status!='deleting'"
+            ),
+            params![cutoff, now_ms],
             |r| r.get(0),
         )?;
         Ok(next.unwrap_or(now_ms) + super::pack::IDLE_MS)
@@ -16315,11 +16377,18 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let held = tx
             .prepare_cached(
-                "UPDATE bots SET packed_node=?3 WHERE id=?1 AND COALESCE(packed_node,0)=?2",
+                "UPDATE bots SET packed_node=NULLIF(?3,0) WHERE id=?1 AND COALESCE(packed_node,0)=?2",
             )?
             .execute(params![batch.bot_id, batch.after, batch.through])?
             == 1;
-        if held {
+        if held && batch.unpack {
+            let mut update = tx.prepare_cached(
+                "UPDATE nodes SET item=?2,packed=NULL WHERE id=?1 AND packed IS NOT NULL AND item=?3",
+            )?;
+            for (id, packed, plain) in &batch.items {
+                update.execute(params![id, plain, packed])?;
+            }
+        } else if held {
             let mut update = tx.prepare_cached(
                 "UPDATE nodes SET item=?2,packed=?3 WHERE id=?1 AND packed IS NULL AND item=?4",
             )?;
@@ -19135,6 +19204,10 @@ macro_rules! reply_node {
     };
 }
 const REPLY_NODE: &str = reply_node!(unpacked!(n));
+/// A bot with packed items that works again: a turn running, or one
+/// ended since the cutoff (`?1`). Packing unpacks its items.
+const WOKEN: &str = "(packed_node IS NOT NULL
+    AND (running_turn IS NOT NULL OR COALESCE(last_finished_ms,0)>?1))";
 
 /// Text of an assistant item in either family encoding; other content is skipped.
 fn assistant_text(item: &Value) -> String {

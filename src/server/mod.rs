@@ -3272,6 +3272,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                     pack_due = None;
                     packing.spawn(pack(service.store.clone()));
                 }
+                // A bot with packed items worked again: a pass unpacks them.
+                _ = service.store.woken(), if packing.is_empty() && !service.draining() => {
+                    pack_due = Some(tokio::time::Instant::now());
+                }
                 // A pass that failed, counted in the store's stats, is
                 // tried again when a turn ending now would be due.
                 Some(packed) = packing.join_next(), if !packing.is_empty() => {

@@ -1200,6 +1200,10 @@ impl Store {
             counters: self.counters.clone(),
         }
     }
+    /// Until a turn of a bot with packed items ends: packing unpacks them.
+    pub async fn woken(&self) {
+        self.shared.woken().await
+    }
     /// Bot `id`'s identity, as its own requests are held to it: kept in
     /// memory once read, until a commit changes it or deletes the bot.
     pub async fn identity(&self, id: i64) -> Result<std::sync::Arc<Identity>> {
