@@ -323,6 +323,40 @@ const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 const TEMP_READ: Duration = Duration::from_secs(30);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether this process holds the screen: raw, on the alternate screen,
+/// the terminal asked what it draws. Held from the first window's start
+/// to Sonny's end, through each window `/switch` opens in another's place
+/// ([`run`]), as Codex keeps its screen from one session to the next.
+static SCREEN_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// This window's arguments, the program first: the process's own, then
+/// those of each window `/switch` opened in its place, as a Sonny started
+/// with them would have them.
+static ARGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// What **Projects** read in the window `/switch` left, for the window it
+/// opened in its place: its page opens on them.
+static PROJECTS_LEFT: std::sync::Mutex<Option<Box<ProjectsKept>>> = std::sync::Mutex::new(None);
+
+/// [`ARGS`]: the process's own until a window opened in another's place.
+fn args() -> Vec<String> {
+    let args = ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    match args.is_empty() {
+        true => std::env::args().collect(),
+        false => args.clone(),
+    }
+}
+
+/// The screen given back as Sonny ends, or before it says why it could
+/// not open: off the alternate screen, keys and paste as they were.
+fn let_screen_go() {
+    if !SCREEN_HELD.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    own_screen(false);
+    keys_apart(false);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    term::restore();
+    let _ = disable_raw_mode();
+}
 /// Into the alternate screen with the mouse, which Sonny owns while it
 /// runs, or out of it, the keys told apart on the screen it is on, and the
 /// terminal's colour-scheme reports heard while it is there.
@@ -3486,7 +3520,7 @@ fn daemon_paths(
 }
 
 fn parse() -> Result<Options, String> {
-    let args = std::env::args().skip(1);
+    let args = args().into_iter().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
@@ -3554,7 +3588,8 @@ fn parse() -> Result<Options, String> {
 /// with the daemon the environment named.
 fn reopen(bot: &str) -> Vec<String> {
     let mut command = vec!["sonny".to_owned()];
-    let mut args = std::env::args().skip(1).peekable();
+    let given = args();
+    let mut args = given.iter().skip(1).cloned().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" | "--reopened" => {}
@@ -3568,7 +3603,7 @@ fn reopen(bot: &str) -> Vec<String> {
             _ => command.push(arg),
         }
     }
-    let named = std::env::args().any(|arg| arg == "--agent");
+    let named = given.iter().any(|arg| arg == "--agent");
     // A lead by its name, the first one too, so a pane restored later
     // opens the same lead, whichever the folder opens by then.
     match project::lead_project(bot) {
@@ -3745,12 +3780,29 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
         _ => {
             agent_client::name_program("window");
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())
-                .and_then(|runtime| runtime.block_on(run()))
+            // Each window on a runtime of its own: what it left running
+            // ends with it, as when the next one replaced the process; the
+            // screen, the keys and the terminal's answers stay.
+            loop {
+                let opened = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|runtime| {
+                        let opened = runtime.block_on(run());
+                        runtime.shutdown_background();
+                        opened
+                    });
+                match opened {
+                    Ok(true) => {}
+                    Ok(false) => break Ok(()),
+                    Err(error) => {
+                        let_screen_go();
+                        break Err(error);
+                    }
+                }
+            }
         }
     };
     match result {
@@ -3976,33 +4028,43 @@ fn status_said(project: &str, title: Option<&str>, rows: &[status::Row], as_json
         .join("\n")
 }
 
-async fn run() -> Result<(), String> {
+/// A window, on the agent its arguments name ([`ARGS`]): whether another
+/// opens in its place, by `/switch`, once it ends.
+async fn run() -> Result<bool, String> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
         match option_env!("SONNY_COMMIT") {
             Some(commit) => println!("sonny {} ({commit})", env!("CARGO_PKG_VERSION")),
             None => println!("sonny {}", env!("CARGO_PKG_VERSION")),
         }
-        return Ok(());
+        return Ok(false);
     }
-    // The program this window runs, so one installed over it later is
-    // seen and reopened on.
-    update::note_started();
+    // Opened by `/switch` in the place of a window still on the screen.
+    let held = SCREEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
-    // Before the daemon and its companions start on this build.
-    upgrade::at_start(&options.store);
-    // Before any lead is made, so its instructions list the skills.
-    skills::install_own();
-    trigger::at_start();
-    home::at_start();
-    boot::at_start();
-    // Fonts are read before the first picture needs them.
-    std::thread::spawn(image::preload);
-    // So are the syntaxes, before the first code is colored.
-    std::thread::spawn(highlight::preload);
+    // What Sonny does as it starts, done once.
+    if !held {
+        // The program this window runs, so one installed over it later is
+        // seen and reopened on.
+        update::note_started();
+        // Before the daemon and its companions start on this build.
+        upgrade::at_start(&options.store);
+        // Before any lead is made, so its instructions list the skills.
+        skills::install_own();
+        trigger::at_start();
+        home::at_start();
+        boot::at_start();
+        // Fonts are read before the first picture needs them.
+        std::thread::spawn(image::preload);
+        // So are the syntaxes, before the first code is colored.
+        std::thread::spawn(highlight::preload);
+    }
     let (client, mut events, companions) = match Client::connect(&options.socket).await {
         Ok((client, events)) => (client, events, Companions::Add),
         Err(error) => {
+            // What starting the daemon says, and asks, is said on the
+            // terminal's own screen, as before the first window.
+            let_screen_go();
             // Starting replaces an older daemon, which takes a moment while
             // the new one opens the store; the screen is not up yet to say so.
             if older_daemon(&error) {
@@ -4072,15 +4134,33 @@ async fn run() -> Result<(), String> {
         trigger::cleanup_by_default(&bot, &options.store, &options.socket);
     }
 
-    enable_raw_mode().map_err(|e| e.to_string())?;
-    term::detect();
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    keys_apart(true);
-    own_screen(true);
+    // The screen, the terminal asked what it draws, once: a window opened
+    // in another's place keeps them.
+    let held = SCREEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
+    if !held {
+        enable_raw_mode().map_err(|e| e.to_string())?;
+        SCREEN_HELD.store(true, std::sync::atomic::Ordering::Relaxed);
+        term::detect();
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+        keys_apart(true);
+        own_screen(true);
+    }
     let mut terminal = Terminal::new(frames::Backend::screen()).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
-    let _ = wipe(&mut terminal);
+    if !held {
+        let _ = wipe(&mut terminal);
+    }
     let mut app = App::new(client, &name, &bot, options.clone());
+    // The window this one opened in place of stays on the screen until
+    // this one's first frame clears it and draws whole, in one update; its
+    // **Projects** open on what it read.
+    if held {
+        app.stale = true;
+        app.projects_kept = PROJECTS_LEFT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
     app.context = caught.context;
     app.window = caught.window;
     app.compacted = caught.compacted.clone();
@@ -4283,26 +4363,23 @@ async fn run() -> Result<(), String> {
     if app.switch_to.is_some() || app.reopen_on.is_some() {
         app.all_ready().await;
     }
-    let _ = wipe(&mut terminal);
-    own_screen(false);
-    keys_apart(false);
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-    term::restore();
-    let _ = disable_raw_mode();
+    // `/switch NAME` or `/new`: the next window opens on the screen this
+    // one leaves as it is.
+    if result.is_err() || app.switch_to.is_none() {
+        let _ = wipe(&mut terminal);
+        let_screen_go();
+    }
     report_status("clear", &name);
-    // `/switch NAME` or `/new`: this window becomes that agent's Sonny, as
-    // if opened on it.
+    // `/switch NAME` or `/new`: that agent's window opens in this one's
+    // place, in this same process, as if Sonny were opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
-        use std::os::unix::process::CommandExt;
-        // This process goes on as the other agent's Sonny, in this same
-        // terminal: this window, as its project knows it, is closed, and
-        // where it is goes on to the next.
+        // This window, as its project knows it, is closed, and where it is
+        // goes on to the next.
         let mut place = None;
         if let Some(marker) = &app.marker {
             marker.retire();
             place = marker.known();
         }
-        let me = named::me().map_err(|e| e.to_string())?;
         // Named by --agent, whatever folder this window is in.
         let mut args = reopen(&other).split_off(1);
         if let Some(at) = args.iter().position(|arg| arg == "--lead") {
@@ -4324,11 +4401,17 @@ async fn run() -> Result<(), String> {
         if let Some(draft) = &draft {
             args.extend(["--draft-file".into(), draft.display().to_string()]);
         }
-        let error = std::process::Command::new(me).args(&args).exec();
-        for kept in [&first, &draft].into_iter().flatten() {
-            let _ = std::fs::remove_file(kept);
+        // The next window's own arguments, as a Sonny started on it has.
+        let mut given = vec![std::env::args().next().unwrap_or_else(|| "sonny".into())];
+        given.extend(args);
+        *ARGS.lock().unwrap_or_else(|e| e.into_inner()) = given;
+        // What **Projects** read goes on to it; a read under way ends here.
+        if let Some(mut kept) = app.projects_kept.take() {
+            kept.job = None;
+            kept.state.writing = None;
+            *PROJECTS_LEFT.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
         }
-        return Err(format!("could not open {other}: {error}"));
+        return Ok(true);
     }
     // Sonny was upgraded while this window was open: it goes on as the new
     // Sonny, in this same terminal, on the same agent, with what was typed.
@@ -4361,7 +4444,7 @@ async fn run() -> Result<(), String> {
             program.display()
         ));
     }
-    result
+    result.map(|()| false)
 }
 
 /// Keeps `brief`, a new lead's first message, in a file of the person's
