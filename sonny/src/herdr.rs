@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -79,7 +79,8 @@ struct Presence {
     named: AtomicBool,
 }
 
-static PRESENCE: OnceLock<Presence> = OnceLock::new();
+/// The window's, each `/switch` opens in its place announcing its own.
+static PRESENCE: Mutex<Option<Arc<Presence>>> = Mutex::new(None);
 
 /// Who reports the bot's state, and who its name in the panel.
 const SOURCE: &str = "sonny";
@@ -102,7 +103,7 @@ pub fn announce(bot: &str, resume: Vec<String>) {
         return;
     };
     let short = bot.split_once('.').map_or(bot, |(_, name)| name);
-    let _ = PRESENCE.set(Presence {
+    let presence = Arc::new(Presence {
         bin,
         pane,
         shown: format!("Sonny: {short}"),
@@ -113,6 +114,7 @@ pub fn announce(bot: &str, resume: Vec<String>) {
         seq: AtomicU64::new(0),
         named: AtomicBool::new(false),
     });
+    *PRESENCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(presence);
 }
 
 /// Tell Herdr the bot's state, as `App::tab_status` names it: `working`,
@@ -120,14 +122,15 @@ pub fn announce(bot: &str, resume: Vec<String>) {
 /// input), or `clear` as Sonny quits. In the background, so Herdr never
 /// slows Sonny down, except for the last, which Sonny waits on briefly.
 pub fn report(state: &str) {
-    if let Some(presence) = PRESENCE.get() {
+    let presence = PRESENCE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(presence) = presence {
         presence.report(state);
     }
 }
 
 impl Presence {
     /// The report, in the background but for `clear`: its thread, to wait on.
-    fn report(&'static self, state: &str) -> Option<std::thread::JoinHandle<()>> {
+    fn report(self: Arc<Self>, state: &str) -> Option<std::thread::JoinHandle<()>> {
         let seq = self.next().to_string();
         let common = ["--source", SOURCE, "--agent", SOURCE, "--seq", &seq];
         if state == "clear" {
@@ -957,7 +960,7 @@ if out is not None:
     #[test]
     fn sonny_tells_herdr_how_its_bot_is_doing_and_how_to_reopen_it() {
         let (bin, dir) = fake("presence", json!({"n": 0, "workspaces": [], "panes": []}));
-        let me: &'static Presence = Box::leak(Box::new(Presence {
+        let me = Arc::new(Presence {
             bin,
             pane: "w1:p2".into(),
             shown: "Sonny: fix-cart".into(),
@@ -971,11 +974,11 @@ if out is not None:
             no_resume: AtomicBool::new(false),
             seq: AtomicU64::new(0),
             named: AtomicBool::new(false),
-        }));
+        });
         for state in ["working", "blocked", "asking", "done"] {
-            me.report(state).unwrap().join().unwrap();
+            me.clone().report(state).unwrap().join().unwrap();
         }
-        assert!(me.report("clear").is_none());
+        assert!(me.clone().report("clear").is_none());
         let calls = calls(&dir);
         let flag = |call: &[String], name: &str| {
             let at = call.iter().position(|a| a == name)?;
@@ -1038,7 +1041,7 @@ if out is not None:
             "before-resume",
             json!({"n": 0, "workspaces": [], "panes": [], "before_resume": true}),
         );
-        let me: &'static Presence = Box::leak(Box::new(Presence {
+        let me = Arc::new(Presence {
             bin,
             pane: "w1:p2".into(),
             shown: "Sonny: lead".into(),
@@ -1048,9 +1051,9 @@ if out is not None:
             no_resume: AtomicBool::new(false),
             seq: AtomicU64::new(0),
             named: AtomicBool::new(false),
-        }));
+        });
         for state in ["working", "idle"] {
-            me.report(state).unwrap().join().unwrap();
+            me.clone().report(state).unwrap().join().unwrap();
         }
         let what: Vec<(String, bool)> = calls(&dir)
             .iter()

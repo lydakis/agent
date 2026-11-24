@@ -323,6 +323,51 @@ const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 const TEMP_READ: Duration = Duration::from_secs(30);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether this process holds the screen: raw, on the alternate screen,
+/// the terminal asked what it draws. Held from the first window's start
+/// to Sonny's end, through each window `/switch` opens in another's place
+/// ([`run`]), as Codex keeps its screen from one session to the next.
+static SCREEN_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// This window's arguments, the program first: the process's own, then
+/// those of each window `/switch` opened in its place, as a Sonny started
+/// with them would have them.
+static ARGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// What **Projects** read in the window `/switch` left, for the window it
+/// opened in its place: its page opens on them.
+static PROJECTS_LEFT: std::sync::Mutex<Option<Box<ProjectsKept>>> = std::sync::Mutex::new(None);
+
+/// [`ARGS`]: the process's own until a window opened in another's place.
+fn args() -> Vec<String> {
+    let args = ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    match args.is_empty() {
+        true => std::env::args().collect(),
+        false => args.clone(),
+    }
+}
+
+/// What the window that ended freed, given back to the system as the next
+/// opens in its place, as its process ending gave it back when the next
+/// one replaced it: glibc keeps what its threads freed until asked.
+fn give_back() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: it only hands free pages back; nothing in use moves.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// The screen given back as Sonny ends, or before it says why it could
+/// not open: off the alternate screen, keys and paste as they were.
+fn let_screen_go() {
+    if !SCREEN_HELD.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    own_screen(false);
+    keys_apart(false);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    term::restore();
+    let _ = disable_raw_mode();
+}
 /// Into the alternate screen with the mouse, which Sonny owns while it
 /// runs, or out of it, the keys told apart on the screen it is on, and the
 /// terminal's colour-scheme reports heard while it is there.
@@ -691,6 +736,9 @@ struct ProjectsState {
     took_kept: bool,
     /// What the last read keeps beside the store, being written.
     writing: Option<tokio::task::JoinHandle<()>>,
+    /// The mark of every project as last kept beside the store, those
+    /// counted again at each read among them: kept again once it moves.
+    shown: u64,
 }
 
 /// What **Projects** counted, kept by the window once the page closes: the
@@ -784,13 +832,16 @@ impl App {
                 }
                 *kept
             }
-            // The projects as any window last counted them show at once,
-            // those another build counted too: this one counts each again.
+            // The projects as any window last showed them show at once,
+            // every one, those another build counted too: this one counts
+            // again each that may have moved since.
             None => {
                 let store = self.store();
-                let (mut each, this_build) = take_projects(&store, self.client.identity());
-                let shown: Vec<projects::Project> =
-                    (each.values()).map(|read| read.project.clone()).collect();
+                let (mut each, mut shown, this_build) =
+                    take_projects(&store, self.client.identity());
+                if shown.is_empty() {
+                    shown = (each.values()).map(|read| read.project.clone()).collect();
+                }
                 if !shown.is_empty() {
                     view.set(shown, now_ms());
                 }
@@ -1190,7 +1241,7 @@ async fn read_projects(
     // here: each one that moved since is counted again.
     if !state.took_kept {
         state.took_kept = true;
-        if let (each, true) = take_projects(&kept, identity) {
+        if let (each, _, true) = take_projects(&kept, identity) {
             for (lead, read) in each {
                 state.each.entry(lead).or_insert(read);
             }
@@ -1211,6 +1262,9 @@ async fn read_projects(
     let mut was = std::mem::take(&mut state.each);
     // Whether a project was counted to another mark than it was kept with.
     let mut moved = false;
+    // Every project's mark, those counted again at every read among them:
+    // what the page showed, kept beside the store once it moves.
+    let mut shown = std::hash::DefaultHasher::new();
     // Each agent under the lead it answers to, so a folder with two leads
     // counts each agent in one row: counted once for every project.
     let makers: HashMap<&str, &str> = (listed.iter())
@@ -1239,6 +1293,7 @@ async fn read_projects(
             .collect();
         let titled = titles.named(&lead.name, lead.bot_id, lead.workspace.as_deref());
         let mark = project_mark(&theirs, &asking, titled.as_deref());
+        std::hash::Hash::hash(&(&lead.name, mark), &mut shown);
         let keeps = !theirs
             .iter()
             .any(|agent| agent.running_turn.is_some() || agent.name == bot);
@@ -1331,12 +1386,20 @@ async fn read_projects(
         }
     }
     // The projects as counted, for the next page in any window, once one
-    // moved or went, written beside the page, which shows them at once.
-    if moved || !was.is_empty() {
+    // moved or went, written beside the page, which shows them at once:
+    // every one as shown, those it counts again too (one that works, the
+    // window's own), so the next page opens whole.
+    let shown = std::hash::Hasher::finish(&shown);
+    let showing = whole && shown != state.shown;
+    if moved || !was.is_empty() || showing {
+        if whole {
+            state.shown = shown;
+        }
         let each = state.each.clone();
         let identity = identity.map(str::to_owned);
+        let found = found.clone();
         state.writing = Some(tokio::task::spawn_blocking(move || {
-            keep_projects(&kept, identity.as_deref(), &each);
+            keep_projects(&kept, identity.as_deref(), &each, &found);
         }));
     }
     Some((found, whole))
@@ -1384,39 +1447,48 @@ fn projects_file(store: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The projects as **Projects** last read them in any window, by lead,
-/// from the daemon's store `identity` names, and whether this build read
-/// them ([`reads_build`]): another build's are shown, not reused, as it
-/// may read a project otherwise.
+/// from the daemon's store `identity` names; every project as it last
+/// showed them, those counted again at every read among them; and
+/// whether this build read them ([`reads_build`]): another build's are
+/// shown, not reused, as it may read a project otherwise.
 fn take_projects(
     store: &std::path::Path,
     identity: Option<&str>,
-) -> (HashMap<String, ProjectRead>, bool) {
+) -> (HashMap<String, ProjectRead>, Vec<projects::Project>, bool) {
     #[derive(serde::Deserialize)]
     struct Kept {
         build: String,
         store: String,
         each: HashMap<String, ProjectRead>,
+        #[serde(default)]
+        shown: Vec<projects::Project>,
     }
     std::fs::read(projects_file(store))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
         .filter(|kept| kept.store == identity.unwrap_or(""))
-        .map(|kept| (kept.each, kept.build == reads_build(identity)))
+        .map(|kept| {
+            let this_build = kept.build == reads_build(identity);
+            (kept.each, kept.shown, this_build)
+        })
         .unwrap_or_default()
 }
 
-/// Keep the projects as read for the next page, in any window: all but
-/// those a workflow's run shows in, whose strip is read live.
+/// Keep the projects as read for the next page, in any window: to reuse,
+/// all but those a workflow's run shows in, whose strip is read live; to
+/// show until the next read lands, every one as `shown`.
 fn keep_projects(
     store: &std::path::Path,
     identity: Option<&str>,
     each: &HashMap<String, ProjectRead>,
+    shown: &[projects::Project],
 ) {
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
         store: &'a str,
         each: HashMap<&'a String, &'a ProjectRead>,
+        shown: &'a [projects::Project],
     }
     let kept = Kept {
         build: reads_build(identity),
@@ -1426,6 +1498,7 @@ fn keep_projects(
                 (read.project.agents.listed.iter()).all(|agent| agent.run.is_none())
             })
             .collect(),
+        shown,
     };
     if let Ok(bytes) = serde_json::to_vec(&kept) {
         keep_beside(&projects_file(store), &bytes);
@@ -3464,7 +3537,7 @@ fn daemon_paths(
 }
 
 fn parse() -> Result<Options, String> {
-    let args = std::env::args().skip(1);
+    let args = args().into_iter().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
@@ -3537,7 +3610,8 @@ fn parse() -> Result<Options, String> {
 /// with the daemon the environment named.
 fn reopen(bot: &str) -> Vec<String> {
     let mut command = vec!["sonny".to_owned()];
-    let mut args = std::env::args().skip(1).peekable();
+    let given = args();
+    let mut args = given.iter().skip(1).cloned().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" | "--reopened" | "--land" => {}
@@ -3551,7 +3625,7 @@ fn reopen(bot: &str) -> Vec<String> {
             _ => command.push(arg),
         }
     }
-    let named = std::env::args().any(|arg| arg == "--agent");
+    let named = given.iter().any(|arg| arg == "--agent");
     // A lead by its name, the first one too, so a pane restored later
     // opens the same lead, whichever the folder opens by then.
     match project::lead_project(bot) {
@@ -3728,12 +3802,29 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
         _ => {
             agent_client::name_program("window");
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())
-                .and_then(|runtime| runtime.block_on(run()))
+            // Each window on a runtime of its own: what it left running
+            // ends with it, as when the next one replaced the process; the
+            // screen, the keys and the terminal's answers stay.
+            loop {
+                let opened = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|runtime| {
+                        let opened = runtime.block_on(run());
+                        runtime.shutdown_background();
+                        opened
+                    });
+                match opened {
+                    Ok(true) => give_back(),
+                    Ok(false) => break Ok(()),
+                    Err(error) => {
+                        let_screen_go();
+                        break Err(error);
+                    }
+                }
+            }
         }
     };
     match result {
@@ -3959,33 +4050,43 @@ fn status_said(project: &str, title: Option<&str>, rows: &[status::Row], as_json
         .join("\n")
 }
 
-async fn run() -> Result<(), String> {
+/// A window, on the agent its arguments name ([`ARGS`]): whether another
+/// opens in its place, by `/switch`, once it ends.
+async fn run() -> Result<bool, String> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
         match option_env!("SONNY_COMMIT") {
             Some(commit) => println!("sonny {} ({commit})", env!("CARGO_PKG_VERSION")),
             None => println!("sonny {}", env!("CARGO_PKG_VERSION")),
         }
-        return Ok(());
+        return Ok(false);
     }
-    // The program this window runs, so one installed over it later is
-    // seen and reopened on.
-    update::note_started();
+    // Opened by `/switch` in the place of a window still on the screen.
+    let held = SCREEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
-    // Before the daemon and its companions start on this build.
-    upgrade::at_start(&options.store);
-    // Before any lead is made, so its instructions list the skills.
-    skills::install_own();
-    trigger::at_start();
-    home::at_start();
-    boot::at_start();
-    // Fonts are read before the first picture needs them.
-    std::thread::spawn(image::preload);
-    // So are the syntaxes, before the first code is colored.
-    std::thread::spawn(highlight::preload);
+    // What Sonny does as it starts, done once.
+    if !held {
+        // The program this window runs, so one installed over it later is
+        // seen and reopened on.
+        update::note_started();
+        // Before the daemon and its companions start on this build.
+        upgrade::at_start(&options.store);
+        // Before any lead is made, so its instructions list the skills.
+        skills::install_own();
+        trigger::at_start();
+        home::at_start();
+        boot::at_start();
+        // Fonts are read before the first picture needs them.
+        std::thread::spawn(image::preload);
+        // So are the syntaxes, before the first code is colored.
+        std::thread::spawn(highlight::preload);
+    }
     let (client, mut events, companions) = match Client::connect(&options.socket).await {
         Ok((client, events)) => (client, events, Companions::Add),
         Err(error) => {
+            // What starting the daemon says, and asks, is said on the
+            // terminal's own screen, as before the first window.
+            let_screen_go();
             // Starting replaces an older daemon, which takes a moment while
             // the new one opens the store; the screen is not up yet to say so.
             if older_daemon(&error) {
@@ -4055,15 +4156,33 @@ async fn run() -> Result<(), String> {
         trigger::cleanup_by_default(&bot, &options.store, &options.socket);
     }
 
-    enable_raw_mode().map_err(|e| e.to_string())?;
-    term::detect();
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    keys_apart(true);
-    own_screen(true);
+    // The screen, the terminal asked what it draws, once: a window opened
+    // in another's place keeps them.
+    let held = SCREEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
+    if !held {
+        enable_raw_mode().map_err(|e| e.to_string())?;
+        SCREEN_HELD.store(true, std::sync::atomic::Ordering::Relaxed);
+        term::detect();
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+        keys_apart(true);
+        own_screen(true);
+    }
     let mut terminal = Terminal::new(frames::Backend::screen()).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
-    let _ = wipe(&mut terminal);
+    if !held {
+        let _ = wipe(&mut terminal);
+    }
     let mut app = App::new(client, &name, &bot, options.clone());
+    // The window this one opened in place of stays on the screen until
+    // this one's first frame clears it and draws whole, in one update; its
+    // **Projects** open on what it read.
+    if held {
+        app.stale = true;
+        app.projects_kept = PROJECTS_LEFT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
     app.context = caught.context;
     app.window = caught.window;
     app.compacted = caught.compacted.clone();
@@ -4268,26 +4387,23 @@ async fn run() -> Result<(), String> {
     if app.switch_to.is_some() || app.reopen_on.is_some() {
         app.all_ready().await;
     }
-    let _ = wipe(&mut terminal);
-    own_screen(false);
-    keys_apart(false);
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-    term::restore();
-    let _ = disable_raw_mode();
+    // `/switch NAME` or `/new`: the next window opens on the screen this
+    // one leaves as it is.
+    if result.is_err() || app.switch_to.is_none() {
+        let _ = wipe(&mut terminal);
+        let_screen_go();
+    }
     report_status("clear", &name);
-    // `/switch NAME` or `/new`: this window becomes that agent's Sonny, as
-    // if opened on it.
+    // `/switch NAME` or `/new`: that agent's window opens in this one's
+    // place, in this same process, as if Sonny were opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
-        use std::os::unix::process::CommandExt;
-        // This process goes on as the other agent's Sonny, in this same
-        // terminal: this window, as its project knows it, is closed, and
-        // where it is goes on to the next.
+        // This window, as its project knows it, is closed, and where it is
+        // goes on to the next.
         let mut place = None;
         if let Some(marker) = &app.marker {
             marker.retire();
             place = marker.known();
         }
-        let me = named::me().map_err(|e| e.to_string())?;
         // Named by --agent, whatever folder this window is in.
         let mut args = reopen(&other).split_off(1);
         if let Some(at) = args.iter().position(|arg| arg == "--lead") {
@@ -4312,11 +4428,17 @@ async fn run() -> Result<(), String> {
         if app.land_after {
             args.push("--land".into());
         }
-        let error = std::process::Command::new(me).args(&args).exec();
-        for kept in [&first, &draft].into_iter().flatten() {
-            let _ = std::fs::remove_file(kept);
+        // The next window's own arguments, as a Sonny started on it has.
+        let mut given = vec![std::env::args().next().unwrap_or_else(|| "sonny".into())];
+        given.extend(args);
+        *ARGS.lock().unwrap_or_else(|e| e.into_inner()) = given;
+        // What **Projects** read goes on to it; a read under way ends here.
+        if let Some(mut kept) = app.projects_kept.take() {
+            kept.job = None;
+            kept.state.writing = None;
+            *PROJECTS_LEFT.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
         }
-        return Err(format!("could not open {other}: {error}"));
+        return Ok(true);
     }
     // Sonny was upgraded while this window was open: it goes on as the new
     // Sonny, in this same terminal, on the same agent, with what was typed.
@@ -4349,7 +4471,7 @@ async fn run() -> Result<(), String> {
             program.display()
         ));
     }
-    result
+    result.map(|()| false)
 }
 
 /// Keeps `brief`, a new lead's first message, in a file of the person's
@@ -30810,8 +30932,12 @@ mod tests {
         let found = page(&client, &store, &asked, &listed, &["alpha.one"], &mut fresh).await;
         assert_eq!(found, ["alpha.lead"]);
         assert_eq!(fresh.each.keys().collect::<Vec<_>>(), ["alpha.lead"]);
-        let (kept, this_build) = take_projects(&store, client.identity());
+        let (kept, shown, this_build) = take_projects(&store, client.identity());
         assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
+        assert_eq!(
+            shown.iter().map(|p| &p.lead).collect::<Vec<_>>(),
+            ["alpha.lead"]
+        );
         assert!(this_build);
         // Another build's projects show, but are not reused; another
         // store's are not taken.
@@ -30819,7 +30945,7 @@ mod tests {
         let mut written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         written["build"] = json!("0.0.0 older");
         std::fs::write(&file, written.to_string()).unwrap();
-        let (kept, this_build) = take_projects(&store, client.identity());
+        let (kept, _, this_build) = take_projects(&store, client.identity());
         assert_eq!(kept.keys().collect::<Vec<_>>(), ["alpha.lead"]);
         assert!(!this_build);
         let mut other = ProjectsState::default();
@@ -30828,6 +30954,96 @@ mod tests {
         written["store"] = json!("another store");
         std::fs::write(&file, written.to_string()).unwrap();
         assert!(take_projects(&store, client.identity()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_next_window_shows_every_project_at_once_those_working_and_its_own_too() {
+        let client = daemon_answering(|_| json!({"approvals": [], "nodes": [], "items": []})).await;
+        let home = std::env::temp_dir().join(unique("projects-shown"));
+        let store = home.join("state.sqlite");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = |name: &str, id: i64, maker: Option<&str>, running: bool| {
+            Arc::new(standing::Agent {
+                name: name.into(),
+                bot_id: Some(id),
+                head: Some(1),
+                running_turn: running.then_some(1),
+                created_by: maker.map(str::to_owned),
+                workspace: Some(
+                    home.join(name.split('.').next().unwrap())
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            })
+        };
+        // The window's own project, one whose task works and a quiet one.
+        let mut listed = vec![
+            agent("own.lead", 1, None, false),
+            agent("busy.lead", 2, None, false),
+            agent("busy.one", 3, Some("busy.lead"), true),
+            agent("quiet.lead", 4, None, false),
+        ];
+        let waiting = Default::default();
+        let mut state = ProjectsState::default();
+        read_projects(
+            &client,
+            &store,
+            &listed,
+            "own.lead",
+            &[],
+            &[],
+            &waiting,
+            &mut state,
+        )
+        .await
+        .unwrap();
+        state.writing.take().unwrap().await.unwrap();
+        // Only the quiet one is reused; every one shows.
+        let (each, shown, _) = take_projects(&store, client.identity());
+        assert_eq!(each.keys().collect::<Vec<_>>(), ["quiet.lead"]);
+        let mut leads: Vec<&str> = shown.iter().map(|p| p.lead.as_str()).collect();
+        leads.sort();
+        assert_eq!(leads, ["busy.lead", "own.lead", "quiet.lead"]);
+        let busy = shown.iter().find(|p| p.lead == "busy.lead").unwrap();
+        assert_eq!(busy.counts.of(status::Group::Working), 1);
+        // Read again with nothing moved: nothing is written again.
+        read_projects(
+            &client,
+            &store,
+            &listed,
+            "own.lead",
+            &[],
+            &[],
+            &waiting,
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(state.writing.is_none());
+        // The task ends: what shows is kept again.
+        Arc::make_mut(&mut listed[2]).running_turn = None;
+        read_projects(
+            &client,
+            &store,
+            &listed,
+            "own.lead",
+            &[],
+            &[],
+            &waiting,
+            &mut state,
+        )
+        .await
+        .unwrap();
+        state.writing.take().unwrap().await.unwrap();
+        let (_, shown, _) = take_projects(&store, client.identity());
+        let busy = shown.iter().find(|p| p.lead == "busy.lead").unwrap();
+        assert_eq!(busy.counts.of(status::Group::Working), 0);
+        // A new window's page opens on them all before any read.
+        let mut app = app(client.clone());
+        app.options.store = store.clone();
+        app.open_projects().await;
+        assert_eq!(app.projects.as_ref().unwrap().view.projects().len(), 3);
     }
 
     #[tokio::test]
