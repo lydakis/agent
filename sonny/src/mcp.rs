@@ -925,6 +925,7 @@ sonny mcp add NAME --url URL [--bearer-token-env-var VAR] [--description TEXT]
 sonny mcp remove NAME
 sonny mcp import [--yes | --json]
 sonny mcp tool
+sonny mcp exec (SCRIPT | -)
 sonny mcp events NAME [CONFIG]";
 
 /// `sonny mcp`: the person's servers, as `codex mcp` keeps Codex's, in
@@ -1013,6 +1014,30 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         // `mcp.NAME` runs it.
         Some((verb, [name, config @ ..])) if verb == "events" && config.len() <= 1 => {
             crate::mcp_events::cli(name, config.first().map(String::as_str))
+        }
+        // A script against the servers, outside any agent, as a source's
+        // command runs one: each server on one connection for the whole
+        // script. From stdin when it is `-`.
+        Some((verb, [script])) if verb == "exec" => {
+            let script = match script.as_str() {
+                "-" => {
+                    let mut read = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut read)
+                        .map_err(|e| format!("reading the script: {e}"))?;
+                    read
+                }
+                script => script.to_owned(),
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(async {
+                    let hub = Hub::for_person();
+                    let ran = crate::exec::printed(&hub, &script).await;
+                    hub.stop().await;
+                    ran
+                })
         }
         Some((verb, [name])) if verb == "remove" => {
             let servers = agent_client::config::read(&path)?.sonny.mcp_servers;

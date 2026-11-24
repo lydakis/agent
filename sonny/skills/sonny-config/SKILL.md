@@ -37,6 +37,9 @@ each setting is; what to set is the person's call.
 - `[sonny.sources.NAME]` in the config: news from outside for the lookout,
   a `command` run `every` so often. Each line it prints is an event; `text`
   is what subscribers read, and a line without it is delivered whole.
+  A command that calls the person's MCP servers runs its script with
+  `sonny mcp exec - < FILE`: every call on one connection to each server,
+  each `text()` a line.
 - `[sonny.permissions.NAME]` in the config: a `/permissions` row of the
   person's own, as Codex's permission profiles: the row it `extends`
   (`auto`, the default, `ask` or `read-only`), then what it changes:
