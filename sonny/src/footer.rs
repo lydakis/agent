@@ -99,6 +99,20 @@ pub fn count(mark: Span<'static>, n: usize, goes: bool) -> Vec<Vec<Span<'static>
     forms
 }
 
+/// A cell drawn already on a beat, as [`beat`] makes a span: a card's
+/// mark brought into view beats as the footer's `?` does.
+pub fn beat_cell(cell: &mut ratatui::buffer::Cell) {
+    let color = match cell.fg {
+        Color::Reset => Color::Yellow,
+        color => color,
+    };
+    cell.set_style(
+        Style::new()
+            .fg(color)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+    );
+}
+
 /// A span of a count on a beat of its pulse: reversed in its hue, as
 /// wide as at rest so nothing beside it moves.
 pub fn beat(span: &mut Span<'static>) {

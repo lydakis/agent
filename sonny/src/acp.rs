@@ -93,6 +93,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         send: None,
         draft: None,
         reopened: false,
+        land: false,
     };
     let agent = Arc::new(Agent {
         out: Arc::new(Out::default()),

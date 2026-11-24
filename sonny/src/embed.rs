@@ -36,7 +36,7 @@ pub struct Embedded {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     size: (u16, u16),
     copied: Arc<Mutex<Vec<String>>>,
-    opened: Arc<Mutex<Option<String>>>,
+    opened: Arc<Mutex<Option<(String, bool)>>>,
     /// The program gave the keys back since last asked ([`give_back`]).
     left: Arc<AtomicBool>,
     /// The program asked for color-scheme reports (mode 2031).
@@ -143,11 +143,15 @@ impl Embedded {
                                 copies.push(text);
                             }
                         }
-                        Piece::Opens(bot) => {
+                        Piece::Opens(asked) => {
+                            let (bot, land) = match asked.strip_suffix(LAND) {
+                                Some(bot) => (bot, true),
+                                None => (asked, false),
+                            };
                             if let Some(bot) = agent_name(bot)
                                 && let Ok(mut opened) = opens.lock()
                             {
-                                *opened = Some(bot);
+                                *opened = Some((bot, land));
                             }
                         }
                     }
@@ -192,8 +196,9 @@ impl Embedded {
     }
 
     /// The agent the program, an agent's Sonny, asked to show in its
-    /// place since last asked ([`open_here`]), if it asked.
-    pub fn opened(&self) -> Option<String> {
+    /// place since last asked ([`open_here`]), if it asked, and whether it
+    /// lands on what that agent needs.
+    pub fn opened(&self) -> Option<(String, bool)> {
         self.opened.lock().ok().and_then(|mut opened| opened.take())
     }
 
@@ -440,6 +445,9 @@ const MOST_COPIED: usize = 8 << 20;
 /// to show another agent there instead (`/switch` in the pane): an OSC of
 /// Sonny's own, `OPEN` `AGENT` and ST, which no terminal reads.
 const OPEN: &[u8] = b"\x1b]7700;open=";
+/// After the agent's name in an [`OPEN`]: it lands on what the agent
+/// needs, as one gone to from its row in `/status` or by `alt+n` does.
+const LAND: &[u8] = b";land";
 /// The longest agent name an [`OPEN`] carries.
 const MOST_OPENED: usize = 256;
 
@@ -466,17 +474,22 @@ pub fn give_back() {
 pub static GAVE_BACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Asks the Sonny this one is drawn in to show `bot` in its place, as
-/// a click on an agent's name opens it there; a terminal ignores it.
-pub fn open_here(bot: &str) {
+/// a click on an agent's name opens it there, landing on what it needs
+/// with `land`; a terminal ignores it.
+pub fn open_here(bot: &str, land: bool) {
+    let land = match land {
+        true => ";land",
+        false => "",
+    };
     // A test says nothing to the terminal it is run in: what it asked is
     // kept for it to read.
     #[cfg(test)]
     if let Ok(mut asked) = OPENED_HERE.lock() {
-        asked.push(bot.to_owned());
+        asked.push(format!("{bot}{land}"));
         return;
     }
     let mut stdout = std::io::stdout();
-    let _ = write!(stdout, "\x1b]7700;open={bot}\x1b\\");
+    let _ = write!(stdout, "\x1b]7700;open={bot}{land}\x1b\\");
     let _ = stdout.flush();
 }
 
@@ -882,7 +895,7 @@ mod tests {
         let mut command = CommandBuilder::new("sh");
         command.args([
             "-c",
-            "printf 'hi\\033]7700;open=shop.fix\\033\\\\'; exec sleep 30",
+            "printf 'hi\\033]7700;open=shop.fix\\033\\\\\\033]7700;open=shop.web;land\\033\\\\'; exec sleep 30",
         ]);
         let program = Embedded::spawn(command, 5, 20, || {}).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -895,7 +908,8 @@ mod tests {
                 None => panic!("never asked"),
             }
         };
-        assert_eq!(opened, "shop.fix");
+        // The last asked wins, its landing with it.
+        assert_eq!(opened, ("shop.web".to_owned(), true));
         assert_eq!(program.opened(), None);
     }
 
