@@ -618,6 +618,45 @@ pub fn moves_on(text: &str, from: Option<&str>) -> bool {
         && !crate::reactions::is_reaction(text)
         && crate::margin::closed(text).is_none()
         && crate::user_shell::read(text).is_none()
+        && !told_aside(text)
+}
+
+/// What sends [`set_aside`]'s message, as the daemon's line after it
+/// names the sender to the model: Sonny, never the person.
+pub const ASIDE_ORIGIN: &str = "sonny.asks";
+
+/// How each line of [`set_aside`]'s message starts and ends, around the
+/// question and its ID; the end says it as `/status` and `ask list` do.
+const ASIDE_OPEN: &str = "Your question \"";
+const ASIDE_CLOSE: &str = " is now set aside: the person wrote past it; a pick still answers it.";
+
+/// What the agent is told, attached to its next model call, when the
+/// person's own words ([`moves_on`]) set its open questions `open` aside:
+/// one line each, the question's first line and its ID. None when none
+/// was open. The agent decides what to do: ask again, close it, or leave
+/// it, as a pick on its card still answers it.
+pub fn set_aside(open: &[Ask]) -> Option<String> {
+    let lines: Vec<String> = (open.iter())
+        .map(|ask| {
+            let question =
+                crate::transcript::cut(ask.question.lines().next().unwrap_or(""), QUOTED);
+            format!("{ASIDE_OPEN}{question}\" ({}){ASIDE_CLOSE}", ask.id)
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Whether a message is one [`set_aside`] wrote: Sonny's words to the
+/// agent, never drawn as a message, and setting nothing aside itself.
+pub fn told_aside(text: &str) -> bool {
+    !text.is_empty()
+        && text.lines().all(|line| {
+            (line.strip_prefix(ASIDE_OPEN))
+                .and_then(|rest| rest.strip_suffix(ASIDE_CLOSE))
+                .and_then(|rest| rest.strip_suffix(')'))
+                .and_then(|rest| rest.rsplit_once("\" ("))
+                .is_some_and(|(_, id)| well_formed(id))
+        })
 }
 
 /// The ask a person's message answers, as [`id`] names it, when
@@ -2107,6 +2146,45 @@ mod tests {
         assert!(!moves_on("You asked (ask:1/a1): Keep it?\n\nYes", None));
         assert!(!moves_on("Done: tests pass", Some("tally.halves")));
         assert!(!moves_on(&crate::reactions::message("👍", None), None));
+        let ask = |id: &str, question: &str| Ask {
+            id: id.into(),
+            ..call(id, &json!({"question": question})).unwrap()
+        };
+        let told = set_aside(&[ask("ask:1/a1", "Keep it?"), ask("ask:2/b1", "Say \"go\"?")]);
+        assert!(!moves_on(told.as_deref().unwrap(), None));
+    }
+
+    #[test]
+    fn what_sets_questions_aside_tells_the_agent_one_line_each() {
+        assert_eq!(set_aside(&[]), None);
+        let mut ask = call(
+            "ask:4/c1",
+            &json!({"question": "Keep the old API?\nTwo use it."}),
+        )
+        .unwrap();
+        ask.id = "ask:4/c1".into();
+        let told = set_aside(&[
+            ask.clone(),
+            Ask {
+                id: "ask:5/c2".into(),
+                ..ask
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            told,
+            "Your question \"Keep the old API?\" (ask:4/c1) is now set aside: the person wrote \
+             past it; a pick still answers it.\nYour question \"Keep the old API?\" (ask:5/c2) \
+             is now set aside: the person wrote past it; a pick still answers it."
+        );
+        assert!(told_aside(&told));
+        // The person's own words that only look like it are theirs.
+        assert!(!told_aside(""));
+        assert!(!told_aside(&format!("{told}\nAnd one more thing.")));
+        assert!(!told_aside(
+            "Your question \"x\" (later) is now set aside: the person wrote past it; a pick \
+             still answers it."
+        ));
     }
 
     #[test]

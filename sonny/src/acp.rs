@@ -763,6 +763,10 @@ struct State {
     /// Calls put to the person, by call and request, and the lead's
     /// questions, by ask.
     asked: HashSet<String>,
+    /// Whether the bot has no question open that this thread has not
+    /// read: none asked since the person's words last set every one
+    /// aside. Until then, a prompt of theirs reads its history first.
+    asks_read: bool,
     /// The last of the bot's kept events this thread handled, to follow on
     /// from when its stream drops.
     cursor: i64,
@@ -983,6 +987,8 @@ impl Session {
             if !made || state.effort == effort {
                 state.effort = None;
             }
+            // Another bot's questions, unread.
+            state.asks_read = false;
             state.bound = Some(Bound {
                 bot,
                 bot_id,
@@ -1434,6 +1440,11 @@ impl Session {
             asked["workspace"] = json!(dir);
         }
         let client = bound.client.clone();
+        // Words of the person's own set the bot's open questions aside,
+        // as Sonny's window and every reader of its history has it: the
+        // bot is told so first, attached to the call that takes them.
+        let telling = (asks::moves_on(&text, person) && !state.asks_read)
+            .then(|| (bound.bot.clone(), bound.bot_id));
         // The lead its folder opens next in Sonny.
         project::wrote_to(bound.client.store(), &bound.workspace, &bound.bot);
         // A prompt that steers joins the turn an earlier one waits on,
@@ -1445,6 +1456,10 @@ impl Session {
                 .answer(&earlier, json!({"stopReason": "end_turn"}));
         }
         drop(state);
+        if let Some((bot, bot_id)) = telling {
+            tell_aside(&client, &bot, bot_id).await;
+            self.state.lock().await.asks_read = true;
+        }
         match client.request("submit", asked).await {
             Ok(reply) => {
                 let mut state = self.state.lock().await;
@@ -1748,6 +1763,9 @@ impl Session {
             }
             "tool_started" => {
                 let (call, name, arguments) = started_call(&client, &bot, data).await;
+                if name == asks::TOOL {
+                    state.asks_read = false;
+                }
                 state.part += 1;
                 state.streamed.clear();
                 // The bot's reaction to the person's newest message here, as
@@ -2067,7 +2085,7 @@ impl Session {
     /// newest first, only to the person's own last words: a question
     /// before those is set aside, as Sonny's window sets it aside.
     async fn questions(&self, agent: &Arc<Agent>, client: &Arc<Client>, bot: &str) {
-        for ask in open_asks(client, bot).await {
+        for ask in open_asks(client, bot, true).await {
             let bot_id = {
                 let mut state = self.state.lock().await;
                 if !state.asked.insert(ask.id.clone()) {
@@ -2211,7 +2229,7 @@ impl Session {
         if crate::resolved::done(crate::resolved::closed(task), running.is_some()) {
             return;
         }
-        for ask in open_asks(client, bot).await {
+        for ask in open_asks(client, bot, true).await {
             if !(self.state.lock().await.asked).insert(format!("{bot} {}", ask.id)) {
                 continue;
             }
@@ -2226,16 +2244,31 @@ impl Session {
     }
 }
 
-/// The questions `bot` has open with options to pick from, the oldest
-/// first, as they were asked. Read back from its history, newest first,
-/// only to the person's own last words: a question before those is set
-/// aside, as Sonny's window sets it aside.
-async fn open_asks(client: &Client, bot: &str) -> Vec<asks::Ask> {
+/// `bot` told, attached to its next model call, of the questions it has
+/// open, which the person's words about to go set aside, as Sonny's window
+/// tells it. Not told, the words go all the same.
+async fn tell_aside(client: &Client, bot: &str, bot_id: Option<i64>) {
+    let open = open_asks(client, bot, false).await;
+    if let Some(told) = asks::set_aside(&open) {
+        let attached = json!({"bot": bot, "bot_id": bot_id,
+            "request_id": crate::unique("acp"), "prompt": told, "delivery": "attach",
+            "origin": asks::ASIDE_ORIGIN});
+        let _ = client.request("submit", attached).await;
+    }
+}
+
+/// The questions `bot` has open, only those with options to pick from
+/// when `picked`, the oldest first, as they were asked. Read back from its
+/// history, newest first, only to the person's own last words: a question
+/// before those is set aside, as Sonny's window sets it aside.
+async fn open_asks(client: &Client, bot: &str, picked: bool) -> Vec<asks::Ask> {
     let (mut asked, mut open) = (asks::Asked::default(), Vec::new());
     let _ = crate::said::walk(client, bot, 0, |at, entry| {
         open.extend(
             (asked.entry(at, entry).into_iter())
-                .filter(|(ask, state)| *state == asks::State::Open && !ask.options.is_empty())
+                .filter(|(ask, state)| {
+                    *state == asks::State::Open && !(picked && ask.options.is_empty())
+                })
                 .map(|(ask, _)| ask),
         );
         asked.moved_on()
@@ -3030,6 +3063,36 @@ mod tests {
             assert_eq!(ids[..2], [person.clone(), person]);
             assert_ne!(ids[2], ids[0]);
             assert_eq!(ids[3], ids[2]);
+        }
+    }
+
+    /// The person's words past the lead's open questions tell it of each,
+    /// options or none, attached and by Sonny; one answered tells nothing.
+    #[tokio::test]
+    async fn words_past_the_leads_questions_tell_it_each_set_aside() {
+        for answered in [true, false] {
+            let submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = submitted.clone();
+            let mut history = crate::tests::asked_history(answered, true);
+            // The later question is a step: no options.
+            history[1].2["arguments"] = json!(json!({"question": "Tag it?"}).to_string());
+            let client = crate::tests::daemon_answering(move |request| {
+                if let Some(read) = crate::tests::history_read(&history, request) {
+                    return read;
+                }
+                seen.lock().unwrap().push(request.clone());
+                json!({"message": 22, "status": "attached"})
+            })
+            .await;
+            tell_aside(&client, "shop.lead", Some(1)).await;
+            let submitted = submitted.lock().unwrap();
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0]["delivery"], "attach");
+            assert_eq!(submitted[0]["origin"], asks::ASIDE_ORIGIN);
+            let told = submitted[0]["prompt"].as_str().unwrap();
+            assert!(asks::told_aside(told));
+            assert_eq!(told.contains("(ask:4/c1)"), !answered);
+            assert!(told.contains("\"Tag it?\" (ask:6/c2)"));
         }
     }
 

@@ -6577,6 +6577,10 @@ struct App {
     /// The asks this window answered and closed, by call, until their
     /// answers land.
     sent_answers: Vec<String>,
+    /// The agent's own open questions a message from here told it were
+    /// set aside ([`asks::set_aside`]), by id, while they are still open
+    /// here: told once, though more messages go before that one lands.
+    told_aside: Vec<String>,
     /// The tasks' asks this window answered, by [`asks::Ask::key`], until
     /// their tasks read them: none is pinned again meanwhile.
     task_answers: Vec<TaskAnswer>,
@@ -8889,6 +8893,7 @@ impl App {
             watched: HashMap::new(),
             watched_at: None,
             sent_answers: Vec::new(),
+            told_aside: Vec::new(),
             task_answers: Vec::new(),
             rechecking: None,
             settling: None,
@@ -13808,6 +13813,7 @@ impl App {
                     // the reply: no hint hangs on either.
                     let steer = item["role"] == "user"
                         && !reactions::is_reaction(&text(&item))
+                        && !asks::told_aside(&text(&item))
                         && turns
                             .get(&node)
                             .is_some_and(|turn| turns.get(&at) == Some(turn));
@@ -13820,6 +13826,9 @@ impl App {
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
                     (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
+                    // What Sonny told the agent of its questions set
+                    // aside: the cards say it.
+                    (_, Some("user")) if asks::told_aside(&text(&item)) => {}
                     // The person took a note away: the margin shows it.
                     (_, Some("user")) if margin::closed(&text(&item)).is_some() => {
                         self.note_closed(node, &text(&item));
@@ -20001,6 +20010,7 @@ impl App {
         let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
+        let aside = self.tell_aside(&prompt, origin);
         // Shown where it will land while it goes, under a number of its own.
         self.unsent_rows += 1;
         let sending = -self.unsent_rows;
@@ -20016,7 +20026,29 @@ impl App {
             submitted,
             then,
             pick,
+            aside,
         }
+    }
+
+    /// What the agent is told with `prompt`, sent from `origin`, when its
+    /// words set the agent's own open questions aside, as every reader of
+    /// its history will ([`asks::moves_on`]): its tasks' wait on the
+    /// person still. Each question is told once.
+    fn tell_aside(&mut self, prompt: &str, origin: Option<&str>) -> Option<String> {
+        let own = |ask: &&asks::Ask| ask.task.is_none();
+        let open: Vec<&asks::Ask> = self.asks.iter().filter(own).collect();
+        self.told_aside
+            .retain(|told| open.iter().any(|ask| ask.id == *told));
+        if !asks::moves_on(prompt, origin) {
+            return None;
+        }
+        let untold: Vec<asks::Ask> = (open.into_iter())
+            .filter(|ask| !self.told_aside.contains(&ask.id))
+            .cloned()
+            .collect();
+        self.told_aside
+            .extend(untold.iter().map(|ask| ask.id.clone()));
+        asks::set_aside(&untold)
     }
 
     /// `prompt` sent as the person's words and the daemon's answer
@@ -25421,6 +25453,9 @@ struct Sent {
     then: Then,
     /// The question it answers, checked as it goes ([`repick`]).
     pick: Option<Pick>,
+    /// What the agent is told first, attached to the model call that
+    /// takes this message: the questions of its own this sets aside.
+    aside: Option<String>,
 }
 
 /// A message answering a question, as it goes: the ask its card names,
@@ -25567,6 +25602,14 @@ async fn submit_message(client: &Client, message: &mut Sent) -> Result<Value, St
         }
     }
     let submitted = message.submitted.clone();
+    // Ahead of the message, so the call that takes it has both: attached,
+    // it joins whichever call the agent makes next, as a reaction does.
+    // Not told, the message goes all the same.
+    if let Some(told) = &message.aside {
+        let attached = json!({"bot": submitted["bot"], "request_id": unique("tui"),
+            "prompt": told, "delivery": "attach", "origin": asks::ASIDE_ORIGIN});
+        let _ = client.request("submit", attached).await;
+    }
     match asks::answer_of(&message.prompt, message.origin) {
         Some(ask) => answer_once(client, ask, submitted).await,
         None => {
@@ -26018,9 +26061,10 @@ fn note_marker(title: String, beside: bool) -> Line<'static> {
 }
 
 /// Whether a message of the person's is drawn elsewhere than as a
-/// message: a reaction under its reply, a note taken away in the margin.
+/// message: a reaction under its reply, a note taken away in the margin,
+/// questions set aside on their cards.
 fn quiet_message(text: &str) -> bool {
-    reactions::is_reaction(text) || margin::closed(text).is_some()
+    reactions::is_reaction(text) || margin::closed(text).is_some() || asks::told_aside(text)
 }
 
 /// A message item's text: a prompt's own words, without the line the
@@ -35016,6 +35060,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_the_agent_was_told_of_a_question_set_aside_is_not_drawn() {
+        let told = asks::set_aside(&[asks::Ask {
+            id: "ask:1/c1".into(),
+            ..asks::call("c1", &json!({"question": "Keep it?"})).unwrap()
+        }])
+        .unwrap();
+        // The page drawn with what the agent was told, and without.
+        let drawn = async |told: Option<&str>| {
+            let items = json!({
+                "1": {"type": "message", "role": "assistant",
+                      "content": [{"type": "output_text", "text": "Merged it."}]},
+                "2": {"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": told}]},
+                "3": {"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": "what next?"}]},
+            });
+            let nodes: Vec<Value> = [3, 2, 1]
+                .into_iter()
+                .filter(|node| *node != 2 || told.is_some())
+                .map(|node| json!({"node": node}))
+                .collect();
+            let client = daemon_answering(move |asked| match asked["op"].as_str() {
+                Some("history_nodes") => json!({"nodes": nodes, "next_from": null}),
+                _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                    .map(|node| json!({"node": node, "item": items[node.to_string()],
+                        "origin": (node == 2).then_some(asks::ASIDE_ORIGIN)}))
+                    .collect::<Vec<_>>()}),
+            })
+            .await;
+            let mut app = app(client);
+            app.history().await;
+            (app.pending.iter())
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        };
+        let with = drawn(Some(&told)).await;
+        assert!(with.iter().any(|row| row.contains("what next?")));
+        assert_eq!(with, drawn(None).await);
+    }
+
+    #[tokio::test]
     async fn the_clean_view_keeps_the_words_and_a_task_started_but_not_a_command() {
         let started = r#"{"bot":"b.fix","handle":"b.fix/1","status":"running","turn":1}"#;
         let client = daemon_answering(move |asked| {
@@ -42981,6 +43066,74 @@ mod tests {
         assert_eq!(margin::closed(told), Some("repro"));
         assert_eq!(sent[0]["origin"], "margin");
         assert!(quiet_message(told));
+    }
+
+    #[tokio::test]
+    async fn words_past_its_questions_tell_the_agent_each_set_aside_once() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"message": 12, "turn": 12})
+        })
+        .await;
+        let mut app = app(client);
+        let ask = |call: &str, question: &str| {
+            let mut ask = asks::call(call, &json!({"question": question})).unwrap();
+            ask.id = asks::id(3, call);
+            ask
+        };
+        let mut tasks = ask("c2", "Ship the fix?");
+        tasks.task = Some(asks::Asker {
+            bot: "b.fix".into(),
+            name: "fix".into(),
+        });
+        app.asks = vec![ask("c1", "Keep the old API?\nIt has two users."), tasks];
+        app.send_now("Meanwhile, why so slow?".into(), (false, false))
+            .await
+            .unwrap();
+        app.send_now("And the tests?".into(), (false, false))
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        // Told first, attached, by Sonny; its task's question waits still.
+        assert_eq!(sent[0]["delivery"], "attach");
+        assert_eq!(sent[0]["origin"], asks::ASIDE_ORIGIN);
+        let told = sent[0]["prompt"].as_str().unwrap();
+        assert_eq!(
+            told,
+            "Your question \"Keep the old API?\" (ask:3/c1) is now set aside: the person \
+             wrote past it; a pick still answers it."
+        );
+        assert!(quiet_message(told));
+        assert!(!asks::moves_on(told, None));
+        assert_eq!(sent[1]["prompt"], "Meanwhile, why so slow?");
+        // Told once, though the first message has not landed yet.
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[2]["prompt"], "And the tests?");
+    }
+
+    #[tokio::test]
+    async fn an_answer_or_a_shell_line_tells_the_agent_nothing_set_aside() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"message": 12, "turn": 12})
+        })
+        .await;
+        let mut app = app(client);
+        let mut ask = asks::call("c1", &json!({"question": "Keep it?"})).unwrap();
+        ask.id = asks::id(3, "c1");
+        app.asks = vec![ask.clone()];
+        assert_eq!(app.tell_aside(&asks::answer(&ask, "yes"), None), None);
+        assert_eq!(app.tell_aside("ls", Some(SHELL)), None);
+        assert_eq!(app.tell_aside(&reactions::message("👍", None), None), None);
+        assert!(app.tell_aside("Meanwhile, why so slow?", None).is_some());
     }
 
     #[tokio::test]
