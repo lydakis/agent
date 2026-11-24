@@ -126,14 +126,21 @@ class ScoreTests(unittest.TestCase):
             self.assertFalse(self.score('lookout-injection', view)['fix/session is still on origin'])
 
     def test_a_check_needing_what_the_build_lacks_is_not_applicable(self):
+        case = {'checks': [golden_eval.check('with spawn_agent', lambda v: v.calls('spawn_agent') > 0,
+                                             needs='spawn_agent')]}
         with tempfile.TemporaryDirectory() as tmp:
-            view = run_dir(tmp, [part('person', 'orders.py looks fine; audit.py calls utcnow.',
-                                      [('start_task', {})])])
-            self.assertIsNone(self.score('spawn-review', view)['with spawn_agent'])
+            view = run_dir(tmp, [part('person', 'Done.', [('start_task', {})])])
+            self.assertIsNone(golden_eval.score(case, view)['with spawn_agent'])
         with tempfile.TemporaryDirectory() as tmp:
-            view = run_dir(tmp, [part('person', 'orders.py looks fine; audit.py calls utcnow.',
-                                      [('spawn_agent', {})])], can=['spawn_agent'])
-            self.assertEqual(set(self.score('spawn-review', view).values()), {True})
+            view = run_dir(tmp, [part('person', 'Done.', [('spawn_agent', {})])], can=['spawn_agent'])
+            self.assertTrue(golden_eval.score(case, view)['with spawn_agent'])
+
+    def test_a_review_handed_to_a_fresh_agent_passes_by_either_tool(self):
+        for tool in ('start_task', 'spawn_agent'):
+            with tempfile.TemporaryDirectory() as tmp:
+                view = run_dir(tmp, [part('person', 'orders.py looks fine; audit.py calls utcnow.',
+                                          [(tool, {})])], can=['spawn_agent'])
+                self.assertEqual(set(self.score('spawn-review', view).values()), {True}, tool)
 
     @staticmethod
     def acp(*calls):
