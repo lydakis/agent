@@ -4,9 +4,15 @@
 //! nothing, while work it may take is open there, is told once what is
 //! open, and again only when more opens. Never on a turn interrupted,
 //! failed or paused, on a closed agent, or while it waits on the person's
-//! answer to an ask. Each thread is read once and again only once its
+//! answer to an ask. A turn that opened work on a board, however it
+//! ended, sends one round of invites for each board at its end, listing
+//! the work it opened there. Each thread is read once and again only once its
 //! file changes, whichever host wrote it: a turn's end costs a look at
 //! each thread's file, as a listing does.
+//!
+//! A lead's turn's end also gives it its role, its folder's rules and its
+//! skills as the person changed them, for its next turn, window or not
+//! ([`renew`]).
 
 use crate::kept::Stamp;
 use serde_json::{Value, json};
@@ -26,6 +32,8 @@ pub struct Ends {
     held: HashSet<(String, String)>,
     /// The open work each agent was told of.
     open: HashMap<String, HashSet<String>>,
+    /// The work each agent's turn opened, by board then thread, in order.
+    opened: HashMap<(String, i64), Vec<(String, String)>>,
 }
 
 /// What a completed turn's end may tell its agent, before the daemon
@@ -50,6 +58,40 @@ impl Ends {
         if let Some(turn) = turn {
             (self.wrote.entry((bot.to_owned(), turn)).or_default()).insert(thread.to_owned());
         }
+    }
+
+    /// `bot`'s turn `turn` opened `thread` as work on `board`.
+    fn opens(&mut self, bot: &str, turn: Option<i64>, board: &str, thread: &str) {
+        if let Some(turn) = turn {
+            let opened = self.opened.entry((bot.to_owned(), turn)).or_default();
+            let it = (board.to_owned(), thread.to_owned());
+            if !opened.contains(&it) {
+                opened.push(it);
+            }
+        }
+    }
+
+    /// The rounds `bot`'s turn `turn` sends at its end: for each board it
+    /// opened work on, in the order it first did, that work, each thread
+    /// with its title as it reads now. A turn whose end was never seen
+    /// sends none.
+    pub fn rounds(&mut self, bot: &str, turn: i64) -> Vec<(String, Vec<(String, String)>)> {
+        let opened = (self.opened)
+            .remove(&(bot.to_owned(), turn))
+            .unwrap_or_default();
+        self.opened.retain(|(one, at), _| one != bot || *at > turn);
+        let mut rounds: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for (board, thread) in opened {
+            let Some((_, Some(work))) = self.threads.get(&thread) else {
+                continue;
+            };
+            let it = (thread, title(work));
+            match rounds.iter_mut().find(|(one, _)| *one == board) {
+                Some((_, work)) => work.push(it),
+                None => rounds.push((board, vec![it])),
+            }
+        }
+        rounds
     }
 
     /// Of the threads `here`, each with its file's stamp, those changed
@@ -282,13 +324,31 @@ fn scan(home: &Path) {
     ends().lock().unwrap().scanned(&here, read);
 }
 
+/// The board a commons call that went through opened new work on: a
+/// post of work, or a reply that made a thread work, which alone names a
+/// board (opening work again names none).
+pub fn opened_on(arguments: &Value) -> Option<&str> {
+    let (post, reply) = (&arguments["post"], &arguments["reply"]);
+    match (post["work"] == true, reply["do"] == "open") {
+        (true, _) => post["board"].as_str(),
+        (_, true) => reply["board"].as_str(),
+        _ => None,
+    }
+}
+
 /// The host's commons call by `bot`, in its turn `turn`, wrote in
-/// `thread`, which the commons in `home` now holds as it is: read again
-/// at once, so a take let go and taken again before the turn ends is a
-/// new take. Read with the turn ends free, off the host's runtime.
-pub fn wrote(home: &Path, bot: &str, turn: Option<i64>, thread: &str) {
+/// `thread`, which the commons in `home` now holds as it is, opening it
+/// as work on the board `opened` names: read again at once, so a take let
+/// go and taken again before the turn ends is a new take. Read with the
+/// turn ends free, off the host's runtime.
+pub fn wrote(home: &Path, bot: &str, turn: Option<i64>, thread: &str, opened: Option<&str>) {
     let _reading = READING.lock().unwrap();
-    ends().lock().unwrap().writes(bot, turn, thread);
+    let mut ends_now = ends().lock().unwrap();
+    ends_now.writes(bot, turn, thread);
+    if let Some(board) = opened {
+        ends_now.opens(bot, turn, board, thread);
+    }
+    drop(ends_now);
     let dir = crate::commons::dir(home);
     let read = match crate::kept::stamp(&dir.join(format!("{thread}.jsonl"))) {
         Some(stamp) => match reread(&dir, vec![(thread.to_owned(), stamp)]).pop() {
@@ -328,10 +388,23 @@ pub fn finished(
     status: &str,
 ) {
     let (store, socket) = daemon;
+    if crate::project::is_lead(&bot) {
+        renew(socket.clone(), bot.clone(), id);
+    }
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return;
     };
     let completed = crate::board::on() && status == "completed";
+    // The work it opened is asked about however it ended.
+    let rounds = ends().lock().unwrap().rounds(&bot, turn);
+    if !rounds.is_empty() {
+        let (home, bot) = (home.clone(), bot.clone());
+        tokio::spawn(async move {
+            for (board, opened) in rounds {
+                crate::commons::round(&home, &board, &opened, (&bot, Some(turn))).await;
+            }
+        });
+    }
     tokio::spawn(async move {
         let named = bot.clone();
         let found = tokio::task::spawn_blocking(move || {
@@ -389,6 +462,82 @@ pub fn finished(
     });
 }
 
+/// The lead `bot`, known as `id`, ended a turn: when its role, its
+/// folder's rules, skills or profiles, or its project's task rule are not
+/// what it holds, it is given them as they are now
+/// ([`crate::project::changed`]). The daemon keeps them for the end of a
+/// turn already running, so they never change within one: its next turn
+/// reads them, paying for one call the prompt cache can't serve. Its
+/// memory alone changing gives it nothing. Read off the host's runtime:
+/// a few small files a lead's turn.
+fn renew(socket: std::path::PathBuf, bot: String, id: Option<i64>) {
+    tokio::spawn(async move {
+        if let Ok((client, _events)) = agent_client::Client::connect(&socket).await {
+            let said = renew_on(&client, &bot, id).await;
+            if let Some(said) = said {
+                println!("{said}");
+            }
+        }
+    });
+}
+
+/// What the host found each lead holding at its last look, by its name and
+/// identity: an idle lead costs one small entry.
+fn known() -> &'static Mutex<HashMap<(String, i64), crate::project::Known>> {
+    static KNOWN: OnceLock<Mutex<HashMap<(String, i64), crate::project::Known>>> = OnceLock::new();
+    KNOWN.get_or_init(Mutex::default)
+}
+
+/// [`renew`] on `client`: the event the host logs, when there is one.
+async fn renew_on(client: &agent_client::Client, bot: &str, id: Option<i64>) -> Option<Value> {
+    let record = (client)
+        .request("inspect", json!({"bot": bot, "bot_id": id}))
+        .await
+        .ok()?;
+    // A lead no agent made: an agent's helper named like one keeps the
+    // instructions it was given.
+    if !crate::project::is_lead_record(&record) {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(record["workspace"].as_str()?);
+    let key = (bot.to_owned(), id.or(record["bot_id"].as_i64())?);
+    // What it will hold once a change kept for its turn's end is taken.
+    let held = (record["configure_pending"]["instructions"].as_str())
+        .or(record["instructions"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let chosen = record["profile"].as_str().map(str::to_owned);
+    let last = known().lock().unwrap().get(&key).cloned();
+    let composed = tokio::task::spawn_blocking(move || {
+        crate::project::changed(&dir, &held, chosen.as_deref(), last.as_ref())
+    })
+    .await
+    .ok()?;
+    let renewal = match composed {
+        Ok(renewal) => renewal,
+        Err(error) => {
+            return Some(json!({"event": "instructions_unread", "bot": bot, "error": error}));
+        }
+    };
+    let Some(text) = renewal.text else {
+        known().lock().unwrap().insert(key, renewal.known);
+        return None;
+    };
+    let asked = json!({"bot": bot, "bot_id": key.1, "instructions": text});
+    match client.request("configure", asked).await {
+        Ok(_) => {
+            known().lock().unwrap().insert(key, renewal.known);
+            // As its window would: what it goes without, once a day.
+            let _ = crate::project::tell_warnings(client, bot, &renewal.left_out).await;
+            Some(json!({"event": "instructions_renewed", "bot": bot}))
+        }
+        Err(error) => {
+            known().lock().unwrap().remove(&key);
+            Some(json!({"event": "instructions_renew_failed", "bot": bot, "error": error.code}))
+        }
+    }
+}
+
 /// Seconds since the epoch.
 fn now() -> i64 {
     (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
@@ -430,13 +579,11 @@ mod tests {
         }
         let said = crate::commons::call_as(home, &caller, &arguments, &|_, _| false).unwrap();
         assert_ne!(said["posted"], false, "{said}");
-        wrote_in(
-            ends,
-            home,
-            name,
-            Some(turn),
-            said["thread"].as_str().unwrap(),
-        );
+        let thread = said["thread"].as_str().unwrap();
+        wrote_in(ends, home, name, Some(turn), thread);
+        if let Some(board) = opened_on(&arguments) {
+            ends.opens(name, Some(turn), board, thread);
+        }
         said
     }
 
@@ -615,6 +762,59 @@ mod tests {
     /// Work changed by another host, as one of another store sharing the
     /// commons, is read at the next turn's end all the same.
     #[test]
+    fn a_turn_that_opens_work_sends_one_round_a_board_at_its_end() {
+        let home = home("rounds");
+        let mut ends = Ends::default();
+        let other = |name: &str| {
+            let mut sent = work(name, json!({}));
+            sent["post"]["board"] = json!("shop/docs");
+            sent
+        };
+        send(&home, &mut ends, "shop.lead", 1, work("store", json!({})));
+        send(&home, &mut ends, "shop.lead", 1, other("guide"));
+        // Waiting on its needs, or kept for some, it is new work all the same.
+        let needs = json!({"needs": ["store"], "for": ["shop.w.1"]});
+        send(&home, &mut ends, "shop.lead", 1, work("cli", needs));
+        // A plain thread made work later in the turn is new work too.
+        let plain = json!({"post": {"name": "talk", "title": "Errors talk", "text": "x",
+            "board": "shop/errors"}});
+        send(&home, &mut ends, "shop.lead", 1, plain);
+        let made = json!({"reply": {"thread": "talk", "do": "open", "board": "shop/errors",
+            "title": "Type the talk", "text": "y"}});
+        send(&home, &mut ends, "shop.lead", 1, made);
+        // Another turn's take and talk open nothing.
+        send(&home, &mut ends, "shop.w.1", 2, act("store", "take"));
+        let pair = |thread: &str, title: &str| (thread.to_owned(), title.to_owned());
+        assert_eq!(
+            ends.rounds("shop.lead", 1),
+            [
+                (
+                    "shop/errors".to_owned(),
+                    vec![
+                        pair("store", "Do store"),
+                        pair("cli", "Do cli"),
+                        pair("talk", "Type the talk")
+                    ]
+                ),
+                ("shop/docs".to_owned(), vec![pair("guide", "Do guide")]),
+            ]
+        );
+        // Sent once, and a work opened again opens no new round.
+        assert!(ends.rounds("shop.lead", 1).is_empty());
+        assert!(ends.rounds("shop.w.1", 2).is_empty());
+        send(&home, &mut ends, "shop.w.1", 3, act("store", "fail"));
+        send(&home, &mut ends, "shop.lead", 4, act("store", "open"));
+        assert!(ends.rounds("shop.lead", 4).is_empty());
+        // A lone piece later is its own round.
+        send(&home, &mut ends, "shop.lead", 5, work("docs", json!({})));
+        assert_eq!(
+            ends.rounds("shop.lead", 5),
+            [("shop/errors".to_owned(), vec![pair("docs", "Do docs")])]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn work_another_host_changed_is_read_at_the_next_turn_s_end() {
         let home = home("other-host");
         let mut ends = Ends::default();
@@ -671,5 +871,53 @@ mod tests {
         let found = end(&mut ends, &home, "shop.w.1", None, 2, true, &boards);
         assert_eq!(found.open.len(), 1, "{found:?}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_lead_s_turn_end_gives_it_a_rule_changed_since_and_nothing_else() {
+        let dir = home("renew").join("shop");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "Run the tests.\n").unwrap();
+        let held = crate::project::changed(&dir, "", None, None).unwrap().text;
+        let held = std::sync::Arc::new(Mutex::new(held.unwrap()));
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (holds, seen) = (held.clone(), asked.clone());
+        let workspace = dir.display().to_string();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => {
+                    let name = request["bot"].as_str().unwrap_or_default();
+                    // A helper an agent made, named like a lead.
+                    let maker = name.ends_with(".helper").then_some("shop.lead");
+                    json!({"name": name, "bot_id": 7, "created_by": maker,
+                        "workspace": workspace, "instructions": *holds.lock().unwrap()})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let configured = || {
+            (asked.lock().unwrap().iter())
+                .filter(|request| request["op"] == "configure")
+                .cloned()
+                .collect::<Vec<Value>>()
+        };
+        // Nothing changed: nothing sent, the lead's cache untouched.
+        assert_eq!(renew_on(&client, "shop.lead", Some(7)).await, None);
+        assert!(configured().is_empty());
+        // The person edits the rules: the lead's next turn reads them.
+        std::fs::write(dir.join("AGENTS.md"), "Run the tests twice.\n").unwrap();
+        let said = renew_on(&client, "shop.lead", Some(7)).await;
+        assert_eq!(said.unwrap()["event"], "instructions_renewed");
+        let sent = configured();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["bot_id"], 7);
+        let text = sent[0]["instructions"].as_str().unwrap();
+        assert!(text.contains("Run the tests twice."), "{text}");
+        // An agent's helper named like a lead keeps what it was given.
+        assert_eq!(renew_on(&client, "shop.lead.helper", Some(7)).await, None);
+        assert_eq!(configured().len(), 1);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

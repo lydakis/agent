@@ -127,7 +127,7 @@ Every line the command prints is one event. A line over 64 KiB is skipped, and a
 - **Plain text:** Delivered as the event `{"text": LINE}`.
 - **JSON object:** `text` plus, if it has them, `id`, `topic` (what it is about: a channel, a thread), `from` (who wrote it there), `url`, and `steer: true`, and any other fields for filtering. `text` is what subscribers read; an object without it is delivered whole, the line as its text, as plain text is.
 - **Clearing a topic:** An object whose `text` is empty, as `{"topic": "12", "text": ""}`, is no event: it clears what the source last said of that topic, or of the source itself with no topic, as an MQTT message with an empty payload clears a topic's retained one. No follow hears it, and a read no longer gives the topic.
-- **Deduplication & state:** An event whose `id` the source printed lately (the last 1,024) is not news again. A poller keeps its own cursor in `$SONNY_SOURCE_DIR`, a folder of its own beside the store (`STORE.sources/NAME`), and `$SONNY_SOURCE` is its name. An event `from` the follower itself is not news to it.
+- **Deduplication & state:** An event whose `id` the source printed lately (the last 1,024) is not news again. A poller keeps its own cursor in `$SONNY_SOURCE_DIR`, a folder of its own beside the store (`STORE.sources/NAME`), and `$SONNY_SOURCE` is its name. The command runs in that folder, so a path it names relative, as `cursor.json`, is kept there whatever folder Sonny started in. An event `from` the follower itself is not news to it.
 - **Logs:** What it writes to stderr (its first 20 lines a run), a run that fails, and a source started or stopped go to the lookout's own log, `STORE.companions/sonny-lookout.log`.
 - **Hot reload:** The lookout reads the settings again every 15 seconds: a source added or changed starts, one removed stops, and a lookout that stops stops its sources' commands. So does a source when a file its `watch` list names changed (its device, inode, size, or times, as Git's stat data), came, or went since it started, as a service manager restarts a unit on its new binary: an edited script then runs on its new code within 15 seconds, a stream that never exits included, and the log says `source_stopped` with why. Nothing is watched unless listed, so a cursor the command writes is no reason to start again.
 
@@ -195,6 +195,16 @@ Each event is a line with no `text`, read whole, its `id` the server's with the 
 ```
 
 A subscription the server refuses when asked (arguments it does not take) is a line on its topic saying why, and one it says skipped events is a line saying so. A connection that breaks, a server's internal error (`-32603`), a stream silent for three of its heartbeats, or a subscription the server ends stops the command with why, and the lookout runs it again a minute later, from where it stood; three such runs in a row and its follows hear it is down.
+
+### Sources that call MCP tools
+
+A source that pages one of the person's MCP servers runs its script with `sonny mcp exec`: the script `exec` takes (`await tools.mcp__SERVER__TOOL(args)`), given as the argument or on stdin with `-`, against the servers in `[sonny.mcp_servers]`, outside any agent and its gates, as the source's command already is. Each `text()` is a line on stdout as it is said, so a script prints its events as any command does; a script that fails or runs past its 10 minutes fails the command, saying why on stderr. Its calls all go down one connection to each server, started for the script and stopped with it, so a server that keeps state per session, as MCP lets it (a cursor it gave, say), is asked within the session that holds it. A source whose own MCP client opens a session for each call loses that state between calls: the next page asked with the last page's cursor is refused (`ExpiredCursor`).
+
+```toml
+[sonny.sources.audit-log]
+command = "sonny mcp exec - < ~/bin/audit-log.js"
+every = "5m"
+```
 
 ### Source shapes
 

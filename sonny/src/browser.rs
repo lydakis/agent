@@ -10,6 +10,7 @@
 //! which the tool host puts to the agent's gate as one step, as `exec` puts
 //! an MCP call that asks first.
 use agent_client::Client;
+use agent_client::config::BrowserSignins;
 use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -1267,10 +1268,16 @@ pub fn tool() -> Option<Value> {
     let mut description = DESCRIPTION.to_owned();
     if !machines.is_empty() {
         let names: Vec<String> = (lent.iter())
-            .map(|machine| match machine.signed_in {
-                true => format!("{} (signed in as the person is there)", machine.name),
-                false => machine.name.clone(),
-            })
+            .map(
+                |machine| match (machine.signed_in, machine.copies_signins) {
+                    (true, true) => format!("{} (signed in as the person is there)", machine.name),
+                    (true, false) => format!(
+                        "{} (signed in where the person signed in to it)",
+                        machine.name
+                    ),
+                    (false, _) => machine.name.clone(),
+                },
+            )
             .collect();
         let names = names.join(", ");
         properties["machine"] = json!({"type": "string", "enum": machines,
@@ -1280,7 +1287,21 @@ pub fn tool() -> Option<Value> {
             CARRIED_BYTES >> 20
         ));
         if lent.iter().any(|machine| machine.signed_in) {
-            description.push_str(" On a machine signed in as the person, your session is a tab of one Chrome its agents share, which takes the person's sign-ins there as it starts: after they sign in, `close` and open again, and it starts again with them once every agent with a tab in it has closed its own.");
+            description.push_str(
+                " On a machine signed in, your session is a tab of one Chrome its agents share.",
+            );
+        }
+        if lent
+            .iter()
+            .any(|machine| machine.signed_in && machine.copies_signins)
+        {
+            description.push_str(" One signed in as the person takes their sign-ins there as it starts: after they sign in, `close` and open again, and it starts again with them once every agent with a tab in it has closed its own.");
+        }
+        if lent
+            .iter()
+            .any(|machine| machine.signed_in && !machine.copies_signins)
+        {
+            description.push_str(" One signed in where the person signed in to it keeps those: on a sign-in page, ask them to run `sonny link browser URL` on that machine and sign in in the window it opens, then open the page again.");
         }
         if !here {
             required.push("machine");
@@ -1484,6 +1505,7 @@ pub async fn lent(
     key: &str,
     from: &str,
     profile: &str,
+    signins: BrowserSignins,
     steps: &crate::exec::Steps,
 ) -> Result<Value, (&'static str, String)> {
     let lines = lines_of(&payload["commands"])?;
@@ -1505,6 +1527,7 @@ pub async fn lent(
         false => Browser::Shared {
             link: key.to_owned(),
             profile: profile.to_owned(),
+            signins,
         },
     };
     // An agent of another machine: its share here is its session's, the
@@ -1521,8 +1544,12 @@ enum Browser {
     /// One it starts from no profile.
     Fresh,
     /// Its own tab of the Chrome of the link `link`, started from
-    /// `profile`, which it shares.
-    Shared { link: String, profile: String },
+    /// `profile` with its sign-ins from `signins`, which it shares.
+    Shared {
+        link: String,
+        profile: String,
+        signins: BrowserSignins,
+    },
 }
 
 // ---- A link's browser: one Chrome on a profile kept for it ----
@@ -1584,41 +1611,31 @@ static LINKS: std::sync::LazyLock<
 /// It runs as a task of its own, so a call let go while the profile is
 /// copied or Chrome starts does not let another start the same, with the
 /// lock given up before the work is done.
-async fn link_browser(key: &str, profile: &str, session: &str) -> Result<String, String> {
+async fn link_browser(
+    key: &str,
+    profile: &str,
+    signins: BrowserSignins,
+    session: &str,
+) -> Result<String, String> {
     let (key, profile, session) = (key.to_owned(), profile.to_owned(), session.to_owned());
-    tokio::spawn(async move { find_link_browser(&key, &profile, &session).await })
+    tokio::spawn(async move { find_link_browser(&key, &profile, signins, &session).await })
         .await
         .map_err(|e| e.to_string())?
 }
 
 /// [`link_browser`], in its own task.
-async fn find_link_browser(key: &str, profile: &str, session: &str) -> Result<String, String> {
+async fn find_link_browser(
+    key: &str,
+    profile: &str,
+    signins: BrowserSignins,
+    session: &str,
+) -> Result<String, String> {
     let held = {
         let mut links = LINKS.lock().unwrap_or_else(|e| e.into_inner());
         links.entry(key.to_owned()).or_default().clone()
     };
     let mut chrome = held.lock().await;
-    let (key_, profile_) = (key.to_owned(), profile.to_owned());
-    let kept = tokio::task::spawn_blocking(move || kept_profile(&key_, &profile_, None))
-        .await
-        .map_err(|e| e.to_string())?;
-    let dir = match kept {
-        Kept::Ready(dir) => dir,
-        // Copied again only with its Chrome closed.
-        Kept::Stale(dir) => {
-            stop_chrome(&dir).await?;
-            let (key_, profile_) = (key.to_owned(), profile.to_owned());
-            let copied = tokio::task::spawn_blocking(move || {
-                kept_profile(&key_, &profile_, chrome_data().as_deref())
-            });
-            match copied.await.map_err(|e| e.to_string())? {
-                Kept::Ready(dir) => dir,
-                Kept::Stale(_) => return Err("the browser's profile could not be copied".into()),
-                Kept::Failed(e) => return Err(e),
-            }
-        }
-        Kept::Failed(e) => return Err(e),
-    };
+    let dir = kept_folder(key, profile).await?;
     // A profile it no longer names: its Chrome closed.
     if let Some(old) = chrome.dir.take().filter(|old| *old != dir) {
         // Left as it is if it will not close: its folder is not touched.
@@ -1627,18 +1644,8 @@ async fn find_link_browser(key: &str, profile: &str, session: &str) -> Result<St
     let url = match chrome_at(&dir).await {
         Some(url) => url,
         None => {
-            // A copy of the person's profile, while no Chrome has it open,
-            // brought up to date with what their Chrome has since.
-            if !is_folder(profile) && holder(&dir).is_none() {
-                let (dir_, profile_) = (dir.clone(), profile.to_owned());
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Some(data) = chrome_data() {
-                        refresh_kept(&dir_, &profile_, &data);
-                    }
-                })
-                .await;
-            }
-            let url = start_chrome(&dir).await?;
+            let copied = refreshed(&dir, profile, signins).await;
+            let url = start_chrome(&dir, copied, None).await?;
             // A Chrome just started holds no session's tab.
             chrome.tabs.clear();
             url
@@ -1652,6 +1659,75 @@ async fn find_link_browser(key: &str, profile: &str, session: &str) -> Result<St
         tokio::spawn(close_when_idle(held.clone()));
     }
     Ok(url)
+}
+
+/// The folder of the profile kept for the link `key`, started from
+/// `profile`: copied from the person's, while no Chrome has it open, when
+/// it is not there or was copied from another.
+async fn kept_folder(key: &str, profile: &str) -> Result<PathBuf, String> {
+    let (key_, profile_) = (key.to_owned(), profile.to_owned());
+    let kept = tokio::task::spawn_blocking(move || kept_profile(&key_, &profile_, None))
+        .await
+        .map_err(|e| e.to_string())?;
+    match kept {
+        Kept::Ready(dir) => Ok(dir),
+        // Copied again only with its Chrome closed.
+        Kept::Stale(dir) => {
+            stop_chrome(&dir).await?;
+            let (key_, profile_) = (key.to_owned(), profile.to_owned());
+            let copied = tokio::task::spawn_blocking(move || {
+                kept_profile(&key_, &profile_, chrome_data().as_deref())
+            });
+            match copied.await.map_err(|e| e.to_string())? {
+                Kept::Ready(dir) => Ok(dir),
+                Kept::Stale(_) => Err("the browser's profile could not be copied".into()),
+                Kept::Failed(e) => Err(e),
+            }
+        }
+        Kept::Failed(e) => Err(e),
+    }
+}
+
+/// The kept profile `dir`, a copy of the person's `profile` (not a folder
+/// used as it is), brought up to date as its Chrome is about to start,
+/// while none has it open: whether it took the person's sign-ins, which
+/// its Chrome then reads only with Chrome's protection of them off.
+async fn refreshed(dir: &Path, profile: &str, signins: BrowserSignins) -> bool {
+    if is_folder(profile) || holder(dir).is_some() {
+        return false;
+    }
+    let (dir, profile) = (dir.to_owned(), profile.to_owned());
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(data) = chrome_data() {
+            refresh_kept(&dir, &profile, &data, signins);
+        }
+    })
+    .await;
+    signins == BrowserSignins::Copied
+}
+
+/// `sonny link browser`: the Chrome of the link `key`, on the profile kept
+/// for it from `profile`, started again in a window here at `url`, for the
+/// person to sign in to what its agents need. Its agents attach to it at
+/// their next call, as to the one they share; its sign-ins stay with the
+/// profile.
+pub async fn show_link_browser(
+    key: &str,
+    profile: &str,
+    signins: BrowserSignins,
+    url: &str,
+) -> Result<PathBuf, String> {
+    if profile.is_empty() {
+        return Err(format!(
+            "{key}'s agents each start a fresh browser (`browser_profile = \"\"`), \
+             which keeps no sign-in"
+        ));
+    }
+    let dir = kept_folder(key, profile).await?;
+    stop_chrome(&dir).await?;
+    let copied = refreshed(&dir, profile, signins).await;
+    start_chrome(&dir, copied, Some(url)).await?;
+    Ok(dir)
 }
 
 /// Closes a link's Chrome once its agents have not called for
@@ -1737,8 +1813,16 @@ fn active_port(said: &str) -> Option<(u16, &str)> {
         .then_some((port, path))
 }
 
-/// Starts Chrome on the profile folder `dir` and says its CDP address.
-async fn start_chrome(dir: &Path) -> Result<String, String> {
+/// The Chrome feature that seals a profile folder's cookies with a key of
+/// its own unless it is Chrome's own folder (Chrome 158 on, macOS), so
+/// that cookies copied from the person's profile are dropped as it starts.
+const OWN_FOLDER_KEY: &str = "KeychainKeyProviderUserDataDirProtection";
+
+/// Starts Chrome on the profile folder `dir` and says its CDP address:
+/// reading the person's cookies copied into it when `copied`; in a window
+/// at `shown`, else as agent-browser's settings say, headless unless they
+/// say `headed`.
+async fn start_chrome(dir: &Path, copied: bool, shown: Option<&str>) -> Result<String, String> {
     let program = chrome_program().ok_or(
         "no Chrome here to start the link's browser: install Google Chrome, or name one as \
          `executablePath` in ~/.agent-browser/config.json",
@@ -1760,8 +1844,11 @@ async fn start_chrome(dir: &Path) -> Result<String, String> {
     if let Some(bypass) = bypass {
         command.arg(format!("--proxy-bypass-list={bypass}"));
     }
+    if copied {
+        command.arg(format!("--disable-features={OWN_FOLDER_KEY}"));
+    }
     // Headless unless agent-browser's own settings say otherwise.
-    if !headed() {
+    if shown.is_none() && !headed() {
         command.arg("--headless=new");
     }
     // Chrome's sandbox needs a user other than root, as agent-browser and
@@ -1771,7 +1858,7 @@ async fn start_chrome(dir: &Path) -> Result<String, String> {
         command.arg("--no-sandbox");
     }
     command
-        .arg("about:blank")
+        .arg(shown.unwrap_or("about:blank"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2037,7 +2124,7 @@ fn kept_profile(key: &str, profile: &str, data: Option<&Path>) -> Kept {
 
 /// Whether a link's `browser_profile` is a folder, used as it is, not a
 /// profile's name.
-fn is_folder(profile: &str) -> bool {
+pub fn is_folder(profile: &str) -> bool {
     profile.contains(['/', '\\', '~'])
 }
 
@@ -2046,25 +2133,123 @@ fn is_folder(profile: &str) -> bool {
 /// Chrome starts, which nothing has open: the person's native messaging
 /// hosts linked in, as Chrome reads them from beside its profiles, so an
 /// extension that talks to a program of theirs (a company's device check)
-/// reaches it, and their sign-ins copied over the copy's, so one they made
-/// since its last start is in it. The rest of the copy stays as its
-/// browser left it.
-fn refresh_kept(dir: &Path, profile: &str, data: &Path) {
+/// reaches it; and, when its sign-ins are `Copied`, each of the person's
+/// cookies newer than the copy's merged into it, so one they made since
+/// its last start is in it and one made in it stays. The rest of the copy
+/// stays as its browser left it.
+fn refresh_kept(dir: &Path, profile: &str, data: &Path, signins: BrowserSignins) {
     let _ = link_hosts(
         &data.join("NativeMessagingHosts"),
         &dir.join("NativeMessagingHosts"),
     );
+    if signins == BrowserSignins::Own {
+        return;
+    }
     let state = std::fs::read_to_string(data.join("Local State")).unwrap_or_default();
     let Some(folder) = profile_folder(&state, profile) else {
         return;
     };
     // Where Chrome keeps them, by its version and system.
     for cookies in ["Cookies", "Network/Cookies"] {
-        let _ = copy_database(
+        let _ = merge_cookies(
             &data.join(&folder).join(cookies),
             &dir.join(&folder).join(cookies),
         );
     }
+}
+
+/// The cookies of Chrome's database `from` merged into `to`, which no
+/// Chrome has open: each of `from`'s that `to` holds no newer version of,
+/// by Chrome's own key for a cookie (its unique index); all of `from` when
+/// `to` has none or the two are not of one version. A snapshot of `from`
+/// is read, as [`copy_database`] takes one, so the person's Chrome writing
+/// it meanwhile changes nothing; one written throughout is left for the
+/// next start.
+fn merge_cookies(from: &Path, to: &Path) -> Result<(), String> {
+    let beside = |path: &Path, suffix: &str| {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        PathBuf::from(file)
+    };
+    let theirs = beside(to, &format!(".theirs.{}", std::process::id()));
+    let gone = |path: &Path| {
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(beside(path, suffix));
+        }
+    };
+    let merged = (|| {
+        if !copy_database(from, &theirs).map_err(|e| e.to_string())? {
+            return Ok(());
+        }
+        if to.is_file() && merged_into(&theirs, to).map_err(|e| e.to_string())? {
+            return Ok(());
+        }
+        // Theirs whole, its journal after it, never another's before.
+        gone(to);
+        for suffix in SIDECARS {
+            match std::fs::rename(beside(&theirs, suffix), beside(to, suffix)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+                _ => {}
+            }
+        }
+        Ok(())
+    })();
+    gone(&theirs);
+    merged
+}
+
+/// [`merge_cookies`] of the snapshot `theirs` into `to`: whether the two
+/// were of one version, and so merged.
+fn merged_into(theirs: &Path, to: &Path) -> rusqlite::Result<bool> {
+    let db = rusqlite::Connection::open(to)?;
+    db.execute(
+        "ATTACH DATABASE ?1 AS theirs",
+        [theirs.to_string_lossy().as_ref()],
+    )?;
+    let version = |schema: &str| {
+        let sql = format!("SELECT value FROM {schema}.meta WHERE key = 'version'");
+        db.query_row(&sql, [], |row| row.get::<_, String>(0)).ok()
+    };
+    if version("main").is_none() || version("main") != version("theirs") {
+        return Ok(false);
+    }
+    let names = |sql: &str| -> rusqlite::Result<Vec<String>> {
+        let mut statement = db.prepare(sql)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect()
+    };
+    let columns = names("SELECT name FROM pragma_table_info('cookies', 'main')")?;
+    // Chrome's key for a cookie: the columns of its unique index.
+    let key = names(
+        "SELECT info.name FROM pragma_index_list('cookies', 'main') AS list, \
+         pragma_index_info(list.name, 'main') AS info WHERE list.\"unique\" ORDER BY info.seqno",
+    )?;
+    let newer = ["last_update_utc", "creation_utc"]
+        .into_iter()
+        .find(|column| columns.iter().any(|c| c == column));
+    let Some(newer) = newer.filter(|_| !key.is_empty()) else {
+        return Ok(false);
+    };
+    let quoted = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
+    let list = (columns.iter())
+        .map(|c| quoted(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let same = (key.iter())
+        .map(|c| format!("mine.{0} IS them.{0}", quoted(c)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let newer = quoted(newer);
+    db.execute(
+        &format!(
+            "INSERT OR REPLACE INTO main.cookies ({list}) SELECT {list} FROM theirs.cookies AS them \
+             WHERE NOT EXISTS (SELECT 1 FROM main.cookies AS mine \
+             WHERE {same} AND mine.{newer} >= them.{newer})"
+        ),
+        [],
+    )?;
+    Ok(true)
 }
 
 /// Each file in `from` linked, by its name, into `to`, so one the person's
@@ -2334,7 +2519,11 @@ async fn drive(
     let (profile, cdp) = match &browser {
         Browser::Own => (None, None),
         Browser::Fresh => (Some(""), None),
-        Browser::Shared { link, profile } => match link_browser(link, profile, &session).await {
+        Browser::Shared {
+            link,
+            profile,
+            signins,
+        } => match link_browser(link, profile, *signins, &session).await {
             Ok(cdp) => (None, Some(cdp)),
             Err(e) => {
                 if let Some(step) = allowed {
@@ -2371,8 +2560,16 @@ async fn drive(
         }
         // After its `close`, a session opens again in the link's Chrome as
         // it is now: started again if that close was its last tab's.
-        if let (true, Browser::Shared { link, profile }) = (closed, &browser) {
-            match link_browser(link, profile, &session).await {
+        if let (
+            true,
+            Browser::Shared {
+                link,
+                profile,
+                signins,
+            },
+        ) = (closed, &browser)
+        {
+            match link_browser(link, profile, *signins, &session).await {
                 Ok(cdp) => {
                     launch.cdp = Some(cdp);
                     *policy = Some(format!("{confirm}\0{browser:?}\0{:?}", launch.cdp));
@@ -2817,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_profile_gets_the_person_s_hosts_and_sign_ins_as_its_chrome_starts() {
+    fn a_kept_profile_gets_the_person_s_hosts_and_keeps_its_own_sign_ins() {
         let root = scratch("refresh");
         let data = root.join("chrome-data");
         let state = json!({"profile": {"info_cache": {"Profile 1": {"name": "Work"}}}});
@@ -2830,21 +3027,11 @@ mod tests {
         let Kept::Ready(dir) = kept_in(&link, "Work", Some(&data)) else {
             panic!("not copied");
         };
-        let at = |secs: u64| std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-        let stamp = |path: &Path, secs: u64| {
-            (std::fs::File::options().write(true).open(path))
-                .and_then(|file| file.set_modified(at(secs)))
-                .unwrap()
-        };
         let hosts = dir.join("NativeMessagingHosts");
-        // The copy's browser wrote its own Cookies after the person's
-        // last did, as it does each time it browses. A host Chrome made
-        // empty, and one gone since.
+        // The copy's browser signed in to a site of its own. A host Chrome
+        // made empty, and one gone since.
         std::fs::write(dir.join("Profile 1/Cookies"), "ours").unwrap();
         std::fs::write(dir.join("Profile 1/Cookies-journal"), "ours too").unwrap();
-        stamp(&data.join("Profile 1/Cookies"), 1_000);
-        stamp(&dir.join("Profile 1/Cookies"), 2_000);
-        stamp(&dir.join("Profile 1/Cookies-journal"), 2_000);
         std::fs::create_dir_all(&hosts).unwrap();
         std::os::unix::fs::symlink(
             data.join("NativeMessagingHosts/old.json"),
@@ -2852,12 +3039,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(hosts.join("own.json"), "kept").unwrap();
-        refresh_kept(&dir, "Work", &data);
+        refresh_kept(&dir, "Work", &data, BrowserSignins::Own);
         let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
-        // The person's sign-ins replace the copy's all the same, whose
-        // journal goes with them.
-        assert_eq!(read(dir.join("Profile 1/Cookies")), "theirs");
-        assert!(!dir.join("Profile 1/Cookies-journal").exists());
+        // Its sign-ins stay its own: Chrome could not read the person's
+        // in another profile folder, and they would wipe its own.
+        assert_eq!(read(dir.join("Profile 1/Cookies")), "ours");
+        assert_eq!(read(dir.join("Profile 1/Cookies-journal")), "ours too");
         // The person's hosts are linked, read as they are now.
         assert_eq!(
             std::fs::read_link(hosts.join("check.json")).unwrap(),
@@ -2867,40 +3054,134 @@ mod tests {
         assert_eq!(read(hosts.join("check.json")), "{\"v\": 2}");
         assert!(std::fs::symlink_metadata(hosts.join("old.json")).is_err());
         assert_eq!(read(hosts.join("own.json")), "kept");
-        // The person signs in again: theirs reach the copy at its next
-        // start, with their journal.
-        std::fs::write(data.join("Profile 1/Cookies"), "signed in").unwrap();
-        std::fs::write(data.join("Profile 1/Cookies-journal"), "j").unwrap();
-        refresh_kept(&dir, "Work", &data);
-        assert_eq!(read(dir.join("Profile 1/Cookies")), "signed in");
-        assert_eq!(read(dir.join("Profile 1/Cookies-journal")), "j");
-        // And what their write-ahead log holds since its last checkpoint.
-        std::fs::remove_file(data.join("Profile 1/Cookies-journal")).unwrap();
-        std::fs::write(data.join("Profile 1/Cookies-wal"), "renewed").unwrap();
-        assert!(
-            copy_database(
-                &data.join("Profile 1/Cookies"),
-                &dir.join("Profile 1/Cookies")
-            )
-            .unwrap()
-        );
-        assert_eq!(read(dir.join("Profile 1/Cookies-wal")), "renewed");
-        assert!(!dir.join("Profile 1/Cookies-journal").exists());
-        // Nothing half copied is left beside them.
-        let left: Vec<String> = (std::fs::read_dir(dir.join("Profile 1")).unwrap().flatten())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".partial"))
-            .collect();
-        assert!(left.is_empty(), "{left:?}");
-        // A profile with no Cookies of its own leaves the copy's.
-        std::fs::remove_file(data.join("Profile 1/Cookies")).unwrap();
-        std::fs::remove_file(data.join("Profile 1/Cookies-wal")).unwrap();
-        refresh_kept(&dir, "Work", &data);
-        assert_eq!(read(dir.join("Profile 1/Cookies")), "signed in");
         // A host the person removed goes from the copy too.
         std::fs::remove_file(data.join("NativeMessagingHosts/check.json")).unwrap();
-        refresh_kept(&dir, "Work", &data);
+        refresh_kept(&dir, "Work", &data, BrowserSignins::Own);
         assert!(std::fs::symlink_metadata(hosts.join("check.json")).is_err());
+    }
+
+    /// A cookie database as Chrome makes one: its version, and the
+    /// cookies `(host, name, value, last_update_utc)`.
+    fn cookies_at(path: &Path, version: &str, cookies: &[(&str, &str, &str, i64)]) {
+        let _ = std::fs::remove_file(path);
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+             CREATE TABLE cookies(creation_utc INTEGER NOT NULL, host_key TEXT NOT NULL,
+               top_frame_site_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL,
+               path TEXT NOT NULL, last_update_utc INTEGER NOT NULL);
+             CREATE UNIQUE INDEX cookies_unique_index
+               ON cookies(host_key, top_frame_site_key, name, path);",
+        )
+        .unwrap();
+        db.execute("INSERT INTO meta VALUES ('version', ?1)", [version])
+            .unwrap();
+        for (host, name, value, updated) in cookies {
+            db.execute(
+                "INSERT INTO cookies VALUES (?4, ?1, '', ?2, ?3, '/', ?4)",
+                rusqlite::params![host, name, value, updated],
+            )
+            .unwrap();
+        }
+    }
+
+    /// The cookies of the database at `path`, `host name=value`, in order.
+    fn cookies_in(path: &Path) -> Vec<String> {
+        let db = rusqlite::Connection::open(path).unwrap();
+        let mut statement = db
+            .prepare("SELECT host_key, name, value FROM cookies ORDER BY host_key, name")
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok(format!(
+                    "{} {}={}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn copied_sign_ins_merge_the_person_s_newer_cookies_into_the_kept_profile() {
+        let root = scratch("merge");
+        let data = root.join("chrome-data");
+        let state = json!({"profile": {"info_cache": {"Profile 1": {"name": "Work"}}}});
+        std::fs::create_dir_all(data.join("Profile 1")).unwrap();
+        std::fs::write(data.join("Local State"), state.to_string()).unwrap();
+        let theirs = data.join("Profile 1/Cookies");
+        cookies_at(&theirs, "24", &[]);
+        let Kept::Ready(dir) = kept_in(&root.join("links/box"), "Work", Some(&data)) else {
+            panic!("not copied");
+        };
+        let ours = dir.join("Profile 1/Cookies");
+        // The copy signed in to a site of its own, and renewed one after
+        // the person last did; the person signed in again to another.
+        cookies_at(
+            &ours,
+            "24",
+            &[
+                ("app.example", "sid", "made-here", 50),
+                ("mail.example", "sid", "renewed-here", 300),
+                ("wiki.example", "sid", "old", 100),
+            ],
+        );
+        cookies_at(
+            &theirs,
+            "24",
+            &[
+                ("mail.example", "sid", "theirs-older", 200),
+                ("wiki.example", "sid", "signed-in-again", 400),
+                ("news.example", "sid", "new", 10),
+            ],
+        );
+        refresh_kept(&dir, "Work", &data, BrowserSignins::Copied);
+        assert_eq!(
+            cookies_in(&ours),
+            [
+                "app.example sid=made-here",
+                "mail.example sid=renewed-here",
+                "news.example sid=new",
+                "wiki.example sid=signed-in-again",
+            ]
+        );
+        // Their database is read, not written, and nothing is left beside
+        // the copy's.
+        assert_eq!(cookies_in(&theirs).len(), 3);
+        let left: Vec<String> = (std::fs::read_dir(dir.join("Profile 1")).unwrap().flatten())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "Cookies")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        // A database of another version is taken whole, as Chrome
+        // migrates its own.
+        cookies_at(&theirs, "25", &[("mail.example", "sid", "upgraded", 500)]);
+        refresh_kept(&dir, "Work", &data, BrowserSignins::Copied);
+        assert_eq!(cookies_in(&ours), ["mail.example sid=upgraded"]);
+        // What their write-ahead log holds is in the snapshot taken.
+        std::fs::remove_file(&theirs).unwrap();
+        cookies_at(&theirs, "25", &[]);
+        let db = rusqlite::Connection::open(&theirs).unwrap();
+        db.pragma_update(None, "journal_mode", "WAL").unwrap();
+        db.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        db.execute(
+            "INSERT INTO cookies VALUES (600, 'wal.example', '', 'sid', 'logged', '/', 600)",
+            [],
+        )
+        .unwrap();
+        assert!(data.join("Profile 1/Cookies-wal").exists());
+        refresh_kept(&dir, "Work", &data, BrowserSignins::Copied);
+        assert!(cookies_in(&ours).contains(&"wal.example sid=logged".to_owned()));
+        drop(db);
+        // A profile with no Cookies of its own leaves the copy's.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(data.join(format!("Profile 1/Cookies{suffix}")));
+        }
+        refresh_kept(&dir, "Work", &data, BrowserSignins::Copied);
+        assert!(cookies_in(&ours).contains(&"wal.example sid=logged".to_owned()));
     }
 
     #[tokio::test]

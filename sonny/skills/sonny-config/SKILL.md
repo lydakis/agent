@@ -35,8 +35,12 @@ each setting is; what to set is the person's call.
 - `[sonny.mcp_servers.NAME]` in the config: MCP servers, kept with
   `sonny mcp add|remove|list|import`.
 - `[sonny.sources.NAME]` in the config: news from outside for the lookout,
-  a `command` run `every` so often. Each line it prints is an event; `text`
-  is what subscribers read, and a line without it is delivered whole.
+  a `command` run `every` so often, in its own folder (`$SONNY_SOURCE_DIR`),
+  where a path it names relative is kept. Each line it prints is an event;
+  `text` is what subscribers read, and a line without it is delivered whole.
+  A command that calls the person's MCP servers runs its script with
+  `sonny mcp exec - < FILE`: every call on one connection to each server,
+  each `text()` a line.
 - `[sonny.permissions.NAME]` in the config: a `/permissions` row of the
   person's own, as Codex's permission profiles: the row it `extends`
   (`auto`, the default, `ask` or `read-only`), then what it changes:
@@ -162,11 +166,14 @@ key `profile`:
   is not the profile a session here starts from. It is copied once into a
   profile kept for the link, which its agents share in one Chrome, a tab
   each: a sign-in or an extension's sync there stays. Each time that
-  Chrome starts, the person's native messaging hosts are linked in and
-  their Cookies copied over the kept ones, so a sign-in in their own
-  Chrome reaches it once it starts again: it closes when the last agent
-  with a tab in it runs `close`, or 30 minutes after its agents' last
-  call. Sonny starts that
+  Chrome starts, the person's native messaging hosts are linked in. With
+  `browser_signins = "own"` its sign-ins are its own: the person signs in
+  with `sonny link browser [URL]` on that machine, as Chrome otherwise
+  reads no cookie copied from their profile. By default (`"copied"`)
+  their newer cookies are merged in at each start, with Chrome's
+  protection of them turned off, so a sign-in in their own Chrome reaches
+  it once it starts again: it closes when the last agent with a tab in it
+  runs `close`, or 30 minutes after its agents' last call. Sonny starts that
   Chrome with the system's keychain (the person's Chrome, or
   `executablePath` in agent-browser's file), headless unless the file says
   `"headed": true`. To start it again

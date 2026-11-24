@@ -816,17 +816,23 @@ class AcpTests(ModelFixture):
         thread.send({'id': forms[0]['id'], 'result': {'action': 'accept', 'content': {'pick': '2'}}})
         thread.send({'id': forms[1]['id'], 'result': {'action': 'accept', 'content': {'pick': '1'},
                                                       '_meta': {'person': 'ana'}}})
-        sent = []
+        # Until both answers reached the model, in whichever order the two
+        # picks went: the questions' own options name Postgres too, so the
+        # words alone say nothing of which has come.
+        sent, texts = [], set()
+
+        def answered(question):
+            return any(t.startswith('You asked (') and question in t for t in texts)
         deadline = time.monotonic() + 30
-        while not ('Postgres' in ''.join(sent) and 'written by ana' in ''.join(sent)):
+        while not (answered('Which database?') and answered('Which cache?')):
             self.assertLess(time.monotonic(), deadline, sent)
             try:
                 sent.append(json.dumps(self.model.requests.get(timeout=1)['input']))
             except queue.Empty:
-                pass
-        texts = {part['text'] for request in sent for item in json.loads(request)
-                 if item.get('role') == 'user' and isinstance(item.get('content'), list)
-                 for part in item['content'] if 'text' in part}
+                continue
+            texts |= {part['text'] for item in json.loads(sent[-1])
+                      if item.get('role') == 'user' and isinstance(item.get('content'), list)
+                      for part in item['content'] if 'text' in part}
         database_answer = next(t for t in texts if t.startswith('You asked (') and 'Which database?' in t)
         self.assertRegex(database_answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres$')
         cache_answer = next(t for t in texts if t.startswith('You asked (') and 'Which cache?' in t)
