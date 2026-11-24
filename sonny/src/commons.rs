@@ -34,8 +34,8 @@ pub(crate) const LIST_BYTES: usize = crate::served::PAGE_BYTES;
 const READS: &str = ".reads";
 /// The invites of the last week, and how many threads ever sent any:
 /// `{"sent": [{"thread", "at", "bot", "golden", "answered"}], "count",
-/// "agents"}`, a round for new work on a board under its first thread,
-/// with every thread it lists as `threads`. A thread whose
+/// "agents"}`, a round for new work on a board under `round:FIRST`, which
+/// names no thread, with every thread it lists as `threads`. A thread whose
 /// invites are still being sent holds one entry with no `bot`, its `reach`
 /// how many it may send.
 const INVITES: &str = ".invites";
@@ -123,15 +123,13 @@ fn pays(golden: bool) -> u64 {
     }
 }
 
-/// The two invite settings, read once.
+/// The two invite settings, read each time: the tool host, which sends a
+/// turn's rounds, outlives a change in `/config`.
 fn settings() -> (u64, u64) {
-    static READ: OnceLock<(u64, u64)> = OnceLock::new();
-    *READ.get_or_init(|| {
-        let sonny = agent_client::config::load()
-            .map(|config| config.sonny)
-            .unwrap_or_default();
-        (sonny.commons_invites, sonny.commons_invite_tokens)
-    })
+    let sonny = agent_client::config::load()
+        .map(|config| config.sonny)
+        .unwrap_or_default();
+    (sonny.commons_invites, sonny.commons_invite_tokens)
 }
 /// Every this many threads invited, one of the thread's invites is a
 /// golden ticket: to any agent at all.
@@ -521,7 +519,7 @@ pub(crate) fn start_locked(
     // on a board too; work draws none of its own, but the round its turn
     // sends at its end for all the work it opened (`round`).
     if post["do"].is_null()
-        && let Some((reach, golden)) = reserve(dir, &[name.to_owned()])
+        && let Some((reach, golden)) = reserve(dir, name, &[])
     {
         let words = invite_words(dir, title, post["text"].as_str().unwrap_or_default());
         started["invite"] =
@@ -647,11 +645,11 @@ fn budget(sent: &[Value], agents: u64) -> Value {
         "answered": answered, "this_week": settled.len(), "agents": agents})
 }
 
-/// Takes one of the day's threads for the invites of `threads`, a thread
-/// or a round's, the first naming it, under the lock, if one is left: how
-/// many it may send, and whether one is a golden ticket; or None.
-fn reserve(dir: &Path, threads: &[String]) -> Option<(usize, bool)> {
-    let thread = threads.first()?;
+/// Takes one of the day's threads for the invites `key` counts under, a
+/// thread's own name or a round's, with the threads a round lists, under
+/// the lock, if one is left: how many it may send, and whether one is a
+/// golden ticket; or None.
+fn reserve(dir: &Path, key: &str, threads: &[String]) -> Option<(usize, bool)> {
     let (mut sent, count) = load(dir);
     let budget = budget(&sent, agents(dir));
     if budget["today"].as_u64() >= budget["a_day"].as_u64() {
@@ -662,8 +660,8 @@ fn reserve(dir: &Path, threads: &[String]) -> Option<(usize, bool)> {
     // share a golden ticket nor skip one.
     let pending = sent.iter().filter(|invite| invite["bot"].is_null()).count() as u64;
     let golden = (count + pending) % GOLDEN_EVERY == GOLDEN_EVERY - 1;
-    let mut reserved = json!({"thread": thread, "at": now(), "golden": golden, "reach": reach});
-    if threads.len() > 1 {
+    let mut reserved = json!({"thread": key, "at": now(), "golden": golden, "reach": reach});
+    if !threads.is_empty() {
         reserved["threads"] = json!(threads);
     }
     sent.push(reserved);
@@ -932,14 +930,15 @@ pub async fn invite(
     let golden = invite["golden"] == true;
     let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
     let seats = Seats {
-        thread,
         request: format!("commons.invite.{thread}"),
         words: &words,
         reach,
         golden,
     };
     let note = |ticket| invited_note(thread, title, author, ticket);
-    sends(home, seats, (author, turn), &note).await
+    let invited = sends(home, seats, (author, turn), &note).await;
+    settle(&dir(home), thread, &invited);
+    invited.into_iter().map(|(bot, _)| bot).collect()
 }
 
 /// The work `bot`'s turn `turn` opened on `board`, each thread with its
@@ -949,6 +948,8 @@ pub async fn invite(
 /// finding, said in that work's thread. Taking it is for the board's
 /// agents, who hear it opened. Under the day's budget, as a thread's
 /// invites, and never from a turn the commons began. The ones invited.
+/// It runs in the tool host: what reads or locks the commons runs off its
+/// runtime.
 pub async fn round(
     home: &Path,
     board: &str,
@@ -956,16 +957,42 @@ pub async fn round(
     (author, turn): (&str, Option<i64>),
 ) -> Vec<String> {
     let dir = dir(home);
+    let Some((first, _)) = opened.first() else {
+        return Vec::new();
+    };
+    let key = format!("round:{first}");
+    let prepared = {
+        let (dir, key, opened) = (dir.clone(), key.clone(), opened.to_vec());
+        tokio::task::spawn_blocking(move || round_words(&dir, &key, &opened)).await
+    };
+    let Ok(Some((reach, golden, words))) = prepared else {
+        return Vec::new();
+    };
+    let seats = Seats {
+        request: format!("commons.round.{first}"),
+        words: &words,
+        reach,
+        golden,
+    };
+    let note = |ticket| round_note(board, opened, author, ticket);
+    let invited = sends(home, seats, (author, turn), &note).await;
+    let bots: Vec<String> = invited.iter().map(|(bot, _)| bot.clone()).collect();
+    let _ = tokio::task::spawn_blocking(move || settle(&dir, &key, &invited)).await;
+    bots
+}
+
+/// One of the day's threads taken for the round `key` of `opened`, under
+/// the lock, if one is left, and the words that aim it: the rarest of its
+/// work's titles and first posts.
+fn round_words(
+    dir: &Path,
+    key: &str,
+    opened: &[(String, String)],
+) -> Option<(usize, bool, Vec<String>)> {
     let threads: Vec<String> = opened.iter().map(|(thread, _)| thread.clone()).collect();
-    let Some(first) = threads.first() else {
-        return Vec::new();
-    };
-    let reserved = match lock(&dir) {
-        Ok(_lock) => reserve(&dir, &threads),
-        Err(_) => None,
-    };
-    let Some((reach, golden)) = reserved else {
-        return Vec::new();
+    let (reach, golden) = {
+        let _lock = lock(dir).ok()?;
+        reserve(dir, key, &threads)?
     };
     let titles: Vec<&str> = opened.iter().map(|(_, title)| title.as_str()).collect();
     let texts: Vec<String> = (threads.iter())
@@ -974,16 +1001,8 @@ pub async fn round(
             Some(posts.first()?["text"].as_str()?.to_owned())
         })
         .collect();
-    let words = invite_words(&dir, &titles.join("\n"), &texts.join("\n"));
-    let seats = Seats {
-        thread: first,
-        request: format!("commons.round.{first}"),
-        words: &words,
-        reach,
-        golden,
-    };
-    let note = |ticket| round_note(board, opened, author, ticket);
-    sends(home, seats, (author, turn), &note).await
+    let words = invite_words(dir, &titles.join("\n"), &texts.join("\n"));
+    Some((reach, golden, words))
 }
 
 /// The note an agent invited to a round of new work gets: the work, by
@@ -1005,11 +1024,9 @@ pub fn round_note(board: &str, opened: &[(String, String)], author: &str, golden
     }
 }
 
-/// What one thread's or round's invites are: the thread they count under,
-/// the request each is sent as, the words that aim them, how many, and
-/// whether one is a golden ticket.
+/// What one thread's or round's invites are: the request each is sent as,
+/// the words that aim them, how many, and whether one is a golden ticket.
 struct Seats<'a> {
-    thread: &'a str,
     request: String,
     words: &'a [String],
     reach: usize,
@@ -1017,15 +1034,15 @@ struct Seats<'a> {
 }
 
 /// Sends the invites `seats` holds, each with the note `note` writes for a
-/// golden ticket or not, and settles them: as [`invite`] says.
+/// golden ticket or not, as [`invite`] says: each agent invited, and
+/// whether it held the golden ticket, for the caller to settle.
 async fn sends(
     home: &Path,
     seats: Seats<'_>,
     (author, turn): (&str, Option<i64>),
     note: &(dyn Fn(bool) -> String + Sync),
-) -> Vec<String> {
+) -> Vec<(String, bool)> {
     let Seats {
-        thread,
         request,
         words,
         reach,
@@ -1093,8 +1110,7 @@ async fn sends(
     }
     .await;
     let _ = sent;
-    settle(&dir(home), thread, &invited);
-    invited.into_iter().map(|(bot, _)| bot).collect()
+    invited
 }
 
 /// Each of `named`, a live agent, hears the post `said` answers for once,
@@ -4917,11 +4933,15 @@ mod tests {
         let dir = dir(&home);
         std::fs::create_dir_all(&dir).unwrap();
         let threads = ["w1".to_owned(), "w2".to_owned()];
-        assert!(reserve(&dir, &threads).is_some());
+        // A plain thread made work had its own invites: the round counts
+        // apart from them, a thread of the day's own.
+        assert!(reserve(&dir, "w1", &[]).is_some());
+        settle(&dir, "w1", &[("c.z".to_owned(), false)]);
+        assert!(reserve(&dir, "round:w1", &threads).is_some());
         // Sent to one agent: the day counts the round once.
-        settle(&dir, "w1", &[("b.y".to_owned(), false)]);
-        assert_eq!(budget(&sent(&dir), 0)["today"], 1);
-        assert_eq!(sent(&dir)[0]["threads"], json!(threads));
+        settle(&dir, "round:w1", &[("b.y".to_owned(), false)]);
+        assert_eq!(budget(&sent(&dir), 0)["today"], 2);
+        assert_eq!(sent(&dir)[1]["threads"], json!(threads));
         // A reply in its second work's thread answers it.
         answered(&dir, "w2", "b.y");
         assert_eq!(budget(&sent(&dir), 0)["answered"], 1);
