@@ -4234,18 +4234,25 @@ impl Database {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
         super::pack::unpacking(&conn)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-            PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
-            PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;",
-        )?;
-        conn.execute_batch(&format!("PRAGMA journal_size_limit={WAL_KEPT};"))?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let has_tables: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='bots')",
             [],
             |r| r.get(0),
         )?;
+        // A new store gives the pages it frees back to the disk as packing
+        // asks (`incremental_vacuum`). The mode is set before anything
+        // writes the file, WAL's header included: set after, it holds only
+        // through a `VACUUM`.
+        if version == 0 && !has_tables {
+            conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
+        }
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
+            PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;",
+        )?;
+        conn.execute_batch(&format!("PRAGMA journal_size_limit={WAL_KEPT};"))?;
         // An older store is copied and the copy checked before migrating,
         // so a release can go back to the store as it was.
         if version != 0 && version < Self::SCHEMA {
@@ -4254,11 +4261,6 @@ impl Database {
             // foreign keys off, as SQLite's rebuild steps ask, and checks
             // them itself before it commits. Off only outside a transaction.
             conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
-        }
-        // A new store gives the pages it frees back to the disk as packing
-        // asks (`incremental_vacuum`); the mode is set before its first table.
-        if version == 0 && !has_tables {
-            conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         }
         // Initialize a fresh store atomically; existing stores must match.
         let tx = conn.unchecked_transaction()?;
@@ -4515,7 +4517,10 @@ impl Database {
         }
         tx.commit()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        incremental(&conn)?;
+        // A new store is INCREMENTAL from its first byte (above).
+        if version != 0 {
+            incremental(&conn)?;
+        }
         // Background command ownership is lost across daemon restart. This
         // does not prove the OS process stopped; never reuse its handle. A
         // call a message lifted, still waiting on its verdict or answer, is
@@ -16179,13 +16184,7 @@ impl Database {
             })
             .optional()?;
         let Some((bot_id, name, after, head)) = due else {
-            let next: Option<i64> = self.conn.query_row(
-                "SELECT MIN(CASE WHEN running_turn IS NULL THEN COALESCE(last_finished_ms,0) ELSE ?1 END)
-                 FROM bots WHERE status!='deleting' AND head>COALESCE(packed_node,0)",
-                [now_ms],
-                |r| r.get(0),
-            )?;
-            return Ok(Pack::Due(next.unwrap_or(now_ms) + super::pack::IDLE_MS));
+            return Ok(Pack::Due(self.pack_due(now_ms)?));
         };
         let mut batch = Packing {
             bot_id,
@@ -16281,6 +16280,19 @@ impl Database {
             }
         }
         Ok(Pack::Batch(batch))
+    }
+    /// When packing next has work, in epoch ms: when the bot that will
+    /// have been idle longest reaches [`super::pack::IDLE_MS`] (at or
+    /// before `now_ms` when one has), or, with no bot left to pack, when
+    /// one idle from now would.
+    pub fn pack_due(&self, now_ms: i64) -> Result<i64> {
+        let next: Option<i64> = self.conn.query_row(
+            "SELECT MIN(CASE WHEN running_turn IS NULL THEN COALESCE(last_finished_ms,0) ELSE ?1 END)
+             FROM bots WHERE status!='deleting' AND head>COALESCE(packed_node,0)",
+            [now_ms],
+            |r| r.get(0),
+        )?;
+        Ok(next.unwrap_or(now_ms) + super::pack::IDLE_MS)
     }
     /// Write what [`Self::to_pack`] packed: each item still as it was read
     /// is kept packed, with its length, and the bot's history through the

@@ -25614,6 +25614,27 @@ fn every_read(db: &mut Database, name: &str, turns: &[i64]) -> Vec<Value> {
 /// read gives back what was written, byte for byte. A bot still at work
 /// stays plain, and one packed works on.
 #[test]
+fn a_new_store_gives_freed_pages_back_from_its_first_write() {
+    let path = std::env::temp_dir().join(format!("agent-new-store-{}.sqlite", std::process::id()));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    // A new store is never rewritten as it opens: its mode holds from the
+    // start, or not at all.
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let mode: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, 2);
+    drop(db);
+    drop(conn);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
 fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     let path = std::env::temp_dir().join(format!("agent-pack-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

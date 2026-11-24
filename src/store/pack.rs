@@ -13,10 +13,12 @@ const LEVEL: i32 = 3;
 /// How long an agent goes without a turn before its items are packed:
 /// Codex's seven days.
 pub const IDLE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-/// The bytes of items one batch reads, packs and writes at most, past its
-/// first turn: what a batch holds in memory, and what one writer job
-/// rewrites, stay bounded however long a history is.
-pub const BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// The bytes of items one batch reads, packs and writes, past its first
+/// item: what a batch holds in memory, and what one writer job rewrites,
+/// stay bounded however long a history is. At 1 MiB a writer job takes a
+/// few milliseconds, so turns beside packing barely wait, and memory freed
+/// after packing stays small (8 MiB left the daemon tens of MiB larger).
+pub const BATCH_BYTES: usize = 1024 * 1024;
 
 /// `item` packed, when that is smaller.
 pub fn pack(packer: &mut zstd::bulk::Compressor<'_>, item: &[u8]) -> Result<Option<Vec<u8>>> {

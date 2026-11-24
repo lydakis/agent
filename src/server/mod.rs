@@ -3226,10 +3226,18 @@ pub async fn run(config: Configuration) -> Result<()> {
             tokio::time::Instant,
             Vec<std::sync::Weak<agent_runtime::provider::pace::Pace>>,
         >::new();
-        // Packing (see `Database::to_pack`): a pass as the daemon starts,
-        // and again when the next idle bot is due; one pass at a time, its
-        // work on the store's threads.
-        let mut pack_due = Some(tokio::time::Instant::now());
+        // Packing (see `Database::to_pack`): a pass when the first idle bot
+        // is due, asked of the worker as the daemon starts (a reader does
+        // nothing until there is work), then when the next is; one pass at
+        // a time, its work on the store's threads.
+        let due_at = |due: i64| {
+            let now = handles::now_ms() as i64;
+            tokio::time::Instant::now() + std::time::Duration::from_millis((due - now).max(0) as u64)
+        };
+        let now = handles::now_ms() as i64;
+        let mut pack_due = Some(due_at(
+            service.store.op("pack_due", move |db| db.pack_due(now)).await?,
+        ));
         let mut packing = tokio::task::JoinSet::<Result<i64>>::new();
         loop {
             if service.draining() && service.active.is_empty() && service.claims.is_empty() {
@@ -3267,13 +3275,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // A pass that failed, counted in the store's stats, is
                 // tried again when a turn ending now would be due.
                 Some(packed) = packing.join_next(), if !packing.is_empty() => {
-                    let now = handles::now_ms() as i64;
-                    let due = match packed {
+                    pack_due = Some(due_at(match packed {
                         Ok(Ok(due)) => due,
-                        _ => now + agent_runtime::store::PACK_IDLE_MS,
-                    };
-                    pack_due = Some(tokio::time::Instant::now()
-                        + std::time::Duration::from_millis((due - now).max(0) as u64));
+                        _ => handles::now_ms() as i64 + agent_runtime::store::PACK_IDLE_MS,
+                    }));
                 }
                 Some(done) = service.switching.finished.recv() => {
                     let chore = std::time::Instant::now();
