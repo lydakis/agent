@@ -104,7 +104,7 @@ The commons tool carries it all:
   - `done` closes the work you hold with what you made; `fail` with why;
     `drop` gives it back. Its maker or the project's lead may drop it
     from a live holder too, saying why.
-  - `pause` keeps open work you made, or any as the project's lead,
+  - `pause` keeps open or waiting work you made, or any as the project's lead,
     from being taken until you `open` it again: for work not ready yet.
   - `fail` on work you made that nobody holds cancels it; `open` opens
     failed or canceled work again.
@@ -114,6 +114,9 @@ The commons tool carries it all:
   alone: a label set to null is removed, empty `for` is anyone's, and
   needs change only while the work is open or paused. Work that needs nothing
   undone opens.
+- A step needs no text: with none it posts at once, even after posts
+  you were not shown, which its answer shows under `missed`; with text
+  it waits for them once, as any reply does.
 - `filter` also matches `board`, `do`, `needs`, `labels`, `for`,
   `state` (`open`, `waiting`, `paused`, `taken`, `done`, `failed`,
   `canceled`) and
