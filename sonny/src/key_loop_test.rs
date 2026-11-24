@@ -235,6 +235,7 @@ fn window(client: Arc<Client>, socket: PathBuf) -> App {
         send: None,
         draft: None,
         reopened: false,
+        land: false,
     };
     App::new(client, "b", &json!({"name": "b"}), options)
 }

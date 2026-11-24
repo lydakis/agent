@@ -173,7 +173,7 @@ Press `/projects` (or `←` on an empty composer) to browse all projects in plac
 - **Fast switching inside a project (empty composer):**
   - `Alt+←` / `Alt+→` (or `Ctrl+←` / `Ctrl+→`): step through agents in this project.
   - `→` (or `Tab`): move keyboard focus to the side pane (`←` returns from page 1).
-  - `Alt+N` (or click `← ? N` in the footer): jump to the next agent needing your approval or answer across **any** project.
+  - `Alt+N` (or click `← ? N` in the footer): jump to the next agent needing your approval or answer across **any** project, landing on its card.
 
 ![Projects at 150, 120, 60 and 44 columns: a superlead with two projects under it, a third outside it, four idle projects folded; the pane shows the picked project's agents where there is room](../docs/sonny/projects-projects.png)
 
@@ -214,7 +214,17 @@ not, goes to the next agent that needs you: this project's first, then
 the other projects' in the order **Projects** lists them, from the one
 after this project's around to the one before it, in each its lead first
 and then by name, so from any agent it reaches every one; at none it says
-`no one needs you`.
+`no one needs you`. It lands on what that agent needs: the approval that
+waits, else the card of the question the composer answers, brought into
+view where it is (left where it is when in view already, read back to a
+page at a time when older than the window drew), its `?` beating a few
+times, the keys in the composer so a number answers at once. Where the
+agent is this window's own it does that here. `enter` or a click on an
+agent's row in `/status` lands the same way, and so does a click on the
+question's words in the composer's hint or its `answering “…”` row; `↑`
+`↓` that switch questions bring each one's card into view, and `end` or
+an answer goes back to the newest. The footer's `?` opens `/status`; it
+never scrolls.
 Side chats are left out, as `/status` leaves them. The footer
 learns from the daemon's events as they come, so an approval held in
 another project shows as soon as `/status` would show it, with nothing read
