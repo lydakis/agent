@@ -3714,7 +3714,7 @@ fn budget_exhausted(bot: &Bot, budget: u64) -> Error {
 /// their own: a bot's row stays a few hundred bytes, so a listing never
 /// reads them and a write to the row never rewrites them.
 /// Each is kept once in `texts`, however many bots hold the same, and the
-/// row names it by digest.
+/// row names it by its id there: a few bytes, smaller than any text.
 fn instruct(
     conn: &Connection,
     id: i64,
@@ -3728,52 +3728,56 @@ fn instruct(
     conn.prepare_cached(
         "INSERT INTO bot_instructions(id,instructions,compaction_instructions) VALUES (?,?,?)",
     )?
-    .execute(params![
-        id,
-        &*instructions,
-        compaction_instructions.as_deref()
-    ])?;
+    .execute(params![id, instructions, compaction_instructions])?;
     Ok(())
 }
-/// Keep `text` in the store once, whoever holds it, and give the digest
-/// that names it: SHA-256 of its bytes, as a tool list's.
-fn keep_text(conn: &Connection, text: &str) -> Result<Box<str>> {
+/// Keep `text` in the store once, whoever holds it, and give the id that
+/// names it. The same text is found again by its digest (SHA-256 of its
+/// bytes, as a tool list's), kept with it alone.
+fn keep_text(conn: &Connection, text: &str) -> Result<i64> {
     let digest = crate::tools::digest_of(text);
-    conn.prepare_cached("INSERT OR IGNORE INTO texts(digest,text) VALUES (?,?)")?
-        .execute([&*digest, text])?;
-    Ok(digest)
+    let known: Option<i64> = conn
+        .prepare_cached("SELECT id FROM texts WHERE digest=?")?
+        .query_row([&*digest], |r| r.get(0))
+        .optional()?;
+    match known {
+        Some(id) => Ok(id),
+        None => Ok(conn
+            .prepare_cached("INSERT INTO texts(digest,text) VALUES (?,?) RETURNING id")?
+            .query_row(params![&*digest, text], |r| r.get(0))?),
+    }
 }
-/// The text the store keeps under `digest`.
-fn kept_text(conn: &Connection, digest: &str) -> Result<String> {
-    conn.prepare_cached("SELECT text FROM texts WHERE digest=?")?
-        .query_row([digest], |r| r.get(0))
+/// The text the store keeps as `id`.
+fn kept_text(conn: &Connection, id: i64) -> Result<String> {
+    conn.prepare_cached("SELECT text FROM texts WHERE id=?")?
+        .query_row([id], |r| r.get(0))
         .optional()?
-        .ok_or_else(|| Error::with("store_text_unknown", digest))
+        .ok_or_else(|| Error::with("store_text_unknown", id.to_string()))
 }
-/// Let go of the text `digest` names once nothing names it: no bot's
+/// Let go of the text `id` names once nothing names it: no bot's
 /// instructions or compaction instructions, and no event of a kept
 /// `configure` (`events` counts those, see [`holding`]).
-fn drop_text(conn: &Connection, digest: Option<&str>) -> Result<()> {
-    if let Some(digest) = digest {
+fn drop_text(conn: &Connection, id: Option<i64>) -> Result<()> {
+    if let Some(id) = id {
         conn.prepare_cached(
-            "DELETE FROM texts WHERE digest=?1 AND events=0
+            "DELETE FROM texts WHERE id=?1 AND events=0
               AND NOT EXISTS(SELECT 1 FROM bot_instructions WHERE instructions=?1)
               AND NOT EXISTS(SELECT 1 FROM bot_instructions WHERE compaction_instructions=?1)",
         )?
-        .execute([digest])?;
+        .execute([id])?;
     }
     Ok(())
 }
 /// The events whose kept `configure` holds its texts once, in `texts`.
 const HOLDING: [&str; 2] = ["configure_pending", "configure_failed"];
-/// What of a kept `configure` its event holds by digest: the instructions,
+/// What of a kept `configure` its event holds by id: the instructions,
 /// the compaction instructions, and tools declared whole, as JSON. Each is
 /// about as large as a whole configure, and the same ones come again in
 /// every agent's event when a client changes them all.
 const HELD: [&str; 3] = ["instructions", "compaction_instructions", "declare"];
 /// `data`, the event of a kept `configure`, as stored: each text of
 /// [`HELD`] it carries kept once in `texts`, counted there as one more
-/// event naming it, and named under `texts` by digest in its place.
+/// event naming it, and named under `texts` by id in its place.
 /// [`spelled`] puts each back where it was.
 fn holding(conn: &Connection, mut data: Value) -> Result<Value> {
     let mut held = serde_json::Map::new();
@@ -3788,10 +3792,10 @@ fn holding(conn: &Connection, mut data: Value) -> Result<Value> {
                 _ => continue,
             };
             pending.remove(field);
-            let digest = keep_text(conn, &text)?;
-            conn.prepare_cached("UPDATE texts SET events=events+1 WHERE digest=?")?
-                .execute([&*digest])?;
-            held.insert(field.into(), json!(&*digest));
+            let id = keep_text(conn, &text)?;
+            conn.prepare_cached("UPDATE texts SET events=events+1 WHERE id=?")?
+                .execute([id])?;
+            held.insert(field.into(), json!(id));
         }
     }
     if !held.is_empty() {
@@ -3810,11 +3814,11 @@ fn spelled(conn: &Connection, kind: &str, mut data: Value) -> Result<Value> {
     else {
         return Ok(data);
     };
-    for (field, digest) in held {
-        let digest = digest
-            .as_str()
+    for (field, id) in held {
+        let id = id
+            .as_i64()
             .ok_or_else(|| Error::new("store_text_unknown"))?;
-        let text = kept_text(conn, digest)?;
+        let text = kept_text(conn, id)?;
         data["configure_pending"][field.as_str()] = match field.as_str() {
             "declare" => serde_json::from_str(&text)?,
             _ => Value::String(text),
@@ -3822,8 +3826,8 @@ fn spelled(conn: &Connection, kind: &str, mut data: Value) -> Result<Value> {
     }
     Ok(data)
 }
-/// The digests the kept `configure`s of `bot`'s events hold.
-fn held_by(conn: &Connection, bot: &str) -> Result<Vec<String>> {
+/// The texts the kept `configure`s of `bot`'s events hold.
+fn held_by(conn: &Connection, bot: &str) -> Result<Vec<i64>> {
     let mut statement = conn.prepare_cached(
         "SELECT h.value FROM events e, json_each(e.data,'$.texts') h
          WHERE e.kind IN ('configure_pending','configure_failed') AND e.bot=?",
@@ -3839,10 +3843,10 @@ fn held_by(conn: &Connection, bot: &str) -> Result<Vec<String>> {
 fn delete_events(conn: &Connection, bot: &str) -> Result<i64> {
     let held = held_by(conn, bot)?;
     let events = conn.execute("DELETE FROM events WHERE bot=?", [bot])? as i64;
-    for digest in held {
-        conn.prepare_cached("UPDATE texts SET events=events-1 WHERE digest=?")?
-            .execute([&digest])?;
-        drop_text(conn, Some(&digest))?;
+    for id in held {
+        conn.prepare_cached("UPDATE texts SET events=events-1 WHERE id=?")?
+            .execute([id])?;
+        drop_text(conn, Some(id))?;
     }
     Ok(events)
 }
@@ -4380,10 +4384,10 @@ impl Database {
                 configure_pending TEXT, refused_summary TEXT, closed_ms INTEGER, profile TEXT,
                 family_start INTEGER, packed_node INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
-            CREATE TABLE IF NOT EXISTS texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL,
-                events INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS texts(id INTEGER PRIMARY KEY, digest TEXT NOT NULL UNIQUE,
+                text TEXT NOT NULL, events INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS bot_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
-                instructions TEXT NOT NULL, compaction_instructions TEXT);
+                instructions INTEGER NOT NULL, compaction_instructions INTEGER);
             CREATE INDEX IF NOT EXISTS bot_instructions_text ON bot_instructions(instructions);
             CREATE INDEX IF NOT EXISTS bot_instructions_compaction
                 ON bot_instructions(compaction_instructions) WHERE compaction_instructions IS NOT NULL;
@@ -5122,7 +5126,7 @@ impl Database {
         tool_list(&self.conn, digest)
     }
     /// A bot's row and its instructions, read from `texts`.
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,it.text,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,compaction,ct.text,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending,closed_ms,profile";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,it.text,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,bots.id,created_by,created_by_id,compaction,ct.text,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending,closed_ms,profile";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     /// Its id and depth, read in the same query.
@@ -5242,9 +5246,9 @@ impl Database {
             self.conn
                 .prepare_cached(&format!(
                     "SELECT {} FROM bots JOIN bot_instructions i USING(id)
-                     JOIN texts it ON it.digest=i.instructions
-                     LEFT JOIN texts ct ON ct.digest=i.compaction_instructions
-                     WHERE id=?",
+                     JOIN texts it ON it.id=i.instructions
+                     LEFT JOIN texts ct ON ct.id=i.compaction_instructions
+                     WHERE bots.id=?",
                     Self::COLUMNS
                 ))?
                 .query_row([id], Self::row_held)
@@ -5269,8 +5273,8 @@ impl Database {
             self.conn
                 .prepare_cached(&format!(
                     "SELECT {} FROM bots JOIN bot_instructions i USING(id)
-                     JOIN texts it ON it.digest=i.instructions
-                     LEFT JOIN texts ct ON ct.digest=i.compaction_instructions
+                     JOIN texts it ON it.id=i.instructions
+                     LEFT JOIN texts ct ON ct.id=i.compaction_instructions
                      WHERE name=?",
                     Self::COLUMNS
                 ))?
@@ -5318,18 +5322,20 @@ impl Database {
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let tx = self.conn.savepoint()?;
-        let before: String = tx
-            .prepare_cached("SELECT instructions FROM bot_instructions WHERE id=?")?
-            .query_row([id], |r| r.get(0))?;
-        let digest = crate::tools::digest_of(instructions);
-        let changed = *digest != *before;
+        let (before, digest): (i64, String) = tx
+            .prepare_cached(
+                "SELECT t.id,t.digest FROM bot_instructions i JOIN texts t ON t.id=i.instructions
+                 WHERE i.id=?",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let changed = *crate::tools::digest_of(instructions) != *digest;
         if changed {
-            keep_text(&tx, instructions)?;
+            let text = keep_text(&tx, instructions)?;
             tx.execute(
                 "UPDATE bot_instructions SET instructions=? WHERE id=?",
-                params![&*digest, id],
+                params![text, id],
             )?;
-            drop_text(&tx, Some(&before))?;
+            drop_text(&tx, Some(before))?;
             tx.execute(
                 "UPDATE bots SET cache_bot=NULL, thinking_prefix=NULL WHERE id=?",
                 [id],
@@ -6194,19 +6200,20 @@ impl Database {
         let mut changed = Vec::new();
         if let Some(instructions) = instructions {
             let tx = self.conn.savepoint()?;
-            let before: Option<String> = tx
-                .prepare_cached("SELECT compaction_instructions FROM bot_instructions WHERE id=?")?
-                .query_row([id], |r| r.get(0))?;
+            let (before, held): (Option<i64>, Option<String>) = tx
+                .prepare_cached(
+                    "SELECT t.id,t.digest FROM bot_instructions i
+                     LEFT JOIN texts t ON t.id=i.compaction_instructions WHERE i.id=?",
+                )?
+                .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let digest = instructions.map(crate::tools::digest_of);
-            if digest.as_deref() != before.as_deref() {
-                if let Some(text) = instructions {
-                    keep_text(&tx, text)?;
-                }
+            if digest.as_deref() != held.as_deref() {
+                let text = instructions.map(|text| keep_text(&tx, text)).transpose()?;
                 tx.execute(
                     "UPDATE bot_instructions SET compaction_instructions=? WHERE id=?",
-                    params![digest.as_deref(), id],
+                    params![text, id],
                 )?;
-                drop_text(&tx, before.as_deref())?;
+                drop_text(&tx, before)?;
                 changed.push("compaction_instructions");
             }
             tx.commit()?;
@@ -17891,7 +17898,7 @@ impl Database {
             tx.query_row("SELECT declared FROM bots WHERE name=?", [name], |r| {
                 r.get(0)
             })?;
-        let texts: Option<(String, Option<String>)> = tx
+        let texts: Option<(i64, Option<i64>)> = tx
             .query_row(
                 "SELECT instructions,compaction_instructions FROM bot_instructions
                  WHERE id=(SELECT id FROM bots WHERE name=?)",
@@ -17906,8 +17913,8 @@ impl Database {
         tx.execute("DELETE FROM bots WHERE name=?", [name])?;
         drop_list(&tx, declared.as_deref())?;
         if let Some((instructions, compaction_instructions)) = texts {
-            drop_text(&tx, Some(&instructions))?;
-            drop_text(&tx, compaction_instructions.as_deref())?;
+            drop_text(&tx, Some(instructions))?;
+            drop_text(&tx, compaction_instructions)?;
         }
         out["nodes"] = json!(freed);
         out["done"] = json!(true);
@@ -22749,17 +22756,20 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     Ok(())
 }
 
-/// 113 -> 114: each text bots hold kept once, by digest, in `texts`:
-/// every bot's instructions and compaction instructions, and what the
-/// events of kept `configure`s carry (see [`holding`]). Nodes may be packed
+/// 113 -> 114: each text bots hold kept once in `texts`, named by its id
+/// there and found again by its digest: every bot's instructions and
+/// compaction instructions (`bot_instructions` rebuilt to hold ids), and
+/// what the events of kept `configure`s carry (see [`holding`]). Nodes may be packed
 /// (`packed`, their unpacked length) and a bot records the newest node of
 /// its history packing has been through (`packed_node`); none is yet. One row at a time, so
 /// memory holds one text however many there are. release/store_down.py
 /// takes it back.
 fn migrate_texts_once(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "CREATE TABLE texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL,
-             events INTEGER NOT NULL DEFAULT 0);
+        "CREATE TABLE texts(id INTEGER PRIMARY KEY, digest TEXT NOT NULL UNIQUE,
+             text TEXT NOT NULL, events INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE kept_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
+             instructions INTEGER NOT NULL, compaction_instructions INTEGER);
          ALTER TABLE nodes ADD COLUMN packed INTEGER;
          ALTER TABLE bots ADD COLUMN packed_node INTEGER;",
     )?;
@@ -22776,10 +22786,14 @@ fn migrate_texts_once(conn: &Connection) -> Result<()> {
         let instructions = keep_text(conn, &instructions)?;
         let compaction = compaction.map(|text| keep_text(conn, &text)).transpose()?;
         conn.execute(
-            "UPDATE bot_instructions SET instructions=?,compaction_instructions=? WHERE id=?",
-            params![&*instructions, compaction.as_deref(), id],
+            "INSERT INTO kept_instructions(id,instructions,compaction_instructions) VALUES (?,?,?)",
+            params![id, instructions, compaction],
         )?;
     }
+    conn.execute_batch(
+        "DROP TABLE bot_instructions;
+         ALTER TABLE kept_instructions RENAME TO bot_instructions;",
+    )?;
     let events: Vec<i64> = conn
         .prepare(
             "SELECT id FROM events WHERE kind IN ('configure_pending','configure_failed') ORDER BY id",
@@ -24900,10 +24914,9 @@ mod tests {
             .execute_batch(
                 "INSERT INTO bots(name,id,status,provider,family,model)
                  VALUES ('Bob',7,'idle','openai','responses','m');
-                 INSERT INTO texts(digest,text) VALUES
-                    ('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','');
-                 INSERT INTO bot_instructions(id,instructions)
-                    VALUES (7,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')",
+                 INSERT INTO texts(id,digest,text) VALUES
+                    (1,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','');
+                 INSERT INTO bot_instructions(id,instructions) VALUES (7,1)",
             )
             .unwrap();
         let read = |db: &Database| Arc::new(Identity::from(db.inspect_id(7).unwrap()));

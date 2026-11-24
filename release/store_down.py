@@ -105,19 +105,20 @@ def back_114(conn):
         " AND json_type(data,'$.texts') IS NOT NULL ORDER BY id")]
     for event in events:
         data = json.loads(conn.execute("SELECT data FROM events WHERE id=?", (event,)).fetchone()[0])
-        for field, digest in data.pop("texts").items():
-            text = conn.execute("SELECT text FROM texts WHERE digest=?", (digest,)).fetchone()[0]
+        for field, text_id in data.pop("texts").items():
+            text = conn.execute("SELECT text FROM texts WHERE id=?", (text_id,)).fetchone()[0]
             data["configure_pending"][field] = json.loads(text) if field == "declare" else text
         conn.execute("UPDATE events SET data=? WHERE id=?", (
             json.dumps(data, separators=(",", ":"), ensure_ascii=False, sort_keys=True), event))
     run(
         conn,
-        "UPDATE bot_instructions SET"
-        "    instructions=(SELECT text FROM texts WHERE digest=bot_instructions.instructions),"
-        "    compaction_instructions=(SELECT text FROM texts"
-        "        WHERE digest=bot_instructions.compaction_instructions);"
-        "DROP INDEX bot_instructions_text;"
-        "DROP INDEX bot_instructions_compaction;"
+        "CREATE TABLE plain_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),"
+        "    instructions TEXT NOT NULL, compaction_instructions TEXT);"
+        "INSERT INTO plain_instructions(id,instructions,compaction_instructions)"
+        "    SELECT i.id,t.text,c.text FROM bot_instructions i JOIN texts t ON t.id=i.instructions"
+        "    LEFT JOIN texts c ON c.id=i.compaction_instructions;"
+        "DROP TABLE bot_instructions;"
+        "ALTER TABLE plain_instructions RENAME TO bot_instructions;"
         "DROP TABLE texts;"
         "ALTER TABLE nodes DROP COLUMN packed;"
         "ALTER TABLE bots DROP COLUMN packed_node;"

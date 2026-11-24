@@ -49,10 +49,10 @@ PRAGMA user_version=113;
 """
 
 UP_114 = """
-CREATE TABLE texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL, events INTEGER NOT NULL DEFAULT 0);
-CREATE INDEX bot_instructions_text ON bot_instructions(instructions);
-CREATE INDEX bot_instructions_compaction
-    ON bot_instructions(compaction_instructions) WHERE compaction_instructions IS NOT NULL;
+CREATE TABLE texts(id INTEGER PRIMARY KEY, digest TEXT NOT NULL UNIQUE,
+    text TEXT NOT NULL, events INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE kept_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
+    instructions INTEGER NOT NULL, compaction_instructions INTEGER);
 ALTER TABLE nodes ADD COLUMN packed INTEGER;
 ALTER TABLE bots ADD COLUMN packed_node INTEGER;
 """
@@ -80,7 +80,7 @@ def packer():
 def keep(conn, text):
     digest = hashlib.sha256(text.encode()).hexdigest()
     conn.execute("INSERT OR IGNORE INTO texts(digest,text) VALUES (?,?)", (digest, text))
-    return digest
+    return conn.execute("SELECT id FROM texts WHERE digest=?", (digest,)).fetchone()[0]
 
 
 class StoreDownTest(unittest.TestCase):
@@ -133,12 +133,15 @@ class StoreDownTest(unittest.TestCase):
             "json_object('namespace','fixture','speeds',json_object('openai/*',json_array('fast')),"
             "'sandbox','read-only'))) WHERE name='Helper'"
         )
-        # 114 keeps each text bots hold once, by digest, and packs the
+        # 114 keeps each text bots hold once, by a small id, and packs the
         # items of agents idle a week: Helper's longest here.
         self.instructions = dict(conn.execute("SELECT id,instructions FROM bot_instructions"))
         conn.executescript(UP_114)
         for bot, text in self.instructions.items():
-            conn.execute("UPDATE bot_instructions SET instructions=? WHERE id=?", (keep(conn, text), bot))
+            conn.execute("INSERT INTO kept_instructions(id,instructions) VALUES (?,?)", (bot, keep(conn, text)))
+        conn.executescript("DROP TABLE bot_instructions;"
+                           "ALTER TABLE kept_instructions RENAME TO bot_instructions;"
+                           "CREATE INDEX bot_instructions_text ON bot_instructions(instructions);")
         held = {"instructions": keep(conn, KEPT["instructions"]),
                 "declare": keep(conn, json.dumps(KEPT["declare"], separators=(",", ":"), sort_keys=True))}
         stored = {"bot_id": 1, "running_turn": 7, "configure_pending": {"settings": {"speed": None}},

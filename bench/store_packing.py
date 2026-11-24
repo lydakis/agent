@@ -11,7 +11,8 @@ Opens STORE read-only (a daemon may hold it) and reports, as JSON:
   the items of each agent's history; this counts each item with the agent
   whose turn wrote it, near enough for an estimate.
 - `texts`: the bytes of instructions and of what the events of kept
-  configures carry, before and kept once by digest.
+  configures carry, before and kept once (named by a small id, found by
+  digest).
 
 With --every N only every Nth item is packed, and its sizes count N times:
 an estimate, said as such. Packed items of a store at schema 114 or later
@@ -108,12 +109,13 @@ def texts(conn):
                 continue
             digest = hashlib.sha256(text.encode()).hexdigest()
             held[digest] = len(text.encode())
-            names[field] = digest
+            names[field] = list(held).index(digest) + 1
             del pending[field]
         if names:
             value["texts"] = names
         events_after += len(json.dumps(value, separators=(",", ":")).encode())
-    after = len(rows) * 64 + sum(held.values())
+    # Each row names its texts by a small id; each text keeps its digest once.
+    after = len(rows) * 2 + sum(held.values()) + len(held) * 64
     return {"instructions_rows": len(rows), "distinct_texts": len(held),
             "bytes": before + events_before, "kept_once_bytes": after + events_after,
             "saved_bytes": before + events_before - after - events_after}

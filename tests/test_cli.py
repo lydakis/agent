@@ -24,7 +24,7 @@ from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import Model, ModelFixture
 
-# The digest that names the empty text, as the store keeps instructions.
+# The digest the store finds the empty text by.
 EMPTY_DIGEST = hashlib.sha256(b'').hexdigest()
 
 # The socket protocol version a daemon of this build announces in `ready`.
@@ -653,7 +653,7 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(run.returncode, 0, run.stderr)
         with sqlite3.connect(self.store) as db:
             rows = dict(db.execute('SELECT name, t.text FROM bots JOIN bot_instructions i USING(id)'
-                                   ' LEFT JOIN texts t ON t.digest=i.compaction_instructions'))
+                                   ' LEFT JOIN texts t ON t.id=i.compaction_instructions'))
         self.assertTrue(rows['Default'].startswith('You are summarizing'))
         self.assertIsNone(rows['Declined'])
         self.assertEqual(rows['Own'], 'Keep it short.')
@@ -1722,9 +1722,9 @@ class CliTests(ModelFixture):
                     db.execute("INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,reasoning)"
                                " VALUES (?,?,NULL,?,'running',?,'openai','responses','synthetic-model',NULL)",
                                (f'old-{n}', n, directory, n))
-                    # Instructions are kept once, in `texts`, named by digest.
-                    db.execute("INSERT OR IGNORE INTO texts(digest,text) VALUES (?,'')", (EMPTY_DIGEST,))
-                    db.execute("INSERT INTO bot_instructions(id,instructions) VALUES (?,?)", (n, EMPTY_DIGEST))
+                    # Instructions are kept once, in `texts`, named by a small id.
+                    db.execute("INSERT OR IGNORE INTO texts(id,digest,text) VALUES (1,?,'')", (EMPTY_DIGEST,))
+                    db.execute("INSERT INTO bot_instructions(id,instructions) VALUES (?,1)", (n,))
                     db.execute("INSERT INTO messages(id,bot,request_id,delivery,status,turn,text,workspace,model)"
                                " VALUES (?,?,'old','reject','taken',?,'check',?,'openai/synthetic-model')",
                                (n, f'old-{n}', n, directory))
