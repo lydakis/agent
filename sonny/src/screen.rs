@@ -2088,10 +2088,12 @@ impl Screen {
                     .collect::<Vec<_>>()
                     .join(" · ");
                 let wide = when.width() as u16;
-                // Inset from the right as the words are from the left.
-                if area.width > 2 * GUTTER + wide {
+                // Ending in the conversation's last column, where the
+                // footer ends and the words wrap: on the person's band, a
+                // column inside its end, as the `›` is inside its start.
+                if area.width >= wide {
                     buf.set_string(
-                        area.x + area.width - GUTTER - wide,
+                        area.right() - wide,
                         area.y + (over - 1 - top) as u16,
                         when,
                         Style::new().add_modifier(Modifier::DIM),
@@ -3102,61 +3104,97 @@ mod tests {
 
     #[test]
     fn the_message_under_the_mouse_shows_when_it_was_written_at_its_top_right_on_the_empty_row() {
+        let band = Style::new().bg(crate::look::BAND);
         let mut screen = Screen::default();
         screen.push(vec![Line::from("• The tests pass.")]);
         screen.mark_last(Mark::Tag(Tag::End(5)));
-        screen.push(vec![Line::default(), Line::from("› thanks")]);
+        // The person's message on their band, its top row empty.
+        screen.push(vec![
+            Line::default().style(band),
+            Line::from("› thanks").style(band),
+        ]);
         screen.mark_last(Mark::Tag(Tag::End(6)));
+        screen.push(vec![Line::default(), Line::from("• Done.")]);
+        screen.mark_last(Mark::Tag(Tag::End(7)));
         // Words right under a step, no blank row between them.
         screen.push(vec![
             Line::from("  ran the tests"),
             Line::from("• Tagged it."),
         ]);
-        screen.mark_last(Mark::Tag(Tag::End(7)));
+        screen.mark_last(Mark::Tag(Tag::End(8)));
         let ms = 1_794_042_780_000;
-        for node in [5, 6, 7] {
+        for node in [5, 6, 7, 8] {
             screen.date(node, ms);
         }
         let when = crate::stamp::written(ms);
-        let area = Rect::new(0, 0, 40, 6);
-        let draw = |screen: &mut Screen| {
-            let mut buf = Buffer::empty(area);
+        // The conversation two columns in from the window's edges, as a
+        // window draws it: its last column is 41, the band's end 42.
+        let area = Rect::new(2, 0, 40, 7);
+        let last = area.right() - 1;
+        let draw = |screen: &mut Screen, area: Rect| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 44, area.height));
             screen.render(area, &mut buf, |_| None);
             buf
         };
         // Nothing at rest.
-        let buf = draw(&mut screen);
-        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
-        // Over a message, its time at its top right edge, on the blank row
-        // over it, muted.
-        screen.mouse(mouse(MouseEventKind::Moved, 4, 2));
-        let buf = draw(&mut screen);
-        assert_eq!(row(&buf, 1), format!("{when:>38}  "));
-        assert!(buf[(37, 1)].modifier.contains(Modifier::DIM));
-        assert!(row(&buf, 2).starts_with("↩ thanks"));
-        // The first row on screen has no row over it: no time.
-        screen.mouse(mouse(MouseEventKind::Moved, 4, 0));
-        let buf = draw(&mut screen);
-        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
-        // A row with words on it over the message is left as it is.
-        screen.mouse(mouse(MouseEventKind::Moved, 4, 4));
-        let buf = draw(&mut screen);
+        let buf = draw(&mut screen, area);
+        assert!((0..7).all(|y| !row(&buf, y).contains(&when)));
+        // Over the person's message, its time on the band's empty top row,
+        // muted, its last cell the conversation's last column: one inside
+        // the band's end, as the `›` is one inside its start.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 2));
+        let buf = draw(&mut screen, area);
+        assert_eq!(row(&buf, 1), format!("{when:>42}  "));
+        assert_eq!(buf[(last, 1)].symbol(), &when[when.len() - 1..]);
+        assert!(buf[(last, 1)].modifier.contains(Modifier::DIM));
+        assert_eq!(buf[(last, 1)].bg, crate::look::BAND);
+        assert_eq!(buf[(last + 1, 1)].bg, crate::look::BAND);
+        assert_eq!(buf[(last + 1, 1)].symbol(), " ");
+        assert!(row(&buf, 2).starts_with("  ↩ thanks"));
+        // Over a reply, the same column, on the blank row over it.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 4));
+        let buf = draw(&mut screen, area);
+        assert_eq!(row(&buf, 3), format!("{when:>42}  "));
+        assert_eq!(buf[(last, 3)].symbol(), &when[when.len() - 1..]);
+        assert!(row(&buf, 4).starts_with("  ↩ Done."));
         assert!(
-            row(&buf, 4).starts_with("↩ Tagged it."),
-            "{:?}",
-            row(&buf, 4)
+            (0..7)
+                .filter(|&y| y != 3)
+                .all(|y| !row(&buf, y).contains(&when))
         );
-        assert_eq!(row(&buf, 3).trim_end(), "  ran the tests");
-        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
+        // A selection near it takes what is drawn under it, never the time.
+        let copied = drag(&mut screen, (last, 3), (last, 4));
+        assert_eq!(copied, Some(Action::Copy("\n• Done.".into())));
+        screen.selection = None;
+        // The first row on screen has no row over it: no time.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 0));
+        let buf = draw(&mut screen, area);
+        assert!((0..7).all(|y| !row(&buf, y).contains(&when)));
+        // A row with words on it over the message is left as it is.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 6));
+        let buf = draw(&mut screen, area);
+        assert!(
+            row(&buf, 6).starts_with("  ↩ Tagged it."),
+            "{:?}",
+            row(&buf, 6)
+        );
+        assert_eq!(row(&buf, 5).trim_end(), "    ran the tests");
+        assert!((0..7).all(|y| !row(&buf, y).contains(&when)));
         // A message's own number goes before its time: the handle the
         // model reads on it and `--quote` takes.
         screen.number(6, "calc.fix/48".into());
-        screen.mouse(mouse(MouseEventKind::Moved, 4, 2));
-        let buf = draw(&mut screen);
-        assert_eq!(
-            row(&buf, 1),
-            format!("{:>38}  ", format!("calc.fix/48 · {when}"))
-        );
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 2));
+        let buf = draw(&mut screen, area);
+        let numbered = format!("calc.fix/48 · {when}");
+        assert_eq!(row(&buf, 1), format!("{numbered:>42}  "));
+        // It may take the whole row, never a wider one: one too narrow
+        // for it leaves it out.
+        let wide = numbered.width() as u16;
+        let fits = Rect::new(2, 0, wide, 7);
+        let buf = draw(&mut screen, fits);
+        assert_eq!(row(&buf, 1).trim(), numbered);
+        let buf = draw(&mut screen, Rect::new(2, 0, wide - 1, 7));
+        assert!((0..7).all(|y| !row(&buf, y).contains(&when)));
     }
 
     #[test]
@@ -3191,8 +3229,8 @@ mod tests {
         for y in [3, 4] {
             screen.mouse(mouse(MouseEventKind::Moved, 6, y));
             let buf = draw(&mut screen, area);
-            assert_eq!(row(&buf, 1), format!("{when:>38}  "), "at {y}");
-            assert!(buf[(37, 1)].modifier.contains(Modifier::DIM));
+            assert_eq!(row(&buf, 1), format!("{when:>40}"), "at {y}");
+            assert!(buf[(39, 1)].modifier.contains(Modifier::DIM));
             assert_eq!(row(&buf, 2).trim_end(), "↳ calc.fix");
             assert!(row(&buf, 3).starts_with("↩ Fixed the rounding."));
             assert_eq!(row(&buf, 5).trim_end(), "└ started ◌ readme");
@@ -3205,7 +3243,7 @@ mod tests {
         // The message under the `└` row keeps its own over it.
         screen.mouse(mouse(MouseEventKind::Moved, 6, 7));
         let buf = draw(&mut screen, area);
-        assert_eq!(row(&buf, 6), format!("{when:>38}  "));
+        assert_eq!(row(&buf, 6), format!("{when:>40}"));
         assert_eq!(row(&buf, 5).trim_end(), "└ started ◌ readme");
         // Scrolled so the `↳` row is the first on screen: nothing over it
         // is shown, so no time, and none on the arrow row.

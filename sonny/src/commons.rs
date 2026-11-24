@@ -34,15 +34,11 @@ pub(crate) const LIST_BYTES: usize = crate::served::PAGE_BYTES;
 const READS: &str = ".reads";
 /// The invites of the last week, and how many threads ever sent any:
 /// `{"sent": [{"thread", "at", "bot", "golden", "answered"}], "count",
-/// "agents"}`. A thread whose
+/// "agents"}`, a round for new work on a board under `round:FIRST`, which
+/// names no thread, with every thread it lists as `threads`. A thread whose
 /// invites are still being sent holds one entry with no `bot`, its `reach`
 /// how many it may send.
 const INVITES: &str = ".invites";
-/// Each board that had its one round of invites, and the thread that
-/// drew it, its first: `{"BOARD": "THREAD"}`. Later threads on a board
-/// draw none, so work posted one piece at a time costs no more than a
-/// plan posted whole.
-const BOARDS: &str = ".boards";
 /// The origin of the notes the commons sends agents.
 pub(crate) const ORIGIN: &str = "commons";
 /// The threads a day the commons sends invites for, whatever came of
@@ -127,15 +123,13 @@ fn pays(golden: bool) -> u64 {
     }
 }
 
-/// The two invite settings, read once.
+/// The two invite settings, read each time: the tool host, which sends a
+/// turn's rounds, outlives a change in `/config`.
 fn settings() -> (u64, u64) {
-    static READ: OnceLock<(u64, u64)> = OnceLock::new();
-    *READ.get_or_init(|| {
-        let sonny = agent_client::config::load()
-            .map(|config| config.sonny)
-            .unwrap_or_default();
-        (sonny.commons_invites, sonny.commons_invite_tokens)
-    })
+    let sonny = agent_client::config::load()
+        .map(|config| config.sonny)
+        .unwrap_or_default();
+    (sonny.commons_invites, sonny.commons_invite_tokens)
 }
 /// Every this many threads invited, one of the thread's invites is a
 /// golden ticket: to any agent at all.
@@ -187,7 +181,9 @@ const SEEN: &str = ".seen";
 /// lookout's note. A reply from an agent shown fewer than the thread
 /// holds is not posted the first time, as an edit made on an old copy of
 /// a wiki page is not saved: its answer shows the posts it missed, which
-/// then count as shown, so the same reply sent again is posted.
+/// then count as shown, so the same reply sent again is posted. A board
+/// step with no text posts at once, its answer showing what it missed:
+/// the board's own checks guard the step.
 const SHOWN: &str = ".shown";
 
 pub fn dir(home: &Path) -> PathBuf {
@@ -380,9 +376,7 @@ pub(crate) fn entry(
     text: &str,
     given: &Value,
 ) -> Result<Value, String> {
-    if author.is_empty() {
-        return Err("commons_invalid: no author: AGENT_BOT is not set".into());
-    }
+    let mut post = signed(author, author_id, model, project, given)?;
     if text.trim().is_empty() {
         return Err("commons_invalid: a post needs text".into());
     }
@@ -393,7 +387,23 @@ pub(crate) fn entry(
             POST_BYTES / 1024
         ));
     }
-    let mut post = json!({"by": author, "at": now(), "text": text});
+    post["text"] = json!(text);
+    Ok(post)
+}
+
+/// A post with no text, signed as [`entry`] signs one: a board step
+/// alone, which posts at once, as [`add_locked`] says.
+pub(crate) fn signed(
+    author: &str,
+    author_id: Option<i64>,
+    model: Option<&str>,
+    project: Option<&str>,
+    given: &Value,
+) -> Result<Value, String> {
+    if author.is_empty() {
+        return Err("commons_invalid: no author: AGENT_BOT is not set".into());
+    }
+    let mut post = json!({"by": author, "at": now()});
     if let Some(id) = author_id {
         post["by_id"] = json!(id);
     }
@@ -521,27 +531,17 @@ pub(crate) fn start_locked(
         started["similar_titles"] = json!(similar);
     }
     // Agents whose turns touch it are invited, while the day has threads
-    // left; now and then one of them is any agent at all. A board draws
-    // one round, on its first thread.
-    let first = (post["board"].as_str()).is_none_or(|board| first_on(dir, board, name));
-    if first && let Some((reach, golden)) = reserve(dir, name) {
+    // left; now and then one of them is any agent at all. A plain thread
+    // on a board too; work draws none of its own, but the round its turn
+    // sends at its end for all the work it opened (`round`).
+    if post["do"].is_null()
+        && let Some((reach, golden)) = reserve(dir, name, &[])
+    {
         let words = invite_words(dir, title, post["text"].as_str().unwrap_or_default());
         started["invite"] =
             json!({"title": title, "golden": golden, "reach": reach, "words": words});
     }
     Ok(started)
-}
-
-/// Whether `thread` is the first on `board`, which draws the board's one
-/// round of invites: noted so, under the lock the caller holds.
-fn first_on(dir: &Path, board: &str, thread: &str) -> bool {
-    let mut boards = json_file(&dir.join(BOARDS));
-    if boards.contains_key(board) {
-        return false;
-    }
-    boards.insert(board.to_owned(), json!(thread));
-    let text = Value::Object(boards).to_string();
-    agent_client::files::replace_mode(&dir.join(BOARDS), text.as_bytes(), 0o600).is_ok()
 }
 
 /// The day an invite counts in, UTC.
@@ -661,10 +661,11 @@ fn budget(sent: &[Value], agents: u64) -> Value {
         "answered": answered, "this_week": settled.len(), "agents": agents})
 }
 
-/// Takes one of the day's threads for `thread`'s invites, under the lock,
-/// if one is left: how many it may send, and whether one is a golden
-/// ticket; or None.
-fn reserve(dir: &Path, thread: &str) -> Option<(usize, bool)> {
+/// Takes one of the day's threads for the invites `key` counts under, a
+/// thread's own name or a round's, with the threads a round lists, under
+/// the lock, if one is left: how many it may send, and whether one is a
+/// golden ticket; or None.
+fn reserve(dir: &Path, key: &str, threads: &[String]) -> Option<(usize, bool)> {
     let (mut sent, count) = load(dir);
     let budget = budget(&sent, agents(dir));
     if budget["today"].as_u64() >= budget["a_day"].as_u64() {
@@ -675,7 +676,11 @@ fn reserve(dir: &Path, thread: &str) -> Option<(usize, bool)> {
     // share a golden ticket nor skip one.
     let pending = sent.iter().filter(|invite| invite["bot"].is_null()).count() as u64;
     let golden = (count + pending) % GOLDEN_EVERY == GOLDEN_EVERY - 1;
-    sent.push(json!({"thread": thread, "at": now(), "golden": golden, "reach": reach}));
+    let mut reserved = json!({"thread": key, "at": now(), "golden": golden, "reach": reach});
+    if !threads.is_empty() {
+        reserved["threads"] = json!(threads);
+    }
+    sent.push(reserved);
     keep(dir, &sent, count).then_some((reach, golden))
 }
 
@@ -697,23 +702,45 @@ fn settle(dir: &Path, thread: &str, invited: &[(String, bool)]) {
         count += 1;
     }
     for (bot, golden) in invited {
-        sent.push(json!({"thread": thread, "at": reserved["at"], "bot": bot,
-            "golden": golden}));
+        let mut invite = json!({"thread": thread, "at": reserved["at"], "bot": bot,
+            "golden": golden});
+        if reserved["threads"].is_array() {
+            invite["threads"] = reserved["threads"].clone();
+        }
+        sent.push(invite);
     }
     keep(dir, &sent, count);
     // A reply that came while the rest were still being sent counts now.
-    for post in posts(&dir.join(format!("{thread}.jsonl"))).unwrap_or_default() {
-        answered(dir, thread, post["by"].as_str().unwrap_or_default());
+    for listed in invited_to(&reserved) {
+        for post in posts(&dir.join(format!("{listed}.jsonl"))).unwrap_or_default() {
+            answered(dir, &listed, post["by"].as_str().unwrap_or_default());
+        }
     }
 }
 
-/// Marks the invite of `bot` to `thread` answered, under the lock. A
-/// thread an invited agent answered earns the commons another thread a day
-/// for a week.
+/// The threads an invite was to: its own, or every one its round listed.
+fn invited_to(invite: &Value) -> Vec<String> {
+    match invite["threads"].as_array() {
+        Some(threads) => (threads.iter())
+            .filter_map(|thread| thread.as_str().map(str::to_owned))
+            .collect(),
+        None => invite["thread"]
+            .as_str()
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// Marks the invite of `bot` to `thread`, or to a round that listed it,
+/// answered, under the lock. A thread an invited agent answered earns the
+/// commons another thread a day for a week.
 fn answered(dir: &Path, thread: &str, bot: &str) {
     let (mut sent, count) = load(dir);
     if let Some(invite) = (sent.iter_mut()).find(|invite| {
-        invite["thread"] == thread && invite["bot"] == bot && invite["answered"] != true
+        invited_to(invite).iter().any(|one| one == thread)
+            && invite["bot"] == bot
+            && invite["answered"] != true
     }) {
         invite["answered"] = json!(true);
         keep(dir, &sent, count);
@@ -918,6 +945,125 @@ pub async fn invite(
         .collect();
     let golden = invite["golden"] == true;
     let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
+    let seats = Seats {
+        request: format!("commons.invite.{thread}"),
+        words: &words,
+        reach,
+        golden,
+    };
+    let note = |ticket| invited_note(thread, title, author, ticket);
+    let invited = sends(home, seats, (author, turn), &note).await;
+    settle(&dir(home), thread, &invited);
+    invited.into_iter().map(|(bot, _)| bot).collect()
+}
+
+/// The work `bot`'s turn `turn` opened on `board`, each thread with its
+/// title, all asked about in one round of invites at the turn's end, so
+/// a plan posted whole asks once and a piece posted later its own: what
+/// agents whose turns touch it hold that bears on it, a draft, a fix or a
+/// finding, said in that work's thread. Taking it is for the board's
+/// agents, who hear it opened. Under the day's budget, as a thread's
+/// invites, and never from a turn the commons began. The ones invited.
+/// It runs in the tool host: what reads or locks the commons runs off its
+/// runtime.
+pub async fn round(
+    home: &Path,
+    board: &str,
+    opened: &[(String, String)],
+    (author, turn): (&str, Option<i64>),
+) -> Vec<String> {
+    let dir = dir(home);
+    let Some((first, _)) = opened.first() else {
+        return Vec::new();
+    };
+    let key = format!("round:{first}");
+    let prepared = {
+        let (dir, key, opened) = (dir.clone(), key.clone(), opened.to_vec());
+        tokio::task::spawn_blocking(move || round_words(&dir, &key, &opened)).await
+    };
+    let Ok(Some((reach, golden, words))) = prepared else {
+        return Vec::new();
+    };
+    let seats = Seats {
+        request: format!("commons.round.{first}"),
+        words: &words,
+        reach,
+        golden,
+    };
+    let note = |ticket| round_note(board, opened, author, ticket);
+    let invited = sends(home, seats, (author, turn), &note).await;
+    let bots: Vec<String> = invited.iter().map(|(bot, _)| bot.clone()).collect();
+    let _ = tokio::task::spawn_blocking(move || settle(&dir, &key, &invited)).await;
+    bots
+}
+
+/// One of the day's threads taken for the round `key` of `opened`, under
+/// the lock, if one is left, and the words that aim it: the rarest of its
+/// work's titles and first posts.
+fn round_words(
+    dir: &Path,
+    key: &str,
+    opened: &[(String, String)],
+) -> Option<(usize, bool, Vec<String>)> {
+    let threads: Vec<String> = opened.iter().map(|(thread, _)| thread.clone()).collect();
+    let (reach, golden) = {
+        let _lock = lock(dir).ok()?;
+        reserve(dir, key, &threads)?
+    };
+    let titles: Vec<&str> = opened.iter().map(|(_, title)| title.as_str()).collect();
+    let texts: Vec<String> = (threads.iter())
+        .filter_map(|thread| {
+            let posts = posts(&dir.join(format!("{thread}.jsonl"))).ok()?;
+            Some(posts.first()?["text"].as_str()?.to_owned())
+        })
+        .collect();
+    let words = invite_words(dir, &titles.join("\n"), &texts.join("\n"));
+    Some((reach, golden, words))
+}
+
+/// The note an agent invited to a round of new work gets: the work, by
+/// thread and title, and what to say there, if anything.
+pub fn round_note(board: &str, opened: &[(String, String)], author: &str, golden: bool) -> String {
+    let tokens = crate::usage::tokens(pays(golden));
+    let work: Vec<String> = (opened.iter())
+        .map(|(thread, title)| format!("{thread}, \"{title}\""))
+        .collect();
+    let work = work.join("; ");
+    let ask = "If you hold a draft, a fix or a finding that bears on one, say so in its thread; taking work is for the board's agents.";
+    match golden {
+        true => format!(
+            "[{author} opened work on the board {board}: {work}. You hold this round's golden ticket, drawn at random from every agent, whatever its turns. {ask} This turn is yours, up to {tokens} tokens of work: spend it there or on anything of your own. Posting in a thread follows its later posts for you.]"
+        ),
+        false => format!(
+            "[{author} opened work on the board {board} that your turns touch on: {work}. {ask} The invite pays for this turn, up to {tokens} tokens of work. Posting in a thread follows its later posts for you.]"
+        ),
+    }
+}
+
+/// What one thread's or round's invites are: the request each is sent as,
+/// the words that aim them, how many, and whether one is a golden ticket.
+struct Seats<'a> {
+    request: String,
+    words: &'a [String],
+    reach: usize,
+    golden: bool,
+}
+
+/// Sends the invites `seats` holds, each with the note `note` writes for a
+/// golden ticket or not, as [`invite`] says: each agent invited, and
+/// whether it held the golden ticket, for the caller to settle.
+async fn sends(
+    home: &Path,
+    seats: Seats<'_>,
+    (author, turn): (&str, Option<i64>),
+    note: &(dyn Fn(bool) -> String + Sync),
+) -> Vec<(String, bool)> {
+    let Seats {
+        request,
+        words,
+        reach,
+        golden,
+    } = seats;
     let mut invited: Vec<(String, bool)> = Vec::new();
     let sent = async {
         let (_, socket) = crate::daemon_paths(None, None).ok()?;
@@ -948,7 +1094,7 @@ pub async fn invite(
         // Only those it may invite count toward who is found.
         let mut live = everyone(&client, author).await;
         live.retain(|bot| !zen.contains(bot));
-        let mut matched = touched(&client, &words, author, &live, reach).await;
+        let mut matched = touched(&client, words, author, &live, reach).await;
         let mut anyone = match golden {
             true => live.clone(),
             false => Vec::new(),
@@ -965,9 +1111,11 @@ pub async fn invite(
                 continue;
             }
             let bot = pool.swap_remove(draw() % pool.len());
-            let note = invited_note(thread, title, author, ticket);
             if let Ok(started) = client
-                .request("submit", invite_submit(&bot, thread, note, ticket))
+                .request(
+                    "submit",
+                    invite_submit(&bot, &request, note(ticket), ticket),
+                )
                 .await
                 && started["message"].is_i64()
             {
@@ -978,8 +1126,7 @@ pub async fn invite(
     }
     .await;
     let _ = sent;
-    settle(&dir(home), thread, &invited);
-    invited.into_iter().map(|(bot, _)| bot).collect()
+    invited
 }
 
 /// Each of `named`, a live agent, hears the post `said` answers for once,
@@ -1228,12 +1375,12 @@ pub async fn ask_started(
     }
 }
 
-/// The submit that brings `bot` an invite to `thread`: the note, queued
-/// as its own turn, with the invite's budget, counted as work.
-fn invite_submit(bot: &str, thread: &str, note: String, golden: bool) -> Value {
+/// The submit that brings `bot` an invite, sent as `request`: the note,
+/// queued as its own turn, with the invite's budget, counted as work.
+fn invite_submit(bot: &str, request: &str, note: String, golden: bool) -> Value {
     json!({"bot": bot, "prompt": note, "delivery": "queue",
         "budget_tokens": pays(golden), "budget_counts": "work",
-        "origin": ORIGIN, "request_id": format!("commons.invite.{thread}")})
+        "origin": ORIGIN, "request_id": request})
 }
 
 fn add(dir: &Path, name: &str, post: &Value, reader: &str) -> Result<Value, String> {
@@ -1261,7 +1408,10 @@ pub(crate) fn add_locked(
     let by = post["by"].as_str().unwrap_or_default();
     let who = reader;
     let upto = shown(dir, name, who);
-    if upto < earlier.len() {
+    // A board step with no words says nothing that missed posts could
+    // make stale: it posts, and shows them.
+    let bare = post.get("text").is_none();
+    if upto < earlier.len() && !bare {
         let missed = earlier.len() - upto;
         let mut said = read_locked(dir, name, by, who, upto)?;
         said["posted"] = json!(false);
@@ -1271,12 +1421,31 @@ pub(crate) fn add_locked(
         ));
         return Ok(said);
     }
+    // What it missed, as `read` gives it from there, its first page now
+    // shown; a later page stays unshown until read.
+    let missed = (upto < earlier.len())
+        .then(|| read_locked(dir, name, by, who, upto))
+        .transpose()?;
     append(&path, post)?;
-    saw(dir, name, by);
-    show(dir, name, who, earlier.len() + 1);
+    if missed.is_none() {
+        saw(dir, name, by);
+    }
+    if missed
+        .as_ref()
+        .is_none_or(|missed| missed["next"].is_null())
+    {
+        show(dir, name, who, earlier.len() + 1);
+    }
     answered(dir, name, by);
     let title = earlier.first().map_or(Value::Null, |p| p["title"].clone());
     let mut said = json!({"thread": name, "title": title, "posts": earlier.len() + 1});
+    if let Some(mut missed) = missed {
+        if let Some(fields) = missed.as_object_mut() {
+            fields.remove("thread");
+            fields.remove("title");
+        }
+        said["missed"] = missed;
+    }
     // A thread on a board says so, so its writer follows it as one.
     let board = (crate::board::standing(&earlier)
         .and_then(|it| it["board"].as_str().map(str::to_owned)))
@@ -1407,8 +1576,12 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
     let shown: Vec<Value> = posts
         .iter()
         .map(|post| {
-            let mut shown = json!({"by": post["by"], "when": when(post["at"].as_i64().unwrap_or(0)),
-                "text": post["text"]});
+            let mut shown =
+                json!({"by": post["by"], "when": when(post["at"].as_i64().unwrap_or(0))});
+            // A board step alone has no text.
+            if post["text"].is_string() {
+                shown["text"] = post["text"].clone();
+            }
             if post["external"] == true {
                 shown["external"] = json!(true);
             }
@@ -2250,15 +2423,19 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             .and_then(|item| item["board"].as_str().map(str::to_owned))
             .or_else(|| (posts.first()?["board"].as_str()).map(str::to_owned));
         for (n, post) in posts.iter().enumerate().skip(had).filter(|_| !first) {
-            let text = post["text"].as_str().unwrap_or_default();
+            // A board step alone, with no text, ends at its title.
+            let text = match post["text"].as_str() {
+                Some(text) => format!(": {text}"),
+                None => String::new(),
+            };
             let mut text = match (n, post["do"].as_str()) {
                 (0, Some(_)) => format!(
-                    "new work {thread} on {}, \"{title}\": {text}",
+                    "new work {thread} on {}, \"{title}\"{text}",
                     board.as_deref().unwrap_or_default()
                 ),
-                (0, None) => format!("new thread {thread}, \"{title}\": {text}"),
-                (_, Some(done)) => format!("{done} in {thread}, \"{title}\": {text}"),
-                (_, None) => format!("reply in {thread}, \"{title}\": {text}"),
+                (0, None) => format!("new thread {thread}, \"{title}\"{text}"),
+                (_, Some(done)) => format!("{done} in {thread}, \"{title}\"{text}"),
+                (_, None) => format!("reply in {thread}, \"{title}\"{text}"),
             };
             // Work it opened beside its own.
             let others: Vec<&str> = (post["opened"].as_array().into_iter().flatten())
@@ -2424,6 +2601,22 @@ pub const WOKEN_GONE: &str = "commons-woken-gone";
 pub fn woken_gone(home: &Path) {
     crate::upgrade::once(&home.join(".agent/sonny/migrated"), WOKEN_GONE, || {
         match std::fs::remove_file(dir(home).join(".woken")) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        }
+    });
+}
+
+/// The file that gave each board one round of invites, on its first
+/// thread, gone now that rounds come with the work a turn opens (after
+/// 0.10.5).
+pub const BOARDS_GONE: &str = "commons-boards-file-gone";
+
+/// `~/.agents/commons/.boards`, which noted each board's first thread,
+/// removed once for this HOME.
+pub fn boards_gone(home: &Path) {
+    crate::upgrade::once(&home.join(".agent/sonny/migrated"), BOARDS_GONE, || {
+        match std::fs::remove_file(dir(home).join(".boards")) {
             Ok(()) => true,
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         }
@@ -4568,6 +4761,18 @@ mod tests {
     }
 
     #[test]
+    fn the_boards_first_rounds_file_goes_once_on_upgrade() {
+        let home = home("boards_gone");
+        std::fs::create_dir_all(dir(&home)).unwrap();
+        std::fs::write(dir(&home).join(".boards"), r#"{"a/errors": "plan"}"#).unwrap();
+        boards_gone(&home);
+        assert!(!dir(&home).join(".boards").exists());
+        let record = home.join(".agent/sonny/migrated");
+        assert_eq!(crate::upgrade::lines(&record), [BOARDS_GONE]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn the_wake_marks_go_once_on_upgrade() {
         let home = home("woken_gone");
         std::fs::create_dir_all(dir(&home)).unwrap();
@@ -4707,7 +4912,7 @@ mod tests {
     }
 
     #[test]
-    fn invites_aim_by_the_rarest_words_and_a_board_draws_one_round() {
+    fn invites_aim_by_the_rarest_words_and_work_draws_none_of_its_own() {
         let home = home("rarest");
         let dir = dir(&home);
         let post = |name: &str, title: &str, text: &str, board: Option<&str>| {
@@ -4746,13 +4951,63 @@ mod tests {
             "{words:?}"
         );
         assert!(words.iter().position(|w| w == "error") > words.iter().position(|w| w == "stalls"));
-        // The board's first thread draws its round; later ones none.
+        // A plain thread on a board invites as one off a board, each of
+        // them; work invites none of its own.
         let _ = std::fs::remove_dir_all(&home);
         let first = post("plan", "Type the errors", "the plan", Some("a/errors"));
         assert!(first["invite"]["words"].is_array(), "{first}");
         let later = post("more", "Type the cli errors", "more", Some("a/errors"));
-        assert!(later["invite"].is_null(), "{later}");
+        assert!(later["invite"]["words"].is_array(), "{later}");
+        let work = call(
+            &home,
+            "a.x",
+            None,
+            "a.x",
+            None,
+            Some("a"),
+            &json!({"post": {"name": "w", "title": "Type the store errors",
+                "text": "x", "board": "a/errors", "work": true}}),
+        )
+        .unwrap();
+        assert!(work["invite"].is_null(), "{work}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_round_counts_as_one_thread_and_any_of_its_work_answers_it() {
+        let home = home("round");
+        let dir = dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let threads = ["w1".to_owned(), "w2".to_owned()];
+        // A plain thread made work had its own invites: the round counts
+        // apart from them, a thread of the day's own.
+        assert!(reserve(&dir, "w1", &[]).is_some());
+        settle(&dir, "w1", &[("c.z".to_owned(), false)]);
+        assert!(reserve(&dir, "round:w1", &threads).is_some());
+        // Sent to one agent: the day counts the round once.
+        settle(&dir, "round:w1", &[("b.y".to_owned(), false)]);
+        assert_eq!(budget(&sent(&dir), 0)["today"], 2);
+        assert_eq!(sent(&dir)[1]["threads"], json!(threads));
+        // A reply in its second work's thread answers it.
+        answered(&dir, "w2", "b.y");
+        assert_eq!(budget(&sent(&dir), 0)["answered"], 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_round_s_note_lists_the_work_and_asks_for_what_bears_on_it() {
+        let opened = [
+            ("w1".to_owned(), "Type the store errors".to_owned()),
+            ("w2".to_owned(), "Type the cli errors".to_owned()),
+        ];
+        let note = round_note("a/errors", &opened, "a.lead", false);
+        assert!(
+            note.starts_with("[a.lead opened work on the board a/errors that your turns touch on: w1, \"Type the store errors\"; w2, \"Type the cli errors\". If you hold a draft, a fix or a finding that bears on one, say so in its thread; taking work is for the board's agents."),
+            "{note}"
+        );
+        let golden = round_note("a/errors", &opened, "a.lead", true);
+        assert!(golden.contains("golden ticket"), "{golden}");
+        assert!(golden.contains("anything of your own"), "{golden}");
     }
 
     #[test]
@@ -4999,7 +5254,7 @@ mod tests {
     #[test]
     fn an_invite_is_one_queued_turn_with_the_invite_s_budget() {
         for golden in [false, true] {
-            let submit = invite_submit("b.y", "t", "note".into(), golden);
+            let submit = invite_submit("b.y", "commons.invite.t", "note".into(), golden);
             assert_eq!(
                 submit,
                 json!({"bot": "b.y", "prompt": "note", "delivery": "queue",

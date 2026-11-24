@@ -4162,10 +4162,12 @@ async fn run() -> Result<(), String> {
     }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), whatever set its instructions before; a file of
-    // the folder's it cannot use is left out, and said. Only here, as the
-    // window opens, as Codex reads its instructions once as a session
-    // starts: they lead every request, so a change while the lead works
-    // would cost its next call the whole prompt cache.
+    // the folder's it cannot use is left out, and said. Memory only here,
+    // as the window opens, as Codex reads its instructions once as a
+    // session starts: they lead every request, so a fact saved while the
+    // lead works would cost its next call the whole prompt cache. A role,
+    // rule or skill the person changes reaches it at its next turn's end,
+    // window or not (`turn_end::renew`).
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
@@ -14723,8 +14725,11 @@ impl App {
                 if changed("gates") && self.gating.take().is_some() {
                     dropped.push("permissions");
                 }
-                if changed("instructions") && self.instruct.take().is_some() {
-                    dropped.push("instructions");
+                // The folder's instructions as the window opened, no pick
+                // of the person's: those given since, as at a lead's turn
+                // end, are as new.
+                if changed("instructions") {
+                    self.instruct = None;
                 }
                 if changed("speed") && self.pace.take().is_some() {
                     dropped.push("speed");
@@ -15347,7 +15352,12 @@ impl App {
                         staged_body(&prompt, width, None, Path::new(&self.workspace), true);
                     lines.push(Line::default());
                     let why = data["detail"].as_str().or(data["error"].as_str());
-                    lines.push(transcript::finished("not run", why.unwrap_or(""), None));
+                    lines.extend(transcript::finished(
+                        "not run",
+                        why.unwrap_or(""),
+                        None,
+                        width,
+                    ));
                     self.commit(lines);
                 }
             }
@@ -15408,7 +15418,7 @@ impl App {
                         let reached = !untouched || acted || turn.is_none() || turn != self.yours;
                         transcript::refused(data, reached, self.prose())
                     }
-                    _ => vec![transcript::finished(status, shown, seconds)],
+                    _ => transcript::finished(status, shown, seconds, self.prose()),
                 };
                 if only_reacted {
                     self.draw_bot_reactions();
@@ -29567,7 +29577,10 @@ mod tests {
         }
         // Its instructions lead every request: sent again between two
         // calls, they would cost the next one the whole prompt cache.
-        // They are taken as a window opens, as Codex reads its own once.
+        // The window takes them as it opens, as Codex reads its own once;
+        // a rule, role or skill changed since reaches the lead at its
+        // turn's end from the tool host, window or not, and memory alone
+        // never does (`project::changed`).
         assert!(app.instruct.is_none());
         let configured: Vec<Value> = (asked.lock().unwrap().iter())
             .filter(|request| request["op"] == "configure")
@@ -31872,7 +31885,7 @@ mod tests {
         assert!(shown.iter().any(|l| l.contains("ran out")), "{shown:?}");
         assert_eq!(
             shown.last().map(String::as_str),
-            Some("not run · the bot's budget is spent")
+            Some("  not run · the bot's budget is spent")
         );
     }
 
@@ -32448,12 +32461,27 @@ mod tests {
         assert_eq!(rows[2], ("• Ran ls".into(), true));
         let line = rows
             .iter()
-            .position(|(row, _)| row.starts_with("Worked for"))
+            .position(|(row, _)| row.starts_with("  Worked for"))
             .unwrap();
         assert_eq!(
             rows[line + 1..],
             [("".into(), false), ("• Done.".into(), false)]
         );
+        // Drawn, the turn's line starts in the words' column, two past the
+        // `•`: a 40-column window's conversation starts in its third.
+        let mut terminal = Terminal::new(Shot(ratatui::backend::TestBackend::new(40, 20))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        let buffer = terminal.backend().0.buffer().clone();
+        let row = |y: u16| -> String { (0..40).map(|x| buffer[(x, y)].symbol()).collect() };
+        let all = || (0..20).map(row).collect::<Vec<_>>();
+        let at = (0..20).find(|&y| row(y).contains("Worked for"));
+        let at = at.unwrap_or_else(|| panic!("{:?}", all()));
+        let done = (0..20).find(|&y| row(y).contains("• Done."));
+        let done = done.unwrap_or_else(|| panic!("{:?}", all()));
+        assert!(row(at).starts_with("    Worked for"), "{:?}", all());
+        assert_eq!(buffer[(2, done)].symbol(), "•");
+        assert_eq!(buffer[(4, done)].symbol(), "D");
+        assert_eq!(buffer[(4, at)].symbol(), "W");
     }
 
     #[tokio::test]
@@ -32541,7 +32569,7 @@ mod tests {
         app.daemon(turn_event("accepted", 2, json!({}))).await;
         app.daemon(turn_event("turn_finished", 2, json!({"status": "failed"})))
             .await;
-        assert_eq!(rows(&app)[2], "failed for 0s");
+        assert_eq!(rows(&app)[2], "  failed for 0s");
     }
 
     #[tokio::test]
@@ -32662,7 +32690,7 @@ mod tests {
         .await;
         assert_eq!(
             rows(&app)[3..],
-            ["• Steered calc.fix ▸", "Worked for 0s", "• Sent."]
+            ["• Steered calc.fix ▸", "  Worked for 0s", "• Sent."]
         );
     }
 
@@ -33227,7 +33255,11 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(!lines(&app).iter().any(|row| row.starts_with("Worked for")));
+        assert!(
+            !lines(&app)
+                .iter()
+                .any(|row| row.starts_with("  Worked for"))
+        );
         // One that says something ends as any other turn.
         app.daemon(turn_event("accepted", 2, note)).await;
         app.daemon(
@@ -33243,7 +33275,7 @@ mod tests {
         ))
         .await;
         let rows = lines(&app);
-        assert!(rows.iter().any(|row| row.starts_with("Worked for")));
+        assert!(rows.iter().any(|row| row.starts_with("  Worked for")));
         assert_eq!(rows.last().map(String::as_str), Some("• Docs are blocked."));
         // A reply long enough to spill above as it streams still speaks.
         app.pending.clear();
@@ -33264,7 +33296,11 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
+        assert!(
+            lines(&app)
+                .iter()
+                .any(|row| row.starts_with("  Worked for"))
+        );
         // The person's own turn, with nothing said, still ends with its line.
         app.pending.clear();
         app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
@@ -33275,7 +33311,11 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
+        assert!(
+            lines(&app)
+                .iter()
+                .any(|row| row.starts_with("  Worked for"))
+        );
     }
 
     #[tokio::test]
@@ -33356,7 +33396,7 @@ mod tests {
             .await;
         app.daemon(turn_event("turn_finished", 2, empty)).await;
         let rows = lines(&app);
-        let line = rows.iter().find(|row| row.starts_with("Worked")).unwrap();
+        let line = rows.iter().find(|row| row.starts_with("  Worked")).unwrap();
         assert!(!line.contains("empty_completion"));
         // Another failure still says what it was.
         app.pending.clear();
@@ -33395,14 +33435,14 @@ mod tests {
         let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
         let line = rows
             .iter()
-            .find(|row| row.starts_with("Worked for"))
+            .find(|row| row.starts_with("  Worked for"))
             .unwrap();
         assert!(line.contains("ended at its budget"), "{line}");
         // Dim, as any turn that ended well: not the red of a failure.
         let drawn = app
             .pending
             .iter()
-            .find(|l| l.to_string().starts_with("Worked for"))
+            .find(|l| l.to_string().starts_with("  Worked for"))
             .unwrap();
         assert!(
             drawn
@@ -34354,7 +34394,7 @@ mod tests {
             ["", "", "› and the notes?", "", "   🎉 "],
             "{rows:?}"
         );
-        assert!(rows[10].starts_with("Worked for"), "{rows:?}");
+        assert!(rows[10].starts_with("  Worked for"), "{rows:?}");
         assert_eq!(rows[11..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
