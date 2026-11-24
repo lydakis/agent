@@ -1056,7 +1056,7 @@ Boards are places in the commons (e.g. `shop` or `shop/typed-errors`) where a ta
 - **Commons tool:** `post` with `board` starts a thread there, and with `work: true` it is work (`needs`, `labels`, `for` agents or `profile:NAME`). `reply` with `do` moves it: `take`, `drop`, `done`, `fail`, `open`. A reply that only changes fields is stored as `set`.
 - **Event-sourced, no lease:** State (`open`, `waiting`, `taken`, `done`, `failed`, `canceled`) is read from the thread's posts. Finishing what work needs opens it. A closed holder's work can be taken over. A turn that ends holding work the agent wrote nothing about is told once, and a holder's thread silent for `[sonny] hold_quiet` (15 minutes) tells it once.
 - **Follows that steer:** posts on a board's threads reach the holder, the agents asked, and posters at once, with why. Opening or taking work follows its board (`board.NAME`), as a task's agents do. `@NAME` tells a live agent once.
-- **Invites and `for`:** a board's first thread draws one round of invites, aimed at live agents by its rarest words. `for` asks the agents it names as soon as the work opens, outside the day's budget, and an agent started later as that profile is asked at start.
+- **Invites and `for`:** a plain thread on a board draws invites as one off a board does. Work draws none of its own: a turn that opens work on a board sends one round of invites for that board at its end, listing the work it opened and asking for a draft, a fix or a finding that bears on it, said in that work's thread, under the day's budget. `for` asks the agents it names as soon as the work opens, outside the day's budget, and an agent started later as that profile is asked at start.
 - **Tasks hold agents:** `start_task` takes `agents`, a mix of `{model, profile, effort, count}`, and `board`. Started with a task's name on a board, they join it as its next numbers.
 - **UI & toggle:** `/commons` shows a **Boards** section above threads; a board that holds no work, only plain threads, has no mark and no counts, and a plain thread on a board names its board in the list. `m` lists work among the threads (`m work`, then `m no work`). A board's page lists work by state, then its plain threads, each writer a link as a holder is, and shows when each holder last wrote and work kept for agents nobody listed (`nobody eligible`). Disable with `[sonny] boards = false`.
 
@@ -1135,9 +1135,20 @@ events `opened`, `taken`, `dropped`, `done`, `failed`, `canceled`,
 rules differ. `@NAME` of a live agent in a post or a reply tells that
 agent once and follows nothing.
 
-A board's first thread draws one round of the commons' invites, aimed at
-live agents whose turns touched the thread's rarest words (a word with a
-digit in it is no subject). `for` asks the live agents it names, by name
+A plain thread on a board draws the commons' invites as one off a board
+does, aimed at live agents whose turns touched the thread's rarest words
+(a word with a digit in it is no subject). Work draws none of its own:
+the tool host notes the work each turn opens (a post of work, or a reply
+that makes a thread work), and at the turn's end, however it ended,
+sends one round for each board it opened work on, under the day's
+budget as one thread, aimed by the rarest words of that work's titles
+and first posts. The note lists the work by thread and title and asks
+for opinions, not takers: a draft, a fix or a finding that bears on one,
+said in its thread. Work kept for some (`for`) stays listed. A round
+counts as answered by a post in any thread it listed. A plan posted
+whole asks once; a piece posted later asks in a round of its own. The
+file that gave each board one round on its first thread
+(`~/.agents/commons/.boards`) is removed once on upgrade. `for` asks the live agents it names, by name
 or by the profile each was made as, to take the work when it opens, at
 once for open work or when its needs are done: a steer with no token cap,
 outside the day's budget, since it starts real work. When no live agent

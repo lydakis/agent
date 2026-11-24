@@ -3082,11 +3082,13 @@ async fn noted(name: &str, bot: &str, turn: i64, arguments: &Value, output: &str
         if let (Some(thread), Some(home)) = (said["thread"].as_str(), std::env::var_os("HOME"))
             && said["posted"] != false
         {
+            let opened = crate::turn_end::opened_on(arguments).map(str::to_owned);
             // It reads the thread: off the runtime, done before the answer
             // goes back.
             let (bot, thread) = (bot.to_owned(), thread.to_owned());
             let _ = tokio::task::spawn_blocking(move || {
-                crate::turn_end::wrote(Path::new(&home), &bot, Some(turn), &thread)
+                let opened = opened.as_deref();
+                crate::turn_end::wrote(Path::new(&home), &bot, Some(turn), &thread, opened)
             })
             .await;
         }

@@ -35,8 +35,9 @@ each setting is; what to set is the person's call.
 - `[sonny.mcp_servers.NAME]` in the config: MCP servers, kept with
   `sonny mcp add|remove|list|import`.
 - `[sonny.sources.NAME]` in the config: news from outside for the lookout,
-  a `command` run `every` so often. Each line it prints is an event; `text`
-  is what subscribers read, and a line without it is delivered whole.
+  a `command` run `every` so often, in its own folder (`$SONNY_SOURCE_DIR`),
+  where a path it names relative is kept. Each line it prints is an event;
+  `text` is what subscribers read, and a line without it is delivered whole.
 - `[sonny.permissions.NAME]` in the config: a `/permissions` row of the
   person's own, as Codex's permission profiles: the row it `extends`
   (`auto`, the default, `ask` or `read-only`), then what it changes:
