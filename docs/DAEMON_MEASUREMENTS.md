@@ -13162,8 +13162,8 @@ it does not grow with the fleet. Sonny's screens moved within noise too.
 
 ## Texts kept once, idle agents packed (#1349)
 
-2026-11-24. Schema 114 keeps instructions and kept configures' texts once by
-digest, packs the history of an agent idle a week with zstd (only in moments
+2026-11-24. Schema 114 keeps instructions and kept configures' texts once
+(named by a small id, found by digest), packs the history of an agent idle a week with zstd (only in moments
 with no turn running), and unpacks it in the background once the agent works
 again. Sizes are in [STORAGE_GROWTH.md](STORAGE_GROWTH.md#texts-kept-once-idle-agents-packed-schema-114).
 
@@ -13222,10 +13222,13 @@ allocator, until the daemon restarts. Packing waits while turns run, so
 none of those turns slowed; with no turn running it packed the whole store
 in about 30 s (2,334 batches).
 
-Memory with 1,000 idle agents, anon PSS (3 rounds, identical each): with
-the benches' 11-byte instructions, main 2,024 KiB and this change 2,228
-KiB (+0.2 KiB per agent, a 64-byte digest in place of each short text);
-with 6 KB instructions shared by all, main 3,116 KiB and this change 2,264
-KiB, and the store 6.8 MB against 1.2 MB. Idle with no agents, +48 KiB
-(the larger schema).
+Memory, anon PSS, 4 rounds alternating (identical within 8 KiB each), texts
+named by a small id (29d477f): with the benches' 11-byte instructions, 8
+agents main 1,384 KiB and this change 1,432; 1,000 agents main 2,024 and
+this change 2,064. The +40 to +48 KiB is the same at both ends: the larger
+schema, not the agents (each 1,000 agents add 640 KiB on main and 632 here).
+With 6 KB instructions shared by all 1,000 agents, main 3,114 KiB and this
+change 2,104, and the store 7.1 MB against 1.0 MB. An earlier commit named
+texts by their 64-byte digest and cost 0.2 KiB more per agent with short
+instructions; the small id removed that.
 

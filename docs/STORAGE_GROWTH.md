@@ -232,10 +232,11 @@ kept. Nothing is cut, summarized, expired, or left out.
 
 - **Texts kept once.** A bot's instructions and compaction instructions,
   and what the events of kept configures carry (instructions, compaction
-  instructions, declared tools), live once in `texts` under their SHA-256
-  digest, as tool lists already did. Every read gives the whole text back.
-  A digest is 64 bytes, so this saves only when a text is long and shared;
-  a short one costs a little.
+  instructions, declared tools), live once in `texts`. A row there has a
+  small integer id, which is what bots and events name it by, and its
+  SHA-256 digest, by which a text set again is found and shared. Every read
+  gives the whole text back. A bot's own row holds two small ids where it
+  held the texts, so even a short text costs nothing more per bot.
 - **Idle agents packed.** As Codex packs a session nobody touched for seven
   days (`codex-rs/rollout`: zstd level 3, a background worker, unpacked
   when resumed), a bot with no turn running and its last ended a week ago
