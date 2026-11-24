@@ -4944,10 +4944,9 @@ fn context_after(event: &Value) -> Option<u64> {
     })
 }
 
-/// What a page of older items was drawn from: its nodes, the turn each
-/// was made in, what newer pages' calls returned that it has the calls
-/// of (the nodes to read, and the calls), and whether it is the first
-/// page, the welcome over it.
+/// A look for an agent's tab off the screen ([`App::open_agent`]).
+type TabLook = tokio::task::JoinHandle<Result<(), String>>;
+
 /// What going to this window's agent lands on ([`App::land_tick`]).
 #[derive(Clone, Debug, PartialEq)]
 enum Landing {
@@ -4960,6 +4959,10 @@ enum Landing {
     Ask(String),
 }
 
+/// What a page of older items was drawn from: its nodes, the turn each
+/// was made in, what newer pages' calls returned that it has the calls
+/// of (the nodes to read, and the calls), and whether it is the first
+/// page, the welcome over it.
 struct Paged {
     nodes: Vec<i64>,
     turns: HashMap<i64, i64>,
@@ -6480,8 +6483,9 @@ struct App {
     /// began: the branch can change under a running turn.
     place_job: Option<(String, tokio::task::JoinHandle<place::Place>)>,
     /// The agent whose tab is being looked for, from a window with no
-    /// layout of its own, and the look.
-    tab_job: Option<(String, tokio::task::JoinHandle<Result<(), String>>)>,
+    /// layout of its own, whether it lands on what it needs should it
+    /// open in the pane after all, and the look.
+    tab_job: Option<(String, bool, TabLook)>,
     /// When the person last used this window, for a lead that keeps only
     /// so many task windows open.
     window_used: used::Marks,
@@ -6659,9 +6663,6 @@ struct App {
     /// The window switched to lands on what its agent needs: it was gone
     /// to as one that needs the person (`alt+n`).
     land_after: bool,
-    /// Opening an agent in the pane lands it on what it needs: it was
-    /// gone to from its row in `/status`.
-    land_beside: bool,
     /// Going to what this window's agent needs, until it is in view
     /// ([`App::land_tick`]).
     landing: Option<Landing>,
@@ -8952,7 +8953,6 @@ impl App {
             switch_to: None,
             carry_draft: false,
             land_after: false,
-            land_beside: false,
             landing: None,
             first_turn: None,
             told_keeps: false,
@@ -9442,7 +9442,7 @@ impl App {
                             continue;
                         }
                         Err(Told::Beside(bot)) => {
-                            self.open_task(&bot);
+                            self.open_task(&bot, false);
                             continue;
                         }
                     };
@@ -9624,6 +9624,10 @@ impl App {
             }
             let again = self.again_came().await;
             changed |= again.is_some();
+            // A page read short is not drawn: a landing on it stops, as find does.
+            if again == Some(true) {
+                self.landing = None;
+            }
             if let Some((older, looked)) = &mut self.find_step
                 && self.again.is_none()
             {
@@ -10502,6 +10506,7 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
             Err(_) => {
                 self.older_read = None;
+                self.landing = None;
                 return false;
             }
         };
@@ -10514,8 +10519,10 @@ impl App {
             Ok(page) => page,
             Err(error) => {
                 self.notice = Some(error.to_string());
-                // Not asked again at once: the way up stops.
+                // Not asked again at once: the way up stops, and so does
+                // a landing that read back.
                 self.to_first = false;
+                self.landing = None;
                 return true;
             }
         };
@@ -10630,6 +10637,7 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
             Err(_) => {
                 self.again = None;
+                self.landing = None;
                 return None;
             }
         };
@@ -11718,9 +11726,7 @@ impl App {
         }
         if bot != self.bot {
             // Opened in the pane, it lands on what it needs there.
-            self.land_beside = land;
-            self.open_agent(bot, false);
-            self.land_beside = false;
+            self.open_agent(bot, false, land);
             return;
         }
         if self.pane.as_ref().is_some_and(pane::Pane::is_card) {
@@ -11754,8 +11760,8 @@ impl App {
     /// An agent named or picked: to its own tab, when the lead's layout
     /// has one for it, or a look at it in the pane, as `[sonny]
     /// agent_opens` says; `other`, a right click, the one it doesn't. With
-    /// no tab, it opens in the pane.
-    fn open_agent(&mut self, bot: &str, other: bool) {
+    /// no tab, it opens in the pane, landing on what it needs with `land`.
+    fn open_agent(&mut self, bot: &str, other: bool, land: bool) {
         use agent_client::config::AgentOpens;
         let tab = (self.agent_opens == AgentOpens::Tab) != other;
         match &mut self.fleet {
@@ -11785,28 +11791,29 @@ impl App {
                         .map_err(|e| e.to_string())?
                     }
                 });
-                self.tab_job = Some((bot, job));
+                self.tab_job = Some((bot, land, job));
             }
-            _ => self.open_task(bot),
+            _ => self.open_task(bot, land),
         }
     }
 
     /// The tab looked for off the screen: with none, the agent opens in
     /// the pane, as a click on it does where nothing is laid out.
     async fn follow_tab(&mut self) {
-        if let Some((_, job)) = &self.tab_job
+        if let Some((_, _, job)) = &self.tab_job
             && job.is_finished()
         {
-            let (bot, job) = self.tab_job.take().unwrap();
+            let (bot, land, job) = self.tab_job.take().unwrap();
             if !matches!(job.await, Ok(Ok(()))) {
-                self.open_task(&bot);
+                // Landed on there as it would have been had it opened at once.
+                self.open_task(&bot, land);
             }
         }
     }
 
     /// The task `bot` opened in the pane: its own Sonny, to watch it and
-    /// talk to it.
-    fn open_task(&mut self, bot: &str) {
+    /// talk to it, landing on what it needs with `land`.
+    fn open_task(&mut self, bot: &str, land: bool) {
         // Drawn in another's pane with no room for one of its own, the
         // Sonny it is drawn in shows the agent there instead, this one
         // kept to go back to.
@@ -11819,7 +11826,7 @@ impl App {
         let mut args = ["--no-sound", "--no-layout", "--embedded", "--agent", bot]
             .map(str::to_owned)
             .to_vec();
-        if self.land_beside {
+        if land {
             args.push("--land".into());
         }
         match self.embed(&name, &args) {
@@ -11991,7 +11998,7 @@ impl App {
             self.open_picked(bot, button.starts_with("task/"));
         }
         if let Some(bot) = button.strip_prefix("other/") {
-            self.open_agent(bot, true);
+            self.open_agent(bot, true, false);
         }
         // A run's name under the reply that ran it opens its page.
         if let Some(run) = button.strip_prefix("run/") {
@@ -18091,7 +18098,7 @@ impl App {
     fn enter_agent(&mut self, bot: &str) {
         self.close_pane(true);
         if bot != self.bot {
-            self.open_agent(bot, false);
+            self.open_agent(bot, false, false);
         }
     }
 
@@ -22541,7 +22548,7 @@ impl App {
         if bot == self.bot {
             return self.close_pane(false);
         }
-        self.open_task(&bot);
+        self.open_task(&bot, false);
     }
 
     /// Drawn in another's pane, that one told when this window comes to
@@ -27563,13 +27570,31 @@ mod tests {
         assert!(app.told_keeps);
     }
 
+    /// An agent picked in `/status` from a window with no layout of its
+    /// own is looked for in a tab first; should none be found, it opens in
+    /// the pane landing on what it needs, as it would have at once.
+    #[tokio::test]
+    async fn a_status_pick_looked_for_in_a_tab_still_lands_in_the_pane() {
+        use agent_client::config::AgentOpens;
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.bot = "shop.lead".into();
+        app.project = Some("shop".into());
+        app.agent_opens = AgentOpens::Tab;
+        app.fleet = None;
+        app.open_picked("shop.web", true);
+        assert!(matches!(&app.tab_job, Some((bot, true, _)) if bot == "shop.web"));
+        app.tab_job = None;
+        app.open_picked("shop.web", false);
+        assert!(matches!(&app.tab_job, Some((bot, false, _)) if bot == "shop.web"));
+    }
+
     #[tokio::test]
     async fn an_agent_clicked_in_another_s_pane_is_asked_of_the_window_it_is_drawn_in() {
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.options.embedded = true;
         // With no tab for it, the window this one is drawn in shows it;
         // this one opens nothing and says nothing.
-        app.open_agent("shop.halves", true);
+        app.open_agent("shop.halves", true, false);
         assert!(app.pane.is_none() && app.notice.is_none());
         assert!(
             embed::OPENED_HERE
@@ -27580,7 +27605,7 @@ mod tests {
         // Wide enough for a pane of its own, as on a large screen, it
         // opens the agent beside its own conversation.
         app.full_width = 200;
-        app.open_agent("shop.webhooks", true);
+        app.open_agent("shop.webhooks", true, false);
         assert_eq!(
             app.pane.as_ref().and_then(|pane| pane.agent.as_deref()),
             Some("shop.webhooks")
@@ -27593,7 +27618,7 @@ mod tests {
                 .contains(&"shop.webhooks".to_owned())
         );
         // Narrowed with a way back in its pane, back still goes there.
-        app.open_agent("shop.refunds", true);
+        app.open_agent("shop.refunds", true, false);
         app.full_width = 0;
         assert!(app.step_pane(true));
         assert_eq!(
@@ -40848,11 +40873,18 @@ mod tests {
         }
     }
 
-    /// A card older than the newest 200 items the window drew is read back
-    /// to a page at a time, beside the loop, and drawn once, open, the
-    /// composer answering it.
-    #[tokio::test]
-    async fn a_card_beyond_the_first_200_items_is_read_back_to() {
+    /// A window on shop.lead whose one question, `Ship it?`, was asked at
+    /// node 1, before 298 items the window's replay of 200 ends short of;
+    /// the store's follow knows it. Every `history_nodes` read is kept, and
+    /// fails while `failing` is set.
+    async fn asked_past_the_replay(
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        App,
+        Terminal<Shot>,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::sync::watch::Sender<elsewhere::Shared>,
+    ) {
         let said = |text: String| {
             json!({"type": "message", "role": "assistant",
                 "content": [{"type": "output_text", "text": text}]})
@@ -40875,6 +40907,10 @@ mod tests {
         let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = reads.clone();
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") if failing.load(std::sync::atomic::Ordering::SeqCst) => {
+                seen.lock().unwrap().push(asked.clone());
+                json!({"error": "store_busy", "detail": "the store is busy"})
+            }
             Some("history_nodes") => {
                 seen.lock().unwrap().push(asked.clone());
                 let from = asked["from"].as_i64().unwrap_or(i64::MAX);
@@ -40905,6 +40941,15 @@ mod tests {
         app.draw(&mut terminal).unwrap();
         app.history().await;
         app.draw(&mut terminal).unwrap();
+        (app, terminal, reads, tell)
+    }
+
+    /// A card older than the newest 200 items the window drew is read back
+    /// to a page at a time, beside the loop, and drawn once, open, the
+    /// composer answering it.
+    #[tokio::test]
+    async fn a_card_beyond_the_first_200_items_is_read_back_to() {
+        let (mut app, mut terminal, reads, _tell) = asked_past_the_replay(Default::default()).await;
         let cards = |app: &mut App| {
             (drawn(app).iter())
                 .filter(|row| row.as_str() == "? Ship it?")
@@ -40932,6 +40977,31 @@ mod tests {
         assert_eq!(cards(&mut app), 1);
         assert!(!drawn(&mut app).iter().any(|row| row.contains("Set aside")));
         assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("ask:1/c1"));
+    }
+
+    /// A read back that fails ends the landing: it is not asked for again.
+    #[tokio::test]
+    async fn a_read_back_that_fails_ends_the_landing() {
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut app, _terminal, reads, _tell) = asked_past_the_replay(failing.clone()).await;
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let first = reads.lock().unwrap().len();
+        app.key(alt_n()).await;
+        for _ in 0..200 {
+            if app.landing.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            app.older_came().await;
+            app.land_tick();
+        }
+        assert!(app.landing.is_none());
+        assert_eq!(reads.lock().unwrap().len() - first, 1);
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("busy"))
+        );
     }
 
     /// The footer's `?` still opens `/status`, whoever needs you, this
