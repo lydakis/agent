@@ -11818,7 +11818,7 @@ impl App {
         // Sonny it is drawn in shows the agent there instead, this one
         // kept to go back to.
         if !self.room_beside() {
-            return embed::open_here(bot);
+            return embed::open_here(bot, land);
         }
         let name = (self.tasks.values().flatten())
             .find(|task| task.bot == bot)
@@ -22498,7 +22498,7 @@ impl App {
     /// in to show `bot` there instead, leaving the main window as it is.
     fn switch_window(&mut self, bot: String) {
         if self.options.embedded {
-            embed::open_here(&bot);
+            embed::open_here(&bot, std::mem::take(&mut self.land_after));
             return;
         }
         self.switch_to = Some(bot);
@@ -22537,7 +22537,7 @@ impl App {
         let Some(pane) = &self.pane else {
             return;
         };
-        let Some(bot) = (pane.program.as_ref())
+        let Some((bot, land)) = (pane.program.as_ref())
             .filter(|_| pane.agent.is_some())
             .and_then(embed::Embedded::opened)
         else {
@@ -22546,9 +22546,13 @@ impl App {
         // The main window's own agent is already shown there: back to it,
         // as picking it in `/status` goes, the pane put aside for Ctrl+].
         if bot == self.bot {
-            return self.close_pane(false);
+            self.close_pane(false);
+            if land {
+                self.land_needs();
+            }
+            return;
         }
-        self.open_task(&bot, false);
+        self.open_task(&bot, land);
     }
 
     /// Drawn in another's pane, that one told when this window comes to
@@ -27586,6 +27590,31 @@ mod tests {
         app.tab_job = None;
         app.open_picked("shop.web", false);
         assert!(matches!(&app.tab_job, Some((bot, false, _)) if bot == "shop.web"));
+    }
+
+    /// Drawn in another's pane with no room for one of its own, an agent
+    /// gone to from its row in `/status` is asked of the window it is
+    /// drawn in with its landing, and `alt+n` there asks the same.
+    #[tokio::test]
+    async fn an_agent_landed_on_from_a_narrow_pane_is_asked_of_the_window_with_its_landing() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.options.embedded = true;
+        app.open_agent("shop.mail", true, true);
+        assert!(
+            embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.mail;land".to_owned())
+        );
+        app.land_after = true;
+        app.switch_window("shop.ship".into());
+        assert!(!app.land_after);
+        assert!(
+            embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.ship;land".to_owned())
+        );
     }
 
     #[tokio::test]
