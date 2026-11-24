@@ -16262,13 +16262,22 @@ impl Database {
             .conn
             .prepare_cached("SELECT item FROM nodes WHERE id=? AND packed IS NULL")?;
         let mut packer = super::pack::packer()?;
+        // `total_bytes` leaves out what pictures weigh, so the bytes read
+        // end the batch too.
+        let mut read = 0;
         for id in chain {
             if let Some(plain) = item
                 .query_row([id], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
-                && let Some(packed) = super::pack::pack(&mut packer, &plain)?
             {
-                batch.items.push((id, plain, packed));
+                read += plain.len();
+                if let Some(packed) = super::pack::pack(&mut packer, &plain)? {
+                    batch.items.push((id, plain, packed));
+                }
+            }
+            if read >= super::pack::BATCH_BYTES {
+                batch.through = id;
+                break;
             }
         }
         Ok(Pack::Batch(batch))
