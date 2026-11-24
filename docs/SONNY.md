@@ -1857,6 +1857,7 @@ stop the picked one with all it started, naming its command; Enter stops it
 # Run on your laptop (the machine with logins/browser/MCP)
 sonny link devbox              # or me@devbox.example.com [--machine NAME] [--name NAME]
 sonny link                     # inspect active links and connected machines
+sonny link browser [URL]       # open the link's shared browser here, to sign in for its agents
 sonny link off devbox
 sonny link forget laptop       # run on the host to forget a linked machine
 ```
@@ -1869,7 +1870,7 @@ sonny link forget laptop       # run on the host to forget a linked machine
 
 ### What host agents can do on a linked machine
 
-- **Browser (`browser` with `machine: "laptop"`):** Runs tabs in a dedicated shared Chrome instance copied once from your `browser_profile` (default `"Default"`; refreshes cookies and native messaging hosts on start, closes after 30 idle minutes). Screenshots return inline; file outputs (PDF, HAR, recordings up to 30 MiB) stream back to approved host paths.
+- **Browser (`browser` with `machine: "laptop"`):** Runs tabs in a dedicated shared Chrome instance copied once from your `browser_profile` (default `"Default"`; links native messaging hosts on start, closes after 30 idle minutes). It keeps the sign-ins you make in it with `sonny link browser URL`, or, with `browser_signins = "copied"`, merges your newer cookies in at each start. Screenshots return inline; file outputs (PDF, HAR, recordings up to 30 MiB) stream back to approved host paths.
 - **Desktop (`desktop` with `machine: "laptop"`):** Runs `agent-desktop` on the linked machine with action approvals routed to the host agent's gate.
 - **MCP (`exec`):** Prefix a script with `// @exec: {"machine": "laptop"}` to run against that machine's MCP servers (listed under `# On NAME`).
 - **Shell and files (`tools.shell`, `read`, `write`, `edit`, `apply_patch` with `machine: "laptop"`):** In code mode, a script's call of the agent's own shell or file tool that names a machine is decided on the host as the same call would be (its rules and approvals), then runs on the laptop with `agent tool`, in the laptop's sandbox: read-only unless the link lists `writable` folders, the network off unless `network = true` with them, in the foreground, never leaving the sandbox. A call stopped on the host stops its commands on the laptop too; output past what the model sees is kept whole in a file there, named in the result for a `read` on the laptop; and commands get none of the laptop's `[shell_environment_policy] exclude` variables, `~/.agent/keys/env` keys or provider keys.
@@ -1884,6 +1885,7 @@ host = "devbox"
 machine = "laptop"
 command = "/home/me/.local/bin/sonny"
 browser_profile = "Default"    # Chrome profile name, path, or "" for fresh browsers
+browser_signins = "copied"     # copied: yours merged in at each start; own: sign-ins made in it (default: copied)
 calls = 16                     # max concurrent remote calls (default: 4 × CPUs)
 upgrade = true                 # the end behind upgrades as the link connects (default: true)
 writable = ["~/code/shop"]     # folders the host's agents' shell and file tools write here; the first is where they start (default: none, read-only)
@@ -1908,6 +1910,7 @@ run macOS or Linux. On the machine to link:
 ```sh
 sonny link devbox          # or me@devbox.example.com; --machine NAME, --name NAME
 sonny link                 # the links, and the machines linked here
+sonny link browser [URL]   # the link's shared browser in a window here, to sign in for its agents
 sonny link off devbox
 sonny link forget laptop   # on the host: forget a machine linked to it
 ```
@@ -1923,6 +1926,7 @@ host = "devbox"                 # what ssh dials
 machine = "laptop"              # what the agents there call this machine; its hostname by default
 command = "/home/me/.local/bin/sonny"   # Sonny there, as setup found it
 browser_profile = "Default"     # the Chrome profile their shared browser is copied from once, or a folder; "" a fresh one each
+browser_signins = "copied"      # copied: yours merged in at each start; own: the sign-ins made in it; copied by default
 calls = 16                      # how many of their calls this machine runs at once; 4 per CPU by default
 upgrade = true                  # the end behind runs `sonny upgrade` as the link connects; on by default
 ```
@@ -1943,7 +1947,7 @@ The host's agents see each linked machine by name:
 
 - `browser` takes `machine`. The commands run in that machine's
   agent-browser, each agent in a tab of its own of one Chrome the link's
-  agents share, signed in as the person is there. That Chrome runs on a
+  agents share. That Chrome runs on a
   profile kept for the link in `~/.agent/sonny/links/NAME/chrome`: copied
   once from the person's Chrome profile `browser_profile` names, and again
   only when that name changes, so the person's own Chrome is left alone and
@@ -1951,9 +1955,29 @@ The host's agents see each linked machine by name:
   device check) stays across restarts. Each time that Chrome starts, the
   person's native messaging hosts (`NativeMessagingHosts` beside their
   profiles, which an extension such as a company's device check talks to)
-  are linked into the kept profile, and their `Cookies` are copied over
-  the kept profile's, so signing in again in their own Chrome reaches the
-  shared browser at its next start. An agent's `close` ends its tab, and
+  are linked into the kept profile.
+
+  Chrome (158 on, macOS) seals the cookies of a profile folder other than
+  its own with a key of that folder's, so the person's cookies copied
+  into the kept profile are dropped as it starts. `browser_signins` says
+  where its sign-ins come from instead:
+
+  - `"own"`: the ones made in it, kept as any profile keeps
+    them. `sonny link browser [NAME] [URL]` on the linked machine starts
+    that Chrome again in a window there at `URL`, for the person to sign
+    in; the link's agents use it at their next call, and an agent on a
+    sign-in page asks the person to do this.
+  - `"copied"`, the default: the person's. Sonny starts that Chrome with Chrome's
+    protection off (`--disable-features=KeychainKeyProviderUserDataDirProtection`),
+    and at each start merges each of the person's cookies the kept
+    profile has no newer version of into its `Cookies`, so signing in
+    again in their own Chrome reaches the shared browser at its next start,
+    and a sign-in made in it stays. This turns off a protection Chrome
+    added against copying a person's cookies; once Chrome drops that
+    switch, it reads like `"own"`, and the person signs in there once more.
+
+  Changing it costs a sign-in in the kept profile per site, as each seals
+  cookies with its own key. An agent's `close` ends its tab, and
   Sonny closes that Chrome once no agent of the link has a tab in it, so
   the next open starts it again. A `browser_profile` that is a
   folder is used as it is; `""` gives each agent a fresh browser of its
