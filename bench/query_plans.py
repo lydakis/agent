@@ -71,7 +71,7 @@ def statements(source):
     source = expanded(source)
     constants = {name: value.replace('\\"', '"') for name, value in re.findall(
         r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE|HELD|MESSAGE_FROM|MESSAGE_TEXT|MESSAGE_NODE|'
-        r'PREVIEW|PREVIEW_NODE|N_ITEM): &str =\s*"((?:[^"\\]|\\.)*)";', source, re.S)}
+        r'PREVIEW|PREVIEW_NODE|N_ITEM|WOKEN): &str =\s*"((?:[^"\\]|\\.)*)";', source, re.S)}
     literals = re.findall(r'r?#?"((?:[^"\\]|\\.)*)"#?', source, re.S)
     for literal in literals:
         text = re.sub(r'\s+', ' ', literal.replace('\\n', ' ')).strip()
