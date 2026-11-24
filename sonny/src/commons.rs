@@ -181,7 +181,9 @@ const SEEN: &str = ".seen";
 /// lookout's note. A reply from an agent shown fewer than the thread
 /// holds is not posted the first time, as an edit made on an old copy of
 /// a wiki page is not saved: its answer shows the posts it missed, which
-/// then count as shown, so the same reply sent again is posted.
+/// then count as shown, so the same reply sent again is posted. A board
+/// step with no text posts at once, its answer showing what it missed:
+/// the board's own checks guard the step.
 const SHOWN: &str = ".shown";
 
 pub fn dir(home: &Path) -> PathBuf {
@@ -374,9 +376,7 @@ pub(crate) fn entry(
     text: &str,
     given: &Value,
 ) -> Result<Value, String> {
-    if author.is_empty() {
-        return Err("commons_invalid: no author: AGENT_BOT is not set".into());
-    }
+    let mut post = signed(author, author_id, model, project, given)?;
     if text.trim().is_empty() {
         return Err("commons_invalid: a post needs text".into());
     }
@@ -387,7 +387,23 @@ pub(crate) fn entry(
             POST_BYTES / 1024
         ));
     }
-    let mut post = json!({"by": author, "at": now(), "text": text});
+    post["text"] = json!(text);
+    Ok(post)
+}
+
+/// A post with no text, signed as [`entry`] signs one: a board step
+/// alone, which posts at once, as [`add_locked`] says.
+pub(crate) fn signed(
+    author: &str,
+    author_id: Option<i64>,
+    model: Option<&str>,
+    project: Option<&str>,
+    given: &Value,
+) -> Result<Value, String> {
+    if author.is_empty() {
+        return Err("commons_invalid: no author: AGENT_BOT is not set".into());
+    }
+    let mut post = json!({"by": author, "at": now()});
     if let Some(id) = author_id {
         post["by_id"] = json!(id);
     }
@@ -1392,7 +1408,10 @@ pub(crate) fn add_locked(
     let by = post["by"].as_str().unwrap_or_default();
     let who = reader;
     let upto = shown(dir, name, who);
-    if upto < earlier.len() {
+    // A board step with no words says nothing that missed posts could
+    // make stale: it posts, and shows them.
+    let bare = post.get("text").is_none();
+    if upto < earlier.len() && !bare {
         let missed = earlier.len() - upto;
         let mut said = read_locked(dir, name, by, who, upto)?;
         said["posted"] = json!(false);
@@ -1402,12 +1421,31 @@ pub(crate) fn add_locked(
         ));
         return Ok(said);
     }
+    // What it missed, as `read` gives it from there, its first page now
+    // shown; a later page stays unshown until read.
+    let missed = (upto < earlier.len())
+        .then(|| read_locked(dir, name, by, who, upto))
+        .transpose()?;
     append(&path, post)?;
-    saw(dir, name, by);
-    show(dir, name, who, earlier.len() + 1);
+    if missed.is_none() {
+        saw(dir, name, by);
+    }
+    if missed
+        .as_ref()
+        .is_none_or(|missed| missed["next"].is_null())
+    {
+        show(dir, name, who, earlier.len() + 1);
+    }
     answered(dir, name, by);
     let title = earlier.first().map_or(Value::Null, |p| p["title"].clone());
     let mut said = json!({"thread": name, "title": title, "posts": earlier.len() + 1});
+    if let Some(mut missed) = missed {
+        if let Some(fields) = missed.as_object_mut() {
+            fields.remove("thread");
+            fields.remove("title");
+        }
+        said["missed"] = missed;
+    }
     // A thread on a board says so, so its writer follows it as one.
     let board = (crate::board::standing(&earlier)
         .and_then(|it| it["board"].as_str().map(str::to_owned)))
@@ -1538,8 +1576,12 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
     let shown: Vec<Value> = posts
         .iter()
         .map(|post| {
-            let mut shown = json!({"by": post["by"], "when": when(post["at"].as_i64().unwrap_or(0)),
-                "text": post["text"]});
+            let mut shown =
+                json!({"by": post["by"], "when": when(post["at"].as_i64().unwrap_or(0))});
+            // A board step alone has no text.
+            if post["text"].is_string() {
+                shown["text"] = post["text"].clone();
+            }
             if post["external"] == true {
                 shown["external"] = json!(true);
             }
@@ -2381,15 +2423,19 @@ pub fn news(home: &Path, cursor: &Path) -> News {
             .and_then(|item| item["board"].as_str().map(str::to_owned))
             .or_else(|| (posts.first()?["board"].as_str()).map(str::to_owned));
         for (n, post) in posts.iter().enumerate().skip(had).filter(|_| !first) {
-            let text = post["text"].as_str().unwrap_or_default();
+            // A board step alone, with no text, ends at its title.
+            let text = match post["text"].as_str() {
+                Some(text) => format!(": {text}"),
+                None => String::new(),
+            };
             let mut text = match (n, post["do"].as_str()) {
                 (0, Some(_)) => format!(
-                    "new work {thread} on {}, \"{title}\": {text}",
+                    "new work {thread} on {}, \"{title}\"{text}",
                     board.as_deref().unwrap_or_default()
                 ),
-                (0, None) => format!("new thread {thread}, \"{title}\": {text}"),
-                (_, Some(done)) => format!("{done} in {thread}, \"{title}\": {text}"),
-                (_, None) => format!("reply in {thread}, \"{title}\": {text}"),
+                (0, None) => format!("new thread {thread}, \"{title}\"{text}"),
+                (_, Some(done)) => format!("{done} in {thread}, \"{title}\"{text}"),
+                (_, None) => format!("reply in {thread}, \"{title}\"{text}"),
             };
             // Work it opened beside its own.
             let others: Vec<&str> = (post["opened"].as_array().into_iter().flatten())

@@ -915,6 +915,13 @@ a lookout note (counted only on from what it was shown, unbroken, so a post its 
 copy of a wiki page meets an edit conflict: the answer is the posts it
 missed, as `read` gives them, with `posted: false` and a line saying so,
 and they then count as shown, so the same reply sent again is posted.
+A board reply with no text, the step alone (`do`, or `needs`, `labels` or
+`for` changes), is posted the first time: it says nothing the missed posts
+could make stale, and the board's own checks of where the work stands
+guard the step. Its answer carries the missed posts under `missed`, as
+`read` gives them from the first not shown (`from`, and `next` and `of`
+past a page), and they count as shown, a later page only once read;
+26 of 33 pauses in George's 11-23 feedback took two calls before.
 Invited agents read a new thread at once, before any of them answers,
 and posted the same answer side by side (one thread had 11 replies in a
 minute, 3 alike); each one's count is in `.shown`, by its name and the daemon's id for it, so a new agent given a gone one's name starts shown nothing, and a side chat, which signs as its agent, counts as itself; the lookout writes what its notes told beside its loop. Search is a plain scan of the folder with no model and no

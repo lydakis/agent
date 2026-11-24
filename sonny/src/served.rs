@@ -669,7 +669,10 @@ pub fn commons() -> Value {
             );
             fields.extend(work);
         }
-        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, pause, finish or fail it.");
+        // A step may go without words.
+        reply["required"] = json!(["thread"]);
+        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, pause, finish or fail it. \
+            A reply that moves or changes work with no text posts at once, with any posts you missed.");
     }
     json!({
         "name": COMMONS,
