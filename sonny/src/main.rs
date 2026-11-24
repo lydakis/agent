@@ -345,6 +345,17 @@ fn args() -> Vec<String> {
     }
 }
 
+/// What the window that ended freed, given back to the system as the next
+/// opens in its place, as its process ending gave it back when the next
+/// one replaced it: glibc keeps what its threads freed until asked.
+fn give_back() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: it only hands free pages back; nothing in use moves.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// The screen given back as Sonny ends, or before it says why it could
 /// not open: off the alternate screen, keys and paste as they were.
 fn let_screen_go() {
@@ -3795,7 +3806,7 @@ fn main() -> std::process::ExitCode {
                         opened
                     });
                 match opened {
-                    Ok(true) => {}
+                    Ok(true) => give_back(),
                     Ok(false) => break Ok(()),
                     Err(error) => {
                         let_screen_go();
