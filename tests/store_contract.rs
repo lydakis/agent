@@ -25579,8 +25579,9 @@ fn a_store_from_109_takes_profiles_with_none_on_its_bots() {
 /// Every pass packing makes at `now_ms`, until nothing is due; how many
 /// batches it wrote.
 fn pack_all(db: &mut Database, now_ms: i64) -> usize {
-    let mut batches = 0;
-    while let Pack::Batch(batch) = db.to_pack(now_ms).unwrap() {
+    let (mut batches, mut from) = (0, 0);
+    while let Pack::Batch(batch) = db.to_pack(now_ms, from).unwrap() {
+        from = batch.bot_id();
         assert!(db.packed(batch).unwrap());
         batches += 1;
     }
@@ -25694,7 +25695,7 @@ fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     // Within the week nothing is packed, and the next pass is due when
     // Bob's last turn is a week old.
     let now = epoch_now() as i64;
-    let Pack::Due(due) = db.to_pack(now).unwrap() else {
+    let Pack::Due(due) = db.to_pack(now, 0).unwrap() else {
         panic!("nothing is due yet");
     };
     assert!(due > now && due <= now + PACK_IDLE_MS);

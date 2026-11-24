@@ -3959,6 +3959,12 @@ pub struct Packing {
     /// Each node's id, its item as read, and that item packed.
     items: Vec<(i64, Vec<u8>, Vec<u8>)>,
 }
+impl Packing {
+    /// The bot this batch packs: where the pass goes on from.
+    pub fn bot_id(&self) -> i64 {
+        self.bot_id
+    }
+}
 /// What a process row runs: a background command, a terminal, or a
 /// detached command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16161,25 +16167,31 @@ impl Database {
         Ok(())
     }
     /// What packing does next, read and packed on a reader: the next
-    /// items still plain in the history of the first bot with no turn
-    /// running and none ended in [`super::pack::IDLE_MS`] before `now_ms`,
-    /// oldest first, until [`super::pack::BATCH_BYTES`] are read. A bot's
+    /// items still plain in the history of the first bot from id `from`
+    /// on with no turn running and none ended in [`super::pack::IDLE_MS`]
+    /// before `now_ms`, oldest first, until [`super::pack::BATCH_BYTES`]
+    /// are read. A pass starts at 0 and goes on from each batch's bot, so
+    /// it reads each bot row once however many bots it packs; a bot it
+    /// went past becomes due in a later pass. A bot's
     /// items are those of its history (its head and the nodes above it)
     /// from its first turn on: what it forked from is its parent's. With
     /// none, when the next bot will have been idle that long; with no bot
     /// left to pack, when one idle from now would be. Each item is packed
     /// only when that is smaller; [`Self::packed`] writes them.
-    pub fn to_pack(&self, now_ms: i64) -> Result<Pack> {
+    pub fn to_pack(&self, now_ms: i64, from: i64) -> Result<Pack> {
         let cutoff = now_ms - super::pack::IDLE_MS;
+        // One snapshot for the whole batch: a bot deleted meanwhile is
+        // read as it was, and `packed` finds it gone.
+        let _snapshot = self.conn.unchecked_transaction()?;
         let due: Option<(i64, String, i64, i64)> = self
             .conn
             .prepare_cached(
                 "SELECT id,name,COALESCE(packed_node,0),head FROM bots
-                 WHERE running_turn IS NULL AND status!='deleting'
+                 WHERE id>=?2 AND running_turn IS NULL AND status!='deleting'
                    AND head>COALESCE(packed_node,0) AND COALESCE(last_finished_ms,0)<=?1
                  ORDER BY id LIMIT 1",
             )?
-            .query_row([cutoff], |r| {
+            .query_row(params![cutoff, from], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?;

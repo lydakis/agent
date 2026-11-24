@@ -8680,11 +8680,16 @@ fn custom_tools(
 /// a reader and written by the worker; when the next pass is due, in epoch
 /// ms.
 async fn pack(store: Store) -> Result<i64> {
+    let mut from = 0;
     loop {
         let now = now_ms() as i64;
-        match store.read("to_pack", move |db| db.to_pack(now)).await? {
+        match store
+            .read("to_pack", move |db| db.to_pack(now, from))
+            .await?
+        {
             agent_runtime::store::Pack::Due(at) => return Ok(at),
             agent_runtime::store::Pack::Batch(batch) => {
+                from = batch.bot_id();
                 store.op("packed", move |db| db.packed(batch)).await?;
             }
         }
