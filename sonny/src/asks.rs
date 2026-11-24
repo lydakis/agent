@@ -655,7 +655,7 @@ pub fn told_aside(text: &str) -> bool {
                 .and_then(|rest| rest.strip_suffix(ASIDE_CLOSE))
                 .and_then(|rest| rest.strip_suffix(')'))
                 .and_then(|rest| rest.rsplit_once("\" ("))
-                .is_some_and(|(_, id)| well_formed(id))
+                .is_some_and(|(_, id)| !id.is_empty() && !id.contains([' ', '"']))
         })
 }
 
@@ -2182,7 +2182,7 @@ mod tests {
         assert!(!told_aside(""));
         assert!(!told_aside(&format!("{told}\nAnd one more thing.")));
         assert!(!told_aside(
-            "Your question \"x\" (later) is now set aside: the person wrote past it; a pick \
+            "Your question \"x\" (not this) is now set aside: the person wrote past it; a pick \
              still answers it."
         ));
     }

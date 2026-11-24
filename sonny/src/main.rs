@@ -20010,7 +20010,12 @@ impl App {
         let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
-        let aside = self.tell_aside(&prompt, origin);
+        // An answer sets nothing aside, though a card read with no turn
+        // names its ask by the call alone until it goes ([`repick`]).
+        let aside = match pick {
+            Some(_) => None,
+            None => self.tell_aside(&prompt, origin),
+        };
         // Shown where it will land while it goes, under a number of its own.
         self.unsent_rows += 1;
         let sending = -self.unsent_rows;
@@ -29639,6 +29644,12 @@ mod tests {
             [
                 "You asked (ask:1/c0): Bump it?\n\nnot yet",
                 "You asked (ask:1/c1): Keep the old API?\n\nDrop it",
+                // The agent told first of the two its words set aside.
+                &asks::set_aside(&[
+                    ask("ask:1/c2", "Tag it?"),
+                    ask("ask:1/c3", "Keep the old API?")
+                ])
+                .unwrap(),
                 "how is it going?"
             ]
         );
@@ -31574,6 +31585,9 @@ mod tests {
         assert_eq!(
             *sent.lock().unwrap(),
             [
+                // The agent told first: the question goes aside.
+                "Your question \"Bump it?\" (ask:1/c0) is now set aside: the person wrote past \
+                 it; a pick still answers it.",
                 "also rename the crate",
                 "You asked (ask:3/c1): Bump it?\n\nnot yet"
             ]
