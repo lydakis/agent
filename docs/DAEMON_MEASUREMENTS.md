@@ -13159,3 +13159,76 @@ Store work per turn is unchanged, and every CPU, latency and memory
 measure is within the runner's noise. The 0.6 MiB of idle RSS is the
 larger binary (the proxy and its HTTP parsing); per idle bot is flat, so
 it does not grow with the fleet. Sonny's screens moved within noise too.
+
+## Texts kept once, idle agents packed (#1349)
+
+2026-11-24. Schema 114 keeps instructions and kept configures' texts once
+(named by a small id, found by digest), packs the history of an agent idle a week with zstd (only in moments
+with no turn running), and unpacks it in the background once the agent works
+again. Sizes are in [STORAGE_GROWTH.md](STORAGE_GROWTH.md#texts-kept-once-idle-agents-packed-schema-114).
+
+### Matched screen (perf gate's benches against main, Perf workflow on 960dcc5)
+
+| Bench | Measure | Main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 26.283 | 26.228 | -0.2% |
+| admission | burst submit p99, ms | 2.948 | 2.945 | -0.1% |
+| completion | release to terminal p99, ms | 6.86 | 7.084 | +3.3% |
+| footprint | idle RSS, MiB | 17.852 | 17.971 | +0.7% |
+| footprint | per idle bot, KiB | 2.05 | 2.208 | +7.7% |
+| footprint | RSS after a turn each, MiB | 56.459 | 58.928 | +4.4% |
+| footprint | CPU per turn, ms | 0.703 | 0.713 | +1.4% |
+| footprint | written to disk per turn, KiB | 68.658 | 73.43 | +7.0% |
+| lifecycle | CPU, s | 0.36 | 0.355 | -1.4% |
+| lifecycle | p95 turn, ms | 575.567 | 575.357 | -0.0% |
+| lifecycle | peak RSS, MiB | 27.402 | 27.08 | -1.2% |
+
+The runner's footprint numbers move by more than these between runs of
+this same change (written to disk per turn was -15.6% and -8.0% on earlier
+commits, RSS after a turn each -18.9% and -9.9%), so they were measured
+again locally below. Sonny's screens moved within noise.
+
+### Local, 4-core Linux, glibc build, main at 0d3f47f
+
+Each scenario runs 60 s against the synthetic model (`delay:100` prompts),
+base and head alternating, page cache of both binaries evicted first. PSS
+is the daemon's at the end. Medians of the rounds shown.
+
+| Scenario | Measure | Main | This change |
+| --- | --- | ---: | ---: |
+| 8 agents, 4 active (2 rounds) | p50 / p95 / p99, ms | 106.8 / 110.5 / 113.4 | 106.7 / 110.1 / 113.5 |
+| | CPU per turn, ms | 3.86 | 3.74 |
+| | PSS, MiB | 20.1 | 20.3 |
+| 5,000 agents, 30 active (2 rounds) | p50 / p95 / p99, ms | 104.9 / 108.4 / 111.2 | 104.4 / 107.5 / 109.9 |
+| | turns/s | 277 | 279 |
+| | CPU per turn, ms | 2.02 | 1.87 |
+| | PSS, MiB | 21.2 | 21.4 |
+| 30 active, 300 agents idle a week, packed, woken: first minute (3 rounds) | p50 / p95 / p99, ms | 118.0 / 136.6 / 148.4 | 117.8 / 135.5 / 149.5 |
+| | CPU per turn, ms | 3.90 | 4.20 |
+| | PSS, MiB | 26.3 | 32.6 |
+| the same, the next minute (unpacked) | p50 / p95 / p99, ms | 119.4 / 138.5 / 147.4 | 118.5 / 135.1 / 144.0 |
+| | CPU per turn, ms | 4.54 | 4.23 |
+| | PSS, MiB | 26.8 | 27.2 |
+| 30 active on a 2.1 GB store from main, every agent idle a week (2 rounds) | p50 / p95 / p99, ms | 114.7 / 132.6 / 144.4 | 111.4 / 127.6 / 140.8 |
+| | CPU per turn, ms | 5.31 | 4.59 |
+| | PSS, MiB | 24.0 | 34.8 |
+
+Waking 300 packed agents at once costs their first minute 0.3 ms of CPU per
+turn and 6 MiB more memory while their histories are unpacked (300 batches
+in the background); after that they run as on main. On the 2.1 GB store the
+first start after the upgrade takes 22 s once (backup and the one-time
+VACUUM); the 10 MiB more memory is what that rewrite left with the
+allocator, until the daemon restarts. Packing waits while turns run, so
+none of those turns slowed; with no turn running it packed the whole store
+in about 30 s (2,334 batches).
+
+Memory, anon PSS, 4 rounds alternating (identical within 8 KiB each), texts
+named by a small id (29d477f): with the benches' 11-byte instructions, 8
+agents main 1,384 KiB and this change 1,432; 1,000 agents main 2,024 and
+this change 2,064. The +40 to +48 KiB is the same at both ends: the larger
+schema, not the agents (each 1,000 agents add 640 KiB on main and 632 here).
+With 6 KB instructions shared by all 1,000 agents, main 3,114 KiB and this
+change 2,104, and the store 7.1 MB against 1.0 MB. An earlier commit named
+texts by their 64-byte digest and cost 0.2 KiB more per agent with short
+instructions; the small id removed that.
+

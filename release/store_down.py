@@ -7,6 +7,10 @@ The daemon brings a store forward by itself when it starts, one schema at a
 time. Each of those steps has its way back here, newest first, so a release
 that knows only SCHEMA opens the store with nothing lost that it can hold:
 
+    114 -> 113  packed messages unpacked; instructions, and the texts the
+                events of kept configures hold, back in place of their
+                digests (needs Python 3.14+, or the zstandard module, when
+                any message was packed)
     113 -> 112  prompts no longer hold the effort their turn asked for
     112 -> 111  turns no longer count the daemon's process ending under them
     111 -> 110  switches between model families go; each agent stays on
@@ -42,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import store_lift_yields  # noqa: E402
 
-NEWEST = 113
+NEWEST = 114
 OLDEST = 106
 
 
@@ -62,6 +66,63 @@ def on_lineage(conn, head, node):
         " SELECT EXISTS(SELECT 1 FROM up WHERE id=?2)",
         (head, node),
     ).fetchone()[0] == 1
+
+
+def unpacker():
+    """What unpacks a packed item, with its length: Python's own zstd from
+    3.14, else the zstandard module; None with neither."""
+    try:
+        from compression import zstd
+    except ImportError:
+        pass
+    else:
+        return lambda packed, size: zstd.decompress(packed)
+    try:
+        import zstandard
+    except ImportError:
+        return None
+    unpack = zstandard.ZstdDecompressor()
+    return lambda packed, size: unpack.decompress(packed, max_output_size=size)
+
+
+def back_114(conn):
+    """Every packed item unpacked, byte for byte, one at a time; each bot's
+    instructions whole in its row again; each event of a kept configure
+    with its texts back where they were, in the JSON the daemon writes;
+    `texts` goes. The store keeps giving freed pages back to the disk."""
+    ids = [row[0] for row in conn.execute("SELECT id FROM nodes WHERE packed IS NOT NULL ORDER BY id")]
+    unpack = unpacker() if ids else None
+    if ids and unpack is None:
+        raise SystemExit(f"{len(ids)} packed messages need Python 3.14 or later, or the zstandard module")
+    for node in ids:
+        packed, size = conn.execute("SELECT item,packed FROM nodes WHERE id=?", (node,)).fetchone()
+        item = unpack(packed, size)
+        if len(item) != size:
+            raise SystemExit(f"node {node} unpacks to {len(item)} bytes, not {size}")
+        conn.execute("UPDATE nodes SET item=? WHERE id=?", (item, node))
+    events = [row[0] for row in conn.execute(
+        "SELECT id FROM events WHERE kind IN ('configure_pending','configure_failed')"
+        " AND json_type(data,'$.texts') IS NOT NULL ORDER BY id")]
+    for event in events:
+        data = json.loads(conn.execute("SELECT data FROM events WHERE id=?", (event,)).fetchone()[0])
+        for field, text_id in data.pop("texts").items():
+            text = conn.execute("SELECT text FROM texts WHERE id=?", (text_id,)).fetchone()[0]
+            data["configure_pending"][field] = json.loads(text) if field == "declare" else text
+        conn.execute("UPDATE events SET data=? WHERE id=?", (
+            json.dumps(data, separators=(",", ":"), ensure_ascii=False, sort_keys=True), event))
+    run(
+        conn,
+        "CREATE TABLE plain_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),"
+        "    instructions TEXT NOT NULL, compaction_instructions TEXT);"
+        "INSERT INTO plain_instructions(id,instructions,compaction_instructions)"
+        "    SELECT i.id,t.text,c.text FROM bot_instructions i JOIN texts t ON t.id=i.instructions"
+        "    LEFT JOIN texts c ON c.id=i.compaction_instructions;"
+        "DROP TABLE bot_instructions;"
+        "ALTER TABLE plain_instructions RENAME TO bot_instructions;"
+        "DROP TABLE texts;"
+        "ALTER TABLE nodes DROP COLUMN packed;"
+        "ALTER TABLE bots DROP COLUMN packed_node;"
+    )
 
 
 def back_113(conn):
@@ -140,7 +201,7 @@ def back_107(conn):
 
 
 # Each schema's way back to the one before it.
-BACK = {113: back_113, 112: back_112, 111: back_111, 110: back_110, 109: back_109, 108: back_108, 107: back_107}
+BACK = {114: back_114, 113: back_113, 112: back_112, 111: back_111, 110: back_110, 109: back_109, 108: back_108, 107: back_107}
 
 
 def back_up(conn, store, copy):

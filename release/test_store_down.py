@@ -1,6 +1,7 @@
 import contextlib
 import fcntl
 import glob
+import hashlib
 import io
 import json
 import os
@@ -46,6 +47,40 @@ UP_113 = """
 ALTER TABLE nodes ADD COLUMN effort TEXT;
 PRAGMA user_version=113;
 """
+
+UP_114 = """
+CREATE TABLE texts(id INTEGER PRIMARY KEY, digest TEXT NOT NULL UNIQUE,
+    text TEXT NOT NULL, events INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE kept_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
+    instructions INTEGER NOT NULL, compaction_instructions INTEGER);
+ALTER TABLE nodes ADD COLUMN packed INTEGER;
+ALTER TABLE bots ADD COLUMN packed_node INTEGER;
+"""
+
+# What a configure kept for a turn's end carries, whole, as 113 kept it.
+KEPT = {"instructions": "New rules.", "declare": [{"name": "exec", "description": "Run it."}],
+        "settings": {"speed": None}}
+
+
+def packer():
+    """zstd as the daemon packs (level 3), or None with no module for it."""
+    try:
+        from compression import zstd
+    except ImportError:
+        pass
+    else:
+        return lambda item: zstd.compress(item, 3)
+    try:
+        import zstandard
+    except ImportError:
+        return None
+    return zstandard.ZstdCompressor(level=3).compress
+
+
+def keep(conn, text):
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    conn.execute("INSERT OR IGNORE INTO texts(digest,text) VALUES (?,?)", (digest, text))
+    return conn.execute("SELECT id FROM texts WHERE digest=?", (digest,)).fetchone()[0]
 
 
 class StoreDownTest(unittest.TestCase):
@@ -98,6 +133,30 @@ class StoreDownTest(unittest.TestCase):
             "json_object('namespace','fixture','speeds',json_object('openai/*',json_array('fast')),"
             "'sandbox','read-only'))) WHERE name='Helper'"
         )
+        # 114 keeps each text bots hold once, by a small id, and packs the
+        # items of agents idle a week: Helper's longest here.
+        self.instructions = dict(conn.execute("SELECT id,instructions FROM bot_instructions"))
+        conn.executescript(UP_114)
+        for bot, text in self.instructions.items():
+            conn.execute("INSERT INTO kept_instructions(id,instructions) VALUES (?,?)", (bot, keep(conn, text)))
+        conn.executescript("DROP TABLE bot_instructions;"
+                           "ALTER TABLE kept_instructions RENAME TO bot_instructions;"
+                           "CREATE INDEX bot_instructions_text ON bot_instructions(instructions);")
+        held = {"instructions": keep(conn, KEPT["instructions"]),
+                "declare": keep(conn, json.dumps(KEPT["declare"], separators=(",", ":"), sort_keys=True))}
+        stored = {"bot_id": 1, "running_turn": 7, "configure_pending": {"settings": {"speed": None}},
+                  "texts": held}
+        conn.execute("INSERT INTO events(bot,kind,data) VALUES ('Lead','configure_pending',?)",
+                     (json.dumps(stored, separators=(",", ":")),))
+        self.event = conn.execute("SELECT max(id) FROM events").fetchone()[0]
+        self.packed_node, self.item = conn.execute(
+            "SELECT n.id,n.item FROM nodes n JOIN turns t ON t.id=n.turn WHERE t.bot='Helper'"
+            " ORDER BY length(n.item) DESC LIMIT 1").fetchone()
+        pack = packer()
+        if pack:
+            conn.execute("UPDATE nodes SET item=?,packed=? WHERE id=?",
+                         (pack(bytes(self.item)), len(self.item), self.packed_node))
+        conn.execute("PRAGMA user_version=114")
         conn.commit()
         conn.close()
 
@@ -114,21 +173,49 @@ class StoreDownTest(unittest.TestCase):
             store_down.main([self.store, *args])
         return json.loads(out.getvalue())
 
+    @unittest.skipUnless(packer(), "needs Python 3.14, or the zstandard module")
+    def test_packed_messages_and_texts_come_back_whole(self):
+        self.assertEqual(self.read(f"SELECT packed FROM nodes WHERE id={self.packed_node}"), [(len(self.item),)])
+        self.assertEqual(self.down("113")["from"], 114)
+        self.assertEqual(self.read("PRAGMA user_version"), [(113,)])
+        self.assertEqual(self.read(f"SELECT item FROM nodes WHERE id={self.packed_node}"), [(self.item,)])
+        self.assertNotIn("packed", {row[1] for row in self.read("PRAGMA table_info(nodes)")})
+        self.assertNotIn("packed_node", {row[1] for row in self.read("PRAGMA table_info(bots)")})
+        self.assertEqual(dict(self.read("SELECT id,instructions FROM bot_instructions")), self.instructions)
+        [(data,)] = self.read(f"SELECT data FROM events WHERE id={self.event}")
+        self.assertEqual(json.loads(data), {"bot_id": 1, "running_turn": 7, "configure_pending": KEPT})
+        self.assertEqual(self.read("SELECT name FROM sqlite_master WHERE name LIKE 'texts%'"
+                                   " OR name LIKE 'bot_instructions_%'"), [])
+
+    def test_packed_messages_need_a_way_to_unpack(self):
+        if not packer():
+            self.skipTest("nothing here packs")
+        real = store_down.unpacker
+        store_down.unpacker = lambda: None
+        try:
+            with self.assertRaises(SystemExit) as refused:
+                self.down("113")
+        finally:
+            store_down.unpacker = real
+        self.assertIn("packed messages need Python 3.14", str(refused.exception))
+        # Taken back as one transaction: the store is as it was.
+        self.assertEqual(self.read("PRAGMA user_version"), [(114,)])
+
     def test_prompts_lose_their_effort(self):
-        self.assertEqual(self.down("112")["from"], 113)
+        self.assertEqual(self.down("112")["from"], 114)
         self.assertEqual(self.read("PRAGMA user_version"), [(112,)])
         self.assertNotIn("effort", {row[1] for row in self.read("PRAGMA table_info(nodes)")})
         self.assertEqual(self.read(f"SELECT count(*) FROM nodes WHERE id={self.switched}"), [(1,)])
 
     def test_turns_lose_their_count_of_cut_offs(self):
-        self.assertEqual(self.down("111")["from"], 113)
+        self.assertEqual(self.down("111")["from"], 114)
         self.assertEqual(self.read("PRAGMA user_version"), [(111,)])
         columns = {row[1] for row in self.read("PRAGMA table_info(turns)")}
         self.assertFalse({"restarts", "restart_head"} & columns)
         self.assertEqual(self.read(f"SELECT count(*) FROM turns WHERE id={self.turn}"), [(1,)])
 
     def test_a_switched_agent_stays_where_it_is_and_each_turn_has_one_node(self):
-        self.assertEqual(self.down("110")["from"], 113)
+        self.assertEqual(self.down("110")["from"], 114)
         self.assertEqual(self.read("PRAGMA user_version"), [(110,)])
         self.assertEqual(self.read(f"SELECT id FROM nodes WHERE turn={self.turn}"), [(self.switched,)])
         self.assertEqual(self.read(f"SELECT turn FROM nodes WHERE id={self.original}"), [(None,)])
@@ -139,7 +226,7 @@ class StoreDownTest(unittest.TestCase):
                          [(1,)])
 
     def test_back_to_0_10_1_s_shape(self):
-        self.assertEqual(self.down("106")["from"], 113)
+        self.assertEqual(self.down("106")["from"], 114)
         self.assertEqual(self.read("PRAGMA user_version"), [(106,)])
         columns = {row[1] for row in self.read("PRAGMA table_info(bots)")}
         self.assertTrue({"instructions", "compaction_instructions"} <= columns)
@@ -157,7 +244,7 @@ class StoreDownTest(unittest.TestCase):
         # Every bot names a list the store keeps.
         self.assertEqual(self.read("SELECT count(*) FROM bots WHERE declared IS NOT NULL"
                                    " AND declared NOT IN (SELECT digest FROM tool_lists)"), [(0,)])
-        self.assertEqual(len(glob.glob(self.store + ".schema-113.*.backup")), 1)
+        self.assertEqual(len(glob.glob(self.store + ".schema-114.*.backup")), 1)
 
     def test_to_0_10_2_only_the_settings_it_refuses_go(self):
         lists = self.read("SELECT * FROM tool_lists")
@@ -195,17 +282,15 @@ class StoreDownTest(unittest.TestCase):
                     self.down("111")
                 finally:
                     store_down.back_up = vacuum
-                [copy] = glob.glob(self.store + ".schema-113.*.backup")
+                [copy] = glob.glob(self.store + ".schema-114.*.backup")
                 self.assertEqual(stat.S_IMODE(os.stat(copy).st_mode), mode)
                 # Already the store's before the copy is written.
                 self.assertEqual(made, [mode])
                 self.assertEqual(stat.S_IMODE(os.stat(self.store + ".owner-lock").st_mode), 0o600)
                 with sqlite3.connect(copy) as conn:
-                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone(), (113,))
-                # The next pass starts from 113 again.
-                conn = sqlite3.connect(self.store)
-                conn.executescript(UP_112 + UP_113)
-                conn.close()
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone(), (114,))
+                # The next pass starts from 114 again.
+                Path(self.store).write_bytes(Path(copy).read_bytes())
 
     def test_a_copy_that_fails_is_removed(self):
         os.chmod(self.store, 0o600)
@@ -224,7 +309,7 @@ class StoreDownTest(unittest.TestCase):
         finally:
             store_down.back_up = back_up
         self.assertEqual(glob.glob(self.store + ".*.backup"), [])
-        self.assertEqual(self.read("PRAGMA user_version"), [(113,)])
+        self.assertEqual(self.read("PRAGMA user_version"), [(114,)])
 
     def test_help_says_how_to_use_it(self):
         out = io.StringIO()
@@ -243,13 +328,13 @@ class StoreDownTest(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX)
             with self.assertRaisesRegex(SystemExit, "a daemon holds this store"):
                 self.down("106")
-        for to in ("105", "114"):
-            with self.assertRaisesRegex(SystemExit, "goes back to 106 through 113"):
+        for to in ("105", "115"):
+            with self.assertRaisesRegex(SystemExit, "goes back to 106 through 114"):
                 self.down(to)
         os.link(self.store, self.store + ".alias")
         with self.assertRaisesRegex(SystemExit, "another hard link"):
             self.down("106")
-        self.assertEqual(self.read("PRAGMA user_version"), [(113,)])
+        self.assertEqual(self.read("PRAGMA user_version"), [(114,)])
 
 
 if __name__ == "__main__":

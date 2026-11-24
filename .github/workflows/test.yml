@@ -58,7 +58,12 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           cargo test --locked --workspace
       - name: Release script tests
-        run: python3 -m unittest discover -s release
+        # store_down.py unpacks packed messages with Python 3.14's zstd or
+        # the zstandard module; the runner's Python has neither.
+        run: |
+          python3 -m venv .local/release-venv
+          .local/release-venv/bin/pip install --quiet zstandard==0.25.0
+          .local/release-venv/bin/python -m unittest discover -s release
 
   macos:
     # The release's package job runs these same tests on this runner before
@@ -78,7 +83,12 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --workspace
       - name: Release script tests
-        run: python3 -m unittest discover -s release
+        # store_down.py unpacks packed messages with Python 3.14's zstd or
+        # the zstandard module; the runner's Python has neither.
+        run: |
+          python3 -m venv .local/release-venv
+          .local/release-venv/bin/pip install --quiet zstandard==0.25.0
+          .local/release-venv/bin/python -m unittest discover -s release
 
   runtime:
     runs-on: ubuntu-24.04

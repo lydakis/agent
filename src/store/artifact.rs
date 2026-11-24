@@ -1,4 +1,5 @@
-//! Lossless storage for large artifacts. Transcript items keep their native JSON.
+//! Lossless storage for large artifacts. Transcript items keep their native
+//! JSON while their agent works; an idle agent's are packed (see pack.rs).
 //! A compressed BLOB starts with a bounded directory of little-endian offsets,
 //! followed by independent 16 KiB blocks, each tagged raw (0) or LZ4 (1).
 //! Keeping one BLOB per artifact preserves cheap retention and avoids per-block
