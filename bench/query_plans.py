@@ -44,10 +44,34 @@ STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN held', 'S
                     'SCAN sqlite_sequence'}
 
 
+def unpacked(name=''):
+    """What `unpacked!` in src/store/db.rs writes: a node's item, read
+    through `unpack` when it is packed."""
+    n = f'{name}.' if name else ''
+    return f'CASE WHEN {n}packed IS NULL THEN {n}item ELSE unpack({n}item,{n}packed) END'
+
+
+def expanded(source):
+    """`source` with the SQL its macros build written out: each one-argument
+    `macro_rules!` whose body is a `concat!` of literals, `unpacked!`, and
+    every `concat!` of literals then joined into one literal."""
+    for name, arg, body in re.findall(
+            r'macro_rules! (\w+) \{\s*\(\$(\w+):expr\) => \{\s*concat!\((.*?)\)\s*\};\s*\}', source, re.S):
+        source = re.sub(name + r'!\(((?:[^()]|\([^()]*\))*)\)',
+                        lambda m, body=body, arg=arg: 'concat!(' + body.replace('$' + arg, m.group(1)) + ')', source)
+    source = re.sub(r'unpacked!\((\w*)\)', lambda m: '"' + unpacked(m.group(1)) + '"', source)
+
+    def joined(match):
+        parts = re.findall(r'"((?:[^"\\]|\\.)*)"', match.group(1))
+        return '"' + ''.join(parts) + '"'
+    return re.sub(r'concat!\(\s*((?:"(?:[^"\\]|\\.)*"\s*,?\s*)+)\)', joined, source)
+
+
 def statements(source):
+    source = expanded(source)
     constants = {name: value.replace('\\"', '"') for name, value in re.findall(
         r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE|HELD|MESSAGE_FROM|MESSAGE_TEXT|MESSAGE_NODE|'
-        r'PREVIEW|PREVIEW_NODE): &str =\s*"((?:[^"\\]|\\.)*)";', source, re.S)}
+        r'PREVIEW|PREVIEW_NODE|N_ITEM): &str =\s*"((?:[^"\\]|\\.)*)";', source, re.S)}
     literals = re.findall(r'r?#?"((?:[^"\\]|\\.)*)"#?', source, re.S)
     for literal in literals:
         text = re.sub(r'\s+', ' ', literal.replace('\\n', ' ')).strip()
@@ -76,6 +100,8 @@ def connect(path):
     a bound value, and with foreign keys on, to include the daemon's
     constraint-check plans."""
     conn = sqlite3.connect(path)
+    # The daemon's `unpack`, for planning: what it returns does not matter.
+    conn.create_function('unpack', 2, lambda item, _: item, deterministic=True)
     conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_QPSG, True)
     conn.execute('PRAGMA foreign_keys=ON')
     return conn

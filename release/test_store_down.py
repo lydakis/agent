@@ -49,7 +49,7 @@ PRAGMA user_version=113;
 """
 
 UP_114 = """
-CREATE TABLE texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL);
+CREATE TABLE texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL, events INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX bot_instructions_text ON bot_instructions(instructions);
 CREATE INDEX bot_instructions_compaction
     ON bot_instructions(compaction_instructions) WHERE compaction_instructions IS NOT NULL;
@@ -79,7 +79,7 @@ def packer():
 
 def keep(conn, text):
     digest = hashlib.sha256(text.encode()).hexdigest()
-    conn.execute("INSERT OR IGNORE INTO texts VALUES (?,?)", (digest, text))
+    conn.execute("INSERT OR IGNORE INTO texts(digest,text) VALUES (?,?)", (digest, text))
     return digest
 
 

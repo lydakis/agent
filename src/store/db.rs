@@ -3745,15 +3745,13 @@ fn kept_text(conn: &Connection, digest: &str) -> Result<String> {
 }
 /// Let go of the text `digest` names once nothing names it: no bot's
 /// instructions or compaction instructions, and no event of a kept
-/// `configure` (see [`holding`]).
+/// `configure` (`events` counts those, see [`holding`]).
 fn drop_text(conn: &Connection, digest: Option<&str>) -> Result<()> {
     if let Some(digest) = digest {
         conn.prepare_cached(
-            "DELETE FROM texts WHERE digest=?1
+            "DELETE FROM texts WHERE digest=?1 AND events=0
               AND NOT EXISTS(SELECT 1 FROM bot_instructions WHERE instructions=?1)
-              AND NOT EXISTS(SELECT 1 FROM bot_instructions WHERE compaction_instructions=?1)
-              AND NOT EXISTS(SELECT 1 FROM events
-                  WHERE kind IN ('configure_pending','configure_failed') AND instr(data,?1)>0)",
+              AND NOT EXISTS(SELECT 1 FROM bot_instructions WHERE compaction_instructions=?1)",
         )?
         .execute([digest])?;
     }
@@ -3767,8 +3765,9 @@ const HOLDING: [&str; 2] = ["configure_pending", "configure_failed"];
 /// every agent's event when a client changes them all.
 const HELD: [&str; 3] = ["instructions", "compaction_instructions", "declare"];
 /// `data`, the event of a kept `configure`, as stored: each text of
-/// [`HELD`] it carries kept once in `texts`, and named under `texts` by
-/// digest in its place. [`spelled`] puts each back where it was.
+/// [`HELD`] it carries kept once in `texts`, counted there as one more
+/// event naming it, and named under `texts` by digest in its place.
+/// [`spelled`] puts each back where it was.
 fn holding(conn: &Connection, mut data: Value) -> Result<Value> {
     let mut held = serde_json::Map::new();
     if let Some(pending) = data
@@ -3782,7 +3781,10 @@ fn holding(conn: &Connection, mut data: Value) -> Result<Value> {
                 _ => continue,
             };
             pending.remove(field);
-            held.insert(field.into(), json!(&*keep_text(conn, &text)?));
+            let digest = keep_text(conn, &text)?;
+            conn.prepare_cached("UPDATE texts SET events=events+1 WHERE digest=?")?
+                .execute([&*digest])?;
+            held.insert(field.into(), json!(&*digest));
         }
     }
     if !held.is_empty() {
@@ -3825,11 +3827,14 @@ fn held_by(conn: &Connection, bot: &str) -> Result<Vec<String>> {
     Ok(held)
 }
 /// Delete every event of `bot`, letting go of the texts only they held;
-/// how many went.
+/// how many went. An event retention prunes keeps its texts counted: they
+/// stay, never the other way round.
 fn delete_events(conn: &Connection, bot: &str) -> Result<i64> {
     let held = held_by(conn, bot)?;
     let events = conn.execute("DELETE FROM events WHERE bot=?", [bot])? as i64;
     for digest in held {
+        conn.prepare_cached("UPDATE texts SET events=events-1 WHERE digest=?")?
+            .execute([&digest])?;
         drop_text(conn, Some(&digest))?;
     }
     Ok(events)
@@ -4356,7 +4361,8 @@ impl Database {
                 configure_pending TEXT, refused_summary TEXT, closed_ms INTEGER, profile TEXT,
                 family_start INTEGER, packed_node INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
-            CREATE TABLE IF NOT EXISTS texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL,
+                events INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS bot_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
                 instructions TEXT NOT NULL, compaction_instructions TEXT);
             CREATE INDEX IF NOT EXISTS bot_instructions_text ON bot_instructions(instructions);
@@ -5094,9 +5100,6 @@ impl Database {
         tool_list(&self.conn, digest)
     }
     /// A bot's row and its instructions, read from `texts`.
-    const FROM: &str = "bots JOIN bot_instructions i USING(id)
-        JOIN texts it ON it.digest=i.instructions
-        LEFT JOIN texts ct ON ct.digest=i.compaction_instructions";
     const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,it.text,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,compaction,ct.text,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending,closed_ms,profile";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
@@ -5216,9 +5219,11 @@ impl Database {
             // Cached: parsing this many columns costs more than the read.
             self.conn
                 .prepare_cached(&format!(
-                    "SELECT {} FROM {} WHERE id=?",
-                    Self::COLUMNS,
-                    Self::FROM
+                    "SELECT {} FROM bots JOIN bot_instructions i USING(id)
+                     JOIN texts it ON it.digest=i.instructions
+                     LEFT JOIN texts ct ON ct.digest=i.compaction_instructions
+                     WHERE id=?",
+                    Self::COLUMNS
                 ))?
                 .query_row([id], Self::row_held)
                 .optional()?
@@ -5241,9 +5246,11 @@ impl Database {
             // Cached: parsing this many columns costs more than the read.
             self.conn
                 .prepare_cached(&format!(
-                    "SELECT {} FROM {} WHERE name=?",
-                    Self::COLUMNS,
-                    Self::FROM
+                    "SELECT {} FROM bots JOIN bot_instructions i USING(id)
+                     JOIN texts it ON it.digest=i.instructions
+                     LEFT JOIN texts ct ON ct.digest=i.compaction_instructions
+                     WHERE name=?",
+                    Self::COLUMNS
                 ))?
                 .query_row([name], Self::row_held)
                 .optional()?
@@ -16188,45 +16195,81 @@ impl Database {
         };
         // Its first turn's first node: a fork's history above it is the
         // parent's, packed, if ever, with the parent.
-        let first: Option<i64> = self.conn.query_row(
-            "SELECT MIN(n.id) FROM turns t JOIN nodes n ON n.turn=t.id WHERE t.bot=?",
-            [&name],
-            |r| r.get(0),
-        )?;
+        let first: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT n.id FROM turns t JOIN nodes n ON n.turn=t.id WHERE t.bot=?
+             ORDER BY t.id LIMIT 1",
+                [&name],
+                |r| r.get(0),
+            )
+            .optional()?;
         let Some(first) = first else {
             return Ok(Pack::Batch(batch));
         };
-        // A child is written after its parent: ids fall toward the root.
-        let mut chain: Vec<i64> = self
-            .conn
-            .prepare_cached(
-                "WITH RECURSIVE chain(id) AS (SELECT ?1 WHERE ?1>?2
-                    UNION ALL SELECT n.parent FROM nodes n JOIN chain c ON n.id=c.id
-                    WHERE n.parent>?2)
-                 SELECT id FROM chain",
-            )?
-            .query_map(params![head, after.max(first - 1)], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+        // The batch is a stretch of its history, found by depth through
+        // skip pointers (`ancestor`) so no step walks the whole history: it
+        // starts at the shallowest node written after `floor` (a child is
+        // written after its parent, so ids grow with depth) and ends where
+        // its items reach BATCH_BYTES (`total_bytes` sums them from the root).
+        let floor = after.max(first - 1);
+        let depth = place(&self.conn, head)?
+            .ok_or_else(|| Error::new("storage_error"))?
+            .depth;
+        let at = |target: i64| -> Result<i64> {
+            ancestor(&self.conn, head, depth, target)?.ok_or_else(|| Error::new("storage_error"))
+        };
+        let total = |node: i64| -> Result<i64> {
+            Ok(self
+                .conn
+                .prepare_cached("SELECT total_bytes FROM nodes WHERE id=?")?
+                .query_row([node], |r| r.get(0))?)
+        };
+        if head <= floor {
+            return Ok(Pack::Batch(batch));
+        }
+        let (mut low, mut high) = (1, depth);
+        while low < high {
+            let middle = (low + high) / 2;
+            if at(middle)? > floor {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let start = low;
+        let before = if start > 1 { total(at(start - 1)?)? } else { 0 };
+        high = depth;
+        while low < high {
+            let middle = (low + high + 1) / 2;
+            if total(at(middle)?)? - before <= super::pack::BATCH_BYTES as i64 {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        let mut id = at(low)?;
+        batch.through = id;
+        let mut chain = vec![id];
+        for _ in start..low {
+            id = place(&self.conn, id)?
+                .and_then(|place| place.parent)
+                .ok_or_else(|| Error::new("storage_error"))?;
+            chain.push(id);
+        }
         chain.reverse();
         let mut item = self
             .conn
             .prepare_cached("SELECT item FROM nodes WHERE id=? AND packed IS NULL")?;
         let mut packer = super::pack::packer()?;
-        let mut read = 0;
         for id in chain {
-            if read >= super::pack::BATCH_BYTES {
-                break;
-            }
             if let Some(plain) = item
                 .query_row([id], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
+                && let Some(packed) = super::pack::pack(&mut packer, &plain)?
             {
-                read += plain.len();
-                if let Some(packed) = super::pack::pack(&mut packer, &plain)? {
-                    batch.items.push((id, plain, packed));
-                }
+                batch.items.push((id, plain, packed));
             }
-            batch.through = id;
         }
         Ok(Pack::Batch(batch))
     }
@@ -16251,8 +16294,13 @@ impl Database {
                 update.execute(params![id, packed, item.len() as i64, item])?;
             }
         }
-        // It frees a page a step.
-        let mut vacuum = tx.prepare_cached("PRAGMA incremental_vacuum")?;
+        // It frees a page a step, at most the pages a batch reads, so one
+        // job stays bounded however many pages are free.
+        let pages: i64 = tx.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let mut vacuum = tx.prepare_cached(&format!(
+            "PRAGMA incremental_vacuum({})",
+            super::pack::BATCH_BYTES as i64 / pages
+        ))?;
         let mut freed = vacuum.query([])?;
         while freed.next()?.is_some() {}
         drop(freed);
@@ -22601,7 +22649,8 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 /// takes it back.
 fn migrate_texts_once(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "CREATE TABLE texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL);
+        "CREATE TABLE texts(digest TEXT PRIMARY KEY, text TEXT NOT NULL,
+             events INTEGER NOT NULL DEFAULT 0);
          ALTER TABLE nodes ADD COLUMN packed INTEGER;
          ALTER TABLE bots ADD COLUMN packed_node INTEGER;",
     )?;
@@ -24742,7 +24791,7 @@ mod tests {
             .execute_batch(
                 "INSERT INTO bots(name,id,status,provider,family,model)
                  VALUES ('Bob',7,'idle','openai','responses','m');
-                 INSERT INTO texts VALUES
+                 INSERT INTO texts(digest,text) VALUES
                     ('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','');
                  INSERT INTO bot_instructions(id,instructions)
                     VALUES (7,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')",
