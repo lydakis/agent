@@ -41015,6 +41015,35 @@ mod tests {
         assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("ask:1/c1"));
     }
 
+    /// A question's turn over pages let go: each is drawn again once for
+    /// the landing, though drawing one can let another go, and then the
+    /// landing ends where nothing older is left to read.
+    #[tokio::test]
+    async fn a_landing_draws_each_page_let_go_again_once() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.older = None;
+        for (id, node) in [(1, 10), (2, 20)] {
+            let paged = Paged::new(vec![node], [(node, 5)].into(), &[], false);
+            app.pages.insert(id, paged);
+        }
+        app.screen.prepend_blank(vec![(1, 3), (2, 3)]);
+        assert!(app.screen.let_go_page(1) && app.screen.let_go_page(2));
+        app.land_on("ask:5/c1".into());
+        let mut drawn_again = Vec::new();
+        for _ in 0..6 {
+            if app.again.take().is_some() {
+                drawn_again.push(());
+            }
+            app.land_tick();
+        }
+        // Both pages still let go (nothing was read back), each drawn
+        // again once, and the landing over.
+        assert_eq!(drawn_again.len(), 2);
+        assert!(app.landing.is_none());
+    }
+
     /// A read back that fails ends the landing: it is not asked for again.
     #[tokio::test]
     async fn a_read_back_that_fails_ends_the_landing() {
