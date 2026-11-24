@@ -2129,7 +2129,11 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   the open questions are set aside. They leave the composer and the
   `needs you` count, each card's `?` turns muted with `Set aside: you
   wrote past it. A pick still answers it.`, and a click on a card's
-  question brings it back into the composer to answer. When your own
+  question brings it back into the composer to answer. The agent is
+  told too, with that message: one line from Sonny for each question,
+  `Your question "QUESTION" (CALL_ID) is now set aside: the person wrote
+  past it; a pick still answers it.`, which you never see; it asks again,
+  closes it, or leaves it. When your own
   words did answer one, or it no longer matters, the agent closes it
   with `close_ask`: answered in your words with the option it goes with,
   or withdrawn with why; there is no matching of your text. Each card
