@@ -4,7 +4,9 @@
 //! nothing, while work it may take is open there, is told once what is
 //! open, and again only when more opens. Never on a turn interrupted,
 //! failed or paused, on a closed agent, or while it waits on the person's
-//! answer to an ask. Each thread is read once and again only once its
+//! answer to an ask. A turn that opened work on a board, however it
+//! ended, sends one round of invites for each board at its end, listing
+//! the work it opened there. Each thread is read once and again only once its
 //! file changes, whichever host wrote it: a turn's end costs a look at
 //! each thread's file, as a listing does.
 
@@ -26,6 +28,8 @@ pub struct Ends {
     held: HashSet<(String, String)>,
     /// The open work each agent was told of.
     open: HashMap<String, HashSet<String>>,
+    /// The work each agent's turn opened, by board then thread, in order.
+    opened: HashMap<(String, i64), Vec<(String, String)>>,
 }
 
 /// What a completed turn's end may tell its agent, before the daemon
@@ -50,6 +54,40 @@ impl Ends {
         if let Some(turn) = turn {
             (self.wrote.entry((bot.to_owned(), turn)).or_default()).insert(thread.to_owned());
         }
+    }
+
+    /// `bot`'s turn `turn` opened `thread` as work on `board`.
+    fn opens(&mut self, bot: &str, turn: Option<i64>, board: &str, thread: &str) {
+        if let Some(turn) = turn {
+            let opened = self.opened.entry((bot.to_owned(), turn)).or_default();
+            let it = (board.to_owned(), thread.to_owned());
+            if !opened.contains(&it) {
+                opened.push(it);
+            }
+        }
+    }
+
+    /// The rounds `bot`'s turn `turn` sends at its end: for each board it
+    /// opened work on, in the order it first did, that work, each thread
+    /// with its title as it reads now. A turn whose end was never seen
+    /// sends none.
+    pub fn rounds(&mut self, bot: &str, turn: i64) -> Vec<(String, Vec<(String, String)>)> {
+        let opened = (self.opened)
+            .remove(&(bot.to_owned(), turn))
+            .unwrap_or_default();
+        self.opened.retain(|(one, at), _| one != bot || *at > turn);
+        let mut rounds: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for (board, thread) in opened {
+            let Some((_, Some(work))) = self.threads.get(&thread) else {
+                continue;
+            };
+            let it = (thread, title(work));
+            match rounds.iter_mut().find(|(one, _)| *one == board) {
+                Some((_, work)) => work.push(it),
+                None => rounds.push((board, vec![it])),
+            }
+        }
+        rounds
     }
 
     /// Of the threads `here`, each with its file's stamp, those changed
@@ -282,13 +320,31 @@ fn scan(home: &Path) {
     ends().lock().unwrap().scanned(&here, read);
 }
 
+/// The board a commons call that went through opened new work on: a
+/// post of work, or a reply that made a thread work, which alone names a
+/// board (opening work again names none).
+pub fn opened_on(arguments: &Value) -> Option<&str> {
+    let (post, reply) = (&arguments["post"], &arguments["reply"]);
+    match (post["work"] == true, reply["do"] == "open") {
+        (true, _) => post["board"].as_str(),
+        (_, true) => reply["board"].as_str(),
+        _ => None,
+    }
+}
+
 /// The host's commons call by `bot`, in its turn `turn`, wrote in
-/// `thread`, which the commons in `home` now holds as it is: read again
-/// at once, so a take let go and taken again before the turn ends is a
-/// new take. Read with the turn ends free, off the host's runtime.
-pub fn wrote(home: &Path, bot: &str, turn: Option<i64>, thread: &str) {
+/// `thread`, which the commons in `home` now holds as it is, opening it
+/// as work on the board `opened` names: read again at once, so a take let
+/// go and taken again before the turn ends is a new take. Read with the
+/// turn ends free, off the host's runtime.
+pub fn wrote(home: &Path, bot: &str, turn: Option<i64>, thread: &str, opened: Option<&str>) {
     let _reading = READING.lock().unwrap();
-    ends().lock().unwrap().writes(bot, turn, thread);
+    let mut ends_now = ends().lock().unwrap();
+    ends_now.writes(bot, turn, thread);
+    if let Some(board) = opened {
+        ends_now.opens(bot, turn, board, thread);
+    }
+    drop(ends_now);
     let dir = crate::commons::dir(home);
     let read = match crate::kept::stamp(&dir.join(format!("{thread}.jsonl"))) {
         Some(stamp) => match reread(&dir, vec![(thread.to_owned(), stamp)]).pop() {
@@ -332,6 +388,16 @@ pub fn finished(
         return;
     };
     let completed = crate::board::on() && status == "completed";
+    // The work it opened is asked about however it ended.
+    let rounds = ends().lock().unwrap().rounds(&bot, turn);
+    if !rounds.is_empty() {
+        let (home, bot) = (home.clone(), bot.clone());
+        tokio::spawn(async move {
+            for (board, opened) in rounds {
+                crate::commons::round(&home, &board, &opened, (&bot, Some(turn))).await;
+            }
+        });
+    }
     tokio::spawn(async move {
         let named = bot.clone();
         let found = tokio::task::spawn_blocking(move || {
@@ -430,13 +496,11 @@ mod tests {
         }
         let said = crate::commons::call_as(home, &caller, &arguments, &|_, _| false).unwrap();
         assert_ne!(said["posted"], false, "{said}");
-        wrote_in(
-            ends,
-            home,
-            name,
-            Some(turn),
-            said["thread"].as_str().unwrap(),
-        );
+        let thread = said["thread"].as_str().unwrap();
+        wrote_in(ends, home, name, Some(turn), thread);
+        if let Some(board) = opened_on(&arguments) {
+            ends.opens(name, Some(turn), board, thread);
+        }
         said
     }
 
@@ -614,6 +678,59 @@ mod tests {
 
     /// Work changed by another host, as one of another store sharing the
     /// commons, is read at the next turn's end all the same.
+    #[test]
+    fn a_turn_that_opens_work_sends_one_round_a_board_at_its_end() {
+        let home = home("rounds");
+        let mut ends = Ends::default();
+        let other = |name: &str| {
+            let mut sent = work(name, json!({}));
+            sent["post"]["board"] = json!("shop/docs");
+            sent
+        };
+        send(&home, &mut ends, "shop.lead", 1, work("store", json!({})));
+        send(&home, &mut ends, "shop.lead", 1, other("guide"));
+        // Waiting on its needs, or kept for some, it is new work all the same.
+        let needs = json!({"needs": ["store"], "for": ["shop.w.1"]});
+        send(&home, &mut ends, "shop.lead", 1, work("cli", needs));
+        // A plain thread made work later in the turn is new work too.
+        let plain = json!({"post": {"name": "talk", "title": "Errors talk", "text": "x",
+            "board": "shop/errors"}});
+        send(&home, &mut ends, "shop.lead", 1, plain);
+        let made = json!({"reply": {"thread": "talk", "do": "open", "board": "shop/errors",
+            "title": "Type the talk", "text": "y"}});
+        send(&home, &mut ends, "shop.lead", 1, made);
+        // Another turn's take and talk open nothing.
+        send(&home, &mut ends, "shop.w.1", 2, act("store", "take"));
+        let pair = |thread: &str, title: &str| (thread.to_owned(), title.to_owned());
+        assert_eq!(
+            ends.rounds("shop.lead", 1),
+            [
+                (
+                    "shop/errors".to_owned(),
+                    vec![
+                        pair("store", "Do store"),
+                        pair("cli", "Do cli"),
+                        pair("talk", "Type the talk")
+                    ]
+                ),
+                ("shop/docs".to_owned(), vec![pair("guide", "Do guide")]),
+            ]
+        );
+        // Sent once, and a work opened again opens no new round.
+        assert!(ends.rounds("shop.lead", 1).is_empty());
+        assert!(ends.rounds("shop.w.1", 2).is_empty());
+        send(&home, &mut ends, "shop.w.1", 3, act("store", "fail"));
+        send(&home, &mut ends, "shop.lead", 4, act("store", "open"));
+        assert!(ends.rounds("shop.lead", 4).is_empty());
+        // A lone piece later is its own round.
+        send(&home, &mut ends, "shop.lead", 5, work("docs", json!({})));
+        assert_eq!(
+            ends.rounds("shop.lead", 5),
+            [("shop/errors".to_owned(), vec![pair("docs", "Do docs")])]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn work_another_host_changed_is_read_at_the_next_turn_s_end() {
         let home = home("other-host");
