@@ -111,6 +111,12 @@ fn file(store: &Path, task: &str) -> PathBuf {
     PathBuf::from(dir).join(format!("{task}.json"))
 }
 
+/// Whether any task has a mark kept beside `store`: one look at the
+/// folder, so a store with none closes nothing and lists nothing for it.
+pub fn any_marked(store: &Path) -> bool {
+    !marked(store).is_empty()
+}
+
 /// The tasks with a mark kept beside `store`, by name.
 fn marked(store: &Path) -> HashSet<String> {
     let folder = file(store, "x");

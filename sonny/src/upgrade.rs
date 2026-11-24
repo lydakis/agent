@@ -323,7 +323,11 @@ fn migrate_from_listing(
     };
     // Read again under the lock: a window that held it may have just
     // finished them.
-    let (nested, projects, marks) = left(&record);
+    let (nested, projects, mut marks) = left(&record);
+    // A store with no mark has none to close: done, with nothing listed.
+    if marks && !crate::resolved::any_marked(store) {
+        marks = !once(&record, crate::resolved::MARKS_CLOSE, || true);
+    }
     if !nested && !projects && !marks {
         return None;
     }
@@ -333,7 +337,7 @@ fn migrate_from_listing(
         let listed_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as i64);
-        let Some(bots) = listing(&client).await else {
+        let Some(bots) = listing(&client, marks).await else {
             return;
         };
         // Old commons posts name their authors' projects: each thread is
@@ -365,22 +369,18 @@ fn migrate_from_listing(
 }
 
 /// What the migrations read of each agent the daemon lists.
-const LISTED: [&str; 8] = [
-    "name",
-    "bot_id",
-    "workspace",
-    "created_by",
-    "created_by_id",
-    "running_turn",
-    "last",
-    "closed_ms",
-];
+const LISTED: [&str; 5] = ["name", "bot_id", "workspace", "created_by", "created_by_id"];
+
+/// What closing the marks reads of each agent besides, kept only while
+/// marks are left to close: `last` keeps only its `turn`.
+const MARKS_READ: [&str; 3] = ["running_turn", "last", "closed_ms"];
 
 /// Every agent the daemon lists, with only what the migrations read of
-/// each ([`LISTED`]), each page let go once read; none when a page could
-/// not be read.
-async fn listing(client: &agent_client::Client) -> Option<Vec<serde_json::Value>> {
+/// each ([`LISTED`], and [`MARKS_READ`] when `marks` are left to close),
+/// each page let go once read; none when a page could not be read.
+async fn listing(client: &agent_client::Client, marks: bool) -> Option<Vec<serde_json::Value>> {
     use serde_json::Value;
+    let read = &MARKS_READ[..if marks { MARKS_READ.len() } else { 0 }];
     let mut bots = Vec::new();
     let mut after = Value::Null;
     loop {
@@ -392,9 +392,12 @@ async fn listing(client: &agent_client::Client) -> Option<Vec<serde_json::Value>
             return None;
         };
         bots.extend(listed.into_iter().map(|mut bot| {
-            let kept = (LISTED.iter())
+            let mut kept: serde_json::Map<String, Value> = (LISTED.iter().chain(read))
                 .filter_map(|field| Some(((*field).to_owned(), bot.get_mut(*field)?.take())))
                 .collect();
+            if let Some(last) = kept.get_mut("last") {
+                *last = serde_json::json!({"turn": last["turn"].take()});
+            }
             Value::Object(kept)
         }));
         match page["next_after"].take() {
@@ -561,13 +564,51 @@ mod tests {
             }
         })
         .await;
-        let bots = listing(&client).await.unwrap();
+        let bots = listing(&client, false).await.unwrap();
         assert_eq!(bots.len(), 3);
         assert_eq!(
             bots[2],
             json!({"name": "p.c", "bot_id": 4, "workspace": "/w", "created_by": "p.lead",
-                "created_by_id": 1, "last": {"turn": 3, "status": "done"}})
+                "created_by_id": 1})
         );
+        // Marks left to close: their last turn too, and only its number.
+        let bots = listing(&client, true).await.unwrap();
+        assert_eq!(
+            bots[2],
+            json!({"name": "p.c", "bot_id": 4, "workspace": "/w", "created_by": "p.lead",
+                "created_by_id": 1, "last": {"turn": 3}})
+        );
+    }
+
+    /// A store with no mark beside it closes nothing: the marks' migration
+    /// is done with no listing, and a window lists nothing for it alone.
+    #[tokio::test]
+    async fn no_marks_close_with_nothing_listed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("sonny-no-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        let store = dir.join("state.sqlite");
+        let record = beside(&store);
+        // The other migrations from a listing are done.
+        once(&record, crate::approvals::NESTED_GONE, || true);
+        once(
+            &dir.join("home/.agent/sonny/migrated"),
+            crate::commons::PROJECTS,
+            || true,
+        );
+        let listed = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = listed.clone();
+        let client = crate::tests::daemon_answering(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            json!({"bots": [], "next_after": null})
+        })
+        .await;
+        let home = Some(dir.join("home"));
+        assert!(migrate_from_listing(client, &store, home).is_none());
+        assert_eq!(listed.load(Ordering::SeqCst), 0);
+        assert!(done(&record, crate::resolved::MARKS_CLOSE));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Windows that open together list the agents for the migrations once
@@ -600,6 +641,7 @@ mod tests {
         ran.await.unwrap();
         assert_eq!(listed.load(Ordering::SeqCst), 1);
         assert!(done(&beside(&store), crate::approvals::NESTED_GONE));
+        assert!(done(&beside(&store), crate::resolved::MARKS_CLOSE));
         assert!(done(
             &dir.join("home/.agent/sonny/migrated"),
             crate::commons::PROJECTS
