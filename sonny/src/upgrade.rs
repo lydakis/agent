@@ -260,6 +260,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::resolved::MARKS_CLOSE,
         retire: "0.12.0",
     },
+    // A board's one round of invites, on its first thread, is gone, and
+    // with it the file that noted it (after 0.10.5).
+    Migration {
+        id: crate::commons::BOARDS_GONE,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -270,6 +276,7 @@ pub fn at_start(store: &Path) {
     store_files(store);
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
         crate::commons::woken_gone(&home);
+        crate::commons::boards_gone(&home);
         crate::board::steps_renamed(&home);
         crate::board::work_follows_close(store, &home);
     }
