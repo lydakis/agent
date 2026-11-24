@@ -626,10 +626,10 @@ class View:
 
     def fixed_on(self, name):
         """Where check `name` passes: main, and each other branch the
-        lead named, whole or by its last part."""
+        lead named whole, not as part of a longer name or path."""
         found = ['main'] if self.main(name) else []
         for ref, got in (self.evidence.get('branches') or {}).items():
-            if got['checks'].get(name) and (self.says(re.escape(ref)) or self.says(re.escape(ref.rsplit('/', 1)[-1]))):
+            if got['checks'].get(name) and self.says(r'(?<![\w./-])' + re.escape(ref) + r'(?![\w/-]|\.\w)'):
                 found.append(ref)
         return found
 
