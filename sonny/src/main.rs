@@ -21638,11 +21638,12 @@ impl App {
         // A task's card is drawn where it was pinned: none there, none.
         let own = !key.starts_with('@');
         let turn = asks::turn_of(&key);
-        // In a page let go: drawn again in its place.
+        // In a page let go: drawn again in its place. One that drew no
+        // rows was never put in, so the read goes on past it.
         if own
             && let Some(turn) = turn
             && let Some(page) = (self.pages.iter())
-                .filter(|(id, _)| !self.screen.drawn(**id))
+                .filter(|(id, _)| self.screen.let_go_page(**id))
                 .find(|(_, paged)| paged.turns.values().any(|at| *at == turn))
                 .map(|(id, _)| *id)
         {

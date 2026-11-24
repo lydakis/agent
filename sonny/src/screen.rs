@@ -616,6 +616,12 @@ impl Screen {
         self.page_span(id).is_some_and(|(_, drawn)| drawn)
     }
 
+    /// Whether the page `id` was let go: in its place, as blank rows, to
+    /// be drawn again. A page that drew no rows was never put in.
+    pub fn let_go_page(&self, id: u64) -> bool {
+        self.page_span(id).is_some_and(|(_, drawn)| !drawn)
+    }
+
     /// The first row with words of the page `id`, when it is drawn.
     pub fn first_in(&self, id: u64) -> Option<usize> {
         let (span, drawn) = self.page_span(id)?;
@@ -4143,6 +4149,10 @@ mod tests {
         assert_eq!(row(&buf, 4).trim_end(), "row 20049");
         assert_eq!(screen.height(20), 14_050);
         assert!(!screen.pages[0].drawn && screen.pages[1].drawn);
+        assert!(screen.let_go_page(2) && !screen.let_go_page(1));
+        // A page with no rows is never put in, so never let go.
+        screen.prepend(3, written(Vec::new()));
+        assert!(!screen.let_go_page(3) && !screen.drawn(3));
         assert_eq!(screen.wanted(), None);
         // Up at the first row it is wanted, and drawn again in its place.
         screen.scroll(isize::MAX);
