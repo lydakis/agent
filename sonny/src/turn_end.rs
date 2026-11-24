@@ -415,40 +415,58 @@ fn renew(socket: std::path::PathBuf, bot: String, id: Option<i64>) {
     });
 }
 
+/// What the host found each lead holding at its last look, by its name and
+/// identity: an idle lead costs one small entry.
+fn known() -> &'static Mutex<HashMap<(String, i64), crate::project::Known>> {
+    static KNOWN: OnceLock<Mutex<HashMap<(String, i64), crate::project::Known>>> = OnceLock::new();
+    KNOWN.get_or_init(Mutex::default)
+}
+
 /// [`renew`] on `client`: the event the host logs, when there is one.
 async fn renew_on(client: &agent_client::Client, bot: &str, id: Option<i64>) -> Option<Value> {
     let record = (client)
         .request("inspect", json!({"bot": bot, "bot_id": id}))
         .await
         .ok()?;
+    // A lead no agent made: an agent's helper named like one keeps the
+    // instructions it was given.
+    if !crate::project::is_lead_record(&record) {
+        return None;
+    }
     let dir = std::path::PathBuf::from(record["workspace"].as_str()?);
+    let key = (bot.to_owned(), id.or(record["bot_id"].as_i64())?);
     // What it will hold once a change kept for its turn's end is taken.
     let held = (record["configure_pending"]["instructions"].as_str())
         .or(record["instructions"].as_str())
         .unwrap_or_default()
         .to_owned();
     let chosen = record["profile"].as_str().map(str::to_owned);
+    let last = known().lock().unwrap().get(&key).cloned();
     let composed = tokio::task::spawn_blocking(move || {
-        crate::project::changed(&dir, &held, chosen.as_deref())
+        crate::project::changed(&dir, &held, chosen.as_deref(), last.as_ref())
     })
     .await
     .ok()?;
-    let (text, left_out) = match composed {
-        Ok((Some(text), left_out)) => (text, left_out),
-        Ok((None, _)) => return None,
+    let renewal = match composed {
+        Ok(renewal) => renewal,
         Err(error) => {
             return Some(json!({"event": "instructions_unread", "bot": bot, "error": error}));
         }
     };
-    let id = id.or(record["bot_id"].as_i64());
-    let asked = json!({"bot": bot, "bot_id": id, "instructions": text});
+    let Some(text) = renewal.text else {
+        known().lock().unwrap().insert(key, renewal.known);
+        return None;
+    };
+    let asked = json!({"bot": bot, "bot_id": key.1, "instructions": text});
     match client.request("configure", asked).await {
         Ok(_) => {
+            known().lock().unwrap().insert(key, renewal.known);
             // As its window would: what it goes without, once a day.
-            let _ = crate::project::tell_warnings(client, bot, &left_out).await;
+            let _ = crate::project::tell_warnings(client, bot, &renewal.left_out).await;
             Some(json!({"event": "instructions_renewed", "bot": bot}))
         }
         Err(error) => {
+            known().lock().unwrap().remove(&key);
             Some(json!({"event": "instructions_renew_failed", "bot": bot, "error": error.code}))
         }
     }
@@ -743,7 +761,7 @@ mod tests {
         let dir = home("renew").join("shop");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "Run the tests.\n").unwrap();
-        let (held, _) = crate::project::changed(&dir, "", None).unwrap();
+        let held = crate::project::changed(&dir, "", None, None).unwrap().text;
         let held = std::sync::Arc::new(Mutex::new(held.unwrap()));
         let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
         let (holds, seen) = (held.clone(), asked.clone());
@@ -751,8 +769,13 @@ mod tests {
         let client = crate::tests::daemon_answering(move |request| {
             seen.lock().unwrap().push(request.clone());
             match request["op"].as_str() {
-                Some("inspect") => json!({"name": "shop.lead", "bot_id": 7,
-                    "workspace": workspace, "instructions": *holds.lock().unwrap()}),
+                Some("inspect") => {
+                    let name = request["bot"].as_str().unwrap_or_default();
+                    // A helper an agent made, named like a lead.
+                    let maker = name.ends_with(".helper").then_some("shop.lead");
+                    json!({"name": name, "bot_id": 7, "created_by": maker,
+                        "workspace": workspace, "instructions": *holds.lock().unwrap()})
+                }
                 _ => json!({}),
             }
         })
@@ -775,6 +798,9 @@ mod tests {
         assert_eq!(sent[0]["bot_id"], 7);
         let text = sent[0]["instructions"].as_str().unwrap();
         assert!(text.contains("Run the tests twice."), "{text}");
+        // An agent's helper named like a lead keeps what it was given.
+        assert_eq!(renew_on(&client, "shop.lead.helper", Some(7)).await, None);
+        assert_eq!(configured().len(), 1);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

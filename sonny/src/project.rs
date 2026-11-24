@@ -550,14 +550,39 @@ pub fn review(
 /// the cost of one call that reads no cache. Its memory changing alone is
 /// no such change: agents save facts all the time, and each would cost its
 /// next call the whole prompt cache, so a lead takes the memory there is
-/// as its window opens, and with a change of the rest. With what was left
-/// out of them.
+/// as its window opens, and with a change of the rest.
+///
+/// `known` is what the last look at this lead found ([`Renewal::known`]):
+/// while it still holds those instructions, a change is the rest composed
+/// without memory changing, which memory never moves, though near the
+/// size limit its growth shortens the skill lists. Without it, the lead
+/// holds the same text as now around its memory.
 pub fn changed(
     dir: &Path,
     held: &str,
     chosen: Option<&str>,
-) -> Result<(Option<String>, Vec<String>), String> {
-    changed_with(dir, held, chosen, &memory(dir)?)
+    known: Option<&Known>,
+) -> Result<Renewal, String> {
+    changed_with(dir, held, chosen, &memory(dir)?, known)
+}
+
+/// What [`changed`] found.
+pub struct Renewal {
+    /// The instructions the lead is to take, when they changed.
+    pub text: Option<String>,
+    /// What was left out of them.
+    pub left_out: Vec<String>,
+    /// What the next look at the lead is given, once it holds `text`, or
+    /// still what it held.
+    pub known: Known,
+}
+
+/// What a lead held when last looked at, and what its folder told it then
+/// but memory, each by its fingerprint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Known {
+    held: String,
+    rest: String,
 }
 
 /// [`changed`], with the `memory` indexes given.
@@ -566,15 +591,26 @@ fn changed_with(
     held: &str,
     chosen: Option<&str>,
     memory: &[PathBuf],
-) -> Result<(Option<String>, Vec<String>), String> {
+    known: Option<&Known>,
+) -> Result<Renewal, String> {
     let Composed {
         text,
         left_out,
         memory,
     } = compose_with(dir, chosen, memory)?;
+    let rest = fingerprint(&compose_with(dir, chosen, &[])?.text);
     let same = text == held
-        || memory.is_some_and(|at| all_but_memory(held, &text[..at.start], &text[at.end..]));
-    Ok(((!same).then_some(text), left_out))
+        || match known {
+            Some(known) if known.held == fingerprint(held) => known.rest == rest,
+            _ => memory.is_some_and(|at| all_but_memory(held, &text[..at.start], &text[at.end..])),
+        };
+    let text = (!same).then_some(text);
+    let held = fingerprint(text.as_deref().unwrap_or(held));
+    Ok(Renewal {
+        text,
+        left_out,
+        known: Known { held, rest },
+    })
 }
 
 /// Whether `held` is `before`, then memory or none, then `after`: what
@@ -1681,7 +1717,7 @@ mod tests {
         );
         write(&index, "# Memory\n\n- first.md: a fact saved first\n");
         let memory = [index.clone()];
-        let renewed = |held: &str| changed_with(&dir, held, None, &memory).unwrap().0;
+        let renewed = |held: &str| changed_with(&dir, held, None, &memory, None).unwrap().text;
         // Memory is found where composing put it, with the role after it.
         let composed = compose_with(&dir, None, &memory).unwrap();
         let at = composed.memory.clone().expect("memory found");
@@ -1695,9 +1731,12 @@ mod tests {
             "# Memory\n\n- first.md: a fact saved first\n- next.md: another\n",
         );
         assert_eq!(renewed(&held), None);
-        let without = changed_with(&dir, "", None, &[]).unwrap().0.unwrap();
+        let without = (changed_with(&dir, "", None, &[], None).unwrap().text).unwrap();
         assert_eq!(renewed(&without), None);
-        assert_eq!(changed_with(&dir, &held, None, &[]).unwrap().0, None);
+        assert_eq!(
+            changed_with(&dir, &held, None, &[], None).unwrap().text,
+            None
+        );
         // A rule changed is, and it brings the memory there is now.
         write(&dir.join("AGENTS.md"), "Run the tests twice.\n");
         let held = renewed(&held).expect("the rule changed");
@@ -1722,6 +1761,75 @@ mod tests {
         let skills = renewed(&no_skills).expect("a list again");
         std::fs::remove_dir_all(dir.join(".agents/skills")).unwrap();
         assert!(renewed(&skills).is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn near_the_size_limit_memory_that_shortens_the_skill_lists_is_still_no_change() {
+        let base = std::env::temp_dir().join(format!("sonny-changed-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (dir, index) = (base.join("shop"), base.join("memory/MEMORY.md"));
+        let write = |path: &Path, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        for n in 0..6 {
+            let about = format!(
+                "Use this skill number {n} when {}",
+                "the subject comes up ".repeat(8)
+            );
+            let skill = format!("---\nname: skill{n}\ndescription: {about}\n---\nDo it.");
+            write(
+                &dir.join(format!(".agents/skills/skill{n}/SKILL.md")),
+                &skill,
+            );
+        }
+        write(&dir.join(".agents/agents/lead.md"), "Lead the shop.\n");
+        write(&index, "# Memory\n\n- first.md: a fact saved first\n");
+        let memory = [index.clone()];
+        // Rules that leave the lists a little room.
+        let rule = |fill: usize| format!("Run the tests.\n{}\n", "x".repeat(fill));
+        write(&dir.join("AGENTS.md"), &rule(1));
+        let small = compose_with(&dir, None, &memory).unwrap().text.len();
+        let fill = agent_client::policy::MAX_INSTRUCTIONS - small - 200;
+        write(&dir.join("AGENTS.md"), &rule(fill));
+        let first = changed_with(&dir, "set by hand", None, &memory, None).unwrap();
+        let held = first.text.expect("the folder's");
+        assert!(
+            held.contains(&"the subject comes up ".repeat(5)),
+            "summaries at their longest"
+        );
+        // Facts saved take the room the lists had: their summaries shorten.
+        let facts: String = (0..40)
+            .map(|n| format!("- fact{n}.md: a fact saved later\n"))
+            .collect();
+        write(
+            &index,
+            &format!("# Memory\n\n- first.md: a fact saved first\n{facts}"),
+        );
+        let now = compose_with(&dir, None, &memory).unwrap().text;
+        assert!(
+            !now.contains(&"the subject comes up ".repeat(5)),
+            "the lists shortened"
+        );
+        // Read only around its memory, that would look like a change...
+        let blind = changed_with(&dir, &held, None, &memory, None).unwrap();
+        assert!(blind.text.is_some());
+        // ...but the lead's last look knows the rest is as it was.
+        let looked = changed_with(&dir, &held, None, &memory, Some(&first.known)).unwrap();
+        assert_eq!(looked.text, None);
+        assert_eq!(looked.known, first.known);
+        // A rule changed is still a change.
+        write(
+            &dir.join("AGENTS.md"),
+            &rule(fill).replace("Run the tests.", "Run the tests!"),
+        );
+        let edited = changed_with(&dir, &held, None, &memory, Some(&looked.known)).unwrap();
+        let taken = edited.text.expect("the rule changed");
+        assert!(taken.contains("Run the tests!"));
+        // And what it takes is what the next look knows it holds.
+        let next = changed_with(&dir, &taken, None, &memory, Some(&edited.known)).unwrap();
+        assert_eq!(next.text, None);
         let _ = std::fs::remove_dir_all(&base);
     }
 
