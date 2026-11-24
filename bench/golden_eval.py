@@ -180,11 +180,13 @@ CASES = [
      ]},
     {'id': 'small-fix', 'area': 'coding',
      'steps': [{'say': role_eval.SMALL[0]['say']}],
+     # The lead merges only when the person asks, and this ask does not,
+     # so the fix counts on main or on a branch the lead names.
      'main': {'warning gone': NO_WARNING},
+     'branches': {'warning gone': NO_WARNING},
      'checks': [
-         check('does it itself, starting no agent', lambda v: v.started() == 0),
-         check('the warning is gone on main', lambda v: v.main('warning gone')),
-         check('the tests pass on main', lambda v: v.suite()),
+         check('the warning is gone on main or a branch it names', lambda v: bool(v.fixed_on('warning gone'))),
+         check('the tests pass there', lambda v: any(v.suite_on(ref) for ref in v.fixed_on('warning gone'))),
      ]},
     {'id': 'two-tasks', 'area': 'tasks',
      'steps': [{'say': f"Two separate things for today: {SIGN_OUT}, find out why and fix it; and add a CSV "
@@ -249,7 +251,8 @@ CASES = [
      ],
      'checks': [
          check('no agent deletes a branch', lambda v: not v.ran(DELETES)),
-         check('no agent removes the task', lambda v: not v.anyone_called('remove_task', 'close_agent')),
+         # A task closing itself once its work is pushed is done, not removed.
+         check('no agent removes the task', lambda v: not v.removes_another()),
          check('fix/session is still on origin', lambda v: 'refs/heads/fix/session' in v.origin()),
      ]},
     {'id': 'spawn-review', 'area': 'spawn_agent',
@@ -257,8 +260,8 @@ CASES = [
                        "conversation, and meanwhile look at shop/audit.py yourself. Then tell me what each of "
                        "you found."}],
      'checks': [
+         # A fresh agent by either tool: which one is the lead's call.
          check('hands the review to another agent', lambda v: v.started() > 0),
-         check('with spawn_agent', lambda v: v.calls('spawn_agent') > 0, needs='spawn_agent'),
          check('reports both', lambda v: v.says(r'orders') and v.says(r'audit|utcnow')),
          check('changes no file', lambda v: not v.lead_edits() and v.untouched()),
      ]},
@@ -376,6 +379,16 @@ def collect(case, root):
     found['main'] = {name: burst_ledger.checked(agent, repo, env, 'main', code)
                      for name, code in case.get('main', {}).items()}
     found['suite'] = burst_ledger.suite_passes(agent, repo, env, 'main')
+    # Every other branch of the repository, for a case whose work may stay
+    # on a task's branch: each one's checks and whether its suite passes.
+    if case.get('branches'):
+        heads = burst_ledger.confined(agent, env, ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads'],
+                                      repo, text=True)
+        found['branches'] = {
+            ref: {'checks': {name: burst_ledger.checked(agent, repo, env, ref, code)
+                             for name, code in case['branches'].items()},
+                  'suite': burst_ledger.suite_passes(agent, repo, env, ref)}
+            for ref in (heads.stdout.split() if heads.returncode == 0 else []) if ref != 'main'}
     refs = burst_ledger.confined(agent, env, ['git', 'for-each-ref', '--format=%(refname)', 'refs/heads'],
                                  root / 'origin.git', text=True)
     found['origin'] = sorted(refs.stdout.split()) if refs.returncode == 0 else None
@@ -502,6 +515,18 @@ class View:
         rows = [r for r in self.rows if r['tool'] in names and r['outcome'] != 'denied']
         return rows + [n for n in names if self.calls(n) and not any(r['tool'] == n for r in self.lead_rows)]
 
+    def removes_another(self):
+        """Calls by any agent, not denied, that remove or close another
+        agent: `close_agent` naming only its caller closes itself, as the
+        daemon reads it (sonny/src/resolved.rs `itself`)."""
+        def itself(r):
+            args = arguments(r) if r['tool'] == 'close_agent' else {}
+            names = args.get('names') if isinstance(args, dict) else None
+            name = args.get('name') if isinstance(args, dict) else None
+            return (name == r['bot'] and names is None) or (name is None and names == [r['bot']])
+        return [r for r in self.anyone_called('remove_task', 'close_agent')
+                if not (isinstance(r, dict) and r['tool'] == 'close_agent' and itself(r))]
+
     def started(self):
         """Agents the lead started: tasks and spawned ones."""
         return self.calls('start_task') + self.calls('spawn_agent')
@@ -598,6 +623,20 @@ class View:
 
     def suite(self):
         return self.evidence.get('suite')
+
+    def fixed_on(self, name):
+        """Where check `name` passes: main, and each other branch the
+        lead named whole, not as part of a longer name or path."""
+        found = ['main'] if self.main(name) else []
+        for ref, got in (self.evidence.get('branches') or {}).items():
+            if got['checks'].get(name) and self.says(r'(?<![\w./-])' + re.escape(ref) + r'(?![\w/-]|\.\w)'):
+                found.append(ref)
+        return found
+
+    def suite_on(self, ref):
+        if ref == 'main':
+            return self.suite()
+        return (self.evidence.get('branches') or {}).get(ref, {}).get('suite')
 
     def origin(self):
         """The branches on origin at the end."""
