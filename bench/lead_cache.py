@@ -11,7 +11,7 @@ the daemon sends and reports the cached tokens a prefix cache would give
 `prompt_cache_key`, in whole 128-token blocks past the first 1,024), so
 `agent usage` reads as a provider's would.
 
-    python3 -m bench.lead_cache run --bin DIR --out OUT [--minutes 5]
+    python3 -m bench.lead_cache run --bin DIR --out OUT [--minutes 5] [--saves S] [--edit-rule M]
     python3 -m bench.lead_cache diff OUT [--show 5]
 
 `diff` compares each request of a bot with the bot's previous one: where
@@ -271,7 +271,7 @@ def start_model(out):
 
 # --- one run -------------------------------------------------------------------
 
-def run(bin_dir, out, minutes, every, window, saves, open_window):
+def run(bin_dir, out, minutes, every, window, saves, open_window, edit_rule=None):
     out = Path(out).resolve()
     if out.exists():
         shutil.rmtree(out)
@@ -332,10 +332,17 @@ every = "{every}s"
         # memory tool: each adds a line to the project's memory index.
         index = home / '.agents/memory/projects/shop/MEMORY.md'
         index.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.time() + minutes * 60
+        started = time.time()
+        deadline = started + minutes * 60
         saved, last = 0, time.time()
         while time.time() < deadline:
             time.sleep(1)
+            # The person edits the folder's rules once: the lead takes the
+            # new text at a turn's end, one call that reads no cache.
+            if edit_rule is not None and time.time() - started >= edit_rule * 60:
+                edit_rule = None
+                with open(repo / 'AGENTS.md', 'a') as f:
+                    f.write('Keep each commit to one change.\n')
             if saves and time.time() - last >= saves:
                 saved, last = saved + 1, time.time()
                 with open(index, 'a') as f:
@@ -345,6 +352,10 @@ every = "{every}s"
         (out / 'usage.json').write_text(usage.stdout + usage.stderr)
         bots = subprocess.run([str(agent), 'ls'], env=env, capture_output=True, text=True)
         (out / 'bots.txt').write_text(bots.stdout)
+        # The CPU each of the build's processes used, the tool host's too.
+        procs = subprocess.run(['ps', '-eo', 'pid,time,rss,args'], capture_output=True, text=True)
+        (out / 'procs.txt').write_text(''.join(line + '\n' for line in procs.stdout.splitlines()
+                                               if str(own) in line))
         if acp:
             acp.close()
         if shown:
@@ -423,12 +434,14 @@ def main():
     r.add_argument('--window', type=int, default=60000)
     r.add_argument('--saves', type=float, default=0, help='seconds between memory saves; 0 for none')
     r.add_argument('--open-window', action='store_true', help='keep a Sonny window open on the lead')
+    r.add_argument('--edit-rule', type=float, default=None, help='minutes in, the person edits AGENTS.md once')
     d = sub.add_parser('diff')
     d.add_argument('out')
     d.add_argument('--show', type=int, default=5)
     args = parser.parse_args()
     if args.command == 'run':
-        run(args.bin, args.out, args.minutes, args.every, args.window, args.saves, args.open_window)
+        run(args.bin, args.out, args.minutes, args.every, args.window, args.saves, args.open_window,
+            args.edit_rule)
     else:
         diff(args.out, args.show)
 

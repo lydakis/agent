@@ -424,15 +424,26 @@ pub struct Composed {
     /// Each file (or the role) that could not be used, and why: the
     /// lead opens without it, and it and the person are told.
     pub left_out: Vec<String>,
+    /// Where the heads of its memory indexes sit in `text`, between the
+    /// skill and profile lists and the role: what agents save, which alone
+    /// never gives a lead new instructions between its turns. None when
+    /// the text does not read as composed so, which a test keeps from
+    /// happening.
+    pub memory: Option<std::ops::Range<usize>>,
 }
 
 /// A lead's instructions as Sonny composes them for `dir` now, in the
 /// role `chosen` or its project's: its role, the folder's rules, skills
 /// and memory, then the project's task rule.
 fn compose(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
+    compose_with(dir, chosen, &memory(dir)?)
+}
+
+/// [`compose`], with the `memory` indexes given.
+fn compose_with(dir: &Path, chosen: Option<&str>, memory: &[PathBuf]) -> Result<Composed, String> {
     let mut left_out = Vec::new();
     let role = role_or_shipped(dir, chosen, &mut left_out)?;
-    let mut composed = folder(dir, &role)?;
+    let mut composed = folder(dir, &role, memory)?;
     left_out.append(&mut composed.left_out);
     let info = read(dir)?;
     let rule = agent_client::project::rule(&info);
@@ -441,17 +452,43 @@ fn compose(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
     Ok(composed)
 }
 
+/// The headings composing writes before a lead's memory: one that follows
+/// what a lead's instructions hold before their memory now is a list or a
+/// file gone since, not memory.
+const BEFORE_MEMORY: [&str; 4] = [
+    "\n\n# Instructions from ",
+    "\n\n# Skills\n",
+    "\n\n# Profiles\n",
+    "\n\n# Role: ",
+];
+
 /// The role with the folder's rules, skills and memory and who it works
 /// for, before the project's task rule. A rule, skill or memory file that
 /// cannot be read, or does not fit, is left out whole and said in
 /// `left_out`: a broken link in a skills folder never keeps a lead from
 /// opening.
-fn folder(dir: &Path, role: &agent_client::policy::Profile) -> Result<Composed, String> {
-    let memory = memory(dir)?;
+fn folder(
+    dir: &Path,
+    role: &agent_client::policy::Profile,
+    memory: &[PathBuf],
+) -> Result<Composed, String> {
     let composed = agent_client::policy::hiding(&agent_client::hidden::known(), || {
-        agent_client::policy::instructions_leaving_out(dir, Some(role), &memory)
+        agent_client::policy::instructions_leaving_out(dir, Some(role), memory)
     })
     .map_err(|e| e.to_string())?;
+    // Memory goes in right before the role, each index's head after a
+    // blank line: where, read from what went in.
+    let role_block = match role.body.is_empty() {
+        true => String::new(),
+        false => format!("\n\n# Role: {}\n\n{}", role.name, role.body),
+    };
+    let saved: usize = composed.memory.iter().map(|index| 2 + index.bytes).sum();
+    let memory = (composed.text.strip_suffix(&role_block))
+        .map(str::len)
+        .and_then(|end| Some(end.checked_sub(saved)?..end))
+        .filter(|at| {
+            (composed.text.get(at.clone())).is_some_and(|m| m.is_empty() || m.starts_with("\n\n"))
+        });
     // Paths under the home folder as `~`, so a narrow window shows what
     // is missing; the lead's shell reads them the same.
     let home = std::env::var("HOME").unwrap_or_default();
@@ -468,6 +505,7 @@ fn folder(dir: &Path, role: &agent_client::policy::Profile) -> Result<Composed, 
     Ok(Composed {
         text: composed.text,
         left_out,
+        memory,
     })
 }
 
@@ -493,16 +531,60 @@ pub fn plain(dir: &Path) -> Result<String, String> {
 }
 
 /// The folder's instructions for a lead, when they are not the ones it
-/// `held` last: a lead takes its folder's as its window opens, and only
-/// then, as Codex reads its instructions once as a session starts. With
+/// `held` last: a lead takes all its folder's, memory too, as its window
+/// opens, as Codex reads its instructions once as a session starts, and
+/// between its turns only what the person changed ([`changed`]). With
 /// what was left out of them, which the lead goes without either way.
 pub fn review(
     dir: &Path,
     held: &str,
     chosen: Option<&str>,
 ) -> Result<(Option<String>, Vec<String>), String> {
-    let Composed { text, left_out } = compose(dir, chosen)?;
+    let Composed { text, left_out, .. } = compose(dir, chosen)?;
     Ok(((text != held).then_some(text), left_out))
+}
+
+/// The folder's instructions for a lead at its turn's end, when its role,
+/// rules, skills, profiles or task rule are not the ones it `held`: the
+/// person changed what it is told, and it takes it for its next turn, at
+/// the cost of one call that reads no cache. Its memory changing alone is
+/// no such change: agents save facts all the time, and each would cost its
+/// next call the whole prompt cache, so a lead takes the memory there is
+/// as its window opens, and with a change of the rest. With what was left
+/// out of them.
+pub fn changed(
+    dir: &Path,
+    held: &str,
+    chosen: Option<&str>,
+) -> Result<(Option<String>, Vec<String>), String> {
+    changed_with(dir, held, chosen, &memory(dir)?)
+}
+
+/// [`changed`], with the `memory` indexes given.
+fn changed_with(
+    dir: &Path,
+    held: &str,
+    chosen: Option<&str>,
+    memory: &[PathBuf],
+) -> Result<(Option<String>, Vec<String>), String> {
+    let Composed {
+        text,
+        left_out,
+        memory,
+    } = compose_with(dir, chosen, memory)?;
+    let same = text == held
+        || memory.is_some_and(|at| all_but_memory(held, &text[..at.start], &text[at.end..]));
+    Ok(((!same).then_some(text), left_out))
+}
+
+/// Whether `held` is `before`, then memory or none, then `after`: what
+/// a lead's instructions hold around their memory now.
+fn all_but_memory(held: &str, before: &str, after: &str) -> bool {
+    let Some(memory) = (held.strip_prefix(before)).and_then(|rest| rest.strip_suffix(after)) else {
+        return false;
+    };
+    memory.is_empty()
+        || (memory.starts_with("\n\n") && !BEFORE_MEMORY.iter().any(|at| memory.starts_with(at)))
 }
 
 /// Where a note of what a lead opened without comes from.
@@ -1024,7 +1106,7 @@ async fn make(
     bot: Option<&str>,
     chosen: Option<&str>,
 ) -> Result<Value, String> {
-    let instructions = folder(dir, role)?.text;
+    let instructions = folder(dir, role, &memory(dir)?)?.text;
     // Gated and confined from the start, as a new lead's mode makes it,
     // whoever opens it first.
     let mode = crate::approvals::default();
@@ -1579,6 +1661,68 @@ mod tests {
         assert!(taken.contains("- deploy:"));
         assert_eq!(review(&dir, &taken, None).unwrap().0, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lead_takes_a_changed_role_rule_or_skill_between_turns_but_never_its_memory_alone() {
+        let base = std::env::temp_dir().join(format!("sonny-changed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (dir, index) = (base.join("shop"), base.join("memory/MEMORY.md"));
+        std::fs::create_dir_all(dir.join(".agents/skills/deploy")).unwrap();
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        let write = |path: &Path, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(&dir.join("AGENTS.md"), "Run the tests.\n");
+        write(
+            &dir.join(".agents/skills/deploy/SKILL.md"),
+            "# Deploy\n\nShip it.",
+        );
+        write(&index, "# Memory\n\n- first.md: a fact saved first\n");
+        let memory = [index.clone()];
+        let renewed = |held: &str| changed_with(&dir, held, None, &memory).unwrap().0;
+        // Memory is found where composing put it, with the role after it.
+        let composed = compose_with(&dir, None, &memory).unwrap();
+        let at = composed.memory.clone().expect("memory found");
+        assert!(composed.text[at].contains("a fact saved first"));
+        let held = renewed("set by hand").expect("the folder's");
+        assert_eq!(renewed(&held), None);
+        // Facts saved, or none at all, are no change: each would cost the
+        // lead's next call the whole prompt cache.
+        write(
+            &index,
+            "# Memory\n\n- first.md: a fact saved first\n- next.md: another\n",
+        );
+        assert_eq!(renewed(&held), None);
+        let without = changed_with(&dir, "", None, &[]).unwrap().0.unwrap();
+        assert_eq!(renewed(&without), None);
+        assert_eq!(changed_with(&dir, &held, None, &[]).unwrap().0, None);
+        // A rule changed is, and it brings the memory there is now.
+        write(&dir.join("AGENTS.md"), "Run the tests twice.\n");
+        let held = renewed(&held).expect("the rule changed");
+        assert!(held.contains("Run the tests twice.") && held.contains("another"));
+        assert_eq!(renewed(&held), None);
+        // So is the role, which holds the most.
+        write(&dir.join(".agents/agents/lead.md"), "Lead the shop.\n");
+        let held = renewed(&held).expect("the role changed");
+        assert!(held.contains("Lead the shop."));
+        // A skill added is, and one gone, last of the list or the list
+        // itself, is too: what follows the rest is no memory.
+        write(&dir.join(".agents/skills/zeta/SKILL.md"), "# Zeta\n\nLast.");
+        let with_zeta = renewed(&held).expect("a skill added");
+        std::fs::remove_dir_all(dir.join(".agents/skills/zeta")).unwrap();
+        assert!(renewed(&with_zeta).is_some());
+        std::fs::remove_dir_all(dir.join(".agents/skills")).unwrap();
+        let no_skills = renewed(&with_zeta).expect("the skills gone");
+        write(
+            &dir.join(".agents/skills/deploy/SKILL.md"),
+            "# Deploy\n\nShip it.",
+        );
+        let skills = renewed(&no_skills).expect("a list again");
+        std::fs::remove_dir_all(dir.join(".agents/skills")).unwrap();
+        assert!(renewed(&skills).is_some());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

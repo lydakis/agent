@@ -4162,10 +4162,12 @@ async fn run() -> Result<(), String> {
     }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), whatever set its instructions before; a file of
-    // the folder's it cannot use is left out, and said. Only here, as the
-    // window opens, as Codex reads its instructions once as a session
-    // starts: they lead every request, so a change while the lead works
-    // would cost its next call the whole prompt cache.
+    // the folder's it cannot use is left out, and said. Memory only here,
+    // as the window opens, as Codex reads its instructions once as a
+    // session starts: they lead every request, so a fact saved while the
+    // lead works would cost its next call the whole prompt cache. A role,
+    // rule or skill the person changes reaches it at its next turn's end,
+    // window or not (`turn_end::renew`).
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
@@ -14714,8 +14716,11 @@ impl App {
                 if changed("gates") && self.gating.take().is_some() {
                     dropped.push("permissions");
                 }
-                if changed("instructions") && self.instruct.take().is_some() {
-                    dropped.push("instructions");
+                // The folder's instructions as the window opened, no pick
+                // of the person's: those given since, as at a lead's turn
+                // end, are as new.
+                if changed("instructions") {
+                    self.instruct = None;
                 }
                 if changed("speed") && self.pace.take().is_some() {
                     dropped.push("speed");
@@ -29518,7 +29523,10 @@ mod tests {
         }
         // Its instructions lead every request: sent again between two
         // calls, they would cost the next one the whole prompt cache.
-        // They are taken as a window opens, as Codex reads its own once.
+        // The window takes them as it opens, as Codex reads its own once;
+        // a rule, role or skill changed since reaches the lead at its
+        // turn's end from the tool host, window or not, and memory alone
+        // never does (`project::changed`).
         assert!(app.instruct.is_none());
         let configured: Vec<Value> = (asked.lock().unwrap().iter())
             .filter(|request| request["op"] == "configure")
