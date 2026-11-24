@@ -9,6 +9,10 @@
 //! the work it opened there. Each thread is read once and again only once its
 //! file changes, whichever host wrote it: a turn's end costs a look at
 //! each thread's file, as a listing does.
+//!
+//! A lead's turn's end also gives it its role, its folder's rules and its
+//! skills as the person changed them, for its next turn, window or not
+//! ([`renew`]).
 
 use crate::kept::Stamp;
 use serde_json::{Value, json};
@@ -384,6 +388,9 @@ pub fn finished(
     status: &str,
 ) {
     let (store, socket) = daemon;
+    if crate::project::is_lead(&bot) {
+        renew(socket.clone(), bot.clone(), id);
+    }
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return;
     };
@@ -453,6 +460,82 @@ pub fn finished(
             "origin": crate::commons::ORIGIN, "request_id": crate::commons::request_id(&format!("commons.turn_end.{bot}.{turn}"))});
         let _ = client.request("submit", submit).await;
     });
+}
+
+/// The lead `bot`, known as `id`, ended a turn: when its role, its
+/// folder's rules, skills or profiles, or its project's task rule are not
+/// what it holds, it is given them as they are now
+/// ([`crate::project::changed`]). The daemon keeps them for the end of a
+/// turn already running, so they never change within one: its next turn
+/// reads them, paying for one call the prompt cache can't serve. Its
+/// memory alone changing gives it nothing. Read off the host's runtime:
+/// a few small files a lead's turn.
+fn renew(socket: std::path::PathBuf, bot: String, id: Option<i64>) {
+    tokio::spawn(async move {
+        if let Ok((client, _events)) = agent_client::Client::connect(&socket).await {
+            let said = renew_on(&client, &bot, id).await;
+            if let Some(said) = said {
+                println!("{said}");
+            }
+        }
+    });
+}
+
+/// What the host found each lead holding at its last look, by its name and
+/// identity: an idle lead costs one small entry.
+fn known() -> &'static Mutex<HashMap<(String, i64), crate::project::Known>> {
+    static KNOWN: OnceLock<Mutex<HashMap<(String, i64), crate::project::Known>>> = OnceLock::new();
+    KNOWN.get_or_init(Mutex::default)
+}
+
+/// [`renew`] on `client`: the event the host logs, when there is one.
+async fn renew_on(client: &agent_client::Client, bot: &str, id: Option<i64>) -> Option<Value> {
+    let record = (client)
+        .request("inspect", json!({"bot": bot, "bot_id": id}))
+        .await
+        .ok()?;
+    // A lead no agent made: an agent's helper named like one keeps the
+    // instructions it was given.
+    if !crate::project::is_lead_record(&record) {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(record["workspace"].as_str()?);
+    let key = (bot.to_owned(), id.or(record["bot_id"].as_i64())?);
+    // What it will hold once a change kept for its turn's end is taken.
+    let held = (record["configure_pending"]["instructions"].as_str())
+        .or(record["instructions"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let chosen = record["profile"].as_str().map(str::to_owned);
+    let last = known().lock().unwrap().get(&key).cloned();
+    let composed = tokio::task::spawn_blocking(move || {
+        crate::project::changed(&dir, &held, chosen.as_deref(), last.as_ref())
+    })
+    .await
+    .ok()?;
+    let renewal = match composed {
+        Ok(renewal) => renewal,
+        Err(error) => {
+            return Some(json!({"event": "instructions_unread", "bot": bot, "error": error}));
+        }
+    };
+    let Some(text) = renewal.text else {
+        known().lock().unwrap().insert(key, renewal.known);
+        return None;
+    };
+    let asked = json!({"bot": bot, "bot_id": key.1, "instructions": text});
+    match client.request("configure", asked).await {
+        Ok(_) => {
+            known().lock().unwrap().insert(key, renewal.known);
+            // As its window would: what it goes without, once a day.
+            let _ = crate::project::tell_warnings(client, bot, &renewal.left_out).await;
+            Some(json!({"event": "instructions_renewed", "bot": bot}))
+        }
+        Err(error) => {
+            known().lock().unwrap().remove(&key);
+            Some(json!({"event": "instructions_renew_failed", "bot": bot, "error": error.code}))
+        }
+    }
 }
 
 /// Seconds since the epoch.
@@ -788,5 +871,53 @@ mod tests {
         let found = end(&mut ends, &home, "shop.w.1", None, 2, true, &boards);
         assert_eq!(found.open.len(), 1, "{found:?}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_lead_s_turn_end_gives_it_a_rule_changed_since_and_nothing_else() {
+        let dir = home("renew").join("shop");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "Run the tests.\n").unwrap();
+        let held = crate::project::changed(&dir, "", None, None).unwrap().text;
+        let held = std::sync::Arc::new(Mutex::new(held.unwrap()));
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (holds, seen) = (held.clone(), asked.clone());
+        let workspace = dir.display().to_string();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => {
+                    let name = request["bot"].as_str().unwrap_or_default();
+                    // A helper an agent made, named like a lead.
+                    let maker = name.ends_with(".helper").then_some("shop.lead");
+                    json!({"name": name, "bot_id": 7, "created_by": maker,
+                        "workspace": workspace, "instructions": *holds.lock().unwrap()})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let configured = || {
+            (asked.lock().unwrap().iter())
+                .filter(|request| request["op"] == "configure")
+                .cloned()
+                .collect::<Vec<Value>>()
+        };
+        // Nothing changed: nothing sent, the lead's cache untouched.
+        assert_eq!(renew_on(&client, "shop.lead", Some(7)).await, None);
+        assert!(configured().is_empty());
+        // The person edits the rules: the lead's next turn reads them.
+        std::fs::write(dir.join("AGENTS.md"), "Run the tests twice.\n").unwrap();
+        let said = renew_on(&client, "shop.lead", Some(7)).await;
+        assert_eq!(said.unwrap()["event"], "instructions_renewed");
+        let sent = configured();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["bot_id"], 7);
+        let text = sent[0]["instructions"].as_str().unwrap();
+        assert!(text.contains("Run the tests twice."), "{text}");
+        // An agent's helper named like a lead keeps what it was given.
+        assert_eq!(renew_on(&client, "shop.lead.helper", Some(7)).await, None);
+        assert_eq!(configured().len(), 1);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

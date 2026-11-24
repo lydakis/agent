@@ -790,10 +790,21 @@ lead's tasks. They are what memory held when the agent
 was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
 
-A lead composes its instructions when it is made, so a fact saved later
-reaches it when it reads memory again, as its memory skill says to before
-starting work. Memory never wakes a lead, so the lead's cached prompt
-prefix stays.
+A lead composes its instructions when it is made and as its window opens,
+so a fact saved later reaches it when it reads memory again, as its memory
+skill says to before starting work. Memory never wakes a lead, and a fact
+saved never changes its instructions between turns, so the lead's cached
+prompt prefix stays.
+
+What the person changes does reach a lead without reopening it: its role,
+its folder's AGENTS.md files, its skills and profiles, and the project's
+task rule. As each lead's turn ends, Sonny's tool host, which runs for
+every lead with a window or without, composes its instructions again and
+sends them when anything but memory differs from what the lead holds
+(`project::changed`), with the memory there is then. The daemon keeps
+them for the end of a turn already running, so a turn never changes
+under itself: the lead's next turn reads them, at the cost of one call
+the prompt cache cannot serve.
 
 Sonny installs a `memory` skill ([SKILL.md](../sonny/skills/memory/SKILL.md))
 that says to use those indexes, or `show` when they are missing or old,
