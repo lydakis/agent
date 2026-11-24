@@ -1455,10 +1455,14 @@ impl Session {
                 .out
                 .answer(&earlier, json!({"stopReason": "end_turn"}));
         }
+        // Marked read before the read: a question asked while it reads
+        // marks it unread again, for the next prompt.
+        if telling.is_some() {
+            state.asks_read = true;
+        }
         drop(state);
         if let Some((bot, bot_id)) = telling {
             tell_aside(&client, &bot, bot_id).await;
-            self.state.lock().await.asks_read = true;
         }
         match client.request("submit", asked).await {
             Ok(reply) => {
