@@ -3228,8 +3228,10 @@ pub async fn run(config: Configuration) -> Result<()> {
         >::new();
         // Packing (see `Database::to_pack`): a pass when the first idle bot
         // is due, asked of the worker as the daemon starts (a reader does
-        // nothing until there is work), then when the next is; one pass at
-        // a time, its work on the store's threads.
+        // nothing until there is work), then when the next is; one batch
+        // at a time, its work on the store's threads. Idle bots are packed
+        // only while no turn runs, so packing never slows a conversation
+        // (Codex's worker); a bot that works again is unpacked at once.
         let due_at = |due: i64| {
             let now = handles::now_ms() as i64;
             tokio::time::Instant::now() + std::time::Duration::from_millis((due - now).max(0) as u64)
@@ -3238,10 +3240,17 @@ pub async fn run(config: Configuration) -> Result<()> {
         let mut pack_due = Some(due_at(
             service.store.op("pack_due", move |db| db.pack_due(now)).await?,
         ));
-        let mut packing = tokio::task::JoinSet::<Result<i64>>::new();
+        let mut packing = tokio::task::JoinSet::<(bool, Result<std::result::Result<i64, i64>>)>::new();
+        // Where the pass goes on from, and whether packing waits for no
+        // turn to run.
+        let (mut pack_from, mut pack_on_quiet) = (0, false);
         loop {
             if service.draining() && service.active.is_empty() && service.claims.is_empty() {
                 break;
+            }
+            if pack_on_quiet && service.active.is_empty() {
+                pack_on_quiet = false;
+                pack_due = Some(tokio::time::Instant::now());
             }
             // Computed before the select so its arms borrow the service freely.
             let (wake_due, wake_delay) = (service.wakes.next().is_some(), service.wake_delay());
@@ -3270,19 +3279,34 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
                 _ = tokio::time::sleep_until(pack_due.unwrap_or_else(tokio::time::Instant::now)), if pack_due.is_some() && packing.is_empty() && !service.draining() => {
                     pack_due = None;
-                    packing.spawn(pack(service.store.clone()));
+                    let (store, quiet) = (service.store.clone(), service.active.is_empty());
+                    packing.spawn(async move { (quiet, pack(store, pack_from, quiet).await) });
                 }
                 // A bot with packed items worked again: a pass unpacks them.
                 _ = service.store.woken(), if packing.is_empty() && !service.draining() => {
                     pack_due = Some(tokio::time::Instant::now());
                 }
                 // A pass that failed, counted in the store's stats, is
-                // tried again when a turn ending now would be due.
+                // tried again when a turn ending now would be due. One that
+                // found bots to pack while turns ran waits for none to run.
                 Some(packed) = packing.join_next(), if !packing.is_empty() => {
-                    pack_due = Some(due_at(match packed {
-                        Ok(Ok(due)) => due,
-                        _ => handles::now_ms() as i64 + agent_runtime::store::PACK_IDLE_MS,
-                    }));
+                    let now = handles::now_ms() as i64;
+                    let due = match packed {
+                        Ok((_, Ok(Ok(bot)))) => {
+                            pack_from = bot;
+                            now
+                        }
+                        Ok((quiet, Ok(Err(due)))) => {
+                            pack_from = 0;
+                            pack_on_quiet = !quiet && due <= now;
+                            due
+                        }
+                        _ => {
+                            pack_from = 0;
+                            now + agent_runtime::store::PACK_IDLE_MS
+                        }
+                    };
+                    pack_due = (!pack_on_quiet).then(|| due_at(due));
                 }
                 Some(done) = service.switching.finished.recv() => {
                     let chore = std::time::Instant::now();
@@ -8680,22 +8704,22 @@ fn custom_tools(
     }
 }
 
-/// One packing pass: batches until none is left, each read and packed on
-/// a reader and written by the worker; when the next pass is due, in epoch
-/// ms.
-async fn pack(store: Store) -> Result<i64> {
-    let mut from = 0;
-    loop {
-        let now = now_ms() as i64;
-        match store
-            .read("to_pack", move |db| db.to_pack(now, from))
-            .await?
-        {
-            agent_runtime::store::Pack::Due(at) => return Ok(at),
-            agent_runtime::store::Pack::Batch(batch) => {
-                from = batch.bot_id();
-                store.op("packed", move |db| db.packed(batch)).await?;
-            }
+/// One step of a packing pass, from bot id `from`: a batch read and
+/// packed (or unpacked) on a reader and written by the worker. `quiet`:
+/// no turn runs, so idle bots may be packed; woken bots are unpacked
+/// either way. The bot the pass goes on from, or when the next pass is
+/// due, in epoch ms.
+async fn pack(store: Store, from: i64, quiet: bool) -> Result<std::result::Result<i64, i64>> {
+    let now = now_ms() as i64;
+    match store
+        .read("to_pack", move |db| db.to_pack(now, from, quiet))
+        .await?
+    {
+        agent_runtime::store::Pack::Due(at) => Ok(Err(at)),
+        agent_runtime::store::Pack::Batch(batch) => {
+            let bot = batch.bot_id();
+            store.op("packed", move |db| db.packed(batch)).await?;
+            Ok(Ok(bot))
         }
     }
 }

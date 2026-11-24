@@ -25580,7 +25580,7 @@ fn a_store_from_109_takes_profiles_with_none_on_its_bots() {
 /// batches it wrote.
 fn pack_all(db: &mut Database, now_ms: i64) -> usize {
     let (mut batches, mut from) = (0, 0);
-    while let Pack::Batch(batch) = db.to_pack(now_ms, from).unwrap() {
+    while let Pack::Batch(batch) = db.to_pack(now_ms, from, true).unwrap() {
         from = batch.bot_id();
         assert!(db.packed(batch).unwrap());
         batches += 1;
@@ -25700,12 +25700,14 @@ fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     // Within the week nothing is packed, and the next pass is due when
     // Bob's last turn is a week old.
     let now = epoch_now() as i64;
-    let Pack::Due(due) = db.to_pack(now, 0).unwrap() else {
+    let Pack::Due(due) = db.to_pack(now, 0, true).unwrap() else {
         panic!("nothing is due yet");
     };
     assert!(due > now && due <= now + PACK_IDLE_MS);
     assert_eq!(packed(), 0);
     age("'Bob'");
+    // While a turn runs anywhere, nothing is packed: due, it waits.
+    assert!(matches!(db.to_pack(now, 0, false).unwrap(), Pack::Due(due) if due <= now));
     assert!(pack_all(&mut db, now) > 0);
     // The prompts and long answers are packed; "ok" would grow, so it
     // stays plain.
@@ -25762,10 +25764,12 @@ fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     );
     assert_eq!(all.len(), before[0].as_array().unwrap().len() + 2);
     let woke = every_read(&mut db, "Bob", &turns);
-    let Pack::Due(due) = db.to_pack(now, i64::MAX).unwrap() else {
+    let Pack::Due(due) = db.to_pack(now, i64::MAX, true).unwrap() else {
         panic!("a pass from the start finds Bob");
     };
     assert!(due <= now);
+    // Unpacking does not wait for turns to end.
+    assert!(matches!(db.to_pack(now, 0, false).unwrap(), Pack::Batch(_)));
     assert!(pack_all(&mut db, now) > 0);
     assert_eq!(packed(), 0);
     assert_eq!(
@@ -25775,8 +25779,7 @@ fn an_idle_bots_items_are_packed_and_read_back_as_written() {
     assert_eq!(stored(&mut db, "Bob"), all);
     assert_eq!(every_read(&mut db, "Bob", &turns), woke);
     // A week after their last turns, Bob's whole history and Carol's are
-    // packed again; Ben, who has had no turn, holds nothing of his own
-    // (the pass that unpacked Bob found that).
+    // packed again; Ben, who has had no turn, holds nothing of his own.
     age("'Bob','Carol'");
     assert_eq!(pack_all(&mut db, now), 2);
     assert_eq!(packed(), 10);

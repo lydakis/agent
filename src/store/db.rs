@@ -16183,19 +16183,21 @@ impl Database {
         }
         Ok(())
     }
-    /// What packing does next, read and packed on a reader: the next
-    /// items still plain in the history of the first bot from id `from`
-    /// on with no turn running and none ended in [`super::pack::IDLE_MS`]
-    /// before `now_ms`, oldest first, until [`super::pack::BATCH_BYTES`]
-    /// are read. A pass starts at 0 and goes on from each batch's bot, so
-    /// it reads each bot row once however many bots it packs; a bot it
-    /// went past becomes due in a later pass. A bot's
+    /// What packing does next, read and packed on a reader: the woken
+    /// bot's items to unpack (see [`Self::to_unpack`]), or, when `quiet`
+    /// (no turn runs), the next items still plain in the history of the
+    /// first bot from id `from` on with no turn running and its last
+    /// ended [`super::pack::IDLE_MS`] or more before `now_ms`, oldest
+    /// first, until [`super::pack::BATCH_BYTES`] are read. A pass starts
+    /// at 0 and goes on from each batch's bot, so it reads each bot row
+    /// once however many bots it packs; a bot it went past becomes due in
+    /// a later pass. A bot's
     /// items are those of its history (its head and the nodes above it)
     /// from its first turn on: what it forked from is its parent's. With
     /// none, when the next bot will have been idle that long; with no bot
     /// left to pack, when one idle from now would be. Each item is packed
     /// only when that is smaller; [`Self::packed`] writes them.
-    pub fn to_pack(&self, now_ms: i64, from: i64) -> Result<Pack> {
+    pub fn to_pack(&self, now_ms: i64, from: i64, quiet: bool) -> Result<Pack> {
         let cutoff = now_ms - super::pack::IDLE_MS;
         // One snapshot for the whole batch: a bot deleted meanwhile is
         // read as it was, and `packed` finds it gone.
@@ -16204,11 +16206,11 @@ impl Database {
             .conn
             .prepare_cached(&format!(
                 "SELECT id,name,COALESCE(packed_node,0),head,{WOKEN} FROM bots
-                 WHERE id>=?2 AND status!='deleting' AND ({WOKEN} OR (running_turn IS NULL
-                   AND head>COALESCE(packed_node,0) AND COALESCE(last_finished_ms,0)<=?1))
+                 WHERE id>=?2 AND status!='deleting' AND ({WOKEN} OR (?3 AND running_turn IS NULL
+                   AND head>COALESCE(packed_node,0) AND last_finished_ms<=?1))
                  ORDER BY id LIMIT 1"
             ))?
-            .query_row(params![cutoff, from], |r| {
+            .query_row(params![cutoff, from, quiet], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .optional()?;
@@ -16353,14 +16355,15 @@ impl Database {
     /// items to unpack; else when the bot that will have been idle
     /// longest reaches [`super::pack::IDLE_MS`] (at or before `now_ms`
     /// when one has), or, with no bot left to pack, when one idle from
-    /// now would.
+    /// now would. A bot that has never ended a turn has nothing of its
+    /// own to pack.
     pub fn pack_due(&self, now_ms: i64) -> Result<i64> {
         let cutoff = now_ms - super::pack::IDLE_MS;
         let next: Option<i64> = self.conn.query_row(
             &format!(
                 "SELECT MIN(CASE WHEN {WOKEN} THEN ?1
                    WHEN head<=COALESCE(packed_node,0) THEN NULL
-                   WHEN running_turn IS NULL THEN COALESCE(last_finished_ms,0) ELSE ?2 END)
+                   WHEN running_turn IS NOT NULL THEN ?2 ELSE last_finished_ms END)
                  FROM bots WHERE status!='deleting'"
             ),
             params![cutoff, now_ms],
