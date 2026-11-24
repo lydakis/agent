@@ -13232,3 +13232,101 @@ change 2,104, and the store 7.1 MB against 1.0 MB. An earlier commit named
 texts by their 64-byte digest and cost 0.2 KiB more per agent with short
 instructions; the small id removed that.
 
+
+## Release 0.10.6 against 0.10.5
+
+This measures every change since 0.10.5 together: v0.10.5 (b542220) against
+the release commit 9d97862. The protocol is 100 against 101, so each side
+runs its own daemon with its own Sonny. Release builds (glibc) on one 4-core
+Linux container, base and head alternated, and each binary's page cache
+dropped before each `bench/ends.py` run, so a newer binary file does not read
+as more memory. The benchmark ran around the tag: George released first and
+asked for the numbers after.
+
+### Low end
+
+Three rounds each; the anonymous rows are separate runs that read `Pss_Anon`.
+
+| Measure | 0.10.5 | 0.10.6 |
+| --- | ---: | ---: |
+| window start, s | 0.099 / 0.099 / 0.078 | 0.085 / 0.086 / 0.095 |
+| key p99, ms | 2.05 / 2.03 / 2.22 | 1.8 / 2.36 / 2.96 |
+| turn p50, ms | 48.1 / 48.05 / 47.86 | 48.24 / 48.18 / 48.15 |
+| turn p99, ms | 52.8 / 52.06 / 50.27 | 51.5 / 53.72 / 53.28 |
+| idle daemon PSS, MiB | 17.6 / 17.9 / 18.0 | 18.0 / 19.0 / 18.4 |
+| idle daemon anon PSS, MiB | 5.4 / 4.8 / 5.0 | 4.9 / 4.6 / 5.4 |
+| idle window PSS, MiB | 16.3 / 16.1 / 16.3 | 16.4 / 15.7 / 15.8 |
+| idle window anon PSS, MiB | 4.8 / 4.6 / 4.6 | 4.7 / 4.6 / 4.7 |
+| idle window wakeups, /s | 4.5 / 4.6 / 4.6 | 4.6 / 4.6 / 4.5 |
+
+### High end
+
+10,000 stored agents, 30 busy, 8 scripts, 20 s, windows spread over folders.
+32 windows four rounds, 100 windows two.
+
+| Measure | 0.10.5 | 0.10.6 |
+| --- | ---: | ---: |
+| 32 windows: turns finished | 7761 / 8396 / 8370 / 8255 | 8024 / 8525 / 8215 / 8025 |
+| scripts finished | 937 / 1028 / 1017 / 992 | 991 / 1050 / 996 / 968 |
+| windows CPU, % | 5.63 / 5.09 / 4.68 / 5.19 | 4.64 / 4.4 / 4.74 / 5.19 |
+| windows PSS, MiB | 185.9 / 185.4 / 186.6 / 186.8 | 188.2 / 187.9 / 189.1 / 188.8 |
+| windows anon PSS, MiB (2 rounds) | 163.9 / 163.5 | 165.7 / 166.5 |
+| daemon CPU, % | 130.08 / 136.34 / 136.28 / 137.52 | 135.31 / 136.86 / 136.32 / 137.5 |
+| daemon PSS, MiB | 36.5 / 37.8 / 37.2 / 36.6 | 37.4 / 37.3 / 37.1 / 37.2 |
+| key p99, ms | 26.26 / 12.15 / 9.24 / 11.94 | 12.26 / 12.41 / 10.66 / 12.22 |
+| worst key, ms | 42.09 / 13.26 / 10.26 / 21.55 | 46.24 / 16.69 / 21.94 / 13.11 |
+| 100 windows: turns finished | 8277 / 7942 | 8436 / 8092 |
+| windows PSS, MiB | 497.6 / 498.2 | 501.0 / 501.9 |
+| daemon PSS, MiB | 38.1 / 38.3 | 37.9 / 37.8 |
+| key p99, ms | 13.83 / 18.6 | 11.66 / 13.39 |
+| worst key, ms | 18.34 / 19.47 | 14.8 / 65.64 |
+
+- **Turns, scripts and keys are even**, and no key took 100 ms on either side.
+- **The 0.10.5 note's 2 to 3% fewer turns at 32 windows was noise.** Before
+  this release, 12 alternating rounds of v0.10.4, v0.10.5 and main (d803546)
+  at 32 windows gave paired differences of -43 ± 287 turns (0.10.5 against
+  0.10.4) and -79 ± 311 (main against 0.10.5), with medians 9,539, 9,388
+  and 9,225 and run-to-run spread of 200 to 250 on each.
+- **Windows hold a little more heap at the high end:** about 2.4 MiB over
+  32 windows (0.07 MiB each) and 3.5 MiB over 100. See the quiet window below.
+
+### Daemon and Sonny screens
+
+Four alternating rounds of the Perf workflow's screens.
+
+| Bench | Measure | 0.10.5 | 0.10.6 | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 45.226 | 49.664 | +9.8% |
+| admission | burst submit p99, ms | 6.584 | 7.422 | +12.7% |
+| completion | release to terminal p99, ms | 14.714 | 16.875 | +14.7% |
+| footprint | idle RSS, MiB | 16.328 | 16.49 | +1.0% |
+| footprint | per idle bot, KiB | 2.064 | 2.23 | +8.0% |
+| footprint | RSS after a turn each, MiB | 34.119 | 31.475 | -7.8% |
+| footprint | CPU per turn, ms | 1.096 | 1.198 | +9.3% |
+| footprint | written to disk per turn, KiB | 46.2 | 50.59 | +9.5% |
+| lifecycle | CPU, s | 0.765 | 0.805 | +5.2% |
+| lifecycle | p95 turn, ms | 592.215 | 591.827 | -0.1% |
+| lifecycle | peak RSS, MiB | 26.748 | 27.369 | +2.3% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 5.25 | 5.375 | +2.4% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 8.685 | 8.25 | -5.0% |
+| sonny | lookout note p95 at 100x10, ms | 2387.0 | 2305.5 | -3.4% |
+| sonny | quiet window CPU, ms/s | 0.765 | 0.96 | +25.5% |
+| sonny | quiet window RSS, MiB | 28.1 | 32.75 | +16.5% |
+| sonny | sky replay CPU per 1k lines, ms | 14.47 | 15.215 | +5.1% |
+| sonny | sky replay RSS, MiB | 61.7 | 60.8 | -1.5% |
+
+- **The store rows match #1349's own Perf screens** (CPU per turn, bytes
+  written per turn, per idle bot), all under the gate's 15%.
+- **Quiet window CPU** is one 10 ms tick more over a 15 s window in some
+  rounds; the medians are 0.75 to 0.78 ms/s on both in the reruns below.
+- **Quiet window RSS: the screen's one warning.** Its peak RSS counts file
+  pages, and Sonny's binary grew 2.9 MB (58.7 to 61.6 MB). With the
+  binaries' page cache dropped first, three rounds each: peak RSS
+  27.2 / 27.5 / 27.3 against 28.4 / 29.2 / 29.0 MiB, and peak anonymous RSS
+  7.3 / 7.0 / 7.6 against 8.2 / 7.9 / 8.0 MiB. So about 0.7 MiB of heap is
+  real, in a lead's window over a 1,000-task fleet. Four rounds of peak
+  anonymous RSS at each step since 0.10.5 (each Sonny with a daemon of its
+  protocol): v0.10.5 7.3 / 7.0 / 7.6 / 7.2, #1334 7.2 / 7.6 / 7.7 / 7.1,
+  #1338 7.4 / 7.2 / 7.5 / 7.6, #1341 7.8 / 7.8 / 8.2 / 7.9, main d803546
+  8.4 / 7.7 / 7.9 / 7.8. The step is #1341 (done is closed), about
+  0.4 MiB at the median; the rest is within the rounds' spread.
