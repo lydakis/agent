@@ -324,7 +324,11 @@ class CompactionTests(ModelFixture):
                                 settings={'context_bytes': 8192, 'compact_at': 95, **capped})
                 self.addCleanup(client.close)
                 self.create(client)
-                for n in range(7):
+                # Six turns stay under the threshold without a cap (the last
+                # sends 6.1 KB of 7.8 KB), so no summary is ever due. A
+                # seventh would end past it and summarize after it reports,
+                # racing the count below.
+                for n in range(6):
                     self.assertEqual(self.run_turn(client, 'Bob', n, 'x' * 450)['data']['status'], 'completed')
                 requests = self.requests()
                 self.assertEqual(any(is_summary(r) for r in requests), cap is not None)
