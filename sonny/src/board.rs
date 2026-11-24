@@ -757,14 +757,18 @@ pub fn reply(
     {
         return Err(format!("work_invalid: do is one of {}", VERBS.join(", ")));
     }
-    let mut post = commons::entry(
-        caller.name,
-        caller.id,
-        caller.model,
-        caller.project,
-        text("text"),
-        given,
-    )?;
+    // A step with no words is the step alone, posted at once.
+    let mut post = match text("text").trim().is_empty() {
+        true => commons::signed(caller.name, caller.id, caller.model, caller.project, given)?,
+        false => commons::entry(
+            caller.name,
+            caller.id,
+            caller.model,
+            caller.project,
+            text("text"),
+            given,
+        )?,
+    };
     post["do"] = json!(action.unwrap_or("set"));
     fields(&mut post, given, true)?;
     let changes = ["needs", "labels", "for"]
@@ -1010,7 +1014,7 @@ pub fn reply(
                     // its maker or the lead opens it again.
                     if state != "open" {
                         return Err(format!(
-                            "work_invalid: {thread} is {state}; pause only open work, which no one holds"
+                            "work_invalid: {thread} is {state}; pause only open or waiting work, which no one holds"
                         ));
                     }
                     if !(made_it || leads) {
@@ -1779,6 +1783,88 @@ mod tests {
         assert_eq!(line["board"], "shop/errors");
         assert_eq!(line["do"], "open");
         assert_eq!(line["opened"], json!(["store"]));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_step_with_no_text_posts_at_once_and_shows_what_it_missed() {
+        let home = home("bare");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        let w1 = |args| send(&home, "shop.w1", "shop", None, false, args);
+        // As the agent calls it, shown only what it was shown.
+        let unread = |name: &str, arguments: Value| {
+            let caller = Caller {
+                name,
+                id: None,
+                reader: name,
+                model: None,
+                project: Some("shop"),
+                profile: None,
+                lead: name.ends_with(".lead"),
+                folder: None,
+            };
+            commons::call_as(&home, &caller, &arguments, &|_, _| false)
+        };
+        let bare = |thread: &str, what: &str| json!({"reply": {"thread": thread, "do": what}});
+        let cursor = home.join("cursor");
+        let _ = commons::news(&home, &cursor).mark_read();
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        w1(json!({"reply": {"thread": "store", "text": "Is this before the api?"}})).unwrap();
+        // The lead missed the question: its pause posts all the same.
+        let paused = unread("shop.lead", bare("store", "pause")).unwrap();
+        assert!(paused["posted"].is_null(), "{paused}");
+        assert_eq!(paused["posts"], 3);
+        assert_eq!(paused["work"]["state"], "paused");
+        assert_eq!(paused["missed"]["from"], 1);
+        assert_eq!(paused["missed"]["posts"][0]["by"], "shop.w1");
+        assert_eq!(
+            paused["missed"]["posts"][0]["text"],
+            "Is this before the api?"
+        );
+        let posts = commons::posts(&commons::dir(&home).join("store.jsonl")).unwrap();
+        assert!(posts[2].get("text").is_none(), "{}", posts[2]);
+        // What it missed counts as shown, and so does its own step: words
+        // after it post at once too.
+        let said = unread(
+            "shop.lead",
+            json!({"reply": {"thread": "store", "text": "Wait."}}),
+        );
+        assert_eq!(said.unwrap()["posts"], 4);
+        // A read shows the step with no text; the lookout's line ends at
+        // the title.
+        let read = w1(json!({"read": "store"})).unwrap();
+        assert!(read["posts"][2].get("text").is_none(), "{read}");
+        assert_eq!(read["posts"][2]["do"], "pause");
+        let news = commons::news(&home, &cursor);
+        let line: Value = serde_json::from_str(&news.lines[2]).unwrap();
+        assert_eq!(line["text"], "pause in store, \"Type the store errors\"");
+        // A step with words still waits once for what its agent missed.
+        w1(json!({"reply": {"thread": "store", "text": "Sure."}})).unwrap();
+        let worded = unread(
+            "shop.lead",
+            json!({"reply": {"thread": "store", "do": "open", "text": "Go."}}),
+        )
+        .unwrap();
+        assert_eq!(worded["posted"], false, "{worded}");
+        assert_eq!(worded["work"]["state"], "paused", "{worded}");
+        // Fields alone are a step too.
+        lead(json!({"reply": {"thread": "store", "do": "open", "text": "Go."}})).unwrap();
+        w1(json!({"reply": {"thread": "store", "text": "Taking it."}})).unwrap();
+        let labeled = unread(
+            "shop.lead",
+            json!({"reply": {"thread": "store", "labels": {"area": "db"}}}),
+        )
+        .unwrap();
+        assert_eq!(labeled["work"]["labels"]["area"], "db", "{labeled}");
+        assert_eq!(labeled["missed"]["posts"][0]["text"], "Taking it.");
+        // The board's checks still guard a step its agent missed news of.
+        w1(bare("store", "take")).unwrap();
+        lead(json!({"reply": {"thread": "store", "text": "Thanks."}})).unwrap();
+        let taken = unread("shop.w2", bare("store", "take")).unwrap_err();
+        assert!(taken.starts_with("work_held"), "{taken}");
+        // Talk still needs text.
+        let talk = unread("shop.w2", json!({"reply": {"thread": "store"}})).unwrap_err();
+        assert!(talk.contains("a post needs text"), "{talk}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

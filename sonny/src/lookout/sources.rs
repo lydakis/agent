@@ -1144,9 +1144,10 @@ impl Seen {
     }
 }
 
-/// One run of a source's command, in a process group of its own, with
-/// `SONNY_SOURCE` and `SONNY_SOURCE_DIR` set; each event it prints is
-/// judged in its health (`judged`) as it comes.
+/// One run of a source's command, in a process group of its own, in its
+/// own folder (`SONNY_SOURCE_DIR`, set with `SONNY_SOURCE`), so a path it
+/// names relative lands there whatever folder Sonny started in; each event
+/// it prints is judged in its health (`judged`) as it comes.
 async fn once(
     source: &Source,
     dir: &Path,
@@ -1166,6 +1167,7 @@ async fn once(
         .arg(&source.command)
         .env("SONNY_SOURCE", &source.name)
         .env("SONNY_SOURCE_DIR", dir)
+        .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2921,6 +2923,32 @@ mod tests {
         assert_eq!(texts, ["run 1 of count", "same", "run 2 of count"]);
         runner.set(Vec::new());
         assert!(runner.running.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_source_runs_in_its_own_folder() {
+        let dir = std::env::temp_dir().join(format!("lookout-own-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.clone(), sent);
+        // A path it names relative lands in its own folder, not in the
+        // folder the lookout started in.
+        runner.set(vec![Source {
+            name: "cursor".into(),
+            command: r#"echo 7 > state; pwd -P"#.into(),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+            watch: Vec::new(),
+            icon: None,
+            wants: None,
+        }]);
+        let ran_in = next_event(&mut got).await.text;
+        let own = dir.join("cursor").canonicalize().unwrap();
+        assert_eq!(std::path::Path::new(&ran_in), own);
+        assert_eq!(std::fs::read_to_string(own.join("state")).unwrap(), "7\n");
+        runner.set(Vec::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

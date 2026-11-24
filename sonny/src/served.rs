@@ -669,7 +669,10 @@ pub fn commons() -> Value {
             );
             fields.extend(work);
         }
-        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, pause, finish or fail it.");
+        // A step may go without words.
+        reply["required"] = json!(["thread"]);
+        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, pause, finish or fail it. \
+            A reply that moves or changes work with no text posts at once, with any posts you missed.");
     }
     json!({
         "name": COMMONS,
@@ -3079,11 +3082,13 @@ async fn noted(name: &str, bot: &str, turn: i64, arguments: &Value, output: &str
         if let (Some(thread), Some(home)) = (said["thread"].as_str(), std::env::var_os("HOME"))
             && said["posted"] != false
         {
+            let opened = crate::turn_end::opened_on(arguments).map(str::to_owned);
             // It reads the thread: off the runtime, done before the answer
             // goes back.
             let (bot, thread) = (bot.to_owned(), thread.to_owned());
             let _ = tokio::task::spawn_blocking(move || {
-                crate::turn_end::wrote(Path::new(&home), &bot, Some(turn), &thread)
+                let opened = opened.as_deref();
+                crate::turn_end::wrote(Path::new(&home), &bot, Some(turn), &thread, opened)
             })
             .await;
         }

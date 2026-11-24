@@ -1249,7 +1249,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
     match origin {
         crate::lookout::BOUNCE_ORIGIN => return "a returned message",
         crate::project::START_ORIGIN => return "Sonny's start",
-        crate::away::ORIGIN => return "Sonny",
+        crate::away::ORIGIN | crate::asks::ASIDE_ORIGIN => return "Sonny",
         _ => {}
     }
     match origin.split('.').next() {
@@ -3561,9 +3561,16 @@ fn shown(path: &str, workspace: &str) -> String {
     }
 }
 
-/// The row under a finished turn: how it ended, how long it took, and
-/// `detail` when it has one.
-pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'static> {
+/// The rows under a finished turn: how it ended, how long it took, and
+/// `detail` when it has one, wrapped to `width`. It starts in the words'
+/// column, two in, as Codex's does, and a row it wraps onto hangs there:
+/// it is words with no mark, and the first column is for marks.
+pub fn finished(
+    status: &str,
+    detail: &str,
+    seconds: Option<u64>,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut label = match status {
         "completed" => "Worked".to_owned(),
         other => other.to_owned(),
@@ -3580,7 +3587,13 @@ pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'stati
         "completed" => Style::new().dim(),
         _ => Style::new().fg(Color::Red),
     };
-    Line::from(Span::styled(label, style))
+    let indent = if width > 2 { "  " } else { "" };
+    wrap(
+        Line::from(Span::styled(label, style)),
+        width,
+        Span::raw(indent),
+        Span::raw(indent),
+    )
 }
 
 /// The most rows of a provider's explanation drawn under its refusal.
@@ -4116,14 +4129,36 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_turn_ends_on_its_words_alone_muted() {
-        let done = finished("completed", "", Some(11));
-        assert_eq!(done.to_string(), "Worked for 11s");
-        assert!(!done.to_string().contains('─'), "no rule");
-        assert!(done.spans[0].style.add_modifier.contains(Modifier::DIM));
-        // A failure is still read in red.
-        let failed = finished("failed", "", None);
-        assert!(failed.spans.iter().all(|s| s.style.fg == Some(Color::Red)));
+    fn a_finished_turn_ends_on_its_words_alone_muted_in_the_words_column() {
+        let text = |lines: &[Line]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let done = finished("completed", "", Some(11), 40);
+        // Two columns in, under a reply's words: no mark before it.
+        assert_eq!(text(&done), ["  Worked for 11s"]);
+        assert!(!done[0].to_string().contains('─'), "no rule");
+        let words = done[0].spans.iter().find(|s| !s.content.trim().is_empty());
+        assert!(words.unwrap().style.add_modifier.contains(Modifier::DIM));
+        // A failure is still read in red, and a row it wraps onto hangs
+        // in the same column.
+        let failed = finished("failed", "the provider could not be reached", Some(3), 24);
+        assert_eq!(
+            text(&failed),
+            [
+                "  failed for 3s · the ",
+                "  provider could not be ",
+                "  reached"
+            ]
+        );
+        assert!(failed.iter().all(|line| line.width() <= 24));
+        let words = failed.iter().flat_map(|line| &line.spans);
+        let words: Vec<_> = words.filter(|s| !s.content.trim().is_empty()).collect();
+        assert!(words.iter().all(|s| s.style.fg == Some(Color::Red)));
+        // A refusal, drawn in its place, keeps its words in that column,
+        // its `✗` in the marks' column as a reply's `•` is.
+        let refused = refused(&serde_json::json!({"category": "cyber"}), true, 40);
+        assert_eq!(
+            text(&refused),
+            ["✗ The provider declined this request ", "  (cyber)."]
+        );
     }
 
     #[test]

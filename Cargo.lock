@@ -4115,6 +4115,7 @@ dependencies = [
  "resvg",
  "rmcp",
  "rquickjs",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

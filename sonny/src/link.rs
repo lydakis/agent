@@ -122,8 +122,11 @@ pub struct Machine {
     pub id: Option<String>,
     /// Whether its browser runs commands sent here.
     pub browser: bool,
-    /// Whether that browser starts signed in as the person is there.
+    /// Whether that browser starts on a profile kept for the person there.
     pub signed_in: bool,
+    /// Whether that profile takes the person's own sign-ins as it starts,
+    /// rather than keeping those made in it.
+    pub copies_signins: bool,
     /// Whether its desktop runs commands sent here.
     pub desktop: bool,
     /// Whether it opens links and files sent to it.
@@ -179,6 +182,7 @@ impl Machine {
             id: said["id"].as_str().map(str::to_owned),
             browser: said["browser"] == true,
             signed_in: said["signed_in"] == true,
+            copies_signins: said["signins"] == "copied",
             desktop: said["desktop"] == true,
             open: said["open"] == true,
             files: said["files"] == true,
@@ -1946,6 +1950,10 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
         "id": this_id(),
         "browser": crate::trusted::here("agent-browser"),
         "signed_in": !link.browser_profile.is_empty(),
+        "signins": match copies_signins(link) {
+            true => "copied",
+            false => "own",
+        },
         "calls": calls,
         "desktop": crate::desktop::here(),
         "open": true,
@@ -2059,8 +2067,14 @@ async fn lend(
     let left = Duration::from_millis(payload["timeout_ms"].as_u64().unwrap_or(600_000));
     match called["tool"].as_str() {
         Some(crate::browser::NAME) => {
-            let browsed =
-                crate::browser::lent(payload, key, &link.host, &link.browser_profile, &steps);
+            let browsed = crate::browser::lent(
+                payload,
+                key,
+                &link.host,
+                &link.browser_profile,
+                link.browser_signins,
+                &steps,
+            );
             match tokio::time::timeout(left.min(crate::browser::TIMEOUT), browsed).await {
                 Ok(answer) => answer,
                 Err(_) => Err(("timed_out", "the browser's commands ran out of time".into())),
@@ -2353,6 +2367,7 @@ fn opened(payload: &Value) -> Result<String, String> {
 
 const USAGE: &str = "usage:
   sonny link HOST [--machine NAME] [--name NAME]   link this machine to HOST, for its agents to use
+  sonny link browser [NAME] [URL]                  open the link's browser here, to sign in for its agents
   sonny link off NAME                              take the link away
   sonny link forget MACHINE                        on a host: forget a machine linked to it
   sonny link                                       the links, and the machines linked here";
@@ -2373,12 +2388,69 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         [serve, machine] if serve == "serve" => runtime()?.block_on(serve_machine(machine.clone())),
         [forget, machine] if forget == "forget" => forget_machine(machine),
         [off, name] if off == "off" => off_link(name),
+        [browser, rest @ ..] if browser == "browser" && rest.len() <= 2 => {
+            runtime()?.block_on(show_browser(rest))
+        }
         [first, rest @ ..]
-            if !first.starts_with('-') && !matches!(first.as_str(), "off" | "serve" | "forget") =>
+            if !first.starts_with('-')
+                && !matches!(first.as_str(), "off" | "serve" | "forget" | "browser") =>
         {
             setup(first, rest)
         }
         _ => Err(USAGE.into()),
+    }
+}
+
+/// Whether the link's agents' browser takes the person's sign-ins as it
+/// starts: copied from a profile of theirs, as `browser_signins` says.
+fn copies_signins(link: &agent_client::config::Link) -> bool {
+    link.browser_signins == agent_client::config::BrowserSignins::Copied
+        && !link.browser_profile.is_empty()
+        && !crate::browser::is_folder(&link.browser_profile)
+}
+
+/// `sonny link browser [NAME] [URL]`: the browser the agents of the link
+/// `NAME` share, the only one when it is not named, opened in a window
+/// here at `URL`, for the person to sign in there for them.
+async fn show_browser(args: &[String]) -> Result<(), String> {
+    let path = agent_client::config::path().ok_or("HOME is not set")?;
+    let config = agent_client::config::read(&path)?;
+    let links = &config.sonny.links;
+    let named =
+        |word: &String| (links.iter()).find(|(key, link)| *key == word || link.host == *word);
+    let (found, url) = match args {
+        [name, url] => (named(name).ok_or(format!("no link {name}"))?, Some(url)),
+        [word] => match named(word) {
+            Some(found) => (found, None),
+            None => (only(links)?, Some(word)),
+        },
+        _ => (only(links)?, None),
+    };
+    let (key, link) = found;
+    let url = url.map_or("about:blank", String::as_str);
+    let dir =
+        crate::browser::show_link_browser(key, &link.browser_profile, link.browser_signins, url)
+            .await?;
+    println!(
+        "{key}'s browser is open on {}: sign in there, and its agents use it at their next call; \
+         what you sign in to stays with it",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// The one link of `links`, when there is one.
+fn only(
+    links: &BTreeMap<String, agent_client::config::Link>,
+) -> Result<(&String, &agent_client::config::Link), String> {
+    let mut all = links.iter();
+    match (all.next(), all.next()) {
+        (Some(only), None) => Ok(only),
+        (None, _) => Err("no link here: `sonny link HOST` makes one".into()),
+        _ => Err(format!(
+            "which link? {}",
+            links.keys().cloned().collect::<Vec<_>>().join(", ")
+        )),
     }
 }
 

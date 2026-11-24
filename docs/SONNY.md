@@ -790,10 +790,21 @@ lead's tasks. They are what memory held when the agent
 was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
 
-A lead composes its instructions when it is made, so a fact saved later
-reaches it when it reads memory again, as its memory skill says to before
-starting work. Memory never wakes a lead, so the lead's cached prompt
-prefix stays.
+A lead composes its instructions when it is made and as its window opens,
+so a fact saved later reaches it when it reads memory again, as its memory
+skill says to before starting work. Memory never wakes a lead, and a fact
+saved never changes its instructions between turns, so the lead's cached
+prompt prefix stays.
+
+What the person changes does reach a lead without reopening it: its role,
+its folder's AGENTS.md files, its skills and profiles, and the project's
+task rule. As each lead's turn ends, Sonny's tool host, which runs for
+every lead with a window or without, composes its instructions again and
+sends them when anything but memory differs from what the lead holds
+(`project::changed`), with the memory there is then. The daemon keeps
+them for the end of a turn already running, so a turn never changes
+under itself: the lead's next turn reads them, at the cost of one call
+the prompt cache cannot serve.
 
 Sonny installs a `memory` skill ([SKILL.md](../sonny/skills/memory/SKILL.md))
 that says to use those indexes, or `show` when they are missing or old,
@@ -904,6 +915,13 @@ a lookout note (counted only on from what it was shown, unbroken, so a post its 
 copy of a wiki page meets an edit conflict: the answer is the posts it
 missed, as `read` gives them, with `posted: false` and a line saying so,
 and they then count as shown, so the same reply sent again is posted.
+A board reply with no text, the step alone (`do`, or `needs`, `labels` or
+`for` changes), is posted the first time: it says nothing the missed posts
+could make stale, and the board's own checks of where the work stands
+guard the step. Its answer carries the missed posts under `missed`, as
+`read` gives them from the first not shown (`from`, and `next` and `of`
+past a page), and they count as shown, a later page only once read;
+26 of 33 pauses in George's 11-23 feedback took two calls before.
 Invited agents read a new thread at once, before any of them answers,
 and posted the same answer side by side (one thread had 11 replies in a
 minute, 3 alike); each one's count is in `.shown`, by its name and the daemon's id for it, so a new agent given a gone one's name starts shown nothing, and a side chat, which signs as its agent, counts as itself; the lookout writes what its notes told beside its loop. Search is a plain scan of the folder with no model and no
@@ -1049,7 +1067,7 @@ Boards are places in the commons (e.g. `shop` or `shop/typed-errors`) where a ta
 - **Commons tool:** `post` with `board` starts a thread there, and with `work: true` it is work (`needs`, `labels`, `for` agents or `profile:NAME`). `reply` with `do` moves it: `take`, `drop`, `done`, `fail`, `open`. A reply that only changes fields is stored as `set`.
 - **Event-sourced, no lease:** State (`open`, `waiting`, `taken`, `done`, `failed`, `canceled`) is read from the thread's posts. Finishing what work needs opens it. A closed holder's work can be taken over. A turn that ends holding work the agent wrote nothing about is told once, and a holder's thread silent for `[sonny] hold_quiet` (15 minutes) tells it once.
 - **Follows that steer:** posts on a board's threads reach the holder, the agents asked, and posters at once, with why. Opening or taking work follows its board (`board.NAME`), as a task's agents do. `@NAME` tells a live agent once.
-- **Invites and `for`:** a board's first thread draws one round of invites, aimed at live agents by its rarest words. `for` asks the agents it names as soon as the work opens, outside the day's budget, and an agent started later as that profile is asked at start.
+- **Invites and `for`:** a plain thread on a board draws invites as one off a board does. Work draws none of its own: a turn that opens work on a board sends one round of invites for that board at its end, listing the work it opened and asking for a draft, a fix or a finding that bears on it, said in that work's thread, under the day's budget. `for` asks the agents it names as soon as the work opens, outside the day's budget, and an agent started later as that profile is asked at start.
 - **Tasks hold agents:** `start_task` takes `agents`, a mix of `{model, profile, effort, count}`, and `board`. Started with a task's name on a board, they join it as its next numbers.
 - **UI & toggle:** `/commons` shows a **Boards** section above threads; a board that holds no work, only plain threads, has no mark and no counts, and a plain thread on a board names its board in the list. `m` lists work among the threads (`m work`, then `m no work`). A board's page lists work by state, then its plain threads, each writer a link as a holder is, and shows when each holder last wrote and work kept for agents nobody listed (`nobody eligible`). Disable with `[sonny] boards = false`.
 
@@ -1128,9 +1146,20 @@ events `opened`, `taken`, `dropped`, `done`, `failed`, `canceled`,
 rules differ. `@NAME` of a live agent in a post or a reply tells that
 agent once and follows nothing.
 
-A board's first thread draws one round of the commons' invites, aimed at
-live agents whose turns touched the thread's rarest words (a word with a
-digit in it is no subject). `for` asks the live agents it names, by name
+A plain thread on a board draws the commons' invites as one off a board
+does, aimed at live agents whose turns touched the thread's rarest words
+(a word with a digit in it is no subject). Work draws none of its own:
+the tool host notes the work each turn opens (a post of work, or a reply
+that makes a thread work), and at the turn's end, however it ended,
+sends one round for each board it opened work on, under the day's
+budget as one thread, aimed by the rarest words of that work's titles
+and first posts. The note lists the work by thread and title and asks
+for opinions, not takers: a draft, a fix or a finding that bears on one,
+said in its thread. Work kept for some (`for`) stays listed. A round
+counts as answered by a post in any thread it listed. A plan posted
+whole asks once; a piece posted later asks in a round of its own. The
+file that gave each board one round on its first thread
+(`~/.agents/commons/.boards`) is removed once on upgrade. `for` asks the live agents it names, by name
 or by the profile each was made as, to take the work when it opens, at
 once for open work or when its needs are done: a steer with no token cap,
 outside the day's budget, since it starts real work. When no live agent
@@ -1629,6 +1658,7 @@ Instead of dumping dozens of individual MCP tool schemas into every model prompt
 - **Code mode (`[sonny] code_mode = true`, default):** Exposes the agent's built-in tools (`tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch`, `tools.web_fetch`) inside `exec` as well, hiding raw tool schemas via `steps_only`.
 - **Tool discovery & limits:** `ALL_TOOLS` and `tools.tool_search(query)` find tools beyond the 3,000-token TypeScript header; `store`/`load` persist small values between scripts. Limits: 256 MiB heap, 10m timeout (overridable with `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}`), 10k-token return (full output saved to disk up to 1 GiB for 7 days), 8 concurrent in-script calls, 16 MiB per call result.
 - **Shared server pool:** `sonny-tool-host` maintains one connection per server across all agents (started on first call, stopped after 10 idle minutes) and caches tool schemas in `~/.agent/sonny/mcp`.
+- **Outside agents (`sonny mcp exec SCRIPT`, or `-` for stdin):** Runs one such script as the person, each `text()` a line on stdout as it is said, every call on one connection to each server for the whole script, so a lookout source pages a server that keeps cursors per session ([Lookout](LOOKOUT.md#sources-that-call-mcp-tools)).
 
 ![The every-tool-call view: a lead's script ran shell once as a step of its exec call, its result under the row](sonny/code-mode-script.png)
 
@@ -1827,6 +1857,7 @@ stop the picked one with all it started, naming its command; Enter stops it
 # Run on your laptop (the machine with logins/browser/MCP)
 sonny link devbox              # or me@devbox.example.com [--machine NAME] [--name NAME]
 sonny link                     # inspect active links and connected machines
+sonny link browser [URL]       # open the link's shared browser here, to sign in for its agents
 sonny link off devbox
 sonny link forget laptop       # run on the host to forget a linked machine
 ```
@@ -1839,7 +1870,7 @@ sonny link forget laptop       # run on the host to forget a linked machine
 
 ### What host agents can do on a linked machine
 
-- **Browser (`browser` with `machine: "laptop"`):** Runs tabs in a dedicated shared Chrome instance copied once from your `browser_profile` (default `"Default"`; refreshes cookies and native messaging hosts on start, closes after 30 idle minutes). Screenshots return inline; file outputs (PDF, HAR, recordings up to 30 MiB) stream back to approved host paths.
+- **Browser (`browser` with `machine: "laptop"`):** Runs tabs in a dedicated shared Chrome instance copied once from your `browser_profile` (default `"Default"`; links native messaging hosts on start, closes after 30 idle minutes). It keeps the sign-ins you make in it with `sonny link browser URL`, or, with `browser_signins = "copied"`, merges your newer cookies in at each start. Screenshots return inline; file outputs (PDF, HAR, recordings up to 30 MiB) stream back to approved host paths.
 - **Desktop (`desktop` with `machine: "laptop"`):** Runs `agent-desktop` on the linked machine with action approvals routed to the host agent's gate.
 - **MCP (`exec`):** Prefix a script with `// @exec: {"machine": "laptop"}` to run against that machine's MCP servers (listed under `# On NAME`).
 - **Shell and files (`tools.shell`, `read`, `write`, `edit`, `apply_patch` with `machine: "laptop"`):** In code mode, a script's call of the agent's own shell or file tool that names a machine is decided on the host as the same call would be (its rules and approvals), then runs on the laptop with `agent tool`, in the laptop's sandbox: read-only unless the link lists `writable` folders, the network off unless `network = true` with them, in the foreground, never leaving the sandbox. A call stopped on the host stops its commands on the laptop too; output past what the model sees is kept whole in a file there, named in the result for a `read` on the laptop; and commands get none of the laptop's `[shell_environment_policy] exclude` variables, `~/.agent/keys/env` keys or provider keys.
@@ -1854,6 +1885,7 @@ host = "devbox"
 machine = "laptop"
 command = "/home/me/.local/bin/sonny"
 browser_profile = "Default"    # Chrome profile name, path, or "" for fresh browsers
+browser_signins = "copied"     # copied: yours merged in at each start; own: sign-ins made in it (default: copied)
 calls = 16                     # max concurrent remote calls (default: 4 × CPUs)
 upgrade = true                 # the end behind upgrades as the link connects (default: true)
 writable = ["~/code/shop"]     # folders the host's agents' shell and file tools write here; the first is where they start (default: none, read-only)
@@ -1878,6 +1910,7 @@ run macOS or Linux. On the machine to link:
 ```sh
 sonny link devbox          # or me@devbox.example.com; --machine NAME, --name NAME
 sonny link                 # the links, and the machines linked here
+sonny link browser [URL]   # the link's shared browser in a window here, to sign in for its agents
 sonny link off devbox
 sonny link forget laptop   # on the host: forget a machine linked to it
 ```
@@ -1893,6 +1926,7 @@ host = "devbox"                 # what ssh dials
 machine = "laptop"              # what the agents there call this machine; its hostname by default
 command = "/home/me/.local/bin/sonny"   # Sonny there, as setup found it
 browser_profile = "Default"     # the Chrome profile their shared browser is copied from once, or a folder; "" a fresh one each
+browser_signins = "copied"      # copied: yours merged in at each start; own: the sign-ins made in it; copied by default
 calls = 16                      # how many of their calls this machine runs at once; 4 per CPU by default
 upgrade = true                  # the end behind runs `sonny upgrade` as the link connects; on by default
 ```
@@ -1913,7 +1947,7 @@ The host's agents see each linked machine by name:
 
 - `browser` takes `machine`. The commands run in that machine's
   agent-browser, each agent in a tab of its own of one Chrome the link's
-  agents share, signed in as the person is there. That Chrome runs on a
+  agents share. That Chrome runs on a
   profile kept for the link in `~/.agent/sonny/links/NAME/chrome`: copied
   once from the person's Chrome profile `browser_profile` names, and again
   only when that name changes, so the person's own Chrome is left alone and
@@ -1921,9 +1955,29 @@ The host's agents see each linked machine by name:
   device check) stays across restarts. Each time that Chrome starts, the
   person's native messaging hosts (`NativeMessagingHosts` beside their
   profiles, which an extension such as a company's device check talks to)
-  are linked into the kept profile, and their `Cookies` are copied over
-  the kept profile's, so signing in again in their own Chrome reaches the
-  shared browser at its next start. An agent's `close` ends its tab, and
+  are linked into the kept profile.
+
+  Chrome (158 on, macOS) seals the cookies of a profile folder other than
+  its own with a key of that folder's, so the person's cookies copied
+  into the kept profile are dropped as it starts. `browser_signins` says
+  where its sign-ins come from instead:
+
+  - `"own"`: the ones made in it, kept as any profile keeps
+    them. `sonny link browser [NAME] [URL]` on the linked machine starts
+    that Chrome again in a window there at `URL`, for the person to sign
+    in; the link's agents use it at their next call, and an agent on a
+    sign-in page asks the person to do this.
+  - `"copied"`, the default: the person's. Sonny starts that Chrome with Chrome's
+    protection off (`--disable-features=KeychainKeyProviderUserDataDirProtection`),
+    and at each start merges each of the person's cookies the kept
+    profile has no newer version of into its `Cookies`, so signing in
+    again in their own Chrome reaches the shared browser at its next start,
+    and a sign-in made in it stays. This turns off a protection Chrome
+    added against copying a person's cookies; once Chrome drops that
+    switch, it reads like `"own"`, and the person signs in there once more.
+
+  Changing it costs a sign-in in the kept profile per site, as each seals
+  cookies with its own key. An agent's `close` ends its tab, and
   Sonny closes that Chrome once no agent of the link has a tab in it, so
   the next open starts it again. A `browser_profile` that is a
   folder is used as it is; `""` gives each agent a fresh browser of its

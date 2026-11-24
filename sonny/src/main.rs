@@ -496,6 +496,10 @@ struct Options {
     draft: Option<PathBuf>,
     /// This window reopened on a Sonny installed while it was open.
     reopened: bool,
+    /// Opened by going to its agent where it needs the person (`alt+n`,
+    /// `enter` on its row in `/status`): what it needs is brought into
+    /// view once known.
+    land: bool,
 }
 
 fn usage() -> String {
@@ -1010,10 +1014,12 @@ impl App {
         let waiting = elsewhere::round(&local, &elsewhere);
         match elsewhere::next(&waiting, &self.bot) {
             None => self.notice = Some("no one needs you".into()),
-            Some(to) if to == self.bot => {}
+            // This window's own: what it needs brought into view.
+            Some(to) if to == self.bot => self.land_needs(),
             Some(to) => {
                 let to = to.to_owned();
                 self.carry_draft = true;
+                self.land_after = true;
                 self.switch_window(to);
             }
         }
@@ -3537,6 +3543,7 @@ fn parse() -> Result<Options, String> {
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
     let (mut window_place, mut send, mut draft, mut reopened) = (None, None, None, false);
+    let mut land = false;
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -3569,6 +3576,9 @@ fn parse() -> Result<Options, String> {
             // was open, with what was typed in its composer.
             "--draft-file" => draft = Some(PathBuf::from(value()?)),
             "--reopened" => reopened = true,
+            // Unlisted: how going to an agent that needs the person lands
+            // on what it needs.
+            "--land" => land = true,
             _ => return Err(usage()),
         }
     }
@@ -3590,6 +3600,7 @@ fn parse() -> Result<Options, String> {
         send,
         draft,
         reopened,
+        land,
     })
 }
 
@@ -3603,7 +3614,7 @@ fn reopen(bot: &str) -> Vec<String> {
     let mut args = given.iter().skip(1).cloned().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--new" | "--reopened" => {}
+            "--new" | "--reopened" | "--land" => {}
             "--folder" | "--lead" | "--agent" | "--window-place" | "--send-file"
             | "--draft-file" => {
                 args.next();
@@ -4281,10 +4292,12 @@ async fn run() -> Result<bool, String> {
     }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), whatever set its instructions before; a file of
-    // the folder's it cannot use is left out, and said. Only here, as the
-    // window opens, as Codex reads its instructions once as a session
-    // starts: they lead every request, so a change while the lead works
-    // would cost its next call the whole prompt cache.
+    // the folder's it cannot use is left out, and said. Memory only here,
+    // as the window opens, as Codex reads its instructions once as a
+    // session starts: they lead every request, so a fact saved while the
+    // lead works would cost its next call the whole prompt cache. A role,
+    // rule or skill the person changes reaches it at its next turn's end,
+    // window or not (`turn_end::renew`).
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
@@ -4411,6 +4424,9 @@ async fn run() -> Result<bool, String> {
             .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
         if let Some(draft) = &draft {
             args.extend(["--draft-file".into(), draft.display().to_string()]);
+        }
+        if app.land_after {
+            args.push("--land".into());
         }
         // The next window's own arguments, as a Sonny started on it has.
         let mut given = vec![std::env::args().next().unwrap_or_else(|| "sonny".into())];
@@ -5050,6 +5066,22 @@ fn context_after(event: &Value) -> Option<u64> {
     (event["event"] == "usage" && data["purpose"].is_null()).then(|| {
         call["input_tokens"].as_u64().unwrap_or(0) + call["output_tokens"].as_u64().unwrap_or(0)
     })
+}
+
+/// A look for an agent's tab off the screen ([`App::open_agent`]).
+type TabLook = tokio::task::JoinHandle<Result<(), String>>;
+
+/// What going to this window's agent lands on ([`App::land_tick`]).
+#[derive(Clone, Debug, PartialEq)]
+enum Landing {
+    /// What it needs: the call waiting on the person, else the question
+    /// the composer answers. `wait`, for a window opened to land: until
+    /// the store's one follow has told what it knows, as a question asked
+    /// further back than the window drew is known only from there.
+    Needs { wait: bool },
+    /// The card of the question at this key, and the pages let go that
+    /// were drawn again for it, each once.
+    Ask(String, Vec<u64>),
 }
 
 /// What a page of older items was drawn from: its nodes, the turn each
@@ -6576,8 +6608,9 @@ struct App {
     /// began: the branch can change under a running turn.
     place_job: Option<(String, tokio::task::JoinHandle<place::Place>)>,
     /// The agent whose tab is being looked for, from a window with no
-    /// layout of its own, and the look.
-    tab_job: Option<(String, tokio::task::JoinHandle<Result<(), String>>)>,
+    /// layout of its own, whether it lands on what it needs should it
+    /// open in the pane after all, and the look.
+    tab_job: Option<(String, bool, TabLook)>,
     /// When the person last used this window, for a lead that keeps only
     /// so many task windows open.
     window_used: used::Marks,
@@ -6699,6 +6732,10 @@ struct App {
     /// The asks this window answered and closed, by call, until their
     /// answers land.
     sent_answers: Vec<String>,
+    /// The agent's own open questions a message from here told it were
+    /// set aside ([`asks::set_aside`]), by id, while they are still open
+    /// here: told once, though more messages go before that one lands.
+    told_aside: Vec<String>,
     /// The tasks' asks this window answered, by [`asks::Ask::key`], until
     /// their tasks read them: none is pinned again meanwhile.
     task_answers: Vec<TaskAnswer>,
@@ -6752,6 +6789,15 @@ struct App {
     /// What is typed goes with the window to the agent it switches to:
     /// `alt+n` works with words typed, which it never drops.
     carry_draft: bool,
+    /// The window switched to lands on what its agent needs: it was gone
+    /// to as one that needs the person (`alt+n`).
+    land_after: bool,
+    /// Going to what this window's agent needs, until it is in view
+    /// ([`App::land_tick`]).
+    landing: Option<Landing>,
+    /// The turn of the oldest node drawn, when known: a question asked
+    /// in a later turn is drawn already, if anywhere.
+    first_turn: Option<i64>,
     /// Drawn in another's pane: whether that one was last told this
     /// window holds work ending it would lose ([`embed::keeps`]).
     told_keeps: bool,
@@ -9011,6 +9057,7 @@ impl App {
             watched: HashMap::new(),
             watched_at: None,
             sent_answers: Vec::new(),
+            told_aside: Vec::new(),
             task_answers: Vec::new(),
             rechecking: None,
             settling: None,
@@ -9035,6 +9082,9 @@ impl App {
             quit: false,
             switch_to: None,
             carry_draft: false,
+            land_after: false,
+            landing: None,
+            first_turn: None,
             told_keeps: false,
             heard: false,
             reopen_on: None,
@@ -9374,6 +9424,11 @@ impl App {
                 }
             }
         }
+        // Gone to as an agent that needs the person: what it needs comes
+        // into view once known.
+        if self.options.land {
+            self.landing = Some(Landing::Needs { wait: true });
+        }
         let (keys_tx, keys) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(read_keys(keys_tx));
         self.run(terminal, events, keys).await
@@ -9517,7 +9572,7 @@ impl App {
                             continue;
                         }
                         Err(Told::Beside(bot)) => {
-                            self.open_task(&bot);
+                            self.open_task(&bot, false);
                             continue;
                         }
                     };
@@ -9678,6 +9733,12 @@ impl App {
                 self.press(&what).await;
             }
             changed |= self.older_came().await;
+            // Going to what this window's agent needs, a step each time
+            // round until it is in view.
+            if self.landing.is_some() {
+                self.land_tick();
+                changed |= self.landing.is_none();
+            }
             // On the way up to the first turn, a page each time round.
             if self.to_first && self.older.is_some() && self.screen.near_top() {
                 self.older();
@@ -9693,6 +9754,10 @@ impl App {
             }
             let again = self.again_came().await;
             changed |= again.is_some();
+            // A page read short is not drawn: a landing on it stops, as find does.
+            if again == Some(true) {
+                self.landing = None;
+            }
             if let Some((older, looked)) = &mut self.find_step
                 && self.again.is_none()
             {
@@ -10571,6 +10636,7 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
             Err(_) => {
                 self.older_read = None;
+                self.landing = None;
                 return false;
             }
         };
@@ -10583,8 +10649,10 @@ impl App {
             Ok(page) => page,
             Err(error) => {
                 self.notice = Some(error.to_string());
-                // Not asked again at once: the way up stops.
+                // Not asked again at once: the way up stops, and so does
+                // a landing that read back.
                 self.to_first = false;
+                self.landing = None;
                 return true;
             }
         };
@@ -10618,6 +10686,7 @@ impl App {
             let cut = nodes.len().saturating_sub(OLDER_ITEMS as usize);
             let ours = nodes.split_off(cut);
             self.first_node = Some(ours[0]);
+            self.first_turn = turns.get(&ours[0]).copied();
             let turns = (ours.iter())
                 .filter_map(|node| Some((*node, *turns.get(node)?)))
                 .collect();
@@ -10698,6 +10767,7 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
             Err(_) => {
                 self.again = None;
+                self.landing = None;
                 return None;
             }
         };
@@ -11772,7 +11842,7 @@ impl App {
     /// An agent picked or clicked where its name is listed: opened as
     /// [`Self::open_agent`] opens it; this window's own is here already,
     /// so `/status` listing it closes, as Esc does.
-    fn open_picked(&mut self, bot: &str) {
+    fn open_picked(&mut self, bot: &str, land: bool) {
         // Opening anything ends a confirm, as a key other than `enter`
         // does: a stop asked on one run never stops it from another's page.
         self.keep_asked();
@@ -11785,10 +11855,17 @@ impl App {
             return;
         }
         if bot != self.bot {
-            return self.open_agent(bot, false);
+            // Opened in the pane, it lands on what it needs there.
+            self.open_agent(bot, false, land);
+            return;
         }
         if self.pane.as_ref().is_some_and(pane::Pane::is_card) {
             self.close_pane(false);
+        }
+        // This window's own, where it needs the person: what it needs
+        // brought into view, the keys in the composer.
+        if land {
+            self.land_needs();
         }
     }
 
@@ -11813,8 +11890,8 @@ impl App {
     /// An agent named or picked: to its own tab, when the lead's layout
     /// has one for it, or a look at it in the pane, as `[sonny]
     /// agent_opens` says; `other`, a right click, the one it doesn't. With
-    /// no tab, it opens in the pane.
-    fn open_agent(&mut self, bot: &str, other: bool) {
+    /// no tab, it opens in the pane, landing on what it needs with `land`.
+    fn open_agent(&mut self, bot: &str, other: bool, land: bool) {
         use agent_client::config::AgentOpens;
         let tab = (self.agent_opens == AgentOpens::Tab) != other;
         match &mut self.fleet {
@@ -11844,38 +11921,44 @@ impl App {
                         .map_err(|e| e.to_string())?
                     }
                 });
-                self.tab_job = Some((bot, job));
+                self.tab_job = Some((bot, land, job));
             }
-            _ => self.open_task(bot),
+            _ => self.open_task(bot, land),
         }
     }
 
     /// The tab looked for off the screen: with none, the agent opens in
     /// the pane, as a click on it does where nothing is laid out.
     async fn follow_tab(&mut self) {
-        if let Some((_, job)) = &self.tab_job
+        if let Some((_, _, job)) = &self.tab_job
             && job.is_finished()
         {
-            let (bot, job) = self.tab_job.take().unwrap();
+            let (bot, land, job) = self.tab_job.take().unwrap();
             if !matches!(job.await, Ok(Ok(()))) {
-                self.open_task(&bot);
+                // Landed on there as it would have been had it opened at once.
+                self.open_task(&bot, land);
             }
         }
     }
 
     /// The task `bot` opened in the pane: its own Sonny, to watch it and
-    /// talk to it.
-    fn open_task(&mut self, bot: &str) {
+    /// talk to it, landing on what it needs with `land`.
+    fn open_task(&mut self, bot: &str, land: bool) {
         // Drawn in another's pane with no room for one of its own, the
         // Sonny it is drawn in shows the agent there instead, this one
         // kept to go back to.
         if !self.room_beside() {
-            return embed::open_here(bot);
+            return embed::open_here(bot, land);
         }
         let name = (self.tasks.values().flatten())
             .find(|task| task.bot == bot)
             .map_or(bot.to_owned(), |task| task.name.clone());
-        let args = ["--no-sound", "--no-layout", "--embedded", "--agent", bot].map(str::to_owned);
+        let mut args = ["--no-sound", "--no-layout", "--embedded", "--agent", bot]
+            .map(str::to_owned)
+            .to_vec();
+        if land {
+            args.push("--land".into());
+        }
         match self.embed(&name, &args) {
             // Its title's button opens it in the main view.
             Ok(()) => {
@@ -12040,10 +12123,12 @@ impl App {
                     watch.pick = Some(at);
                 }
             }
-            self.open_picked(bot);
+            // A row of `/status` lands on what its agent needs, as `enter`
+            // there does; an agent's name elsewhere only goes to it.
+            self.open_picked(bot, button.starts_with("task/"));
         }
         if let Some(bot) = button.strip_prefix("other/") {
-            self.open_agent(bot, true);
+            self.open_agent(bot, true, false);
         }
         // A run's name under the reply that ran it opens its page.
         if let Some(run) = button.strip_prefix("run/") {
@@ -12086,6 +12171,10 @@ impl App {
         if let Some(key) = button.strip_prefix("card/") {
             self.card_clicked(key);
         }
+        // The question's words in the composer: its card brought into view.
+        if let Some(key) = button.strip_prefix("land/") {
+            self.land_on(key.to_owned());
+        }
         // A request folded to its verdict, opened whole or folded again.
         if let Some(tag) = (button.strip_prefix("request/")).and_then(|tag| tag.parse::<u64>().ok())
             && let Some(key) = (self.written.iter())
@@ -12118,6 +12207,9 @@ impl App {
             };
             let answer = asks::answer(&ask, &(at + 1).to_string());
             self.notice = None;
+            // An answer goes back to the newest rows, where what it starts
+            // comes, as sending does.
+            self.screen.latest();
             match &ask.task {
                 Some(_) => self.answer_task(&ask, &answer, &[], None),
                 None => self.send(answer, None, (false, false), &[], Then::Closes(ask)),
@@ -13709,6 +13801,9 @@ impl App {
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
+            if self.first_node == Some(first) {
+                self.first_turn = turns.get(&first).copied();
+            }
         }
         // The newest page read on attaching, known only now to start the
         // conversation or not: the welcome goes first, before any of it is
@@ -13930,6 +14025,7 @@ impl App {
                     // the reply: no hint hangs on either.
                     let steer = item["role"] == "user"
                         && !reactions::is_reaction(&text(&item))
+                        && !asks::told_aside(&text(&item))
                         && turns
                             .get(&node)
                             .is_some_and(|turn| turns.get(&at) == Some(turn));
@@ -13942,6 +14038,9 @@ impl App {
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
                     (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
+                    // What Sonny told the agent of its questions set
+                    // aside: the cards say it.
+                    (_, Some("user")) if asks::told_aside(&text(&item)) => {}
                     // The person took a note away: the margin shows it.
                     (_, Some("user")) if margin::closed(&text(&item)).is_some() => {
                         self.note_closed(node, &text(&item));
@@ -14836,8 +14935,11 @@ impl App {
                 if changed("gates") && self.gating.take().is_some() {
                     dropped.push("permissions");
                 }
-                if changed("instructions") && self.instruct.take().is_some() {
-                    dropped.push("instructions");
+                // The folder's instructions as the window opened, no pick
+                // of the person's: those given since, as at a lead's turn
+                // end, are as new.
+                if changed("instructions") {
+                    self.instruct = None;
                 }
                 if changed("speed") && self.pace.take().is_some() {
                     dropped.push("speed");
@@ -15460,7 +15562,12 @@ impl App {
                         staged_body(&prompt, width, None, Path::new(&self.workspace), true);
                     lines.push(Line::default());
                     let why = data["detail"].as_str().or(data["error"].as_str());
-                    lines.push(transcript::finished("not run", why.unwrap_or(""), None));
+                    lines.extend(transcript::finished(
+                        "not run",
+                        why.unwrap_or(""),
+                        None,
+                        width,
+                    ));
                     self.commit(lines);
                 }
             }
@@ -15521,7 +15628,7 @@ impl App {
                         let reached = !untouched || acted || turn.is_none() || turn != self.yours;
                         transcript::refused(data, reached, self.prose())
                     }
-                    _ => vec![transcript::finished(status, shown, seconds)],
+                    _ => transcript::finished(status, shown, seconds, self.prose()),
                 };
                 if only_reacted {
                     self.draw_bot_reactions();
@@ -16940,6 +17047,8 @@ impl App {
             true => self.approvals.remove(at),
             false => self.raised.remove(at),
         };
+        // Answered, back to the newest rows, as an answer to a question.
+        self.screen.latest();
         let bot = call["bot"].as_str().unwrap_or(&self.bot).to_owned();
         let asked = json!({"bot": bot, "turn": call["turn"], "call_id": call["call_id"],
             "request": call["request"], "tag": person_gate(&call), "decision": decision,
@@ -17455,7 +17564,7 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Right if plain => {
                     if let Some(caller) = caller {
-                        self.open_picked(&caller);
+                        self.open_picked(&caller, false);
                     }
                     return true;
                 }
@@ -17536,13 +17645,13 @@ impl App {
                     // Enter goes to the picked agent; on a heading it
                     // does the heading's one thing, opening or folding.
                     (KeyCode::Enter, Some(Picked::Agent(bot) | Picked::Task(_, bot))) => {
-                        self.open_picked(&bot)
+                        self.open_picked(&bot, true)
                     }
                     // `→` goes into a workflow's row, as `enter` does.
                     (KeyCode::Right, Some(Picked::Agent(bot)))
                         if workflow::view::split(&bot).1.is_some() =>
                     {
-                        self.open_picked(&bot)
+                        self.open_picked(&bot, false)
                     }
                     (KeyCode::Enter, Some(Picked::Group(group))) => {
                         if let Some(watch) = &mut self.watch {
@@ -18001,6 +18110,7 @@ impl App {
                     // the newest page, the way up starts over.
                     true if self.screen.trimmed() => {
                         self.first_node = None;
+                        self.first_turn = None;
                         self.older = None;
                         self.unpaired.clear();
                         self.repaint = true;
@@ -18130,7 +18240,7 @@ impl App {
     fn enter_agent(&mut self, bot: &str) {
         self.close_pane(true);
         if bot != self.bot {
-            self.open_agent(bot, false);
+            self.open_agent(bot, false, false);
         }
     }
 
@@ -18408,7 +18518,7 @@ impl App {
                         watch.pick = Some(at);
                     }
                     if let Picked::Task(_, bot) = picked {
-                        self.open_picked(&bot);
+                        self.open_picked(&bot, true);
                     }
                 }
             }
@@ -18841,6 +18951,11 @@ impl App {
             return;
         }
         self.heard = true;
+        // The person moved on: a landing still under way does not take
+        // the view from them later. A key that lands sets one anew.
+        if (used(&event) && !matches!(event, Event::FocusGained)) || is_wheel(&event) {
+            self.landing = None;
+        }
         // A stop or a removal asked for in the pane lives only while the
         // keys stay there: whatever took them away (a click, Ctrl+\, a
         // paste) said no, so the view never waits armed for their return.
@@ -20123,6 +20238,12 @@ impl App {
         let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
+        // An answer sets nothing aside, though a card read with no turn
+        // names its ask by the call alone until it goes ([`repick`]).
+        let aside = match pick {
+            Some(_) => None,
+            None => self.tell_aside(&prompt, origin),
+        };
         // Shown where it will land while it goes, under a number of its own.
         self.unsent_rows += 1;
         let sending = -self.unsent_rows;
@@ -20138,7 +20259,29 @@ impl App {
             submitted,
             then,
             pick,
+            aside,
         }
+    }
+
+    /// What the agent is told with `prompt`, sent from `origin`, when its
+    /// words set the agent's own open questions aside, as every reader of
+    /// its history will ([`asks::moves_on`]): its tasks' wait on the
+    /// person still. Each question is told once.
+    fn tell_aside(&mut self, prompt: &str, origin: Option<&str>) -> Option<String> {
+        let own = |ask: &&asks::Ask| ask.task.is_none();
+        let open: Vec<&asks::Ask> = self.asks.iter().filter(own).collect();
+        self.told_aside
+            .retain(|told| open.iter().any(|ask| ask.id == *told));
+        if !asks::moves_on(prompt, origin) {
+            return None;
+        }
+        let untold: Vec<asks::Ask> = (open.into_iter())
+            .filter(|ask| !self.told_aside.contains(&ask.id))
+            .cloned()
+            .collect();
+        self.told_aside
+            .extend(untold.iter().map(|ask| ask.id.clone()));
+        asks::set_aside(&untold)
     }
 
     /// `prompt` sent as the person's words and the daemon's answer
@@ -21589,6 +21732,149 @@ impl App {
             false => (at + count - 1) % count,
         };
         self.focus = self.asks.get(to).map(asks::Ask::key);
+        // Each one's card brought into view as the composer comes to it.
+        if let Some(key) = self.focus.clone() {
+            self.land_on(key);
+        }
+    }
+
+    /// What this window's agent needs brought into view: the call waiting
+    /// on the person, else the question the composer answers, as `alt+n`
+    /// and `enter` on its row in `/status` go to it. Nothing, when it
+    /// needs nothing.
+    fn land_needs(&mut self) {
+        self.landing = Some(Landing::Needs { wait: false });
+        self.land_tick();
+    }
+
+    /// The card of the question at `key` brought into view: the composer
+    /// switched to it, or its words there clicked.
+    fn land_on(&mut self, key: String) {
+        self.landing = Some(Landing::Ask(key, Vec::new()));
+        self.land_tick();
+    }
+
+    /// A step on the way to what [`App::landing`] lands on, each pass of
+    /// the loop until it is in view: a card the screen holds is brought
+    /// into view at the next draw; one in a page let go is drawn again in
+    /// its place, and one older than the window drew is read back to a
+    /// page at a time, both beside the loop as the wheel's pages are. A
+    /// card is never drawn a second time.
+    fn land_tick(&mut self) {
+        let (key, mut searched) = match &self.landing {
+            None => return,
+            Some(Landing::Ask(key, searched)) => (key.clone(), searched.clone()),
+            Some(Landing::Needs { wait }) => {
+                let wait = *wait;
+                // The rows committed so far on the screen, the call
+                // written out among them.
+                self.flush();
+                if let Some(tag) = (self.waiting())
+                    .and_then(|call| self.written.get(&self.aside_key(call)))
+                    .map(|written| screen::Tag::Request(written.tag))
+                    .filter(|tag| self.screen.has(*tag))
+                {
+                    self.landing = None;
+                    self.screen.land(tag, "⏸");
+                    return;
+                }
+                match self.needed_ask() {
+                    // What is typed next answers it, as a number does at
+                    // once: words already typed stay the person's own.
+                    Some(key) => {
+                        if self.blank() {
+                            self.chatting = false;
+                        }
+                        (key, Vec::new())
+                    }
+                    None if wait && self.untold() => return,
+                    None => {
+                        self.landing = None;
+                        return;
+                    }
+                }
+            }
+        };
+        self.landing = Some(Landing::Ask(key.clone(), searched.clone()));
+        self.flush();
+        if let Some((tag, ..)) = self.cards.get(&key)
+            && self.screen.has(screen::Tag::Ask(*tag))
+        {
+            let tag = screen::Tag::Ask(*tag);
+            self.landing = None;
+            self.screen.land(tag, "?");
+            return;
+        }
+        // A task's card is drawn where it was pinned: none there, none.
+        let own = !key.starts_with('@');
+        let turn = asks::turn_of(&key);
+        // A page being drawn again is waited for.
+        if self.again.is_some() {
+            return;
+        }
+        // In a page let go: drawn again in its place, once for this
+        // landing, as drawing one can let another go. One that drew no rows
+        // was never put in, so the read goes on past it.
+        if own
+            && let Some(turn) = turn
+            && let Some(page) = (self.pages.iter())
+                .filter(|(id, _)| self.screen.let_go_page(**id) && !searched.contains(*id))
+                .find(|(_, paged)| paged.turns.values().any(|at| *at == turn))
+                .map(|(id, _)| *id)
+        {
+            self.draw_again(page);
+            searched.push(page);
+            self.landing = Some(Landing::Ask(key, searched));
+            return;
+        }
+        // Older than the window drew: read back a page at a time, never
+        // past its turn nor rows trimmed away.
+        let past = (self.first_turn).is_some_and(|first| turn.is_some_and(|turn| first < turn));
+        if own && self.older.is_some() && !past && !self.screen.trimmed() {
+            self.older();
+            return;
+        }
+        self.landing = None;
+    }
+
+    /// The key of the question the composer answers, else of this window's
+    /// own asked further back than it drew, as the store's one follow
+    /// knows it, pinned here for the composer to answer as its card is read
+    /// back to.
+    fn needed_ask(&mut self) -> Option<String> {
+        if let Some(ask) = self.asks.get(self.at()) {
+            return Some(ask.key());
+        }
+        let ask = match &self.other_projects {
+            Some((open, _)) => open.waiting.borrow().asks.get(&self.bot).cloned(),
+            None => None,
+        }
+        .or_else(|| {
+            let fleet = self.fleet.as_ref()?;
+            (fleet.needs.asks())
+                .find(|(bot, _)| *bot == self.bot)
+                .map(|(_, ask)| ask.clone())
+        })?;
+        let key = ask.key();
+        if ask.task.is_some()
+            || self.settled.contains_key(&key)
+            || self.aside.iter().any(|aside| aside.key() == key)
+        {
+            return None;
+        }
+        self.keep_draft();
+        self.asks.push(ask);
+        self.focus = Some(key.clone());
+        Some(key)
+    }
+
+    /// The store's one follow has told nothing yet, though it will: it
+    /// starts once the window's own counts are read.
+    fn untold(&self) -> bool {
+        match &self.other_projects {
+            Some((open, _)) => open.waiting.borrow().order.is_empty(),
+            None => self.questions_here() && !self.options.store.as_os_str().is_empty(),
+        }
     }
 
     /// Whether something on the screen moves with time alone, so each
@@ -21602,6 +21888,7 @@ impl App {
             || (self.pane.as_ref()).is_some_and(|pane| pane.is_card() || pane.program.is_some())
             || self.needs_pulse.get().moving(Instant::now())
             || self.elsewhere_pulse.get().moving(Instant::now())
+            || self.screen.pulsing(Instant::now())
     }
 
     /// Whether only words are drawn: the person's, the agent's, its
@@ -22387,7 +22674,7 @@ impl App {
     /// in to show `bot` there instead, leaving the main window as it is.
     fn switch_window(&mut self, bot: String) {
         if self.options.embedded {
-            embed::open_here(&bot);
+            embed::open_here(&bot, std::mem::take(&mut self.land_after));
             return;
         }
         self.switch_to = Some(bot);
@@ -22426,7 +22713,7 @@ impl App {
         let Some(pane) = &self.pane else {
             return;
         };
-        let Some(bot) = (pane.program.as_ref())
+        let Some((bot, land)) = (pane.program.as_ref())
             .filter(|_| pane.agent.is_some())
             .and_then(embed::Embedded::opened)
         else {
@@ -22435,9 +22722,13 @@ impl App {
         // The main window's own agent is already shown there: back to it,
         // as picking it in `/status` goes, the pane put aside for Ctrl+].
         if bot == self.bot {
-            return self.close_pane(false);
+            self.close_pane(false);
+            if land {
+                self.land_needs();
+            }
+            return;
         }
-        self.open_task(&bot);
+        self.open_task(&bot, land);
     }
 
     /// Drawn in another's pane, that one told when this window comes to
@@ -22978,7 +23269,9 @@ impl App {
         // as a reply in a chat has what it replies to.
         let heading = width.min(measure());
         let mut headings = self.quoting_over(heading);
-        headings.extend(self.answering_over(heading));
+        let answering_row = self.answering_over(heading);
+        let answered = answering_row.is_some() && !self.new_brief();
+        headings.extend(answering_row);
         // The newest over the words, the room kept for one row of them.
         let heading_room = room.saturating_sub(1);
         headings.drain(..headings.len().saturating_sub(heading_room));
@@ -23884,6 +24177,24 @@ impl App {
                     let columns = (composer.x + from)..(composer.x + to).min(composer.right());
                     if y < composer.bottom() {
                         opens_at.push((y, columns, format!("{}{bot}", links::AGENT)));
+                    }
+                }
+            }
+            // The question's words, in the hint and on the row over what is
+            // typed: a click brings its card into view.
+            if let Some(key) = self.asking().map(asks::Ask::key) {
+                let hint =
+                    (self.input.is_empty() && self.suggested().is_none()).then_some(headings.len());
+                let over = (answered && !headings.is_empty()).then(|| headings.len() - 1);
+                for row in [over, hint].into_iter().flatten() {
+                    let Some((from, to)) = composer_rows.get(row).and_then(quoted) else {
+                        continue;
+                    };
+                    let y = composer.y + row as u16;
+                    let columns =
+                        (composer.x + from as u16)..(composer.x + to as u16).min(composer.right());
+                    if y < composer.bottom() {
+                        opens_at.push((y, columns, format!("{}land/{key}", screen::BUTTON)));
                     }
                 }
             }
@@ -24969,6 +25280,17 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
 /// The composer's hint `rows` with the task whose question it answers,
 /// named after `from`, in the agents' color, and where. This window's
 /// own agent, after `Steer` or `Message`, is plain words.
+/// The columns a question's words take on a row of the composer, from
+/// its opening quote past its closing one: `Answer “…”` and `answering
+/// “…”` name it so.
+fn quoted(row: &Line) -> Option<(usize, usize)> {
+    let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+    let open = text.find('“')?;
+    let close = text.rfind('”').filter(|close| *close > open)?;
+    let from = text[..open].width();
+    Some((from, text[..close].width() + 1))
+}
+
 fn hint_agents(
     rows: Vec<Line<'static>>,
     names: &[(String, String)],
@@ -25543,6 +25865,9 @@ struct Sent {
     then: Then,
     /// The question it answers, checked as it goes ([`repick`]).
     pick: Option<Pick>,
+    /// What the agent is told first, attached to the model call that
+    /// takes this message: the questions of its own this sets aside.
+    aside: Option<String>,
 }
 
 /// A message answering a question, as it goes: the ask its card names,
@@ -25689,6 +26014,14 @@ async fn submit_message(client: &Client, message: &mut Sent) -> Result<Value, St
         }
     }
     let submitted = message.submitted.clone();
+    // Ahead of the message, so the call that takes it has both: attached,
+    // it joins whichever call the agent makes next, as a reaction does.
+    // Not told, the message goes all the same.
+    if let Some(told) = &message.aside {
+        let attached = json!({"bot": submitted["bot"], "request_id": unique("tui"),
+            "prompt": told, "delivery": "attach", "origin": asks::ASIDE_ORIGIN});
+        let _ = client.request("submit", attached).await;
+    }
     match asks::answer_of(&message.prompt, message.origin) {
         Some(ask) => answer_once(client, ask, submitted).await,
         None => {
@@ -26140,9 +26473,10 @@ fn note_marker(title: String, beside: bool) -> Line<'static> {
 }
 
 /// Whether a message of the person's is drawn elsewhere than as a
-/// message: a reaction under its reply, a note taken away in the margin.
+/// message: a reaction under its reply, a note taken away in the margin,
+/// questions set aside on their cards.
 fn quiet_message(text: &str) -> bool {
-    reactions::is_reaction(text) || margin::closed(text).is_some()
+    reactions::is_reaction(text) || margin::closed(text).is_some() || asks::told_aside(text)
 }
 
 /// A message item's text: a prompt's own words, without the line the
@@ -26938,6 +27272,7 @@ mod tests {
             send: None,
             draft: None,
             reopened: false,
+            land: false,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -27427,13 +27762,56 @@ mod tests {
         assert!(app.told_keeps);
     }
 
+    /// An agent picked in `/status` from a window with no layout of its
+    /// own is looked for in a tab first; should none be found, it opens in
+    /// the pane landing on what it needs, as it would have at once.
+    #[tokio::test]
+    async fn a_status_pick_looked_for_in_a_tab_still_lands_in_the_pane() {
+        use agent_client::config::AgentOpens;
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.bot = "shop.lead".into();
+        app.project = Some("shop".into());
+        app.agent_opens = AgentOpens::Tab;
+        app.fleet = None;
+        app.open_picked("shop.web", true);
+        assert!(matches!(&app.tab_job, Some((bot, true, _)) if bot == "shop.web"));
+        app.tab_job = None;
+        app.open_picked("shop.web", false);
+        assert!(matches!(&app.tab_job, Some((bot, false, _)) if bot == "shop.web"));
+    }
+
+    /// Drawn in another's pane with no room for one of its own, an agent
+    /// gone to from its row in `/status` is asked of the window it is
+    /// drawn in with its landing, and `alt+n` there asks the same.
+    #[tokio::test]
+    async fn an_agent_landed_on_from_a_narrow_pane_is_asked_of_the_window_with_its_landing() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.options.embedded = true;
+        app.open_agent("shop.mail", true, true);
+        assert!(
+            embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.mail;land".to_owned())
+        );
+        app.land_after = true;
+        app.switch_window("shop.ship".into());
+        assert!(!app.land_after);
+        assert!(
+            embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.ship;land".to_owned())
+        );
+    }
+
     #[tokio::test]
     async fn an_agent_clicked_in_another_s_pane_is_asked_of_the_window_it_is_drawn_in() {
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.options.embedded = true;
         // With no tab for it, the window this one is drawn in shows it;
         // this one opens nothing and says nothing.
-        app.open_agent("shop.halves", true);
+        app.open_agent("shop.halves", true, false);
         assert!(app.pane.is_none() && app.notice.is_none());
         assert!(
             embed::OPENED_HERE
@@ -27444,7 +27822,7 @@ mod tests {
         // Wide enough for a pane of its own, as on a large screen, it
         // opens the agent beside its own conversation.
         app.full_width = 200;
-        app.open_agent("shop.webhooks", true);
+        app.open_agent("shop.webhooks", true, false);
         assert_eq!(
             app.pane.as_ref().and_then(|pane| pane.agent.as_deref()),
             Some("shop.webhooks")
@@ -27457,7 +27835,7 @@ mod tests {
                 .contains(&"shop.webhooks".to_owned())
         );
         // Narrowed with a way back in its pane, back still goes there.
-        app.open_agent("shop.refunds", true);
+        app.open_agent("shop.refunds", true, false);
         app.full_width = 0;
         assert!(app.step_pane(true));
         assert_eq!(
@@ -29640,7 +30018,10 @@ mod tests {
         }
         // Its instructions lead every request: sent again between two
         // calls, they would cost the next one the whole prompt cache.
-        // They are taken as a window opens, as Codex reads its own once.
+        // The window takes them as it opens, as Codex reads its own once;
+        // a rule, role or skill changed since reaches the lead at its
+        // turn's end from the tool host, window or not, and memory alone
+        // never does (`project::changed`).
         assert!(app.instruct.is_none());
         let configured: Vec<Value> = (asked.lock().unwrap().iter())
             .filter(|request| request["op"] == "configure")
@@ -29717,6 +30098,12 @@ mod tests {
             [
                 "You asked (ask:1/c0): Bump it?\n\nnot yet",
                 "You asked (ask:1/c1): Keep the old API?\n\nDrop it",
+                // The agent told first of the two its words set aside.
+                &asks::set_aside(&[
+                    ask("ask:1/c2", "Tag it?"),
+                    ask("ask:1/c3", "Keep the old API?")
+                ])
+                .unwrap(),
                 "how is it going?"
             ]
         );
@@ -31746,6 +32133,9 @@ mod tests {
         assert_eq!(
             *sent.lock().unwrap(),
             [
+                // The agent told first: the question goes aside.
+                "Your question \"Bump it?\" (ask:1/c0) is now set aside: the person wrote past \
+                 it; a pick still answers it.",
                 "also rename the crate",
                 "You asked (ask:3/c1): Bump it?\n\nnot yet"
             ]
@@ -32030,7 +32420,7 @@ mod tests {
         assert!(shown.iter().any(|l| l.contains("ran out")), "{shown:?}");
         assert_eq!(
             shown.last().map(String::as_str),
-            Some("not run · the bot's budget is spent")
+            Some("  not run · the bot's budget is spent")
         );
     }
 
@@ -32606,12 +32996,27 @@ mod tests {
         assert_eq!(rows[2], ("• Ran ls".into(), true));
         let line = rows
             .iter()
-            .position(|(row, _)| row.starts_with("Worked for"))
+            .position(|(row, _)| row.starts_with("  Worked for"))
             .unwrap();
         assert_eq!(
             rows[line + 1..],
             [("".into(), false), ("• Done.".into(), false)]
         );
+        // Drawn, the turn's line starts in the words' column, two past the
+        // `•`: a 40-column window's conversation starts in its third.
+        let mut terminal = Terminal::new(Shot(ratatui::backend::TestBackend::new(40, 20))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        let buffer = terminal.backend().0.buffer().clone();
+        let row = |y: u16| -> String { (0..40).map(|x| buffer[(x, y)].symbol()).collect() };
+        let all = || (0..20).map(row).collect::<Vec<_>>();
+        let at = (0..20).find(|&y| row(y).contains("Worked for"));
+        let at = at.unwrap_or_else(|| panic!("{:?}", all()));
+        let done = (0..20).find(|&y| row(y).contains("• Done."));
+        let done = done.unwrap_or_else(|| panic!("{:?}", all()));
+        assert!(row(at).starts_with("    Worked for"), "{:?}", all());
+        assert_eq!(buffer[(2, done)].symbol(), "•");
+        assert_eq!(buffer[(4, done)].symbol(), "D");
+        assert_eq!(buffer[(4, at)].symbol(), "W");
     }
 
     #[tokio::test]
@@ -32699,7 +33104,7 @@ mod tests {
         app.daemon(turn_event("accepted", 2, json!({}))).await;
         app.daemon(turn_event("turn_finished", 2, json!({"status": "failed"})))
             .await;
-        assert_eq!(rows(&app)[2], "failed for 0s");
+        assert_eq!(rows(&app)[2], "  failed for 0s");
     }
 
     #[tokio::test]
@@ -32820,7 +33225,7 @@ mod tests {
         .await;
         assert_eq!(
             rows(&app)[3..],
-            ["• Steered calc.fix ▸", "Worked for 0s", "• Sent."]
+            ["• Steered calc.fix ▸", "  Worked for 0s", "• Sent."]
         );
     }
 
@@ -33385,7 +33790,11 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(!lines(&app).iter().any(|row| row.starts_with("Worked for")));
+        assert!(
+            !lines(&app)
+                .iter()
+                .any(|row| row.starts_with("  Worked for"))
+        );
         // One that says something ends as any other turn.
         app.daemon(turn_event("accepted", 2, note)).await;
         app.daemon(
@@ -33401,7 +33810,7 @@ mod tests {
         ))
         .await;
         let rows = lines(&app);
-        assert!(rows.iter().any(|row| row.starts_with("Worked for")));
+        assert!(rows.iter().any(|row| row.starts_with("  Worked for")));
         assert_eq!(rows.last().map(String::as_str), Some("• Docs are blocked."));
         // A reply long enough to spill above as it streams still speaks.
         app.pending.clear();
@@ -33422,7 +33831,11 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
+        assert!(
+            lines(&app)
+                .iter()
+                .any(|row| row.starts_with("  Worked for"))
+        );
         // The person's own turn, with nothing said, still ends with its line.
         app.pending.clear();
         app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
@@ -33433,7 +33846,11 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
+        assert!(
+            lines(&app)
+                .iter()
+                .any(|row| row.starts_with("  Worked for"))
+        );
     }
 
     #[tokio::test]
@@ -33514,7 +33931,7 @@ mod tests {
             .await;
         app.daemon(turn_event("turn_finished", 2, empty)).await;
         let rows = lines(&app);
-        let line = rows.iter().find(|row| row.starts_with("Worked")).unwrap();
+        let line = rows.iter().find(|row| row.starts_with("  Worked")).unwrap();
         assert!(!line.contains("empty_completion"));
         // Another failure still says what it was.
         app.pending.clear();
@@ -33553,14 +33970,14 @@ mod tests {
         let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
         let line = rows
             .iter()
-            .find(|row| row.starts_with("Worked for"))
+            .find(|row| row.starts_with("  Worked for"))
             .unwrap();
         assert!(line.contains("ended at its budget"), "{line}");
         // Dim, as any turn that ended well: not the red of a failure.
         let drawn = app
             .pending
             .iter()
-            .find(|l| l.to_string().starts_with("Worked for"))
+            .find(|l| l.to_string().starts_with("  Worked for"))
             .unwrap();
         assert!(
             drawn
@@ -34512,7 +34929,7 @@ mod tests {
             ["", "", "› and the notes?", "", "   🎉 "],
             "{rows:?}"
         );
-        assert!(rows[10].starts_with("Worked for"), "{rows:?}");
+        assert!(rows[10].starts_with("  Worked for"), "{rows:?}");
         assert_eq!(rows[11..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
@@ -35229,6 +35646,47 @@ mod tests {
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert_eq!(rows, ["• Merged it.", "   🎉 ", "", "", "› what next?", ""]);
         assert_eq!(app.replies, [(1, "Merged it.".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn what_the_agent_was_told_of_a_question_set_aside_is_not_drawn() {
+        let told = asks::set_aside(&[asks::Ask {
+            id: "ask:1/c1".into(),
+            ..asks::call("c1", &json!({"question": "Keep it?"})).unwrap()
+        }])
+        .unwrap();
+        // The page drawn with what the agent was told, and without.
+        let drawn = async |told: Option<&str>| {
+            let items = json!({
+                "1": {"type": "message", "role": "assistant",
+                      "content": [{"type": "output_text", "text": "Merged it."}]},
+                "2": {"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": told}]},
+                "3": {"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": "what next?"}]},
+            });
+            let nodes: Vec<Value> = [3, 2, 1]
+                .into_iter()
+                .filter(|node| *node != 2 || told.is_some())
+                .map(|node| json!({"node": node}))
+                .collect();
+            let client = daemon_answering(move |asked| match asked["op"].as_str() {
+                Some("history_nodes") => json!({"nodes": nodes, "next_from": null}),
+                _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                    .map(|node| json!({"node": node, "item": items[node.to_string()],
+                        "origin": (node == 2).then_some(asks::ASIDE_ORIGIN)}))
+                    .collect::<Vec<_>>()}),
+            })
+            .await;
+            let mut app = app(client);
+            app.history().await;
+            (app.pending.iter())
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        };
+        let with = drawn(Some(&told)).await;
+        assert!(with.iter().any(|row| row.contains("what next?")));
+        assert_eq!(with, drawn(None).await);
     }
 
     #[tokio::test]
@@ -40267,7 +40725,7 @@ mod tests {
             caller: "calc.lead".into(),
             ..Default::default()
         };
-        app.open_picked(&other.bot());
+        app.open_picked(&other.bot(), false);
         assert_eq!(watch(&app), (Some("run2".into()), None));
         assert_eq!(app.notice.as_deref(), Some("not stopped"));
         app.watch.as_mut().unwrap().run = None;
@@ -40600,6 +41058,398 @@ mod tests {
             .collect();
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
         (row, (cursor.x, cursor.y))
+    }
+
+    /// A window on `shop.lead`, 80 by 20, whose agent asked `questions`,
+    /// oldest first, each as call `cN` of turn N with `under` rows of its
+    /// work after it: with a screen's worth and more under them, their
+    /// cards scrolled away. The store's one follow says it needs you.
+    async fn asked_and_went_on(
+        client: Arc<Client>,
+        questions: &[&str],
+        under: usize,
+    ) -> (
+        App,
+        Terminal<Shot>,
+        tokio::sync::watch::Sender<elsewhere::Shared>,
+    ) {
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.project = Some("shop".into());
+        let (open, tell) = elsewhere::Elsewhere::told("shop");
+        app.other_projects = Some((open, Instant::now()));
+        tell.send_modify(|shared| {
+            shared.order = [("shop".to_owned(), 0)].into();
+            shared.agents = vec![(0, "shop".to_owned(), "shop.lead".to_owned())];
+        });
+        let mut terminal = Terminal::new(Shot(ratatui::backend::TestBackend::new(80, 20))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        for (n, question) in questions.iter().enumerate() {
+            let turn = n as i64 + 1;
+            let call = format!("c{turn}");
+            app.commit_call(
+                &call,
+                Some(turn),
+                asks::TOOL,
+                &two_options(question),
+                "{}",
+                false,
+            );
+            app.asked(&call, Some(turn), &two_options(question));
+            app.commit(
+                (0..under)
+                    .map(|at| Line::from(format!("worked on {turn}.{at}")))
+                    .collect(),
+            );
+        }
+        app.draw(&mut terminal).unwrap();
+        (app, terminal, tell)
+    }
+
+    /// An ask's arguments: `question`, with two options.
+    fn two_options(question: &str) -> Value {
+        json!({"question": question, "why": "w",
+            "options": [{"label": "Now", "explanation": "e"},
+                        {"label": "Later", "explanation": "e"}]})
+    }
+
+    /// The row the window drew that holds `text`, and where it starts.
+    fn drawn_at(terminal: &Terminal<Shot>, text: &str) -> Option<(u16, u16)> {
+        let buffer = terminal.backend().0.buffer();
+        (0..buffer.area.height).find_map(|y| {
+            let row: Vec<&str> = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let joined = row.concat();
+            let at = joined.find(text)?;
+            let x = (row.iter().scan(0, |len, cell| {
+                *len += cell.len();
+                Some(*len)
+            }))
+            .position(|len| len > at)?;
+            Some((x as u16, y))
+        })
+    }
+
+    fn alt_n() -> Event {
+        Event::Key(event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT))
+    }
+
+    fn pressed(code: KeyCode) -> Event {
+        Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// `alt+n` in the window of the one agent that needs you moves the
+    /// view to its card, the keys left in the composer, answering it; the
+    /// card's `?` beats; `end` goes back to the newest, and an answer
+    /// returns there too.
+    #[tokio::test]
+    async fn alt_n_in_the_window_of_the_one_agent_that_needs_you_lands_on_its_card() {
+        let client = daemon_answering(|_| json!({"message": 2, "turn": 2})).await;
+        let (mut app, mut terminal, _tell) = asked_and_went_on(client, &["Ship it?"], 40).await;
+        assert_eq!(drawn_at(&terminal, "? Ship it?"), None);
+        app.key(alt_n()).await;
+        app.draw(&mut terminal).unwrap();
+        let (x, y) = drawn_at(&terminal, "? Ship it?").expect("landed on its card");
+        assert!(app.switch_to.is_none() && !app.quit);
+        assert!(!app.pane_keys);
+        assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("ask:1/c1"));
+        let mark = terminal.backend().0.buffer()[(x, y)].modifier;
+        assert!(mark.contains(Modifier::REVERSED), "{mark:?}");
+        // Back to the newest.
+        app.key(pressed(KeyCode::End)).await;
+        app.draw(&mut terminal).unwrap();
+        assert_eq!(app.screen.back(), 0);
+        assert_eq!(drawn_at(&terminal, "? Ship it?"), None);
+        // Landed again, a pick on the card answers it and goes back there.
+        app.key(alt_n()).await;
+        app.draw(&mut terminal).unwrap();
+        assert!(app.screen.back() > 0);
+        app.press("answer/0/ask:1/c1").await;
+        app.beside_done().await;
+        assert_eq!(app.screen.back(), 0);
+    }
+
+    /// `enter` on that agent's row in `/status` closes the view and lands
+    /// on its card, the keys in the composer.
+    #[tokio::test]
+    async fn enter_on_this_windows_agent_in_status_closes_it_and_lands_on_its_card() {
+        let client = daemon_answering(|_| json!({})).await;
+        let (mut app, mut terminal, _tell) = asked_and_went_on(client, &["Ship it?"], 40).await;
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
+        app.pane_keys = true;
+        let mut watch = watch_of("shop");
+        watch.rows = vec![status::Row {
+            name: "lead".into(),
+            bot: "shop.lead".into(),
+            state: "needs you".into(),
+            group: status::Group::NeedsYou,
+            ..Default::default()
+        }];
+        let picked = Picked::Agent("shop.lead".into());
+        watch.pick = card_picks(&watch, 76).iter().position(|p| *p == picked);
+        assert!(watch.pick.is_some());
+        app.watch = Some(watch);
+        app.draw(&mut terminal).unwrap();
+        assert_eq!(drawn_at(&terminal, "? Ship it?"), None);
+        app.key(pressed(KeyCode::Enter)).await;
+        app.draw(&mut terminal).unwrap();
+        assert!(!app.pane.as_ref().is_some_and(pane::Pane::is_card));
+        assert!(!app.pane_keys);
+        assert!(drawn_at(&terminal, "? Ship it?").is_some());
+    }
+
+    /// A card in view stays where it is, scrolled a little or not at all.
+    #[tokio::test]
+    async fn a_card_in_view_does_not_move_when_landed_on() {
+        let client = daemon_answering(|_| json!({})).await;
+        let (mut app, mut terminal, _tell) = asked_and_went_on(client, &["Ship it?"], 2).await;
+        app.screen.scroll(1);
+        app.draw(&mut terminal).unwrap();
+        let at = drawn_at(&terminal, "? Ship it?").expect("in view");
+        let back = app.screen.back();
+        app.key(alt_n()).await;
+        app.draw(&mut terminal).unwrap();
+        assert_eq!(app.screen.back(), back);
+        assert_eq!(drawn_at(&terminal, "? Ship it?"), Some(at));
+    }
+
+    /// With two open it lands on the one the composer answers, and `↑`
+    /// `↓` that switch between them bring each one's card into view.
+    #[tokio::test]
+    async fn with_two_open_up_and_down_move_the_view_to_the_other() {
+        let client = daemon_answering(|_| json!({})).await;
+        let (mut app, mut terminal, _tell) =
+            asked_and_went_on(client, &["Ship it?", "Tag it?"], 40).await;
+        app.key(alt_n()).await;
+        app.draw(&mut terminal).unwrap();
+        assert!(drawn_at(&terminal, "? Ship it?").is_some());
+        assert_eq!(drawn_at(&terminal, "? Tag it?"), None);
+        app.key(pressed(KeyCode::Down)).await;
+        app.draw(&mut terminal).unwrap();
+        assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("ask:2/c2"));
+        assert!(drawn_at(&terminal, "? Tag it?").is_some());
+        assert_eq!(drawn_at(&terminal, "? Ship it?"), None);
+        app.key(pressed(KeyCode::Up)).await;
+        app.draw(&mut terminal).unwrap();
+        assert!(drawn_at(&terminal, "? Ship it?").is_some());
+        assert_eq!(drawn_at(&terminal, "? Tag it?"), None);
+    }
+
+    /// A click on the question's words in the composer, in its hint with
+    /// nothing typed and on the `answering “…”` row over words typed,
+    /// brings its card into view.
+    #[tokio::test]
+    async fn a_click_on_the_question_in_the_composer_lands_on_its_card() {
+        let client = daemon_answering(|_| json!({})).await;
+        let (mut app, mut terminal, _tell) = asked_and_went_on(client, &["Ship it?"], 40).await;
+        for typed in ["", "soon"] {
+            app.input.set(typed);
+            app.screen.latest();
+            app.draw(&mut terminal).unwrap();
+            assert_eq!(drawn_at(&terminal, "? Ship it?"), None);
+            let (x, y) = drawn_at(&terminal, "“Ship it?”").expect(typed);
+            let (_, _, link) = (app.opens_at.iter())
+                .find(|(row, columns, _)| *row == y && columns.contains(&(x + 2)))
+                .cloned()
+                .expect("a link on the question");
+            assert_eq!(link, format!("{}land/ask:1/c1", screen::BUTTON));
+            app.follow(&link);
+            for what in std::mem::take(&mut app.pressed) {
+                app.press(&what).await;
+            }
+            app.draw(&mut terminal).unwrap();
+            assert!(drawn_at(&terminal, "? Ship it?").is_some(), "{typed:?}");
+            assert_eq!(&*app.input, typed);
+        }
+    }
+
+    /// A window on shop.lead whose one question, `Ship it?`, was asked at
+    /// node 1, before 298 items the window's replay of 200 ends short of;
+    /// the store's follow knows it. Every `history_nodes` read is kept, and
+    /// fails while `failing` is set.
+    async fn asked_past_the_replay(
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        App,
+        Terminal<Shot>,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::sync::watch::Sender<elsewhere::Shared>,
+    ) {
+        let said = |text: String| {
+            json!({"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": text}]})
+        };
+        let mut history: Vec<(i64, i64, Value)> = (3..=300)
+            .rev()
+            .map(|node| (node, node, said(format!("worked on {node}"))))
+            .collect();
+        history.push((
+            2,
+            1,
+            json!({"type": "function_call_output", "call_id": "c1", "output": "{\"asked\": true}"}),
+        ));
+        history.push((
+            1,
+            1,
+            json!({"type": "function_call", "name": asks::TOOL, "call_id": "c1",
+                "arguments": two_options("Ship it?").to_string()}),
+        ));
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = reads.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") if failing.load(std::sync::atomic::Ordering::SeqCst) => {
+                seen.lock().unwrap().push(asked.clone());
+                json!({"error": "store_busy", "detail": "the store is busy"})
+            }
+            Some("history_nodes") => {
+                seen.lock().unwrap().push(asked.clone());
+                let from = asked["from"].as_i64().unwrap_or(i64::MAX);
+                let limit = asked["limit"].as_u64().unwrap_or(u64::MAX) as usize;
+                let older: Vec<&(i64, i64, Value)> = (history.iter())
+                    .filter(|(node, ..)| *node <= from)
+                    .collect();
+                let nodes: Vec<Value> = (older.iter().take(limit))
+                    .map(|(node, turn, _)| json!({"node": node, "turn": turn}))
+                    .collect();
+                json!({"nodes": nodes, "next_from": older.get(limit).map(|(node, ..)| node)})
+            }
+            _ => history_read(&history, asked).unwrap_or_else(|| json!({})),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.project = Some("shop".into());
+        let (open, tell) = elsewhere::Elsewhere::told("shop");
+        app.other_projects = Some((open, Instant::now()));
+        let ask = asks::call("ask:1/c1", &two_options("Ship it?")).unwrap();
+        tell.send_modify(|shared| {
+            shared.order = [("shop".to_owned(), 0)].into();
+            shared.agents = vec![(0, "shop".to_owned(), "shop.lead".to_owned())];
+            shared.asks = [("shop.lead".to_owned(), ask)].into();
+        });
+        let mut terminal = Terminal::new(Shot(ratatui::backend::TestBackend::new(80, 20))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        app.history().await;
+        app.draw(&mut terminal).unwrap();
+        (app, terminal, reads, tell)
+    }
+
+    /// A card older than the newest 200 items the window drew is read back
+    /// to a page at a time, beside the loop, and drawn once, open, the
+    /// composer answering it.
+    #[tokio::test]
+    async fn a_card_beyond_the_first_200_items_is_read_back_to() {
+        let (mut app, mut terminal, reads, _tell) = asked_past_the_replay(Default::default()).await;
+        let cards = |app: &mut App| {
+            (drawn(app).iter())
+                .filter(|row| row.as_str() == "? Ship it?")
+                .count()
+        };
+        assert_eq!(cards(&mut app), 0);
+        assert!(app.asking().is_none());
+        let first = reads.lock().unwrap().len();
+        app.key(alt_n()).await;
+        for _ in 0..200 {
+            if app.landing.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            app.older_came().await;
+            app.land_tick();
+        }
+        assert!(app.landing.is_none());
+        // A page at a time: 50 items each, two pages back to it.
+        let pages: Vec<Value> = reads.lock().unwrap()[first..].to_vec();
+        assert_eq!(pages.len(), 2, "{pages:?}");
+        assert!(pages.iter().all(|read| read["limit"] == OLDER_ITEMS));
+        app.draw(&mut terminal).unwrap();
+        assert!(drawn_at(&terminal, "? Ship it?").is_some());
+        assert_eq!(cards(&mut app), 1);
+        assert!(!drawn(&mut app).iter().any(|row| row.contains("Set aside")));
+        assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("ask:1/c1"));
+    }
+
+    /// A question's turn over pages let go: each is drawn again once for
+    /// the landing, though drawing one can let another go, and then the
+    /// landing ends where nothing older is left to read.
+    #[tokio::test]
+    async fn a_landing_draws_each_page_let_go_again_once() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.older = None;
+        for (id, node) in [(1, 10), (2, 20)] {
+            let paged = Paged::new(vec![node], [(node, 5)].into(), &[], false);
+            app.pages.insert(id, paged);
+        }
+        app.screen.prepend_blank(vec![(1, 3), (2, 3)]);
+        assert!(app.screen.let_go_page(1) && app.screen.let_go_page(2));
+        app.land_on("ask:5/c1".into());
+        let mut drawn_again = Vec::new();
+        for _ in 0..6 {
+            if app.again.take().is_some() {
+                drawn_again.push(());
+            }
+            app.land_tick();
+        }
+        // Both pages still let go (nothing was read back), each drawn
+        // again once, and the landing over.
+        assert_eq!(drawn_again.len(), 2);
+        assert!(app.landing.is_none());
+    }
+
+    /// A read back that fails ends the landing: it is not asked for again.
+    #[tokio::test]
+    async fn a_read_back_that_fails_ends_the_landing() {
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut app, _terminal, reads, _tell) = asked_past_the_replay(failing.clone()).await;
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let first = reads.lock().unwrap().len();
+        app.key(alt_n()).await;
+        for _ in 0..200 {
+            if app.landing.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            app.older_came().await;
+            app.land_tick();
+        }
+        assert!(app.landing.is_none());
+        assert_eq!(reads.lock().unwrap().len() - first, 1);
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("busy"))
+        );
+    }
+
+    /// The footer's `?` still opens `/status`, whoever needs you, this
+    /// window's agent too, and never scrolls.
+    #[tokio::test]
+    async fn the_footers_question_mark_still_opens_status_and_never_scrolls() {
+        let client = daemon_answering(|_| json!({})).await;
+        let (mut app, mut terminal, _tell) = asked_and_went_on(client, &["Ship it?"], 40).await;
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            ..Default::default()
+        });
+        app.draw(&mut terminal).unwrap();
+        let back = app.screen.back();
+        let footer = terminal.backend().0.buffer().area.height - 1;
+        let (_, _, link) = (app.opens_at.iter())
+            .find(|(row, _, link)| *row == footer && link.ends_with("status"))
+            .cloned()
+            .expect("the footer's ? opens /status");
+        app.follow(&link);
+        for what in std::mem::take(&mut app.pressed) {
+            app.press(&what).await;
+        }
+        app.draw(&mut terminal).unwrap();
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
+        assert_eq!(app.screen.back(), back);
+        assert!(app.landing.is_none());
+        assert_eq!(drawn_at(&terminal, "? Ship it?"), None);
     }
 
     #[tokio::test]
@@ -43197,6 +44047,74 @@ mod tests {
         assert_eq!(margin::closed(told), Some("repro"));
         assert_eq!(sent[0]["origin"], "margin");
         assert!(quiet_message(told));
+    }
+
+    #[tokio::test]
+    async fn words_past_its_questions_tell_the_agent_each_set_aside_once() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"message": 12, "turn": 12})
+        })
+        .await;
+        let mut app = app(client);
+        let ask = |call: &str, question: &str| {
+            let mut ask = asks::call(call, &json!({"question": question})).unwrap();
+            ask.id = asks::id(3, call);
+            ask
+        };
+        let mut tasks = ask("c2", "Ship the fix?");
+        tasks.task = Some(asks::Asker {
+            bot: "b.fix".into(),
+            name: "fix".into(),
+        });
+        app.asks = vec![ask("c1", "Keep the old API?\nIt has two users."), tasks];
+        app.send_now("Meanwhile, why so slow?".into(), (false, false))
+            .await
+            .unwrap();
+        app.send_now("And the tests?".into(), (false, false))
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        // Told first, attached, by Sonny; its task's question waits still.
+        assert_eq!(sent[0]["delivery"], "attach");
+        assert_eq!(sent[0]["origin"], asks::ASIDE_ORIGIN);
+        let told = sent[0]["prompt"].as_str().unwrap();
+        assert_eq!(
+            told,
+            "Your question \"Keep the old API?\" (ask:3/c1) is now set aside: the person \
+             wrote past it; a pick still answers it."
+        );
+        assert!(quiet_message(told));
+        assert!(!asks::moves_on(told, None));
+        assert_eq!(sent[1]["prompt"], "Meanwhile, why so slow?");
+        // Told once, though the first message has not landed yet.
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[2]["prompt"], "And the tests?");
+    }
+
+    #[tokio::test]
+    async fn an_answer_or_a_shell_line_tells_the_agent_nothing_set_aside() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"message": 12, "turn": 12})
+        })
+        .await;
+        let mut app = app(client);
+        let mut ask = asks::call("c1", &json!({"question": "Keep it?"})).unwrap();
+        ask.id = asks::id(3, "c1");
+        app.asks = vec![ask.clone()];
+        assert_eq!(app.tell_aside(&asks::answer(&ask, "yes"), None), None);
+        assert_eq!(app.tell_aside("ls", Some(SHELL)), None);
+        assert_eq!(app.tell_aside(&reactions::message("👍", None), None), None);
+        assert!(app.tell_aside("Meanwhile, why so slow?", None).is_some());
     }
 
     #[tokio::test]

@@ -102,6 +102,7 @@
 //! host = "me@devbox"            # what ssh dials
 //! machine = "laptop"            # what the agents there call this machine, its hostname by default
 //! browser_profile = "Default"   # the Chrome profile their shared browser is copied from once, Default by default, or a folder; "" a fresh one each
+//! browser_signins = "copied"    # copied: yours merged in at each start; own: it keeps those made in it (`sonny link browser`); copied by default
 //! calls = 16                    # how many of their calls this machine runs at once, 4 per CPU by default
 //! upgrade = true                # the end behind upgrades when the link connects, so both run one release; on by default
 //! writable = ["~/code/shop"]    # folders their shell and file tools write here, the first their start; none by default, read-only
@@ -905,11 +906,12 @@ pub struct Link {
     pub command: Option<String>,
     /// The Chrome profile their agents' one shared browser runs on, as
     /// agent-browser's `--profile` takes it: a profile's name, `Default`
-    /// by default, copied once into a profile kept for the link, signed in
-    /// as the person is here, whose newer cookies and native messaging
-    /// hosts reach it at each start; a folder, used as it is; empty for a fresh
-    /// browser of each agent's own.
+    /// by default, copied once into a profile kept for the link, whose
+    /// native messaging hosts reach it at each start; a folder, used as it
+    /// is; empty for a fresh browser of each agent's own.
     pub browser_profile: String,
+    /// Where the sign-ins of a profile kept for the link come from.
+    pub browser_signins: BrowserSignins,
     /// How many calls of that host's agents this machine runs at once;
     /// unset, four for each of its CPUs.
     pub calls: Option<usize>,
@@ -928,6 +930,23 @@ pub struct Link {
 
 /// The Chrome profile a link's browsers start from unless it says.
 pub const LINK_BROWSER_PROFILE: &str = "Default";
+
+/// Where a link's kept Chrome profile gets its sign-ins,
+/// `browser_signins`. Chrome (158 on) seals the cookies of a profile
+/// folder other than its own with a key of that folder's, so the person's
+/// cookies copied into one are dropped as it starts, unless it is started
+/// with that protection off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserSignins {
+    /// Its own: the person signs in there once a site (`sonny link
+    /// browser`), and it keeps them as any profile does.
+    Own,
+    /// The person's: their newer cookies merged into it at each start,
+    /// with Chrome's protection of them turned off. The least to do,
+    /// which George chose over that protection (11-24).
+    #[default]
+    Copied,
+}
 
 /// The agent-browser action categories its `browser` tool confirms unless
 /// the config says otherwise: agent-browser's own destructive ones, and
@@ -1361,6 +1380,13 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
                         _ => Err(invalid()),
                     })
                     .collect::<Result<_, _>>()?;
+            }
+            "browser_signins" => {
+                link.browser_signins = match value.as_str() {
+                    Some("own") => BrowserSignins::Own,
+                    Some("copied") => BrowserSignins::Copied,
+                    _ => return Err(format!("{key_at} is own or copied")),
+                }
             }
             // "" is a fresh browser, with no profile to start from.
             "browser_profile" => {
@@ -2826,6 +2852,20 @@ mod tests {
         let config = parse("[sonny.links.box]\nhost = \"box\"\nupgrade = false\n").unwrap();
         assert!(!config.sonny.links["box"].upgrade);
         assert!(parse("[sonny.links.box]\nhost = \"box\"\nupgrade = \"no\"\n").is_err());
+    }
+
+    #[test]
+    fn a_link_s_browser_takes_the_person_s_sign_ins_unless_it_says_own() {
+        let read = |extra: &str| parse(&format!("[sonny.links.box]\nhost = \"box\"\n{extra}"));
+        let signins = |extra: &str| read(extra).unwrap().sonny.links["box"].browser_signins;
+        assert_eq!(signins(""), BrowserSignins::Copied);
+        assert_eq!(signins("browser_signins = \"own\"\n"), BrowserSignins::Own);
+        assert_eq!(
+            signins("browser_signins = \"copied\"\n"),
+            BrowserSignins::Copied
+        );
+        assert!(read("browser_signins = \"mine\"\n").is_err());
+        assert!(read("browser_signins = true\n").is_err());
     }
 
     #[test]

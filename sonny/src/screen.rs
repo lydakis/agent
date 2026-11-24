@@ -297,6 +297,13 @@ pub struct Screen {
     /// pictures ready ([`Screen::fill_drawn`]): one held elsewhere a while
     /// may stand for a picture ready already.
     pushed_waiting: bool,
+    /// The rows tagged so to bring into view at the next draw, unless
+    /// they are in it already ([`Screen::land`]).
+    reveal: Option<Tag>,
+    /// The mark on rows tagged so that beats a few times, from when they
+    /// were brought into view, as the footer's `?` does: the tag, the
+    /// mark and its pulse.
+    beat: Option<(Tag, &'static str, crate::look::Pulse)>,
 }
 
 /// What the mark over a message says: its handle, `BOT/N`, the number the
@@ -536,6 +543,37 @@ impl Screen {
             .collect()
     }
 
+    /// The rows tagged `tag` together, the newest if more are, among
+    /// those drawn: from the first of them to past the last.
+    fn shown_tagged(&self, tag: Tag) -> Option<std::ops::Range<usize>> {
+        let last = self.tagged(tag)?;
+        let mut first = last;
+        while first > 0 && self.rows[first - 1].tag == Some(tag) {
+            first -= 1;
+        }
+        let start = self.shown_at(first)?;
+        let end = self.shown_at(last + 1).unwrap_or(self.shown.len());
+        Some(start..end)
+    }
+
+    /// The rows tagged `tag` brought into view at the next draw, as find
+    /// brings the place found: left where they are when they are in it
+    /// already, else the view moved to show them midway, from their first
+    /// row when they are taller than it. Their `mark` beats a few times
+    /// either way, as the footer's `?` does, to say where they are.
+    pub fn land(&mut self, tag: Tag, mark: &'static str) {
+        self.reveal = Some(tag);
+        let mut pulse = crate::look::Pulse::default();
+        pulse.see(1, Instant::now());
+        self.beat = Some((tag, mark, pulse));
+    }
+
+    /// Whether a mark brought into view still beats `now`, so each tick
+    /// draws it.
+    pub fn pulsing(&self, now: Instant) -> bool {
+        (self.beat.as_ref()).is_some_and(|(_, _, pulse)| pulse.moving(now))
+    }
+
     /// The row tagged `tag`, the newest if more are.
     fn tagged(&self, tag: Tag) -> Option<usize> {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
@@ -576,6 +614,12 @@ impl Screen {
     /// Whether the page `id` is drawn.
     pub fn drawn(&self, id: u64) -> bool {
         self.page_span(id).is_some_and(|(_, drawn)| drawn)
+    }
+
+    /// Whether the page `id` was let go: in its place, as blank rows, to
+    /// be drawn again. A page that drew no rows was never put in.
+    pub fn let_go_page(&self, id: u64) -> bool {
+        self.page_span(id).is_some_and(|(_, drawn)| !drawn)
     }
 
     /// The first row with words of the page `id`, when it is drawn.
@@ -1929,6 +1973,24 @@ impl Screen {
                 self.back = self.shown.len() - end;
             }
         }
+        if let Some(tag) = self.reveal.take()
+            && let Some(rows) = self.shown_tagged(tag)
+        {
+            let bottom = self.shown.len() - self.back.min(self.shown.len());
+            let top = bottom.saturating_sub(height);
+            let tall = rows.len();
+            let seen = match tall <= height {
+                true => rows.start >= top && rows.end <= bottom,
+                false => rows.start >= top && rows.start < bottom,
+            };
+            if !seen {
+                let bottom = match tall <= height {
+                    true => rows.end + (height - tall) / 2,
+                    false => rows.start.saturating_sub(1) + height,
+                };
+                self.back = self.shown.len() - bottom.min(self.shown.len());
+            }
+        }
         self.back = self.back.min(self.most(height));
         let bottom = self.shown.len() - self.back;
         let top = bottom.saturating_sub(height);
@@ -1957,6 +2019,27 @@ impl Screen {
             {
                 crate::look::bar_cell(&mut buf[(area.x, area.y + y as u16)], slot);
             }
+        }
+        // The mark of rows brought into view, on a beat: reversed, as
+        // the footer's `?` beats.
+        let now = Instant::now();
+        if let Some((tag, mark, pulse)) = &self.beat
+            && pulse.on(now)
+            && let Some(rows) = self.shown_tagged(*tag)
+        {
+            let cells = (rows.start.max(top)..rows.end.min(bottom)).flat_map(|row| {
+                let y = area.y + (row - top) as u16;
+                (area.x..area.right()).map(move |x| (x, y))
+            });
+            if let Some(at) = cells.into_iter().find(|at| buf[*at].symbol() == *mark) {
+                crate::footer::beat_cell(&mut buf[at]);
+            }
+        } else if self
+            .beat
+            .as_ref()
+            .is_some_and(|(_, _, pulse)| !pulse.moving(now))
+        {
+            self.beat = None;
         }
         let drawn = Rect {
             height: (bottom - top) as u16,
@@ -2088,10 +2171,12 @@ impl Screen {
                     .collect::<Vec<_>>()
                     .join(" · ");
                 let wide = when.width() as u16;
-                // Inset from the right as the words are from the left.
-                if area.width > 2 * GUTTER + wide {
+                // Ending in the conversation's last column, where the
+                // footer ends and the words wrap: on the person's band, a
+                // column inside its end, as the `›` is inside its start.
+                if area.width >= wide {
                     buf.set_string(
-                        area.x + area.width - GUTTER - wide,
+                        area.right() - wide,
                         area.y + (over - 1 - top) as u16,
                         when,
                         Style::new().add_modifier(Modifier::DIM),
@@ -3102,61 +3187,97 @@ mod tests {
 
     #[test]
     fn the_message_under_the_mouse_shows_when_it_was_written_at_its_top_right_on_the_empty_row() {
+        let band = Style::new().bg(crate::look::BAND);
         let mut screen = Screen::default();
         screen.push(vec![Line::from("• The tests pass.")]);
         screen.mark_last(Mark::Tag(Tag::End(5)));
-        screen.push(vec![Line::default(), Line::from("› thanks")]);
+        // The person's message on their band, its top row empty.
+        screen.push(vec![
+            Line::default().style(band),
+            Line::from("› thanks").style(band),
+        ]);
         screen.mark_last(Mark::Tag(Tag::End(6)));
+        screen.push(vec![Line::default(), Line::from("• Done.")]);
+        screen.mark_last(Mark::Tag(Tag::End(7)));
         // Words right under a step, no blank row between them.
         screen.push(vec![
             Line::from("  ran the tests"),
             Line::from("• Tagged it."),
         ]);
-        screen.mark_last(Mark::Tag(Tag::End(7)));
+        screen.mark_last(Mark::Tag(Tag::End(8)));
         let ms = 1_794_042_780_000;
-        for node in [5, 6, 7] {
+        for node in [5, 6, 7, 8] {
             screen.date(node, ms);
         }
         let when = crate::stamp::written(ms);
-        let area = Rect::new(0, 0, 40, 6);
-        let draw = |screen: &mut Screen| {
-            let mut buf = Buffer::empty(area);
+        // The conversation two columns in from the window's edges, as a
+        // window draws it: its last column is 41, the band's end 42.
+        let area = Rect::new(2, 0, 40, 7);
+        let last = area.right() - 1;
+        let draw = |screen: &mut Screen, area: Rect| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 44, area.height));
             screen.render(area, &mut buf, |_| None);
             buf
         };
         // Nothing at rest.
-        let buf = draw(&mut screen);
-        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
-        // Over a message, its time at its top right edge, on the blank row
-        // over it, muted.
-        screen.mouse(mouse(MouseEventKind::Moved, 4, 2));
-        let buf = draw(&mut screen);
-        assert_eq!(row(&buf, 1), format!("{when:>38}  "));
-        assert!(buf[(37, 1)].modifier.contains(Modifier::DIM));
-        assert!(row(&buf, 2).starts_with("↩ thanks"));
-        // The first row on screen has no row over it: no time.
-        screen.mouse(mouse(MouseEventKind::Moved, 4, 0));
-        let buf = draw(&mut screen);
-        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
-        // A row with words on it over the message is left as it is.
-        screen.mouse(mouse(MouseEventKind::Moved, 4, 4));
-        let buf = draw(&mut screen);
+        let buf = draw(&mut screen, area);
+        assert!((0..7).all(|y| !row(&buf, y).contains(&when)));
+        // Over the person's message, its time on the band's empty top row,
+        // muted, its last cell the conversation's last column: one inside
+        // the band's end, as the `›` is one inside its start.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 2));
+        let buf = draw(&mut screen, area);
+        assert_eq!(row(&buf, 1), format!("{when:>42}  "));
+        assert_eq!(buf[(last, 1)].symbol(), &when[when.len() - 1..]);
+        assert!(buf[(last, 1)].modifier.contains(Modifier::DIM));
+        assert_eq!(buf[(last, 1)].bg, crate::look::BAND);
+        assert_eq!(buf[(last + 1, 1)].bg, crate::look::BAND);
+        assert_eq!(buf[(last + 1, 1)].symbol(), " ");
+        assert!(row(&buf, 2).starts_with("  ↩ thanks"));
+        // Over a reply, the same column, on the blank row over it.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 4));
+        let buf = draw(&mut screen, area);
+        assert_eq!(row(&buf, 3), format!("{when:>42}  "));
+        assert_eq!(buf[(last, 3)].symbol(), &when[when.len() - 1..]);
+        assert!(row(&buf, 4).starts_with("  ↩ Done."));
         assert!(
-            row(&buf, 4).starts_with("↩ Tagged it."),
-            "{:?}",
-            row(&buf, 4)
+            (0..7)
+                .filter(|&y| y != 3)
+                .all(|y| !row(&buf, y).contains(&when))
         );
-        assert_eq!(row(&buf, 3).trim_end(), "  ran the tests");
-        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
+        // A selection near it takes what is drawn under it, never the time.
+        let copied = drag(&mut screen, (last, 3), (last, 4));
+        assert_eq!(copied, Some(Action::Copy("\n• Done.".into())));
+        screen.selection = None;
+        // The first row on screen has no row over it: no time.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 0));
+        let buf = draw(&mut screen, area);
+        assert!((0..7).all(|y| !row(&buf, y).contains(&when)));
+        // A row with words on it over the message is left as it is.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 6));
+        let buf = draw(&mut screen, area);
+        assert!(
+            row(&buf, 6).starts_with("  ↩ Tagged it."),
+            "{:?}",
+            row(&buf, 6)
+        );
+        assert_eq!(row(&buf, 5).trim_end(), "    ran the tests");
+        assert!((0..7).all(|y| !row(&buf, y).contains(&when)));
         // A message's own number goes before its time: the handle the
         // model reads on it and `--quote` takes.
         screen.number(6, "calc.fix/48".into());
-        screen.mouse(mouse(MouseEventKind::Moved, 4, 2));
-        let buf = draw(&mut screen);
-        assert_eq!(
-            row(&buf, 1),
-            format!("{:>38}  ", format!("calc.fix/48 · {when}"))
-        );
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 2));
+        let buf = draw(&mut screen, area);
+        let numbered = format!("calc.fix/48 · {when}");
+        assert_eq!(row(&buf, 1), format!("{numbered:>42}  "));
+        // It may take the whole row, never a wider one: one too narrow
+        // for it leaves it out.
+        let wide = numbered.width() as u16;
+        let fits = Rect::new(2, 0, wide, 7);
+        let buf = draw(&mut screen, fits);
+        assert_eq!(row(&buf, 1).trim(), numbered);
+        let buf = draw(&mut screen, Rect::new(2, 0, wide - 1, 7));
+        assert!((0..7).all(|y| !row(&buf, y).contains(&when)));
     }
 
     #[test]
@@ -3191,8 +3312,8 @@ mod tests {
         for y in [3, 4] {
             screen.mouse(mouse(MouseEventKind::Moved, 6, y));
             let buf = draw(&mut screen, area);
-            assert_eq!(row(&buf, 1), format!("{when:>38}  "), "at {y}");
-            assert!(buf[(37, 1)].modifier.contains(Modifier::DIM));
+            assert_eq!(row(&buf, 1), format!("{when:>40}"), "at {y}");
+            assert!(buf[(39, 1)].modifier.contains(Modifier::DIM));
             assert_eq!(row(&buf, 2).trim_end(), "↳ calc.fix");
             assert!(row(&buf, 3).starts_with("↩ Fixed the rounding."));
             assert_eq!(row(&buf, 5).trim_end(), "└ started ◌ readme");
@@ -3205,7 +3326,7 @@ mod tests {
         // The message under the `└` row keeps its own over it.
         screen.mouse(mouse(MouseEventKind::Moved, 6, 7));
         let buf = draw(&mut screen, area);
-        assert_eq!(row(&buf, 6), format!("{when:>38}  "));
+        assert_eq!(row(&buf, 6), format!("{when:>40}"));
         assert_eq!(row(&buf, 5).trim_end(), "└ started ◌ readme");
         // Scrolled so the `↳` row is the first on screen: nothing over it
         // is shown, so no time, and none on the arrow row.
@@ -4066,6 +4187,10 @@ mod tests {
         assert_eq!(row(&buf, 4).trim_end(), "row 20049");
         assert_eq!(screen.height(20), 14_050);
         assert!(!screen.pages[0].drawn && screen.pages[1].drawn);
+        assert!(screen.let_go_page(2) && !screen.let_go_page(1));
+        // A page with no rows is never put in, so never let go.
+        screen.prepend(3, written(Vec::new()));
+        assert!(!screen.let_go_page(3) && !screen.drawn(3));
         assert_eq!(screen.wanted(), None);
         // Up at the first row it is wanted, and drawn again in its place.
         screen.scroll(isize::MAX);
@@ -4383,6 +4508,51 @@ mod tests {
         // Up: the line at the top, and near the top the whole way up.
         assert_eq!(keep(&mut screen, 4, 2).0, "row 4");
         assert_eq!(keep(&mut screen, 1, 2).0, "row 0");
+    }
+
+    /// A card brought into view stays where it is when it is in view,
+    /// comes midway when it is not, and from its first row when it is
+    /// taller than the view; its mark beats as it comes.
+    #[test]
+    fn a_card_revealed_comes_midway_unless_in_view_and_its_mark_beats() {
+        let area = Rect::new(0, 0, 20, 6);
+        let mut screen = Screen::default();
+        screen.push(lines(0..10, "old"));
+        let card = vec![Line::from("? Ship it?"), Line::from("┃ 1. Now")];
+        screen.push_marked(
+            card,
+            vec![(0, Mark::Tag(Tag::Ask(1))), (1, Mark::Tag(Tag::Ask(1)))],
+        );
+        screen.push(lines(0..30, "new"));
+        let shown = |buf: &Buffer| {
+            (0..6)
+                .map(|y| row(buf, y).trim_end().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let buf = drawn(&mut screen, area);
+        assert!(!shown(&buf).contains(&"? Ship it?".to_owned()));
+        // Out of view: midway, the keys' reversed beat on its mark.
+        screen.land(Tag::Ask(1), "?");
+        let buf = drawn(&mut screen, area);
+        assert_eq!(&shown(&buf)[2..4], ["? Ship it?", "┃ 1. Now"]);
+        let mark = buf[(0, 2)].modifier;
+        assert!(mark.contains(Modifier::REVERSED), "{mark:?}");
+        assert!(screen.pulsing(Instant::now()));
+        // In view, scrolled a row: left where it is.
+        screen.scroll(1);
+        let before = shown(&drawn(&mut screen, area));
+        screen.land(Tag::Ask(1), "?");
+        assert_eq!(shown(&drawn(&mut screen, area)), before);
+        // Taller than the view: from its first row, a row over it.
+        let tall: Vec<Line<'static>> = (0..10).map(|n| Line::from(format!("┃ {n}"))).collect();
+        let marks = (0..11).map(|at| (at, Mark::Tag(Tag::Ask(2)))).collect();
+        let mut rows = vec![Line::from("? Tag it?")];
+        rows.extend(tall);
+        screen.push_marked(rows, marks);
+        screen.push(lines(0..30, "newer"));
+        drawn(&mut screen, area);
+        screen.land(Tag::Ask(2), "?");
+        assert_eq!(shown(&drawn(&mut screen, area))[1], "? Tag it?");
     }
 
     #[test]
