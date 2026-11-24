@@ -4955,8 +4955,9 @@ enum Landing {
     /// the store's one follow has told what it knows, as a question asked
     /// further back than the window drew is known only from there.
     Needs { wait: bool },
-    /// The card of the question at this key.
-    Ask(String),
+    /// The card of the question at this key, and the pages let go that
+    /// were drawn again for it, each once.
+    Ask(String, Vec<u64>),
 }
 
 /// What a page of older items was drawn from: its nodes, the turn each
@@ -21580,7 +21581,7 @@ impl App {
     /// The card of the question at `key` brought into view: the composer
     /// switched to it, or its words there clicked.
     fn land_on(&mut self, key: String) {
-        self.landing = Some(Landing::Ask(key));
+        self.landing = Some(Landing::Ask(key, Vec::new()));
         self.land_tick();
     }
 
@@ -21591,9 +21592,9 @@ impl App {
     /// page at a time, both beside the loop as the wheel's pages are. A
     /// card is never drawn a second time.
     fn land_tick(&mut self) {
-        let key = match &self.landing {
+        let (key, mut searched) = match &self.landing {
             None => return,
-            Some(Landing::Ask(key)) => key.clone(),
+            Some(Landing::Ask(key, searched)) => (key.clone(), searched.clone()),
             Some(Landing::Needs { wait }) => {
                 let wait = *wait;
                 // The rows committed so far on the screen, the call
@@ -21615,7 +21616,7 @@ impl App {
                         if self.blank() {
                             self.chatting = false;
                         }
-                        key
+                        (key, Vec::new())
                     }
                     None if wait && self.untold() => return,
                     None => {
@@ -21625,7 +21626,7 @@ impl App {
                 }
             }
         };
-        self.landing = Some(Landing::Ask(key.clone()));
+        self.landing = Some(Landing::Ask(key.clone(), searched.clone()));
         self.flush();
         if let Some((tag, ..)) = self.cards.get(&key)
             && self.screen.has(screen::Tag::Ask(*tag))
@@ -21638,18 +21639,23 @@ impl App {
         // A task's card is drawn where it was pinned: none there, none.
         let own = !key.starts_with('@');
         let turn = asks::turn_of(&key);
-        // In a page let go: drawn again in its place. One that drew no
-        // rows was never put in, so the read goes on past it.
+        // A page being drawn again is waited for.
+        if self.again.is_some() {
+            return;
+        }
+        // In a page let go: drawn again in its place, once for this
+        // landing, as drawing one can let another go. One that drew no rows
+        // was never put in, so the read goes on past it.
         if own
             && let Some(turn) = turn
             && let Some(page) = (self.pages.iter())
-                .filter(|(id, _)| self.screen.let_go_page(**id))
+                .filter(|(id, _)| self.screen.let_go_page(**id) && !searched.contains(*id))
                 .find(|(_, paged)| paged.turns.values().any(|at| *at == turn))
                 .map(|(id, _)| *id)
         {
-            if self.again.is_none() {
-                self.draw_again(page);
-            }
+            self.draw_again(page);
+            searched.push(page);
+            self.landing = Some(Landing::Ask(key, searched));
             return;
         }
         // Older than the window drew: read back a page at a time, never
