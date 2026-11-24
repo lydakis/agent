@@ -26,6 +26,9 @@ open = "5"
 # Calls T3 Code's MCP endpoint (t3.rs) and asks a Chrome already running
 # for its address (browser.rs).
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
+# Merges the person's Chrome cookies into a link's kept profile (browser.rs),
+# as the runtime's store reads SQLite: the same crate and version.
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 # Scroll regions write history rows without padding them to the width, so
 # a pane that narrows later does not re-wrap them.
 ratatui = { version = "0.30", features = ["scrolling-regions"] }
