@@ -312,13 +312,13 @@ Every note goes as a steer, joining the running turn at its next round or starti
 ### Digests
 
 - A follower's notes are one group, as Prometheus Alertmanager groups alerts, with `group_wait` 0 and `group_interval` 2 seconds: an event goes at once when no note went in the last 2 seconds, and what comes within 2 seconds of a note goes together once they pass, so a burst from many agents is a note every 2 seconds, not one each.
-- A source's `digest` says how often at most a follower hears it, as Slack's "at most once every 15 minutes or hour": the first event after a quiet spell is told as it comes, and what comes after waits until the digest has passed since the note that last told that source, then all of it goes, in one note or in notes one after another when it is more than a note holds. The digest counts again from the last of them.
+- A source's `digest` says how often at most a follower hears it, as Slack's "at most once every 15 minutes or hour": the first event after a quiet spell is told as it comes, and what comes after waits until the digest has passed since the note that last told what it held of that source, then all of it goes, in one note or in notes one after another when it is more than a note holds. The digest counts again from the last of them.
 - A follow's own `digest` takes its sources' place for what it hears, counted from the note that last told what it held; `"0"` says it waits for none, though its source digests. Heard by several follows, an event goes when the first of them allows.
 - What waits to be told, and when each source and each follow's digest last told a follower, is kept in `STORE.sources/.held/BOT.json` until it is, so a restart loses none.
 
 ### Steers
 
-- An event the source marks `"steer": true`, one the source's `steer` pattern matches, or one a follow's `steer` matches goes at once, as the person's words do, and waits for no digest; the follow counts it as its steer.
+- An event the source marks `"steer": true`, one the source's `steer` pattern matches, or one a follow's `steer` matches goes at once, as the person's words do, and waits for no digest; the follow counts it as its steer; a note that told it starts no digest's window again, as an Alertmanager group's interval counts from that group's own notification, so a busy follow's held news still goes once its digest has passed.
 - Who sets which: an agent adds `steer` itself for what it owns, as a pull request it opened, and `quiet` for what should not go silent, as work it holds or a build it waits on; a `filter` or a `digest` only when the person asks for one, since what a filter leaves out it never hears and a digest makes it late. The `follows` tool says so. The person sets a source's own `digest` and `steer` in the settings. `/background` lists each follow with its filter, digest, `steer`, and `quiet`.
 
 ### Quiet follows

@@ -1779,7 +1779,7 @@ fn notes(times: &[Timed]) -> usize {
                 })
                 .count()
                 .max(1);
-            for e in carried.drain(..take) {
+            for e in carried.drain(..take).filter(|e| !e.steer) {
                 last.insert(e.clock, went);
             }
             for e in &mut carried {
