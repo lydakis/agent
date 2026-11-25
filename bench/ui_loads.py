@@ -55,6 +55,7 @@ the summary sets them side by side.
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import statistics
@@ -191,6 +192,13 @@ def composer_reads(text):
                 return True
         return False
     return test
+
+
+def sky_counted(lines):
+    """The sky's own footer, which it draws only once it has opened:
+    a row of the sky (the whole line, or the pane after its `│`) that
+    starts with how many agents it shows."""
+    return any(re.search(r'(^|│)\s*\d+ agents?\b', line) for line in lines)
 
 
 def both(*tests):
@@ -457,7 +465,7 @@ def run(build, size, args, tapped=False):
             back(window)
         for name, ready in (('usage', has('By model')), ('background', has('Follows')),
                             ('commons', has('threads')),
-                            ('sky', both(has('p0 lead'), lacks('Catching up')))):
+                            ('sky', both(sky_counted, lacks('Catching up')))):
             for _ in range(args.repeat):
                 timed(name, f'/{name}\r'.encode(), page=ready)
                 back(window)
@@ -573,6 +581,8 @@ def typing(fleet, window, held, args):
         time.sleep(.05)
     spent = time.monotonic() - began
     done = turns[0] - before
+    # The CPU the typing took, read before the workers are let go.
+    spent_cpu = (cpu_seconds(window.pid) - cpu[0], cpu_seconds(fleet.daemon.pid) - cpu[1])
     stop.set()
     for worker in workers:
         worker.join(10)
@@ -583,8 +593,8 @@ def typing(fleet, window, held, args):
             'p50_ms': round(statistics.median(took), 1),
             'p99_ms': took[min(len(took) - 1, int(len(took) * .99))], 'max_ms': took[-1],
             'over_100ms': sum(t > 100 for t in took),
-            'window_cpu_pct': round((cpu_seconds(window.pid) - cpu[0]) / spent * 100, 1),
-            'daemon_cpu_pct': round((cpu_seconds(fleet.daemon.pid) - cpu[1]) / spent * 100, 1)}
+            'window_cpu_pct': round(spent_cpu[0] / spent * 100, 1),
+            'daemon_cpu_pct': round(spent_cpu[1] / spent * 100, 1)}
 
 
 def builds(specs, out):
