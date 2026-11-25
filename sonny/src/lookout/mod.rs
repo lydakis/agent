@@ -4673,7 +4673,7 @@ mod tests {
         service
             .subscribers
             .insert("calc.lead".into(), tasks.clone());
-        // A task that subscribes for itself is no one's task in the updates.
+        // A task that subscribes for itself is still its lead's task.
         let own = vec![sub("own", &["calc.review"], &[])];
         service.subscribers.insert("calc.review".into(), own);
         assert!(service.place(&lead));
@@ -5843,6 +5843,67 @@ mod tests {
         assert!(names("shop.lead").is_empty());
         let log = std::fs::read_to_string(&service.log).unwrap();
         assert!(log.contains("its subscriber was closed"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_closed_lead_keeps_its_tasks_follow_and_hears_its_tasks_work() {
+        let dir = std::env::temp_dir().join(format!("sonny-lead-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        subs::ensure(&store, "calc.lead", subs::Sub::lead("calc.lead", "calc")).unwrap();
+        subs::change(
+            &store,
+            "calc.lead",
+            Some(1),
+            Some(&json!({"name": "ci", "sources": ["ci"]})),
+            None,
+            &["ci".into()],
+        )
+        .unwrap();
+        // Closed while its task still works.
+        let lead = json!({"name": "calc.lead", "bot_id": 1, "workspace": "/",
+            "status": "idle", "closed_ms": 1_000});
+        let fix = json!({"name": "calc.fix", "bot_id": 2, "workspace": "/",
+            "status": "running", "created_by": "calc.lead", "created_by_id": 1});
+        let mut service = service(store.clone(), &[lead.clone(), fix]);
+        service.log = dir.join("state.sqlite.lookout.jsonl");
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(service.listed_closed("calc.lead"));
+        assert!(service.closed("calc.lead"));
+        let names: Vec<String> = (subs::read(&store, "calc.lead").into_iter())
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["tasks"]);
+        // Closed again, or as the listing shows it at a start, it keeps it.
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.closed("calc.lead"));
+        assert!(!service.closed_unheard());
+        // Its lookout still watches the task, whose turn's end is news to
+        // it: the note, a message, opens it again.
+        assert!(service.place(&lead));
+        service.index();
+        let ended = json!({"status": "completed"});
+        let finished = ev("calc.fix", 1, "turn_finished", ended.clone());
+        assert_eq!(service.hearing(&finished), ["calc.lead"]);
+        let lookout = service.lookouts.get_mut("calc.lead").unwrap();
+        lookout.live = true;
+        let asked = json!({"from": {"bot": "calc.lead"}});
+        lookout.event(&ev("calc.fix", 1, "accepted", asked), Some("calc.lead"));
+        lookout.event(&finished, Some("calc.lead"));
+        let read: Vec<(&str, i64)> = (lookout.due.iter())
+            .map(|pending| (pending.task.as_str(), pending.turn))
+            .collect();
+        assert_eq!(read, [("calc.fix", 1)]);
+        // A task that closed and works no more tells it nothing: it stays
+        // closed.
+        lookout.due.clear();
+        lookout.event(
+            &ev("calc.fix", 1, "closed", json!({"closed_ms": 2_000})),
+            None,
+        );
+        assert!(lookout.due.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

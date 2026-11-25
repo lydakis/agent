@@ -44,10 +44,10 @@ Each follower has a lookout of its own while it has a follow, and manages its ow
 When Sonny opens a project, it adds the lead's `tasks` follow, unless the lead's file already holds one by that name, which it keeps as it is:
 
 ```json
-{"name": "tasks", "tasks_of": ["shop.lead"], "agents": ["shop.*"]}
+{"name": "tasks", "tasks_of": ["shop.lead"], "agents": ["shop.*"], "outlives_close": true}
 ```
 
-That is the folder's first lead's. Another lead of the folder, `shop.lead.billing`, gets `tasks_of` alone, so it hears only of its own tasks; the first lead's `shop.*` skips the other leads and every bot they or theirs made. Another lead, which has follows of its own, is heard only by a follow that names it as it is, with no `*`, as the person asks a lead to watch another: then it is a task here in all but what it makes, which stays its own, and the turns its own lookout's notes start. Removing `tasks` stops a lead's lookout until Sonny next opens its project.
+That is the folder's first lead's. Another lead of the folder, `shop.lead.billing`, gets `tasks_of` alone, so it hears only of its own tasks; the first lead's `shop.*` in its `tasks` follow skips the other leads and every bot they or theirs made. Any other follow hears another lead as it names it, by name or by a glob, as the person asks a lead to watch another: then it is a task here in all but what it makes, which stays its own, and the turns its own lookout's notes start. The `tasks` follow lasts while its lead is closed: a lead whose tasks still work is not done, and their news opens it again, however it was opened before. Removing `tasks` stops a lead's lookout until Sonny next opens its project.
 
 Every follow hears exactly what it names, nothing more or less: a lead and its task following the same topic both hear it. A lead tells a task in its brief which topics to follow, as `NAME:TOPIC`; a lead that wants to stop hearing a topic narrows its own follow, with a narrower `sources` or a filter.
 
@@ -99,7 +99,7 @@ Examples:
 ### Lifecycle and counters
 
 - A follow is held by the bot that made it, by its ID: a later bot given the same name inherits none of it.
-- Follows end as automations do, by one rule. A follow ends when `until` passes or `runs` is reached (a note counts once it lands, however many events it tells, and the count outlasts a lookout restart); when its owner is deleted; when it watched only bots by exact name, every one of them is deleted now, and it has no source; or when its owner is closed (`close_agent`, or the `close` request), except follows marked `outlives_close`, which Sonny writes on what posting in a commons thread subscribes, so a closed bot can still take part there. The daemon's `closed` event says when, and a lookout that was away reads it from the listing's `closed_ms`. A closed bot still is, and is sent work again by a message, so another's follow that watches it stays. Each end is a line in the lookout's log with why.
+- Follows end as automations do, by one rule. A follow ends when `until` passes or `runs` is reached (a note counts once it lands, however many events it tells, and the count outlasts a lookout restart); when its owner is deleted; when it watched only bots by exact name, every one of them is deleted now, and it has no source; or when its owner is closed (`close_agent`, or the `close` request), except follows marked `outlives_close`, which Sonny writes on what posting in a commons thread subscribes, so a closed bot can still take part there, and on a lead's `tasks` follow, so a closed lead still hears its tasks. The daemon's `closed` event says when, and a lookout that was away reads it from the listing's `closed_ms`. A closed bot still is, and is sent work again by a message, so another's follow that watches it stays. Each end is a line in the lookout's log with why.
 - Each follow says under `lately` what it told in the last 24 hours, once it has told anything: the events and tasks' news its notes carried (`heard`), those notes (`notes`), how many of them steered for it, by its `steer` or the source's mark (`steers`), and when it last told (`last`). The lookout counts them by the hour as each note lands, in `STORE.lookout/.counts/BOT.json`, so a flood shows as a follow with many notes, without reading the log.
 
 ## Sources
@@ -272,7 +272,7 @@ can be filtered to the changes an agent's work touches:
 
 ## The tasks source
 
-The built-in `tasks` source tells a follower what happens in the bots its follows watch, less those with follows of their own, each bot its topic:
+The built-in `tasks` source tells a follower what happens in the bots its follows watch, each bot its topic. A bot with follows of its own is watched as any other; the follower's own doings are never its news, and a workflow's workers are watched by no one, since their run tells its caller once, at its end:
 
 | `type` | When it fires | `from` in header | Text |
 | --- | --- | --- | --- |
