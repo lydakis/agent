@@ -488,17 +488,12 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     if held.unwrap_or(agent_client::HOLD_MS) != hold {
         settings.insert("hold_ms".into(), json!(given.config.hold_ms));
     }
-    // A trigger's shadow copy keeps the rules it was made with: the
-    // person's, without what they let run outside the sandbox.
-    let shadow =
-        (record["name"].as_str()).is_some_and(|name| crate::trigger::shadow_source(name).is_some());
     // One whose maker is gone goes by the person's rules too, but is let
     // out of its sandbox by none it didn't have from its maker.
     let creator = record["created_by_id"].as_i64();
-    let rules = match (shadow, creator) {
-        (true, _) => json!(crate::trigger::shadow_rules(given.rules)),
-        (false, Some(_)) => json!(orphan_rules(given.rules, &record["settings"]["rules"])),
-        (false, None) => json!(given.rules),
+    let rules = match creator {
+        Some(_) => json!(orphan_rules(given.rules, &record["settings"]["rules"])),
+        None => json!(given.rules),
     };
     let own = creator.is_none_or(|creator| !given.live.contains(&creator));
     if own && record["settings"]["rules"] != rules {

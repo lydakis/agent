@@ -731,13 +731,8 @@ struct Nested {
     description: String,
     /// Whether a call of it asks the agent's gate first.
     asks: bool,
-    /// Whether its server says it only reads (`readOnlyHint`).
-    reads: bool,
     /// What its row in the agent's audit trail says it is.
     facts: Facts,
-    /// Whether a call of it is refused outright: in a trigger's shadow
-    /// run, whatever does not only read, or would ask.
-    refused: bool,
     /// One of the agent's own tools, which its daemon runs as a step of
     /// the `exec` call (`run_step`), deciding and recording it itself.
     daemon: bool,
@@ -1257,17 +1252,7 @@ async fn run_keeping(
             ));
         }
     };
-    let mut nested = Arc::clone(&catalog.nested);
-    // A trigger's shadow run reads and does nothing else: a call of a tool
-    // that does not say it only reads, or that would ask the person, is
-    // refused, never asked about.
-    if crate::trigger::shadow_source(bot).is_some() {
-        let mut refusing = (*nested).clone();
-        for tool in refusing.values_mut() {
-            tool.refused = !tool.reads || tool.asks;
-        }
-        nested = Arc::new(refusing);
-    }
+    let nested = Arc::clone(&catalog.nested);
     // What the script begins with: the tools it is shown, its clock and
     // its seed; as the journal recorded them for a script run again.
     let begun = journal
@@ -1428,13 +1413,11 @@ fn shown_tools(
                 tool: text(2)?,
                 description: text(3)?,
                 asks: false,
-                reads: false,
                 facts: Facts {
                     kind: "mcp",
                     place: None,
                     access: None,
                 },
-                refused: false,
                 daemon: false,
             },
         );
@@ -1732,13 +1715,11 @@ fn build(from: Vec<Listed>, own: Option<&[Value]>) -> Catalog {
                 tool: name.to_owned(),
                 description,
                 asks,
-                reads: tool["annotations"]["readOnlyHint"] == true,
                 facts: Facts {
                     kind: "mcp",
                     place: Some(mcp_place(config)),
                     access: mcp_access(&tool["annotations"]),
                 },
-                refused: false,
                 daemon: false,
             });
         }
@@ -1794,19 +1775,16 @@ fn daemon_tool(tool: &Value) -> Option<(String, Nested, Value)> {
     text.push_str(&format!(
         "\n```ts\ndeclare const tools: {{ {name}(args: {input}): Promise<CallToolResult>; }};\n```"
     ));
-    let reads = matches!(name.as_str(), "read" | "echo");
     let nested = Nested {
         server: String::new(),
         tool: name.clone(),
         description: text.clone(),
         asks: false,
-        reads,
         facts: Facts {
             kind: "daemon",
             place: None,
             access: None,
         },
-        refused: false,
         daemon: true,
     };
     Some((
@@ -2990,12 +2968,6 @@ impl Caller {
             }
             return Err(error);
         };
-        if nested.refused {
-            return Err(format!(
-                "tools.{id} refused: this is a shadow run, a read-only copy, and the tool does \
-                 not say it only reads; say what you would have called it with instead"
-            ));
-        }
         let arguments: Value = serde_json::from_str(&arguments).map_err(|e| e.to_string())?;
         // The agent's own tool: its daemon decides, runs and records it as
         // a step of this call, one at a time.
@@ -3932,72 +3904,6 @@ text(ALL_TOOLS.some(t => t.name === "history"));"#;
     }
 
     #[tokio::test]
-    async fn a_shadow_runs_only_what_says_it_reads_and_asks_nothing() {
-        let dir = scratch("shadow");
-        let hub = hub(&dir).await;
-        let (client, mut steps) = gate(&dir, Duration::ZERO, None).await;
-        let asker = Steps::new(client, "shop.lead.shadow-1a2b".into(), 7, "c1".into());
-        let script = r#"text(await tools.mcp__test__echo({text: "hi"}).then(r => r.content[0].text));
-try { await tools.mcp__test__add({a: 1, b: 2}); } catch (e) { text(e.message); }
-text("done");"#;
-        let said = run(
-            &hub,
-            Some(&dir),
-            "shop.lead.shadow-1a2b",
-            script,
-            Duration::from_secs(30),
-            Some(asker),
-        )
-        .await
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_owned();
-        assert!(
-            said.ends_with(
-                "Output:\nhi\ntools.mcp__test__add refused: this is a shadow run, a read-only \
-                 copy, and the tool does not say it only reads; say what you would have called \
-                 it with instead\ndone"
-            ),
-            "{said}"
-        );
-        // The read that ran is recorded, and nothing is put to the gate.
-        let mut told = Vec::new();
-        while let Ok(step) = steps.try_recv() {
-            told.push(step);
-        }
-        // The daemon's own tools are listed, which asks nothing.
-        assert!(
-            told.iter()
-                .all(|s| s["op"] == "tools" || s["op"] == "step_result" || s["record"] == true),
-            "nothing asked the gate: {told:?}"
-        );
-        assert!(
-            told.iter().any(|s| s["name"] == "mcp__test__echo"),
-            "{told:?}"
-        );
-        // Under `prompt`, a read asks first, so a shadow refuses it too.
-        let mut servers = hub.servers();
-        servers.get_mut("test").unwrap().default_tools_approval_mode =
-            agent_client::config::ApprovalMode::Prompt;
-        hub.configure(&servers).await;
-        let said = run(
-            &hub,
-            Some(&dir),
-            "shop.lead.shadow-1a2b",
-            "try { await tools.mcp__test__echo({text: 'hi'}); } catch (e) { text('refused'); }",
-            Duration::from_secs(30),
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            said.as_str().unwrap().ends_with("Output:\nrefused"),
-            "{said}"
-        );
-    }
-
-    #[tokio::test]
     async fn a_script_runs_at_once_beside_many_waiting_for_verdicts() {
         let dir = scratch("steps-places");
         let hub = hub(&dir).await;
@@ -4555,13 +4461,11 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             tool: name.into(),
             description: description.into(),
             asks: false,
-            reads: false,
             facts: Facts {
                 kind: "mcp",
                 place: Some("outside"),
                 access: None,
             },
-            refused: false,
         };
         let nested: BTreeMap<String, Nested> = [
             (

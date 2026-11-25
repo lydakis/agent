@@ -21,8 +21,8 @@ Sonny's agents manage their own automations via the `automations` tool (`add`, `
 ```sh
 ~/.agent/automation add [--name NAME] [WHEN] \
   [--agent NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL] [--fresh]] \
-  [--reply-to AGENT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] \
-  [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] -- MESSAGE
+  [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] \
+  [--turn-budget-tokens N [--budget-counts work]] [--live] -- MESSAGE
 
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
@@ -48,15 +48,14 @@ Every CLI reply is one JSON value on stdout; failures print `{"error": CODE, "de
 - **Existing agent (`--agent NAME`):** Defaults to the calling shell's `AGENT_BOT`. Pinned by bot ID so a deleted/recreated bot is never messaged accidentally (`bot_not_found`).
 - **Start on demand (`--start NAME --model PROVIDER/MODEL [--effort LEVEL]`):** Creates the agent on first run using Sonny's standard workspace policy, `auto` sandbox/reviewer, and tools (`memory`, `exec`). Add `--fresh` to create a fresh `NAME-N` agent per run (keeping at most the running, latest finished, and latest failed agents, and noting prior failures on line 1).
 - **Pre-flight gate (`--if CMD`):** Runs `sh -c CMD` (60s timeout) before waking any agent. Exit `0` runs, exit `1` skips silently (zero model calls), any other exit or timeout fails the run and alerts the owner once on state change. Commands added by an agent run inside that agent's own sandbox (`agent sandbox --bot`); commands added by you run as your user.
-- **Forward replies (`--reply-to BOT`):** Waits for the turn to finish (up to 24h) and steers its answer to `BOT`, skipping overlapping ticks while waiting.
 - **Stop conditions & budgets:** `--runs N` stops after `N` deliveries; `--until 'YYYY-MM-DD HH:MM'` ends at local time; `--turn-budget-tokens N` (optionally with `--budget-counts work` to ignore re-sent history) caps spend per run.
-- **Shadow dry runs (`--shadow`):** Forks the target into a read-only `BOT.shadow-HEX` copy with no shell, no human/reviewer approval gate, and read-only MCP calls only; sends the dry-run answer to `--reply-to` (or the creator) and deletes the copy. Incompatible with `--fresh`.
+- **Hearing how a run went:** An automation starts work; how that work went is news. An agent that wants a run's answer follows the run's agent in the Lookout (`follows`), which tells it each run that replied words, failed or was stopped, with the follow's filter and digest. Sonny passes on no answer and sends no failure note of its own.
 - **Live message templates (`--live`):** Evaluates Jinja blanks (`source('NAME')`, `file('PATH')`, `modified('PATH')`, `now()`, `| ago`, `| time`; up to 32 KiB) right as each run starts so the prompt arrives with fresh data already filled in.
 
 ### Permissions, delivery, and state
 
-- **Stepwise approvals:** In the `automations` tool, reads need no approval. Adding, removing another's, or running an automation is approved per capability (`if` as `shell`, waking/replying to another bot as `send_message`, `start` as `start_task`).
-- **Queued delivery & coalescing:** Runs submit with `delivery: queue` and `origin: "automation"` (never human consent for the reviewer). Repeating automations skip (`bot_busy`) if a prior run is already queued behind active work. Missed calendar runs during sleep coalesce to one run on wake. Turn failures alert the owner via lookout steer and appear in `/background`.
+- **Stepwise approvals:** In the `automations` tool, reads need no approval. Adding, removing another's, or running an automation is approved per capability (`if` as `shell`, waking another bot as `send_message`, `start` as `start_task`).
+- **Queued delivery & coalescing:** Runs submit with `delivery: queue` and `origin: "automation"` (never human consent for the reviewer). Repeating automations skip (`bot_busy`) if a prior run is already queued behind active work. Missed calendar runs during sleep coalesce to one run on wake. Turn failures appear in `/background`, and reach an agent that follows the run's agent.
 - **Idempotency & files:** Re-adding an identical definition returns `duplicate: true`; a differing one fails with `automation_exists` naming the differing field. Definitions live in `~/.agent/automations/jobs/NAME.json`, state in `~/.agent/automations/NAME.json`, on-demand asks in `NAME.asks`, locked via `~/.agent/automations/.lock`. Pinned to the daemon's store lineage (`store_mismatch` if another store reuses the socket).
 
 Sonny ships the `automation` skill ([SKILL.md](../sonny/skills/automation/SKILL.md)) guiding agents to keep bookmarks/ledgers in files rather than relying on compacted chat history.
@@ -82,7 +81,7 @@ automations.
 Sonny's agents add and change automations with the `automations` tool, which
 Sonny's tool host answers outside the agent's sandbox, since an automation runs
 as the person outside it: `add` (the fields below, as `every`, `cron`, `start {name,
-model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
+model, effort}`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `run` or `read` NAME, or nothing to list them.
 Nothing lists them as the other tools that list do (follows, memory, the
 commons): one line each, its name, when it runs (`when`), the agent it
@@ -90,8 +89,8 @@ messages (`agent`), when its last run was and how it went (`last`, with how
 the turn it sent ended once known), and any `problem`, `missed` or `ended`;
 a long list comes in pages, `next` in the answer saying where the rest
 start, as `from`. `read` NAME shows one whole, its message and last result
-too. An agent lists and reads only its own: those that wake it, send their
-answers to it, or start an agent it added; `sonny automation list` lists
+too. An agent lists and reads only its own: those that wake it or start an
+agent it added; `sonny automation list` lists
 every one.
 A look acts on nothing and runs as any read does, also for an agent whose
 sandbox no one reviews. An add, a removal or a run is judged by its parts,
@@ -100,8 +99,7 @@ agent is a step of the call (`approve_step`) under the tool it amounts to,
 which the daemon decides as that tool's call from the model would be, by its
 rules, its gate and its sandbox. An `if` is a `shell` command in the agent's
 sandbox, where it runs at each fire (one it did not write runs outside it, and
-is asked so); another agent it wakes, or that gets each run's answer, is
-`send_message`; an agent it starts is `start_task`, refused as a start is to a
+is asked so); another agent it wakes is `send_message`; an agent it starts is `start_task`, refused as a start is to a
 confined agent no one reviews. An add that only wakes the agent asks nothing,
 nor does a removal of one of its own; a removal of another's asks that one's
 parts, and a run the parts of the one it runs. Whose automation it is goes by
@@ -112,13 +110,10 @@ definition its parts were asked about: one replaced, or added, while they were
 asked about is refused as `automation_changed`, to be asked about again.
 A row whose last run sent a turn says how that turn ended, as the daemon
 has it: `last.turn_status`, and `last.turn_error` when it did not complete,
-so an agent sees the failure the person sees in `/background`. It does not
-have to look: when a turn a run sent fails (not one whose model said
-nothing), the lookout tells the agent that added a `start` automation, else
-the agent the run messaged, with a steer: read in its next model call, or
-waking it when idle (`[automation NAME · TIME · turn N it sent BOT failed:
-WHY]`). A run with `reply_to` passes the failure on with its
-answer instead.
+so an agent sees the failure the person sees in `/background`. An agent
+that wants to hear each run's answer, or its failure, as it comes follows
+the run's agent in the lookout: an automation starts work, and how that work
+went is news, filtered and digested as any follow's.
 It waits for a verdict wherever the agent's other calls do (`/permissions`),
 since an automation runs as the person and its `if` command outside any
 sandbox. For people, scripts and other harnesses, Sonny writes
@@ -126,7 +121,7 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 `sonny automation`:
 
 ```sh
-~/.agent/automation add [--name NAME] [WHEN] [--agent NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to AGENT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] -- MESSAGE
+~/.agent/automation add [--name NAME] [WHEN] [--agent NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--live] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
@@ -136,25 +131,6 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 
 Every reply is one JSON value on stdout; a failure is one
 `{"error": CODE, "detail": ...}` on stderr with exit 1.
-
-**Shadow runs.** `--shadow` is a dry run, for moving a job from elsewhere
-onto an automation. Each run forks its agent where it is now (a `--start`
-automation whose agent no run made yet first makes that agent, as its first
-run would, and sends it nothing)
-into `BOT.shadow-HEX`, a copy in the read-only sandbox, with no shell, no
-gate a person or a model answers, the person's command rules without their
-`allow` rules, and of Sonny's tools only
-`exec`, whose MCP calls of a tool that does not say it only reads
-(`readOnlyHint`), or that its server's approval mode would ask about, are
-refused. So everything past reading is refused, never asked about. A copy
-that cannot be confined is removed before it runs. Its answer goes to
-`--reply-to`, which defaults to the agent that added the automation, else to
-the agent that added a `--start` one, else to the agent it copies, as
-`[automation NAME · TIME · shadow run of BOT STATUS: ...]`, and the copy is
-removed once that went (or after a day idle). It has no shell because a
-sandboxed agent's commands still reach its daemon socket, which takes a
-message to another agent or a pause from a read-only agent too; so a dry run
-reads with the daemon's file tools and read-only MCP tools, not commands.
 
 **Live messages.** With `--live`, the message is a template, as a live
 memory fact's text is, filled as each run starts: `source('NAME')` (what
@@ -167,12 +143,12 @@ in its prompt instead of spending its first calls fetching it. `add` refuses
 source you have not set up, or calls `tasks()`, which a run outlives; a file
 not written yet fills on a later run. A run whose blanks do not fill gets
 the message as written and a line saying why, so the run still comes. What
-it filled to is at most 32 KiB. A shadow run fills the same way.
+it filled to is at most 32 KiB.
 
 **A broken `--if`.** A gate that cannot run, ends with anything but exit 0
 or 1, or runs past 60 s, fails the run, with the end of what it wrote to
-stderr. The agent that hears of the automation (`--reply-to`, else the agent
-that added a `--start` automation, else the agent it messages) is told once
+stderr. The agent that hears of the automation (the agent that added a
+`--start` automation, else the agent it messages) is told once
 when it breaks, and once when it works again, as alerts go off on a change
 of state rather than on every check; the row's `checked.told` keeps
 whether the break was told. While the daemon is paused (`/pause`), a gate
@@ -235,7 +211,7 @@ state when the run settles, and later runs message it. A name an agent already h
 `add` (`bot_exists`), and an agent of that name made before the first run
 makes that run fail, naming it. The agent that added it is pinned by its
 id too: once it is deleted, `create` fails with `creator_not_found`, and the
-automation ends, keeping its row, as when its `--reply-to` agent is gone. The `create` carries the automation's own
+automation ends, keeping its row. The `create` carries the automation's own
 request id, so a run cut short after the daemon made the agent asks again
 and gets that same agent, and no other.
 
@@ -261,23 +237,10 @@ daemon's 128. A run's message is kept on the row before it goes, so an
 attempt cut short sends it again as it was. A memory tool call in a run's
 turn, and a change from a run's shell through `~/.agent/memory`, is the
 automation's, so an open memory cleanup belongs to the automation, and a run
-that carries on one cut short changes it as its own. `--fresh` and
-`--shadow` do not go together, and an automation replaced with or without
-`--fresh` starts its agents over.
+that carries on one cut short changes it as its own. An automation
+replaced with or without `--fresh` starts its agents over.
 
-**What else.** `--reply-to BOT` keeps the run's process until the turn it
-sent ends (the daemon's `wait`, up to a day), then steers that turn's
-answer to BOT, pinned by id, as the lookout tells a task's update; the scheduler starts no second run of the automation
-meanwhile, so a repeating one skips the times that turn spans. The run's
-request id then ends `.to.ID`, BOT's id, so the lookout does not also tell
-that agent of the turn as a task update, unless that answer has not
-reached it 15 s after the turn ended. A run cut short while it waits
-(the Mac restarted) passes no answer on: nothing resumes that wait. An
-answer the daemon cut short is
-marked so in its first line; a turn that ended saying nothing passes on an
-empty answer. One that does not get through keeps an ended automation listed,
-saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
-never comes back) ends the automation. `--if CMD` runs `sh -c CMD` in the folder
+**What else.** `--if CMD` runs `sh -c CMD` in the folder
 `add` ran in, with the `PATH` `add` ran with and `AGENT_SOCKET` and
 `AGENT_STORE` naming the automation's daemon, before anything else, for up
 to 60 s, in its own process group, which ends with it. One an agent added
@@ -314,10 +277,8 @@ cap does. Each message the
 agent gets starts with one line, `[automation NAME · YYYY-MM-DD HH:MM · why]`,
 the local run time and what started it (its time, `file PATH`, `commit REPO
 at SHA`, or `run now`), so a
-catch-up run after sleep reads as late; an
-answer passed on by `--reply-to` starts with the agent and turn it is from.
-Submissions carry `origin: "automation"`, and a passed-on answer carries
-`from: {bot, turn}`, the turn it is; the lookout's notes carry `origin:
+catch-up run after sleep reads as late.
+Submissions carry `origin: "automation"`; the lookout's notes carry `origin:
 "lookout"`. All are automated input, not human consent for the reviewer.
 
 **Adding again.** An automation is named after its agent unless `--name` says
@@ -325,7 +286,7 @@ otherwise. `add` with a name in use and the same definition changes nothing
 and returns that automation with `"duplicate": true`, so a retried `add` is
 safe; with another definition it is refused as `automation_exists`, whose
 `field` names the first that differs (`when`, `bot`, `start`, `message`,
-`reply_to`, `if`, `runs`, `turn_budget_tokens`, `commit`, `dir`, `daemon`,
+`if`, `runs`, `turn_budget_tokens`, `commit`, `dir`, `daemon`,
 `store_id`): `rm` it
 first. A name differing from another only in case is refused
 (`name_taken`), since macOS folders would give both one file, and `rm` finds
@@ -392,14 +353,14 @@ can leave is listed and removable:
   file of the current generation, so an automation made again under an ended
   one's name starts afresh.
 - **Running** records its result and ends an automation that is over (a one-off,
-  one whose agent, `--reply-to` agent or, for `--start`, adding agent is
+  one whose agent or, for `--start`, adding agent is
   gone, one that reached `--runs` or its `--until`), both under the lock
   and only while the definition is still the one it ran for: an automation
   removed while its message went out is left as it now is. A one-off that
   delivered keeps its last result until its turn is known to have ended:
   whoever asks the daemon how it ended (`/background`, the footer's count,
-  the `automations` tool) removes the row once that turn completed with any
-  answer passed on, and one whose turn failed stays listed with
+  the `automations` tool) removes the row once that turn completed, and
+  one whose turn failed stays listed with
   `last.turn_error` until it is removed, as systemd keeps a failed unit
   until `reset-failed`. One that ends without delivering (its agent
   gone, the daemon unreachable, `missed`) loses its definition but keeps
