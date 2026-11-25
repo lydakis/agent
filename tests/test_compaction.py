@@ -288,14 +288,21 @@ class CompactionTests(ModelFixture):
         self.model.compaction_text = 'A brief summary.'
         client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
+        after = []
         for n in range(15):
             last = self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)
             self.assertEqual(last['data']['status'], 'completed')
-        # The last of these ends past the threshold and summarizes after it
-        # reports. Let that summary land before counting the large turns':
-        # its own, as earlier small turns summarize after they end too. A
-        # shared CI runner can take longer than the default wait for it.
-        client.summarized('Bob', timeout=30, turn=last['turn'])
+            if last['data'].get('summary_after'):
+                after.append(last['turn'])
+        # Some of these end past the threshold and summarize after they
+        # report, which their ends say. Which ones depends on how fast each
+        # summary lands: one still running when the next turn ends keeps
+        # that turn from starting its own. Let every one land before
+        # counting the large turns'. A shared CI runner can take longer
+        # than the default wait for them.
+        self.assertTrue(after)
+        for turn in after:
+            client.summarized('Bob', timeout=30, turn=turn)
         previous = client.request('inspect', bot='Bob')['result']['compaction']
         self.assertIsNotNone(previous)
         self.requests()

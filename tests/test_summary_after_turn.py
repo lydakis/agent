@@ -60,6 +60,8 @@ class SummaryAfterTurnTests(ModelFixture):
     def test_a_summary_due_as_a_turn_ends_runs_after_it_and_goes_in_while_the_bot_waits(self):
         client = self.start()
         ended = self.past_threshold(client)
+        # Its end says a summary follows.
+        self.assertIs(ended['data']['summary_after'], True)
         landed = client.summarized('Bob', timeout=10)
         # The turn ended at once; its summary ran after it, billed to it.
         (start, end), = self.summaries()
@@ -215,9 +217,13 @@ class SummaryAfterTurnTests(ModelFixture):
 
     def test_a_pause_stops_a_summary_on_its_way_and_the_next_turn_summarizes(self):
         client = self.start(delay=2.0)
-        self.past_threshold(client)
+        ended = self.past_threshold(client)
         self.wait_for(lambda: getattr(self.model, 'summarizing', False))
         self.assertTrue(client.request('pause', reason='stop the line')['result']['changed'])
+        # It ends saying why, on the turn it was started after.
+        skipped = client.summarized('Bob', timeout=10)
+        self.assertEqual((skipped['event'], skipped['turn'], skipped['data']['reason']),
+                         ('compaction_skipped', ended['turn'], 'paused'))
         # It would have landed by now; stopped, it wrote nothing.
         time.sleep(2.5)
         self.assertIsNone(client.request('inspect', bot='Bob')['result']['compaction'])

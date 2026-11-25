@@ -603,7 +603,7 @@ Settings live in `~/.agent/config.toml` (editable via `/config`) and can be over
 | Task tab policy | `[sonny] task_tabs`, `most_task_tabs` | — | `"asked"` (`every`); `32` tabs (`0` = unlimited) |
 | Task worktree retention | `[sonny] task_worktrees` | — | `15` (min `1`; oldest idle clean worktrees pruned) |
 | Decision deadline | `[sonny] ask_wait_minutes` | — | `60` (`0` = always wait) |
-| Away, and back | `[sonny] away_minutes` | — | `30` (`0` = never): minutes without your use of any window or a message through `sonny acp` before every lead is told you are away; it raises only decisions until you are back, then gives the rest in one message. On, Sonny starts its scheduler, which tells them, with no automation; a lead the daemon did not answer for is told again each minute |
+| Away, and back | `[sonny] away_minutes` | — | `20` (`0` = never): minutes without your use of any window or a message through `sonny acp` before every lead is told you are away; it raises only decisions until you are back, then gives the rest in one message. A lead hears you are back when you look at it: use its window, open it, switch to it, or write to it through `sonny acp`; the others stay away until you do. On, Sonny starts its scheduler, which tells them, with no automation; a lead the daemon did not answer for is told again each minute |
 | Start daemon at boot | `[sonny] start_at_boot` | — | `false` |
 | External lookout sources | `[sonny.sources.NAME]` | — | `command`, `every`, `digest`, `steer`, `watch`, `wants`, `icon` |
 | Lookout note trailer | `[sonny] lookout_trailer` | — | Default quiet-unless-urgent rule (`""` for none) |
@@ -633,7 +633,6 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | Whether agents have boards, work in the commons they take | `[sonny] boards` (true, the default, or false; off, the commons tool takes no work fields, its skill has no Boards section, and `start_task` takes no `board` or `agents`; off with the commons too) | |
-| How long taken work may go without a post before its holder is asked whether it is still on it, and its board hears it went quiet | `[sonny] hold_quiet` (15 minutes by default; 0 never) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most rows a margin note draws | `[sonny] margin_note_lines` (40 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |

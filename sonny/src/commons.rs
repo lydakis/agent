@@ -1303,7 +1303,7 @@ pub async fn ask_for(home: &Path, store: &Path, threads: &[String], author: &str
         let note = asked_note(author, thread, title, board);
         let mut asked = Vec::new();
         for (name, id) in named {
-            let follow = crate::board::post_follow(thread, id, crate::board::ASKED, None);
+            let follow = crate::board::post_follow(thread, id, crate::board::ASKED);
             let _ = crate::lookout::subs::put(store, &name, follow);
             let submit = json!({"bot": name, "prompt": note, "delivery": "steer",
                 "origin": ORIGIN, "request_id": request_id(&format!("commons.asked.{thread}.{}.{name}", posts.len()))});
@@ -1367,7 +1367,7 @@ pub async fn ask_started(
             title,
             work["board"].as_str().unwrap_or_default(),
         );
-        let follow = crate::board::post_follow(thread, id, crate::board::ASKED, None);
+        let follow = crate::board::post_follow(thread, id, crate::board::ASKED);
         let _ = crate::lookout::subs::put(store, name, follow);
         let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
             "request_id": request_id(&format!("commons.asked.{thread}.{}.{name}", posts.len()))});
@@ -2473,42 +2473,8 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 lines.push(line.to_string());
             }
         }
-        let mut kept = json!({"posts": posts.len(), "bytes": bytes});
-        // Work held, kept to tell its board once it goes quiet.
-        if let Some(work) = crate::board::standing(&posts).filter(|it| it["state"] == "taken") {
-            let title = work["title"].as_str().unwrap_or(title);
-            kept["held"] = json!({"at": posts.last().map_or(0, |p| p["at"].as_i64().unwrap_or(0)),
-                "board": work["board"], "holder": work["holder"], "title": title});
-        }
-        read.insert(thread, kept);
+        read.insert(thread, json!({"posts": posts.len(), "bytes": bytes}));
         changed = true;
-    }
-    // Held work with no post for `[sonny] hold_quiet`: its board hears it
-    // once, until its thread moves again.
-    let quiet = crate::board::hold_quiet()
-        .and_then(|quiet| Some((agent_client::config::span("quiet", &quiet).ok()?, quiet)));
-    if let Some((span, quiet)) = quiet.filter(|_| !first) {
-        let now = now();
-        for (thread, kept) in read.iter_mut() {
-            let held = &mut kept["held"];
-            let Some(at) = held["at"].as_i64() else {
-                continue;
-            };
-            if held["told"] == true || now < at + span as i64 {
-                continue;
-            }
-            held["told"] = json!(true);
-            changed = true;
-            let (holder, title) = (
-                held["holder"].as_str().unwrap_or_default(),
-                held["title"].as_str().unwrap_or_default(),
-            );
-            let text =
-                format!("{holder} has held {thread}, \"{title}\", with no post there for {quiet}.");
-            let line = json!({"id": format!("{thread}/{at}/quiet"), "board": held["board"],
-                "event": "quiet", "thread": thread, "holder": holder, "text": text});
-            lines.push(line.to_string());
-        }
     }
     News {
         lines,

@@ -38,7 +38,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
 };
@@ -315,6 +315,10 @@ pub struct Turn {
     pub after: std::sync::Mutex<Option<After>>,
     /// Set while this turn's summary runs after it ended, which bills it.
     pub tailing: AtomicBool,
+    /// How many summaries of this turn were kept as failed for good (not
+    /// one a request of its own follows), so one run after it ended knows
+    /// whether its end was told.
+    pub failed: AtomicU32,
 }
 
 /// A steer waiting for the running turn's next boundary. Armed by `steer`
@@ -684,9 +688,10 @@ impl Finished {
         bot: &str,
         turn: i64,
         error: Option<&Error>,
+        summary_after: bool,
     ) -> Result<bool> {
         let (outcome, next) = db.atomic(|db| {
-            db.finish(turn, error)?;
+            db.finish_noting(turn, error, summary_after)?;
             let outcome = db
                 .turn_outcome(bot, turn)?
                 .ok_or_else(|| Error::new("stale_turn"))?;
@@ -1955,6 +1960,8 @@ impl Turn {
         };
         let (before, start) = (record.spent(), self.settings().max_rounds() - 2);
         let mut rounds = start;
+        let failed = self.failed.load(Relaxed);
+        let mut planned = true;
         let (base, result) = match base {
             Err(error) => (None, Err(error)),
             Ok(base) => (
@@ -1994,7 +2001,10 @@ impl Turn {
                                 )
                                 .await
                             }
-                            Ok(None) => Ok(Summary::Skipped),
+                            Ok(None) => {
+                                planned = false;
+                                Ok(Summary::Skipped)
+                            }
                             Err(error) => Err(error),
                         }
                     };
@@ -2035,6 +2045,32 @@ impl Turn {
                     db.note_pacing(turn, retries, paced_ms, 0)
                 })
                 .await;
+        }
+        // Every summary started after a turn ends in an event of that
+        // turn, which its `turn_finished` said would follow: one written
+        // is installed or refused as it goes in; one that failed was kept
+        // as failed; the rest say why they came to nothing.
+        if self.failed.load(Relaxed) == failed {
+            let skipped = match &landed.result {
+                Ok(Summary::Written(_)) => None,
+                Ok(Summary::Skipped) if !planned => Some(json!({"reason": "nothing_to_summarize"})),
+                Ok(Summary::Skipped) => Some(json!({"reason": "shutdown"})),
+                Ok(Summary::Parked(until)) => Some(json!({"reason": "parked", "until": until})),
+                Err(error) if error.code == PAUSED => Some(json!({"reason": "paused"})),
+                Err(error) => {
+                    let _ = self.compaction_failed(self.turn, error).await;
+                    None
+                }
+            };
+            if let Some(data) = skipped {
+                let (bot, turn) = (self.bot.clone(), self.turn);
+                let _ = self
+                    .store
+                    .op("compaction_skipped", move |db| {
+                        db.compaction_skipped(&bot, turn, data)
+                    })
+                    .await;
+            }
         }
         self.land(&handle, landed, base, unlanded).await;
     }
@@ -2175,6 +2211,14 @@ impl Turn {
             cap.until = cap.until.saturating_add(unseen.of(cap.counts));
         }
         Ok(installed)
+    }
+
+    /// Whether this turn planned a summary as it ended.
+    pub fn has_after(&self) -> bool {
+        self.after
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// The summary this turn planned as it ended, started once its end is
@@ -3047,6 +3091,14 @@ impl Turn {
     /// error's facts: the turn's `turn_finished` says so when it was the
     /// turn's last summary.
     async fn compaction_failed(&self, turn: i64, error: &Error) -> Result<()> {
+        // One a request of its own follows does not end the summary.
+        let follows = error
+            .facts
+            .as_deref()
+            .is_some_and(|facts| facts.get("fallback") == Some(&Value::Bool(true)));
+        if !follows {
+            self.failed.fetch_add(1, Relaxed);
+        }
         let mut data = json!({"error":error.code,"detail":error.detail});
         if let (Some(data), Some(facts)) = (data.as_object_mut(), error.facts.as_deref()) {
             for (key, value) in facts {
@@ -9505,6 +9557,7 @@ mod tests {
             ahead: None,
             after: Default::default(),
             tailing: Default::default(),
+            failed: Default::default(),
             identity: 0,
             bot: "Bob".into(),
             turn,
@@ -9695,6 +9748,7 @@ mod tests {
             ahead: None,
             after: Default::default(),
             tailing: Default::default(),
+            failed: Default::default(),
             identity: 0,
             bot: "Bob".into(),
             turn,
@@ -9867,6 +9921,7 @@ mod tests {
             ahead: None,
             after: Default::default(),
             tailing: Default::default(),
+            failed: Default::default(),
             identity: 0,
             bot: "Bob".into(),
             turn,
@@ -10090,6 +10145,7 @@ mod tests {
             ahead: None,
             after: Default::default(),
             tailing: Default::default(),
+            failed: Default::default(),
             identity: 0,
             bot: "Bob".into(),
             turn: 1,

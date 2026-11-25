@@ -10875,6 +10875,21 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+    /// A summary started after `turn` that came to nothing without
+    /// failing, as that turn's event, with its `reason`.
+    pub fn compaction_skipped(&mut self, bot: &str, turn: i64, data: Value) -> Result<()> {
+        let running: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT running_turn FROM bots WHERE name=?")?
+            .query_row([bot], |r| r.get(0))?;
+        let tx = self.conn.savepoint()?;
+        event(&tx, bot, Some(turn), "compaction_skipped", data)?;
+        if running != Some(turn) {
+            retain_late(&tx, turn, bot)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     /// The data of the bot's newest failed summary when that was a
     /// refusal: one read of the bot's row.
     pub fn refused_summary(&self, bot: &str) -> Result<Option<Value>> {
@@ -14412,6 +14427,17 @@ impl Database {
     }
     /// End a turn and return every committed event in cursor order.
     pub fn finish(&mut self, turn: i64, error: Option<&Error>) -> Result<Vec<Value>> {
+        self.finish_noting(turn, error, false)
+    }
+    /// End a turn, as [`Database::finish`]; `summary_after` says a summary
+    /// of the bot's history starts as the end commits, which its
+    /// `turn_finished` tells.
+    pub fn finish_noting(
+        &mut self,
+        turn: i64,
+        error: Option<&Error>,
+        summary_after: bool,
+    ) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
         let waiting = self.waiting(turn)?;
         let code = error.map(|e| e.code.as_str());
@@ -14709,6 +14735,9 @@ impl Database {
         }
         if let Some(limit) = limit {
             data["limit"] = json!(limit);
+        }
+        if summary_after {
+            data["summary_after"] = json!(true);
         }
         // The turn's last summary did not apply: why, as it was recorded.
         let failed: Option<String> = tx
