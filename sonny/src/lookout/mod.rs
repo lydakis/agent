@@ -3107,9 +3107,15 @@ impl Lookout {
             asked["quotes"] = json!(quotes);
         }
         // Its subscriptions' digests count from it once it lands, and
-        // allow no other note meanwhile.
+        // allow no other note meanwhile: only for what they held, as an
+        // Alertmanager group's interval counts from that group's own
+        // notification. What steers waits for no digest, so it starts
+        // none's window again.
         let mut subs: Vec<String> = Vec::new();
-        for sub in sent.iter().flat_map(|heard| &heard.subs) {
+        for sub in (sent.iter())
+            .filter(|heard| !heard.event.steer)
+            .flat_map(|heard| &heard.subs)
+        {
             if self.sub_digest(sub).is_some() && !subs.contains(sub) {
                 subs.push(sub.clone());
             }
@@ -3188,7 +3194,7 @@ impl Lookout {
                 self.count(&key, &heard, &steered);
                 self.spend(&key);
                 self.unkept_sent = Unkept::default();
-                for heard in &sent {
+                for heard in sent.iter().filter(|heard| !heard.event.steer) {
                     self.told_sources.insert(heard.event.source.clone(), now);
                 }
                 told_commons(&crate::commons::who(&self.lead, self.lead_id), &sent);
@@ -5935,6 +5941,58 @@ mod tests {
                 .contains("two")
         );
         assert!(lookout.heard.is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_steers_starts_no_digest_s_window_again() {
+        let (client, mut got) = submits().await;
+        let mut lookout = lookout();
+        lookout.live = true;
+        let mut chat = hears("chat");
+        chat.digest = Some("1h".into());
+        chat.steer = Some(json!({"text": [{"prefix": "down"}]}));
+        lookout.subs.push(chat);
+        lookout.lead_id = Some(1);
+        let hour = Duration::from_secs(3600);
+        // Its own digest and its source's both told a while ago, a
+        // minute of each window left.
+        let then = Instant::now() - (hour - Duration::from_secs(60));
+        lookout.told_subs.insert("chat".into(), then);
+        lookout.told_sources.insert("slack".into(), then);
+        let digested = |text: &str| sources::Event {
+            digest: Some(hour),
+            ..slack(text, false)
+        };
+        lookout.heard_from(&digested("lunch?"));
+        wake(&mut lookout, &client).await;
+        assert!(got.try_recv().is_err());
+        // A steer goes at once, alone, and both windows still end when
+        // they would have: what they hold waits a minute more, not an
+        // hour after the last steer.
+        for text in ["down: prod", "down: api"] {
+            lookout.heard_from(&digested(text));
+            wake(&mut lookout, &client).await;
+            let prompt = told(got.recv().await.unwrap()["prompt"].as_str().unwrap());
+            assert!(
+                prompt.contains(text) && !prompt.contains("lunch"),
+                "{prompt}"
+            );
+        }
+        assert_eq!(lookout.told_subs["chat"], then);
+        assert_eq!(lookout.told_sources["slack"], then);
+        assert!(lookout.ready(&lookout.heard[0], then + hour));
+        // Once the window ends, what it held goes, and the next counts
+        // from that note.
+        let ended = Instant::now();
+        lookout.told_subs.insert("chat".into(), ended - hour);
+        lookout.told_sources.insert("slack".into(), ended - hour);
+        wake(&mut lookout, &client).await;
+        let prompt = got.recv().await.unwrap()["prompt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(prompt.contains("lunch?"), "{prompt}");
+        assert!(lookout.told_subs["chat"] >= ended && lookout.told_sources["slack"] >= ended);
     }
 
     #[test]
