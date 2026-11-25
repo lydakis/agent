@@ -315,8 +315,9 @@ pub struct Turn {
     pub after: std::sync::Mutex<Option<After>>,
     /// Set while this turn's summary runs after it ended, which bills it.
     pub tailing: AtomicBool,
-    /// How many summaries of this turn were kept as failed, so one run
-    /// after it ended knows whether its end was told.
+    /// How many summaries of this turn were kept as failed for good (not
+    /// one a request of its own follows), so one run after it ended knows
+    /// whether its end was told.
     pub failed: AtomicU32,
 }
 
@@ -3090,7 +3091,14 @@ impl Turn {
     /// error's facts: the turn's `turn_finished` says so when it was the
     /// turn's last summary.
     async fn compaction_failed(&self, turn: i64, error: &Error) -> Result<()> {
-        self.failed.fetch_add(1, Relaxed);
+        // One a request of its own follows does not end the summary.
+        let follows = error
+            .facts
+            .as_deref()
+            .is_some_and(|facts| facts.get("fallback") == Some(&Value::Bool(true)));
+        if !follows {
+            self.failed.fetch_add(1, Relaxed);
+        }
         let mut data = json!({"error":error.code,"detail":error.detail});
         if let (Some(data), Some(facts)) = (data.as_object_mut(), error.facts.as_deref()) {
             for (key, value) in facts {
