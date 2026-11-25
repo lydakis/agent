@@ -284,6 +284,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::board::PLAIN_FOLLOWS_PLAIN,
         retire: "0.12.0",
     },
+    // A lead's `tasks` follow outlives a close, marked so in each follows
+    // file (after 0.10.6).
+    Migration {
+        id: crate::lookout::subs::LEAD_TASKS_OUTLIVE_CLOSE,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -306,6 +312,7 @@ fn store_files(store: &Path) {
     crate::lookout::subs::agents_files(store);
     crate::lookout::subs::goals_gone(store);
     crate::lookout::subs::commons_outlive_close(store);
+    crate::lookout::subs::lead_tasks_outlive_close(store);
     crate::board::hold_quiet_gone(store);
     crate::git::drop_snapshot_indexes(store);
 }
@@ -712,6 +719,7 @@ mod tests {
             "agents_files",
             "goals_gone",
             "commons_outlive_close",
+            "lead_tasks_outlive_close",
             "work_follows_close",
             "plain_follows_plain",
             "nested_gone",
@@ -744,6 +752,7 @@ mod tests {
             crate::lookout::subs::AGENTS,
             crate::lookout::subs::GOALS_GONE,
             crate::lookout::subs::COMMONS_OUTLIVE_CLOSE,
+            crate::lookout::subs::LEAD_TASKS_OUTLIVE_CLOSE,
             crate::git::NO_SNAPSHOTS,
         ] {
             assert!(done(&record, id), "{id}");
