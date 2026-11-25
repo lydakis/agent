@@ -1181,6 +1181,16 @@ impl Addressed {
     }
 }
 
+/// `name`, known as `id`, as an addressed event's id names it: an agent
+/// made again under the name is told its own news, not taken for a
+/// repeat of the one before's.
+pub(crate) fn whom(name: &str, id: Option<i64>) -> String {
+    match id {
+        Some(id) => format!("{name}/{id}"),
+        None => name.to_owned(),
+    }
+}
+
 /// Says `news` to its agent, one of `store`'s, through the store's
 /// commons source: the agent follows [`to_me`] in `store` the first time
 /// anything is addressed to it, and the news joins the store's [`TO`].
@@ -1356,7 +1366,10 @@ pub async fn mention(
         };
         let news = Addressed {
             event: "mentioned",
-            id: format!("{thread}/{n}/mentioned/{name}"),
+            id: format!(
+                "{thread}/{n}/mentioned/{}",
+                whom(name, record["bot_id"].as_i64())
+            ),
             to: name.clone(),
             to_id: record["bot_id"].as_i64(),
             from: Some(author.to_owned()),
@@ -1472,7 +1485,7 @@ fn asked(
     let board = work["board"].as_str().unwrap_or_default();
     Addressed {
         event: "asked",
-        id: format!("{thread}/{}/asked/{name}", posts.len()),
+        id: format!("{thread}/{}/asked/{}", posts.len(), whom(name, id)),
         to: name.to_owned(),
         to_id: id,
         from: Some(author.to_owned()),

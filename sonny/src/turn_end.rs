@@ -204,7 +204,7 @@ fn holding(
 ) -> crate::commons::Addressed {
     crate::commons::Addressed {
         event: "holding",
-        id: format!("{thread}/holding/{bot}/{turn}"),
+        id: format!("{thread}/holding/{}/{turn}", crate::commons::whom(bot, id)),
         to: bot.to_owned(),
         to_id: id,
         from: None,
@@ -586,7 +586,8 @@ mod tests {
         assert_eq!(line["to"], "shop.w.1");
         assert_eq!(line["thread"], "store");
         assert_eq!(line["board"], "shop/errors");
-        assert_eq!(line["id"], "store/holding/shop.w.1/2");
+        assert_eq!(line["id"], "store/holding/shop.w.1/4/2");
+        assert_eq!(line["to_id"], 4);
         assert!(line.get("from").is_none(), "{line}");
         let text = line["text"].as_str().unwrap();
         assert!(
