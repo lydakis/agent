@@ -145,3 +145,43 @@ lookout (George, 11-17).
 - Add behavior tests when implementation begins. Documentation-only changes need
   source/link review and diff checks, not an invented application test suite.
 - Do not select a language or add runtime dependencies just to scaffold a repo.
+
+## Code Review Rules
+
+For Codex when it reviews a pull request here. A pull request merges once CI
+is green and a review round finds no bug a person would hit, so report what
+blocks that and leave out the rest.
+
+### What counts as P1
+
+A bug a person hits in normal use, lost or corrupted data, a security hole, a
+broken build or test, or a benchmark made worse than the base.
+
+### Not findings here
+
+George declines these, and each costs a review round. Leave them out:
+
+- A crash or kill at one exact step, such as between two fsyncs.
+- A race that needs a precise interleaving to show up.
+- Extreme load, past what the benchmarks screen.
+- Hostile input from our own trusted callers (the CLI, Sonny, the person's
+  config).
+- A break with an earlier Agent revision ("No compatibility branches").
+
+### Check these in the diff
+
+- A Sonny feature change updates its sonny/FEATURES.md row ("Working rules").
+- American spelling in code, docs, config keys and shipped text.
+- No UI line, label, hint or restyle the pull request's description does not
+  ask for.
+- No invented limits or caps; pacing learns from the provider.
+- No hidden behavior: whoever asks for X gets X, set by config, with one
+  convention everywhere.
+- Errors branch on published types and status codes, never on message text.
+- Tracked files hold no real names, machine paths or transcripts; examples
+  are synthetic ("Working rules").
+- A `src/` change keeps "Keep the daemon fast and light" and src/AGENTS.md.
+
+### How to report
+
+Each finding names a file and line and says in one line who hits it and how.
