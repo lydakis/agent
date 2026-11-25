@@ -306,16 +306,7 @@ pub fn cli() -> i32 {
 /// and gives what it keeps next, none to have it go.
 fn change<T>(change: impl FnOnce(Option<Away>) -> (Option<Away>, T)) -> Result<T, String> {
     let file = away_file().ok_or("no HOME")?;
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let lock = std::fs::File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(file.with_extension("lock"))
-        .map_err(|e| e.to_string())?;
-    lock.lock().map_err(|e| e.to_string())?;
+    let _lock = lock()?;
     let (next, out) = change(read_away());
     match next {
         Some(away) => write_away(&away)?,
@@ -327,6 +318,22 @@ fn change<T>(change: impl FnOnce(Option<Away>) -> (Option<Away>, T)) -> Result<T
         },
     }
     Ok(out)
+}
+
+/// Hold the lock beside `~/.agent/sonny/away` until the guard goes.
+fn lock() -> Result<std::fs::File, String> {
+    let file = away_file().ok_or("no HOME")?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file.with_extension("lock"))
+        .map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    Ok(lock)
 }
 
 async fn tell_away() -> Result<(), String> {
@@ -342,7 +349,12 @@ async fn tell_away() -> Result<(), String> {
     // Kept before the first note, with every lead in it: one the daemon
     // took but did not answer for is told again next minute, or, once the
     // person looks at it, again with its back note.
+    // Back since, before any lead was told: nothing to tell. A look that
+    // comes after this check, under the same lock, finds its lead told.
     let tell = change(|kept| {
+        if present_ms() != Some(since_ms) {
+            return (kept, None);
+        }
         let kept = kept.filter(|kept| kept.socket == socket);
         let (tell, leads) = to_tell(kept.as_ref(), &names, since_ms);
         let away = Away {
@@ -350,8 +362,11 @@ async fn tell_away() -> Result<(), String> {
             leads,
             socket: socket.clone(),
         };
-        (Some(away), tell)
+        (Some(away), Some(tell))
     })?;
+    let Some(tell) = tell else {
+        return Ok(());
+    };
     let note = away_note(since_ms);
     let (mut told, mut failed) = (Vec::new(), None);
     for name in tell {
@@ -490,7 +505,12 @@ fn touch(bot: Option<String>) -> Option<(PathBuf, String, Lead)> {
         let _ = opened.set_modified(SystemTime::now());
     }
     let bot = bot?;
-    let away = read_away()?;
+    // Read under the lock, after the touch: `sonny away` either saw this
+    // use and told no one, or wrote this lead's absence before this read.
+    let away = {
+        let _lock = lock().ok()?;
+        read_away()?
+    };
     let lead = *away.leads.get(&bot)?;
     Some((away.socket, bot, lead))
 }
