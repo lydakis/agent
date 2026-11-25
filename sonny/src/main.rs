@@ -33,6 +33,8 @@ mod context;
 mod declared;
 mod desktop;
 mod diff;
+#[cfg(test)]
+mod draw_bench;
 mod drawing;
 mod elsewhere;
 mod embed;
