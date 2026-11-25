@@ -2211,19 +2211,45 @@ fn in_turn(machines: Vec<Machine>, client: Option<&str>, only_theirs: bool) -> V
 const BUSY_WAIT: Duration = Duration::from_secs(60);
 const BUSY_AGAIN: Duration = Duration::from_millis(250);
 
+/// Why the machines linked here handed over nothing.
+#[derive(Debug, PartialEq)]
+enum Unhanded {
+    /// None of these has the file, or none of them is connected.
+    Nowhere(Vec<String>),
+    /// Why it could not be had.
+    Failed(String),
+}
+
+impl Unhanded {
+    /// Said of the file dropped from `path`: where it was not found, or
+    /// why it could not be had.
+    fn dropped(self, path: &str) -> String {
+        let name = (Path::new(path).file_name()).map_or(path.into(), |name| name.to_string_lossy());
+        match self {
+            Unhanded::Nowhere(asked) => format!(
+                "{name} was not found on this machine or on {}",
+                asked.join(" or ")
+            ),
+            Unhanded::Failed(why) => format!("{name}: {why}"),
+        }
+    }
+}
+
 /// What `payload` asks of the machines in `asked`, each in turn until one
 /// has it: its answer, or why none did. A machine whose calls are all
 /// taken is asked again until one frees. Blocks while it waits, on a
 /// thread of its own.
-fn hand(payload: Value, asked: Vec<String>) -> Result<Value, String> {
+fn hand(payload: Value, asked: Vec<String>) -> Result<Value, Unhanded> {
     if asked.is_empty() {
-        return Err("no machine linked here is connected".into());
+        return Err(Unhanded::Failed(
+            "no machine linked here is connected".into(),
+        ));
     }
     let answered = std::thread::spawn(move || {
         let runtime = (tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Unhanded::Failed(e.to_string()))?;
         for machine in &asked {
             let until = Instant::now() + BUSY_WAIT;
             loop {
@@ -2234,29 +2260,34 @@ fn hand(payload: Value, asked: Vec<String>) -> Result<Value, String> {
                     Err(("link_busy", _)) if Instant::now() < until => {
                         std::thread::sleep(BUSY_AGAIN)
                     }
-                    Err((_, why)) => return Err(why),
+                    Err((_, why)) => return Err(Unhanded::Failed(why)),
                 }
             }
         }
-        Err(format!("not on {}", asked.join(" or ")))
+        Err(Unhanded::Nowhere(asked))
     });
     answered
         .join()
-        .map_err(|_| "the link's thread failed".to_owned())?
+        .map_err(|_| Unhanded::Failed("the link's thread failed".to_owned()))?
 }
 
 /// The picture in a file dropped from a machine linked here, at `path`
-/// there, converted there when it is one models do not take as it is.
+/// there, converted there when it is one models do not take as it is; or
+/// why not, said of the file.
 pub fn picture(path: &str) -> Result<crate::attach::Picture, String> {
-    let answer = hand(json!({"path": path, "picture": true}), handers(false))?;
-    crate::attach::from_json(&answer["picture"])
+    let asked = json!({"path": path, "picture": true});
+    let answer = hand(asked, handers(false)).map_err(|why| why.dropped(path))?;
+    crate::attach::from_json(&answer["picture"]).map_err(|why| Unhanded::Failed(why).dropped(path))
 }
 
 /// The picture on the clipboard of a machine linked here, if it holds one.
 pub fn clipboard() -> Result<Option<crate::attach::Picture>, String> {
     // The clipboard of the machine the person is at: every machine has
     // one, so another is asked only when none is known to be theirs.
-    let answer = hand(json!({"clipboard": true}), handers(true))?;
+    let answer = hand(json!({"clipboard": true}), handers(true)).map_err(|why| match why {
+        Unhanded::Nowhere(asked) => format!("not on {}", asked.join(" or ")),
+        Unhanded::Failed(why) => why,
+    })?;
     match answer["none"] == true {
         true => Ok(None),
         false => crate::attach::from_json(&answer["picture"]).map(Some),
@@ -2264,17 +2295,18 @@ pub fn clipboard() -> Result<Option<crate::attach::Picture>, String> {
 }
 
 /// A file dropped from a machine linked here, at `path` there, copied to
-/// `to` here for the agent to read.
+/// `to` here for the agent to read; or why not, said of the file.
 pub fn copy(path: &str, to: &Path) -> Result<(), String> {
     use base64::Engine;
-    let answer = hand(json!({"path": path}), handers(false))?;
+    let failed = |why: String| Unhanded::Failed(why).dropped(path);
+    let answer = hand(json!({"path": path}), handers(false)).map_err(|why| why.dropped(path))?;
     let bytes = (base64::engine::general_purpose::STANDARD)
         .decode(answer["data"].as_str().unwrap_or_default())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| failed(e.to_string()))?;
     if let Some(dir) = to.parent() {
-        private(dir).map_err(|e| e.to_string())?;
+        private(dir).map_err(|e| failed(e.to_string()))?;
     }
-    std::fs::write(to, bytes).map_err(|e| format!("{}: {e}", to.display()))
+    std::fs::write(to, bytes).map_err(|e| failed(format!("{}: {e}", to.display())))
 }
 
 /// Where a file dropped from another machine is kept here, by its name
@@ -2999,6 +3031,19 @@ mod tests {
             ["desk", "laptop", "old"]
         );
         assert_eq!(in_turn(linked(), None, true), ["desk", "laptop", "old"]);
+    }
+
+    /// A dropped file no machine linked here has is said by its name,
+    /// with the machines asked; any other failure by its name and why.
+    #[test]
+    fn a_dropped_file_none_here_has_says_where_it_is_not() {
+        let nowhere = Unhanded::Nowhere(vec!["mini".into(), "desk".into()]);
+        assert_eq!(
+            nowhere.dropped("/Users/someone/Desktop/shot 1.png"),
+            "shot 1.png was not found on this machine or on mini or desk"
+        );
+        let failed = Unhanded::Failed("Operation not permitted".into());
+        assert_eq!(failed.dropped("/a/b.png"), "b.png: Operation not permitted");
     }
 
     #[test]
