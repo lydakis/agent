@@ -164,8 +164,12 @@ class ImageTests(ModelFixture):
         ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m['data']['handle'] == handle)
         self.assertEqual(ended['data']['outcome'], 'allowed')
         prompt = 'calls:' + json.dumps([['wait', {'handles': [handle]}]])
-        turn = client.request('submit', bot='Bob', request_id='w', prompt=prompt, delivery='queue')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The read, allowed, runs on, and its end is told to Bob in a turn of
+        # its own, which may still run when this is submitted: then this
+        # waits in line and opens no turn yet, so it is followed by its
+        # message.
+        message = client.request('submit', bot='Bob', request_id='w', prompt=prompt, delivery='queue')['result']['message']
+        self.assertEqual(client.finished(message)['data']['status'], 'completed')
         while True:
             request = self.model.requests.get(timeout=3)
             last = request['input'][-1]
