@@ -110,12 +110,12 @@ class ScoreTests(unittest.TestCase):
                            [row('start_task'), tests(5), tests(9)], files=files)
             self.assertEqual(set(self.score('quiet-automation', good).values()), {True})
         with tempfile.TemporaryDirectory() as tmp:
-            # The second run kept calling after its tests, and the first
-            # said something, which reached the lead.
+            # The second run kept calling after its tests, a plan step that
+            # names them, and the first said something, which reached the lead.
             said = [dict(runs[0], reply='All tests pass.'), runs[1]]
             loud = run_dir(tmp, [part('person', 'Started shop.watch.'),
                                  {**part('note'), 'start': 'shop.watch replied to automation, completed: All'}],
-                           [tests(5), tests(9), row('update_plan', bot='shop.watch', turn=9)],
+                           [tests(5), tests(9), row('update_plan', bot='shop.watch', turn=9, preview='Run tests')],
                            files={**files, 'automation.json': json.dumps(said)})
             checks = self.score('quiet-automation', loud)
             self.assertTrue(checks['the automation ran at least twice'])

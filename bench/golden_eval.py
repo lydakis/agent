@@ -114,7 +114,9 @@ EDITS = {'write', 'edit', 'apply_patch'}
 SHELL_WRITES = (r"sed\s+-i|perl\s+-pi|\btee\b|>>?\s*['\"]?[\w./-]+\.py\b|write_text|"
                 r"open\([^)]*['\"][wa]['\"]|git\s+apply|\bpatch\s+-")
 SKILL = re.compile(r'skills/([A-Za-z0-9_.-]+)/SKILL\.md')
-# A call that runs the repository's tests, by its words.
+# A call that runs the repository's tests: a command or a code-mode script
+# (the tools that run things), by its words.
+RUNNERS = {'shell', 'exec'}
 TESTS = r"unittest|pytest|\btests?\b"
 
 NOISE = [
@@ -487,13 +489,13 @@ class View:
 
     def ran_tests(self, run):
         """Whether an automation's run made a call that ran the tests."""
-        return any(re.search(TESTS, r['preview'] or '') for r in self.run_calls(run))
+        return any(map(runs_tests, self.run_calls(run)))
 
     def after_tests(self, run):
         """The calls an automation's run made after its last that ran the
         tests; all of them when none did."""
         calls = self.run_calls(run)
-        ran = [i for i, r in enumerate(calls) if re.search(TESTS, r['preview'] or '')]
+        ran = [i for i, r in enumerate(calls) if runs_tests(r)]
         return calls[ran[-1] + 1:] if ran else calls
 
     def answer(self):
@@ -701,6 +703,12 @@ class View:
         if not folder.is_dir():
             return ''
         return '\n'.join(p.read_text(errors='replace') for p in sorted(folder.rglob('*.md')) if p.is_file())
+
+
+def runs_tests(row):
+    """Whether a trail row ran the tests: a command or script whose words
+    do, not any call that names them, such as a plan's step."""
+    return row['tool'] in RUNNERS and bool(re.search(TESTS, row['preview'] or ''))
 
 
 def read_by(read, row):

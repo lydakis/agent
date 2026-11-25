@@ -280,8 +280,9 @@ person for: noise needs no work, and an empty reply ends the turn.
 two minutes with an automation of its own while they pass. Every run should
 end with an empty reply right after the tests, as task.md says, so no note
 reaches the lead. A run's calls come from the trail (`automation.json`,
-beside `automation.md`): each run must make a call that runs the tests, and
-those after its last such call count against it.
+beside `automation.md`): each run must run the tests, by a `shell` command or
+an `exec` script whose words do (a plan step that names them is not one),
+and calls after its last such call count against it.
 
 `recover-context` tells the lead's model its context holds 55,000 tokens
 (`[context_windows]` in the run's config), gives it a codename and a
