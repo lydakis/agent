@@ -188,7 +188,10 @@ class BlindTests(unittest.TestCase):
             db.executescript(
                 "CREATE TABLE messages(id INTEGER PRIMARY KEY, bot TEXT, turn INTEGER, origin TEXT);"
                 "CREATE TABLE turns(id INTEGER PRIMARY KEY, bot TEXT, status TEXT, reply_node INTEGER);"
-                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, item BLOB);")
+                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, item BLOB);"
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY, bot TEXT, turn INTEGER, tool TEXT);")
+            db.executemany("INSERT INTO audit(bot, turn, tool) VALUES (?, ?, ?)", [
+                ('shop.watch', 9, 'shell'), ('shop.watch', 7, 'read'), ('shop.watch', 9, 'update_plan')])
             said = {'type': 'message', 'role': 'assistant',
                     'content': [{'type': 'output_text', 'text': 'Tests pass in /work/a/target/release.'}]}
             db.execute("INSERT INTO nodes VALUES (1, ?)", (json.dumps(said),))
@@ -212,8 +215,9 @@ class BlindTests(unittest.TestCase):
             # about an automation's run.
             self.assertEqual((run / 'automation.md').read_text(),
                              '## Turns an automation started\n\n'
-                             '- shop.watch/5 completed: (empty reply)\n'
-                             '- shop.watch/9 completed: "Tests pass in /work/a/target/release."\n'
+                             '- shop.watch/5 completed, no call: (empty reply)\n'
+                             '- shop.watch/9 completed, calls: shell, update_plan: '
+                             '"Tests pass in /work/a/target/release."\n'
                              '\n## Notes to the lead about them\n\n'
                              'shop.watch replied to automation, completed: Tests pass\n')
             # Read again, the notes are not added twice.
@@ -223,9 +227,13 @@ class BlindTests(unittest.TestCase):
                     mock.patch.object(role_eval, 'DAY', role_eval.QUIET):
                 role_eval.blind()
             [blind] = list((out / 'blind').iterdir())
-            self.assertIn('- shop.watch/5 completed: (empty reply)', blind.read_text())
+            self.assertIn('- shop.watch/5 completed, no call: (empty reply)', blind.read_text())
             # A path that names the arm is hidden there too.
-            self.assertIn('- shop.watch/9 completed: "Tests pass in /BUILD."', blind.read_text())
+            self.assertIn('- shop.watch/9 completed, calls: shell, update_plan: "Tests pass in /BUILD."',
+                          blind.read_text())
+            # And the same runs for the golden set's checks.
+            self.assertEqual([(r['turn'], r['reply']) for r in json.loads((run / 'automation.json').read_text())],
+                             [(5, ''), (9, 'Tests pass in /work/a/target/release.')])
 
 
 class ConfinedTests(unittest.TestCase):

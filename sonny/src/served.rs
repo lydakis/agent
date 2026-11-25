@@ -1322,8 +1322,8 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = invocation.daemon()
             {
-                // A thread on a board is followed for why the agent is
-                // there, and work opened or taken follows its board.
+                // Work's thread is followed for why the agent is there,
+                // and work opened or taken follows its board.
                 let on_board = (crate::board::on())
                     .then(|| crate::board::follows(&store, &caller, caller_id, arguments, &said))
                     .flatten();

@@ -151,8 +151,8 @@ const CUTS: [(&str, &str); 3] = [
         "the project's memory, and the person",
     ),
     (
-        "its bot, or look in the commons, or ask your lead",
-        "its bot, or ask your lead",
+        "the history tool, look in the commons or ask your lead",
+        "the history tool or ask your lead",
     ),
     (
         " When you find something agents in other projects could use, post it to the commons.",
@@ -2777,10 +2777,11 @@ pub fn subscribe(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Resu
 
 /// Subscribes `bot` to `thread`, as posting there does, and says what it
 /// is subscribed to, for the post's answer: the subscription's name, how
-/// often the thread's posts reach it, and how to change that. A thread on
-/// a board is followed as `on_board` says, in place of a follow of it
-/// whose rules differ: each post as it comes, and why. None when its
-/// subscriptions cannot be written.
+/// often the thread's posts reach it, and how to change that. Work's
+/// thread is followed as `on_board` says, in place of a follow of it
+/// Sonny made whose rules differ, never of one the agent changed: each
+/// post as it comes, and why. None when its subscriptions cannot be
+/// written.
 pub fn subscribed(
     store: &Path,
     bot: &str,
