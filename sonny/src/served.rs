@@ -1602,7 +1602,8 @@ impl Server {
         let (nudge, serving) = (Arc::new(Notify::new()), Arc::new(Mutex::new(held)));
         // The workflows that were running when the last host stopped.
         crate::workflow::resume(store.clone(), socket.clone());
-        // News addressed while no host ran, still waiting.
+        // News addressed while no host ran, still waiting, and all that
+        // comes to wait while it runs.
         if let Some(home) = std::env::var_os("HOME") {
             tokio::spawn(crate::commons::send_waiting(home.into(), store.clone()));
         }
@@ -3081,12 +3082,11 @@ async fn answer(
 /// the host, from the call and its answer: a commons post or reply wrote
 /// in its thread. News a commons call or a start addressed to an agent
 /// whose follow the lookout had not taken yet is moved on from here,
-/// where it outlives the call (`commons::send_waiting`).
+/// where it outlives the call: the host's `commons::send_waiting` is
+/// poked.
 async fn noted(name: &str, bot: &str, turn: i64, arguments: &Value, output: &str, store: &Path) {
-    if (name == COMMONS || name == START)
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        tokio::spawn(crate::commons::send_waiting(home.into(), store.to_owned()));
+    if name == COMMONS || name == START {
+        crate::commons::poke_waiting(store);
     }
     if name == COMMONS && (arguments["post"].is_object() || arguments["reply"].is_object()) {
         let said: Value = serde_json::from_str(output).unwrap_or_default();

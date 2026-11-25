@@ -1093,11 +1093,16 @@ async fn sends(
     invited
 }
 
-/// Where the commons keeps the news it addresses to one agent, a line
-/// each, as the commons source tells it: `mentioned`, `asked` and
-/// `holding`, each with `to`. Not a thread: its name is none a thread
-/// can have.
-const TO: &str = ".to.jsonl";
+/// Where a store's commons source finds the news addressed to one of the
+/// store's agents, a line each, as it tells it: `mentioned`, `asked` and
+/// `holding`, each with `to`. In the source's own folder ([`source_dir`]),
+/// so it is the store's alone: another store sharing the commons, with
+/// an agent of the same name, does not hear it.
+const TO: &str = "to.jsonl";
+
+/// Where news to an agent of the store waits for the store's lookout to
+/// hear it, in the same folder ([`address`]).
+const WAITING: &str = "to-waiting.jsonl";
 
 /// What the commons source keeps of [`TO`] in its cursor: how far it was
 /// read, in bytes. No thread's name, which has no dot.
@@ -1166,19 +1171,19 @@ impl Addressed {
     }
 }
 
-/// Says `news` to its agent through the commons source: the agent
-/// follows [`to_me`] in `store` the first time anything is addressed to
-/// it, and the news joins [`TO`]. Its lookout would not hear it yet while
-/// that lookout has not taken the agent's follows file as it is now, as
-/// one just made, or while the store's commons source has never looked,
-/// since a first look tells none of the past: then the news waits in the
-/// store's [`waiting`] file for the tool host to move it on
-/// ([`send_waiting`]). Whether it was kept.
+/// Says `news` to its agent, one of `store`'s, through the store's
+/// commons source: the agent follows [`to_me`] in `store` the first time
+/// anything is addressed to it, and the news joins the store's [`TO`].
+/// Its lookout would not hear it yet while that lookout has not taken the
+/// agent's follows file as it is now, as one just made, or while the
+/// store's commons source has never looked, since a first look tells
+/// none of the past: then the news waits in [`WAITING`] for the tool host
+/// to move it on ([`send_waiting`]). Whether it was kept.
 pub fn address(home: &Path, store: &Path, news: &Addressed) -> bool {
     made_once(home, store, &news.to, news.to_id);
     let file = match heard(store, &news.to) {
-        true => dir(home).join(TO),
-        false => waiting(store),
+        true => source_dir(store).join(TO),
+        false => source_dir(store).join(WAITING),
     };
     keep_addressed(home, &file, &news.line())
 }
@@ -1207,13 +1212,9 @@ fn made_once(home: &Path, store: &Path, to: &str, id: Option<i64>) {
     let _ = agent_client::files::replace_mode(&record, body.as_bytes(), 0o600);
 }
 
-/// Where the news [`address`] kept for `store` waits for that store's
-/// lookout, a line each as [`TO`] will hold it: beside the store, since
-/// stores that share the commons each have a lookout of their own.
-fn waiting(store: &Path) -> PathBuf {
-    crate::lookout::beside(store, ".sources")
-        .join(agent_client::config::COMMONS_SOURCE)
-        .join("to-waiting.jsonl")
+/// `store`'s commons source's own folder, where its cursor is kept.
+fn source_dir(store: &Path) -> PathBuf {
+    crate::lookout::beside(store, ".sources").join(agent_client::config::COMMONS_SOURCE)
 }
 
 /// Whether `store`'s lookout would hear news to `to` as it joins [`TO`]:
@@ -1221,38 +1222,57 @@ fn waiting(store: &Path) -> PathBuf {
 /// either no lookout runs, which takes every follows file before it
 /// reads on, or the one that runs took `to`'s as it is now.
 fn heard(store: &Path, to: &str) -> bool {
-    let looked = crate::lookout::beside(store, ".sources")
-        .join(agent_client::config::COMMONS_SOURCE)
-        .join("read.json")
-        .exists();
+    let looked = source_dir(store).join("read.json").exists();
     let took = crate::lookout::subs::taken(store, to);
     looked && (took["current"] == true || took["running"] != true)
 }
 
 /// The news waiting for `store` joins [`TO`] as its lookout comes to hear
 /// it: that lookout reads every follows file again within its REREAD,
-/// and at once after a `commons` or `follows` call ends. Looked at until
-/// none waits, or for twice that; what still waits then waits for the
-/// next look. The tool host looks after each call that may address news,
-/// at each turn end that did, and as it starts.
+/// and at once after a `commons` or `follows` call ends, and its commons
+/// source makes its cursor on its first look. The tool host runs this
+/// for its store from its start: while any news waits, it looks again
+/// every quarter second; while none does, it waits for [`poke_waiting`],
+/// which the host calls after each call that may address news and at
+/// each turn end that did.
 pub async fn send_waiting(home: PathBuf, store: PathBuf) {
-    let within = 2 * crate::lookout::REREAD;
-    let since = std::time::Instant::now();
+    let poked = poked(&store);
     loop {
-        let (home, store) = (home.clone(), store.clone());
-        let left = tokio::task::spawn_blocking(move || move_waiting(&home, &store)).await;
-        if !matches!(left, Ok(true)) || since.elapsed() >= within {
-            return;
+        let (at, kept) = (home.clone(), store.clone());
+        let left = tokio::task::spawn_blocking(move || move_waiting(&at, &kept)).await;
+        match left {
+            Ok(true) => {
+                let soon = tokio::time::sleep(std::time::Duration::from_millis(250));
+                tokio::select! {
+                    () = soon => {}
+                    () = poked.notified() => {}
+                }
+            }
+            _ => poked.notified().await,
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+}
+
+/// News may wait for `store` now: its [`send_waiting`] looks.
+pub fn poke_waiting(store: &Path) {
+    poked(store).notify_one();
+}
+
+/// What wakes `store`'s [`send_waiting`], one for each store a host
+/// serves. A poke while it looks is kept for its next wait.
+fn poked(store: &Path) -> std::sync::Arc<tokio::sync::Notify> {
+    static POKES: OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<tokio::sync::Notify>>>,
+    > = OnceLock::new();
+    let mut pokes = POKES.get_or_init(Default::default).lock().unwrap();
+    pokes.entry(store.to_owned()).or_default().clone()
 }
 
 /// One look at what waits for `store`, under the commons folder's lock:
 /// each line whose agent its lookout would hear joins [`TO`], in order,
 /// and the rest stays. Whether any stays.
 fn move_waiting(home: &Path, store: &Path) -> bool {
-    let waiting = waiting(store);
+    let waiting = source_dir(store).join(WAITING);
     if !waiting.exists() {
         return false;
     }
@@ -1269,7 +1289,7 @@ fn move_waiting(home: &Path, store: &Path) -> bool {
             continue;
         };
         let to = news["to"].as_str().unwrap_or_default();
-        if !heard(store, to) || append(&dir.join(TO), &news).is_err() {
+        if !heard(store, to) || append(&source_dir(store).join(TO), &news).is_err() {
             kept.push_str(line);
             kept.push('\n');
         }
@@ -2659,7 +2679,7 @@ pub fn news(home: &Path, cursor: &Path) -> News {
     // What the commons addressed to one agent, each line as it was kept;
     // on a first look, none of the past.
     let had = read.get(TO_READ).and_then(|to| to["bytes"].as_u64());
-    if let Some((addressed, bytes)) = addressed_since(&dir.join(TO), had.unwrap_or(0))
+    if let Some((addressed, bytes)) = addressed_since(&cursor.join(TO), had.unwrap_or(0))
         && Some(bytes) != had
     {
         if !first {
@@ -4951,7 +4971,7 @@ mod tests {
             assert!(address(&home, &store, &addressed(event, "shop.w.1", n)));
         }
         // A line half written waits for its end.
-        let to = dir(&home).join(TO);
+        let to = cursor.join(TO);
         std::fs::OpenOptions::new()
             .append(true)
             .open(&to)
@@ -4992,6 +5012,47 @@ mod tests {
         let lines = look(&home, &cursor);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("store/4/asked/b.y"), "{lines:?}");
+        // Another store sharing the commons, with an agent of the same
+        // name, hears none of it.
+        let other = crate::lookout::beside(&home.join("other"), ".sources")
+            .join(agent_client::config::COMMONS_SOURCE);
+        assert!(look(&home, &other).is_empty());
+        assert!(address(&home, &store, &addressed("asked", "b.y", 5)));
+        assert!(look(&home, &other).is_empty());
+        assert_eq!(look(&home, &cursor).len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The host's waiter moves news on whenever its store's lookout comes
+    /// to hear it, however late, poked or not.
+    #[tokio::test]
+    async fn the_host_moves_waiting_news_on_once_its_lookout_hears_it() {
+        let home = home("waiter");
+        let store = home.join("store");
+        std::fs::create_dir_all(&home).unwrap();
+        let waiter = tokio::spawn(send_waiting(home.clone(), store.clone()));
+        // The store's commons source never looked: the news waits.
+        assert!(address(&home, &store, &addressed("asked", "shop.w.1", 1)));
+        poke_waiting(&store);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let cursor = source_dir(&store);
+        assert!(cursor.join(WAITING).exists());
+        assert!(look(&home, &cursor).is_empty());
+        // It looked: unpoked, the news is on within a moment.
+        let to = cursor.join(TO);
+        for _ in 0..40 {
+            if to.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!cursor.join(WAITING).exists());
+        let lines = look(&home, &cursor);
+        assert!(
+            lines.len() == 1 && lines[0].contains("store/1/asked"),
+            "{lines:?}"
+        );
+        waiter.abort();
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -5009,7 +5070,7 @@ mod tests {
         // A lookout runs for the store.
         let lock = std::fs::File::create(crate::lookout::beside(&store, ".lookout.lock")).unwrap();
         lock.lock().unwrap();
-        let (to, waiting) = (dir(&home).join(TO), waiting(&store));
+        let (to, waiting) = (cursor.join(TO), cursor.join(WAITING));
         assert!(address(&home, &store, &addressed("asked", "shop.w.1", 1)));
         assert!(!to.exists());
         assert!(move_waiting(&home, &store), "it still waits");

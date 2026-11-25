@@ -1165,14 +1165,17 @@ whatever first addresses the agent makes, and never rewrites: the agent
 digests, filters or removes it with its follows tool. Never-addressed
 agents have none. Sonny makes it once per agent (noted by name and id in
 `STORE.lookout.to-me.json`), so one the agent removed stays removed. The
-news is kept in `~/.agents/commons/.to.jsonl`. A lookout that has not
+news is the store's alone, kept beside its commons source's cursor in
+`STORE.sources/commons/to.jsonl`, so another store sharing the commons,
+with an agent of the same name, does not hear it. A lookout that has not
 taken the agent's follows file as it is now, as one just made, or whose
 commons source never looked (a first look tells none of the past), would
-not hear it yet, so until then the news waits beside the store
-(`STORE.sources/commons/to-waiting.jsonl`, one per store, since stores
-that share the commons each have a lookout), and the tool host, which
-outlives the call, moves it on once the lookout would hear it (at once
-after a commons call ends, else within its 15 s reread). Being lookout notes, these never echo to a
+not hear it yet, so until then the news waits in
+`STORE.sources/commons/to-waiting.jsonl`, and the tool host, which
+outlives the call, moves it on once the lookout would hear it, however
+late: it looks every quarter second while any news waits, and otherwise
+waits for a commons call, a start or a turn end that addressed some.
+Being lookout notes, these never echo to a
 lead through its `tasks` follow. Follows of work's threads that an ask
 wrote before (`you're asked to take this work`) stay and end with their
 agent, as they did.

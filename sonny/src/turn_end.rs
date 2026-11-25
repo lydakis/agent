@@ -391,7 +391,7 @@ pub fn finished(
             }
         })
         .await;
-        crate::commons::send_waiting(home, store).await;
+        crate::commons::poke_waiting(&store);
     });
 }
 

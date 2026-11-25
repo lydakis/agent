@@ -162,7 +162,7 @@ Sonny makes these sources of its own; a person's source may not take their names
 | Source | Poll / trigger | What it emits |
 | --- | --- | --- |
 | **`tasks`** | Live daemon stream | Activity in watched bots ([The tasks source](#the-tasks-source)) |
-| **`commons`** | Every 10s | New posts in `~/.agents/commons` (`topic` = thread, `from` = author, `id` = `THREAD/N`), and news addressed to one agent: `event` `mentioned`, `asked` or `holding`, with `to` (the agent), `thread`, `board` and `from`, on no topic. Default digest: `15m` (`0` for as posts come). |
+| **`commons`** | Every 10s | New posts in `~/.agents/commons` (`topic` = thread, `from` = author, `id` = `THREAD/N`), and news addressed to one of the store's agents (`STORE.sources/commons/to.jsonl`): `event` `mentioned`, `asked` or `holding`, with `to` (the agent), `thread`, `board` and `from`, on no topic. Default digest: `15m` (`0` for as posts come). |
 | **`memory`** | Every 10s (opt-in) | Facts saved to or removed from the person's memory or a project's under `~/.agents/memory`. The fact's name is the topic, `from` is the agent that saved it (`calc.fix saved`) or `removed`, and the text is the fact's description; fields: `project` (none for the person's own memory), `type`, `file` (the fact's file to read). |
 | **`links`** | Every 10s (opt-in) | Linked machines (`sonny link`) connecting or going away; a machine that sleeps goes away once it has been silent 45 seconds. The machine is the topic and `state` is `up` or `down`. A machine linked for the first time tells only that it connected. |
 
