@@ -292,18 +292,37 @@ mod own {
         async fn a_program_started_is_responsible_for_itself_and_says_what_it_printed() {
             // HOME, which every test run has, to see one taken away.
             assert!(std::env::var_os("HOME").is_some());
-            let script =
-                "echo $$ $(pwd) ${HOME-unset} ${SONNY_GIVEN-unset}; echo said >&2; sleep 1; exit 3";
-            let args = vec!["-c".to_owned(), script.to_owned()];
+            // The program says its ID once it has printed, and then waits
+            // to be let go, so it is looked at while it runs, its ID still
+            // its own, however slow the machine is to start it.
+            let dir = std::env::temp_dir().join(format!("responsible-own-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let (up, go) = (dir.join("up"), dir.join("go"));
+            for fifo in [&up, &go] {
+                let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                // SAFETY: a NUL-terminated path and a mode.
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            }
+            let script = format!(
+                "echo $$ $(pwd) ${{HOME-unset}} ${{SONNY_GIVEN-unset}}; echo said >&2; \
+                 echo $$ > '{}'; read _ < '{}'; exit 3",
+                up.display(),
+                go.display()
+            );
+            let args = vec!["-c".to_owned(), script];
             let ran = tokio::spawn(async move {
                 let changes = [("HOME", None), ("SONNY_GIVEN", Some(OsStr::new("given")))];
                 output(Path::new("/bin/sh"), &args, Path::new("/"), &changes).await
             });
-            // Asked while it sleeps, so its ID is still its own.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let mut seen = None;
+            let said = tokio::task::spawn_blocking(move || std::fs::read_to_string(up))
+                .await
+                .unwrap()
+                .unwrap();
+            let pid: libc::pid_t = said.trim().parse().unwrap();
+            let mut parent = None;
             for line in std::process::Command::new("/bin/ps")
-                .args(["-axo", "pid=,ppid=,command="])
+                .args(["-axo", "pid=,ppid="])
                 .output()
                 .unwrap()
                 .stdout
@@ -311,19 +330,21 @@ mod own {
             {
                 let line = String::from_utf8_lossy(line);
                 let words: Vec<&str> = line.split_whitespace().collect();
-                if words.len() > 2
-                    && words[1] == std::process::id().to_string()
-                    && line.contains("sleep 1; exit 3")
-                {
-                    seen = words[0].parse::<libc::pid_t>().ok();
+                if words.first() == Some(&pid.to_string().as_str()) {
+                    parent = words.get(1).and_then(|w| w.parse::<u32>().ok());
                 }
             }
-            let pid = seen.expect("the program runs under this one");
+            assert_eq!(
+                parent,
+                Some(std::process::id()),
+                "the program runs under this one"
+            );
             assert_eq!(
                 // SAFETY: this lookup takes only a process ID.
                 unsafe { responsibility_get_pid_responsible_for_pid(pid) },
                 pid
             );
+            std::fs::write(&go, "\n").unwrap();
             let ran = ran.await.unwrap().unwrap();
             assert_eq!(
                 String::from_utf8_lossy(&ran.stdout),
@@ -331,6 +352,7 @@ mod own {
             );
             assert_eq!(ran.stderr, b"said\n");
             assert!(!ran.success);
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[tokio::test]
