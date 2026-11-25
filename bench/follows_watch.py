@@ -147,6 +147,16 @@ class Follows(Bench):
         return result
 
 
+def memory(pid):
+    """The lookout's own memory (anonymous) and the binary's pages it
+    has in (file), which depend on which binary file was written last."""
+    status = Path(f'/proc/{pid}/status').read_text()
+    kib = {line.split(':')[0]: int(line.split()[1]) for line in status.splitlines()
+           if line.startswith(('RssAnon', 'RssFile'))}
+    return {'anon_mib': round(kib.get('RssAnon', 0) / 1024, 1),
+            'file_mib': round(kib.get('RssFile', 0) / 1024, 1)}
+
+
 def summary(waits, count):
     def pct(q):
         return round(waits[min(len(waits) - 1, int(q * len(waits)))]) if waits else None
@@ -176,7 +186,8 @@ def main():
         sampler = Sampler(bench.lookout.pid)
         time.sleep(args.idle_s)
         idle = sampler.done()
-        results['idle'] = {**idle, 'cpu_s_per_min': round(idle['cpu_s'] * 60 / idle['seconds'], 3)}
+        results['idle'] = {**idle, 'cpu_s_per_min': round(idle['cpu_s'] * 60 / idle['seconds'], 3),
+                           **memory(bench.lookout.pid)}
         results['singles'] = bench.singles(args.singles, 0)
         first = args.singles
         results['bursts'] = {}
