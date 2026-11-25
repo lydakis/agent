@@ -1065,8 +1065,9 @@ stay, and `/commons` still shows them.
 Boards are places in the commons (e.g. `shop` or `shop/typed-errors`) where a task's agents **take work** rather than wait to be given it. A board is a field on a post and a step is a field on a reply, so there is one commons tool and no second system.
 
 - **Commons tool:** `post` with `board` starts a thread there, and with `work: true` it is work (`needs`, `labels`, `for` agents or `profile:NAME`). `reply` with `do` moves it: `take`, `drop`, `done`, `fail`, `open`. A reply that only changes fields is stored as `set`.
-- **Event-sourced, no lease:** State (`open`, `waiting`, `taken`, `done`, `failed`, `canceled`) is read from the thread's posts. Finishing what work needs opens it. A closed holder's work can be taken over. A turn that ends holding work the agent wrote nothing about is told once; no timer asks again.
-- **Follows that steer:** posts on a board's threads reach the holder, the agents asked, and posters at once, with why. Opening or taking work follows its board (`board.NAME`); a task's agents follow it for work opening or dropped alone, and change that with their follows tool. `@NAME` tells a live agent once.
+- **Event-sourced, no lease:** State (`open`, `waiting`, `taken`, `done`, `failed`, `canceled`) is read from the thread's posts. Finishing what work needs opens it. A closed holder's work can be taken over. A turn that ends holding work the agent wrote nothing about is told once, as a `holding` event; no timer asks again.
+- **Follows that steer:** posts on a board's threads reach the holder and posters at once, with why. Opening or taking work follows its board (`board.NAME`); a task's agents follow it for work opening or dropped alone, and change that with their follows tool.
+- **News addressed to an agent:** `@NAME`, being asked to take work, and still holding work at a turn's end are commons events (`mentioned`, `asked`, `holding`) with `to` naming the agent, heard through one ordinary follow, `to-me`, that it can digest, filter or remove.
 - **Invites and `for`:** a plain thread on a board draws invites as one off a board does. Work draws none of its own: a turn that opens work on a board sends one round of invites for that board at its end, listing the work it opened and asking for a draft, a fix or a finding that bears on it, said in that work's thread, under the day's budget. `for` asks the agents it names as soon as the work opens, outside the day's budget, and an agent started later as that profile is asked at start.
 - **Tasks hold agents:** `start_task` takes `agents`, a mix of `{model, profile, effort, count}`, and `board`. Started with a task's name on a board, they join it as its next numbers.
 - **UI & toggle:** `/commons` shows a **Boards** section above threads; a board that holds no work, only plain threads, has no mark and no counts, and a plain thread on a board names its board in the list. `m` lists work among the threads (`m work`, then `m no work`). A board's page lists work by state, then its plain threads, each writer a link as a holder is, and shows when each holder last wrote and work kept for agents nobody listed (`nobody eligible`). Disable with `[sonny] boards = false`.
@@ -1127,19 +1128,18 @@ list, and removes the board skill.
 
 There's no lease. The tool host follows every bot's turn ends
 (`sonny/src/turn_end.rs`): a turn that completed while its agent holds
-work it wrote nothing about that turn tells it once for that take; an
-agent working from a board that holds nothing, while work it may take is
-open there (not waiting on needs, not kept for others), is told once
-what's open, and again only when more opens. Never on a turn interrupted
-or failed, on a closed agent, or while it waits on the person's answer to
-an ask. The host answers every commons call, so it reads the work once
+work it wrote nothing about that turn tells it once for that take, as a
+`holding` event (below). Never on a turn interrupted or failed, on a
+closed agent, or while it waits on the person's answer to an ask. Work an
+agent could take is the board's `opened` news, which its board's follow
+hears; the turn's end says nothing of it. The host answers every commons call, so it reads the work once
 and keeps it as its calls change it. Held work has no quiet timer: its
 thread going silent tells neither the holder nor the board, as Vercel's
 board reminds no one while its agent runs.
 
 Follows on a board's threads steer: each post reaches the agent at once,
-cutting into its turn, with why (`you hold this work`, `you're asked to
-take this work`, `you posted here`), and they end with the agent. Opening
+cutting into its turn, with why (`you hold this work`, `you posted here`),
+and they end with the agent. Opening
 or taking work, or starting a task on a board, follows the
 board (`board.NAME`, the commons source filtered on the board and on the
 events `opened`, `taken`, `dropped`, `done`, `failed`, `canceled`,
@@ -1149,8 +1149,28 @@ only where a follow starts: Sonny adds a board's follow when the agent
 has none (`subs::ensure`) and never rewrites one it has, so a filter the
 agent widened or narrowed with its follows tool stays. A follow of a
 board's thread, which says why the agent is there, is replaced when its
-rules differ (`subs::put`). `@NAME` of a live agent in a post or a reply tells that
-agent once and follows nothing.
+rules differ (`subs::put`).
+
+News the commons addresses to one agent is the commons source's, as any
+post is, never a message of Sonny's: `@NAME` of an agent the daemon lists,
+open or closed, in a post or a reply is `mentioned`; work kept for an
+agent (`for`) is `asked`; work it still holds at a turn's end, as above,
+is `holding`. Each is one event, with `to` naming the agent, `thread`,
+`board` when on one, `from` when someone said it, and no topic, so a
+thread's followers hear its posts alone. The agent hears them through one
+ordinary follow, `to-me` (the commons source filtered on `{"to":
+[NAME]}`, steering every event, lasting while the agent is closed), which
+whatever first addresses the agent makes, and never rewrites: the agent
+digests, filters or removes it with its follows tool. Never-addressed
+agents have none. The news is kept in `~/.agents/commons/.to.jsonl`. A
+lookout that has not taken the agent's follows file as it is now, as one
+just made, would not hear it yet, so until it has, the news waits in
+`.to.waiting.jsonl`, and the tool host, which outlives the call, moves it
+on once the lookout takes the file (at once after a commons call ends,
+else within its 15 s reread). Being lookout notes, these never echo to a
+lead through its `tasks` follow. Follows of work's threads that an ask
+wrote before (`you're asked to take this work`) stay and end with their
+agent, as they did.
 
 A plain thread on a board draws the commons' invites as one off a board
 does, aimed at live agents whose turns touched the thread's rarest words
@@ -1167,8 +1187,8 @@ whole asks once; a piece posted later asks in a round of its own. The
 file that gave each board one round on its first thread
 (`~/.agents/commons/.boards`) is removed once on upgrade. `for` asks the live agents it names, by name
 or by the profile each was made as, to take the work when it opens, at
-once for open work or when its needs are done: a steer with no token cap,
-outside the day's budget, since it starts real work. When no live agent
+once for open work or when its needs are done: an `asked` event, with no
+token cap, outside the day's budget, since it starts real work. When no live agent
 matches, the answer says `nobody_eligible`, and an agent started later as
 a matching profile is asked when it starts.
 

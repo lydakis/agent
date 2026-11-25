@@ -130,7 +130,8 @@ pub const ASK_FOR: &str = "ask_for";
 
 /// Why a thread on a board reaches an agent that holds its work.
 pub const HOLDS: &str = "you hold this work";
-/// Why a thread on a board reaches an agent its work is for.
+/// Why a thread on a board reached an agent its work is for, as a follow
+/// written before the `asked` event (`commons::to_me`) still says.
 pub const ASKED: &str = "you're asked to take this work";
 /// Why a thread on a board reaches an agent that posted in it.
 pub const POSTED: &str = "you posted here";
@@ -159,7 +160,7 @@ pub fn follow_kept(store: &Path, caller: &str, board: &str, id: Option<i64>) {
 /// when it opened or took work there, and for an agent another dropped
 /// work from, its thread as one that posted there. The caller's own
 /// follow of the thread, as [`commons::subscribed`] takes it: as its
-/// holder, one the work is for, or one that posted; none for a thread on
+/// holder, or one that posted; none for a thread on
 /// no board.
 pub fn follows(
     store: &Path,
@@ -182,12 +183,9 @@ pub fn follows(
         let _ = crate::lookout::subs::put(store, name, post_follow(thread, held_by, POSTED));
     }
     let holds = work["state"] == "taken" && work["holder"] == caller;
-    let asked = matches!(work["state"].as_str(), Some("open"))
-        && (work["for"].as_array().into_iter().flatten()).any(|named| named == caller);
-    let mut follow = match (holds, asked) {
-        (true, _) => post_follow(thread, id, HOLDS),
-        (false, true) => post_follow(thread, id, ASKED),
-        _ => post_follow(thread, id, POSTED),
+    let mut follow = match holds {
+        true => post_follow(thread, id, HOLDS),
+        false => post_follow(thread, id, POSTED),
     };
     // A plain thread on a board lasts while its agent is closed, as any
     // commons thread it posts in; work's thread ends with it.

@@ -1093,10 +1093,178 @@ async fn sends(
     invited
 }
 
-/// Each of `named`, a live agent, hears the post `said` answers for once,
-/// as `@NAME` asks: a note that cuts into its turn, following nothing, so
-/// it posts there if it would hear more. The ones told.
-pub async fn mention(home: &Path, said: &Value, author: &str, named: &[String]) -> Vec<String> {
+/// Where the commons keeps the news it addresses to one agent, a line
+/// each, as the commons source tells it: `mentioned`, `asked` and
+/// `holding`, each with `to`. Not a thread: its name is none a thread
+/// can have.
+const TO: &str = ".to.jsonl";
+
+/// What the commons source keeps of [`TO`] in its cursor: how far it was
+/// read, in bytes. No thread's name, which has no dot.
+const TO_READ: &str = ".to";
+
+/// The name of an agent's follow of what the commons addresses to it. No
+/// thread's follow takes it: theirs are `commons.THREAD`.
+pub const TO_ME: &str = "to-me";
+
+/// Why the [`to_me`] follow reaches its agent.
+const TO_ME_ABOUT: &str = "it is addressed to you";
+
+/// What follows the commons' news addressed to `name`, known as `owner`:
+/// the commons source's events whose `to` names it, each as it comes,
+/// cutting into a busy turn, as an ordinary follow its agent can digest,
+/// filter or remove. It lasts while its agent is closed, since what is
+/// addressed to a closed agent still is.
+pub fn to_me(name: &str, owner: Option<i64>) -> crate::lookout::subs::Sub {
+    crate::lookout::subs::Sub {
+        name: TO_ME.to_owned(),
+        tasks_of: Vec::new(),
+        agents: Vec::new(),
+        sources: vec![agent_client::config::COMMONS_SOURCE.to_owned()],
+        filter: Some(json!({"to": [name]})),
+        digest: None,
+        steer: Some(crate::board::every()),
+        owner,
+        until: None,
+        runs: None,
+        made: None,
+        outlives_close: true,
+        quiet: None,
+        about: Some(TO_ME_ABOUT.to_owned()),
+    }
+}
+
+/// One piece of the commons' news for one agent: `event` (`mentioned`,
+/// `asked` or `holding`), `to` the agent, known as `to_id`, about
+/// `thread`, on `board` when it is on one, from `from` when someone said
+/// it, as `text`. `id` names it, as the source's ID does a post's, so
+/// one said twice is news once.
+pub struct Addressed {
+    pub event: &'static str,
+    pub id: String,
+    pub to: String,
+    pub to_id: Option<i64>,
+    pub from: Option<String>,
+    pub thread: String,
+    pub board: Option<String>,
+    pub text: String,
+}
+
+impl Addressed {
+    /// Its line, as [`TO`] keeps it and the commons source tells it: on
+    /// no thread's topic, so a thread's followers hear its posts alone.
+    pub(crate) fn line(&self) -> Value {
+        let mut line = json!({"id": self.id, "event": self.event, "to": self.to,
+            "thread": self.thread, "text": self.text});
+        if let Some(from) = &self.from {
+            line["from"] = json!(from);
+        }
+        if let Some(board) = &self.board {
+            line["board"] = json!(board);
+        }
+        line
+    }
+}
+
+/// Says `news` to its agent through the commons source: the agent
+/// follows [`to_me`] in `store` unless it follows something by that
+/// name, which stays as it is, and the news joins [`TO`]. A lookout that
+/// has not taken the agent's follows file as it is now, as one just
+/// made, would not hear it yet: then the news waits in [`WAITING`] for
+/// the tool host to move it on ([`send_waiting`]). Whether it was kept.
+pub fn address(home: &Path, store: &Path, news: &Addressed) -> bool {
+    let follow = to_me(&news.to, news.to_id);
+    let _ = crate::lookout::subs::ensure(store, &news.to, follow);
+    let file = match heard(store, &news.to) {
+        true => TO,
+        false => WAITING,
+    };
+    keep_addressed(&dir(home).join(file), &news.line())
+}
+
+/// Where news [`address`] kept waits for a lookout to take its agent's
+/// follows file, a line each as [`TO`] will hold it.
+const WAITING: &str = ".to.waiting.jsonl";
+
+/// Whether news to `to` would be heard as it joins [`TO`]: no lookout
+/// runs for `store`, which takes it from the start, or the one that runs
+/// took `to`'s follows file as it is now.
+fn heard(store: &Path, to: &str) -> bool {
+    let took = crate::lookout::subs::taken(store, to);
+    took["current"] == true || took["running"] != true
+}
+
+/// The news waiting in [`WAITING`] joins [`TO`] as its agent's follows
+/// file is taken by the lookout of `store`, which reads every file again
+/// within its REREAD, and at once after a `commons` or `follows` call
+/// ends: looked at until none waits, or for twice that. What still waits
+/// then waits for the next look. The tool host looks after each call
+/// that may address news, and at each turn end that did.
+pub async fn send_waiting(home: PathBuf, store: PathBuf) {
+    let within = 2 * crate::lookout::REREAD;
+    let since = std::time::Instant::now();
+    loop {
+        let (home, store) = (home.clone(), store.clone());
+        let left = tokio::task::spawn_blocking(move || move_waiting(&home, &store)).await;
+        if !matches!(left, Ok(true)) || since.elapsed() >= within {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// One look at [`WAITING`] in `home`'s commons, under the folder's lock:
+/// each line whose agent would be heard joins [`TO`], in order, and the
+/// rest stays. Whether any stays.
+fn move_waiting(home: &Path, store: &Path) -> bool {
+    let dir = dir(home);
+    let waiting = dir.join(WAITING);
+    if !waiting.exists() {
+        return false;
+    }
+    let Ok(_held) = lock(&dir) else {
+        return true;
+    };
+    let Ok(text) = std::fs::read_to_string(&waiting) else {
+        return false;
+    };
+    let mut kept = String::new();
+    for line in text.lines() {
+        let Ok(news) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let to = news["to"].as_str().unwrap_or_default();
+        if !heard(store, to) || append(&dir.join(TO), &news).is_err() {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    let written = match kept.is_empty() {
+        true => std::fs::remove_file(&waiting).map_err(|e| e.to_string()),
+        false => agent_client::files::replace_mode(&waiting, kept.as_bytes(), 0o600)
+            .map_err(|e| e.to_string()),
+    };
+    written.is_ok() && !kept.is_empty()
+}
+
+/// `line` added to `file` in the commons, under the folder's lock.
+fn keep_addressed(file: &Path, line: &Value) -> bool {
+    let Some(Ok(_held)) = file.parent().map(lock) else {
+        return false;
+    };
+    append(file, line).is_ok()
+}
+
+/// Each of `named` the daemon lists, open or closed, hears the post
+/// `said` answers for once, as `@NAME` asks: a `mentioned` event to it,
+/// through its [`to_me`] follow in `store`. The ones told.
+pub async fn mention(
+    home: &Path,
+    store: &Path,
+    said: &Value,
+    author: &str,
+    named: &[String],
+) -> Vec<String> {
     let thread = said["thread"].as_str().unwrap_or_default().to_owned();
     let n = said["posts"].as_u64().unwrap_or(1).saturating_sub(1) as usize;
     let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl"))) else {
@@ -1107,10 +1275,7 @@ pub async fn mention(home: &Path, said: &Value, author: &str, named: &[String]) 
     };
     let title = posts[0]["title"].as_str().unwrap_or_default();
     let text = post["text"].as_str().unwrap_or_default();
-    let note = format!(
-        "{author} named you in the commons thread {thread}, \"{title}\":\n\n{text}\n\n\
-         Reply there to answer; this note follows nothing."
-    );
+    let board = (said["work"]["board"].as_str()).or(said["board"].as_str());
     let Ok((_, socket)) = crate::daemon_paths(None, None) else {
         return Vec::new();
     };
@@ -1119,18 +1284,33 @@ pub async fn mention(home: &Path, said: &Value, author: &str, named: &[String]) 
     };
     let mut told = Vec::new();
     for name in named {
-        let asked = name.clone();
-        let gone = tokio::task::spawn_blocking(move || crate::task::gone(&asked, None)).await;
-        if gone.unwrap_or(true) {
+        let Some(record) = known(&client, name).await else {
             continue;
-        }
-        let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
-            "request_id": request_id(&format!("commons.mention.{thread}.{n}.{name}"))});
-        if client.request("submit", submit).await.is_ok() {
+        };
+        let news = Addressed {
+            event: "mentioned",
+            id: format!("{thread}/{n}/mentioned/{name}"),
+            to: name.clone(),
+            to_id: record["bot_id"].as_i64(),
+            from: Some(author.to_owned()),
+            thread: thread.clone(),
+            board: board.map(str::to_owned),
+            text: format!("{author} named {name} in {thread}, \"{title}\": {text}"),
+        };
+        if address(home, store, &news) {
             told.push(name.clone());
         }
     }
     told
+}
+
+/// The agent `name` as the daemon lists it, open or closed: none when it
+/// lists no agent of that name.
+async fn known(client: &agent_client::Client, name: &str) -> Option<Value> {
+    let page = (client.request("bots", json!({"names": [name]})).await).ok()?;
+    (page["bots"].as_array().into_iter().flatten())
+        .find(|bot| bot["name"] == name)
+        .cloned()
 }
 
 /// The live agents of a board's project that `work`'s `for` names, by
@@ -1209,19 +1389,39 @@ pub async fn listed(client: &agent_client::Client, name: &str) -> Option<Value> 
         .cloned()
 }
 
-/// The note that asks an agent to take work kept for it.
-fn asked_note(author: &str, thread: &str, title: &str, board: &str) -> String {
-    format!(
-        "[{author} asks you to take the work {thread}, \"{title}\", on {board}: it is kept for \
-         you. Reply there with do take to hold it, or say why you can't. Its posts reach you as \
-         they come.]"
-    )
+/// The news that asks `name` to take work kept for it: an `asked` event
+/// to it, from `author`, as `posts`, its thread's posts so far, stand.
+fn asked(
+    author: &str,
+    name: &str,
+    id: Option<i64>,
+    thread: &str,
+    posts: &[Value],
+    work: &Value,
+) -> Addressed {
+    let title = (work["title"].as_str())
+        .or(posts[0]["title"].as_str())
+        .unwrap_or_default();
+    let board = work["board"].as_str().unwrap_or_default();
+    Addressed {
+        event: "asked",
+        id: format!("{thread}/{}/asked/{name}", posts.len()),
+        to: name.to_owned(),
+        to_id: id,
+        from: Some(author.to_owned()),
+        thread: thread.to_owned(),
+        board: Some(board.to_owned()),
+        text: format!(
+            "{author} asks {name} to take the work {thread}, \"{title}\", on {board}: it is kept \
+             for {name}. Reply there with do take to hold it, or say why you can't."
+        ),
+    }
 }
 
 /// Asks the live agents each of `threads`' open work is for to take it,
-/// as `for` does, outside the day's invites: a note that cuts into each
-/// one's turn, with no budget of its own since it starts real work, and
-/// a follow of the thread in `store` saying why. What came of each:
+/// as `for` does, outside the day's invites: an `asked` event to each,
+/// heard through its [`to_me`] follow in `store`, with no budget of its
+/// own since it starts real work. What came of each:
 /// `{"thread", "asked": [names]}`, or `nobody_eligible` naming whom it is
 /// for when no live agent is.
 pub async fn ask_for(home: &Path, store: &Path, threads: &[String], author: &str) -> Vec<Value> {
@@ -1261,21 +1461,17 @@ pub async fn ask_for(home: &Path, store: &Path, threads: &[String], author: &str
             said.push(json!({"thread": thread, "nobody_eligible": work["for"]}));
             continue;
         }
-        let title = (work["title"].as_str())
-            .or(posts[0]["title"].as_str())
-            .unwrap_or_default();
-        let note = asked_note(author, thread, title, board);
-        let mut asked = Vec::new();
+        let mut told = Vec::new();
         for (name, id) in named {
-            let follow = crate::board::post_follow(thread, id, crate::board::ASKED);
-            let _ = crate::lookout::subs::put(store, &name, follow);
-            let submit = json!({"bot": name, "prompt": note, "delivery": "steer",
-                "origin": ORIGIN, "request_id": request_id(&format!("commons.asked.{thread}.{}.{name}", posts.len()))});
-            if client.request("submit", submit).await.is_ok() {
-                asked.push(name);
+            if address(
+                home,
+                store,
+                &asked(author, &name, id, thread, &posts, &work),
+            ) {
+                told.push(name);
             }
         }
-        said.push(json!({"thread": thread, "asked": asked}));
+        said.push(json!({"thread": thread, "asked": told}));
     }
     said
 }
@@ -1305,8 +1501,7 @@ pub fn kept_for(home: &Path, project: &str, name: &str, profile: Option<&str>) -
 
 /// Asks the agent `name`, known as `id`, just started, to take each of
 /// `threads`, as [`ask_for`] asks those there when work opens.
-pub async fn ask_started(
-    client: &agent_client::Client,
+pub fn ask_started(
     home: &Path,
     store: &Path,
     threads: &[String],
@@ -1321,21 +1516,8 @@ pub async fn ask_started(
         let Some(work) = crate::board::standing(&posts) else {
             continue;
         };
-        let title = (work["title"].as_str())
-            .or(posts[0]["title"].as_str())
-            .unwrap_or_default();
         let by = work["by"].as_str().unwrap_or(starter);
-        let note = asked_note(
-            by,
-            thread,
-            title,
-            work["board"].as_str().unwrap_or_default(),
-        );
-        let follow = crate::board::post_follow(thread, id, crate::board::ASKED);
-        let _ = crate::lookout::subs::put(store, name, follow);
-        let submit = json!({"bot": name, "prompt": note, "delivery": "steer", "origin": ORIGIN,
-            "request_id": request_id(&format!("commons.asked.{thread}.{}.{name}", posts.len()))});
-        let _ = client.request("submit", submit).await;
+        address(home, store, &asked(by, name, id, thread, &posts, &work));
     }
 }
 
@@ -1723,21 +1905,6 @@ pub(crate) fn summary_of(name: &str, text: &[u8]) -> Option<Value> {
     opening.as_object_mut().map(|post| post.remove("text"));
     summary[OPENING] = opening;
     Some(summary)
-}
-
-/// The daemon's longest request ID, in bytes.
-const REQUEST_ID_BYTES: usize = 128;
-
-/// `id` as a request ID the daemon takes: as it is when it fits, else
-/// named by its digest, as unique as it.
-pub(crate) fn request_id(id: &str) -> String {
-    if id.len() <= REQUEST_ID_BYTES {
-        return id.to_owned();
-    }
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(id.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    format!("commons.{hex}")
 }
 
 /// The threads from the `from`th newest, as many as `bytes` holds, with
@@ -2453,10 +2620,46 @@ pub fn news(home: &Path, cursor: &Path) -> News {
         read.insert(thread, json!({"posts": posts.len(), "bytes": bytes}));
         changed = true;
     }
+    // What the commons addressed to one agent, each line as it was kept;
+    // on a first look, none of the past.
+    let had = read.get(TO_READ).and_then(|to| to["bytes"].as_u64());
+    if let Some((addressed, bytes)) = addressed_since(&dir.join(TO), had.unwrap_or(0))
+        && Some(bytes) != had
+    {
+        if !first {
+            lines.extend(addressed);
+        }
+        read.insert(TO_READ.to_owned(), json!({"bytes": bytes}));
+        changed = true;
+    }
     News {
         lines,
         read: changed.then_some((path, read)),
     }
+}
+
+/// The whole lines of the [`TO`] file at `path` past byte `from`, and
+/// where they end: a line half written waits for its end. A file shorter
+/// than `from`, made again, is read from its start. None when there is
+/// no file.
+fn addressed_since(path: &Path, from: u64) -> Option<(Vec<String>, u64)> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = if len < from { 0 } else { from };
+    file.seek(std::io::SeekFrom::Start(from)).ok()?;
+    let mut text = Vec::new();
+    file.read_to_end(&mut text).ok()?;
+    let whole = text
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |at| at + 1);
+    let lines = (text[..whole].split(|b| *b == b'\n'))
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .filter(|line| serde_json::from_str::<Value>(line).is_ok_and(|v| v.is_object()))
+        .map(str::to_owned)
+        .collect();
+    Some((lines, from + whole as u64))
 }
 
 /// Subscribes `bot` to the posts of `thread`, as posting in it does,
@@ -4674,6 +4877,172 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// One mentioned, asked or holding agent's news: `event` to `to`, known
+    /// as 7, about the thread `store` on the board `shop/errors`.
+    fn addressed(event: &'static str, to: &str, n: usize) -> Addressed {
+        Addressed {
+            event,
+            id: format!("store/{n}/{event}/{to}"),
+            to: to.to_owned(),
+            to_id: Some(7),
+            from: (event != "holding").then(|| "shop.lead".to_owned()),
+            thread: "store".to_owned(),
+            board: Some("shop/errors".to_owned()),
+            text: format!("{event} {to}"),
+        }
+    }
+
+    #[test]
+    fn what_is_addressed_to_an_agent_is_the_commons_source_s_news_once_on_no_topic() {
+        let home = home("addressed");
+        let (cursor, store) = (home.join("cursor"), home.join("store"));
+        std::fs::create_dir_all(&home).unwrap();
+        // Kept before the source first looked: the past, told never.
+        assert!(address(
+            &home,
+            &store,
+            &addressed("mentioned", "shop.w.1", 0)
+        ));
+        assert!(look(&home, &cursor).is_empty());
+        for (event, n) in [("mentioned", 1), ("asked", 2), ("holding", 3)] {
+            assert!(address(&home, &store, &addressed(event, "shop.w.1", n)));
+        }
+        // A line half written waits for its end.
+        let to = dir(&home).join(TO);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&to)
+            .unwrap()
+            .write_all(b"{\"id\":\"half")
+            .unwrap();
+        let lines: Vec<Value> = (look(&home, &cursor).iter())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                json!({"id": "store/1/mentioned/shop.w.1", "event": "mentioned",
+                    "to": "shop.w.1", "thread": "store", "board": "shop/errors",
+                    "from": "shop.lead", "text": "mentioned shop.w.1"}),
+                json!({"id": "store/2/asked/shop.w.1", "event": "asked", "to": "shop.w.1",
+                    "thread": "store", "board": "shop/errors", "from": "shop.lead",
+                    "text": "asked shop.w.1"}),
+                json!({"id": "store/3/holding/shop.w.1", "event": "holding",
+                    "to": "shop.w.1", "thread": "store", "board": "shop/errors",
+                    "text": "holding shop.w.1"}),
+            ]
+        );
+        // No topic: a thread's followers hear its posts alone.
+        assert!(lines.iter().all(|line| line.get("topic").is_none()));
+        assert!(look(&home, &cursor).is_empty());
+        // Once whole, it is news.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&to)
+            .unwrap()
+            .write_all(b"\",\"event\":\"mentioned\",\"to\":\"b.y\",\"text\":\"t\"}\n")
+            .unwrap();
+        assert_eq!(look(&home, &cursor).len(), 1);
+        // Made again, shorter, it is read from its start.
+        std::fs::remove_file(&to).unwrap();
+        assert!(address(&home, &store, &addressed("asked", "b.y", 4)));
+        let lines = look(&home, &cursor);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("store/4/asked/b.y"), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// News to an agent whose follows file the running lookout has not
+    /// taken yet waits, so it is not told before the agent hears it.
+    #[test]
+    fn news_waits_until_the_lookout_takes_the_agent_s_follow() {
+        let home = home("waiting");
+        let store = home.join("store");
+        std::fs::create_dir_all(&home).unwrap();
+        // A lookout runs for the store.
+        let lock = std::fs::File::create(crate::lookout::beside(&store, ".lookout.lock")).unwrap();
+        lock.lock().unwrap();
+        let (to, waiting) = (dir(&home).join(TO), dir(&home).join(WAITING));
+        assert!(address(&home, &store, &addressed("asked", "shop.w.1", 1)));
+        assert!(!to.exists());
+        assert!(move_waiting(&home, &store), "it still waits");
+        // The lookout takes the file as it is now.
+        let file = crate::lookout::subs::dir(&store).join("shop.w.1.json");
+        let revision = crate::kept::stamp(&file).unwrap().text();
+        let taken = json!({"shop.w.1": {"revision": revision, "at_ms": 1}});
+        let taken_file = crate::lookout::beside(&store, ".lookout.taken.json");
+        std::fs::write(&taken_file, taken.to_string()).unwrap();
+        assert!(!move_waiting(&home, &store), "none waits");
+        assert!(!waiting.exists());
+        let kept = std::fs::read_to_string(&to).unwrap();
+        assert!(kept.contains("store/1/asked/shop.w.1"), "{kept}");
+        // Taken already, the next news goes straight on.
+        assert!(address(
+            &home,
+            &store,
+            &addressed("mentioned", "shop.w.1", 2)
+        ));
+        assert!(!waiting.exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap().lines().count(), 2);
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_agent_addressed_hears_it_through_one_to_me_follow_of_its_own() {
+        use crate::lookout::sources::Event;
+        use crate::lookout::subs;
+        let home = home("to-me");
+        let store = home.join("store");
+        std::fs::create_dir_all(&home).unwrap();
+        let heard = |sub: &subs::Sub, line: &Value| {
+            let event = Event::parse("commons", &line.to_string(), 0).unwrap();
+            sub.hears(&event)
+        };
+        // Never addressed, an agent follows nothing.
+        assert!(subs::read(&store, "shop.w.1").is_empty());
+        let mention = addressed("mentioned", "shop.w.1", 1);
+        assert!(address(&home, &store, &mention));
+        let follows = subs::read(&store, "shop.w.1");
+        assert_eq!(follows, [to_me("shop.w.1", Some(7))]);
+        let follow = &follows[0];
+        assert_eq!(follow.name, TO_ME);
+        assert!(follow.outlives_close, "a closed agent still hears it");
+        assert!(heard(follow, &mention.line()));
+        assert!(heard(follow, &addressed("holding", "shop.w.1", 2).line()));
+        // Each event steers, as the person's words do.
+        let steer = follow.steer.as_ref().unwrap();
+        assert!(crate::lookout::pattern::matches(steer, &mention.line()));
+        // Another's news is not its, nor is a thread's follow's.
+        assert!(!heard(follow, &addressed("asked", "shop.w.2", 3).line()));
+        let thread = subs::Sub::commons("store", Some(7));
+        assert!(!heard(&thread, &mention.line()));
+        // A board's follow hears the board's steps, not who was asked.
+        let board = crate::board::follow("shop/errors", Some(7));
+        assert!(!heard(&board, &addressed("asked", "shop.w.1", 4).line()));
+        // Closing the agent leaves it.
+        assert_eq!(subs::closed(&store, "shop.w.1", Some(7)).unwrap(), 0);
+        assert_eq!(subs::read(&store, "shop.w.1").len(), 1);
+        // The agent's own change to it stands: here, asks alone, as a
+        // digest.
+        let mine = subs::Sub {
+            filter: Some(json!({"to": ["shop.w.1"], "event": ["asked"]})),
+            steer: None,
+            digest: Some("1h".to_owned()),
+            ..to_me("shop.w.1", Some(7))
+        };
+        subs::put(&store, "shop.w.1", mine.clone()).unwrap();
+        assert!(address(
+            &home,
+            &store,
+            &addressed("mentioned", "shop.w.1", 5)
+        ));
+        assert_eq!(subs::read(&store, "shop.w.1"), std::slice::from_ref(&mine));
+        assert!(!heard(&mine, &mention.line()));
+        assert!(heard(&mine, &addressed("asked", "shop.w.1", 6).line()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn a_reply_reaches_its_subscribers_at_once_whoever_holds_an_invite() {
         let home = home("woken");
@@ -5012,18 +5381,6 @@ mod tests {
         assert!(kept_for(&home, "shop", "shop.w.1", Some("worker")).is_empty());
         assert!(kept_for(&home, "docs", "docs.r.1", Some("reviewer")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn a_request_id_too_long_for_the_daemon_is_named_by_its_digest() {
-        let short = "commons.asked.store.3.shop.w1";
-        assert_eq!(request_id(short), short);
-        let name = "a".repeat(50);
-        let long = format!("commons.asked.{}.12.{name}", "t".repeat(64));
-        let id = request_id(&long);
-        assert!(id.len() <= REQUEST_ID_BYTES, "{id}");
-        assert_eq!(request_id(&long), id);
-        assert_ne!(request_id(&format!("{long}x")), id);
     }
 
     /// The walk down a post's words stops once no live agent is left to
