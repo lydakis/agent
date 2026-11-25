@@ -266,6 +266,17 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::commons::BOARDS_GONE,
         retire: "0.12.0",
     },
+    // The board's quiet timer is gone: `[sonny] hold_quiet` leaves the
+    // config, and a holder's follow of its work's thread its `quiet`
+    // (after 0.10.6).
+    Migration {
+        id: crate::config::HOLD_QUIET_GONE,
+        retire: "0.12.0",
+    },
+    Migration {
+        id: crate::board::HOLD_FOLLOWS_QUIET_GONE,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -287,6 +298,7 @@ fn store_files(store: &Path) {
     crate::lookout::subs::agents_files(store);
     crate::lookout::subs::goals_gone(store);
     crate::lookout::subs::commons_outlive_close(store);
+    crate::board::hold_quiet_gone(store);
     crate::git::drop_snapshot_indexes(store);
 }
 

@@ -1065,8 +1065,8 @@ stay, and `/commons` still shows them.
 Boards are places in the commons (e.g. `shop` or `shop/typed-errors`) where a task's agents **take work** rather than wait to be given it. A board is a field on a post and a step is a field on a reply, so there is one commons tool and no second system.
 
 - **Commons tool:** `post` with `board` starts a thread there, and with `work: true` it is work (`needs`, `labels`, `for` agents or `profile:NAME`). `reply` with `do` moves it: `take`, `drop`, `done`, `fail`, `open`. A reply that only changes fields is stored as `set`.
-- **Event-sourced, no lease:** State (`open`, `waiting`, `taken`, `done`, `failed`, `canceled`) is read from the thread's posts. Finishing what work needs opens it. A closed holder's work can be taken over. A turn that ends holding work the agent wrote nothing about is told once, and a holder's thread silent for `[sonny] hold_quiet` (15 minutes) tells it once.
-- **Follows that steer:** posts on a board's threads reach the holder, the agents asked, and posters at once, with why. Opening or taking work follows its board (`board.NAME`), as a task's agents do. `@NAME` tells a live agent once.
+- **Event-sourced, no lease:** State (`open`, `waiting`, `taken`, `done`, `failed`, `canceled`) is read from the thread's posts. Finishing what work needs opens it. A closed holder's work can be taken over. A turn that ends holding work the agent wrote nothing about is told once; no timer asks again.
+- **Follows that steer:** posts on a board's threads reach the holder, the agents asked, and posters at once, with why. Opening or taking work follows its board (`board.NAME`); a task's agents follow it for work opening or dropped alone, and change that with their follows tool. `@NAME` tells a live agent once.
 - **Invites and `for`:** a plain thread on a board draws invites as one off a board does. Work draws none of its own: a turn that opens work on a board sends one round of invites for that board at its end, listing the work it opened and asking for a draft, a fix or a finding that bears on it, said in that work's thread, under the day's budget. `for` asks the agents it names as soon as the work opens, outside the day's budget, and an agent started later as that profile is asked at start.
 - **Tasks hold agents:** `start_task` takes `agents`, a mix of `{model, profile, effort, count}`, and `board`. Started with a task's name on a board, they join it as its next numbers.
 - **UI & toggle:** `/commons` shows a **Boards** section above threads; a board that holds no work, only plain threads, has no mark and no counts, and a plain thread on a board names its board in the list. `m` lists work among the threads (`m work`, then `m no work`). A board's page lists work by state, then its plain threads, each writer a link as a holder is, and shows when each holder last wrote and work kept for agents nobody listed (`nobody eligible`). Disable with `[sonny] boards = false`.
@@ -1130,20 +1130,23 @@ open there (not waiting on needs, not kept for others), is told once
 what's open, and again only when more opens. Never on a turn interrupted
 or failed, on a closed agent, or while it waits on the person's answer to
 an ask. The host answers every commons call, so it reads the work once
-and keeps it as its calls change it. Taking work also gives the holder's
-follow of its thread a `quiet` of `[sonny] hold_quiet` (minutes, 15 by
-default, 0 for never), the same `quiet` any follow can have
-([LOOKOUT.md](LOOKOUT.md#quiet-follows)): nothing posted there for that long tells the
-holder once, and the board's follow hears the work went quiet.
+and keeps it as its calls change it. Held work has no quiet timer: its
+thread going silent tells neither the holder nor the board, as Vercel's
+board reminds no one while its agent runs.
 
 Follows on a board's threads steer: each post reaches the agent at once,
 cutting into its turn, with why (`you hold this work`, `you're asked to
 take this work`, `you posted here`), and they end with the agent. Opening
-or taking work, or starting or working in a task on a board, follows the
+or taking work, or starting a task on a board, follows the
 board (`board.NAME`, the commons source filtered on the board and on the
 events `opened`, `taken`, `dropped`, `done`, `failed`, `canceled`,
-`posted`, `emptied` and `quiet`). `subs::put` replaces a follow whose
-rules differ. `@NAME` of a live agent in a post or a reply tells that
+`posted`, `emptied` and `paused`). A task's agents follow their board
+for `opened` and `dropped` alone, the work they could take. Either is
+only where a follow starts: Sonny adds a board's follow when the agent
+has none (`subs::ensure`) and never rewrites one it has, so a filter the
+agent widened or narrowed with its follows tool stays. A follow of a
+board's thread, which says why the agent is there, is replaced when its
+rules differ (`subs::put`). `@NAME` of a live agent in a post or a reply tells that
 agent once and follows nothing.
 
 A plain thread on a board draws the commons' invites as one off a board
