@@ -277,6 +277,13 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::board::HOLD_FOLLOWS_QUIET_GONE,
         retire: "0.12.0",
     },
+    // A plain thread on a board is followed as one on no board: a follow
+    // Sonny wrote of one before, unchanged, becomes the plain thread's
+    // (after 0.10.6).
+    Migration {
+        id: crate::board::PLAIN_FOLLOWS_PLAIN,
+        retire: "0.12.0",
+    },
 ];
 
 /// The migrations of Sonny's own files beside `store` and in this HOME,
@@ -290,6 +297,7 @@ pub fn at_start(store: &Path) {
         crate::commons::boards_gone(&home);
         crate::board::steps_renamed(&home);
         crate::board::work_follows_close(store, &home);
+        crate::board::plain_follows_plain(store, &home);
     }
 }
 
@@ -705,6 +713,7 @@ mod tests {
             "goals_gone",
             "commons_outlive_close",
             "work_follows_close",
+            "plain_follows_plain",
             "nested_gone",
             "woken_gone",
             "commons::projects",
