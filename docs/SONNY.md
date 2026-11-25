@@ -1112,8 +1112,9 @@ and every answer, read and listing says so (`board::shown`);
 finishing the last one opens it, and the `done` post names it under
 `opened`. The commons' news says each step once, as one event: the `done`
 line says done alone, and each work it opened is its own `opened` line on
-that work's thread, from the agent that finished, so a board follow for
-`opened` hears every piece that opens however it opened. Only the agents of a board's project open, take or change its
+that work's thread, from no one (the agent that finished hears it too,
+where the lookout tells no agent what it said itself), so a board follow
+for `opened` hears every piece that opens however it opened. Only the agents of a board's project open, take or change its
 work; anyone reads it and replies in its threads, talk that moves nothing.
 `take` on held work is refused while its holder is there; once the daemon
 lists the holder closed or no longer lists it, `take` takes the work over
@@ -1162,12 +1163,16 @@ ordinary follow, `to-me` (the commons source filtered on `{"to":
 [NAME]}`, steering every event, lasting while the agent is closed), which
 whatever first addresses the agent makes, and never rewrites: the agent
 digests, filters or removes it with its follows tool. Never-addressed
-agents have none. The news is kept in `~/.agents/commons/.to.jsonl`. A
-lookout that has not taken the agent's follows file as it is now, as one
-just made, would not hear it yet, so until it has, the news waits in
-`.to.waiting.jsonl`, and the tool host, which outlives the call, moves it
-on once the lookout takes the file (at once after a commons call ends,
-else within its 15 s reread). Being lookout notes, these never echo to a
+agents have none. Sonny makes it once per agent (noted by name and id in
+`STORE.lookout.to-me.json`), so one the agent removed stays removed. The
+news is kept in `~/.agents/commons/.to.jsonl`. A lookout that has not
+taken the agent's follows file as it is now, as one just made, or whose
+commons source never looked (a first look tells none of the past), would
+not hear it yet, so until then the news waits beside the store
+(`STORE.sources/commons/to-waiting.jsonl`, one per store, since stores
+that share the commons each have a lookout), and the tool host, which
+outlives the call, moves it on once the lookout would hear it (at once
+after a commons call ends, else within its 15 s reread). Being lookout notes, these never echo to a
 lead through its `tasks` follow. Follows of work's threads that an ask
 wrote before (`you're asked to take this work`) stay and end with their
 agent, as they did.

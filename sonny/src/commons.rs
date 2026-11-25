@@ -1167,39 +1167,74 @@ impl Addressed {
 }
 
 /// Says `news` to its agent through the commons source: the agent
-/// follows [`to_me`] in `store` unless it follows something by that
-/// name, which stays as it is, and the news joins [`TO`]. A lookout that
-/// has not taken the agent's follows file as it is now, as one just
-/// made, would not hear it yet: then the news waits in [`WAITING`] for
-/// the tool host to move it on ([`send_waiting`]). Whether it was kept.
+/// follows [`to_me`] in `store` the first time anything is addressed to
+/// it, and the news joins [`TO`]. Its lookout would not hear it yet while
+/// that lookout has not taken the agent's follows file as it is now, as
+/// one just made, or while the store's commons source has never looked,
+/// since a first look tells none of the past: then the news waits in the
+/// store's [`waiting`] file for the tool host to move it on
+/// ([`send_waiting`]). Whether it was kept.
 pub fn address(home: &Path, store: &Path, news: &Addressed) -> bool {
-    let follow = to_me(&news.to, news.to_id);
-    let _ = crate::lookout::subs::ensure(store, &news.to, follow);
+    made_once(home, store, &news.to, news.to_id);
     let file = match heard(store, &news.to) {
-        true => TO,
-        false => WAITING,
+        true => dir(home).join(TO),
+        false => waiting(store),
     };
-    keep_addressed(&dir(home).join(file), &news.line())
+    keep_addressed(home, &file, &news.line())
 }
 
-/// Where news [`address`] kept waits for a lookout to take its agent's
-/// follows file, a line each as [`TO`] will hold it.
-const WAITING: &str = ".to.waiting.jsonl";
+/// `to`, known as `id`, follows [`to_me`] in `store` unless one was made
+/// for it before, so a follow it removed stays removed and one it changed
+/// stays as it is; a new agent given the name, another id, gets its own.
+/// What was made is kept beside the store, by name, each id.
+fn made_once(home: &Path, store: &Path, to: &str, id: Option<i64>) {
+    let Ok(_held) = lock(&dir(home)) else {
+        return;
+    };
+    let record = crate::lookout::beside(store, ".lookout.to-me.json");
+    let mut made = json_file(&record);
+    let ids = made.entry(to.to_owned()).or_insert_with(|| json!([]));
+    if (ids.as_array().into_iter().flatten()).any(|one| *one == json!(id)) {
+        return;
+    }
+    if crate::lookout::subs::ensure(store, to, to_me(to, id)).is_err() {
+        return;
+    }
+    if let Some(ids) = ids.as_array_mut() {
+        ids.push(json!(id));
+    }
+    let body = Value::Object(made).to_string();
+    let _ = agent_client::files::replace_mode(&record, body.as_bytes(), 0o600);
+}
 
-/// Whether news to `to` would be heard as it joins [`TO`]: no lookout
-/// runs for `store`, which takes it from the start, or the one that runs
-/// took `to`'s follows file as it is now.
+/// Where the news [`address`] kept for `store` waits for that store's
+/// lookout, a line each as [`TO`] will hold it: beside the store, since
+/// stores that share the commons each have a lookout of their own.
+fn waiting(store: &Path) -> PathBuf {
+    crate::lookout::beside(store, ".sources")
+        .join(agent_client::config::COMMONS_SOURCE)
+        .join("to-waiting.jsonl")
+}
+
+/// Whether `store`'s lookout would hear news to `to` as it joins [`TO`]:
+/// its commons source has looked once, so later news is news to it, and
+/// either no lookout runs, which takes every follows file before it
+/// reads on, or the one that runs took `to`'s as it is now.
 fn heard(store: &Path, to: &str) -> bool {
+    let looked = crate::lookout::beside(store, ".sources")
+        .join(agent_client::config::COMMONS_SOURCE)
+        .join("read.json")
+        .exists();
     let took = crate::lookout::subs::taken(store, to);
-    took["current"] == true || took["running"] != true
+    looked && (took["current"] == true || took["running"] != true)
 }
 
-/// The news waiting in [`WAITING`] joins [`TO`] as its agent's follows
-/// file is taken by the lookout of `store`, which reads every file again
-/// within its REREAD, and at once after a `commons` or `follows` call
-/// ends: looked at until none waits, or for twice that. What still waits
-/// then waits for the next look. The tool host looks after each call
-/// that may address news, and at each turn end that did.
+/// The news waiting for `store` joins [`TO`] as its lookout comes to hear
+/// it: that lookout reads every follows file again within its REREAD,
+/// and at once after a `commons` or `follows` call ends. Looked at until
+/// none waits, or for twice that; what still waits then waits for the
+/// next look. The tool host looks after each call that may address news,
+/// at each turn end that did, and as it starts.
 pub async fn send_waiting(home: PathBuf, store: PathBuf) {
     let within = 2 * crate::lookout::REREAD;
     let since = std::time::Instant::now();
@@ -1213,15 +1248,15 @@ pub async fn send_waiting(home: PathBuf, store: PathBuf) {
     }
 }
 
-/// One look at [`WAITING`] in `home`'s commons, under the folder's lock:
-/// each line whose agent would be heard joins [`TO`], in order, and the
-/// rest stays. Whether any stays.
+/// One look at what waits for `store`, under the commons folder's lock:
+/// each line whose agent its lookout would hear joins [`TO`], in order,
+/// and the rest stays. Whether any stays.
 fn move_waiting(home: &Path, store: &Path) -> bool {
-    let dir = dir(home);
-    let waiting = dir.join(WAITING);
+    let waiting = waiting(store);
     if !waiting.exists() {
         return false;
     }
+    let dir = dir(home);
     let Ok(_held) = lock(&dir) else {
         return true;
     };
@@ -1241,17 +1276,19 @@ fn move_waiting(home: &Path, store: &Path) -> bool {
     }
     let written = match kept.is_empty() {
         true => std::fs::remove_file(&waiting).map_err(|e| e.to_string()),
-        false => agent_client::files::replace_mode(&waiting, kept.as_bytes(), 0o600)
-            .map_err(|e| e.to_string()),
+        false => agent_client::files::replace_mode(&waiting, kept.as_bytes(), 0o600),
     };
     written.is_ok() && !kept.is_empty()
 }
 
-/// `line` added to `file` in the commons, under the folder's lock.
-fn keep_addressed(file: &Path, line: &Value) -> bool {
-    let Some(Ok(_held)) = file.parent().map(lock) else {
+/// `line` added to `file`, under the lock of `home`'s commons folder.
+fn keep_addressed(home: &Path, file: &Path, line: &Value) -> bool {
+    let Ok(_held) = lock(&dir(home)) else {
         return false;
     };
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     append(file, line).is_ok()
 }
 
@@ -2597,11 +2634,10 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                     "{opened} opened on {}, \"{title}\": what it needed is done, {thread} last",
                     board.as_deref().unwrap_or_default()
                 )});
+                // No `from`: nobody said it, and the agent whose step
+                // opened it hears it too, as its board's news.
                 if let Some(board) = &board {
                     line["board"] = json!(board);
-                }
-                if let Some(by) = post["by"].as_str() {
-                    line["from"] = json!(by);
                 }
                 lines.push(line.to_string());
             }
@@ -4895,15 +4931,22 @@ mod tests {
     #[test]
     fn what_is_addressed_to_an_agent_is_the_commons_source_s_news_once_on_no_topic() {
         let home = home("addressed");
-        let (cursor, store) = (home.join("cursor"), home.join("store"));
+        let store = home.join("store");
+        let cursor =
+            crate::lookout::beside(&store, ".sources").join(agent_client::config::COMMONS_SOURCE);
         std::fs::create_dir_all(&home).unwrap();
-        // Kept before the source first looked: the past, told never.
+        // Addressed before the store's source first looked, which tells
+        // none of the past: it waits, and is news once that look is made.
         assert!(address(
             &home,
             &store,
             &addressed("mentioned", "shop.w.1", 0)
         ));
         assert!(look(&home, &cursor).is_empty());
+        assert!(!move_waiting(&home, &store), "none waits");
+        let lines = look(&home, &cursor);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("store/0/mentioned/shop.w.1"), "{lines:?}");
         for (event, n) in [("mentioned", 1), ("asked", 2), ("holding", 3)] {
             assert!(address(&home, &store, &addressed(event, "shop.w.1", n)));
         }
@@ -4959,10 +5002,14 @@ mod tests {
         let home = home("waiting");
         let store = home.join("store");
         std::fs::create_dir_all(&home).unwrap();
+        // The store's commons source has looked once.
+        let cursor =
+            crate::lookout::beside(&store, ".sources").join(agent_client::config::COMMONS_SOURCE);
+        assert!(look(&home, &cursor).is_empty());
         // A lookout runs for the store.
         let lock = std::fs::File::create(crate::lookout::beside(&store, ".lookout.lock")).unwrap();
         lock.lock().unwrap();
-        let (to, waiting) = (dir(&home).join(TO), dir(&home).join(WAITING));
+        let (to, waiting) = (dir(&home).join(TO), waiting(&store));
         assert!(address(&home, &store, &addressed("asked", "shop.w.1", 1)));
         assert!(!to.exists());
         assert!(move_waiting(&home, &store), "it still waits");
@@ -5040,6 +5087,16 @@ mod tests {
         assert_eq!(subs::read(&store, "shop.w.1"), std::slice::from_ref(&mine));
         assert!(!heard(&mine, &mention.line()));
         assert!(heard(&mine, &addressed("asked", "shop.w.1", 6).line()));
+        // Removed, it stays removed; a new agent of the name gets its own.
+        assert!(subs::remove(&store, "shop.w.1", TO_ME).unwrap());
+        assert!(address(&home, &store, &addressed("asked", "shop.w.1", 7)));
+        assert!(subs::read(&store, "shop.w.1").is_empty());
+        let newer = Addressed {
+            to_id: Some(8),
+            ..addressed("asked", "shop.w.1", 8)
+        };
+        assert!(address(&home, &store, &newer));
+        assert_eq!(subs::read(&store, "shop.w.1"), [to_me("shop.w.1", Some(8))]);
         let _ = std::fs::remove_dir_all(&home);
     }
 

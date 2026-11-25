@@ -2258,7 +2258,9 @@ mod tests {
             .find(|line| line["event"] == "opened" && line["topic"] == "enum")
             .unwrap();
         assert_eq!(opened["board"], "shop/errors");
-        assert_eq!(opened["from"], "shop.w1");
+        // Said by no one, so the worker whose done opened it hears it too:
+        // the lookout tells no agent what it said itself.
+        assert!(opened.get("from").is_none(), "{opened}");
         assert!(opened.get("do").is_none(), "{opened}");
         let text = opened["text"].as_str().unwrap();
         assert!(text.contains("\"Remove the enum\""), "{text}");
