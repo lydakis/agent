@@ -115,6 +115,19 @@ class ServedToolTests(ModelFixture):
         self.assertTrue(done, [e['event'] for e in events if e['turn'] == turn])
         return node_item(self.daemon, bot, done[-1]['data']['node'])['result']['output']
 
+    def invited(self, thread, wait=10):
+        """The agents a new thread's invites went to, once sent: they go
+        out after its post has answered."""
+        deadline = time.monotonic() + wait
+        while True:
+            path = self.path / '.agents/commons/.invites'
+            sent = json.loads(path.read_text())['sent'] if path.exists() else []
+            mine = [i for i in sent if i['thread'] == thread]
+            if path.exists() and not any(i.get('bot') is None for i in mine):
+                return [i['bot'] for i in mine]
+            self.assertLess(time.monotonic(), deadline, sent)
+            time.sleep(.05)
+
     def git(self, folder, *args):
         subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args], cwd=folder,
                        check=True, capture_output=True)
@@ -1172,7 +1185,8 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         post = {'name': 'stalls', 'title': 'Checkpoint stalls under load', 'text': 'Seen this?'}
         started = json.loads(self.call('calc.a', 'commons', {'post': post}))
         # Three invites fill its seats at even odds, but one agent's turns touch it.
-        self.assertEqual(started['invited'], ['shop.b'], started)
+        self.assertNotIn('invited', started)
+        self.assertEqual(self.invited('stalls'), ['shop.b'])
         # The note starts its turn.
         deadline = time.monotonic() + 5
         while len(turns := self.daemon.request('turns', bot='shop.b')['result']['turns']) < 2:
@@ -1196,8 +1210,8 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.call('shop.b', 'commons', {'reply': {'thread': 'stalls', 'text': 'Same here.'}})
         # A thread started in a turn the commons began brings no invite.
         post = {'name': 'more', 'title': 'More checkpoint stalls', 'text': 'And this?'}
-        started = json.loads(self.call('shop.b', 'commons', {'post': post}, origin='commons'))
-        self.assertEqual(started['invited'], [], started)
+        self.call('shop.b', 'commons', {'post': post}, origin='commons')
+        self.assertEqual(self.invited('more'), [])
         listed = json.loads(self.call('mail.c', 'commons', {}))
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'reach': 3, 'answered': 1, 'this_week': 1,
                                              'agents': 3})
@@ -1226,8 +1240,8 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         busy = self.daemon.request('submit', bot='shop.b', request_id='busy', prompt='gate')['result']['message']
         self.host()
         post = {'name': 'stalls', 'title': 'Checkpoint stalls under load', 'text': 'Seen this?'}
-        started = json.loads(self.call('calc.a', 'commons', {'post': post}))
-        self.assertEqual(started['invited'], ['shop.b'], started)
+        self.call('calc.a', 'commons', {'post': post})
+        self.assertEqual(self.invited('stalls'), ['shop.b'])
         listed = json.loads(self.call('calc.a', 'commons', {}))
         self.assertEqual((listed['invites']['today'], listed['invites']['this_week']), (1, 1), listed)
         self.model.release_headers.set()
