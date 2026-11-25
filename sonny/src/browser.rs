@@ -2134,9 +2134,10 @@ pub fn is_folder(profile: &str) -> bool {
 /// hosts linked in, as Chrome reads them from beside its profiles, so an
 /// extension that talks to a program of theirs (a company's device check)
 /// reaches it; and, when its sign-ins are `Copied`, each of the person's
-/// cookies newer than the copy's merged into it, so one they made since
-/// its last start is in it and one made in it stays. The rest of the copy
-/// stays as its browser left it.
+/// cookies merged into it over the copy's own, so their sign-in wins over
+/// a signed-out cookie a sign-in page left in it, and one only it holds
+/// (a sign-in made in it) stays. The rest of the copy stays as its
+/// browser left it.
 fn refresh_kept(dir: &Path, profile: &str, data: &Path, signins: BrowserSignins) {
     let _ = link_hosts(
         &data.join("NativeMessagingHosts"),
@@ -2159,9 +2160,9 @@ fn refresh_kept(dir: &Path, profile: &str, data: &Path, signins: BrowserSignins)
 }
 
 /// The cookies of Chrome's database `from` merged into `to`, which no
-/// Chrome has open: each of `from`'s that `to` holds no newer version of,
-/// by Chrome's own key for a cookie (its unique index); all of `from` when
-/// `to` has none or the two are not of one version. A snapshot of `from`
+/// Chrome has open: each of `from`'s replaces `to`'s by Chrome's own key
+/// for a cookie (its unique index), and `to`'s others stay; all of `from`
+/// when `to` has none or the two are not of one version. A snapshot of `from`
 /// is read, as [`copy_database`] takes one, so the person's Chrome writing
 /// it meanwhile changes nothing; one written throughout is left for the
 /// next start.
@@ -2225,28 +2226,18 @@ fn merged_into(theirs: &Path, to: &Path) -> rusqlite::Result<bool> {
         "SELECT info.name FROM pragma_index_list('cookies', 'main') AS list, \
          pragma_index_info(list.name, 'main') AS info WHERE list.\"unique\" ORDER BY info.seqno",
     )?;
-    let newer = ["last_update_utc", "creation_utc"]
-        .into_iter()
-        .find(|column| columns.iter().any(|c| c == column));
-    let Some(newer) = newer.filter(|_| !key.is_empty()) else {
+    if key.is_empty() {
         return Ok(false);
-    };
+    }
     let quoted = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
     let list = (columns.iter())
         .map(|c| quoted(c))
         .collect::<Vec<_>>()
         .join(", ");
-    let same = (key.iter())
-        .map(|c| format!("mine.{0} IS them.{0}", quoted(c)))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let newer = quoted(newer);
+    // The person's wins, whichever is newer: a sign-in page the copy
+    // visited stores a newer signed-out cookie under the same key.
     db.execute(
-        &format!(
-            "INSERT OR REPLACE INTO main.cookies ({list}) SELECT {list} FROM theirs.cookies AS them \
-             WHERE NOT EXISTS (SELECT 1 FROM main.cookies AS mine \
-             WHERE {same} AND mine.{newer} >= them.{newer})"
-        ),
+        &format!("INSERT OR REPLACE INTO main.cookies ({list}) SELECT {list} FROM theirs.cookies"),
         [],
     )?;
     Ok(true)
@@ -3106,7 +3097,7 @@ mod tests {
     }
 
     #[test]
-    fn copied_sign_ins_merge_the_person_s_newer_cookies_into_the_kept_profile() {
+    fn copied_sign_ins_merge_the_person_s_cookies_over_the_kept_profile_s() {
         let root = scratch("merge");
         let data = root.join("chrome-data");
         let state = json!({"profile": {"info_cache": {"Profile 1": {"name": "Work"}}}});
@@ -3118,14 +3109,15 @@ mod tests {
             panic!("not copied");
         };
         let ours = dir.join("Profile 1/Cookies");
-        // The copy signed in to a site of its own, and renewed one after
-        // the person last did; the person signed in again to another.
+        // The copy signed in to a site of its own, and landed on a sign-in
+        // page after the person last signed in to another, which left a
+        // newer signed-out cookie; the person signed in again to a third.
         cookies_at(
             &ours,
             "24",
             &[
                 ("app.example", "sid", "made-here", 50),
-                ("mail.example", "sid", "renewed-here", 300),
+                ("mail.example", "sid", "signed-out-here", 300),
                 ("wiki.example", "sid", "old", 100),
             ],
         );
@@ -3133,7 +3125,7 @@ mod tests {
             &theirs,
             "24",
             &[
-                ("mail.example", "sid", "theirs-older", 200),
+                ("mail.example", "sid", "signed-in", 200),
                 ("wiki.example", "sid", "signed-in-again", 400),
                 ("news.example", "sid", "new", 10),
             ],
@@ -3143,7 +3135,7 @@ mod tests {
             cookies_in(&ours),
             [
                 "app.example sid=made-here",
-                "mail.example sid=renewed-here",
+                "mail.example sid=signed-in",
                 "news.example sid=new",
                 "wiki.example sid=signed-in-again",
             ]

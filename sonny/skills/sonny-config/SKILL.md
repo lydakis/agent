@@ -170,7 +170,7 @@ key `profile`:
   `browser_signins = "own"` its sign-ins are its own: the person signs in
   with `sonny link browser [URL]` on that machine, as Chrome otherwise
   reads no cookie copied from their profile. By default (`"copied"`)
-  their newer cookies are merged in at each start, with Chrome's
+  their cookies are merged in over its own at each start, with Chrome's
   protection of them turned off, so a sign-in in their own Chrome reaches
   it once it starts again: it closes when the last agent with a tab in it
   runs `close`, or 30 minutes after its agents' last call. Sonny starts that
