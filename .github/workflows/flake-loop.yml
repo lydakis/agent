@@ -19,6 +19,10 @@ jobs:
         include:
           - name: trace-1357
             ref: claude/project-thread-wpfgqs-1357
+          - name: responsible-main
+            ref: c22724d1f969ef6975eb156aaec7102d4296f0a7
+          - name: responsible-fix
+            ref: claude/project-thread-wpfgqs-1296
     runs-on: macos-26
     timeout-minutes: 60
     defaults:
@@ -58,5 +62,7 @@ jobs:
           if [ "${{ matrix.name }}" = trace-1357 ]; then
             python3 loop.py store-checkpoint 1500 8 "$LIB" store::tests::a_long_log_is_checkpointed_beside_the_writer_and_starts_over
           else
-            python3 loop.py responsible 200 6 "$SONNY" responsible::own::tests::a_program_started_is_responsible_for_itself_and_says_what_it_printed
+            # Under load: eight busy loops beside twelve runs at once.
+            for i in 1 2 3 4 5 6 7 8; do (yes > /dev/null &); done
+            python3 loop.py responsible 300 12 "$SONNY" responsible::own::tests::a_program_started_is_responsible_for_itself_and_says_what_it_printed
           fi
