@@ -1,0 +1,72 @@
+name: Flake loop (temporary)
+
+# Temporary, on this thread's branch only, never merged: runs the macOS-only
+# flaky tests in loops on the macOS runner, on main and on the fixes, for
+# the counts their pull requests report.
+
+on:
+  push:
+    branches: [claude/project-thread-wpfgqs]
+
+permissions:
+  contents: read
+
+jobs:
+  loop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: main
+            ref: c22724d8
+          - name: fix-1296
+            ref: claude/project-thread-wpfgqs-1296
+          - name: fix-1295
+            ref: claude/project-thread-wpfgqs-1295
+          - name: fix-1309
+            ref: claude/project-thread-wpfgqs-1309
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+      - name: Say what the store test found when it fails
+        run: |
+          sed -i '' 's/assert!(log < 10, "the WAL went on from {log} frames");/assert!(log < 10, "the WAL went on from {log} frames: {}", store.stats());/' src/store.rs
+          grep -n 'the WAL went on' src/store.rs
+      - name: Build the tests
+        run: |
+          cargo test --locked -p agent-runtime --lib --no-run 2>&1 | tee lib.txt
+          cargo test --locked -p sonny --bin sonny --no-run 2>&1 | tee sonny.txt
+          echo "LIB=$(grep -o '(.*)' lib.txt | grep Executable -v | tail -1 | tr -d '()')" >> $GITHUB_ENV
+          echo "SONNY=$(grep -o '(.*)' sonny.txt | tail -1 | tr -d '()')" >> $GITHUB_ENV
+      - name: Loops
+        run: |
+          cat > loop.py <<'PY'
+          import subprocess, sys
+          from concurrent.futures import ThreadPoolExecutor
+          name, runs, par, *cmd = sys.argv[1:]
+          def one(n):
+              done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              if done.returncode:
+                  lines = [l for l in done.stdout.splitlines() if 'panicked' in l or 'WAL' in l or 'left' in l or 'right' in l or 'then' in l]
+                  print(f'--- {name} run {n} failed:', *lines[:8], sep='\n  ', flush=True)
+              return done.returncode != 0
+          with ThreadPoolExecutor(int(par)) as pool:
+              fails = sum(pool.map(one, range(int(runs))))
+          print(f'RESULT {name}: {fails} failed of {runs}', flush=True)
+          PY
+          ls -la "$LIB" "$SONNY"
+          python3 loop.py store-checkpoint 600 8 "$LIB" store::tests::a_long_log_is_checkpointed_beside_the_writer_and_starts_over
+          python3 loop.py store-module 100 4 "$LIB" store::
+          python3 loop.py responsible 200 6 "$SONNY" responsible::own::tests::a_program_started_is_responsible_for_itself_and_says_what_it_printed
+          python3 loop.py exec-replay 100 4 "$SONNY" exec::tests::a_script_ scheduler::
+          python3 loop.py markdown 60 4 "$SONNY" markdown::tests::a_long_
