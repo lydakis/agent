@@ -501,8 +501,6 @@ fn automations() -> Value {
                             "description": "An agent the first run starts in your folder as a task, which later \
                                 runs message."
                         },
-                        "reply_to": {"type": "string", "minLength": 1,
-                            "description": "Who gets the turn's answer when it ends."},
                         "if": {"type": "string", "minLength": 1,
                             "description": "A shell command run in your folder first; it runs only if that exits \
                                 0, so a check finding nothing costs no turn."},
@@ -511,11 +509,6 @@ fn automations() -> Value {
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
                             "description": "Caps each run's turn tokens, every request's input and history counted, \
                                 so one below the history ends each run at its first reply. Only when the person asks."},
-                        "shadow": {"type": "boolean",
-                            "description": "A dry run: each run goes to a read-only copy of the agent, anything \
-                                past reading refused, its answer a report to you (or reply_to) of what it would \
-                                have done. Replace it without \
-                                shadow once the reports match the job."},
                         "live": {"type": "boolean",
                             "description": "The message is a template like a live memory fact's, filled as each run starts."},
                         "replace": {"type": "boolean",
@@ -2555,9 +2548,6 @@ impl Part {
     }
 }
 
-/// What a run's answer is said to be, to the agent it goes to.
-const ANSWERS: &str = "each run's answer";
-
 /// The parts of an `add` by the agent `me`: none for one that only wakes
 /// it, else its `if` command as a `shell` call in its own sandbox, where it
 /// runs at each fire, a message to another agent as `send_message`, and an
@@ -2580,9 +2570,6 @@ fn added_parts(me: &str, add: &Value) -> Vec<Part> {
     }
     if let Some(to) = text("agent").filter(|to| *to != me) {
         parts.push(Part::message(to, "the agent it wakes", message));
-    }
-    if let Some(to) = text("reply_to").filter(|to| *to != me) {
-        parts.push(Part::message(to, "the agent it answers", ANSWERS));
     }
     parts
 }
@@ -2618,9 +2605,6 @@ fn standing_parts(caller: &crate::trigger::Caller, trigger: &crate::trigger::Tri
             parts.push(Part::message(name, "the agent it wakes", &trigger.message))
         }
         Target::Bot { .. } => {}
-    }
-    if let Some((to, _)) = trigger.reply_to.as_ref().filter(|(_, id)| !mine(*id)) {
-        parts.push(Part::message(to, "the agent it answers", ANSWERS));
     }
     parts
 }
@@ -4222,7 +4206,7 @@ mod tests {
         let (client, asked) = steps_daemon(&[]).await;
         for wakes in [
             json!({"every": "30m", "message": "Check the build."}),
-            json!({"every": "30m", "agent": "watch", "reply_to": "watch", "message": "Check."}),
+            json!({"every": "30m", "agent": "watch", "message": "Check."}),
         ] {
             let _ = add(&client, wakes).await;
         }
@@ -4240,7 +4224,7 @@ mod tests {
         let _ = add(
             &client,
             json!({"every": "1h", "if": "test -f done", "agent": "shop.lead",
-                "reply_to": "shop.lead", "message": "The build is done."}),
+                "message": "The build is done."}),
         )
         .await;
         let _ = add(
@@ -4257,10 +4241,6 @@ mod tests {
                 (
                     "send_message".to_owned(),
                     json!({"to": "shop.lead", "message": "The build is done."})
-                ),
-                (
-                    "send_message".to_owned(),
-                    json!({"to": "shop.lead", "message": ANSWERS})
                 ),
                 (
                     START.to_owned(),
@@ -4280,7 +4260,7 @@ mod tests {
                 .iter()
                 .filter(|request| request["op"] == "step_result"))
             .count(),
-            4,
+            3,
             "{asked:?}"
         );
     }
@@ -4328,7 +4308,6 @@ mod tests {
             at: None,
             commit: None,
             dir: None,
-            reply_to: None,
             gate: None,
             gate_by: None,
             runs: None,
@@ -4342,7 +4321,6 @@ mod tests {
             },
             store_id: "00ab".into(),
             message: "Check.".into(),
-            shadow: false,
             live: false,
         };
         let caller = |store: &str, id: i64| crate::trigger::Caller {

@@ -735,7 +735,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         replay_over: false,
         cursor: None,
         saved: None,
-        fires: HashMap::new(),
         senders: HashMap::new(),
         askers: HashMap::new(),
         resume: marks(&settings.store).0,
@@ -743,7 +742,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         replay: marks(&settings.store).1,
         kept: told_marks(&settings.store),
         in_flight: HashMap::new(),
-        telling: HashMap::new(),
         bouncing: HashMap::new(),
         watchers: HashMap::new(),
         started: true,
@@ -822,7 +820,7 @@ impl Readers {
     }
 }
 
-/// A failed fire's note under way.
+/// A bounce's note under way.
 struct Telling {
     note: tokio::task::AbortHandle,
     /// The cursors of the turn's start and end: the replay that tells it
@@ -874,20 +872,14 @@ struct Service {
     /// Each subscriber's own mark, as the last lookout kept it, until its
     /// lookout is seated (`mark_told`).
     kept: HashMap<String, i64>,
-    /// Turns triggers' fires sent, by agent and turn, each with its
-    /// trigger's generation: one that fails is told (`trigger::tell_failed`).
-    fires: HashMap<(String, i64), String>,
     /// The agents whose messages started or joined each turn, by bot and
     /// turn, for whom a turn that fails is a note (`bounced`).
     senders: HashMap<(String, i64), Vec<Sender>>,
     /// Who asked for each turn whose senders wait on its end.
     askers: HashMap<(String, i64), Asked>,
-    /// Failed fires' turns whose note is under way, by agent and turn: held
-    /// so a restart or a reconnect before the daemon takes the note replays
-    /// the turn and tells it again, not never.
-    telling: HashMap<(String, i64), Telling>,
-    /// Bounces under way, by agent, turn and who is told: held as a failed
-    /// fire's note is, so one the daemon has not taken is told again.
+    /// Bounces under way, by agent, turn and who is told: held so a restart
+    /// or a reconnect before the daemon takes the note replays the turn and
+    /// tells it again, not never.
     bouncing: HashMap<Bounce, Telling>,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
@@ -1073,12 +1065,9 @@ impl Service {
         }
         // Notes under way answer the old connection: the replay tells them
         // again.
-        for telling in
-            (self.telling.drain().map(|(_, t)| t)).chain(self.bouncing.drain().map(|(_, t)| t))
-        {
+        for (_, telling) in self.bouncing.drain() {
             telling.note.abort();
         }
-        let (told, mut taken) = tokio::sync::mpsc::channel(64);
         let (bounce_told, mut bounce_taken) = tokio::sync::mpsc::channel::<Bounce>(64);
         let (done, mut results) = tokio::sync::mpsc::channel::<(
             String,
@@ -1191,31 +1180,6 @@ impl Service {
                     {
                         self.reread();
                     }
-                    let bot_id = (event["bot"].as_str())
-                        .and_then(|bot| self.records.get(bot))
-                        .and_then(|record| record["bot_id"].as_i64());
-                    if let Some((generation, bot, turn, error)) = self.fired(&event, live)
-                        && let Some(store) = client.store().map(str::to_owned)
-                    {
-                        let (client, told) = (client.clone(), told.clone());
-                        let key = (bot.clone(), turn);
-                        let note = tokio::spawn(async move {
-                            let sent = crate::trigger::tell_failed(&client, &store, &generation, (&bot, bot_id, turn), &error)
-                                .await;
-                            // Taken, or refused for good: a dropped
-                            // connection's replay tells it again.
-                            if sent.is_err_and(|error| error.code == "daemon_disconnected") {
-                                return;
-                            }
-                            let _ = told.send((bot, turn)).await;
-                        });
-                        let telling = Telling {
-                            note: note.abort_handle(),
-                            began: self.in_flight.get(&key).copied(),
-                            ended: cursor,
-                        };
-                        self.telling.insert(key, telling);
-                    }
                     // The senders of a turn that failed, or of a message
                     // that ended in line, kept to bounce it back once the
                     // lookouts hear its end.
@@ -1277,9 +1241,6 @@ impl Service {
                         continue;
                     }
                     touched = Some(hearing);
-                }
-                Some(key) = taken.recv() => {
-                    self.telling.remove(&key);
                 }
                 Some(key) = bounce_taken.recv() => {
                     self.bouncing.remove(&key);
@@ -1378,33 +1339,6 @@ impl Service {
         }
     }
 
-    /// A turn a trigger's fire sent, noted as it starts; once it ends
-    /// failed, while live, its trigger's generation, agent, turn and why,
-    /// for the agent to be told. A model that said nothing did not fail.
-    fn fired(&mut self, event: &Value, live: bool) -> Option<(String, String, i64, String)> {
-        let (bot, turn) = (event["bot"].as_str()?, number(event)?);
-        let data = &event["data"];
-        match event["event"].as_str()? {
-            "accepted" | "queued" => {
-                let generation = crate::trigger::fire_generation(data["request_id"].as_str()?)?;
-                // Bounded: a turn whose end was never seen is let go.
-                if self.fires.len() >= FIRES {
-                    self.fires.clear();
-                }
-                self.fires
-                    .insert((bot.to_owned(), turn), generation.to_owned());
-                None
-            }
-            "turn_finished" | "message_ended" => {
-                let generation = self.fires.remove(&(bot.to_owned(), turn))?;
-                let error = data["error"].as_str().unwrap_or("no reason given");
-                (live && data["status"] == "failed" && error != "empty_completion")
-                    .then(|| (generation, bot.to_owned(), turn, error.to_owned()))
-            }
-            _ => None,
-        }
-    }
-
     /// Lets go of the turns under way that the listing shows ended, or
     /// never running, unseen: but for one carrying another agent's
     /// message, which may still wait in line, ready or held, and whose end
@@ -1432,8 +1366,8 @@ impl Service {
     }
 
     /// Note where each turn or message whose end is still owed began, so
-    /// a restart reads again from there: one a lookout hears, a fire's,
-    /// and one carrying another agent's message, so a restart still sees
+    /// a restart reads again from there: one a lookout hears, and one
+    /// carrying another agent's message, so a restart still sees
     /// it end and can bounce it. A message taken into a running turn ends
     /// in line there: its own number has no end of its own to wait for.
     fn track(&mut self, event: &Value, heard: bool, cursor: Option<i64>) {
@@ -1452,9 +1386,7 @@ impl Service {
                     self.in_flight.entry(key).or_insert(at);
                 }
             }
-            Some("accepted" | "queued")
-                if heard || self.fires.contains_key(&key) || self.senders.contains_key(&key) =>
-            {
+            Some("accepted" | "queued") if heard || self.senders.contains_key(&key) => {
                 if let Some(at) = cursor {
                     self.in_flight.entry(key).or_insert(at);
                 }
@@ -1493,7 +1425,7 @@ impl Service {
                     self.askers.remove(&(bot.to_owned(), message));
                 }
                 // Bounded: turns whose end was never seen are let go.
-                if self.senders.len() >= FIRES || self.askers.len() >= FIRES {
+                if self.senders.len() >= TRACKED || self.askers.len() >= TRACKED {
                     self.senders.clear();
                     self.askers.clear();
                 }
@@ -1965,10 +1897,9 @@ impl Service {
         }
     }
 
-    /// Up to just before the oldest news a lookout has not told, the
-    /// or the oldest failed fire whose
-    /// note is under way, which a restart or a reconnect
-    /// takes up again: news only in memory, or a read or check a dropped
+    /// Up to just before the oldest news a lookout has not told, or the
+    /// oldest bounce whose note is under way, which a restart or a
+    /// reconnect takes up again: news only in memory, or a read or check a dropped
     /// connection cut short, is told or run again, not lost.
     fn floor(&mut self) -> Option<i64> {
         for lookout in self.lookouts.values_mut() {
@@ -1977,10 +1908,7 @@ impl Service {
             }
         }
         let floor = (self.lookouts.values().filter_map(|l| l.from))
-            .chain(
-                (self.telling.values().chain(self.bouncing.values()))
-                    .filter_map(|telling| telling.ended),
-            )
+            .chain((self.bouncing.values()).filter_map(|telling| telling.ended))
             .min();
         match (self.cursor, floor) {
             (Some(at), Some(floor)) => Some(at.min(floor - 1)),
@@ -2026,13 +1954,10 @@ impl Service {
     }
 
     /// Just before the oldest turn under way that a lookout hears, or
-    /// whose failed fire's note is: its start says which trigger sent it.
+    /// whose bounce is under way: its start says whose message it carried.
     fn replay_floor(&self) -> Option<i64> {
         (self.in_flight.values().copied())
-            .chain(
-                (self.telling.values().chain(self.bouncing.values()))
-                    .filter_map(|telling| telling.began),
-            )
+            .chain((self.bouncing.values()).filter_map(|telling| telling.began))
             .min()
             .map(|at| at - 1)
     }
@@ -2066,8 +1991,8 @@ fn cursor_path(store: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// The most fires' turns noted at once.
-const FIRES: usize = 4096;
+/// The most turns whose senders or askers are noted at once.
+const TRACKED: usize = 4096;
 
 /// The number an event names: its turn's, or for a message in line that
 /// no turn has taken, the message's, which the turn it opens shares.
@@ -4026,62 +3951,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fires_turn_that_failed_is_told_once_its_end_is_news() {
-        let mut service = service(PathBuf::from("/nonexistent"), &[]);
-        let fire = |turn| json!({"request_id": format!("trigger_12-34_9.1.2.{turn}")});
-        let failed = json!({"status": "failed", "error": "provider_error"});
-        // Its own turn, then a failed end: told, once.
-        assert_eq!(
-            service.fired(&ev("calc.lead", 4, "accepted", fire(4)), true),
-            None
-        );
-        assert_eq!(
-            service.fired(&ev("calc.lead", 4, "turn_finished", failed.clone()), true),
-            Some((
-                "12-34".into(),
-                "calc.lead".into(),
-                4,
-                "provider_error".into()
-            ))
-        );
-        assert_eq!(
-            service.fired(&ev("calc.lead", 4, "turn_finished", failed.clone()), true),
-            None
-        );
-        // A completed one, one that said nothing, the replay's: not told.
-        for (turn, end, live) in [
-            (5, json!({"status": "completed"}), true),
-            (
-                6,
-                json!({"status": "failed", "error": "empty_completion"}),
-                true,
-            ),
-            (7, failed.clone(), false),
-        ] {
-            service.fired(&ev("calc.lead", turn, "queued", fire(turn)), live);
-            assert_eq!(
-                service.fired(&ev("calc.lead", turn, "turn_finished", end), live),
-                None
-            );
-        }
-        // Nor a turn no fire sent, nor the answer one passes on.
-        service.fired(
-            &ev("calc.lead", 8, "accepted", json!({"request_id": "tui-1"})),
-            true,
-        );
-        assert_eq!(
-            service.fired(&ev("calc.lead", 8, "turn_finished", failed.clone()), true),
-            None
-        );
-        let reply = json!({"request_id": "trigger_12-34_reply.3.9"});
-        service.fired(&ev("calc.lead", 9, "queued", reply), true);
-        assert_eq!(
-            service.fired(&ev("calc.lead", 9, "turn_finished", failed), true),
-            None
-        );
-    }
-
-    #[tokio::test]
     async fn a_lead_whose_filter_hears_no_failure_still_gets_its_bounce() {
         let mut service = service(PathBuf::from("/nonexistent"), &[]);
         service
@@ -4321,12 +4190,10 @@ mod tests {
             replayed: None,
             replay: None,
             in_flight: HashMap::new(),
-            telling: HashMap::new(),
             bouncing: HashMap::new(),
             watchers: HashMap::new(),
             started: false,
             rewriting: HashSet::new(),
-            fires: HashMap::new(),
             senders: HashMap::new(),
             askers: HashMap::new(),
         }
@@ -4952,19 +4819,21 @@ mod tests {
         service.save_cursor();
         held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
-        // A failed fire whose note is under way is told again from its
-        // start: its end is news and its start names its trigger.
+        // A bounce whose note is under way is told again from its start:
+        // its end is news and its start names whose message it carried.
         let telling = Telling {
             note: tokio::spawn(async {}).abort_handle(),
             began: Some(30),
             ended: Some(50),
         };
-        service.telling.insert(("calc.fix".into(), 7), telling);
+        service
+            .bouncing
+            .insert(("calc.fix".into(), 7, "calc.lead".into()), telling);
         service.save_cursor();
         held::written();
         assert_eq!(marks(&store), (Some(49), Some(29)));
         // The daemon took it: nothing holds the stream.
-        service.telling.clear();
+        service.bouncing.clear();
         service.save_cursor();
         held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));

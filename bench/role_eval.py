@@ -541,7 +541,7 @@ SCRIPTS = {
         'run': (1, {}, False),
         'rm': (1, {}, False),
         'add': (0, {'--name': True, '--every': True, '--in': True, '--at': True, '--cron': True,
-                    '--bot': True, '--reply-to': True, '--runs': True,
+                    '--bot': True, '--runs': True,
                     '--turn-budget-tokens': True, '--replace': False}, True),
     },
     'memory': {
