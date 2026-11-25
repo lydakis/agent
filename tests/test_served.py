@@ -1224,32 +1224,6 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
                    if t['request_id'].startswith('commons.')]
         self.assertEqual(commons, ['commons.invite.stalls'])
 
-    def test_an_invite_goes_by_words_few_agents_said_not_one_every_agent_heard(self):
-        # Every agent of a project heard its lead's morning note; three
-        # others each once worked on one of the thread's subjects.
-        said = {'shop.c': 'morning note', 'shop.d': 'morning note', 'shop.e': 'morning note',
-                'calc.b': 'the checkpoint', 'mail.f': 'fsync again', 'docs.g': 'what stalls'}
-        for bot in ('calc.a', *said):
-            self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
-                                instructions='Agent.', declare=[declared('commons')])
-        for bot, prompt in said.items():
-            turn = self.daemon.request('submit', bot=bot, request_id=bot, prompt=prompt)['result']['message']
-            self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        # The commons' threads say the subjects often and the morning
-        # never: ranked there, the morning would lead.
-        commons = self.path / '.agents/commons'
-        commons.mkdir(parents=True)
-        for n in range(6):
-            post = {'by': 'calc.a', 'at': 1, 'title': f'Checkpoint fsync stalls {n}',
-                    'text': 'checkpoint fsync stalls'}
-            (commons / f'old{n}.jsonl').write_text(json.dumps(post) + '\n')
-        self.host()
-        post = {'name': 'wal', 'title': 'Morning checkpoint fsync stalls', 'text': 'Seen this?'}
-        self.call('calc.a', 'commons', {'post': post})
-        # Three invites fill its seats at even odds: the three agents of the
-        # words few agents said, none of the note every agent heard.
-        self.assertEqual(sorted(self.invited('wal')), ['calc.b', 'docs.g', 'mail.f'])
-
     def test_an_invite_to_a_busy_agent_waits_in_line_and_counts_as_sent(self):
         import threading
         for bot in ('calc.a', 'shop.b'):

@@ -537,9 +537,9 @@ pub(crate) fn start_locked(
     if post["do"].is_null()
         && let Some((reach, golden)) = reserve(dir, name, &[])
     {
-        let words = invite_words(title, post["text"].as_str().unwrap_or_default());
-        started["invite"] = json!({"title": title, "golden": golden, "reach": reach,
-            "words": kept_words(&words)});
+        let words = invite_words(dir, title, post["text"].as_str().unwrap_or_default());
+        started["invite"] =
+            json!({"title": title, "golden": golden, "reach": reach, "words": words});
     }
     Ok(started)
 }
@@ -774,13 +774,12 @@ fn words(title: &str) -> Vec<String> {
 }
 
 /// What of a thread's title and first post is searched for in agents'
-/// turns, each word of four letters or more with how much the thread says
-/// it, BM25's saturated term frequency, the title's twice the text's; most
-/// said first. How rare a word is, BM25's other half, is counted where it
-/// is searched, among agents' turns ([`touched`]). A word with a digit in
-/// it is a hash, a number or an id, which names no subject, and is left
-/// out.
-fn invite_words(title: &str, text: &str) -> Words {
+/// turns, rarest first: each word of four letters or more, scored as the
+/// pointer scores a thread's (BM25 over the commons' threads), a word few
+/// threads say above one many do, the title's twice the text's. A word
+/// with a digit in it is a hash, a number or an id, which names no
+/// subject, and is left out.
+fn invite_words(dir: &Path, title: &str, text: &str) -> Vec<String> {
     let mut said: HashMap<String, (u32, u32)> = HashMap::new();
     for word in counted_words(title) {
         said.entry(word).or_default().0 += 1;
@@ -789,35 +788,27 @@ fn invite_words(title: &str, text: &str) -> Words {
         said.entry(word).or_default().1 += 1;
     }
     said.retain(|word, _| !word.chars().any(|c| c.is_ascii_digit()));
-    let mut words: Vec<(String, f64)> = (said.into_iter())
+    let mut held = INDEX.lock().unwrap_or_else(|p| p.into_inner());
+    let held = held.get_or_insert_with(HashMap::new);
+    index(dir, held);
+    let threads: Vec<&Indexed> = (held.iter())
+        .filter(|(path, thread)| path.starts_with(dir) && thread.posts > 0)
+        .map(|(_, thread)| thread)
+        .collect();
+    let count = threads.len() as f64;
+    let mut scored: Vec<(f64, String)> = (said.into_iter())
         .map(|(word, (title, text))| {
+            let holding = threads
+                .iter()
+                .filter(|t| t.words.contains_key(&word))
+                .count() as f64;
+            let weight = (1.0 + (count - holding + 0.5) / (holding + 0.5)).ln();
             let tf = TITLE_BOOST * f64::from(title) + f64::from(text);
-            (word, tf * (BM25_K1 + 1.0) / (tf + BM25_K1))
+            (weight * tf * (BM25_K1 + 1.0) / (tf + BM25_K1), word)
         })
         .collect();
-    words.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    words
-}
-
-/// A thread's words, each with how much it says it, as [`invite_words`]
-/// gives them.
-type Words = Vec<(String, f64)>;
-
-/// The words an invite keeps, as [`invite_words`] gives them.
-fn kept_words(words: &[(String, f64)]) -> Value {
-    json!(
-        words
-            .iter()
-            .map(|(word, said)| json!([word, said]))
-            .collect::<Vec<_>>()
-    )
-}
-
-/// The words an invite kept, back as [`invite_words`] gave them.
-fn words_kept(words: &Value) -> Words {
-    (words.as_array().into_iter().flatten())
-        .filter_map(|pair| Some((pair[0].as_str()?.to_owned(), pair[1].as_f64()?)))
-        .collect()
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, word)| word).collect()
 }
 
 /// The note an invited agent gets: why it, from whom, and the budget of
@@ -841,112 +832,47 @@ fn draw() -> usize {
         .map_or(0, |d| d.subsec_nanos() as usize)
 }
 
-/// How rare a word held by `held` of `of` agents is: BM25's inverse
-/// document frequency, as Lucene counts it, its documents agents.
-fn rarity(held: usize, of: usize) -> f64 {
-    let (held, of) = (held as f64, of as f64);
-    (1.0 + (of - held + 0.5) / (held + 0.5)).ln()
-}
-
 /// The live agents whose turns mention a thread's words, besides its
-/// author. Each word scores as BM25 scores it, how much the thread says
-/// it times how rare it is among the agents it is searched in: how many
-/// of them its search finds, so a word nearly every agent said ranks last,
-/// however rare it is in the commons. Down the ranking until `reach` are
-/// found, so a word that matches no one costs no seat. `words` come most
-/// said first, so once those searched have found `reach` above what any
-/// word left could score, held by one agent, the rest are not searched:
-/// they could not change who is found.
+/// author, `words` rarest first: down the list until `reach` are found,
+/// so a word that matches no one costs no seat.
 async fn touched(
     client: &agent_client::Client,
-    words: &[(String, f64)],
+    words: &[String],
     author: &str,
     live: &[String],
     reach: usize,
 ) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
     // Past every live agent but its author, no search finds another.
     let could = live.iter().filter(|one| *one != author).count();
-    let want = reach.min(could);
-    // Each word searched, best first, its score and the agents it found;
-    // a tie keeps the word searched first first.
-    let mut ranked: Vec<(f64, Vec<String>)> = Vec::new();
-    for (word, said) in words {
-        if want == 0 {
+    for word in words {
+        if found.len() >= reach.min(could) {
             break;
         }
-        let best = rarity(1, could) * said;
-        if filled(&ranked, want).is_some_and(|enough| enough >= best) {
-            break;
-        }
-        let holders = holders(client, word, author, live).await;
-        let score = rarity(holders.len(), could) * said;
-        let place = ranked.partition_point(|(scored, _)| *scored >= score);
-        ranked.insert(place, (score, holders));
-    }
-    let mut found: Vec<String> = Vec::new();
-    for (_, holders) in ranked {
-        if found.len() >= want {
-            break;
-        }
-        for bot in holders {
-            if !found.contains(&bot) {
-                found.push(bot);
-            }
-        }
-    }
-    found
-}
-
-/// The score of the word down `ranked` whose agents bring those found to
-/// `want`, if they do.
-fn filled(ranked: &[(f64, Vec<String>)], want: usize) -> Option<f64> {
-    let mut found: Vec<&str> = Vec::new();
-    for (score, holders) in ranked {
-        for bot in holders {
-            if !found.contains(&bot.as_str()) {
-                found.push(bot);
-            }
-        }
-        if found.len() >= want {
-            return Some(*score);
-        }
-    }
-    None
-}
-
-/// The live agents besides `author` whose turns hold `word`, as its search
-/// finds them, newest first. A page holds so many matches, not agents, so
-/// older pages too while one brings someone new, as a word many agents
-/// said fills a page with a few of them, or none is found yet, so a busy
-/// poster crowds out no one: up to `SEARCH_PAGES`.
-async fn holders(
-    client: &agent_client::Client,
-    word: &str,
-    author: &str,
-    live: &[String],
-) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    let mut before = Value::Null;
-    for _ in 0..SEARCH_PAGES {
-        let ask = json!({"bot": "*", "query": word, "before": before});
-        let Ok(said) = client.request("history_search", ask).await else {
-            break;
-        };
-        let mut new = false;
-        for bot in (said["matches"].as_array().into_iter().flatten())
-            .filter_map(|found| found["bot"].as_str())
-        {
-            if bot != author
-                && live.iter().any(|one| one == bot)
-                && !found.iter().any(|one| one == bot)
+        // Older pages too, while a word's matches are all the poster's or
+        // agents already found, so a busy poster crowds out no one.
+        let mut before = Value::Null;
+        for _ in 0..SEARCH_PAGES {
+            let ask = json!({"bot": "*", "query": word, "before": before});
+            let Ok(said) = client.request("history_search", ask).await else {
+                break;
+            };
+            let mut new = false;
+            for bot in (said["matches"].as_array().into_iter().flatten())
+                .filter_map(|found| found["bot"].as_str())
             {
-                found.push(bot.to_owned());
-                new = true;
+                if bot != author
+                    && live.iter().any(|one| one == bot)
+                    && !found.iter().any(|one| one == bot)
+                {
+                    found.push(bot.to_owned());
+                    new = true;
+                }
             }
-        }
-        before = said["next_before"].clone();
-        if (!new && !found.is_empty()) || before.is_null() {
-            break;
+            before = said["next_before"].clone();
+            if new || before.is_null() {
+                break;
+            }
         }
     }
     found
@@ -1002,7 +928,9 @@ pub async fn invite(
 ) -> Vec<String> {
     let thread = started["thread"].as_str().unwrap_or_default();
     let title = invite["title"].as_str().unwrap_or_default();
-    let words = words_kept(&invite["words"]);
+    let words: Vec<String> = (invite["words"].as_array().into_iter().flatten())
+        .filter_map(|word| word.as_str().map(str::to_owned))
+        .collect();
     let golden = invite["golden"] == true;
     let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
     let seats = Seats {
@@ -1068,7 +996,11 @@ pub async fn round(
 /// One of the day's threads taken for the round `key` of `opened`, under
 /// the lock, if one is left, and the words that aim it: the rarest of its
 /// work's titles and first posts.
-fn round_words(dir: &Path, key: &str, opened: &[(String, String)]) -> Option<(usize, bool, Words)> {
+fn round_words(
+    dir: &Path,
+    key: &str,
+    opened: &[(String, String)],
+) -> Option<(usize, bool, Vec<String>)> {
     let threads: Vec<String> = opened.iter().map(|(thread, _)| thread.clone()).collect();
     let (reach, golden) = {
         let _lock = lock(dir).ok()?;
@@ -1081,7 +1013,7 @@ fn round_words(dir: &Path, key: &str, opened: &[(String, String)]) -> Option<(us
             Some(posts.first()?["text"].as_str()?.to_owned())
         })
         .collect();
-    let words = invite_words(&titles.join("\n"), &texts.join("\n"));
+    let words = invite_words(dir, &titles.join("\n"), &texts.join("\n"));
     Some((reach, golden, words))
 }
 
@@ -1110,7 +1042,7 @@ pub fn round_note(board: &str, opened: &[(String, String)], author: &str, golden
 struct Seats<'a> {
     request: String,
     socket: &'a Path,
-    words: &'a [(String, f64)],
+    words: &'a [String],
     reach: usize,
     golden: bool,
 }
@@ -4888,8 +4820,7 @@ mod tests {
             post("first")["invite"],
             json!({"title": "SQLite checkpoint stalls", "golden": false,
                 "reach": reach(0, 0, base as usize),
-                "words": [["checkpoint", 1.375], ["sqlite", 1.375], ["stalls", 1.375],
-                    ["seen", 1.0]]})
+                "words": ["checkpoint", "sqlite", "stalls", "seen"]})
         );
         // A thread no agent's invite reached is given back.
         settle(&dir, "first", &[]);
@@ -4951,8 +4882,9 @@ mod tests {
     }
 
     #[test]
-    fn invites_aim_by_the_most_said_words_and_work_draws_none_of_its_own() {
+    fn invites_aim_by_the_rarest_words_and_work_draws_none_of_its_own() {
         let home = home("rarest");
+        let dir = dir(&home);
         let post = |name: &str, title: &str, text: &str, board: Option<&str>| {
             let mut post = json!({"name": name, "title": title, "text": text});
             if let Some(board) = board {
@@ -4969,10 +4901,6 @@ mod tests {
             )
             .unwrap()
         };
-        // A title's word counts twice a text's, the most said first; one
-        // with a digit is no subject. How rare each is is counted where
-        // it is searched, in agents' turns, so the commons' threads don't
-        // weigh it.
         for n in 0..6 {
             post(
                 &format!("t{n}"),
@@ -4981,13 +4909,18 @@ mod tests {
                 None,
             );
         }
+        // A word few threads say leads; one with a digit is no subject.
         let words = invite_words(
+            &dir,
             "Fix the checkpoint error",
-            "wal stalls on 0x1f2e3d sha256 error",
+            "wal stalls on 0x1f2e3d sha256",
         );
-        let named: Vec<&str> = words.iter().map(|(word, _)| word.as_str()).collect();
-        assert_eq!(named, ["error", "checkpoint", "stalls"], "{words:?}");
-        assert_eq!(words_kept(&kept_words(&words)), words);
+        assert_eq!(words.first().map(String::as_str), Some("checkpoint"));
+        assert!(
+            words.iter().all(|w| !w.chars().any(|c| c.is_ascii_digit())),
+            "{words:?}"
+        );
+        assert!(words.iter().position(|w| w == "error") > words.iter().position(|w| w == "stalls"));
         // A plain thread on a board invites as one off a board, each of
         // them; work invites none of its own.
         let _ = std::fs::remove_dir_all(&home);
@@ -5055,24 +4988,6 @@ mod tests {
             "{sizes:?}"
         );
         let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn a_word_ranks_by_how_many_agents_hold_it_and_the_search_stops_once_none_left_can_matter() {
-        // Of 100 agents, a word one holds outranks one all hold, however
-        // much more a thread says the common one.
-        assert!(rarity(1, 100) * 1.0 > rarity(90, 100) * 2.2);
-        assert!(rarity(0, 100) > rarity(1, 100));
-        let found = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        let ranked = vec![
-            (4.0, found(&["a.x"])),
-            (3.0, found(&["a.x", "b.y"])),
-            (2.0, found(&["c.z", "d.w"])),
-        ];
-        assert_eq!(filled(&ranked, 1), Some(4.0));
-        assert_eq!(filled(&ranked, 2), Some(3.0));
-        assert_eq!(filled(&ranked, 4), Some(2.0));
-        assert_eq!(filled(&ranked, 5), None);
     }
 
     #[test]
@@ -5200,7 +5115,7 @@ mod tests {
             _ => json!({}),
         })
         .await;
-        let words: Vec<(String, f64)> = (0..50).map(|n| (format!("word{n}"), 1.0)).collect();
+        let words: Vec<String> = (0..50).map(|n| format!("word{n}")).collect();
         assert!(
             touched(&client, &words, "shop.lead", &[], 8)
                 .await
@@ -5213,60 +5128,6 @@ mod tests {
             ["shop.w1"]
         );
         assert_eq!(searched.load(Ordering::SeqCst), 1);
-    }
-
-    /// A word every agent said ranks below one a few said, however much
-    /// more the thread says it, and the words left once none could rank
-    /// above those that found enough are not searched.
-    #[tokio::test]
-    async fn invites_go_to_the_agents_of_a_word_few_agents_said() {
-        use std::sync::{Arc, Mutex};
-        let searched = Arc::new(Mutex::new(Vec::<String>::new()));
-        let counted = searched.clone();
-        let client = crate::tests::daemon_answering(move |request| {
-            let word = request["query"].as_str().unwrap_or_default().to_owned();
-            counted.lock().unwrap().push(word.clone());
-            let bots: Vec<String> = match word.as_str() {
-                // The lead's morning note, which every agent heard.
-                "morning" => (1..=9).map(|n| format!("shop.w{n}")).collect(),
-                "checkpoint" => vec!["shop.w3".to_owned()],
-                "stalls" => vec!["shop.w3".to_owned(), "shop.w7".to_owned()],
-                _ => Vec::new(),
-            };
-            let matches: Vec<Value> = bots.iter().map(|bot| json!({"bot": bot})).collect();
-            json!({"matches": matches, "next_before": null})
-        })
-        .await;
-        let live: Vec<String> = (1..=9)
-            .map(|n| format!("shop.w{n}"))
-            .chain(["shop.lead".to_owned()])
-            .collect();
-        let words = |list: &[(&str, f64)]| -> Vec<(String, f64)> {
-            list.iter()
-                .map(|(word, said)| (word.to_string(), *said))
-                .collect()
-        };
-        let aimed = words(&[("morning", 1.571), ("checkpoint", 1.375), ("stalls", 1.0)]);
-        assert_eq!(
-            touched(&client, &aimed, "shop.lead", &live, 2).await,
-            ["shop.w3", "shop.w7"]
-        );
-        // Two words that found enough, said more than any left: the rest
-        // could not rank above them, so they are not searched.
-        searched.lock().unwrap().clear();
-        let mut early = words(&[("checkpoint", 1.375), ("stalls", 1.375)]);
-        early.extend((0..20).map(|n| (format!("other{n}"), 1.0)));
-        let found = touched(&client, &early, "shop.lead", &live, 2).await;
-        assert_eq!(found, ["shop.w3", "shop.w7"]);
-        assert_eq!(*searched.lock().unwrap(), ["checkpoint", "stalls"]);
-        // One found by the first: a word said as much could at most tie,
-        // and a tie keeps the word searched first.
-        searched.lock().unwrap().clear();
-        assert_eq!(
-            touched(&client, &early, "shop.lead", &live, 1).await,
-            ["shop.w3"]
-        );
-        assert_eq!(*searched.lock().unwrap(), ["checkpoint"]);
     }
 
     /// Every agent is someone to invite, closed ones too, so the daemon is
