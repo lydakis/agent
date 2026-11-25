@@ -158,13 +158,17 @@ loaded, so keep the source's read-only token in a file both `quiet` and the
 job read, such as `token` in the job folder with mode 600.
 
 For the lead, the run's reply is its post, with no key to send or look up:
-write the plan into the run record (step 8), apply it and mark the record
-done (step 9), then reply with the post's text. A record a run finds not
-marked done (step 2) never replied: mark it done without applying anything,
-and this run reads those items again. A run cut off before it replies ends
-failed or stopped, which the lead hears through its follow. An urgent item
-also goes to the urgent destination, as a post keyed with the run's key and
-`_urgent`, recorded and confirmed as steps 8 and 9 say.
+write the plan into the run record (step 8), mark it "replying", apply its
+ledger lines and move its bookmarks, then reply with the post's text as the
+run's last words. Your own conversation shows whether a run replied. When
+step 2 finds a record marked replying, finish applying it, then look at your
+previous turn: if it ended with that text, mark the record done; if not, it
+was cut off first, so put that text at the head of this run's post and mark
+the record done once this run's plan holds it. A record not marked replying
+never replied and applied nothing: mark it done, and this run reads those
+items again. An urgent item also goes to the urgent destination, as a post
+keyed with the run's key and `_urgent`, recorded and confirmed as steps 8
+and 9 say.
 
 What a source said goes into a post quoted and named as the source's, never
 as a request of the job's own. The lead reads the reply as the job's
