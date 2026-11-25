@@ -834,6 +834,28 @@ pub(super) fn take(
     changed
 }
 
+/// Bring what the lookout took of one subscriber's file up to `revision`,
+/// as [`take`] does for all: whether it changed.
+pub(super) fn take_one(
+    taken: &mut std::collections::HashMap<String, Took>,
+    name: &str,
+    revision: Option<crate::kept::Stamp>,
+    now: u128,
+) -> bool {
+    let had = taken.get(name).map(|took| took.revision);
+    if had == Some(revision) || (had.is_none() && revision.is_none()) {
+        return false;
+    }
+    taken.insert(
+        name.to_owned(),
+        Took {
+            revision,
+            at_ms: now,
+        },
+    );
+    true
+}
+
 /// Keep what the lookout took of each subscriber's file beside the store.
 pub(super) fn took(store: &Path, taken: &std::collections::HashMap<String, Took>) {
     let body: serde_json::Map<String, Value> = (taken.iter())
@@ -849,8 +871,9 @@ pub(super) fn took(store: &Path, taken: &std::collections::HashMap<String, Took>
 
 /// What the lookout makes of `subscriber`'s file: whether one runs, when it
 /// took the file, and whether what it took is the file as it is now, a
-/// removed file included. A running lookout reads every file again within
-/// `REREAD`.
+/// removed file included. A running lookout reads a file as it is
+/// written (`watch`), or every file again within `REREAD` where the folder
+/// cannot be watched.
 pub fn taken(store: &Path, subscriber: &str) -> Value {
     let running = super::running(store);
     let took = (std::fs::read_to_string(taken_file(store)).ok())
@@ -867,7 +890,6 @@ pub fn taken(store: &Path, subscriber: &str) -> Value {
         "running": running,
         "took_ms": took["at_ms"].as_u64(),
         "current": running && same,
-        "rereads_every_s": super::REREAD.as_secs(),
     })
 }
 
@@ -942,6 +964,29 @@ impl Read {
         self.0 = kept;
         all.sort_by(|a, b| a.0.cmp(&b.0));
         all
+    }
+}
+
+impl Read {
+    /// One subscriber's file, as [`Read::all`] reads each: read again only
+    /// once its stamp changed. Its stamp, none for a file that is gone,
+    /// and what it holds.
+    pub(super) fn one(
+        &mut self,
+        store: &Path,
+        bot: &str,
+    ) -> (Option<crate::kept::Stamp>, Vec<Sub>) {
+        // Stamped before the read, so a change during it is read next time.
+        let stamp = crate::kept::stamp(&file(store, bot));
+        let subs = match (stamp, self.0.remove(bot)) {
+            (None, _) => Vec::new(),
+            (Some(now), Some((had, subs))) if now == had => subs,
+            _ => read(store, bot),
+        };
+        if let Some(stamp) = stamp.filter(crate::kept::Stamp::settled) {
+            self.0.insert(bot.to_owned(), (stamp, subs.clone()));
+        }
+        (stamp, subs)
     }
 }
 
