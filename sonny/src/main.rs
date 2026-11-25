@@ -24208,8 +24208,12 @@ impl App {
             {
                 // By its name as the hint shows it, shortened or whole.
                 let room = self.width.min(measure()).saturating_sub(prompt::LEAD);
+                // Gone from it, nothing on it opens the task.
                 let shown = asks::hint_name(ask, self.at(), self.asks.len(), room);
-                let names = [(shown.unwrap_or_default(), task.bot.clone())];
+                let names: Vec<(String, String)> = shown
+                    .map(|name| (name, task.bot.clone()))
+                    .into_iter()
+                    .collect();
                 let found;
                 (composer_rows, found) = hint_agents(composer_rows, &names);
                 for (row, from, to, bot) in found {

@@ -1827,16 +1827,22 @@ impl Hint {
 /// The answer hint in `width` columns, by display width. Short of room it
 /// gives way in this order, a later part only once every earlier one has
 /// given all it gives: the question shortens with `…` down to 8 columns;
-/// its keys go as any line of keys does, `esc write instead` staying; the
-/// words before them; which of several it is; then a task's name shortens
-/// with `…`. Nothing is cut without a `…`, and a key is whole or gone.
+/// its keys go as any line of keys does, `esc write instead` staying, and
+/// `type or` with the pick; a step's `say how it went`; which of several
+/// it is; then a task's name shortens with `…` while three of its letters
+/// show, else goes whole. Narrower still, the question shortens past its
+/// 8 columns. Nothing is cut without a `…`, and a key is whole or gone.
 fn fit_hint(ask: &Ask, at: usize, of: usize, width: usize) -> Hint {
     const QUESTION: usize = 8;
+    const NAME_LETTERS: usize = 3;
+    let pick = match ask.options.len() {
+        0 => None,
+        1 => Some("1".to_owned()),
+        n => Some(format!("1–{n}")),
+    };
     let mut keys = crate::hint::Keys::new();
-    match ask.options.len() {
-        0 => {}
-        1 => keys = keys.key("1", "pick"),
-        n => keys = keys.key(format!("1–{n}"), "pick"),
+    if let Some(pick) = &pick {
+        keys = keys.key(pick.clone(), "pick");
     }
     if of > 1 {
         keys = keys.key("↑↓", "switch");
@@ -1866,12 +1872,16 @@ fn fit_hint(ask: &Ask, at: usize, of: usize, width: usize) -> Hint {
     if hint.width() <= width {
         return hint;
     }
-    // 2. Its keys, as any line of keys gives way.
+    // 2. Its keys, as any line of keys gives way. `type or` goes with the
+    // pick: the two are one phrase.
     hint.keys = keys.fit(room(&hint, hint.keys.width()));
+    if pick.is_some_and(|pick| !hint.keys.contains(&format!("{pick} pick"))) {
+        hint.words = "";
+    }
     if hint.width() <= width {
         return hint;
     }
-    // 3. The words before the keys.
+    // 3. A step's words, how it went.
     hint.words = "";
     if hint.width() <= width {
         return hint;
@@ -1881,10 +1891,15 @@ fn fit_hint(ask: &Ask, at: usize, of: usize, width: usize) -> Hint {
     if hint.width() <= width {
         return hint;
     }
-    // 5. A task's name, shortened.
+    // 5. A task's name, shortened while three of its letters show, else
+    // gone whole with its `from`: its card says whose it is.
     if let Some(name) = hint.name.take() {
         let room = room(&hint, 0).saturating_sub(" from ".width());
-        hint.name = Some(crate::transcript::cut(&name, room));
+        let shown = crate::transcript::cut(&name, room);
+        let letters = shown.trim_end_matches('…').chars().count();
+        if shown == name || letters >= NAME_LETTERS {
+            hint.name = Some(shown);
+        }
         if hint.width() <= width {
             return hint;
         }
@@ -2217,11 +2232,8 @@ mod tests {
             fits(&ask, 0, 1, 56),
             "Answer “Should w…”: type or 1–2 pick · esc write instead"
         );
-        // Then `1–2 pick` goes, and then `type or`.
-        assert_eq!(
-            fits(&ask, 0, 1, 53),
-            "Answer “Should…”: type or esc write instead"
-        );
+        // Then `1–2 pick` goes, and `type or` with it: one phrase.
+        assert_eq!(fits(&ask, 0, 1, 53), "Answer “Should…”: esc write instead");
         assert_eq!(fits(&ask, 0, 1, 40), "Answer “Should…”: esc write instead");
         // Measured by display width: a wide character takes two.
         let mut wide = should();
@@ -2270,10 +2282,12 @@ mod tests {
             fits(&step, 0, 1, 45),
             "Answer “Sign in…” from fix: esc write instead"
         );
+        // Too short to keep three of its letters, the name goes whole.
         assert_eq!(
             fits(&step, 0, 1, 44),
-            "Answer “Sign in…” from f…: esc write instead"
+            "Answer “Sign in…”: esc write instead"
         );
+        assert_eq!(hint_name(&step, 0, 1, 44), None);
     }
 
     #[test]
@@ -2299,11 +2313,23 @@ mod tests {
             "Answer “Should…” from release-notes…: esc write instead"
         );
         assert_eq!(hint_name(&ask, 0, 2, 55).as_deref(), Some("release-notes…"));
-        // Narrower than the rule's parts leave room for, the question
-        // shortens past its 8 columns.
-        let row = fits(&ask, 0, 2, 40);
-        assert_eq!(row, "Answer “Shou…” from …: esc write instead");
-        assert_eq!(hint_name(&ask, 0, 2, 40).as_deref(), Some("…"));
+        // While three of its letters show; short of that it goes whole,
+        // with its `from` and its link. The card says whose it is.
+        assert_eq!(
+            fits(&ask, 0, 2, 45),
+            "Answer “Should…” from rel…: esc write instead"
+        );
+        assert_eq!(hint_name(&ask, 0, 2, 45).as_deref(), Some("rel…"));
+        for width in [44, 40] {
+            assert_eq!(
+                fits(&ask, 0, 2, width),
+                "Answer “Should…”: esc write instead"
+            );
+            assert_eq!(hint_name(&ask, 0, 2, width), None);
+        }
+        // Narrower than that row, the question shortens past its 8
+        // columns.
+        assert_eq!(fits(&ask, 0, 2, 33), "Answer “Shou…”: esc write instead");
     }
 
     #[test]
@@ -2347,9 +2373,17 @@ mod tests {
                             text(&hint(ask, 0, of, width))
                         );
                     }
-                    // Whatever is cut ends in `…`, and a key is whole.
+                    // Whatever is cut ends in `…`, and a key is whole. A
+                    // name shows three letters or none, and `type or` goes
+                    // with the pick.
                     let row = text(&hint(ask, 0, of, width));
                     assert!(row.width() <= width, "{width}: {row}");
+                    assert!(!row.contains("type or esc"), "{width}: {row}");
+                    assert!(!row.contains("from …"), "{width}: {row}");
+                    if let Some(name) = &fitted.name {
+                        let letters = name.trim_end_matches('…').chars().count();
+                        assert!(Some(name) == whole.name.as_ref() || letters >= 3, "{row}");
+                    }
                     if width >= 40 {
                         assert!(row.ends_with(" esc write instead"), "{width}: {row}");
                     }
