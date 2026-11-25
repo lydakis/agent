@@ -158,9 +158,11 @@ pub fn follow_kept(store: &Path, caller: &str, board: &str, id: Option<i64>) {
 /// agents it touches, in `store`: the board for `caller`, known as `id`,
 /// when it opened or took work there, and for an agent another dropped
 /// work from, its thread as one that posted there. The caller's own
-/// follow of the thread, as [`commons::subscribed`] takes it: as its
-/// holder, one the work is for, or one that posted; none for a thread on
-/// no board.
+/// follow of work's thread, as [`commons::subscribed`] takes it: as its
+/// holder, one the work is for, or one that posted; none for a thread
+/// that is not work, on a board or not, which is followed as any plain
+/// thread. Each is Sonny's ([`crate::lookout::subs::put`]): a follow the
+/// agent changed stays as it is.
 pub fn follows(
     store: &Path,
     caller: &str,
@@ -184,15 +186,15 @@ pub fn follows(
     let holds = work["state"] == "taken" && work["holder"] == caller;
     let asked = matches!(work["state"].as_str(), Some("open"))
         && (work["for"].as_array().into_iter().flatten()).any(|named| named == caller);
-    let mut follow = match (holds, asked) {
+    // A plain thread on a board is followed as one on no board.
+    if !work.is_object() {
+        return None;
+    }
+    Some(match (holds, asked) {
         (true, _) => post_follow(thread, id, HOLDS),
         (false, true) => post_follow(thread, id, ASKED),
         _ => post_follow(thread, id, POSTED),
-    };
-    // A plain thread on a board lasts while its agent is closed, as any
-    // commons thread it posts in; work's thread ends with it.
-    follow.outlives_close = !work.is_object();
-    Some(follow)
+    })
 }
 
 /// The agents a post or a reply of the commons tool names as `@NAME`, in
@@ -1218,6 +1220,47 @@ pub fn work_follows_close(store: &Path, home: &Path) {
                 sub.remove("outlives_close");
             }
             work
+        })
+    });
+}
+
+/// A plain thread on a board is followed as one on no board (after
+/// 0.10.6).
+pub const PLAIN_FOLLOWS_PLAIN: &str = "board-plain-follows-plain";
+
+/// Each follow beside `store` of a plain thread on a board, still as
+/// [`follows`] wrote it before (each post as it comes, as one that posted
+/// there, lasting while its agent is closed), becomes the follow posting
+/// in any plain thread makes ([`Sub::commons`]), once for the store:
+/// `home`'s commons say which threads are plain. One its agent changed,
+/// or of work's thread, stays as it is. An older Sonny reads the plain
+/// follow as it reads any, and puts its own back as its agent posts.
+pub fn plain_follows_plain(store: &Path, home: &Path) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    let dir = commons::dir(home);
+    let prefix = format!("{}.", agent_client::config::COMMONS_SOURCE);
+    crate::upgrade::once(Path::new(&record), PLAIN_FOLLOWS_PLAIN, || {
+        crate::lookout::subs::files_changed(store, |sub| {
+            let Some(had) = Sub::from_json(sub) else {
+                return false;
+            };
+            let Some(thread) = had.name.strip_prefix(&prefix) else {
+                return false;
+            };
+            let mut before = post_follow(thread, had.owner, POSTED);
+            before.outlives_close = true;
+            let plain = had == before
+                && commons::posts(&dir.join(format!("{thread}.jsonl"))).is_ok_and(|posts| {
+                    posts
+                        .first()
+                        .is_some_and(|first| first["board"].is_string())
+                        && standing(&posts).is_none()
+                });
+            if plain {
+                *sub = Sub::commons(thread, had.owner).to_json();
+            }
+            plain
         })
     });
 }
@@ -2671,15 +2714,14 @@ mod tests {
         let plain = json!({"post": {"name": "idea", "title": "An idea",
             "text": "x", "board": "shop/errors"}});
         let said = lead(plain.clone()).unwrap();
-        let plain_follow = follows(&store, "shop.lead", Some(1), &plain, &said).unwrap();
-        assert!(plain_follow.outlives_close);
+        assert!(follows(&store, "shop.lead", Some(1), &plain, &said).is_none());
         assert!(
             !Sub::from_json(&work_follow.to_json())
                 .unwrap()
                 .outlives_close
         );
         crate::lookout::subs::put(&store, "shop.lead", work_follow).unwrap();
-        crate::lookout::subs::put(&store, "shop.lead", plain_follow).unwrap();
+        commons::subscribed(&store, "shop.lead", Some(1), "idea", None).unwrap();
         assert_eq!(
             crate::lookout::subs::closed(&store, "shop.lead", Some(1)),
             Ok(2)
@@ -2767,6 +2809,172 @@ mod tests {
             (crate::lookout::subs::read(&store, "shop.lead").iter())
                 .any(|sub| sub.name == "commons.store" && sub.outlives_close)
         );
+        let _ = std::fs::remove_dir_all(&home);
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(record);
+    }
+    /// `agent`, known as `id`, calls the commons tool with `arguments`
+    /// as the tool host does, follows written as it writes them: its
+    /// follow of the thread after, as its file holds it.
+    fn called(home: &Path, agent: &str, id: i64, arguments: Value) -> Option<Sub> {
+        let store = home.join("store");
+        let said = send(home, agent, "shop", None, false, arguments.clone()).unwrap();
+        let thread = said["thread"].as_str().unwrap().to_owned();
+        let on_board = follows(&store, agent, Some(id), &arguments, &said);
+        commons::subscribed(&store, agent, Some(id), &thread, on_board).unwrap();
+        thread_follow(&store, agent, &thread)
+    }
+
+    fn thread_follow(store: &Path, agent: &str, thread: &str) -> Option<Sub> {
+        (crate::lookout::subs::read(store, agent).into_iter())
+            .find(|sub| sub.name == format!("commons.{thread}"))
+    }
+
+    /// `agent`'s own follow of `thread`, digested hourly, in place of
+    /// Sonny's, as its follows tool changes one: removed, then added.
+    fn own_digest(store: &Path, agent: &str, id: i64, thread: &str) -> Sub {
+        let name = format!("commons.{thread}");
+        let change = |add: Option<&Value>, remove: Option<&str>| {
+            crate::lookout::subs::change(store, agent, Some(id), add, remove, &["commons".into()])
+                .unwrap()
+        };
+        change(None, Some(&name));
+        let add = json!({"name": name, "sources": [format!("commons:{thread}")], "digest": "1h"});
+        change(Some(&add), None);
+        let own = thread_follow(store, agent, thread).unwrap();
+        assert!(!crate::lookout::subs::sonnys(&own), "{own:?}");
+        own
+    }
+
+    #[test]
+    fn a_follow_its_agent_changed_stays_through_its_replies_takes_and_drops() {
+        let home = home("own-follow");
+        let store = home.join("store");
+        // With no follow of its own, posting in work's thread steers.
+        let lead = |args| called(&home, "shop.lead", 1, args);
+        let mine = lead(work("store", "Type the store errors", json!({}))).unwrap();
+        assert_eq!(mine.steer, Some(every()));
+        assert_eq!(mine.about.as_deref(), Some(POSTED));
+        // A worker that posted there digests the thread hourly: its reply,
+        // its take and the lead's drop leave that as it is.
+        let w1 = |args| called(&home, "shop.w1", 2, args);
+        w1(json!({"reply": {"thread": "store", "text": "looking"}})).unwrap();
+        let own = own_digest(&store, "shop.w1", 2, "store");
+        assert_eq!(
+            w1(json!({"reply": {"thread": "store", "text": "more"}})),
+            Some(own.clone())
+        );
+        assert_eq!(w1(act("store", "take")), Some(own.clone()));
+        let said = send(
+            &home,
+            "shop.lead",
+            "shop",
+            None,
+            false,
+            act("store", "drop"),
+        )
+        .unwrap();
+        assert_eq!(said["dropped_from"]["name"], "shop.w1");
+        follows(&store, "shop.lead", Some(1), &act("store", "drop"), &said);
+        assert_eq!(thread_follow(&store, "shop.w1", "store"), Some(own.clone()));
+        // Asked to take work, an agent keeps the follow it set too.
+        let mut asked = work("api", "Type the api errors", json!({}));
+        asked["post"]["for"] = json!(["shop.w1"]);
+        lead(asked).unwrap();
+        let own = own_digest(&store, "shop.w1", 2, "api");
+        crate::lookout::subs::put(&store, "shop.w1", post_follow("api", Some(2), ASKED)).unwrap();
+        assert_eq!(thread_follow(&store, "shop.w1", "api"), Some(own));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn sonny_s_own_follow_keeps_up_with_why_its_agent_is_there() {
+        let home = home("sonnys-follow");
+        let store = home.join("store");
+        let lead = |args| called(&home, "shop.lead", 1, args);
+        let w1 = |args| called(&home, "shop.w1", 2, args);
+        // A plain thread on a board is followed as one on no board: at
+        // the commons' digest, lasting while its agent is closed.
+        let plain = lead(json!({"post": {"name": "idea", "title": "An idea",
+            "text": "x", "board": "shop/errors"}}))
+        .unwrap();
+        assert_eq!(plain, Sub::commons("idea", Some(1)));
+        assert_eq!(
+            w1(json!({"reply": {"thread": "idea", "text": "+1"}})),
+            Some(Sub::commons("idea", Some(2)))
+        );
+        // Made work, it steers each that posts there next, as why.
+        let opened = json!({"reply": {"thread": "idea", "do": "open",
+            "board": "shop/errors", "title": "Do the idea", "text": "y"}});
+        assert_eq!(lead(opened), Some(post_follow("idea", Some(1), POSTED)));
+        assert_eq!(
+            w1(act("idea", "take")),
+            Some(post_follow("idea", Some(2), HOLDS))
+        );
+        // Dropped, its follow says it posted there.
+        let said = send(&home, "shop.lead", "shop", None, false, act("idea", "drop")).unwrap();
+        follows(&store, "shop.lead", Some(1), &act("idea", "drop"), &said);
+        let dropped = thread_follow(&store, "shop.w1", "idea").unwrap();
+        assert_eq!(dropped.about.as_deref(), Some(POSTED));
+        assert_eq!(dropped.steer, Some(every()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn put_leaves_what_the_agent_set_and_takes_what_another_bot_held() {
+        let home = home("put-own");
+        let store = home.join("store");
+        let put = |sub: Sub| crate::lookout::subs::put(&store, "shop.w1", sub).unwrap();
+        assert!(put(post_follow("t", Some(2), POSTED)));
+        assert!(!put(post_follow("t", Some(2), POSTED)));
+        assert!(put(post_follow("t", Some(2), HOLDS)));
+        let own = own_digest(&store, "shop.w1", 2, "t");
+        assert!(!put(post_follow("t", Some(2), ASKED)));
+        assert_eq!(thread_follow(&store, "shop.w1", "t"), Some(own));
+        // A later bot of the name holds none of an earlier one's.
+        assert!(put(post_follow("t", Some(3), ASKED)));
+        assert_eq!(
+            thread_follow(&store, "shop.w1", "t"),
+            Some(post_follow("t", Some(3), ASKED))
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn follows_of_plain_threads_on_a_board_written_before_follow_them_plainly_once() {
+        let home = home("plain-follows");
+        let store = home.join("store");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        for name in ["idea", "other"] {
+            lead(json!({"post": {"name": name, "title": "An idea",
+                "text": "x", "board": "shop/errors"}}))
+            .unwrap();
+        }
+        // As 0.10.6 wrote them: a plain thread's on a board steering, as
+        // one that posted there, lasting while its agent is closed.
+        let before = |thread: &str| {
+            let mut sub = post_follow(thread, Some(1), POSTED);
+            sub.outlives_close = true;
+            sub
+        };
+        let mut changed = before("other");
+        changed.digest = Some("1h".into());
+        let work_follow = post_follow("store", Some(1), POSTED);
+        for sub in [before("idea"), changed.clone(), work_follow.clone()] {
+            crate::lookout::subs::put(&store, "shop.lead", sub).unwrap();
+        }
+        plain_follows_plain(&store, &home);
+        let follow = |thread| thread_follow(&store, "shop.lead", thread);
+        assert_eq!(follow("idea"), Some(Sub::commons("idea", Some(1))));
+        assert_eq!(follow("other"), Some(changed));
+        assert_eq!(follow("store"), Some(work_follow));
+        // Once: a follow written afterwards as before stays as it is.
+        crate::lookout::subs::remove(&store, "shop.lead", "commons.idea").unwrap();
+        crate::lookout::subs::put(&store, "shop.lead", before("idea")).unwrap();
+        plain_follows_plain(&store, &home);
+        assert_eq!(follow("idea"), Some(before("idea")));
         let _ = std::fs::remove_dir_all(&home);
         let mut record = store.as_os_str().to_owned();
         record.push(".migrated");
