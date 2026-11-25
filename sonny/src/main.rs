@@ -757,6 +757,10 @@ struct ProjectsKept {
     waiting: std::collections::HashSet<String>,
     version: Option<u64>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
+    /// The project picked to go to, as the page showed it: the window
+    /// opened on its lead shows its counts and agents from its first
+    /// frame, until its own count lands.
+    picked: Option<projects::Project>,
 }
 
 impl ProjectsKept {
@@ -897,9 +901,22 @@ impl App {
             waiting: std::mem::take(&mut open.waiting),
             version: open.version,
             job: open.job.take(),
+            picked: None,
         };
         kept.landed();
         self.projects_kept = Some(Box::new(kept));
+    }
+
+    /// A window opened from **Projects** on the project picked there: its
+    /// footer counts and the pane's agents as the page showed them, read
+    /// from the store's one follow, until the window's own count lands.
+    fn open_on_picked(&mut self) {
+        let picked = (self.projects_kept.as_mut()).and_then(|kept| kept.picked.take());
+        let Some(picked) = picked.filter(|picked| picked.lead == self.bot) else {
+            return;
+        };
+        self.counts.get_or_insert(picked.counts);
+        self.margin.set_agents(picked.agents, &self.bot);
     }
 
     /// What needs the person in every project, followed for as long as
@@ -1162,7 +1179,14 @@ impl App {
             projects::Act::Stay => {}
             projects::Act::Close => self.close_projects(),
             projects::Act::Go(lead) => {
+                let picked = (self.projects.as_ref())
+                    .and_then(|open| open.view.picked())
+                    .filter(|picked| picked.lead == lead)
+                    .cloned();
                 self.close_projects();
+                if let Some(kept) = &mut self.projects_kept {
+                    kept.picked = picked;
+                }
                 self.switch_picked(lead);
             }
         }
@@ -9351,6 +9375,7 @@ impl App {
         self.recall = recall::Recall::load(attach::MOST_BYTES);
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
+        self.open_on_picked();
         self.history().await;
         // What was sent and still waits, wherever it was sent from.
         self.restage().await;
@@ -9479,6 +9504,10 @@ impl App {
         let mut held: Option<Event> = None;
         // Woken as each picture drawn beside the loop is ready.
         drawing::wake(&self.woken);
+        // The first look round goes right after the first frame, not a
+        // tick later: what is read beside the loop (the footer's count,
+        // the pane's agents) starts as the window opens.
+        self.woken.notify_one();
         loop {
             let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
             let wanted = keyed || changed || self.quit;
@@ -13556,7 +13585,7 @@ impl App {
         }
         self.counted_local = Some(local);
         self.counted_at = Some(Instant::now());
-        let (client, woken) = (self.client.clone(), self.woken.clone());
+        let client = self.client.clone();
         let (store, bot) = (self.options.store.clone(), self.bot.clone());
         let lone = self.project.is_none();
         // What was read of each agent's history and question goes with the
@@ -13574,7 +13603,7 @@ impl App {
         // whole only from a new snapshot.
         let kept_mark = self.rows_mark.filter(|_| !whole);
         let readers = self.readers.clone();
-        self.counting = Some(tokio::spawn(async move {
+        let count = async move {
             let failed = |reads| Counted {
                 mark: None,
                 read: None,
@@ -13677,7 +13706,6 @@ impl App {
             if let Some((_held, kept, lead)) = first.filter(|_| read.fresh) {
                 keep_for(&kept, &lead, &bot, client.identity(), &latest, &seen);
             }
-            woken.notify_one();
             let whole = read.whole && read.listed;
             let mut built = read.rows;
             // The agents counted, made again only once they are not those
@@ -13739,6 +13767,13 @@ impl App {
                 agents: Some(agents),
                 kept: Some(kept_rows),
             })
+        };
+        // The window looks again as the count ends, whatever it found.
+        let woken = self.woken.clone();
+        self.counting = Some(tokio::spawn(async move {
+            let counted = count.await;
+            woken.notify_one();
+            counted
         }));
     }
 
@@ -31099,6 +31134,62 @@ mod tests {
         app.options.store = store.clone();
         app.open_projects().await;
         assert_eq!(app.projects.as_ref().unwrap().view.projects().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_lead_opened_from_projects_shows_its_counts_from_the_first_frame() {
+        let client = daemon_answering(|_| json!({})).await;
+        let shop = projects::Project {
+            lead: "shop.lead".into(),
+            name: "shop".into(),
+            counts: status::Counts {
+                working: 2,
+                idle: 5,
+                ..Default::default()
+            },
+            agents: status::Agents {
+                project: "shop".into(),
+                ..Default::default()
+            },
+            last: now_ms(),
+            ..Default::default()
+        };
+        let mut left = app(client.clone());
+        let mut view = projects::View::new("shop.lead").showing("b");
+        view.set(vec![shop.clone()], now_ms());
+        left.projects = Some(Box::new(ProjectsOpen {
+            view,
+            job: None,
+            read_at: None,
+            state: ProjectsState::default(),
+            whole: true,
+            waiting: Default::default(),
+            version: None,
+            page: Rect::default(),
+            side: Rect::default(),
+        }));
+        let enter = Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        left.projects_event(enter).await;
+        assert_eq!(left.switch_to.as_deref(), Some("shop.lead"));
+        // The window opened in its place on the lead picked counts as the
+        // page did, before its own count.
+        let mut opened = app(client.clone());
+        opened.bot = "shop.lead".into();
+        opened.projects_kept = left.projects_kept.take();
+        opened.open_on_picked();
+        assert_eq!(opened.counts, Some(shop.counts));
+        assert_eq!(opened.margin.agents().project, "shop");
+        // Taken once: the page it opens again picks nothing.
+        assert!(opened.projects_kept.as_ref().unwrap().picked.is_none());
+        // A window on another agent takes nothing of it.
+        let mut other = app(client);
+        other.projects_kept = Some(Box::new(ProjectsKept {
+            picked: Some(shop),
+            ..Default::default()
+        }));
+        other.open_on_picked();
+        assert_eq!(other.counts, None);
+        assert!(other.projects_kept.as_ref().unwrap().picked.is_none());
     }
 
     #[tokio::test]
