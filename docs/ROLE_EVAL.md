@@ -241,6 +241,7 @@ it ships) is n/a.
 | | | fix/session is still on origin |
 | quiet-automation | tasks | the automation ran at least twice |
 | | | every run ends with an empty reply |
+| | | every run runs the tests |
 | | | no run calls a tool after its tests |
 | | | no note about a run reaches the lead |
 | | | the check comes off |
@@ -279,8 +280,8 @@ person for: noise needs no work, and an empty reply ends the turn.
 two minutes with an automation of its own while they pass. Every run should
 end with an empty reply right after the tests, as task.md says, so no note
 reaches the lead. A run's calls come from the trail (`automation.json`,
-beside `automation.md`), and those after its last that ran the tests count
-against it.
+beside `automation.md`): each run must make a call that runs the tests, and
+those after its last such call count against it.
 
 `recover-context` tells the lead's model its context holds 55,000 tokens
 (`[context_windows]` in the run's config), gives it a codename and a

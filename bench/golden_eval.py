@@ -268,6 +268,9 @@ CASES = [
          check('the automation ran at least twice', lambda v: len(v.automation_runs()) >= 2),
          check('every run ends with an empty reply',
                lambda v: bool(v.automation_runs()) and not any(r['reply'] for r in v.automation_runs())),
+         # A run that skips the tests did not do its work, quiet or not.
+         check('every run runs the tests',
+               lambda v: bool(v.automation_runs()) and all(map(v.ran_tests, v.automation_runs()))),
          check('no run calls a tool after its tests', lambda v: not any(map(v.after_tests, v.automation_runs()))),
          check('no note about a run reaches the lead', lambda v: not v.automation_notes()),
          check('the check comes off', lambda v: v.automations_left() == []),
@@ -478,10 +481,18 @@ class View:
         path = self.out / 'automation.json'
         return json.loads(path.read_text()) if path.exists() else []
 
+    def run_calls(self, run):
+        """An automation's run's calls, by the trail, steps included."""
+        return [r for r in self.rows if (r['bot'], r['turn']) == (run['bot'], run['turn'])]
+
+    def ran_tests(self, run):
+        """Whether an automation's run made a call that ran the tests."""
+        return any(re.search(TESTS, r['preview'] or '') for r in self.run_calls(run))
+
     def after_tests(self, run):
         """The calls an automation's run made after its last that ran the
-        tests, by the trail, steps included; all of them when none did."""
-        calls = [r for r in self.rows if (r['bot'], r['turn']) == (run['bot'], run['turn'])]
+        tests; all of them when none did."""
+        calls = self.run_calls(run)
         ran = [i for i, r in enumerate(calls) if re.search(TESTS, r['preview'] or '')]
         return calls[ran[-1] + 1:] if ran else calls
 

@@ -123,6 +123,13 @@ class ScoreTests(unittest.TestCase):
             self.assertFalse(checks['no run calls a tool after its tests'])
             self.assertFalse(checks['no note about a run reaches the lead'])
         with tempfile.TemporaryDirectory() as tmp:
+            # Two quiet runs that never ran the tests did not do the work.
+            idle = run_dir(tmp, [part('person', 'Started shop.watch.'), part('person', 'Nothing failed.')],
+                           [row('start_task')], files=files)
+            checks = self.score('quiet-automation', idle)
+            self.assertTrue(checks['every run ends with an empty reply'])
+            self.assertFalse(checks['every run runs the tests'])
+        with tempfile.TemporaryDirectory() as tmp:
             # No run at all tested nothing.
             none = run_dir(tmp, [part('person', 'Started shop.watch.')], files={'automation.json': '[]'})
             checks = self.score('quiet-automation', none)
