@@ -355,7 +355,7 @@ class ServedToolTests(ModelFixture):
                          {'follows': [], 'sources': [{'name': 'commons', 'events': 0},
                                                      {'name': 'links', 'events': 0},
                                                      {'name': 'memory', 'events': 0}],
-                          'lookout': {'running': False, 'current': False, 'took_ms': None, 'rereads_every_s': 15}})
+                          'lookout': {'running': False, 'current': False, 'took_ms': None}})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_host_keeps_up(self):
         server = Path(__file__).with_name('mcp_server.py')

@@ -731,7 +731,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         subscribers: HashMap::new(),
         files: subs::Read::default(),
         read_at: HashMap::new(),
-        took_due: false,
         follows: None,
         next_until: None,
         unwatched_why: None,
@@ -863,9 +862,6 @@ struct Service {
     /// kept beside the store ([`subs::taken`]) for its `follows`
     /// listing to show.
     read_at: HashMap<String, subs::Took>,
-    /// `read_at` changed since it was last kept beside the store: kept on
-    /// the next tick, so a burst of writes is one write of it.
-    took_due: bool,
     /// The follows folder, watched with the kernel; none where it cannot be,
     /// and the files are read on the timer instead.
     follows: Option<watch::Watch>,
@@ -1349,9 +1345,6 @@ impl Service {
                     if self.next_until.is_some_and(|at| (epoch_ms() / 1000) as i64 >= at) {
                         self.reread();
                     }
-                    if std::mem::take(&mut self.took_due) {
-                        subs::took(&self.store, &self.read_at);
-                    }
                     for lookout in self.lookouts.values_mut() {
                         lookout.quiet_check(now);
                         lookout.flush();
@@ -1636,7 +1629,9 @@ impl Service {
         // Every revision read is kept, one that changes nothing and a
         // file that went included, so the listing knows it was taken.
         let now = epoch_ms();
-        self.took_due |= subs::take(&mut self.read_at, &revisions, now);
+        if subs::take(&mut self.read_at, &revisions, now) {
+            subs::took(&self.store, &self.read_at);
+        }
         self.next_until = (read.values().flatten())
             .filter_map(subs::Sub::ends_at)
             .min();
@@ -1725,9 +1720,10 @@ impl Service {
         let now = epoch_ms();
         let now_s = (now / 1000) as i64;
         let mut changed = Vec::new();
+        let mut took = false;
         for name in names {
             let (revision, mut read) = self.files.one(&self.store, &name);
-            self.took_due |= subs::take_one(&mut self.read_at, &name, revision, now);
+            took |= subs::take_one(&mut self.read_at, &name, revision, now);
             for sub in read.iter().filter(|sub| sub.over(now_s)) {
                 self.end_sub(&name, sub, "its until came");
             }
@@ -1746,6 +1742,10 @@ impl Service {
                 false => self.subscribers.insert(name.clone(), read),
             };
             changed.push(name);
+        }
+        // Once for every file the notice named.
+        if took {
+            subs::took(&self.store, &self.read_at);
         }
         if changed.is_empty() {
             return changed;
@@ -4416,7 +4416,6 @@ mod tests {
             subscribers: HashMap::new(),
             files: subs::Read::default(),
             read_at: HashMap::new(),
-            took_due: false,
             follows: None,
             next_until: None,
             unwatched_why: None,
