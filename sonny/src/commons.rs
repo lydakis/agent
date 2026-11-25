@@ -952,16 +952,19 @@ async fn holders(
     found
 }
 
-/// Every live agent besides `author`: one closed is no one to invite.
+/// Every agent besides `author`, closed ones and ones in zen too: an
+/// invite is for everybody, and one to a closed agent opens it again.
 async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
     let mut bots = Vec::new();
     let mut after = json!("");
     while let Ok(page) = client
-        .request("bots", json!({"after": after, "limit": 256, "open": true}))
+        .request("bots", json!({"after": after, "limit": 256}))
         .await
     {
         bots.extend(
             (page["bots"].as_array().into_iter().flatten())
+                // One being deleted is no one any more.
+                .filter(|bot| bot["status"] != "deleting")
                 .filter_map(|bot| bot["name"].as_str())
                 .filter(|name| *name != author)
                 // Sonny's own bots (the reviewer's base and its forks) are
@@ -977,40 +980,11 @@ async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
     bots
 }
 
-/// The agents in zen now, by name, found by the key their zen is kept
-/// under.
-async fn in_zen(client: &agent_client::Client, home: &Path, store: &Path) -> Vec<String> {
-    let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.to_owned());
-    let mut zen = Vec::new();
-    let mut after = json!("");
-    while let Ok(page) = client
-        .request("bots", json!({"after": after, "limit": 256}))
-        .await
-    {
-        zen.extend(
-            (page["bots"].as_array().into_iter().flatten())
-                .filter(|bot| {
-                    bot["bot_id"].as_i64().is_some_and(|id| {
-                        let key = crate::reactions::key(&store, id);
-                        crate::zen::focus_in(home, &key).is_some()
-                    })
-                })
-                .filter_map(|bot| bot["name"].as_str())
-                .map(str::to_owned),
-        );
-        match &page["next_after"] {
-            Value::Null => break,
-            next => after = next.clone(),
-        }
-    }
-    zen
-}
-
 /// Invites agents to the thread `started` began, as `invite` says: a
 /// queued note to each, which starts its turn with the invite's budget
 /// (`pays`), the one turn the commons starts of its own. As many as `reach`, drawn
 /// at random from those whose turns mention the title's words, one of
-/// them, on a golden ticket, from every agent; never one in zen. All at
+/// them, on a golden ticket, from every agent. All at
 /// once, as a post's first hour decides how far it goes (Salganik, Dodds
 /// and Watts 2006, early popularity compounding). The ones invited; when
 /// none is, the thread is given back to the day.
@@ -1021,7 +995,7 @@ async fn in_zen(client: &agent_client::Client, home: &Path, store: &Path) -> Vec
 /// answered.
 pub async fn invite(
     home: &Path,
-    daemon: (&Path, &Path),
+    socket: &Path,
     started: &Value,
     (author, turn): (&str, Option<i64>),
     invite: &Value,
@@ -1033,13 +1007,13 @@ pub async fn invite(
     let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
     let seats = Seats {
         request: format!("commons.invite.{thread}"),
-        daemon,
+        socket,
         words: &words,
         reach,
         golden,
     };
     let note = |ticket| invited_note(thread, title, author, ticket);
-    let invited = sends(home, seats, (author, turn), &note).await;
+    let invited = sends(seats, (author, turn), &note).await;
     let bots: Vec<String> = invited.iter().map(|(bot, _)| bot.clone()).collect();
     // It runs in the tool host: what locks the commons runs off its runtime.
     let (dir, thread) = (dir(home), thread.to_owned());
@@ -1060,7 +1034,7 @@ pub async fn invite(
 /// runtime.
 pub async fn round(
     home: &Path,
-    daemon: (&Path, &Path),
+    socket: &Path,
     board: &str,
     opened: &[(String, String)],
     (author, turn): (&str, Option<i64>),
@@ -1079,13 +1053,13 @@ pub async fn round(
     };
     let seats = Seats {
         request: format!("commons.round.{first}"),
-        daemon,
+        socket,
         words: &words,
         reach,
         golden,
     };
     let note = |ticket| round_note(board, opened, author, ticket);
-    let invited = sends(home, seats, (author, turn), &note).await;
+    let invited = sends(seats, (author, turn), &note).await;
     let bots: Vec<String> = invited.iter().map(|(bot, _)| bot.clone()).collect();
     let _ = tokio::task::spawn_blocking(move || settle(&dir, &key, &invited)).await;
     bots
@@ -1131,11 +1105,11 @@ pub fn round_note(board: &str, opened: &[(String, String)], author: &str, golden
 }
 
 /// What one thread's or round's invites are: the request each is sent as,
-/// the daemon they go through, its store and socket, the words that aim
-/// them, how many, and whether one is a golden ticket.
+/// the daemon's socket they go through, the words that aim them, how many,
+/// and whether one is a golden ticket.
 struct Seats<'a> {
     request: String,
-    daemon: (&'a Path, &'a Path),
+    socket: &'a Path,
     words: &'a [(String, f64)],
     reach: usize,
     golden: bool,
@@ -1145,14 +1119,13 @@ struct Seats<'a> {
 /// golden ticket or not, as [`invite`] says: each agent invited, and
 /// whether it held the golden ticket, for the caller to settle.
 async fn sends(
-    home: &Path,
     seats: Seats<'_>,
     (author, turn): (&str, Option<i64>),
     note: &(dyn Fn(bool) -> String + Sync),
 ) -> Vec<(String, bool)> {
     let Seats {
         request,
-        daemon: (store, socket),
+        socket,
         words,
         reach,
         golden,
@@ -1178,14 +1151,8 @@ async fn sends(
                 return None;
             }
         }
-        // An agent in zen talks about its focus alone: invite others.
-        let zen = match crate::zen::any_in(home) {
-            true => in_zen(&client, home, store).await,
-            false => Vec::new(),
-        };
         // Only those it may invite count toward who is found.
-        let mut live = everyone(&client, author).await;
-        live.retain(|bot| !zen.contains(bot));
+        let live = everyone(&client, author).await;
         let mut matched = touched(&client, words, author, &live, reach).await;
         let mut anyone = match golden {
             true => live.clone(),
@@ -5287,6 +5254,30 @@ mod tests {
             ["shop.w3"]
         );
         assert_eq!(*searched.lock().unwrap(), ["checkpoint"]);
+    }
+
+    /// Every agent is someone to invite, closed ones too, so the daemon is
+    /// asked for all of them: only the poster, Sonny's own bots and ones
+    /// being deleted are left out.
+    #[tokio::test]
+    async fn everyone_closed_ones_too_is_someone_to_invite() {
+        let client = crate::tests::daemon_answering(|request| {
+            assert_eq!(request["op"], "bots");
+            assert!(request.get("open").is_none(), "{request}");
+            match request["after"].as_str() {
+                Some("") => json!({"bots": [
+                    {"name": "shop.lead", "status": "idle"},
+                    {"name": "shop.w1", "status": "idle", "closed_ms": 5},
+                ], "next_after": "shop.w1"}),
+                _ => json!({"bots": [
+                    {"name": "shop.w2", "status": "running"},
+                    {"name": "shop.w3", "status": "deleting"},
+                    {"name": crate::project::internal("review"), "status": "idle"},
+                ], "next_after": null}),
+            }
+        })
+        .await;
+        assert_eq!(everyone(&client, "shop.lead").await, ["shop.w1", "shop.w2"]);
     }
 
     /// An agent's project is its lead's, not its name's first part: a

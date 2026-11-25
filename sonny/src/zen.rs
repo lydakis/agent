@@ -106,11 +106,6 @@ pub fn focus_in(home: &Path, key: &str) -> Option<String> {
 /// The most a focus file is read: far past any focus a person types.
 pub const MAX_FOCUS: usize = 16 * 1024;
 
-/// Whether any agent is in zen, before asking which.
-pub fn any_in(home: &Path) -> bool {
-    std::fs::read_dir(home.join(".agent/sonny/zen")).is_ok_and(|mut dir| dir.next().is_some())
-}
-
 /// Zen on the agent keyed `key` with `focus`, or off with none.
 pub fn set(key: Option<&str>, focus: Option<&str>) -> Result<(), String> {
     let home = home().ok_or("zen: no HOME")?;
