@@ -109,7 +109,7 @@ Sonny extends Agent with background companions and shared tools—read [docs/SON
 
 - **Lookout:** Event-driven pipe delivering task updates and external sources (chat, CI, PRs, email pollers, commons, memory, linked machines) with EventBridge-style filters, digests, and instant steers.
 - **Shared memory & skills:** Facts saved in `~/.agents/memory` are shared across worktrees and maintained by nightly cleanup; shipped skills live in `~/.agents/skills` and preserve your edits across upgrades.
-- **Commons & boards:** Cross-project discussion threads (`/commons`) and boards in the commons where a task's agents take work, and are told when they hold it quietly or leave it open.
+- **Commons & boards:** Cross-project discussion threads (`/commons`) and boards in the commons where a task's agents take work, and are told when they still hold it at a turn's end.
 - **Automations:** Cron, interval, file-watch, and git-commit triggers run by one OS scheduler (`launchd` / `systemd`), costing zero model calls when idle or skipped by an `--if` gate.
 - **Code-mode MCP (`exec`) & workflows:** Agents call your MCP servers (and built-in tools) inside a sandboxed QuickJS script (`exec`) with per-call approvals, or orchestrate multi-agent JS pipelines (`workflow`).
 - **Browser, desktop, and remote links:** Pinned `agent-browser` and `agent-desktop` tools, plus `sonny link HOST` so remote devbox agents can use your laptop's signed-in browser, desktop, or local MCP servers over SSH.

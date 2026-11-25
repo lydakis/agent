@@ -130,7 +130,8 @@ pub const ASK_FOR: &str = "ask_for";
 
 /// Why a thread on a board reaches an agent that holds its work.
 pub const HOLDS: &str = "you hold this work";
-/// Why a thread on a board reaches an agent its work is for.
+/// Why a thread on a board reached an agent its work is for, as a follow
+/// written before the `asked` event (`commons::to_me`) still says.
 pub const ASKED: &str = "you're asked to take this work";
 /// Why a thread on a board reaches an agent that posted in it.
 pub const POSTED: &str = "you posted here";
@@ -159,10 +160,10 @@ pub fn follow_kept(store: &Path, caller: &str, board: &str, id: Option<i64>) {
 /// when it opened or took work there, and for an agent another dropped
 /// work from, its thread as one that posted there. The caller's own
 /// follow of work's thread, as [`commons::subscribed`] takes it: as its
-/// holder, one the work is for, or one that posted; none for a thread
-/// that is not work, on a board or not, which is followed as any plain
-/// thread. Each is Sonny's ([`crate::lookout::subs::put`]): a follow the
-/// agent changed stays as it is.
+/// holder, or one that posted; none for a thread that is not work, on a
+/// board or not, which is followed as any plain thread. Each is Sonny's
+/// ([`crate::lookout::subs::put`]): a follow the agent changed stays as it
+/// is.
 pub fn follows(
     store: &Path,
     caller: &str,
@@ -184,16 +185,13 @@ pub fn follows(
         let _ = crate::lookout::subs::put(store, name, post_follow(thread, held_by, POSTED));
     }
     let holds = work["state"] == "taken" && work["holder"] == caller;
-    let asked = matches!(work["state"].as_str(), Some("open"))
-        && (work["for"].as_array().into_iter().flatten()).any(|named| named == caller);
     // A plain thread on a board is followed as one on no board.
     if !work.is_object() {
         return None;
     }
-    Some(match (holds, asked) {
-        (true, _) => post_follow(thread, id, HOLDS),
-        (false, true) => post_follow(thread, id, ASKED),
-        _ => post_follow(thread, id, POSTED),
+    Some(match holds {
+        true => post_follow(thread, id, HOLDS),
+        false => post_follow(thread, id, POSTED),
     })
 }
 
@@ -2303,7 +2301,9 @@ mod tests {
             .find(|line| line["event"] == "opened" && line["topic"] == "enum")
             .unwrap();
         assert_eq!(opened["board"], "shop/errors");
-        assert_eq!(opened["from"], "shop.w1");
+        // Said by no one, so the worker whose done opened it hears it too:
+        // the lookout tells no agent what it said itself.
+        assert!(opened.get("from").is_none(), "{opened}");
         assert!(opened.get("do").is_none(), "{opened}");
         let text = opened["text"].as_str().unwrap();
         assert!(text.contains("\"Remove the enum\""), "{text}");
