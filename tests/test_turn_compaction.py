@@ -595,12 +595,18 @@ class TurnCompactionTests(ModelFixture):
             self.assertEqual((trigger['reason'], trigger['window']), ('bytes', window), data)
             # The summary, kept prompts and the kept tail leave at least a
             # quarter of the view's threshold: a third is the keep target's
-            # share, and a cut lands on a turn's prompt or a round start of
-            # the newest turn, so the tail may keep one older turn whole.
+            # share, and a cut lands on a turn's prompt or a round start,
+            # so the tail may keep one round or turn start past it.
             self.assertGreaterEqual(data['room_bytes'], trigger['at_bytes'] // 4, (n, data))
-        # Nothing piles up: the twentieth leaves the room the second did.
-        rooms = [data['room_bytes'] for data in compacted[1:]]
-        self.assertGreaterEqual(min(rooms), rooms[0] * 95 // 100, rooms)
+        # Nothing piles up: the twentieth leaves the room the second did
+        # under the same limit, the soft one as a turn ends or the hard one
+        # inside a turn, which a cut at a round of an older turn can take
+        # turns reaching.
+        for after_turn in (True, False):
+            rooms = [data['room_bytes'] for data in compacted[1:]
+                     if bool(data['request'].get('after_turn')) == after_turn]
+            if rooms:
+                self.assertGreaterEqual(min(rooms), rooms[0] * 95 // 100, (after_turn, rooms))
 
     def test_a_lead_keeps_room_to_work_across_twenty_compactions_at_200k(self):
         # Four bytes a token, 40 KB of instructions and tools, rounds of
@@ -616,6 +622,61 @@ class TurnCompactionTests(ModelFixture):
         # A byte a token, so the test sends a million bytes, not four.
         compacted = self.drive(1_000_000, 1, 15_000, 3500)
         self.assert_room(compacted, 1_000_000)
+
+    def test_a_long_turn_steered_every_round_stays_under_its_window(self):
+        # A lead's long turn at a 100,000-token window, a byte a token: a
+        # 6 KB message joins it every round, sixty in all, far more than
+        # the window. Each summary keeps the newest of them whole beside the
+        # prompt, within the bytes it keeps, and the older ones go into it,
+        # so each leaves room under its threshold and no call passes the
+        # window, which the model refuses past (Nov 24 item 6).
+        window, steer = 100_000, 6000
+        self.model.bytes_per_token = 1
+        self.model.compaction_text = 's' * 2000
+        sizes = []
+
+        def refuse_past_window(request, user):
+            sizes.append(len(json.dumps(request)))
+            return 'http' if sizes[-1] > window else None
+        self.model.context_full = refuse_past_window
+        client = self.client(tools='shell', settings={'context_windows': {'openai/*': window}})
+        client.request('create', bot='Lead', workspace=str(self.path), tools=['shell'],
+                       instructions='i' * 3000, compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Lead', request_id='1', prompt='long:60x10')['result']['message']
+        steers, ended = [], None
+        for n in range(60):
+            seen = client.receive(lambda m: m.get('turn') == turn and (
+                m.get('event') == 'turn_finished' or (m.get('event') == 'tool_started'
+                                                     and m['data'].get('call_id') == f'long-{n}')),
+                timeout=30)
+            if seen['event'] == 'turn_finished':
+                ended = seen
+                break
+            steers.append(client.request('submit', bot='Lead', request_id=f's{n}', delivery='steer',
+                                         expected_turn=turn,
+                                         prompt=f'steer: note {n} ' + 'n' * steer)['result']['message'])
+        ended = ended or client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', (len(steers), ended))
+        taken = [client.finished(s)['data']['status'] for s in steers]
+        self.assertGreater(len(steers) * steer, window * 3)
+        self.assertEqual(set(taken), {'taken'})
+        events = all_events(client, 'Lead')
+        self.assertFalse([e for e in events if e['event'] in ('retry', 'compaction_failed')])
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertGreaterEqual(len(compacted), 5)
+        for n, data in enumerate(compacted):
+            self.assertEqual(data['trigger']['reason'], 'bytes', (n, data))
+            self.assertGreater(data['room_bytes'], 0, (n, data))
+            # The messages kept beside the prompt take no more than the
+            # bytes the summary keeps whole.
+            self.assertLessEqual(len(data['pinned_messages']) * steer, data['trigger']['keep_bytes'], (n, data))
+        # Nothing piles up: the last leaves the room the second did, give
+        # or take a steer.
+        self.assertGreaterEqual(compacted[-1]['room_bytes'], compacted[1]['room_bytes'] - 2 * steer, compacted)
+        self.assertLessEqual(max(sizes), window)
+        # The next turn goes as any other.
+        nxt = client.request('submit', bot='Lead', request_id='next', prompt='next')['result']['message']
+        self.assertEqual(client.finished(nxt, timeout=30)['data']['status'], 'completed')
 
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')

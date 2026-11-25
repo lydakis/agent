@@ -17206,6 +17206,156 @@ fn a_catch_up_step_may_end_before_a_steer_that_follows_a_result() {
     assert_eq!(plan.ids.last(), Some(&calls[3].1));
 }
 
+/// A round of a running turn, then a steer of about a kilobyte absorbed
+/// after it: the steer's node.
+fn round_and_steer(db: &mut Database, turn: i64, n: usize) -> i64 {
+    exchange(db, turn, &format!("c{n}"), &lines(n, 2));
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin(
+        "Bob",
+        &format!("s{n}"),
+        &format!("steer {n} {}", "x".repeat(1000)),
+        true,
+        &steer,
+        allow_provider,
+    )
+    .unwrap();
+    let absorbed = db
+        .absorb(
+            turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+    absorbed.outcomes[0].1["node"].as_i64().unwrap()
+}
+
+#[test]
+fn messages_kept_beside_a_cut_s_prompt_take_the_kept_bytes_newest_first() {
+    // A steer of about a kilobyte after each small round. The summary
+    // keeps 3,000 bytes whole: the tail from the cut, about three rounds,
+    // and beside the prompt the newest steers older than the cut that fit
+    // that budget, two; the older ones go to the summary, which reads them.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let limit = ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    let mut steers: Vec<i64> = (0..6)
+        .map(|n| round_and_steer(&mut db, turn, n))
+        .collect();
+    exchange(&mut db, turn, "c6", &lines(6, 2));
+    let plan = compaction_plan(&db, "Bob", 3000, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.cut, plan.pinned), (steers[3], Some(prompt)));
+    assert_eq!(plan.keep_bytes, 3000);
+    // The summary reads every steer before the cut.
+    assert!(steers[..3].iter().all(|steer| plan.ids.contains(steer)));
+    let event = db
+        .compact("Bob", &plan, "summary", None, 0, limit, Value::Null)
+        .unwrap();
+    assert_eq!(event["data"]["pinned_messages"], json!(steers[1..3]));
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..4], &[prompt, steers[1], steers[2], steers[3]]);
+
+    // The next cut carries them over under the same budget, newest first:
+    // each later steer takes an older one's place.
+    steers.extend((7..9).map(|n| round_and_steer(&mut db, turn, n)));
+    exchange(&mut db, turn, "c9", &lines(9, 2));
+    let second = compaction_plan(&db, "Bob", 3000, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((second.cut, second.pinned), (steers[5], Some(prompt)));
+    let event = db
+        .compact("Bob", &second, "summary two", None, 0, limit, Value::Null)
+        .unwrap();
+    assert_eq!(event["data"]["pinned_messages"], json!(steers[3..5]));
+}
+
+#[test]
+fn a_turn_after_a_long_one_summarizes_the_long_one_s_rest_at_a_round() {
+    // The previous cut is inside the long turn, so its prompt is behind
+    // it. A short next turn alone does not reach the kept bytes; the cut
+    // lands at a round start of the long turn's rest, keeping its prompt.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let mut calls = Vec::new();
+    for n in 0..6 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)));
+    }
+    let limit = ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.cut, plan.pinned), (calls[5].0, Some(prompt)));
+    db.compact("Bob", &plan, "summary one", None, 0, limit, Value::Null)
+        .unwrap();
+    for n in 6..10 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)));
+    }
+    let entries = db
+        .append(turn, vec![assistant(&"done ".repeat(100))], &[], None)
+        .unwrap();
+    let done = entries
+        .iter()
+        .find_map(|entry| entry["data"]["node"].as_i64())
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    converse(&mut db, "Bob", 2);
+    // More than the next turn's two short messages, less than them with
+    // the long turn's last reply.
+    let plan = compaction_plan(&db, "Bob", 300, 64 << 10, 256)
+        .unwrap()
+        .expect("a cut inside the long turn's rest");
+    assert_eq!((plan.cut, plan.pinned), (done, Some(prompt)));
+    assert_eq!(plan.covered, (1, 1));
+    assert_eq!(plan.ids.first(), Some(&calls[5].0));
+    assert_eq!(plan.ids.last(), Some(&calls[9].1));
+    db.compact("Bob", &plan, "summary two", None, 0, limit, Value::Null)
+        .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, done]);
+    let items = sent(&db, &window);
+    assert_eq!(items[0]["content"][0]["text"], "long task");
+    assert_eq!(items.last().unwrap()["content"][0]["text"], "r2");
+}
+
 /// An Anthropic bot whose every reply thinks for 3,000 bytes and answers in
 /// a few.
 fn thinking_turns(db: &mut Database, turns: usize) {
@@ -19186,10 +19336,12 @@ fn a_cut_s_kept_pictures_count_toward_the_picture_bound() {
     for n in 1..6 {
         exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50));
     }
-    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+    let mut plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
         .unwrap()
         .unwrap();
     assert_eq!(plan.pinned, Some(prompt));
+    // Kept bytes that take the steer beside the prompt.
+    plan.keep_bytes = 32 << 10;
     let limit = ContextUsage {
         bytes: 64 << 10,
         items: 256,

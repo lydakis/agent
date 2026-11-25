@@ -2676,6 +2676,10 @@ pub struct CompactionPlan {
     /// The elision floor the span is read under: results through it go to
     /// the summarizer as their stubs, which `sizes` counts.
     pub elided: i64,
+    /// The newest bytes the summary leaves whole, the `compact_keep` share
+    /// of the threshold: the messages kept beside a pinned prompt take no
+    /// more than it, newest first.
+    pub keep_bytes: i64,
 }
 impl CompactionPlan {
     /// The summarizer request around the span's items: the previous summary
@@ -7551,11 +7555,12 @@ impl Database {
             )?
             .collect::<rusqlite::Result<_>>()?;
         // The newest boundary whose tail reaches either retention target: a
-        // turn's prompt, or, inside the newest turn, a round start: the first
-        // item after a tool result that is not one, a model output or an
-        // absorbed steer, so no call is parted from its result and a steer
-        // is kept whole. Only items near the boundary are read.
-        let newest_prompt = rows.iter().position(|r| r.3.is_some());
+        // turn's prompt, or, inside any turn the walk covers, a round start:
+        // the first item after a tool result that is not one, a model output
+        // or an absorbed steer, so no call is parted from its result and a
+        // steer is kept whole. A turn that follows a long one can so still
+        // summarize the long one's rest. Only items near the boundary are
+        // read.
         let mut item =
             self.conn
                 .prepare_cached(concat!("SELECT ", unpacked!(), " FROM nodes WHERE id=?"))?;
@@ -7579,8 +7584,7 @@ impl Database {
                 cut = Some((index, *id, false));
                 break;
             }
-            let in_turn = newest_prompt.is_none_or(|p| index + 1 < p) && index + 1 < rows.len();
-            if in_turn && result(index + 1)? && !result(index)? {
+            if index + 1 < rows.len() && result(index + 1)? && !result(index)? {
                 cut = Some((index, *id, true));
                 break;
             }
@@ -7595,13 +7599,18 @@ impl Database {
             return Ok(None);
         };
         let thinking = newest.5 - thinking_before;
-        // A cut inside the turn keeps its prompt in view: the newest prompt
-        // walked, or, when the previous cut was inside this turn too, the
-        // prompt that one kept.
-        let pinned = match (within, newest_prompt) {
-            (false, _) => None,
-            (true, Some(p)) => Some((rows[p].0, rows[p].3.ok_or(Error::new("storage_error"))?)),
-            (true, None) => Some(partial.ok_or(Error::new("storage_error"))?),
+        // A cut inside a turn keeps that turn's prompt in view: the first
+        // prompt walked past the cut, or, when the previous cut was inside
+        // this turn too, the prompt that one kept.
+        let pinned = match within {
+            false => None,
+            true => Some(
+                older
+                    .iter()
+                    .find_map(|row| row.3.map(|seq| (row.0, seq)))
+                    .or(partial)
+                    .ok_or(Error::new("storage_error"))?,
+            ),
         };
         let span = older
             .iter()
@@ -7619,6 +7628,7 @@ impl Database {
             (max_bytes as usize / 3).min(64 * 1024),
             elided,
         );
+        plan.keep_bytes = keep_bytes;
         // A turn split by the previous cut is covered now, in part or whole.
         if let Some((_, turn)) = partial {
             plan.covered = (plan.covered.0.min(turn), plan.covered.1.max(turn));
@@ -7859,6 +7869,7 @@ impl Database {
             (max_bytes as usize / 3).min(64 * 1024),
             elided,
         );
+        plan.keep_bytes = keep_bytes;
         if let Some((_, turn)) = partial {
             plan.covered = (plan.covered.0.min(turn), plan.covered.1.max(turn));
         }
@@ -7958,6 +7969,7 @@ impl Database {
             catch_up,
             summary_bytes,
             elided,
+            keep_bytes: 0,
         }
     }
     /// Record a compaction at the current head. The separate cut marks the
@@ -8092,8 +8104,11 @@ impl Database {
         )?;
         // A cut inside the turn keeps, beside its prompt, the messages sent
         // to the turn before the cut, whole and in order, so none of them
-        // reads older than the prompt. Those the room cannot take go oldest
-        // first: a later one may overrule them, never the other way round.
+        // reads older than the prompt. They take no more than the bytes the
+        // summary leaves whole, newest first, as Codex keeps the person's
+        // messages beside its summary; older ones are the summary's, which
+        // read them. Those the room cannot take go oldest first too: a later
+        // one may overrule them, never the other way round.
         let mut pins = match (plan.pinned, old_cut) {
             (Some(prompt), Some(old_cut)) if old_pinned == Some(prompt) => {
                 let mut pins = old_pins.clone();
@@ -8103,6 +8118,16 @@ impl Database {
             (Some(prompt), _) => self.turn_messages(plan.cut, prompt)?,
             (None, _) => Vec::new(),
         };
+        let mut kept = 0;
+        let mut newest = pins.len();
+        while newest > 0 {
+            kept += self.sent_bytes(&bot, pins[newest - 1])?;
+            if kept > plan.keep_bytes {
+                break;
+            }
+            newest -= 1;
+        }
+        pins.drain(..newest);
         let after = loop {
             let after = self.compaction_context_usage(
                 &bot,
@@ -8317,6 +8342,19 @@ impl Database {
         }
         Ok(messages)
     }
+    /// A node's own bytes as the bot sends it: under the elision floor,
+    /// one with a stub goes as it.
+    fn sent_bytes(&self, bot: &Bot, node: i64) -> Result<i64> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT n.total_bytes-COALESCE(p.total_bytes,0)
+                    -CASE WHEN n.id<=COALESCE(e.through,0) AND n.elided>0 THEN n.elided ELSE 0 END
+                 FROM nodes n LEFT JOIN nodes p ON p.id=n.parent
+                 LEFT JOIN elisions e ON e.node=?2 WHERE n.id=?1",
+            )?
+            .query_row(params![node, bot.elision], |r| r.get(0))?)
+    }
     /// The messages a compaction version keeps beside its pinned prompt,
     /// oldest first.
     fn pins(&self, compaction: i64) -> Result<Vec<i64>> {
@@ -8366,14 +8404,8 @@ impl Database {
             omitted = depth - 1;
             turns = seq - 1;
             // The messages kept beside it, each as the prompt goes.
-            let mut sized = self.conn.prepare_cached(
-                "SELECT n.total_bytes-COALESCE(p.total_bytes,0)
-                    -CASE WHEN n.id<=COALESCE(e.through,0) AND n.elided>0 THEN n.elided ELSE 0 END
-                 FROM nodes n LEFT JOIN nodes p ON p.id=n.parent
-                 LEFT JOIN elisions e ON e.node=?2 WHERE n.id=?1",
-            )?;
-            for pin in pins {
-                bytes += sized.query_row(params![pin, bot.elision], |r| r.get::<_, i64>(0))?;
+            for &pin in pins {
+                bytes += self.sent_bytes(bot, pin)?;
                 items += 1;
                 in_turn -= 1;
             }
