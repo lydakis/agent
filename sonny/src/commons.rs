@@ -151,8 +151,8 @@ const CUTS: [(&str, &str); 3] = [
         "the project's memory, and the person",
     ),
     (
-        "its bot, or look in the commons, or ask your lead",
-        "its bot, or ask your lead",
+        "the history tool, look in the commons or ask your lead",
+        "the history tool or ask your lead",
     ),
     (
         " When you find something agents in other projects could use, post it to the commons.",
