@@ -4401,6 +4401,11 @@ async fn run() -> Result<bool, String> {
     // `/switch NAME` or `/new`: that agent's window opens in this one's
     // place, in this same process, as if Sonny were opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
+        // The person looks at it now: back, for it, if it was told they
+        // were away, told before this window's runtime goes. Only a lead
+        // that waits for its back note waits on the daemon, never long.
+        let back = away::back(Some(other.clone()));
+        let _ = tokio::time::timeout(Duration::from_secs(2), back).await;
         // This window, as its project knows it, is closed, and where it is
         // goes on to the next.
         let mut place = None;
@@ -22713,9 +22718,9 @@ impl App {
     /// in to show `bot` there instead, leaving the main window as it is.
     fn switch_window(&mut self, bot: String) {
         // The person looks at it now: back, for it, if it was told they
-        // were away.
-        crate::away::here(Some(&bot));
+        // were away. A main window tells it as it goes, waiting for it.
         if self.options.embedded {
+            crate::away::here(Some(&bot));
             embed::open_here(&bot, std::mem::take(&mut self.land_after));
             return;
         }

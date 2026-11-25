@@ -16,7 +16,9 @@
 //! away since then. It keeps which leads it tells, and since when, in
 //! `~/.agent/sonny/away`, written before the first note: a lead the daemon
 //! did not answer for is told again the next minute, under the same request
-//! ID, until every lead answered.
+//! ID, until every lead answered, or with its back note when the person is
+//! back first. Every change to the file is made under a lock beside it, so
+//! two windows' looks, or a look and the scheduler, never undo each other.
 //!
 //! The person is back for a lead when they look at it: use its window, open
 //! it, switch to it, or write to it through `sonny acp` ([`here`]). Only that
@@ -298,6 +300,35 @@ pub fn cli() -> i32 {
     }
 }
 
+/// Change what `~/.agent/sonny/away` keeps, as one step among every
+/// Sonny's: a window's look and the scheduler each read, change and write
+/// it, and one's write never undoes another's. `change` gets what it keeps
+/// and gives what it keeps next, none to have it go.
+fn change<T>(change: impl FnOnce(Option<Away>) -> (Option<Away>, T)) -> Result<T, String> {
+    let file = away_file().ok_or("no HOME")?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file.with_extension("lock"))
+        .map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    let (next, out) = change(read_away());
+    match next {
+        Some(away) => write_away(&away)?,
+        None => match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error.to_string());
+            }
+            _ => {}
+        },
+    }
+    Ok(out)
+}
+
 async fn tell_away() -> Result<(), String> {
     if !due() {
         return Ok(());
@@ -308,47 +339,50 @@ async fn tell_away() -> Result<(), String> {
     let names: Vec<String> = (every_lead(&client).await?.iter())
         .filter_map(|lead| lead["name"].as_str().map(str::to_owned))
         .collect();
-    let kept = read_away().filter(|kept| kept.socket == socket);
-    let (tell, leads) = to_tell(kept.as_ref(), &names, since_ms);
     // Kept before the first note, with every lead in it: one the daemon
-    // took but did not answer for is told again next minute, and hears
-    // the person is back once they look at it.
-    write_away(&Away {
-        since_ms,
-        leads,
-        socket: socket.clone(),
+    // took but did not answer for is told again next minute, or, once the
+    // person looks at it, again with its back note.
+    let tell = change(|kept| {
+        let kept = kept.filter(|kept| kept.socket == socket);
+        let (tell, leads) = to_tell(kept.as_ref(), &names, since_ms);
+        let away = Away {
+            since_ms,
+            leads,
+            socket: socket.clone(),
+        };
+        (Some(away), tell)
     })?;
     let note = away_note(since_ms);
-    let id = format!("sonny-away-{since_ms}");
     let (mut told, mut failed) = (Vec::new(), None);
     for name in tell {
-        match send(&client, &name, &note, &id, "attach").await {
+        match send(&client, &name, &note, &away_id(since_ms), "attach").await {
             Ok(()) => told.push(name),
             Err(error) => failed = Some(format!("{name}: {error}")),
         }
     }
-    // Read again: a lead looked at meanwhile is gone from it.
-    let Some(mut away) = read_away().filter(|now| now.since_ms == since_ms) else {
-        return Ok(());
-    };
-    for name in told {
-        if let Some(lead) = away.leads.get_mut(&name)
-            && lead.since_ms == since_ms
-        {
-            lead.told = true;
-        }
-    }
-    // Back while they were being told: a lead not told they went has
-    // nothing to hear of it.
-    if present_ms().is_some_and(|present| present > since_ms) {
-        away.leads
-            .retain(|_, lead| lead.since_ms != since_ms || lead.told);
-    }
-    write_away(&away)?;
+    // A lead looked at meanwhile is gone from it, and stays gone.
+    change(|now| {
+        let now = now.map(|mut now| {
+            for name in &told {
+                if let Some(lead) = now.leads.get_mut(name)
+                    && lead.since_ms == since_ms
+                {
+                    lead.told = true;
+                }
+            }
+            now
+        });
+        (now, ())
+    })?;
     match failed {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// The request ID of the away note of the absence from `since_ms`.
+fn away_id(since_ms: i64) -> String {
+    format!("sonny-away-{since_ms}")
 }
 
 /// Whether `lead` heard anything since `since_ms`: a turn runs, or its
@@ -362,45 +396,51 @@ fn heard_since(lead: &Value, since_ms: i64) -> bool {
 
 /// Tell `bot`, a lead told the person went at `since_ms`, that they are
 /// back: a steer, when it heard anything since, which answers with what
-/// it kept, else attached, so it knows too. It is gone from the file then,
-/// and the file once no lead is left in it; one the daemon refuses is told
-/// with the next look.
-async fn tell_back(client: &Client, bot: &str, since_ms: i64) -> Result<(), String> {
+/// it kept, else attached, so it knows too. An away note the daemon did
+/// not answer for (`told` false) goes again first, under its request ID:
+/// a note it took counts as sent, one it did not goes now, before the back
+/// note. The lead is gone from the file then, and the file once no lead is
+/// left in it; one the daemon refuses is told with the next look.
+async fn tell_back(client: &Client, bot: &str, lead: Lead) -> Result<(), String> {
+    let since_ms = lead.since_ms;
     let listed = client
         .request("bots", json!({"name": bot, "limit": 1}))
         .await
         .map_err(|e| e.to_string())?;
-    let lead = (listed["bots"].as_array().into_iter().flatten())
+    let listed = (listed["bots"].as_array().into_iter().flatten())
         .find(|lead| lead["name"].as_str() == Some(bot));
     // Gone: no one to tell.
-    if let Some(lead) = lead {
-        let delivery = match heard_since(lead, since_ms) {
+    if let Some(listed) = listed {
+        if !lead.told {
+            send(
+                client,
+                bot,
+                &away_note(since_ms),
+                &away_id(since_ms),
+                "attach",
+            )
+            .await?;
+        }
+        let delivery = match heard_since(listed, since_ms) {
             true => "steer",
             false => "attach",
         };
         let id = format!("sonny-back-{since_ms}");
         send(client, bot, &back_note(since_ms), &id, delivery).await?;
     }
-    let Some(mut away) = read_away() else {
-        return Ok(());
-    };
-    if away
-        .leads
-        .get(bot)
-        .is_none_or(|lead| lead.since_ms != since_ms)
-    {
-        return Ok(());
-    }
-    away.leads.remove(bot);
-    match away.leads.is_empty() {
-        true => {
-            if let Some(file) = away_file() {
-                let _ = std::fs::remove_file(file);
+    change(|away| {
+        let away = away.and_then(|mut away| {
+            if away
+                .leads
+                .get(bot)
+                .is_some_and(|kept| kept.since_ms == since_ms)
+            {
+                away.leads.remove(bot);
             }
-            Ok(())
-        }
-        false => write_away(&away),
-    }
+            (!away.leads.is_empty()).then_some(away)
+        });
+        (away, ())
+    })
 }
 
 /// The person used Sonny just now, looking at `bot` when there is one:
@@ -416,24 +456,27 @@ pub fn here(bot: Option<&str>) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    let bot = bot.map(str::to_owned);
-    runtime.spawn(async move {
-        let Ok(Some((socket, bot, since_ms))) =
-            tokio::task::spawn_blocking(move || touch(bot)).await
-        else {
-            return;
-        };
-        if let Ok(client) = connect(&socket).await {
-            let _ = tell_back(&client, &bot, since_ms).await;
-        }
-    });
+    runtime.spawn(back(bot.map(str::to_owned)));
 }
 
-/// Touch the presence file; then `bot`, when it is a lead the daemon
-/// answered for its away note, with its daemon's socket and when the
-/// person went. One still being told hears they are back with the next
-/// look, after its away note.
-fn touch(bot: Option<String>) -> Option<(PathBuf, String, i64)> {
+/// What [`here`] does, to wait on: as a window that switches to `bot`
+/// does before it goes, so the note is not cut short with it.
+pub async fn back(bot: Option<String>) {
+    if cfg!(test) {
+        return;
+    }
+    let Ok(Some((socket, bot, lead))) = tokio::task::spawn_blocking(move || touch(bot)).await
+    else {
+        return;
+    };
+    if let Ok(client) = connect(&socket).await {
+        let _ = tell_back(&client, &bot, lead).await;
+    }
+}
+
+/// Touch the presence file; then `bot`, when it is a lead told the person
+/// is away, with its daemon's socket and its absence.
+fn touch(bot: Option<String>) -> Option<(PathBuf, String, Lead)> {
     let file = present_file()?;
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -448,8 +491,8 @@ fn touch(bot: Option<String>) -> Option<(PathBuf, String, i64)> {
     }
     let bot = bot?;
     let away = read_away()?;
-    let since_ms = away.leads.get(&bot).filter(|lead| lead.told)?.since_ms;
-    Some((away.socket, bot, since_ms))
+    let lead = *away.leads.get(&bot)?;
+    Some((away.socket, bot, lead))
 }
 
 #[cfg(test)]
@@ -591,6 +634,50 @@ mod tests {
         );
         let (tell, _) = to_tell(Some(&unanswered), &["shop.lead".to_owned()], AT);
         assert_eq!(tell, ["shop.lead"]);
+    }
+
+    #[test]
+    fn looks_at_once_from_many_windows_each_take_their_own_lead_off() {
+        // The one test of this file that writes it, under the tests' home.
+        let names: Vec<String> = (0..16).map(|at| format!("p{at}.lead")).collect();
+        let lead = Lead {
+            since_ms: AT,
+            told: true,
+        };
+        let away = Away {
+            since_ms: AT,
+            leads: names.iter().map(|name| (name.clone(), lead)).collect(),
+            socket: PathBuf::from("/tmp/agent.sock"),
+        };
+        change(|_| (Some(away), ())).unwrap();
+        let looks: Vec<_> = (names.iter().skip(1).cloned())
+            .map(|name| {
+                std::thread::spawn(move || {
+                    change(|away| {
+                        let mut away = away.unwrap();
+                        // Read, then written a moment later, as a window does
+                        // around its daemon's answer.
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        away.leads.remove(&name);
+                        (Some(away), ())
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        for look in looks {
+            look.join().unwrap();
+        }
+        let left = read_away().unwrap();
+        assert_eq!(left.leads.keys().collect::<Vec<_>>(), [&names[0]]);
+        // The last look takes the file with it.
+        change(|away| {
+            let mut away = away.unwrap();
+            away.leads.clear();
+            ((!away.leads.is_empty()).then_some(away), ())
+        })
+        .unwrap();
+        assert!(read_away().is_none());
     }
 
     #[test]
