@@ -18,7 +18,7 @@ jobs:
       matrix:
         include:
           - name: main
-            ref: c22724d8
+            ref: c22724d1f969ef6975eb156aaec7102d4296f0a7
           - name: fix-1296
             ref: claude/project-thread-wpfgqs-1296
           - name: fix-1295
