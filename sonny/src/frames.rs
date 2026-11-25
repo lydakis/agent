@@ -17,7 +17,10 @@
 //! names (a cell, a style, the cursor), so writing the same bytes again
 //! changes nothing on the screen: such a frame is dropped, and an idle
 //! window writes nothing. Anything written between frames (a full clear)
-//! means the next frame is written whatever it holds.
+//! means the next frame is written whatever it holds, and so does a frame
+//! that clears the screen first ([`forget`]): the terminal may have lost
+//! what the last frame showed, as one can on a pane's relayout, and a
+//! frame drawn whole again draws the very same bytes.
 
 use std::io::{Stdout, Write};
 use std::sync::{LazyLock, Mutex};
@@ -74,6 +77,12 @@ impl<W: Write> Hold<W> {
             std::mem::swap(&mut self.last, &mut self.now);
         }
         Ok(())
+    }
+
+    /// The last frame's bytes forgotten: the next frame is written
+    /// whatever it holds.
+    fn forget(&mut self) {
+        self.last.clear();
     }
 
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -206,6 +215,13 @@ impl<W: Write> ratatui::backend::Backend for Backend<W> {
     }
 }
 
+/// The screen drawn whole from the next frame on, even one byte for byte
+/// the last: called as the screen is cleared, whether the terminal lost
+/// what it showed or not.
+pub fn forget() {
+    screen().forget();
+}
+
 /// One frame drawn to the screen, everything `draw` writes through
 /// [`Screen`] held until it ends.
 pub fn frame(draw: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
@@ -274,5 +290,26 @@ mod tests {
         // As after a frame that failed.
         assert!(!failed(&mut hold, b"TAIL").is_empty());
         assert!(!drawn(&mut hold, b"TAIL").is_empty());
+    }
+
+    /// A screen cleared and drawn whole, then cleared again (the terminal
+    /// lost it, a resize said so) with nothing changed: the second frame is
+    /// the first's very bytes, and is written all the same, or the window
+    /// stays blank but for what changes after.
+    #[test]
+    fn a_frame_drawn_whole_again_is_written_though_the_same() {
+        let mut hold = Hold::new(Vec::new());
+        let whole = |hold: &mut Hold<Vec<u8>>| {
+            hold.out.clear();
+            hold.begin();
+            hold.forget();
+            hold.write(b"CLEAR ALL CELLS").unwrap();
+            hold.end(true).unwrap();
+            std::mem::take(&mut hold.out)
+        };
+        assert!(!whole(&mut hold).is_empty());
+        assert!(!whole(&mut hold).is_empty());
+        // Only drawn whole: the same diff after it still writes nothing.
+        assert_eq!(drawn(&mut hold, b"CLEAR ALL CELLS"), b"");
     }
 }

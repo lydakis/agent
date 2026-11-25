@@ -456,9 +456,13 @@ impl<B: Backend<Error = std::io::Error> + std::io::Write> Drawn for B {}
 /// it back: an answer late through a multiplexer or a slow link ends Sonny
 /// with "the cursor position could not be read", and nothing here needs
 /// the cursor kept. The window's size is read anew for it, should a
-/// resize have gone unsaid.
+/// resize have gone unsaid; and the frame that draws it whole is written
+/// even when it is the last frame's very bytes, as the terminal may have
+/// lost that frame (a pane laid out again as a lead opens in place of
+/// another, the screen cleared with the size the same).
 fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
     term::resized();
+    frames::forget();
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))
 }
@@ -6886,6 +6890,10 @@ struct App {
     /// The selected words a picture's placeholder went in place of, by its
     /// number: put back if no picture comes.
     replaced: Vec<(usize, String)>,
+    /// The path a dropped picture's placeholder stands for, by its number,
+    /// as the words it would be had it been no picture: put back in its
+    /// place if no picture comes, so a drop never leaves the composer.
+    dropped: Vec<(usize, String)>,
     /// A message sent while a picture or file it shows was still on its
     /// way, sent once all are here (with `queue`, as [`App::submit_as`]
     /// takes it): the keys go on meanwhile.
@@ -9127,6 +9135,7 @@ impl App {
             preparing: Vec::new(),
             fetching: Vec::new(),
             replaced: Vec::new(),
+            dropped: Vec::new(),
             send_waiting: None,
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
@@ -19436,7 +19445,9 @@ impl App {
                     KeyCode::Char('j') if ctrl => self.input.insert("\n"),
                     // A picture on the clipboard, as Codex and Claude Code
                     // take one: terminals paste only text.
-                    KeyCode::Char('v') if ctrl => self.prepare(attach::pasted),
+                    KeyCode::Char('v') if ctrl => {
+                        self.prepare(attach::pasted);
+                    }
                     // With nothing typed, the agent above or below in the
                     // pane's list of the project's agents. A terminal that
                     // sends alt+← as alt+b is taken at its word.
@@ -20161,6 +20172,7 @@ impl App {
         self.preparing.clear();
         self.fetching.clear();
         self.replaced.clear();
+        self.dropped.clear();
         self.send_waiting = None;
         self.quotes.clear();
     }
@@ -20792,11 +20804,12 @@ impl App {
 
     /// A picture to give with the message, made ready by `make` beside the
     /// loop (a file read, a clipboard asked, a PNG decoded and scaled): its
-    /// placeholder goes in the composer now, and the keys go on.
+    /// placeholder goes in the composer now, and the keys go on. Its
+    /// number.
     fn prepare(
         &mut self,
         make: impl FnOnce() -> Result<Option<attach::Picture>, String> + Send + 'static,
-    ) {
+    ) -> usize {
         // One picture is made at a time, in the order they came, as on the
         // key loop before: a batch of big screenshots is decoded one by
         // one, never all at once. Each waits for the one given before it,
@@ -20818,6 +20831,20 @@ impl App {
             made
         });
         self.preparing.push((number, job));
+        number
+    }
+
+    /// A dropped picture made ready as [`App::prepare`] makes one, `words`
+    /// (its path as a shell reads it) put back in place of its placeholder
+    /// should no picture come: the drop stays in the composer as the path
+    /// of a file that is no picture does.
+    fn prepare_dropped(
+        &mut self,
+        words: String,
+        make: impl FnOnce() -> Result<Option<attach::Picture>, String> + Send + 'static,
+    ) {
+        let number = self.prepare(make);
+        self.dropped.push((number, words));
     }
 
     /// The next picture's placeholder, put where the cursor is: its number.
@@ -20897,7 +20924,8 @@ impl App {
         for word in dropped {
             match word {
                 attach::Dropped::Picture(path) => {
-                    self.prepare(move || attach::load(&path).map(Some));
+                    let words = attach::shell_quoted(&path.to_string_lossy());
+                    self.prepare_dropped(words, move || attach::load(&path).map(Some));
                 }
                 attach::Dropped::Here(path) => {
                     let path = path.to_string_lossy();
@@ -20914,11 +20942,7 @@ impl App {
                     // one read here does; another file's path stands until
                     // the copy is here.
                     if handing && attach::is_picture(std::path::Path::new(&path)) {
-                        self.prepare(move || {
-                            let got = link::picture(&path);
-                            got.map(Some)
-                                .map_err(|why| format!("{}: {why}", file_name(&path)))
-                        });
+                        self.prepare_dropped(words, move || link::picture(&path).map(Some));
                         continue;
                     }
                     self.input.insert_word(&words);
@@ -20936,10 +20960,11 @@ impl App {
                     }
                     let woken = self.woken.clone();
                     let job = tokio::task::spawn_blocking(move || {
-                        let to = link::kept_as(&path).ok_or("HOME is not set")?;
+                        let to = (link::kept_as(&path))
+                            .ok_or_else(|| format!("{}: HOME is not set", file_name(&path)))?;
                         let got = link::copy(&path, &to).map(|()| to);
                         woken.notify_one();
-                        got.map_err(|why| format!("{}: {why}", file_name(&path)))
+                        got
                     });
                     self.fetching.push((words, job));
                 }
@@ -20966,11 +20991,15 @@ impl App {
 
     /// Picture `number` as it was made ready: behind its placeholder while
     /// the draft or Ctrl-Y can bring that back, or, none or past what a
-    /// message may hold, its placeholder taken out and why said.
+    /// message may hold, its placeholder taken out and why said. A dropped
+    /// one's path takes its place then, as a dropped file that is no picture
+    /// stands: what was dropped stays where it was dropped.
     fn ready(&mut self, number: usize, got: Result<Option<attach::Picture>, String>) {
         let placeholder = attach::placeholder(number);
         let replaced = (self.replaced.iter().position(|(at, _)| *at == number))
             .map(|at| self.replaced.remove(at).1);
+        let dropped = (self.dropped.iter().position(|(at, _)| *at == number))
+            .map(|at| self.dropped.remove(at).1);
         if !self.may_come_back(&placeholder)
             || !(self.pictures.get(number - 1)).is_some_and(Option::is_none)
         {
@@ -21000,15 +21029,22 @@ impl App {
             Ok(None) => "no picture on the clipboard".into(),
             Err(error) => error,
         };
-        // The words it went in place of, if any, come back.
-        let replaced = replaced.unwrap_or_default();
-        if !self.input.swap(&format!("{placeholder} "), &replaced) {
+        // A dropped file's path takes its place, else the words it went in
+        // place of, if any, come back.
+        let (replaced, spaced) = match dropped {
+            Some(words) => (words.clone(), format!("{words} ")),
+            None => (
+                replaced.clone().unwrap_or_default(),
+                replaced.unwrap_or_default(),
+            ),
+        };
+        if !self.input.swap(&format!("{placeholder} "), &spaced) {
             self.input.swap(&placeholder, &replaced);
         }
-        self.input.unkill(&placeholder, &replaced);
+        self.input.unkill(&placeholder, &spaced);
         // And in the words a picture still being read went in place of.
         for (_, words) in &mut self.replaced {
-            prompt::put_back(words, &placeholder, &replaced);
+            prompt::put_back(words, &placeholder, &spaced);
         }
         // Its number goes to the next picture, when none came after it.
         if self.pictures.len() == number {
@@ -42502,6 +42538,73 @@ mod tests {
             .await;
         assert!(app.fetching.is_empty() || link::handing());
         assert_eq!(&*app.input, "/Users/someone/elsewhere.pdf ");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A dropped picture that cannot be had (not on any machine linked
+    /// here, or no picture after all) stays in the composer as its path,
+    /// where it was dropped, and why is said: it never leaves the composer
+    /// for the status row alone. Its number goes to the next picture.
+    #[tokio::test]
+    async fn a_dropped_picture_that_cannot_be_had_stays_as_its_path() {
+        let client = daemon_answering(|_: &Value| json!({"message": 2})).await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(format!("sonny-unhad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named as a Mac names a screenshot, and no PNG inside.
+        let shot = dir.join("Screenshot 2026-11-24 at 8.10.02\u{202f}PM.png");
+        std::fs::write(&shot, b"not a png").unwrap();
+        app.workspace = dir.display().to_string();
+        app.input.insert("look at ");
+        app.key(Event::Paste(
+            "Screenshot\\ 2026-11-24\\ at\\ 8.10.02\u{202f}PM.png".into(),
+        ))
+        .await;
+        assert_eq!(&*app.input, "look at [Image #1] ");
+        app.all_ready().await;
+        let words = attach::shell_quoted(&shot.to_string_lossy());
+        assert_eq!(*app.input, format!("look at {words} "));
+        assert!(app.pictures.is_empty() && app.dropped.is_empty());
+        assert!(
+            (app.notice.as_deref()).is_some_and(|said| said.contains(&*shot.to_string_lossy())),
+            "{:?}",
+            app.notice
+        );
+        // One from another machine none here has: its path, and where it
+        // is not.
+        app.input.set("see ");
+        app.prepare_dropped("/Users/someone/Desktop/shot.png".into(), || {
+            Err("shot.png was not found on this machine or on mini".into())
+        });
+        app.input.insert("and this");
+        app.all_ready().await;
+        assert_eq!(&*app.input, "see /Users/someone/Desktop/shot.png and this");
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .starts_with("shot.png was not found")
+        );
+        // Cut with Ctrl-U before it failed, Ctrl-Y brings back its path.
+        app.input.clear();
+        app.prepare_dropped("/Users/someone/b.png".into(), || Err("b.png: gone".into()));
+        let ctrl = |c| {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        app.key(ctrl('u')).await;
+        app.all_ready().await;
+        assert!(app.input.is_empty());
+        app.key(ctrl('y')).await;
+        assert_eq!(&*app.input, "/Users/someone/b.png ");
+        // A pasted picture that fails has no path: its placeholder goes.
+        app.input.clear();
+        app.prepare(|| Ok(None));
+        app.all_ready().await;
+        assert!(app.input.is_empty());
+        assert_eq!(app.notice.as_deref(), Some("no picture on the clipboard"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
