@@ -4211,7 +4211,9 @@ impl Database {
                         CHECKPOINT_PAGES
                     };
                     asked = pages;
+                    crate::store::trace(format!("ask pages={pages} in_commit={}", crate::store::IN_COMMIT.load(std::sync::atomic::Ordering::SeqCst)));
                     ask();
+                    crate::store::trace("ask returned".into());
                 }
                 Ok(())
             }))?;
@@ -4757,7 +4759,12 @@ impl Database {
         if !self.in_group() {
             return fail("storage_group_rolled_back");
         }
-        self.conn.prepare_cached("COMMIT")?.execute([])?;
+        crate::store::IN_COMMIT.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::store::trace("commit begins".into());
+        let done = self.conn.prepare_cached("COMMIT")?.execute([]);
+        crate::store::IN_COMMIT.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::store::trace("commit returned".into());
+        done?;
         // Readers list approvals with the verdicts held now, and read again
         // the identities the group changed, before any of its jobs is
         // answered.

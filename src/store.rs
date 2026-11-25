@@ -34,6 +34,16 @@ pub use db::{
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 
+pub static IN_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static TRACE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static TRACE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+pub fn trace(line: String) {
+    let at = TRACE_START.get_or_init(std::time::Instant::now).elapsed().as_micros();
+    let thread = format!("{:?}", std::thread::current().id());
+    let mut t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    t.push_str(&format!("{at}us {thread} {line}\n"));
+}
+
 /// The WAL's checkpoints, off the writer, on the reader pool: once it is
 /// open, each of the writer's asks queues one checkpoint as a read, which
 /// the next free reader runs on its own connection, so no thread or
@@ -79,10 +89,12 @@ fn checkpoints(
                 Box::new(move |db: &Database| {
                     loop {
                         let started = std::time::Instant::now();
+                        trace(format!("checkpoint starts in_commit={}", IN_COMMIT.load(SeqCst)));
                         let found = {
                             let _running = running.lock().unwrap_or_else(|e| e.into_inner());
                             db.checkpoint()
                         };
+                        trace(format!("checkpoint ends {found:?} in_commit={}", IN_COMMIT.load(SeqCst)));
                         if let Ok((frames, copied)) = found
                             && frames >= 0
                         {
@@ -1973,7 +1985,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
             .unwrap();
-        assert!(log < 10, "the WAL went on from {log} frames");
+        assert!(log < 10, "the WAL went on from {log} frames: {}\nTRACE\n{}", store.stats(), TRACE.lock().unwrap());
     }
 
     #[tokio::test]
