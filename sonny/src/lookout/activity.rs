@@ -432,7 +432,7 @@ impl Activity {
 /// round, a golden ticket), known by their origin as an automation's run
 /// is. What the task does about one, a post or work it takes, reaches the
 /// subscriber through what it follows there.
-fn note(data: &Value) -> bool {
+pub(super) fn note(data: &Value) -> bool {
     (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
         || (data["origin"] == crate::commons::ORIGIN && data["from"]["bot"].is_null())
 }
