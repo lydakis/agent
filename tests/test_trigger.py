@@ -329,29 +329,26 @@ class TriggerFireTests(ModelFixture):
         self.assertFalse(last.exists())
 
     def test_an_ask_sends_the_request_it_sent_before_also_for_the_trigger_that_replaced_it(self):
-        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        lead = self.bot_id('p.lead')
         taking = self.home / '.agent/automations/p.task.taking'
         taking.mkdir(parents=True)
         (taking / '100.1.1').write_text('')
-        sent = self.fire('p.task', 'first', generation='g1', extra=['--reply-to', 'p.lead', '--reply-to-id', str(lead)])
-        self.assertEqual((sent['last']['outcome'], sent['last']['reply']['outcome']), ('sent', 'sent'), sent)
-        self.settle('p.lead')
+        sent = self.fire('p.task', 'first', generation='g1')
+        self.assertEqual(sent['last']['outcome'], 'sent', sent)
+        self.settle('p.task')
         turn = self.turns('p.task')[-1]
-        answers = len(self.turns('p.lead'))
         connection = Connection(str(self.store) + '.sock')
         try:
             prompt = connection.request('prompts', bot='p.task', turn=turn['turn'], bytes=65536)['result']['prompts'][0]['text']
         finally:
             connection.close()
-        # The fire was cut short once its turn and its answer went, and
-        # another definition took the name: the ask it left sends what went,
-        # and its answer where it went, under the ids they went under, which
-        # the daemon takes once; not the new message under the new generation.
+        # The fire was cut short once its turn went, and another definition
+        # took the name: the ask it left sends what went, under the id it
+        # went under, which the daemon takes once; not the new message under
+        # the new generation.
         submit = {'bot': 'p.task', 'bot_id': self.bot_id('p.task'), 'request_id': turn['request_id'],
                   'prompt': prompt, 'delivery': 'queue', 'origin': 'automation', 'budget_tokens': None}
-        kept = {'store_id': self.store_identity(), 'generation': 'g1', 'reply_to': ['p.lead', lead], 'submit': submit}
+        kept = {'store_id': self.store_identity(), 'generation': 'g1', 'submit': submit}
         (taking / '100.1.1').write_text(json.dumps(kept))
         # Cut short before it settled: the row has no result of it.
         row = self.home / '.agent/automations/p.task.json'
@@ -359,9 +356,7 @@ class TriggerFireTests(ModelFixture):
         # Its `--if` said go once already: one that would say no now is not asked.
         again = self.fire('p.task', 'second', generation='g2', extra=['--if', 'exit 1', '--dir', str(self.path)])
         self.assertEqual((again['last']['outcome'], again['last']['turn']), ('sent', turn['turn']), again)
-        self.assertEqual(again['last']['reply']['outcome'], 'sent', again)
         self.assertEqual(len(self.turns('p.task')), 2)
-        self.assertEqual(len(self.turns('p.lead')), answers)
         self.assertFalse((taking / '100.1.1').exists())
         # Cut short once it had settled: its send is not counted again.
         (taking / '100.1.1').write_text(json.dumps(kept))
@@ -375,7 +370,6 @@ class TriggerFireTests(ModelFixture):
         self.settle('p.task')
         self.assertEqual(len(self.turns('p.task')), 3)
         self.assertRegex(self.turns('p.task')[-1]['prompt_preview'], LINE.format('p.task', 'run now') + 'third$')
-        self.assertEqual(len(self.turns('p.lead')), answers)
 
     def test_a_start_trigger_makes_its_agent_once_and_messages_it_after(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
@@ -557,101 +551,6 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(made['settings']['sandbox'], 'danger-full-access', made['settings'])
         self.assertEqual(made['gates'], [])
         self.settle('p.free')
-
-    def test_an_answer_goes_to_the_reply_agent(self):
-        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
-        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        lead = self.bot_id('p.lead')
-        sent = self.fire('p.task', 'Check the PR.', extra=['--reply-to', 'p.lead', '--reply-to-id', str(lead)])
-        self.assertEqual(sent['last']['reply']['outcome'], 'sent', sent)
-        self.settle('p.lead')
-        task_turn = sent['last']['turn']
-        answer = self.turns('p.lead')[-1]
-        self.assertRegex(answer['prompt_preview'], '^' + LINE.format('p.task', f'p.task turn {task_turn} completed'))
-        # It is the task's answer, and says so in the protocol, not only in its first line.
-        connection = Connection(str(self.store) + '.sock')
-        try:
-            events = connection.request('events', bot='p.lead', after=0, limit=256)['result']['events']
-            accepted = next(e['data'] for e in events if e['event'] == 'accepted' and e['turn'] == answer['turn'])
-            self.assertEqual(accepted['from'], {'bot': 'p.task', 'turn': task_turn, 'bot_id': self.bot_id('p.task')})
-            self.assertNotIn('origin', accepted)
-            # The task's own turn names where its answer goes.
-            self.assertEqual(self.turns('p.task')[-1]['request_id'].rsplit('.to.', 1)[1], str(lead))
-        finally:
-            connection.close()
-
-    def test_a_fire_withdrawn_in_line_tells_the_reply_agent_without_naming_a_turn(self):
-        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
-        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        lead = self.bot_id('p.lead')
-        connection = Connection(str(self.store) + '.sock')
-        try:
-            # Busy, the task takes the fire's message in line, where it is
-            # withdrawn.
-            busy = connection.request('submit', bot='p.task', request_id='busy', prompt='slow')['result']
-            fire = self.fire('p.task', 'Check the PR.', wait=False,
-                             extra=['--reply-to', 'p.lead', '--reply-to-id', str(lead)])
-            deadline = time.monotonic() + 30
-            while not (waiting := [m for m in self.messages('p.task') if m['status'] in ('queued', 'ready')]):
-                self.assertLess(time.monotonic(), deadline, 'the fire never reached the daemon')
-                time.sleep(.1)
-            withdrawn = waiting[0]['message']
-            self.assertIn('result', connection.request('interrupt', bot='p.task', turn=withdrawn))
-            self.assertEqual(fire.wait(timeout=60), 0)
-            self.agent('wait', '--store', str(self.store), busy['handle'])
-            last = json.loads((self.home / '.agent/automations/p.task.json').read_text())['last']
-            self.assertEqual(last['reply']['outcome'], 'sent', last)
-            self.settle('p.lead')
-            # It ran in no turn, so the note names none; its words say how
-            # it ended.
-            events = connection.request('events', bot='p.lead', after=0, limit=256)['result']['events']
-            told = [e['data'] for e in events if e['event'] == 'accepted'][-1]
-            self.assertNotIn('from', told)
-            self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
-                             '^' + LINE.format('p.task', f'p.task turn {withdrawn} withdrawn'))
-        finally:
-            connection.close()
-
-    def test_a_shadow_fire_reports_from_a_read_only_copy_that_then_goes(self):
-        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
-        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        lead = self.bot_id('p.lead')
-        sent = self.fire('p.task', 'Post the digest.',
-                         extra=['--shadow', '1', '--reply-to', 'p.lead', '--reply-to-id', str(lead)])
-        last = sent['last']
-        self.assertEqual((last['outcome'], last['reply']['outcome']), ('sent', 'sent'), sent)
-        copy = last['shadow']
-        self.assertRegex(copy, r'^p\.task\.shadow-[0-9a-f]{1,6}$')
-        self.assertEqual(last['handle'], f'{copy}/{last["turn"]}')
-        # The agent it copies did nothing; the copy is gone once its report went.
-        self.assertEqual(len(self.turns('p.task')), 1)
-        names = [b['name'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)]
-        self.assertNotIn(copy, names)
-        self.settle('p.lead')
-        report = self.turns('p.lead')[-1]
-        self.assertRegex(report['prompt_preview'], '^' + LINE.format(
-            'p.task', 'shadow run of p.task completed: a read-only copy, so nothing past reading was done'))
-
-    def test_a_start_shadow_makes_its_agent_sending_it_nothing_and_copies_it(self):
-        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
-        lead = self.bot_id('p.lead')
-        work = self.path / 'work'
-        work.mkdir()
-        target = ['--start', 'p.review', '--model', 'openai/synthetic-model', '--by', 'p.lead', '--by-id', str(lead)]
-        env = {'AGENT_PROVIDER': f'openai=responses,{self.url}'}
-        sent = self.fire('p.review', 'Review the newest commit.', target=target,
-                         extra=['--dir', str(work), '--shadow', '1'], app=self.bundle(), env=env)
-        last = sent['last']
-        self.assertEqual((last['outcome'], last['reply']['outcome']), ('sent', 'sent'), sent)
-        self.assertRegex(last['shadow'], r'^p\.review\.shadow-[0-9a-f]{1,6}$')
-        # The agent is made as its first fire would make it, and sent nothing:
-        # the copy is a fork of it, with the tools and expiry every copy has.
-        self.assertEqual(sent['started_id'], self.bot_id('p.review'))
-        self.assertEqual(self.turns('p.review'), [])
-        names = [b['name'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)]
-        self.assertNotIn(last['shadow'], names)
-        self.settle('p.lead')
-        self.assertIn('shadow run of p.review completed', self.turns('p.lead')[-1]['prompt_preview'])
 
     def test_a_trigger_at_its_run_limit_sends_nothing_more(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

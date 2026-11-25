@@ -52,8 +52,6 @@ pub struct Item {
     /// What came of it: a trigger's sends and last fire; whether a
     /// subscription is Sonny's own.
     pub facts: Vec<String>,
-    /// Who gets a trigger's answers, when not the agent it messages.
-    pub reply_to: Option<String>,
     /// Sonny's own: a lead's `tasks` subscription. Never counted, never
     /// removed.
     pub own: bool,
@@ -146,7 +144,6 @@ pub fn read(
                     true => vec!["Sonny's own, for the lead's tasks".into()],
                     false => Vec::new(),
                 },
-                reply_to: None,
                 own,
                 failed,
                 handle: None,
@@ -430,7 +427,6 @@ fn unscheduled(cleanup: Option<(String, i64)>) -> Option<Item> {
             format!("tried {}", ago(tried)),
             "Sonny tries again at its next start".into(),
         ],
-        reply_to: None,
         own: false,
         failed: Some(first_line(&why)),
         episode: None,
@@ -474,7 +470,6 @@ fn servers(view: &Value) -> Vec<Item> {
                 when: String::new(),
                 what: String::new(),
                 facts,
-                reply_to: None,
                 own: false,
                 failed: Some(match why.is_empty() {
                     true => "could not be read".into(),
@@ -574,14 +569,6 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         if outcome == "failed" && failed.is_none() {
             failed = Some("failed".into());
         }
-        // Its turn went well and its answer did not reach `--reply-to`.
-        if last["reply"]["outcome"] == "failed" && failed.is_none() {
-            facts.push("its answer was not passed on".into());
-            failed = Some(match last["reply"]["detail"].as_str() {
-                Some(detail) if !detail.is_empty() => detail_line(detail),
-                _ => "its answer was not passed on".into(),
-            });
-        }
     }
     // What its `--if` said last: checked and nothing new is a healthy
     // quiet; could not check is a failure until a check answers again.
@@ -633,7 +620,6 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         when: text("when"),
         what: first_line(&text("message")),
         facts,
-        reply_to: row["reply_to"].as_str().map(str::to_owned),
         own: false,
         failed,
         handle: trigger::sent(row),
@@ -2250,12 +2236,6 @@ impl View {
             if item.own {
                 about.push(vec![("Sonny's own".into(), None)]);
             }
-            if let Some(to) = item.reply_to.as_ref().filter(|to| **to != item.bot) {
-                about.push(vec![
-                    ("answers go to ".into(), None),
-                    (short(to), Some(to.clone())),
-                ]);
-            }
             if let Some(why) = page_alert(&item) {
                 body.extend(crate::transcript::wrap(
                     Line::from(vec![Span::raw("✗ ").fg(Color::Red), Span::raw(why)]),
@@ -2726,10 +2706,7 @@ impl View {
         // The agent its run went to: the run whose turn it sent, where
         // each run starts its own; none where it sent no turn.
         let run = &row["run"];
-        // A shadow run went to a copy, gone once its report is passed on:
-        // said in words, no link.
-        let shadow = last["shadow"].is_string();
-        let bot = (last["handle"].as_str().filter(|_| !shadow)).map(|handle| {
+        let bot = last["handle"].as_str().map(|handle| {
             (["running", "finished", "failed"].iter())
                 .map(|key| &run[key])
                 .find(|run| run["handle"].as_str() == Some(handle))
@@ -2746,20 +2723,12 @@ impl View {
             (Some(outcome), _) => Some(outcome.to_owned()),
             (None, _) => None,
         };
-        let ended = match last["reply"]["outcome"] == "failed" {
-            true => Some("its answer was not passed on".to_owned()),
-            false => ended,
-        };
         let when = ago(now_ms().saturating_sub(fired) / 1000);
         let mut spans = match &bot {
             Some(bot) => vec![
                 Span::raw(format!("{when} in ")),
                 Span::raw(self.scope.short(bot)).fg(Color::Blue),
             ],
-            None if shadow => vec![Span::raw(format!(
-                "{when} in a copy of {}",
-                self.scope.short(&item.bot)
-            ))],
             None => vec![Span::raw(when)],
         };
         if let Some(ended) = ended {
@@ -2857,7 +2826,6 @@ impl View {
     /// with and its bot. This window's own is plain words.
     fn item_names(&self, item: &Item) -> Vec<(String, String)> {
         let mut bots = vec![item.bot.clone()];
-        bots.extend(item.reply_to.clone());
         bots.extend(
             item.reminder
                 .as_ref()
@@ -2938,10 +2906,7 @@ impl View {
                 Span::raw(INDENT),
             ));
         }
-        let mut facts = item.facts.clone();
-        if let Some(to) = item.reply_to.as_ref().filter(|to| **to != item.bot) {
-            facts.push(format!("answers go to {}", self.scope.short(to)));
-        }
+        let facts = &item.facts;
         if !facts.is_empty() {
             out.extend(undotted(crate::transcript::wrap(
                 Line::from(facts.join(" · ")).dim(),
@@ -3430,7 +3395,6 @@ pub(crate) mod tests {
             when: "every 1d".into(),
             what: "Read preferences.md".into(),
             facts: vec!["sent 2".into()],
-            reply_to: None,
             own,
             failed: None,
             handle: None,
@@ -4216,7 +4180,7 @@ pub(crate) mod tests {
     fn an_automations_page_says_when_it_runs_next_and_how_its_last_run_went() {
         let now = now_ms();
         let row = json!({"name": "nightly", "when": "cron 0 3 * * *", "bot": "calc.lead",
-            "bot_id": 1, "start": null, "by": null, "reply_to": null,
+            "bot_id": 1, "start": null, "by": null,
             "if": "git -C /nowhere/calc log --since=1.day --oneline | grep -q .",
             "checked": {"gate": "no", "checked_ms": now - 120_000},
             "runs": 5, "sent": 2, "until": "2026-12-01 09:00", "turn_budget_tokens": 90000,
@@ -4310,16 +4274,6 @@ pub(crate) mod tests {
         view.items[0].failed = None;
         let page = page_text(&mut view, 80);
         assert!(page.iter().all(|line| !line.contains("check")), "{page:?}");
-        // A shadow run went to a copy: said in words, with no link.
-        view.items[0].row["sent"] = json!(1);
-        view.items[0].row["last"] = json!({"outcome": "sent", "fired_ms": now - 60_000,
-            "handle": "calc.lead-shadow-1/1", "shadow": "calc.lead-shadow-1",
-            "turn_status": "completed"});
-        let page = page_text(&mut view, 80);
-        let at = page.iter().position(|l| l.starts_with("last")).unwrap();
-        assert_eq!(page[at], "last  1m ago in a copy of lead");
-        let links = &view.page.as_ref().unwrap().links;
-        assert!(links.iter().all(|link| link.0 != at), "{links:?}");
     }
 
     #[test]
@@ -4327,13 +4281,12 @@ pub(crate) mod tests {
         let now = now_ms();
         let row = json!({"name": "pushcheck", "when": "commit /nowhere/calc", "bot": "calc.pushcheck",
             "bot_id": null, "start": {"model": "demo/scripted", "effort": null, "fresh": true},
-            "by": "calc.lead", "reply_to": "calc.lead", "sent": 1,
+            "by": "calc.lead", "sent": 1,
             "message": "Check what was pushed.",
             "run": {"running": {"n": 1, "bot": "calc.pushcheck-1", "id": 4, "handle": "h"}},
             "last": {"outcome": "sent", "fired_ms": now - 25_000, "handle": "h"}});
         let item = Item {
             row: row.clone(),
-            reply_to: Some("calc.lead".into()),
             message: "Check what was pushed.".into(),
             ..item(Kind::Trigger, "pushcheck", &["calc.pushcheck"], false)
         };
@@ -4345,7 +4298,7 @@ pub(crate) mod tests {
         let page = page_text(&mut view, 80);
         assert_eq!(
             page[1],
-            "starts pushcheck each run · Scripted · added by lead · answers go to lead"
+            "starts pushcheck each run · Scripted · added by lead"
         );
         assert_eq!(page[3], "when  a commit lands in /nowhere/calc");
         assert_eq!(page[4], "last  25s ago in pushcheck-1 · working");
@@ -4355,7 +4308,6 @@ pub(crate) mod tests {
         assert_eq!(
             targets,
             [
-                Target::Agent("calc.lead".into()),
                 Target::Agent("calc.lead".into()),
                 Target::Agent("calc.pushcheck-1".into()),
             ]
@@ -4605,13 +4557,12 @@ pub(crate) mod tests {
         let fired = now_ms() - 3 * 3600 * 1000;
         let row = json!({"name": "nightly", "when": "cron 0 8 * * *", "bot": "calc.lead",
             "message": "Read the inbox\nthen post", "sent": 4, "runs": 10,
-            "reply_to": "calc.lead", "if": null,
+            "if": null,
             "last": {"outcome": "failed", "fired_ms": fired, "detail": "bot_busy: it works"}});
         let item = trigger_item(&row, vec!["calc.lead".into()]);
         assert_eq!(item.what, "Read the inbox…");
         assert_eq!(item.facts, ["sent 4 of 10", "last failed 3h ago"]);
         assert_eq!(item.failed.as_deref(), Some("busy: it works"));
-        assert_eq!(item.reply_to.as_deref(), Some("calc.lead"));
         // A later fire that failed the same way, sending no turn, is news.
         let mut later = row.clone();
         later["last"]["fired_ms"] = json!(fired + 86_400_000);
@@ -4908,14 +4859,6 @@ pub(crate) mod tests {
         assert_eq!(stopped.failed, None);
         assert_eq!(stopped.facts[2], "its turn interrupted");
         assert_eq!(ended("h3").failed, None);
-        // Its answer did not reach the agent it was for.
-        let mut lost = row("h3");
-        lost["reply_to"] = json!("calc.lead");
-        lost["last"]["reply"] = json!({"outcome": "failed", "detail": "bot_not_found: calc.lead"});
-        trigger::with_turn(&mut lost, &turns);
-        let lost = trigger_item(&lost, vec!["memory-cleanup".into()]);
-        assert_eq!(lost.failed.as_deref(), Some("agent not found: calc.lead"));
-        assert_eq!(lost.facts[2], "its answer was not passed on");
         // Not asked yet: the window asks the daemon for it.
         let running = ended("h4");
         assert_eq!(running.failed, None);
@@ -5062,7 +5005,7 @@ pub(crate) mod tests {
     #[test]
     fn every_agent_a_lists_row_names_opens_it() {
         let row = json!({"name": "deploy", "bot": "calc.fix", "when": trigger::ON_DEMAND,
-            "message": "Ship it.", "sent": 0, "last": null, "reply_to": "calc.lead"});
+            "message": "Ship it.", "sent": 0, "last": null});
         let mut view = view_of(
             std::env::temp_dir().join("background-links.sqlite"),
             vec![trigger_item(&row, vec!["calc.fix".into()])],
@@ -5090,10 +5033,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             named,
-            [
-                ("fix".to_owned(), "calc.fix".to_owned()),
-                ("lead".to_owned(), "calc.lead".to_owned())
-            ],
+            [("fix".to_owned(), "calc.fix".to_owned())],
             "{card:#?}"
         );
         // Drawn as a link is, in the agents' color, the row picked too.

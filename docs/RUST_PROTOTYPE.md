@@ -2170,8 +2170,8 @@ one fails to parse). The fork and the message commit in one store job, or
 neither does: a message the store refuses leaves no fork. The reply is the
 fork's, with the message's answer under `submitted`, and it is answered in
 request order as any submission is. A resend with the same keys answers both
-as duplicates. A copy asked one thing at once (Sonny's suggestion, reviewer
-and shadow runs) costs one commit and one round trip fewer than `fork` then
+as duplicates. A copy asked one thing at once (Sonny's suggestion and
+reviewer runs) costs one commit and one round trip fewer than `fork` then
 `submit`.
 
 Submission is idempotent on `(bot, request_id)`. An identical retry returns the
