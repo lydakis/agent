@@ -136,7 +136,7 @@ as the lookout reads it, and the notes that woke the lead about one. `blind` add
 | Z1 | every run of the task's automation ends with an empty reply (`automation.md`) |
 | Z2 | no note about one of those runs reaches the lead (`automation.md`) |
 | Z3 | the lead says nothing failed and the check comes off (calls count) |
-| Z4 | no run of the task's automation calls a tool after the one that ran the tests (`automation.md`) |
+| Z4 | no run of the task's automation calls a tool after the one that ran the tests, read by hand (`automation.md`) |
 
 Also note how many runs fired: fewer than two tested little.
 
@@ -241,8 +241,8 @@ it ships) is n/a.
 | | | fix/session is still on origin |
 | quiet-automation | tasks | the automation ran at least twice |
 | | | every run ends with an empty reply |
-| | | every run runs the tests |
-| | | no run calls a tool after its tests |
+| | | every run runs a command |
+| | | no run calls a tool after its last command |
 | | | no note about a run reaches the lead |
 | | | the check comes off |
 | spawn-review | spawn_agent | hands the review to another agent, by either tool |
@@ -280,9 +280,12 @@ person for: noise needs no work, and an empty reply ends the turn.
 two minutes with an automation of its own while they pass. Every run should
 end with an empty reply right after the tests, as task.md says, so no note
 reaches the lead. A run's calls come from the trail (`automation.json`,
-beside `automation.md`): each run must run the tests, by a `shell` command or
-an `exec` script whose words do (a plan step that names them is not one),
-and calls after its last such call count against it.
+beside `automation.md`). A run's work is what it runs, by `shell` or an
+`exec` script: each run must run something, and any call after its last
+one, such as closing itself or a plan step, counts against it. Reading a
+command's words for the tests missed wrapper scripts and matched names (a
+task called test-watch), so the check does not try. It does not catch a run
+that loops on commands that do nothing; Z4 is read by hand.
 
 `recover-context` tells the lead's model its context holds 55,000 tokens
 (`[context_windows]` in the run's config), gives it a codename and a

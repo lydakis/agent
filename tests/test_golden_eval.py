@@ -110,25 +110,25 @@ class ScoreTests(unittest.TestCase):
                            [row('start_task'), tests(5), tests(9)], files=files)
             self.assertEqual(set(self.score('quiet-automation', good).values()), {True})
         with tempfile.TemporaryDirectory() as tmp:
-            # The second run kept calling after its tests, a plan step that
-            # names them, and the first said something, which reached the lead.
+            # The second run closed itself after its tests, and the first
+            # said something, which reached the lead.
             said = [dict(runs[0], reply='All tests pass.'), runs[1]]
             loud = run_dir(tmp, [part('person', 'Started shop.watch.'),
                                  {**part('note'), 'start': 'shop.watch replied to automation, completed: All'}],
-                           [tests(5), tests(9), row('update_plan', bot='shop.watch', turn=9, preview='Run tests')],
+                           [tests(5), tests(9), row('close_agent', bot='shop.watch', turn=9, preview='{"name": "shop.test-watch"}')],
                            files={**files, 'automation.json': json.dumps(said)})
             checks = self.score('quiet-automation', loud)
             self.assertTrue(checks['the automation ran at least twice'])
             self.assertFalse(checks['every run ends with an empty reply'])
-            self.assertFalse(checks['no run calls a tool after its tests'])
+            self.assertFalse(checks['no run calls a tool after its last command'])
             self.assertFalse(checks['no note about a run reaches the lead'])
         with tempfile.TemporaryDirectory() as tmp:
-            # Two quiet runs that never ran the tests did not do the work.
+            # Two quiet runs that ran nothing did not do the work.
             idle = run_dir(tmp, [part('person', 'Started shop.watch.'), part('person', 'Nothing failed.')],
                            [row('start_task')], files=files)
             checks = self.score('quiet-automation', idle)
             self.assertTrue(checks['every run ends with an empty reply'])
-            self.assertFalse(checks['every run runs the tests'])
+            self.assertFalse(checks['every run runs a command'])
         with tempfile.TemporaryDirectory() as tmp:
             # No run at all tested nothing.
             none = run_dir(tmp, [part('person', 'Started shop.watch.')], files={'automation.json': '[]'})

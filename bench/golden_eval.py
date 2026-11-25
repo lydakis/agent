@@ -114,10 +114,10 @@ EDITS = {'write', 'edit', 'apply_patch'}
 SHELL_WRITES = (r"sed\s+-i|perl\s+-pi|\btee\b|>>?\s*['\"]?[\w./-]+\.py\b|write_text|"
                 r"open\([^)]*['\"][wa]['\"]|git\s+apply|\bpatch\s+-")
 SKILL = re.compile(r'skills/([A-Za-z0-9_.-]+)/SKILL\.md')
-# A call that runs the repository's tests: a command or a code-mode script
-# (the tools that run things), by its words.
+# The tools that run things: a command, or a code-mode script. An
+# automation's work is what these run; reading their words for the tests
+# misses wrapper scripts and matches names (a task called test-watch).
 RUNNERS = {'shell', 'exec'}
-TESTS = r"unittest|pytest|\btests?\b"
 
 NOISE = [
     ('chat', 'sam', 'lunch order closes at 11:30, add yourself to the sheet'),
@@ -270,10 +270,13 @@ CASES = [
          check('the automation ran at least twice', lambda v: len(v.automation_runs()) >= 2),
          check('every run ends with an empty reply',
                lambda v: bool(v.automation_runs()) and not any(r['reply'] for r in v.automation_runs())),
-         # A run that skips the tests did not do its work, quiet or not.
-         check('every run runs the tests',
-               lambda v: bool(v.automation_runs()) and all(map(v.ran_tests, v.automation_runs()))),
-         check('no run calls a tool after its tests', lambda v: not any(map(v.after_tests, v.automation_runs()))),
+         # A run that runs nothing did not do its work, quiet or not.
+         check('every run runs a command',
+               lambda v: bool(v.automation_runs()) and all(map(v.ran_command, v.automation_runs()))),
+         # Its work done, it ends with its reply: a call after its last
+         # command, such as closing itself or a plan step, is one too many.
+         check('no run calls a tool after its last command',
+               lambda v: not any(map(v.after_work, v.automation_runs()))),
          check('no note about a run reaches the lead', lambda v: not v.automation_notes()),
          check('the check comes off', lambda v: v.automations_left() == []),
      ]},
@@ -487,15 +490,15 @@ class View:
         """An automation's run's calls, by the trail, steps included."""
         return [r for r in self.rows if (r['bot'], r['turn']) == (run['bot'], run['turn'])]
 
-    def ran_tests(self, run):
-        """Whether an automation's run made a call that ran the tests."""
-        return any(map(runs_tests, self.run_calls(run)))
+    def ran_command(self, run):
+        """Whether an automation's run ran a command or script."""
+        return any(r['tool'] in RUNNERS for r in self.run_calls(run))
 
-    def after_tests(self, run):
-        """The calls an automation's run made after its last that ran the
-        tests; all of them when none did."""
+    def after_work(self, run):
+        """The calls an automation's run made after its last command or
+        script; all of them when it ran none."""
         calls = self.run_calls(run)
-        ran = [i for i, r in enumerate(calls) if runs_tests(r)]
+        ran = [i for i, r in enumerate(calls) if r['tool'] in RUNNERS]
         return calls[ran[-1] + 1:] if ran else calls
 
     def answer(self):
@@ -703,12 +706,6 @@ class View:
         if not folder.is_dir():
             return ''
         return '\n'.join(p.read_text(errors='replace') for p in sorted(folder.rglob('*.md')) if p.is_file())
-
-
-def runs_tests(row):
-    """Whether a trail row ran the tests: a command or script whose words
-    do, not any call that names them, such as a plan's step."""
-    return row['tool'] in RUNNERS and bool(re.search(TESTS, row['preview'] or ''))
 
 
 def read_by(read, row):
