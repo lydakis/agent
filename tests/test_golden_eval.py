@@ -35,8 +35,8 @@ def run_dir(tmp, parts, audit=(), main=None, suite=True, origin=('refs/heads/mai
 
 
 class CaseTests(unittest.TestCase):
-    def test_twelve_cases_over_every_area_and_every_check_in_the_docs(self):
-        self.assertEqual(len(golden_eval.CASES), 12)
+    def test_thirteen_cases_over_every_area_and_every_check_in_the_docs(self):
+        self.assertEqual(len(golden_eval.CASES), 13)
         self.assertEqual({c['area'] for c in golden_eval.CASES},
                          {'lead', 'coding', 'tasks', 'lookout', 'spawn_agent', 'history', 'recovery', 'skills'})
         doc = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
@@ -93,6 +93,41 @@ class ScoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             loud = run_dir(tmp, [part('person', 'Subscribed.'), part('note', 'Lunch closes at 11:30.')])
             self.assertFalse(self.score('lookout-quiet', loud)['says nothing about noise'])
+        with tempfile.TemporaryDirectory() as tmp:
+            # Quiet, but it kept calling before its empty reply.
+            busy = run_dir(tmp, [part('person', 'Subscribed.'), part('note', calls=[('update_plan', {})])])
+            checks = self.score('lookout-quiet', busy)
+            self.assertTrue(checks['says nothing about noise'])
+            self.assertFalse(checks['calls no tool in a turn a note started'])
+
+    def test_a_quiet_automation_run_ends_empty_right_after_its_tests(self):
+        runs = [{'bot': 'shop.watch', 'turn': 5, 'status': 'completed', 'reply': ''},
+                {'bot': 'shop.watch', 'turn': 9, 'status': 'completed', 'reply': ''}]
+        tests = lambda turn: row('shell', bot='shop.watch', turn=turn, preview='python3 -m unittest -q')
+        files = {'automation.json': json.dumps(runs), 'automations.json': json.dumps({'automations': []})}
+        with tempfile.TemporaryDirectory() as tmp:
+            good = run_dir(tmp, [part('person', 'Started shop.watch.'), part('person', 'Nothing failed.')],
+                           [row('start_task'), tests(5), tests(9)], files=files)
+            self.assertEqual(set(self.score('quiet-automation', good).values()), {True})
+        with tempfile.TemporaryDirectory() as tmp:
+            # The second run kept calling after its tests, and the first
+            # said something, which reached the lead.
+            said = [dict(runs[0], reply='All tests pass.'), runs[1]]
+            loud = run_dir(tmp, [part('person', 'Started shop.watch.'),
+                                 {**part('note'), 'start': 'shop.watch replied to automation, completed: All'}],
+                           [tests(5), tests(9), row('update_plan', bot='shop.watch', turn=9)],
+                           files={**files, 'automation.json': json.dumps(said)})
+            checks = self.score('quiet-automation', loud)
+            self.assertTrue(checks['the automation ran at least twice'])
+            self.assertFalse(checks['every run ends with an empty reply'])
+            self.assertFalse(checks['no run calls a tool after its tests'])
+            self.assertFalse(checks['no note about a run reaches the lead'])
+        with tempfile.TemporaryDirectory() as tmp:
+            # No run at all tested nothing.
+            none = run_dir(tmp, [part('person', 'Started shop.watch.')], files={'automation.json': '[]'})
+            checks = self.score('quiet-automation', none)
+            self.assertFalse(checks['the automation ran at least twice'])
+            self.assertFalse(checks['every run ends with an empty reply'])
 
     def test_relevant_news_is_read_only_in_turns_a_note_started(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -374,12 +409,13 @@ class UsageTests(unittest.TestCase):
                 {'event': 'usage', 'bot': 'shop.lead', 'data': {'input_tokens': 100}},
                 {'event': 'usage', 'bot': 'shop.lead', 'data': {'input_tokens': 900, 'purpose': 'compaction'}},
                 {'event': 'usage', 'bot': 'shop.fix', 'data': {'input_tokens': 40, 'purpose': 'compaction'}}])
-            view = run_dir(tmp, [part('person', 'ok'), part('note'), part('note', 'the freeze moved')], [
+            view = run_dir(tmp, [part('person', 'ok'), part('note', calls=[('history', {})]),
+                                 part('note', 'the freeze moved')], [
                 row('shell', approved='person'), row('shell', bot='shop.fix', approved='person'),
                 row('shell', bot='shop.fix', approved='sandbox')], files={'events.jsonl': events})
             used = golden_eval.usage(view)
             self.assertEqual((used['lead']['approvals'], used['others']['approvals']), (1, 1))
-            self.assertEqual((used['note turns'], used['note replies']), (2, 1))
+            self.assertEqual((used['note turns'], used['note replies'], used['note calls']), (2, 1, 1))
             self.assertEqual((used['lead']['aside rounds'], used['lead']['aside input tokens']), (1, 900))
             self.assertEqual((used['lead']['rounds'], used['others']['aside rounds']), (2, 1))
 
