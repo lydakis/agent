@@ -3,7 +3,7 @@
 //! `follows` tool edits; the lookout reads them again every few
 //! seconds. The lookout watches for whoever has a file and knows no leads:
 //! Sonny writes a lead's `tasks` subscription when it opens the lead's
-//! project (`lead`, `ensure`).
+//! project (`lead`, `ensure`), and it lasts while the lead is closed.
 use agent_client::config::{COMMONS_SOURCE, LINKS_SOURCE, MEMORY_SOURCE};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -43,8 +43,9 @@ pub struct Sub {
     /// added again under the name starts afresh.
     pub made: Option<u64>,
     /// Whether it lasts while its bot is closed, as what posting in a
-    /// commons thread subscribes does: a closed bot still is, and can
-    /// still take part there. Sonny sets it; a `follows` add cannot.
+    /// commons thread subscribes does, and a lead's `tasks`: a closed bot
+    /// still is, and can still take part there or hear its tasks. Sonny
+    /// sets it; a `follows` add cannot.
     pub outlives_close: bool,
     /// How long it may hear nothing before a note says so, as `15m`: once
     /// that span passes with nothing heard, its subscriber is told, once,
@@ -62,7 +63,9 @@ impl Sub {
     /// What Sonny subscribes a lead to: every bot it or its tasks made;
     /// and for the folder's first lead, `{project}.lead`, every bot named in
     /// the project's way too, so a bot no agent made reaches a lead. Another
-    /// lead of the folder hears its own tasks only, never the others'.
+    /// lead of the folder hears its own tasks only, never the others'. It
+    /// lasts while the lead is closed: a lead whose tasks still work is not
+    /// done, and what they do opens it again (George, 11-25).
     pub fn lead(lead: &str, project: &str) -> Sub {
         let first = lead == format!("{project}.lead");
         Sub {
@@ -80,7 +83,7 @@ impl Sub {
             until: None,
             runs: None,
             made: None,
-            outlives_close: false,
+            outlives_close: true,
             quiet: None,
             about: None,
         }
@@ -377,6 +380,29 @@ pub fn commons_outlive_close(store: &Path) {
     });
 }
 
+/// A lead's `tasks` follow outlives a close (after 0.10.6): one written
+/// before is marked so.
+pub const LEAD_TASKS_OUTLIVE_CLOSE: &str = "lookout-lead-tasks-outlive-close";
+
+/// Each lead's `tasks` follow, as [`Sub::lead`] writes it for the lead
+/// whose file holds it, marked `outlives_close`, once for the store. Going
+/// back, an older Sonny reads the mark as written and keeps the follow
+/// through a close, as this one does.
+pub fn lead_tasks_outlive_close(store: &Path) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    crate::upgrade::once(Path::new(&record), LEAD_TASKS_OUTLIVE_CLOSE, || {
+        files_changed_of(store, |subscriber, sub| {
+            let tasks = sub["name"] == "tasks" && sub["tasks_of"] == json!([subscriber]);
+            if tasks && sub["outlives_close"] != true {
+                sub["outlives_close"] = json!(true);
+                return true;
+            }
+            false
+        })
+    });
+}
+
 /// Goals are gone (0.9.0): what the lookout kept of them goes with them.
 pub const GOALS_GONE: &str = "lookout-goals-gone";
 
@@ -413,6 +439,12 @@ fn files_renamed(store: &Path, from: &str, to: &str) -> bool {
 /// Every subscription file beside `store` with `change` made to each of
 /// its subscriptions, written when it changed one: whether each was.
 pub(crate) fn files_changed(store: &Path, change: impl Fn(&mut Value) -> bool) -> bool {
+    files_changed_of(store, |_, sub| change(sub))
+}
+
+/// [`files_changed`], with `change` told whose file each subscription is
+/// in, by the subscriber's name.
+fn files_changed_of(store: &Path, change: impl Fn(&str, &mut Value) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir(store)) else {
         return true;
     };
@@ -432,9 +464,10 @@ pub(crate) fn files_changed(store: &Path, change: impl Fn(&mut Value) -> bool) -
         let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        let subscriber = (path.file_stem()).map_or(String::new(), |s| s.to_string_lossy().into());
         let mut moved = false;
         for sub in (value["subscriptions"].as_array_mut().into_iter()).flatten() {
-            moved |= change(sub);
+            moved |= change(&subscriber, sub);
         }
         if moved {
             let partial = path.with_extension(format!("json.{}.partial", std::process::id()));
@@ -2063,6 +2096,58 @@ mod tests {
     }
 
     #[test]
+    fn a_lead_s_tasks_follow_outlives_a_close_once_marked() {
+        let store = std::env::temp_dir().join(format!("sonny-lead-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        std::fs::create_dir_all(dir(&store)).unwrap();
+        // As an older Sonny wrote them, one the person changed among them.
+        let lead = json!({"subscriptions": [
+            {"name": "tasks", "tasks_of": ["shop.lead"], "agents": ["shop.*"]},
+            {"name": "ci", "sources": ["ci"]}]});
+        let other = json!({"subscriptions": [
+            {"name": "tasks", "tasks_of": ["shop.lead.billing"], "digest": "5m"}]});
+        // A follow by that name of another's tasks is not a lead's own.
+        let task = json!({"subscriptions": [
+            {"name": "tasks", "tasks_of": ["shop.lead"], "bot_id": 4}]});
+        std::fs::write(file(&store, "shop.lead"), lead.to_string()).unwrap();
+        std::fs::write(file(&store, "shop.lead.billing"), other.to_string()).unwrap();
+        std::fs::write(file(&store, "shop.fix"), task.to_string()).unwrap();
+        lead_tasks_outlive_close(&store);
+        let kept = |bot: &str| -> Vec<String> {
+            (read(&store, bot).into_iter())
+                .filter(|sub| sub.outlives_close)
+                .map(|sub| sub.name)
+                .collect()
+        };
+        assert_eq!(kept("shop.lead"), ["tasks"]);
+        assert_eq!(kept("shop.lead.billing"), ["tasks"]);
+        assert!(kept("shop.fix").is_empty());
+        // What the person set stays as it was.
+        assert_eq!(
+            read(&store, "shop.lead.billing")[0].digest.as_deref(),
+            Some("5m")
+        );
+        // As Sonny writes it now, for every lead of the folder.
+        for (lead, project) in [("shop.lead", "shop"), ("shop.lead.billing", "shop")] {
+            assert!(
+                Sub::from_json(&Sub::lead(lead, project).to_json())
+                    .unwrap()
+                    .outlives_close
+            );
+        }
+        // Closed, the lead keeps its tasks and loses the rest.
+        assert_eq!(closed(&store, "shop.lead", Some(1)), Ok(1));
+        let names: Vec<String> = (read(&store, "shop.lead").into_iter())
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["tasks"]);
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(record);
+    }
+
+    #[test]
     fn what_posting_in_the_commons_subscribed_outlives_a_close_once_marked() {
         let store = std::env::temp_dir().join(format!("sonny-outlive-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir(&store));
@@ -2985,9 +3070,14 @@ mod tests {
             ["tasks", "prs"]
         );
         assert_eq!(subs[0], tasks);
-        // What the tool lists is what it would add again.
+        // What the tool lists is what it would add again, but that it
+        // outlives a close, which only Sonny marks.
         assert_eq!(Sub::from_json(&tasks.to_json()), Some(tasks.clone()));
-        assert_eq!(parse(&tasks.to_json()), Ok(tasks));
+        let added = Sub {
+            outlives_close: false,
+            ..tasks.clone()
+        };
+        assert_eq!(parse(&tasks.to_json()), Ok(added));
         assert_eq!(all(&store).len(), 2);
         change(&store, "shop.lead", None, None, Some("prs"), &[]).unwrap();
         change(&store, "shop.lead", None, None, Some("tasks"), &[]).unwrap();

@@ -213,11 +213,6 @@ fn fits(declared: &[Value]) -> bool {
 /// rest. Why not, when its own beside Sonny's are past what the daemon
 /// takes ([`too_many`]).
 pub fn refresh(record: &Value) -> Result<Option<Map<String, Value>>, String> {
-    // A trigger's shadow copy keeps the few tools it was made with, and
-    // no gate a person answers.
-    if (record["name"].as_str()).is_some_and(|name| crate::trigger::shadow_source(name).is_some()) {
-        return Ok(None);
-    }
     // Sonny's own by a tool its lookout answers, not by a name another
     // client's tool could share.
     let Some(declared) = record["declared"].as_array() else {

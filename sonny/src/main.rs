@@ -16531,8 +16531,8 @@ impl App {
     /// `/background` lists, and the triggers' turns kept.
     fn behind_counted(&mut self, mut items: Vec<background::Item>) {
         // A trigger that ended goes once its last turn did well, also one
-        // that ended after its turn did, as a `--reply-to` fire passing on
-        // the answer, and a one-off its `--if` said no to. Found among the
+        // that ended after its turn did, and a one-off its `--if` said no
+        // to. Found among the
         // rows as read: only those that go are read again.
         if let Some(store) = self.client.store()
             && background::forget_done(store, &self.turns) > 0

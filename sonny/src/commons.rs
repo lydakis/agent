@@ -654,28 +654,42 @@ fn budget(sent: &[Value], agents: u64) -> Value {
     let answered = (settled.iter())
         .filter(|invite| invite["answered"] == true)
         .count();
+    // A round asks most of those it invites to say nothing, so its
+    // invites leave out of the rate a thread's reach goes by: silence
+    // there is the answer it expects, not one missed.
+    let (rate_sent, rate_answered) = (settled.iter())
+        .filter(|invite| invite["threads"].is_null())
+        .fold((0, 0), |(sent, answered), invite| {
+            (sent + 1, answered + usize::from(invite["answered"] == true))
+        });
     let base = invites_a_day(agents);
     let earned = (threads(sent, |invite| invite["answered"] == true).len() as u64).min(base);
     json!({"today": today, "a_day": base + earned,
-        "reach": reach(answered, settled.len(), base as usize),
+        "reach": reach(rate_answered, rate_sent, base as usize),
         "answered": answered, "this_week": settled.len(), "agents": agents})
 }
 
 /// Takes one of the day's threads for the invites `key` counts under, a
 /// thread's own name or a round's, with the threads a round lists, under
 /// the lock, if one is left: how many it may send, and whether one is a
-/// golden ticket; or None.
+/// golden ticket; or None. A thread sends as many as the week's rate says
+/// fill its seats; a round, which asks for what an agent holds and expects
+/// most to hold nothing, sends one a seat and the golden ticket besides
+/// when it draws one, whatever the rate.
 fn reserve(dir: &Path, key: &str, threads: &[String]) -> Option<(usize, bool)> {
     let (mut sent, count) = load(dir);
     let budget = budget(&sent, agents(dir));
     if budget["today"].as_u64() >= budget["a_day"].as_u64() {
         return None;
     }
-    let reach = budget["reach"].as_u64().unwrap_or(1) as usize;
     // Its place counts those still being sent, so two at once neither
     // share a golden ticket nor skip one.
     let pending = sent.iter().filter(|invite| invite["bot"].is_null()).count() as u64;
     let golden = (count + pending) % GOLDEN_EVERY == GOLDEN_EVERY - 1;
+    let reach = match threads.is_empty() {
+        true => budget["reach"].as_u64().unwrap_or(1) as usize,
+        false => SEATS + usize::from(golden),
+    };
     let mut reserved = json!({"thread": key, "at": now(), "golden": golden, "reach": reach});
     if !threads.is_empty() {
         reserved["threads"] = json!(threads);
@@ -903,8 +917,11 @@ async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
 /// A thread started in a turn the commons itself began brings none: as an
 /// automatic reply never answers another (RFC 3834), so an invited agent's
 /// threads cannot set off a chain of invites with no person behind them.
+/// The tool host sends them once the post that started the thread has
+/// answered.
 pub async fn invite(
     home: &Path,
+    socket: &Path,
     started: &Value,
     (author, turn): (&str, Option<i64>),
     invite: &Value,
@@ -918,14 +935,18 @@ pub async fn invite(
     let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
     let seats = Seats {
         request: format!("commons.invite.{thread}"),
+        socket,
         words: &words,
         reach,
         golden,
     };
     let note = |ticket| invited_note(thread, title, author, ticket);
     let invited = sends(seats, (author, turn), &note).await;
-    settle(&dir(home), thread, &invited);
-    invited.into_iter().map(|(bot, _)| bot).collect()
+    let bots: Vec<String> = invited.iter().map(|(bot, _)| bot.clone()).collect();
+    // It runs in the tool host: what locks the commons runs off its runtime.
+    let (dir, thread) = (dir(home), thread.to_owned());
+    let _ = tokio::task::spawn_blocking(move || settle(&dir, &thread, &invited)).await;
+    bots
 }
 
 /// The work `bot`'s turn `turn` opened on `board`, each thread with its
@@ -934,11 +955,14 @@ pub async fn invite(
 /// agents whose turns touch it hold that bears on it, a draft, a fix or a
 /// finding, said in that work's thread. Taking it is for the board's
 /// agents, who hear it opened. Under the day's budget, as a thread's
-/// invites, and never from a turn the commons began. The ones invited.
+/// invites, but one agent a seat and the golden ticket when it draws one
+/// ([`reserve`]), and never from a turn the commons began. The ones
+/// invited.
 /// It runs in the tool host: what reads or locks the commons runs off its
 /// runtime.
 pub async fn round(
     home: &Path,
+    socket: &Path,
     board: &str,
     opened: &[(String, String)],
     (author, turn): (&str, Option<i64>),
@@ -957,6 +981,7 @@ pub async fn round(
     };
     let seats = Seats {
         request: format!("commons.round.{first}"),
+        socket,
         words: &words,
         reach,
         golden,
@@ -1012,9 +1037,11 @@ pub fn round_note(board: &str, opened: &[(String, String)], author: &str, golden
 }
 
 /// What one thread's or round's invites are: the request each is sent as,
-/// the words that aim them, how many, and whether one is a golden ticket.
+/// the daemon's socket they go through, the words that aim them, how many,
+/// and whether one is a golden ticket.
 struct Seats<'a> {
     request: String,
+    socket: &'a Path,
     words: &'a [String],
     reach: usize,
     golden: bool,
@@ -1030,14 +1057,14 @@ async fn sends(
 ) -> Vec<(String, bool)> {
     let Seats {
         request,
+        socket,
         words,
         reach,
         golden,
     } = seats;
     let mut invited: Vec<(String, bool)> = Vec::new();
     let sent = async {
-        let (_, socket) = crate::daemon_paths(None, None).ok()?;
-        let (client, _events) = agent_client::Client::connect(&socket).await.ok()?;
+        let (client, _events) = agent_client::Client::connect(socket).await.ok()?;
         if let Some(turn) = turn {
             // Someone who steered it there, a person or an agent, is behind it:
             // not the commons, nor a source's news of it (or of anything
@@ -2392,7 +2419,7 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 Some(text) => format!(": {text}"),
                 None => String::new(),
             };
-            let mut text = match (n, post["do"].as_str()) {
+            let text = match (n, post["do"].as_str()) {
                 (0, Some(_)) => format!(
                     "new work {thread} on {}, \"{title}\"{text}",
                     board.as_deref().unwrap_or_default()
@@ -2401,30 +2428,43 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 (_, Some(done)) => format!("{done} in {thread}, \"{title}\"{text}"),
                 (_, None) => format!("reply in {thread}, \"{title}\"{text}"),
             };
-            // Work it opened beside its own.
-            let others: Vec<&str> = (post["opened"].as_array().into_iter().flatten())
-                .filter_map(Value::as_str)
-                .filter(|opened| *opened != thread)
-                .collect();
-            if !others.is_empty() {
-                text.push_str(&format!("\nIt opened {}.", others.join(", ")));
-            }
             let mut line = json!({"id": format!("{thread}/{n}"), "topic": thread, "text": text});
             if let Some(by) = post["by"].as_str() {
                 line["from"] = json!(by);
             }
-            // Where a board's follow hears it, what it did, and the items
-            // it opened, which a worker's follow is steered by.
+            // Where a board's follow hears it, and what it did: one step,
+            // one event.
             if let Some(board) = &board {
                 line["board"] = json!(board);
                 line["event"] = json!(crate::board::event_of(&posts, n, &thread));
             }
-            for key in ["do", "opened"] {
-                if !post[key].is_null() {
-                    line[key] = post[key].clone();
-                }
+            if !post["do"].is_null() {
+                line["do"] = post["do"].clone();
             }
             lines.push(line.to_string());
+            // Each other work the step opened, its last need done: that
+            // work's own news, on its own thread, heard as it opening.
+            let others = (post["opened"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .filter(|opened| *opened != thread && valid_name(opened).is_ok());
+            for opened in others {
+                let title = first_post(&dir.join(format!("{opened}.jsonl")))
+                    .and_then(|first| first["title"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let mut line = json!({"id": format!("{thread}/{n}/opened/{opened}"),
+                "topic": opened, "event": "opened",
+                "text": format!(
+                    "{opened} opened on {}, \"{title}\": what it needed is done, {thread} last",
+                    board.as_deref().unwrap_or_default()
+                )});
+                if let Some(board) = &board {
+                    line["board"] = json!(board);
+                }
+                if let Some(by) = post["by"].as_str() {
+                    line["from"] = json!(by);
+                }
+                lines.push(line.to_string());
+            }
             // The board's last work settling: the board's own news, on no
             // thread, so the thread's followers hear the post alone.
             if let Some(emptied) = post["emptied"].as_str() {
@@ -4900,6 +4940,53 @@ mod tests {
         )
         .unwrap();
         assert!(work["invite"].is_null(), "{work}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_round_sends_one_a_seat_and_its_silence_leaves_the_thread_rate_alone() {
+        let home = home("round-seats");
+        let dir = dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = invites_a_day(400) as usize;
+        let (mut sent, count) = load(&dir);
+        // A week of rounds no one answered, as they are meant to go, and
+        // threads each answered once in two.
+        for n in 0..30 {
+            sent.push(
+                json!({"thread": format!("round:w{n}"), "at": now() - 86_400,
+                "bot": format!("b.{n}"), "threads": [format!("w{n}")]}),
+            );
+        }
+        for n in 0..4 {
+            sent.push(json!({"thread": format!("t{n}"), "at": now() - 86_400,
+                "bot": format!("c.{n}"), "answered": n % 2 == 0}));
+        }
+        assert!(write(&dir, &sent, count + 34, 400));
+        // A thread's reach goes by the threads' rate alone; the status
+        // still counts every invite of the week.
+        let budget = budget(&super::sent(&dir), 400);
+        assert_eq!(budget["reach"], reach(2, 4, base));
+        assert_eq!(
+            (budget["answered"].as_u64(), budget["this_week"].as_u64()),
+            (Some(2), Some(34))
+        );
+        // A round sends one a seat, the golden ticket besides when drawn,
+        // however low the rate.
+        let threads = ["w".to_owned()];
+        let mut sizes = Vec::new();
+        for n in 0..GOLDEN_EVERY {
+            let (reach, golden) = reserve(&dir, &format!("round:x{n}"), &threads).unwrap();
+            sizes.push((reach, golden));
+            settle(&dir, &format!("round:x{n}"), &[(format!("d.{n}"), golden)]);
+        }
+        assert!(sizes.contains(&(SEATS + 1, true)), "{sizes:?}");
+        assert!(
+            sizes
+                .iter()
+                .all(|&(reach, golden)| reach == SEATS + usize::from(golden)),
+            "{sizes:?}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
