@@ -941,7 +941,7 @@ pub enum BrowserSignins {
     /// Its own: the person signs in there once a site (`sonny link
     /// browser`), and it keeps them as any profile does.
     Own,
-    /// The person's: their newer cookies merged into it at each start,
+    /// The person's: their cookies merged into it over its own at each start,
     /// with Chrome's protection of them turned off. The least to do,
     /// which George chose over that protection (11-24).
     #[default]
