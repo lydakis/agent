@@ -1847,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn news_names_works_board_and_what_it_opened() {
+    fn news_names_works_board_and_that_it_opened() {
         let home = home("news");
         let cursor = home.join("cursor");
         let _ = commons::news(&home, &cursor).mark_read();
@@ -1864,7 +1864,8 @@ mod tests {
         let line: Value = serde_json::from_str(&news.lines[0]).unwrap();
         assert_eq!(line["board"], "shop/errors");
         assert_eq!(line["do"], "open");
-        assert_eq!(line["opened"], json!(["store"]));
+        assert_eq!(line["event"], "opened");
+        assert!(line.get("opened").is_none(), "{line}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2282,16 +2283,31 @@ mod tests {
                 ("store", "taken"),
                 ("store", "done"),
                 ("enum", "waiting"),
+                ("enum", "opened"),
                 ("enum", "taken"),
                 ("idea", "posted"),
                 ("idea", "reply"),
             ])
         );
-        // The done line says what it opened.
-        let done = (news.lines.iter())
-            .find(|line| line.contains("\"done\"") && line.contains("\"store\""))
+        // The done line says done alone; enum opening is its own line, on
+        // its own thread, from the agent whose step opened it.
+        let lines: Vec<Value> = (news.lines.iter())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let done = (lines.iter())
+            .find(|line| line["event"] == "done" && line["topic"] == "store")
             .unwrap();
-        assert!(done.contains("It opened enum."), "{done}");
+        assert!(!done["text"].as_str().unwrap().contains("enum"), "{done}");
+        assert!(done.get("opened").is_none(), "{done}");
+        let opened = (lines.iter())
+            .find(|line| line["event"] == "opened" && line["topic"] == "enum")
+            .unwrap();
+        assert_eq!(opened["board"], "shop/errors");
+        assert_eq!(opened["from"], "shop.w1");
+        assert!(opened.get("do").is_none(), "{opened}");
+        let text = opened["text"].as_str().unwrap();
+        assert!(text.contains("\"Remove the enum\""), "{text}");
+        assert_ne!(opened["id"], done["id"]);
         let _ = news.mark_read();
         // The last work settling empties the board: its own line, on no
         // thread.
@@ -2419,6 +2435,58 @@ mod tests {
             follows(&store, agent, Some(id), &take, &said).unwrap();
             assert_eq!(board(agent), own, "{agent}");
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_idle_worker_hears_each_work_a_done_opens() {
+        let home = home("unlocks");
+        let store = home.join("store");
+        let cursor = home.join("cursor");
+        let _ = commons::news(&home, &cursor).mark_read();
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        lead(work("enum", "Remove the enum", json!({"needs": ["store"]}))).unwrap();
+        lead(work(
+            "api",
+            "Type the api errors",
+            json!({"needs": ["store"]}),
+        ))
+        .unwrap();
+        let w1 = |args| send(&home, "shop.w1", "shop", None, false, args);
+        w1(act("store", "take")).unwrap();
+        // An idle worker of the board's task, as it starts: work opening
+        // or dropped.
+        crate::lookout::subs::put(&store, "shop.w2", works_from("shop/errors", Some(3))).unwrap();
+        let idle = (crate::lookout::subs::read(&store, "shop.w2").into_iter())
+            .find(|sub| sub.name == "board.shop.errors")
+            .unwrap();
+        let _ = commons::news(&home, &cursor).mark_read();
+        w1(act("store", "done")).unwrap();
+        let news = commons::news(&home, &cursor);
+        let heard: Vec<(String, String)> = (news.lines.iter())
+            .filter_map(|line| {
+                let event = crate::lookout::sources::Event::parse(
+                    agent_client::config::COMMONS_SOURCE,
+                    line,
+                    0,
+                )?;
+                idle.hears(&event).then(|| {
+                    let what = event.fields["event"].as_str().unwrap_or_default();
+                    (event.topic.clone().unwrap_or_default(), what.to_owned())
+                })
+            })
+            .collect();
+        let mut heard = heard;
+        heard.sort();
+        // Both pieces its done opened, each once, and not the done.
+        assert_eq!(
+            heard,
+            [
+                ("api".to_owned(), "opened".to_owned()),
+                ("enum".to_owned(), "opened".to_owned())
+            ]
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
