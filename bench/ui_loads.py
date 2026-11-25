@@ -169,6 +169,21 @@ def lacks(*words):
     return lambda lines: not any(all(w in line for w in words) for line in lines)
 
 
+def composer_reads(text):
+    """The composer's line holds exactly `text` after its `›`; for no
+    text, its placeholder (`Message …`)."""
+    def test(lines):
+        for line in lines:
+            head = line.lstrip()
+            if not head.startswith('›'):
+                continue
+            said = head[1:].split('│')[0].strip()
+            if said == text or (not text and said.startswith('Message')):
+                return True
+        return False
+    return test
+
+
 def both(*tests):
     return lambda lines: all(test(lines) for test in tests)
 
@@ -191,6 +206,14 @@ def bar(working, idle=None, exact=False):
                         return True
         return False
     return test
+
+
+def wall(watch, name):
+    """When `name` showed, in wall-clock ms, as the daemon stamps turns;
+    None while it has not."""
+    if name not in watch.seen:
+        return None
+    return (watch.seen[name] - time.monotonic()) * 1000 + time.time() * 1000
 
 
 def quiet(pids, limit=120, still=.03):
@@ -428,19 +451,32 @@ def run(build, size, args, tapped=False):
         # The status bar following a task: one of p0's resting open tasks
         # takes a turn of eight seconds.
         idle_task = next(f'p0.t{t}' for t in range(fleet.per - 1) if t % 3 and f'p0.t{t}' not in held)
+        # Each change is timed from the daemon's own record of the turn:
+        # shown working after the turn started, shown resting after it
+        # finished (both wall clock, as the daemon stamps them).
         for k in range(args.repeat):
-            watch = window.expect(up=bar(own + 1, exact=True))
+            working, resting = bar(own + 1, exact=True), bar(own, exact=True)
+            went = []
+
+            def back_down(lines):
+                # Resting again, only once it was seen working.
+                if not went and working(lines):
+                    went.append(True)
+                return bool(went) and resting(lines)
+            watch = window.expect(up=working, down=back_down)
             sent = need(fleet.control.request('submit', bot=idle_task, request_id=f'bar-{k}',
                                               prompt='delay:8000'), 'submit')
-            up = watch.wait(10, need_all=False)['up']
             handle = f'{idle_task}/{sent["message"]}'
-            watch = window.expect(down=bar(own, exact=True))
-            while need(fleet.control.request('wait', handles=[handle], timeout_ms=2_000),
-                       'wait')['results'][handle].get('pending'):
-                pass
-            watch.began = time.monotonic()
-            down = watch.wait(30, need_all=False)['down']
-            result.setdefault('bar', []).append({'started_ms': up, 'ended_ms': down})
+            while True:
+                turn = need(fleet.control.request('wait', handles=[handle], timeout_ms=2_000),
+                            'wait')['results'][handle]
+                if not turn.get('pending'):
+                    break
+            watch.wait(30, need_all=False)
+            up_at, down_at = wall(watch, 'up'), wall(watch, 'down')
+            result.setdefault('bar', []).append({
+                'started_ms': round(up_at - turn['started_ms'], 1) if up_at else None,
+                'ended_ms': round(down_at - turn['finished_ms'], 1) if down_at else None})
             time.sleep(1)
         # At rest.
         quiet([window.pid, daemon.pid])
@@ -506,11 +542,19 @@ def typing(fleet, window, held, args):
     took = []
     cpu = (cpu_seconds(window.pid), cpu_seconds(fleet.daemon.pid))
     began = time.monotonic()
+    # Twenty letters that never repeat, the composer emptied between runs
+    # of them (untimed), so what a key must bring can't already show: the
+    # composer's line reading exactly what was typed so far.
+    letters = 'abcdefghijklmnopqrst'
     for k in range(args.keys):
-        letter = 'abcdefghij'[k % 10]
-        typed = 'x' + ''.join('abcdefghij'[j % 10] for j in range(k + 1))
-        watch = window.press(letter.encode(), shown=has(typed[-12:] if len(typed) > 12 else typed[1:]))
+        at = k % len(letters)
+        if at == 0 and k:
+            os.write(window.fd, b'\x15')  # ctrl+u
+            window.expect(empty=composer_reads('')).wait(10, need_all=False)
+        typed = letters[:at + 1]
+        watch = window.press(typed[-1].encode(), shown=composer_reads(typed))
         got = watch.wait(5, need_all=False)['shown']
+        # A key that never showed counts as the five seconds waited.
         took.append(got if got is not None else 5000)
         time.sleep(.05)
     spent = time.monotonic() - began
@@ -547,7 +591,7 @@ PAGES = ('projects', 'switch', 'status', 'usage', 'background', 'commons', 'sky'
 def report(out):
     """Every round under OUT, set side by side: each timed thing's median
     over rounds and repeats, per build and size."""
-    rows = {}
+    rows, missed = {}, {}
     for file in sorted(Path(out).glob('round-*.json')):
         got = json.loads(file.read_text())
         key = (got['size'], got['build'])
@@ -562,12 +606,19 @@ def report(out):
                     for measure, ms in entry.items():
                         if isinstance(ms, (int, float)):
                             rows.setdefault((name, measure), {}).setdefault(key, []).append(ms)
+                        elif ms is None:
+                            # Never shown in its time: counted, not dropped.
+                            missed.setdefault((name, measure), {}).setdefault(key, 0)
+                            missed[(name, measure)][key] += 1
             elif part in ('idle', 'typing'):
                 pass
         for part in ('idle', 'typing'):
             for measure, value in (got.get(part) or {}).items():
                 if isinstance(value, (int, float)):
                     rows.setdefault((part, measure), {}).setdefault(key, []).append(value)
+    for (name, measure), found in missed.items():
+        rows[(name, f'{measure} never shown')] = {key: [found.get(key, 0)] for key in
+                                                  {k for counts in rows.values() for k in counts}}
     keys = sorted({k for found in rows.values() for k in found})
     lines = ['| what | ' + ' | '.join(f'{size:,} {build}' for size, build in keys) + ' |',
              '|---|' + '---|' * len(keys)]
