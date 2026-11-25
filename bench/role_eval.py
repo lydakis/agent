@@ -42,6 +42,7 @@ key is never written into a run. Scoring follows docs/ROLE_EVAL.md, blind.
 Nothing here names a real person, company or machine.
 """
 import argparse
+import collections
 import concurrent.futures
 import json
 import os
@@ -1082,7 +1083,10 @@ def messages(home, out):
 def automation_runs(home, out):
     """Every turn an automation started, from the run's store, for the
     quiet day: whose turn, how it ended and its reply, as the lookout reads
-    one (the last message with words), so an empty one shows as such."""
+    one (the last message with words), so an empty one shows as such, and
+    the tools it called in order, from the audit trail, so a run that keeps
+    calling after its work shows too. `automation.json` holds the same for
+    the golden set's checks."""
     store = home / '.agent/state.sqlite'
     if not store.exists():
         return
@@ -1090,14 +1094,24 @@ def automation_runs(home, out):
     rows = db.execute("SELECT t.bot, t.id, t.status, CAST(n.item AS TEXT) FROM messages m "
                       "JOIN turns t ON t.id = m.turn LEFT JOIN nodes n ON n.id = t.reply_node "
                       "WHERE m.origin IN ('automation', 'trigger') ORDER BY t.id").fetchall()
+    try:
+        trail = collections.defaultdict(list)
+        for bot, turn, tool in db.execute("SELECT bot, turn, tool FROM audit ORDER BY id"):
+            trail[bot, turn].append(tool)
+    except sqlite3.OperationalError:  # a build before the trail
+        trail = None
     db.close()
-    lines = []
+    lines, runs = [], []
     for bot, turn, status, item in rows:
         parts = (json.loads(item).get('content') or []) if item else []
         reply = ''.join(c.get('text', '') for c in parts if isinstance(c, dict)).strip()
-        lines.append(f"- {bot}/{turn} {status}: {json.dumps(reply[:600]) if reply else '(empty reply)'}")
+        tools = None if trail is None else trail.get((bot, turn), [])
+        called = '' if tools is None else f", calls: {', '.join(tools)}" if tools else ', no call'
+        lines.append(f"- {bot}/{turn} {status}{called}: {json.dumps(reply[:600]) if reply else '(empty reply)'}")
+        runs.append({'bot': bot, 'turn': turn, 'status': status, 'reply': reply})
     (out / 'automation.md').write_text('## Turns an automation started\n\n'
                                        + ('\n'.join(lines) if lines else '(none)') + '\n')
+    (out / 'automation.json').write_text(json.dumps(runs, indent=1))
 
 
 def failures(out):

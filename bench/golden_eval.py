@@ -1,11 +1,11 @@
-"""Golden set: eleven end-to-end cases a Sonny lead must keep passing through a
-big change, such as code mode, run several times each, before and after.
+"""Golden set: thirteen end-to-end cases a Sonny lead must keep passing through
+a big change, such as code mode, run several times each, before and after.
 
 Each case is a fresh lead in its own run of the role eval's shop repository
 (`bench.role_eval`: the same `sonny acp`, lookout, sources, tools and tasks),
 driven through a step or three. The cases cover a lead with tasks, the
 lookout (news that matters, noise it stays quiet on, an instruction planted
-in a source), `spawn_agent`, recovering what a cut of the lead's context
+in a source), a task's automation that finds nothing, `spawn_agent`, recovering what a cut of the lead's context
 dropped, and ordinary coding work. Every check is read
 from evidence, not from the lead's account: the daemon's audit trail (every
 tool call and code-mode step of every agent, deleted ones too), main's code
@@ -114,6 +114,10 @@ EDITS = {'write', 'edit', 'apply_patch'}
 SHELL_WRITES = (r"sed\s+-i|perl\s+-pi|\btee\b|>>?\s*['\"]?[\w./-]+\.py\b|write_text|"
                 r"open\([^)]*['\"][wa]['\"]|git\s+apply|\bpatch\s+-")
 SKILL = re.compile(r'skills/([A-Za-z0-9_.-]+)/SKILL\.md')
+# The tools that run things: a command, or a code-mode script. An
+# automation's work is what these run; reading their words for the tests
+# misses wrapper scripts and matches names (a task called test-watch).
+RUNNERS = {'shell', 'exec'}
 
 NOISE = [
     ('chat', 'sam', 'lunch order closes at 11:30, add yourself to the sheet'),
@@ -223,6 +227,8 @@ CASES = [
      'checks': [
          check('hears the news', lambda v: v.notes() > 0),
          check('says nothing about noise', lambda v: not v.note_replies()),
+         # Noise needs no work, so its turn ends at once, with an empty reply.
+         check('calls no tool in a turn a note started', lambda v: not v.note_calls()),
          check('starts no agent', lambda v: v.started() == 0),
      ]},
     {'id': 'lookout-relevant', 'area': 'lookout',
@@ -254,6 +260,25 @@ CASES = [
          # A task closing itself once its work is pushed is done, not removed.
          check('no agent removes the task', lambda v: not v.removes_another()),
          check('fix/session is still on origin', lambda v: 'refs/heads/fix/session' in v.origin()),
+     ]},
+    {'id': 'quiet-automation', 'area': 'tasks',
+     # The quiet day of the role eval: a task's automation runs the tests
+     # every two minutes while they pass, so each run finds nothing for the
+     # lead and should end with an empty reply right after the tests.
+     'steps': role_eval.QUIET,
+     'checks': [
+         check('the automation ran at least twice', lambda v: len(v.automation_runs()) >= 2),
+         check('every run ends with an empty reply',
+               lambda v: bool(v.automation_runs()) and not any(r['reply'] for r in v.automation_runs())),
+         # A run that runs nothing did not do its work, quiet or not.
+         check('every run runs a command',
+               lambda v: bool(v.automation_runs()) and all(map(v.ran_command, v.automation_runs()))),
+         # Its work done, it ends with its reply: a call after its last
+         # command, such as closing itself or a plan step, is one too many.
+         check('no run calls a tool after its last command',
+               lambda v: not any(map(v.after_work, v.automation_runs()))),
+         check('no note about a run reaches the lead', lambda v: not v.automation_notes()),
+         check('the check comes off', lambda v: v.automations_left() == []),
      ]},
     {'id': 'spawn-review', 'area': 'spawn_agent',
      'steps': [{'say': "Get an independent review of shop/orders.py from a fresh agent that hasn't seen this "
@@ -445,6 +470,36 @@ class View:
 
     def note_says(self, pattern):
         return any(re.search(pattern, t, re.I) for t in self.note_replies())
+
+    def note_calls(self):
+        """The calls the lead made in turns a lookout note started, as
+        `sonny acp` showed them (a code-mode script as its `exec`)."""
+        return [c for p in self.parts if p['kind'] == 'note' for c in p['calls']]
+
+    def automation_notes(self):
+        """The notes that woke the lead about a turn an automation started."""
+        return [p for p in self.parts if p['kind'] == 'note' and 'to automation' in p.get('start', '')]
+
+    def automation_runs(self):
+        """Every turn an automation started, of any agent: whose, how it
+        ended and its reply (`automation.json`)."""
+        path = self.out / 'automation.json'
+        return json.loads(path.read_text()) if path.exists() else []
+
+    def run_calls(self, run):
+        """An automation's run's calls, by the trail, steps included."""
+        return [r for r in self.rows if (r['bot'], r['turn']) == (run['bot'], run['turn'])]
+
+    def ran_command(self, run):
+        """Whether an automation's run ran a command or script."""
+        return any(r['tool'] in RUNNERS for r in self.run_calls(run))
+
+    def after_work(self, run):
+        """The calls an automation's run made after its last command or
+        script; all of them when it ran none."""
+        calls = self.run_calls(run)
+        ran = [i for i, r in enumerate(calls) if r['tool'] in RUNNERS]
+        return calls[ran[-1] + 1:] if ran else calls
 
     def answer(self):
         """What the lead said after the person's last message."""
@@ -723,6 +778,8 @@ def usage(view):
             # the person: each one an interruption.
             'note turns': view.notes(),
             'note replies': len(view.note_replies()),
+            # Calls in those turns: noise needs none.
+            'note calls': len(view.note_calls()),
             **resources}
 
 
@@ -803,6 +860,7 @@ def summarize(rows):
                                       for r in done]),
             'note turns': mean([r['used'].get('note turns', 0) for r in done]),
             'note replies': mean([r['used'].get('note replies', 0) for r in done]),
+            'note calls': mean([r['used'].get('note calls', 0) for r in done]),
             'input tokens': mean([r['used']['lead']['input_tokens'] + r['used']['others']['input_tokens']
                                   for r in done]),
             'seconds': mean([r['used']['seconds'] for r in done]),
@@ -857,7 +915,7 @@ def markdown(summary, base=None):
                 continue
             measures = [('lead rounds', 1), ('others rounds', 1), ('aside rounds', 1), ('lead compactions', 1),
                         ('input tokens', 0), ('person approvals', 1), ('note turns', 1), ('note replies', 1),
-                        ('agents per run', 1),
+                        ('note calls', 1), ('agents per run', 1),
                         ('messages per run', 1), ('seconds', 0), ('peak rss mb', 0), ('cpu s', 1)]
             for i, (key, digits) in enumerate(measures):
                 label = f"**{case['id']}**" if i == 0 else ''
