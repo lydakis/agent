@@ -633,7 +633,6 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | Whether agents have boards, work in the commons they take | `[sonny] boards` (true, the default, or false; off, the commons tool takes no work fields, its skill has no Boards section, and `start_task` takes no `board` or `agents`; off with the commons too) | |
-| How long taken work may go without a post before its holder is asked whether it is still on it, and its board hears it went quiet | `[sonny] hold_quiet` (15 minutes by default; 0 never) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most rows a margin note draws | `[sonny] margin_note_lines` (40 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |

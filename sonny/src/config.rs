@@ -366,15 +366,6 @@ pub const SETTINGS: &[Setting] = &[
         default: "true",
     },
     Setting {
-        key: "sonny.hold_quiet",
-        group: "",
-        name: "hold quiet",
-        label: "",
-        about: "minutes work an agent took may go without a post in its thread before the holder is asked whether it is still on it and its board hears it went quiet; 0 never; read as work is taken",
-        values: &[],
-        default: "15",
-    },
-    Setting {
         key: "sonny.commons_invites",
         group: "Commons and sky",
         name: "commons invites",
@@ -515,14 +506,18 @@ pub const VIEW_ONE: &str = "view-one";
 /// and `side_chat = "fork"` `"work"`, so the file says the Rulebook's
 /// words (0.10.0).
 pub const TAB_WORDS: &str = "tab-words";
+/// The migration that takes `[sonny] hold_quiet` away, with the board's
+/// quiet timer it set (after 0.10.6).
+pub const HOLD_QUIET_GONE: &str = "hold-quiet-gone";
 
 /// At start, once each, before the config is read: a line depth the
 /// person set for Sonny moved to the daemon, which bounds it now; the
 /// reviewer's model and effort under the reviewer's name; quiet mode,
 /// gone, leaving no key the config would refuse, no file and no skill; and
 /// the reply check's and done check's keys, gone with the checks; and the
-/// two switches for what the conversation shows, one `view`; and the
-/// words its keys and values say, the Rulebook's.
+/// two switches for what the conversation shows, one `view`; the
+/// words its keys and values say, the Rulebook's; and the board's quiet
+/// timer's key, gone with the timer.
 pub fn at_start() {
     let (Some(home), Some(path)) = (
         std::env::var_os("HOME").map(PathBuf::from),
@@ -547,6 +542,9 @@ pub fn at_start() {
     crate::upgrade::once(&migrated, CHECKS_GONE, || rewrite(&path, checks_gone));
     crate::upgrade::once(&migrated, VIEW_ONE, || rewrite(&path, view_one));
     crate::upgrade::once(&migrated, TAB_WORDS, || rewrite(&path, tab_words));
+    crate::upgrade::once(&migrated, HOLD_QUIET_GONE, || {
+        rewrite(&path, hold_quiet_gone)
+    });
 }
 
 /// The config at `path` as `change` rewrites it, each other line as the
@@ -681,6 +679,12 @@ fn quiet_gone(text: &str) -> Result<Option<String>, ()> {
 /// sets neither `needs_check` nor `task_done_check`, which `/config` wrote.
 fn checks_gone(text: &str) -> Result<Option<String>, ()> {
     sonny_keys_gone(text, &["needs_check", "task_done_check"])
+}
+
+/// `text` as [`rewrite`] writes it for [`HOLD_QUIET_GONE`]: none when
+/// `[sonny]` sets no `hold_quiet`.
+fn hold_quiet_gone(text: &str) -> Result<Option<String>, ()> {
+    sonny_keys_gone(text, &["hold_quiet"])
 }
 
 /// `text` as [`rewrite`] writes it for [`VIEW_ONE`]: none when `[sonny]`
@@ -1369,6 +1373,27 @@ mod tests {
         assert_eq!(checks_gone("sonny.needs_check = false\n"), Err(()));
     }
 
+    #[test]
+    fn the_board_quiet_timer_s_key_goes_and_the_rest_stays_as_written() {
+        let text = "[sonny]\nboards = true\nhold_quiet = 30  # mine\nchime = true\n";
+        assert_eq!(
+            hold_quiet_gone(text),
+            Ok(Some("[sonny]\nboards = true\nchime = true\n".into()))
+        );
+        assert_eq!(hold_quiet_gone("[sonny]\nchime = true\n"), Ok(None));
+        assert_eq!(hold_quiet_gone("sonny.hold_quiet = 0\n"), Err(()));
+        // The config refuses the key, and reads what is left.
+        let dir = std::env::temp_dir().join(format!("hold-quiet-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "[sonny]\nhold_quiet = 0\n").unwrap();
+        assert!(agent_client::config::read(&file).is_err());
+        assert!(rewrite(&file, hold_quiet_gone));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "[sonny]\n");
+        assert!(agent_client::config::read(&file).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The longest a setting's label runs, as the Rulebook's `label-max`.
     const LABEL_MAX: usize = 70;
 
@@ -1433,7 +1458,6 @@ mod tests {
             "sonny.sky_haiku_margin",
             "sonny.sky_haiku_hold",
             "sonny.commons_invite_tokens",
-            "sonny.hold_quiet",
             "sonny.tool_processes",
             "sonny.lookout_waiting",
         ] {
