@@ -111,7 +111,7 @@ def fleet(binary, bots, summary_ms):
                 asked = time.monotonic()
                 client.request('stats')
                 probes.append(time.monotonic() - asked)
-                landed = sum(1 for m in client.saved if m.get('event') in ('compacted', 'compaction_failed'))
+                landed = sum(1 for m in client.saved if m.get('event') in ('compacted', 'compaction_failed', 'compaction_skipped'))
                 if not any(summary for _, summary, _ in server.arrivals) and time.monotonic() - began > 3:
                     break  # none started: summaries wait for each bot's next turn
                 time.sleep(.05)

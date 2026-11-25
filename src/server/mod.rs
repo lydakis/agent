@@ -5277,6 +5277,7 @@ impl Service {
             aheads: self.aheads.clone(),
             after: Default::default(),
             tailing: Default::default(),
+            failed: Default::default(),
         };
         let task = Arc::new(task);
         let tails = self.tails.sender.clone();
@@ -5298,8 +5299,11 @@ impl Service {
             let result = match &exit {
                 turn::Exit::Finished(error) => {
                     slot.release();
+                    // Its end says whether the summary it planned follows.
+                    let after = task.has_after();
                     let committed =
-                        commit_finish(&task.store, &bot, id, error.as_ref(), &mut cancelled).await;
+                        commit_finish(&task.store, &bot, id, error.as_ref(), after, &mut cancelled)
+                            .await;
                     // The summary it planned as it ended starts once the
                     // end is committed, holding the turn's own record.
                     match task.take_after() {
@@ -6163,7 +6167,7 @@ impl Service {
         let name = bot.clone();
         let next_ready = store
             .op_pruning("finish", name.clone(), move |db| {
-                turn::Finished::record(db, &name, turn, Some(&Error::new(turn::INTERRUPTED)))
+                turn::Finished::record(db, &name, turn, Some(&Error::new(turn::INTERRUPTED)), false)
             })
             .await?;
         // Only once the end commits: a refused one leaves the turn
@@ -8419,6 +8423,7 @@ async fn commit_finish(
     bot: &str,
     turn: i64,
     error: Option<&Error>,
+    summary_after: bool,
     cancelled: &mut watch::Receiver<Option<&'static str>>,
 ) -> Result<bool> {
     let mut error = error.cloned();
@@ -8427,7 +8432,7 @@ async fn commit_finish(
         let (name, attempt) = (bot.to_owned(), error.clone());
         let failure = match store
             .op_pruning("finish", bot.to_owned(), move |db| {
-                turn::Finished::record(db, &name, turn, attempt.as_ref())
+                turn::Finished::record(db, &name, turn, attempt.as_ref(), summary_after)
             })
             .await
         {
@@ -9655,7 +9660,7 @@ mod tests {
         service.ready_hint = false;
         let next_ready = store
             .op("finish", move |db| {
-                turn::Finished::record(db, "Bob", next, None)
+                turn::Finished::record(db, "Bob", next, None, false)
             })
             .await
             .unwrap();
@@ -10179,7 +10184,7 @@ mod tests {
         // to take what was kept.
         let next = store
             .op("finish", move |db| {
-                turn::Finished::record(db, "Bob", first, None)?;
+                turn::Finished::record(db, "Bob", first, None, false)?;
                 Ok(db
                     .begin(
                         "Bob",
@@ -10247,7 +10252,7 @@ mod tests {
         // before the submission's own commit, which has room to start it.
         let (next, admitted, instructions) = store
             .op("finish", move |db| {
-                turn::Finished::record(db, "Bob", first, None)?;
+                turn::Finished::record(db, "Bob", first, None, false)?;
                 let started = db.begin(
                     "Bob",
                     "second",
@@ -10328,7 +10333,7 @@ mod tests {
         // next message comes, with room to start it at once.
         store
             .op("finish", move |db| {
-                turn::Finished::record(db, "Bob", first, None)
+                turn::Finished::record(db, "Bob", first, None, false)
             })
             .await
             .unwrap();
