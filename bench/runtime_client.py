@@ -127,7 +127,7 @@ class Client:
 
     def summarized(self, bot, timeout=5, turn=None):
         """Wait for the summary a turn of `bot` started as it ended to land,
-        installed or not: `turn`'s, when it is named. The message stays
+        installed, failed or skipped: `turn`'s, when it is named. The message stays
         among the saved ones."""
         def landed(message):
             if message.get('bot') != bot or turn not in (None, message.get('turn')):
@@ -135,6 +135,8 @@ class Client:
             if message.get('event') == 'compaction_failed':
                 # One a request of its own follows is not the end of it.
                 return message['data'].get('fallback') is not True
+            if message.get('event') == 'compaction_skipped':
+                return True
             request = (message.get('data') or {}).get('request') or {}
             return message.get('event') == 'compacted' and request.get('after_turn') is True
         message = self.receive(landed, timeout)

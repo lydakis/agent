@@ -4889,6 +4889,18 @@ says `"after_turn": true`, and its `turn` is the one that ended; so do
 its `compaction_text_delta` and `compaction_thinking_delta` events, which a
 client keeps off the turn running then. Protocol 59.
 
+The turn's `turn_finished` says `"summary_after": true` when it started
+one, and every one it starts ends in an event of that turn: `compacted`
+when it goes in, `compaction_failed` (one without `"fallback": true`)
+when it fails or is refused going in, or `compaction_skipped` when it
+comes to nothing without failing, with its `reason`:
+`nothing_to_summarize` when planned again it finds nothing to cut,
+`parked` (with `until`, Unix milliseconds) when its pool held it,
+`paused` when a `pause` stopped it, or `shutdown` when the daemon was
+stopping before it sent its call. A client waiting for the view a
+summary leaves waits for one of these three. A daemon stopped mid-call
+and a bot deleted end it with none. Protocol 102.
+
 It goes in as soon as it lands when no turn of the bot runs. A turn that
 started meanwhile does not wait for it: the turn starts no summary of its
 own while it runs, and takes it in at its first boundary after it lands,
