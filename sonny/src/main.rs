@@ -24202,10 +24202,14 @@ impl App {
             // agent's name does anywhere (`from fix`). This window's own
             // (`Steer shop lead`) stays plain words.
             if self.input.is_empty()
-                && let Some(task) = self.asking().and_then(|ask| ask.task.as_ref())
+                && let Some(ask) = self.asking()
+                && let Some(task) = ask.task.as_ref()
                 && task.bot != self.bot
             {
-                let names = [(task.name.clone(), task.bot.clone())];
+                // By its name as the hint shows it, shortened or whole.
+                let room = self.width.min(measure()).saturating_sub(prompt::LEAD);
+                let shown = asks::hint_name(ask, self.at(), self.asks.len(), room);
+                let names = [(shown.unwrap_or_default(), task.bot.clone())];
                 let found;
                 (composer_rows, found) = hint_agents(composer_rows, &names);
                 for (row, from, to, bot) in found {

@@ -1774,24 +1774,74 @@ fn place(at: usize, of: usize) -> String {
 }
 
 /// The composer's hint while what is typed answers `ask`, the `at`th of
-/// `of` open, cut to `width`: which question, muted, then its keys in
+/// `of` open, in `width` columns: which question, muted, then its keys in
 /// the one grammar.
 pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>> {
-    let mut keys = match ask.options.len() {
-        0 => Vec::new(),
-        1 => vec!["1 pick".to_owned()],
-        n => vec![format!("1–{n} pick")],
-    };
-    if of > 1 {
-        keys.push("↑↓ switch".into());
+    let fitted = fit_hint(ask, at, of, width);
+    let said = crate::transcript::cut(&fitted.said(), width);
+    let mut spans = vec![Span::raw(said).dim()];
+    if !fitted.keys.is_empty() {
+        spans.push(Span::raw(" ").dim());
+        spans.extend(crate::hint::spans(&fitted.keys));
     }
-    let keys = (keys.iter())
-        .fold(crate::hint::Keys::new(), |all, pair| {
-            let (key, does) = pair.split_once(' ').unwrap_or((pair, ""));
-            all.key(key, does)
-        })
-        .esc(crate::hint::Esc::WriteInstead)
-        .text();
+    spans
+}
+
+/// The task's name as the composer's hint for `ask` shows it in `width`
+/// columns, shortened or whole, for its link to open the task.
+pub fn hint_name(ask: &Ask, at: usize, of: usize, width: usize) -> Option<String> {
+    fit_hint(ask, at, of, width).name
+}
+
+/// The answer hint's parts, each as much of it as the row has room for.
+struct Hint {
+    question: String,
+    /// The task's name, `from` it, when the question is a task's.
+    name: Option<String>,
+    /// Which of several it is: ` (1 of 2)`.
+    place: String,
+    /// The words before the keys: ` type or`.
+    words: &'static str,
+    keys: String,
+}
+
+impl Hint {
+    /// The muted words before the keys.
+    fn said(&self) -> String {
+        let whose = (self.name.as_ref()).map_or(String::new(), |name| format!(" from {name}"));
+        format!(
+            "Answer “{}”{whose}{}:{}",
+            self.question, self.place, self.words
+        )
+    }
+
+    fn width(&self) -> usize {
+        let keys = match self.keys.is_empty() {
+            true => 0,
+            false => 1 + self.keys.width(),
+        };
+        self.said().width() + keys
+    }
+}
+
+/// The answer hint in `width` columns, by display width. Short of room it
+/// gives way in this order, a later part only once every earlier one has
+/// given all it gives: the question shortens with `…` down to 8 columns;
+/// its keys go as any line of keys does, `esc write instead` staying; the
+/// words before them; which of several it is; then a task's name shortens
+/// with `…`. Nothing is cut without a `…`, and a key is whole or gone.
+fn fit_hint(ask: &Ask, at: usize, of: usize, width: usize) -> Hint {
+    const QUESTION: usize = 8;
+    let mut keys = crate::hint::Keys::new();
+    match ask.options.len() {
+        0 => {}
+        1 => keys = keys.key("1", "pick"),
+        n => keys = keys.key(format!("1–{n}"), "pick"),
+    }
+    if of > 1 {
+        keys = keys.key("↑↓", "switch");
+    }
+    let keys = keys.esc(crate::hint::Esc::WriteInstead);
     // Words answer it too: typed, or for a step of the person's, how it
     // went, or the step itself run here.
     let words = match ask.options.len() {
@@ -1799,20 +1849,54 @@ pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>>
         0 => " say how it went ·",
         _ => " type or",
     };
-    let place = place(at, of);
-    // A task's question, pinned in its lead's window, by whose it is.
-    let whose = (ask.task.as_ref()).map_or(String::new(), |task| format!(" from {}", task.name));
-    let room = width.saturating_sub(
-        "Answer “”: ".chars().count()
-            + whose.chars().count()
-            + place.chars().count()
-            + words.chars().count()
-            + keys.chars().count(),
-    );
-    let question = crate::transcript::cut(&plain(&ask.question), room.max(8));
-    let mut spans = vec![Span::raw(format!("Answer “{question}”{whose}{place}:{words} ")).dim()];
-    spans.extend(crate::hint::spans(&keys));
-    spans
+    let question = plain(&ask.question);
+    let mut hint = Hint {
+        question: String::new(),
+        // A task's question, pinned in its lead's window, by whose it is.
+        name: ask.task.as_ref().map(|task| task.name.clone()),
+        place: place(at, of),
+        words,
+        keys: keys.text(),
+    };
+    // What the rest leaves the part being fitted.
+    let room = |hint: &Hint, part: usize| width.saturating_sub(hint.width() - part);
+    // 1. The question, down to 8 columns.
+    let room_for_question = room(&hint, 0);
+    hint.question = crate::transcript::cut(&question, room_for_question.max(QUESTION));
+    if hint.width() <= width {
+        return hint;
+    }
+    // 2. Its keys, as any line of keys gives way.
+    hint.keys = keys.fit(room(&hint, hint.keys.width()));
+    if hint.width() <= width {
+        return hint;
+    }
+    // 3. The words before the keys.
+    hint.words = "";
+    if hint.width() <= width {
+        return hint;
+    }
+    // 4. Which of several it is.
+    hint.place = String::new();
+    if hint.width() <= width {
+        return hint;
+    }
+    // 5. A task's name, shortened.
+    if let Some(name) = hint.name.take() {
+        let room = room(&hint, 0).saturating_sub(" from ".width());
+        hint.name = Some(crate::transcript::cut(&name, room));
+        if hint.width() <= width {
+            return hint;
+        }
+    }
+    // Narrower still, the question shortens past its 8 columns; then the
+    // keys go, whole, and what is left is cut with `…` where it is drawn.
+    hint.question = crate::transcript::cut(&question, room(&hint, hint.question.width()));
+    if hint.width() <= width {
+        return hint;
+    }
+    hint.keys = String::new();
+    hint
 }
 
 /// The question as it reads on its card, without its Markdown marks.
@@ -2096,6 +2180,185 @@ mod tests {
             super::ran(&ran("cd web\nnpm login", 1)),
             "Ran ! cd web … · exit 1"
         );
+    }
+
+    /// The hint for `ask` at `width` fits it and ends in the key that
+    /// leaves it for words of one's own, by display width.
+    fn fits(ask: &Ask, at: usize, of: usize, width: usize) -> String {
+        let row = text(&hint(ask, at, of, width));
+        assert!(row.width() <= width, "{width}: {row}");
+        assert!(row.ends_with(" esc write instead"), "{width}: {row}");
+        row
+    }
+
+    fn should() -> Ask {
+        call(
+            "c1",
+            &json!({
+                "question": "Should we keep the old API for one more release?",
+                "why": "w",
+                "options": [
+                    {"label": "Keep it", "explanation": "e"},
+                    {"label": "Drop it", "explanation": "e"}
+                ]
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn short_of_room_the_question_shortens_then_its_keys_then_its_words_go() {
+        let ask = should();
+        assert_eq!(
+            fits(&ask, 0, 1, 96),
+            "Answer “Should we keep the old API for one more release?”: type or 1–2 pick · esc write instead"
+        );
+        assert_eq!(
+            fits(&ask, 0, 1, 56),
+            "Answer “Should w…”: type or 1–2 pick · esc write instead"
+        );
+        // Then `1–2 pick` goes, and then `type or`.
+        assert_eq!(
+            fits(&ask, 0, 1, 53),
+            "Answer “Should…”: type or esc write instead"
+        );
+        assert_eq!(fits(&ask, 0, 1, 40), "Answer “Should…”: esc write instead");
+        // Measured by display width: a wide character takes two.
+        let mut wide = should();
+        wide.question = "要不要再保留旧接口一个版本？".into();
+        assert_eq!(
+            fits(&wide, 0, 1, 56),
+            "Answer “要不要再…”: type or 1–2 pick · esc write instead"
+        );
+    }
+
+    #[test]
+    fn two_open_the_switch_goes_before_the_pick() {
+        let ask = should();
+        assert_eq!(
+            fits(&ask, 0, 2, 76),
+            "Answer “Should…” (1 of 2): type or 1–2 pick · ↑↓ switch · esc write instead"
+        );
+        assert_eq!(
+            fits(&ask, 0, 2, 74),
+            "Answer “Should…” (1 of 2): type or 1–2 pick · esc write instead"
+        );
+        // Then the pick, the words, and which of the two it is.
+        assert_eq!(
+            fits(&ask, 0, 2, 51),
+            "Answer “Should…” (1 of 2): esc write instead"
+        );
+        assert_eq!(fits(&ask, 0, 2, 40), "Answer “Should…”: esc write instead");
+    }
+
+    #[test]
+    fn a_step_short_of_room_drops_how_it_went_before_its_key() {
+        let mut step = call(
+            "c1",
+            &json!({"question": "Sign in to the registry with your token?", "why": "w"}),
+        )
+        .unwrap();
+        assert_eq!(
+            fits(&step, 0, 1, 40),
+            "Answer “Sign in…”: esc write instead"
+        );
+        step.task = Some(Asker {
+            bot: "calc.fix".into(),
+            name: "fix".into(),
+        });
+        assert_eq!(
+            fits(&step, 0, 1, 45),
+            "Answer “Sign in…” from fix: esc write instead"
+        );
+        assert_eq!(
+            fits(&step, 0, 1, 44),
+            "Answer “Sign in…” from f…: esc write instead"
+        );
+    }
+
+    #[test]
+    fn a_tasks_long_name_shortens_last_and_stays_its_link() {
+        let mut ask = should();
+        let name = "release-notes-for-version";
+        assert_eq!(name.width(), 25);
+        ask.task = Some(Asker {
+            bot: "calc.notes".into(),
+            name: name.into(),
+        });
+        assert_eq!(
+            fits(&ask, 0, 2, 96),
+            "Answer “Should…” from release-notes-for-version (1 of 2): type or 1–2 pick · esc write instead"
+        );
+        assert_eq!(hint_name(&ask, 0, 2, 96).as_deref(), Some(name));
+        assert_eq!(
+            fits(&ask, 0, 2, 66),
+            "Answer “Should…” from release-notes-for-version: esc write instead"
+        );
+        assert_eq!(
+            fits(&ask, 0, 2, 55),
+            "Answer “Should…” from release-notes…: esc write instead"
+        );
+        assert_eq!(hint_name(&ask, 0, 2, 55).as_deref(), Some("release-notes…"));
+        // Narrower than the rule's parts leave room for, the question
+        // shortens past its 8 columns.
+        let row = fits(&ask, 0, 2, 40);
+        assert_eq!(row, "Answer “Shou…” from …: esc write instead");
+        assert_eq!(hint_name(&ask, 0, 2, 40).as_deref(), Some("…"));
+    }
+
+    #[test]
+    fn the_hint_gives_way_in_order_a_later_part_only_once_the_earlier_have() {
+        let named = |mut ask: Ask, name: &str| {
+            ask.task = Some(Asker {
+                bot: "calc.x".into(),
+                name: name.into(),
+            });
+            ask
+        };
+        let step = call(
+            "c2",
+            &json!({"question": "Sign in to the registry?", "why": "w"}),
+        );
+        let asks = [
+            should(),
+            named(should(), "release-notes-for-version"),
+            step.clone().unwrap(),
+            named(step.unwrap(), "fix"),
+        ];
+        for ask in &asks {
+            for of in [1, 2, 3] {
+                let whole = fit_hint(ask, 0, of, 1000);
+                for width in 20..=140 {
+                    let fitted = fit_hint(ask, 0, of, width);
+                    // Each part whole or not, by the order it gives way in;
+                    // one with nothing to give has no say.
+                    let parts = [
+                        Some(fitted.question == whole.question),
+                        (whole.keys != "esc write instead").then(|| fitted.keys == whole.keys),
+                        Some(fitted.words == whole.words),
+                        (!whole.place.is_empty()).then(|| fitted.place == whole.place),
+                        whole.name.as_ref().map(|_| fitted.name == whole.name),
+                    ];
+                    let parts: Vec<bool> = parts.into_iter().flatten().collect();
+                    for (at, &kept) in parts.iter().enumerate() {
+                        assert!(
+                            !kept || parts[at + 1..].iter().all(|&later| later),
+                            "{width}: {}",
+                            text(&hint(ask, 0, of, width))
+                        );
+                    }
+                    // Whatever is cut ends in `…`, and a key is whole.
+                    let row = text(&hint(ask, 0, of, width));
+                    assert!(row.width() <= width, "{width}: {row}");
+                    if width >= 40 {
+                        assert!(row.ends_with(" esc write instead"), "{width}: {row}");
+                    }
+                    if fitted.question != whole.question {
+                        assert!(fitted.question.ends_with('…'));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
