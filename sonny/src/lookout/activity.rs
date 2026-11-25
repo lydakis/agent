@@ -131,7 +131,8 @@ pub enum Out {
 enum Asker {
     /// Named as its end names them.
     By(String),
-    /// A lookout note: the turn answers it, and its end is no event.
+    /// A lookout note or an invite to commons work ([`note`]): the turn
+    /// answers it, and its end is no event.
     Note,
 }
 
@@ -188,11 +189,11 @@ impl Activity {
     }
 
     /// Who wrote a message, as its event names them; `None` for the
-    /// subscriber, whose words are no event to it, for a lookout note, an
+    /// subscriber, whose words are no event to it, for a [`note`], an
     /// automation's run and the daemon telling a bot its background
-    /// command ended: how their turns end is the event.
+    /// command ended: how their turns end is the event, a note's aside.
     fn author(&self, data: &Value) -> Option<String> {
-        if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
+        if note(data)
             || (data["origin"]
                 .as_str()
                 .is_some_and(|origin| crate::trigger::sent_it(origin) || origin == "background")
@@ -211,7 +212,7 @@ impl Activity {
 
     /// Who asked for a turn a message started, as its end names them.
     fn asker(&self, data: &Value) -> Asker {
-        if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-")) {
+        if note(data) {
             return Asker::Note;
         }
         let origin = (data["origin"].as_str()).or(data["person"].as_str());
@@ -423,6 +424,17 @@ impl Activity {
         }
         self.approvals.insert((task.to_owned(), call.to_owned()))
     }
+}
+
+/// Whether a message is a note to the task rather than anyone's words to
+/// it, so neither it nor how the turn it starts ends is news: a lookout
+/// note, and the commons' invites to its work (a thread's invite, a work
+/// round, a golden ticket), known by their origin as an automation's run
+/// is. What the task does about one, a post or work it takes, reaches the
+/// subscriber through what it follows there.
+fn note(data: &Value) -> bool {
+    (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
+        || (data["origin"] == crate::commons::ORIGIN && data["from"]["bot"].is_null())
 }
 
 /// Who asked for a turn, as its end names them: `you` for the subscriber,
@@ -786,6 +798,48 @@ mod tests {
             json!({"status": "completed"}),
         );
         assert!(activity.event(&ended, None, 2).is_empty());
+    }
+
+    #[test]
+    fn a_commons_invite_to_a_task_tells_its_lead_nothing() {
+        let mut activity = Activity::new("calc.lead");
+        let ended = |turn| {
+            ev(
+                "calc.ui",
+                turn,
+                "turn_finished",
+                json!({"status": "completed", "checkpoint": 9}),
+            )
+        };
+        // An invite, a work round and a golden ticket queue as their own turn.
+        for (turn, request) in [
+            (5, "commons.invite.store"),
+            (7, "commons.round.store.bill"),
+            (9, "commons.invite.store.golden"),
+        ] {
+            let invite = json!({"origin": "commons", "request_id": request,
+                "from": {"bot": null}, "node": 4});
+            let queued = ev("calc.ui", turn, "queued", invite.clone());
+            assert!(activity.event(&queued, None, 1).is_empty());
+            let accepted = ev("calc.ui", turn, "accepted", invite);
+            assert!(activity.event(&accepted, None, 2).is_empty());
+            assert!(activity.event(&ended(turn), None, 3).is_empty());
+        }
+        // Nor does it brief the task, so the person's next words are news.
+        let person =
+            reads(activity.event(&ev("calc.ui", 11, "accepted", json!({"node": 12})), None, 4));
+        assert_eq!(person.len(), 1);
+        assert!(matches!(&person[0].kind, Kind::Words { from, brief: None, .. } if from == PERSON));
+        let told = reads(activity.event(&ended(11), None, 5));
+        assert!(matches!(&told[0].kind, Kind::Reply { asked_by: Some(by), .. } if by == PERSON));
+    }
+
+    #[test]
+    fn an_agent_s_message_sent_from_the_commons_is_still_its_words() {
+        let mut activity = Activity::new("calc.lead");
+        let from_agent = json!({"origin": "commons", "from": {"bot": "shop.w1"}, "node": 4});
+        let pending = reads(activity.event(&ev("calc.ui", 3, "accepted", from_agent), None, 1));
+        assert!(matches!(&pending[0].kind, Kind::Words { from, .. } if from == "shop.w1"));
     }
 
     #[test]
