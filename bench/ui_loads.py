@@ -112,6 +112,10 @@ class Term(Screen):
                 except Exception:  # noqa: BLE001 - a sequence pyte cannot take
                     self.stream = pyte.ByteStream(self.screen)
                 lines = list(self.screen.display)
+                buffer = self.screen.buffer
+                # The rows drawn in reverse video: where a list's pick is.
+                self.reversed = [lines[y] for y in range(self.screen.lines)
+                                 if any(buffer[y][x].reverse for x in range(self.screen.columns))]
             with self.stamp_lock:
                 for watch in self.watches:
                     for name, test in watch.tests.items():
@@ -167,6 +171,11 @@ def has(*words):
 
 def lacks(*words):
     return lambda lines: not any(all(w in line for w in words) for line in lines)
+
+
+def picked(term, *words):
+    """The list's pick, the row in reverse video, holds these words."""
+    return lambda lines: any(all(w in row for w in words) for row in getattr(term, 'reversed', []))
 
 
 def composer_reads(text):
@@ -415,8 +424,8 @@ def run(build, size, args, tapped=False):
         for _ in range(args.repeat):
             timed('projects', LEFT, first_row=both(last_row, lacks('reading…')), head=head)
             # Moving the pick down and back up.
-            timed('pick', DOWN, drawn=lambda lines: True)
-            timed('pick', UP, drawn=lambda lines: True)
+            timed('pick', DOWN, moved=picked(window, title(1)))
+            timed('pick', UP, moved=picked(window, title(0)))
             back(window)
         # Switching leads from Projects: to a lead this window has not
         # shown yet (↓ k times from p0 to pk), then back to p0, which it has.
@@ -433,9 +442,13 @@ def run(build, size, args, tapped=False):
         # /switch: open, then type to narrow.
         for _ in range(args.repeat):
             timed('switch', b'/switch\r', listed=has('p0.t1'))
-            for letter in b'p1.t':
-                timed('switch_type', bytes([letter]), drawn=lambda lines: True)
-            timed('switch_type', b'2', drawn=lambda lines: True, narrowed=both(has('p1.t2'), lacks('p0.t1')))
+            # Each letter shows in the list's filter; the last one leaves
+            # p1.t2 and not p0.t1.
+            for n, letter in enumerate('p1.t2'):
+                tests = {'typed': composer_reads('p1.t2'[:n + 1])}
+                if letter == '2':
+                    tests['narrowed'] = both(has('p1.t2'), lacks('p0.t1'))
+                timed('switch_type', letter.encode(), **tests)
             back(window)
             back(window)
         # The pages.
