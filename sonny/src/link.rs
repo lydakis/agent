@@ -2214,21 +2214,20 @@ const BUSY_AGAIN: Duration = Duration::from_millis(250);
 /// Why the machines linked here handed over nothing.
 #[derive(Debug, PartialEq)]
 enum Unhanded {
-    /// None of these has the file: it is on a machine not linked here.
+    /// None of these has the file, or none of them is connected.
     Nowhere(Vec<String>),
     /// Why it could not be had.
     Failed(String),
 }
 
 impl Unhanded {
-    /// Said of the file dropped from `path`: where it is not and how to
-    /// drop it, as a path from a machine with none linked is told.
+    /// Said of the file dropped from `path`: where it was not found, or
+    /// why it could not be had.
     fn dropped(self, path: &str) -> String {
         let name = (Path::new(path).file_name()).map_or(path.into(), |name| name.to_string_lossy());
         match self {
             Unhanded::Nowhere(asked) => format!(
-                "{name} is not on this machine or on {}; link the one it is on with \
-                 `sonny link` to drop files from it",
+                "{name} was not found on this machine or on {}",
                 asked.join(" or ")
             ),
             Unhanded::Failed(why) => format!("{name}: {why}"),
@@ -3035,15 +3034,13 @@ mod tests {
     }
 
     /// A dropped file no machine linked here has is said by its name,
-    /// with the machines asked and how to drop it, as one with none linked
-    /// is; any other failure by its name and why.
+    /// with the machines asked; any other failure by its name and why.
     #[test]
     fn a_dropped_file_none_here_has_says_where_it_is_not() {
         let nowhere = Unhanded::Nowhere(vec!["mini".into(), "desk".into()]);
         assert_eq!(
             nowhere.dropped("/Users/someone/Desktop/shot 1.png"),
-            "shot 1.png is not on this machine or on mini or desk; link the one it is on \
-             with `sonny link` to drop files from it"
+            "shot 1.png was not found on this machine or on mini or desk"
         );
         let failed = Unhanded::Failed("Operation not permitted".into());
         assert_eq!(failed.dropped("/a/b.png"), "b.png: Operation not permitted");

@@ -42570,11 +42570,7 @@ mod tests {
         // is not.
         app.input.set("see ");
         app.prepare_dropped("/Users/someone/Desktop/shot.png".into(), || {
-            Err(
-                "shot.png is not on this machine or on mini; link the one it is on with \
-                 `sonny link` to drop files from it"
-                    .into(),
-            )
+            Err("shot.png was not found on this machine or on mini".into())
         });
         app.input.insert("and this");
         app.all_ready().await;
@@ -42583,7 +42579,7 @@ mod tests {
             app.notice
                 .as_deref()
                 .unwrap()
-                .starts_with("shot.png is not on this machine")
+                .starts_with("shot.png was not found")
         );
         // Cut with Ctrl-U before it failed, Ctrl-Y brings back its path.
         app.input.clear();
