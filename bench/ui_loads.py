@@ -173,10 +173,16 @@ def both(*tests):
     return lambda lines: all(test(lines) for test in tests)
 
 
-def bar(working, idle=None):
+def bar(working, idle=None, exact=False):
     """The status bar under the composer shows these counts: the row
-    after the composer's last line holds `● working` (and `○ idle`)."""
+    after the composer's last line holds `● working` (and `○ idle`). One
+    more working counts too: the lead's own turn as its window opens (the
+    upgrade note a fresh HOME's first lead gets) is rightly counted until
+    it ends."""
     def test(lines):
+        return one(working, lines) or (not exact and one(working + 1, lines))
+
+    def one(working, lines):
         for at, line in enumerate(lines):
             if '›' in line[:3] or 'Message' in line:
                 for below in lines[at + 1:at + 4]:
@@ -423,12 +429,12 @@ def run(build, size, args, tapped=False):
         # takes a turn of eight seconds.
         idle_task = next(f'p0.t{t}' for t in range(fleet.per - 1) if t % 3 and f'p0.t{t}' not in held)
         for k in range(args.repeat):
-            watch = window.expect(up=bar(own + 1))
+            watch = window.expect(up=bar(own + 1, exact=True))
             sent = need(fleet.control.request('submit', bot=idle_task, request_id=f'bar-{k}',
                                               prompt='delay:8000'), 'submit')
             up = watch.wait(10, need_all=False)['up']
             handle = f'{idle_task}/{sent["message"]}'
-            watch = window.expect(down=bar(own))
+            watch = window.expect(down=bar(own, exact=True))
             while need(fleet.control.request('wait', handles=[handle], timeout_ms=2_000),
                        'wait')['results'][handle].get('pending'):
                 pass
