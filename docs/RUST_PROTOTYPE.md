@@ -4696,8 +4696,8 @@ model call, when the effective view since the last summary reaches
 `compact_tokens`, the daemon summarizes everything
 older than the newest boundary whose tail holds `compact_keep` percent
 verbatim, limited by the room left after pinned context. A boundary is a
-turn's prompt or, [inside the newest turn](#cuts-inside-a-turn), a round
-start: the first item after a tool result that is not one, a model output or
+turn's prompt or, [inside any turn](#cuts-inside-a-turn) the summary
+reaches, a round start: the first item after a tool result that is not one, a model output or
 an absorbed steer. The item dimension can choose the cut even when small messages
 have barely consumed the byte budget. The summary is one model call, to the
 bot's own model or the `compaction_model` the client named at creation (same
@@ -5141,8 +5141,11 @@ CLI syntax, option scope, output, and exit conventions: [CLI.md](CLI.md).
 
 One long task can outgrow the budget inside a single submitted turn, even
 with its results [elided](#tool-result-elision): its own calls, messages,
-and stubs keep growing. So the newest turn offers more boundaries than its
-prompt: every model round after a completed tool exchange. The newest
+and stubs keep growing. So a turn offers more boundaries than its
+prompt: every model round after a completed tool exchange. This holds for
+every turn the walk back from the head passes, not only the newest, so a
+short turn that follows a long one whose earlier cut was inside it can
+still summarize the long one's rest at a round. The newest
 boundary whose tail reaches the keep target wins, whether a prompt or a
 round, so compaction leaves about `compact_keep` percent verbatim however
 the view is split into turns; a turn smaller than that is never cut. The
@@ -5159,17 +5162,25 @@ its `pinned_messages`, and while the window starts at that cut, the
 request carries the prompt as its first item after the pinned context,
 then those messages in the order they came, then the items from the cut.
 So a correction sent mid-turn never reads older than the prompt it
-corrects, as it would if only the summary told of it. They count against
-the room the prompt does; when the active turn would not fit beside them,
-the oldest go into the summary first, since a later message may overrule
-an earlier one but not the other way round. The summary header says `covering turns A to
+corrects, as it would if only the summary told of it. They take no more
+than the bytes the summary keeps verbatim (`compact_keep` percent of the
+threshold), newest first, as Codex keeps the person's newest messages
+beside its summary within a budget (`build_compacted_history`); older ones
+are left to the summary, which reads them as part of its span. Without
+that bound, a lead that waits for hours with messages joining its turn
+every round kept all of them whole, each summary covered only the waits
+between them, and the view passed the model's window. They also count
+against the room the prompt does; when the active turn would not fit
+beside them, the oldest go into the summary first, since a later message
+may overrule an earlier one but not the other way round. The summary header says `covering turns A to
 B and the start of turn C`, or `covering the start of turn C`, and its
 list of verbatim user messages leaves out turn C's prompt, which follows
 in full; the list keeps it for when a later compaction covers the whole
 turn. The context note counts the messages it leaves out of turn C
 separately from earlier turns. A second cut in the same turn summarizes
 from the first, merging the previous summary, and keeps the same prompt
-and messages, with those sent since the first cut after them.
+and messages, with those sent since the first cut after them, within the
+same bound.
 Once the turn has ended, a later cut at a turn's prompt covers it whole.
 The turn keeps running for its clients throughout: events, steers,
 approvals, and its checkpoint are unchanged; only what the next request

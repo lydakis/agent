@@ -2487,7 +2487,7 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 Some(text) => format!(": {text}"),
                 None => String::new(),
             };
-            let mut text = match (n, post["do"].as_str()) {
+            let text = match (n, post["do"].as_str()) {
                 (0, Some(_)) => format!(
                     "new work {thread} on {}, \"{title}\"{text}",
                     board.as_deref().unwrap_or_default()
@@ -2496,30 +2496,43 @@ pub fn news(home: &Path, cursor: &Path) -> News {
                 (_, Some(done)) => format!("{done} in {thread}, \"{title}\"{text}"),
                 (_, None) => format!("reply in {thread}, \"{title}\"{text}"),
             };
-            // Work it opened beside its own.
-            let others: Vec<&str> = (post["opened"].as_array().into_iter().flatten())
-                .filter_map(Value::as_str)
-                .filter(|opened| *opened != thread)
-                .collect();
-            if !others.is_empty() {
-                text.push_str(&format!("\nIt opened {}.", others.join(", ")));
-            }
             let mut line = json!({"id": format!("{thread}/{n}"), "topic": thread, "text": text});
             if let Some(by) = post["by"].as_str() {
                 line["from"] = json!(by);
             }
-            // Where a board's follow hears it, what it did, and the items
-            // it opened, which a worker's follow is steered by.
+            // Where a board's follow hears it, and what it did: one step,
+            // one event.
             if let Some(board) = &board {
                 line["board"] = json!(board);
                 line["event"] = json!(crate::board::event_of(&posts, n, &thread));
             }
-            for key in ["do", "opened"] {
-                if !post[key].is_null() {
-                    line[key] = post[key].clone();
-                }
+            if !post["do"].is_null() {
+                line["do"] = post["do"].clone();
             }
             lines.push(line.to_string());
+            // Each other work the step opened, its last need done: that
+            // work's own news, on its own thread, heard as it opening.
+            let others = (post["opened"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .filter(|opened| *opened != thread && valid_name(opened).is_ok());
+            for opened in others {
+                let title = first_post(&dir.join(format!("{opened}.jsonl")))
+                    .and_then(|first| first["title"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let mut line = json!({"id": format!("{thread}/{n}/opened/{opened}"),
+                "topic": opened, "event": "opened",
+                "text": format!(
+                    "{opened} opened on {}, \"{title}\": what it needed is done, {thread} last",
+                    board.as_deref().unwrap_or_default()
+                )});
+                if let Some(board) = &board {
+                    line["board"] = json!(board);
+                }
+                if let Some(by) = post["by"].as_str() {
+                    line["from"] = json!(by);
+                }
+                lines.push(line.to_string());
+            }
             // The board's last work settling: the board's own news, on no
             // thread, so the thread's followers hear the post alone.
             if let Some(emptied) = post["emptied"].as_str() {
