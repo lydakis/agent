@@ -17261,9 +17261,7 @@ fn messages_kept_beside_a_cut_s_prompt_take_the_kept_bytes_newest_first() {
         bytes: 64 << 10,
         items: 256,
     };
-    let mut steers: Vec<i64> = (0..6)
-        .map(|n| round_and_steer(&mut db, turn, n))
-        .collect();
+    let mut steers: Vec<i64> = (0..6).map(|n| round_and_steer(&mut db, turn, n)).collect();
     exchange(&mut db, turn, "c6", &lines(6, 2));
     let plan = compaction_plan(&db, "Bob", 3000, 64 << 10, 256)
         .unwrap()
