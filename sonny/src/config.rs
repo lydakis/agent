@@ -190,9 +190,9 @@ pub const SETTINGS: &[Setting] = &[
         group: "Agents",
         name: "away",
         label: "minutes without you before leads hold news for your return; 0 never",
-        about: "minutes without your use of any window, or a message through sonny acp, before every lead is told you are away; it puts only decisions to you and tells the rest in one message once you are back; 0 never",
+        about: "minutes without your use of any window, or a message through sonny acp, before every lead is told you are away; it puts only decisions to you and tells the rest in one message once you are back, which it hears when you look at it; 0 never",
         values: &[],
-        default: "30",
+        default: "20",
     },
     Setting {
         key: "sonny.ask_wait_minutes",
