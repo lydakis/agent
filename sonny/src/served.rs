@@ -1357,11 +1357,8 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                         json!(crate::commons::mention(&home, &said, &caller, &mentioned).await);
                 }
             }
-            if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
-                said["invited"] = json!(
-                    crate::commons::invite(&home, &said, (&caller, invocation.turn), &invite).await
-                );
-            }
+            // A new thread's `invite` goes back to the tool host, which
+            // sends its invites once the post has answered ([`invites_after`]).
             Ok(said.to_string())
         }
         crate::asks::CLOSE => {
@@ -3057,7 +3054,10 @@ async fn answer(
         .and_then(|line| serde_json::from_str(line).ok());
     match said {
         Some(said) if said["output"].is_string() => {
-            let output = str_of(&said["output"]);
+            let mut output = str_of(&said["output"]);
+            if name == COMMONS {
+                output = invites_after(output, &invocation);
+            }
             noted(name, bot, turn, &arguments, &output).await;
             Ok(output)
         }
@@ -3070,6 +3070,29 @@ async fn answer(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         )),
     }
+}
+
+/// A commons post's answer without the `invite` a new thread holds, whose
+/// invites the host sends once the post has answered: aiming them searches
+/// every agent's turns for each of the thread's words, which the posting
+/// agent need not wait on. It runs in the host, which outlives the call.
+fn invites_after(output: String, invocation: &Invocation) -> String {
+    let Ok(mut said) = serde_json::from_str::<Value>(&output) else {
+        return output;
+    };
+    let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) else {
+        return output;
+    };
+    if let (Some(home), Some(socket)) = (
+        std::env::var_os("HOME").map(PathBuf::from),
+        invocation.socket.clone(),
+    ) {
+        let (started, author, turn) = (said.clone(), invocation.bot.clone(), invocation.turn);
+        tokio::spawn(async move {
+            crate::commons::invite(&home, &socket, &started, (&author, turn), &invite).await;
+        });
+    }
+    said.to_string()
 }
 
 /// What the host keeps between turns of a call it answered: the call runs
