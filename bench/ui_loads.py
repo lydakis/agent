@@ -271,7 +271,7 @@ class Fleet:
         waiting = list(handles)
         while waiting:
             batch, waiting = waiting[:64], waiting[64:]
-            found = need(self.control.request('wait', handles=batch, timeout_ms=600_000), 'wait')
+            found = need(self.control.request('wait', handles=batch, timeout_ms=3_000), 'wait')
             for handle, result in found['results'].items():
                 if result.get('pending'):
                     waiting.append(handle)
@@ -429,7 +429,7 @@ def run(build, size, args, tapped=False):
             up = watch.wait(10, need_all=False)['up']
             handle = f'{idle_task}/{sent["message"]}'
             watch = window.expect(down=bar(own))
-            while need(fleet.control.request('wait', handles=[handle], timeout_ms=30_000),
+            while need(fleet.control.request('wait', handles=[handle], timeout_ms=2_000),
                        'wait')['results'][handle].get('pending'):
                 pass
             watch.began = time.monotonic()
@@ -456,7 +456,7 @@ def run(build, size, args, tapped=False):
         began = time.monotonic()
         window = fleet.window('p1.lead', 1, sock=sock)
         own1 = sum(1 for bot in held if bot.startswith('p1.'))
-        watch = window.expect(composer=has('Message'), conversation=has('hello from p1.lead'), bar=bar(own1))
+        watch = window.expect(composer=has('Message p1 lead'), bar=bar(own1))
         watch.began = began
         result['window2_start'] = watch.wait(300)
         quiet([window.pid, daemon.pid])
@@ -472,7 +472,7 @@ def typing(fleet, window, held, args):
     """Key to character, in ms, while BUSY open tasks no one holds run
     turns back to back."""
     stop, turns = threading.Event(), [0]
-    free = [f'p{n}.t{t}' for n in range(1, fleet.projects) for t in range(fleet.per - 1)
+    free = [f'p{n}.t{t}' for n in range(fleet.projects - 1, 1, -1) for t in range(fleet.per - 1)
             if t % 3 and f'p{n}.t{t}' not in held] or [f'p0.t{t}' for t in range(fleet.per - 1) if t % 3]
 
     def work(bot):
@@ -535,6 +535,9 @@ def builds(specs, out):
     return found
 
 
+PAGES = ('projects', 'switch', 'status', 'usage', 'background', 'commons', 'sky')
+
+
 def report(out):
     """Every round under OUT, set side by side: each timed thing's median
     over rounds and repeats, per build and size."""
@@ -546,10 +549,13 @@ def report(out):
             if isinstance(value, dict) and part not in ('idle', 'typing'):
                 value = [value]
             if isinstance(value, list):
-                for entry in value:
+                for at, entry in enumerate(value):
+                    # A page's first open in the window, apart from its
+                    # opens after.
+                    name = part if part not in PAGES else f'{part} {"first" if at == 0 else "again"}'
                     for measure, ms in entry.items():
                         if isinstance(ms, (int, float)):
-                            rows.setdefault((part, measure), {}).setdefault(key, []).append(ms)
+                            rows.setdefault((name, measure), {}).setdefault(key, []).append(ms)
             elif part in ('idle', 'typing'):
                 pass
         for part in ('idle', 'typing'):
