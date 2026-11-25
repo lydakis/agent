@@ -17,12 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: trace-1357
-            ref: claude/project-thread-wpfgqs-1357
-          - name: responsible-main
-            ref: c22724d1f969ef6975eb156aaec7102d4296f0a7
-          - name: responsible-fix
-            ref: claude/project-thread-wpfgqs-1296
+          - name: store-fix
+            ref: claude/project-thread-wpfgqs-1357-fix
+          - name: store-main
+            ref: 634308244527c41e1586594d1a55bfe823d193d1
     runs-on: macos-26
     timeout-minutes: 60
     defaults:
@@ -59,7 +57,7 @@ jobs:
           print(f'RESULT {name}: {fails} failed of {runs}', flush=True)
           PY
           ls -la "$LIB" "$SONNY"
-          if [ "${{ matrix.name }}" = trace-1357 ]; then
+          if true; then
             python3 loop.py store-checkpoint 1500 8 "$LIB" store::tests::a_long_log_is_checkpointed_beside_the_writer_and_starts_over
           else
             # Under load: eight busy loops beside twelve runs at once.
