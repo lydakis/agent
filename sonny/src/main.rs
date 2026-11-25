@@ -456,9 +456,13 @@ impl<B: Backend<Error = std::io::Error> + std::io::Write> Drawn for B {}
 /// it back: an answer late through a multiplexer or a slow link ends Sonny
 /// with "the cursor position could not be read", and nothing here needs
 /// the cursor kept. The window's size is read anew for it, should a
-/// resize have gone unsaid.
+/// resize have gone unsaid; and the frame that draws it whole is written
+/// even when it is the last frame's very bytes, as the terminal may have
+/// lost that frame (a pane laid out again as a lead opens in place of
+/// another, the screen cleared with the size the same).
 fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
     term::resized();
+    frames::forget();
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))
 }
