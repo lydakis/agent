@@ -67,7 +67,7 @@
 //! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
 //! commons_pointer = false       # a new task's brief names no commons threads sharing its words, on by default
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0: go now, no reminder
-//! away_minutes = 30             # minutes without your use of any window, or a message through `sonny acp`, before leads are told you are away; 0 never
+//! away_minutes = 20             # minutes without your use of any window, or a message through `sonny acp`, before leads are told you are away; each hears you are back once you look at it; 0 never
 //! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! most_task_tabs = 64          # task tabs a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
@@ -974,7 +974,7 @@ pub const TASK_WORKTREES: u64 = 15;
 
 /// How long the person goes without using Sonny, in minutes, before the
 /// leads are told they are away, unless `away_minutes` says otherwise.
-pub const AWAY_MINUTES: u64 = 30;
+pub const AWAY_MINUTES: u64 = 20;
 
 /// The most rows a note draws unless `margin_note_lines` says otherwise:
 /// state to glance at beside the conversation; anything longer goes in

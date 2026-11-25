@@ -1348,14 +1348,15 @@ impl Session {
         if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
             return Ok(json!({"stopReason": "end_turn"}));
         }
-        // The person wrote: they are here, and back if they were away.
-        crate::away::here();
         let bound = {
             let mut state = self.state.lock().await;
             state.cancelled = false;
-            state.bound.is_some()
+            state.bound.as_ref().map(|bound| bound.bot.clone())
         };
-        if !bound {
+        // The person wrote: they are here, and back for the agent they
+        // wrote to, if it was told they were away.
+        crate::away::here(bound.as_deref());
+        if bound.is_none() {
             // The first prompt of a thread T3 Code opened for a task is
             // that task's brief.
             let claimed = t3::claim(&text, &self.cwd);
@@ -1379,8 +1380,10 @@ impl Session {
                 self.state.lock().await.prompt = None;
                 return Err((FAILED, error));
             }
+            // The agent they wrote to, now that the thread has one.
+            let bot = (self.state.lock().await.bound.as_ref()).map(|b| b.bot.clone());
+            crate::away::here(bot.as_deref());
             if chosen.is_some() {
-                let bot = (self.state.lock().await.bound.as_ref()).map(|b| b.bot.clone());
                 let said = format!("This thread is {}.", bot.unwrap_or_default());
                 agent.out.update(
                     &self.id,

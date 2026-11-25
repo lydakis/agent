@@ -11902,6 +11902,9 @@ impl App {
     /// no tab, it opens in the pane, landing on what it needs with `land`.
     fn open_agent(&mut self, bot: &str, other: bool, land: bool) {
         use agent_client::config::AgentOpens;
+        // The person looks at it now: back, for it, if it was told they
+        // were away.
+        crate::away::here(Some(bot));
         let tab = (self.agent_opens == AgentOpens::Tab) != other;
         match &mut self.fleet {
             Some(fleet) if tab => fleet.go_to(bot, true),
@@ -22709,6 +22712,9 @@ impl App {
     /// if opened on it; one drawn in a pane asks the Sonny it is drawn
     /// in to show `bot` there instead, leaving the main window as it is.
     fn switch_window(&mut self, bot: String) {
+        // The person looks at it now: back, for it, if it was told they
+        // were away.
+        crate::away::here(Some(&bot));
         if self.options.embedded {
             embed::open_here(&bot, std::mem::take(&mut self.land_after));
             return;
