@@ -91,6 +91,20 @@ pub struct Journal {
     pub replay: Mutex<Replay>,
 }
 
+/// The lock goes with the journal, not only with its descriptor: a
+/// command another thread starts meanwhile holds a copy of every
+/// descriptor until it execs, and the lock with it, so a host that let go
+/// would still turn the next one away. An unlock through any copy lets go
+/// for all of them.
+impl Drop for Journal {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.get_mut().unwrap_or_else(|e| e.into_inner()) {
+            // SAFETY: flock on a descriptor `file` owns and keeps open.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 /// What an earlier run of a script recorded.
 #[derive(Default, Debug)]
 pub struct Replay {
@@ -443,6 +457,40 @@ mod tests {
         let path = path(Path::new("/s.exec"), 42, "call_ab/c-1");
         let name = path.file_name().unwrap().to_str().unwrap();
         assert_eq!(call_of(name), Some((42, "call_ab/c-1".to_owned())));
+    }
+
+    #[test]
+    fn a_journal_let_go_is_free_while_a_command_started_meanwhile_holds_its_descriptor() {
+        use std::io::{Read, Write};
+        use std::os::unix::process::CommandExt;
+        let dir = scratch("let-go");
+        let at = path(&dir, 1, "c");
+        let journal = Journal::begin(at.clone()).unwrap();
+        journal.start(json!({"t": "start", "v": VERSION, "code": "x"}));
+        // A command started on another thread, held between its fork and
+        // its exec, where it has a copy of every descriptor: it says so,
+        // and waits to be let on.
+        let (mut forked, forked_in) = std::io::pipe().unwrap();
+        let (go_out, mut go) = std::io::pipe().unwrap();
+        let (told, waits) = (forked_in.as_raw_fd(), go_out.as_raw_fd());
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        // SAFETY: only write and read, on descriptors the child has.
+        unsafe {
+            command.pre_exec(move || {
+                let mut byte = 0u8;
+                libc::write(told, (&raw const byte).cast(), 1);
+                libc::read(waits, (&raw mut byte).cast(), 1);
+                Ok(())
+            });
+        }
+        let started = std::thread::spawn(move || command.status());
+        forked.read_exact(&mut [0]).unwrap();
+        drop(journal);
+        let taken = matches!(Journal::claim(&at), Claim::Taken(_));
+        go.write_all(&[0]).unwrap();
+        assert!(started.join().unwrap().unwrap().success());
+        assert!(taken, "the journal let go is still held");
     }
 
     #[test]
