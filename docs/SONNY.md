@@ -1156,11 +1156,13 @@ News the commons addresses to one agent is the commons source's, as any
 post is, never a message of Sonny's: `@NAME` of an agent the daemon lists,
 open or closed, in a post or a reply is `mentioned`; work kept for an
 agent (`for`) is `asked`; work it still holds at a turn's end, as above,
-is `holding`. Each is one event, with `to` naming the agent, `thread`,
-`board` when on one, `from` when someone said it, and no topic, so a
-thread's followers hear its posts alone. The agent hears them through one
-ordinary follow, `to-me` (the commons source filtered on `{"to":
-[NAME]}`, steering every event, lasting while the agent is closed), which
+is `holding`. Each is one event, with `to` naming the agent and `to_id`
+its id, `thread`, `board` when on one, `from` when someone said it, and
+no topic, so a thread's followers hear its posts alone. The agent hears
+them through one ordinary follow, `to-me` (the commons source filtered
+on `{"to": [NAME], "to_id": [ID]}`, so an agent made again under the name
+hears none of what was said to the one before, steering every event,
+lasting while the agent is closed), which
 whatever first addresses the agent makes, and never rewrites: the agent
 digests, filters or removes it with its follows tool. Never-addressed
 agents have none. Sonny makes it once per agent (noted by name and id in

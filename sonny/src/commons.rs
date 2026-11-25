@@ -1116,7 +1116,9 @@ pub const TO_ME: &str = "to-me";
 const TO_ME_ABOUT: &str = "it is addressed to you";
 
 /// What follows the commons' news addressed to `name`, known as `owner`:
-/// the commons source's events whose `to` names it, each as it comes,
+/// the commons source's events whose `to` names it, and whose `to_id` is
+/// `owner` when known, so an agent made again under the name does not
+/// hear what was said to the one before, each as it comes,
 /// cutting into a busy turn, as an ordinary follow its agent can digest,
 /// filter or remove. It lasts while its agent is closed, since what is
 /// addressed to a closed agent still is.
@@ -1126,7 +1128,10 @@ pub fn to_me(name: &str, owner: Option<i64>) -> crate::lookout::subs::Sub {
         tasks_of: Vec::new(),
         agents: Vec::new(),
         sources: vec![agent_client::config::COMMONS_SOURCE.to_owned()],
-        filter: Some(json!({"to": [name]})),
+        filter: Some(match owner {
+            Some(id) => json!({"to": [name], "to_id": [id]}),
+            None => json!({"to": [name]}),
+        }),
         digest: None,
         steer: Some(crate::board::every()),
         owner,
@@ -1161,6 +1166,11 @@ impl Addressed {
     pub(crate) fn line(&self) -> Value {
         let mut line = json!({"id": self.id, "event": self.event, "to": self.to,
             "thread": self.thread, "text": self.text});
+        // The agent's id too: one made again under the name hears none
+        // of what was said to the one before.
+        if let Some(id) = self.to_id {
+            line["to_id"] = json!(id);
+        }
         if let Some(from) = &self.from {
             line["from"] = json!(from);
         }
@@ -4985,13 +4995,13 @@ mod tests {
             lines,
             [
                 json!({"id": "store/1/mentioned/shop.w.1", "event": "mentioned",
-                    "to": "shop.w.1", "thread": "store", "board": "shop/errors",
+                    "to": "shop.w.1", "to_id": 7, "thread": "store", "board": "shop/errors",
                     "from": "shop.lead", "text": "mentioned shop.w.1"}),
                 json!({"id": "store/2/asked/shop.w.1", "event": "asked", "to": "shop.w.1",
-                    "thread": "store", "board": "shop/errors", "from": "shop.lead",
+                    "to_id": 7, "thread": "store", "board": "shop/errors", "from": "shop.lead",
                     "text": "asked shop.w.1"}),
                 json!({"id": "store/3/holding/shop.w.1", "event": "holding",
-                    "to": "shop.w.1", "thread": "store", "board": "shop/errors",
+                    "to": "shop.w.1", "to_id": 7, "thread": "store", "board": "shop/errors",
                     "text": "holding shop.w.1"}),
             ]
         );
@@ -5158,6 +5168,10 @@ mod tests {
         };
         assert!(address(&home, &store, &newer));
         assert_eq!(subs::read(&store, "shop.w.1"), [to_me("shop.w.1", Some(8))]);
+        // It hears its own news, not what was said to the one before.
+        let renewed = &subs::read(&store, "shop.w.1")[0];
+        assert!(heard(renewed, &newer.line()));
+        assert!(!heard(renewed, &mention.line()));
         let _ = std::fs::remove_dir_all(&home);
     }
 
