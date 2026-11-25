@@ -207,8 +207,8 @@ struct Sent {
 }
 
 /// Who a message that started a turn came from: a bot, the origin it
-/// went with, and whether a lookout note sent it, whose turn's end is no
-/// event.
+/// went with, and whether it was a note ([`activity::note`]: a lookout
+/// note or a commons invite), whose turn's end is no event.
 #[derive(Clone)]
 struct Asked {
     from: Option<String>,
@@ -1432,8 +1432,7 @@ impl Service {
                 // The message that starts a turn names who asked for it.
                 if kind != "steered" {
                     let text = |value: &Value| value.as_str().map(str::to_owned);
-                    let note =
-                        (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"));
+                    let note = activity::note(data);
                     let origin = text(&data["origin"]).or(text(&data["person"]));
                     let from = text(&data["from"]["bot"]);
                     let asked = Asked { from, origin, note };
@@ -4094,6 +4093,37 @@ mod tests {
         let mut ended = in_line("calc.fix", 5, "message_ended", failed);
         ended["data"]["from"] = from["from"].clone();
         assert_eq!(service.bounced(&ended, true).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_message_steered_into_a_commons_invite_s_failed_turn_bounces() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        service
+            .watchers
+            .insert("calc.fix".into(), vec!["calc.lead".into()]);
+        service.lookouts.insert("calc.lead".into(), seated());
+        let from = json!({"from": {"bot": "calc.lead", "turn": 1, "bot_id": 1}});
+        let failed = json!({"status": "failed", "error": "provider_http_400"});
+        // The lead steers into a turn: the person's turn ends as the tasks
+        // source tells it, but an invite's ends with no event, so the lead
+        // hears it fail only by its bounce, as for a lookout note's turn.
+        for (turn, started, bounces) in [
+            (4, json!({"node": 2}), false),
+            (
+                6,
+                json!({"origin": "commons", "request_id": "commons.invite.t"}),
+                true,
+            ),
+            (8, json!({"request_id": "lookout-abc"}), true),
+        ] {
+            service.bounced(&ev("calc.fix", turn, "accepted", started), true);
+            let mut steered = json!({"bot": "calc.fix", "turn": turn, "message": turn + 1,
+                "event": "steered", "data": {"message": turn + 1, "node": 9}});
+            steered["data"]["from"] = from["from"].clone();
+            service.bounced(&steered, true);
+            let ended = ev("calc.fix", turn, "turn_finished", failed.clone());
+            assert_eq!(service.bounced(&ended, true).len(), usize::from(bounces));
+        }
     }
 
     #[tokio::test]
