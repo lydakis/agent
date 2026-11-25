@@ -3605,17 +3605,31 @@ mod tests {
         assert_eq!(closed("**done** and *more"), "**done** and *more*");
     }
 
+    /// The CPU time this thread has used. The cost tests below compare
+    /// it rather than the time on the clock, which also counts the time
+    /// a busy runner gave this thread's CPU to the tests beside it.
+    fn thread_time() -> std::time::Duration {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `now` is a valid timespec for the call to fill.
+        let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+        assert_eq!(read, 0, "{}", std::io::Error::last_os_error());
+        std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    }
+
     #[test]
     fn a_long_fence_streamed_costs_its_length_once() {
         let time = |lines: usize| {
             let mut markdown = Markdown::default();
-            let started = std::time::Instant::now();
+            let started = thread_time();
             markdown.feed("```", 80, false);
             for at in 0..lines {
                 markdown.feed(&format!("line {at} of the code"), 80, false);
             }
             markdown.feed("```", 80, false);
-            started.elapsed()
+            thread_time() - started
         };
         let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
         for _ in 0..5 {
@@ -3632,13 +3646,13 @@ mod tests {
     fn a_long_paragraph_streamed_costs_its_length_once() {
         let time = |lines: usize| {
             let mut markdown = Markdown::default();
-            let started = std::time::Instant::now();
+            let started = thread_time();
             for at in 0..lines {
                 markdown.open(&format!("line {at} of the"), 80, false);
                 markdown.feed(&format!("line {at} of the `long` paragraph"), 80, false);
             }
             markdown.end(80, false);
-            started.elapsed()
+            thread_time() - started
         };
         let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
         for _ in 0..5 {
@@ -3655,7 +3669,7 @@ mod tests {
     fn a_long_list_streamed_costs_its_length_once() {
         let time = |items: usize| {
             let mut markdown = Markdown::default();
-            let started = std::time::Instant::now();
+            let started = thread_time();
             for at in 0..items {
                 markdown.open(&format!("1. item {at} of the"), 80, false);
                 markdown.feed(&format!("1. item {at} of the **list**"), 80, false);
@@ -3663,7 +3677,7 @@ mod tests {
                 markdown.feed("   its words go on", 80, false);
             }
             markdown.end(80, false);
-            started.elapsed()
+            thread_time() - started
         };
         let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
         for _ in 0..5 {
