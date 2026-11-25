@@ -39,7 +39,8 @@ type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 /// the next free reader runs on its own connection, so no thread or
 /// connection is kept for them. One reader at a time runs them: asks
 /// made while one is queued are that one, and an ask while it runs has
-/// that reader run one more after it. Each is counted as the
+/// that reader run one more after it. One that stops short of the log's
+/// end, having moved, runs once more at once. Each is counted as the
 /// `checkpoint` operation from when it was asked for. With no room in the
 /// queue the ask is dropped, and the writer checkpoints itself as the log
 /// grows, as SQLite would have. The writer's own checkpoints are counted
@@ -77,18 +78,28 @@ fn checkpoints(
             let (state, counters, running) = (state.clone(), counters.clone(), held.clone());
             pool.push(
                 Box::new(move |db: &Database| {
+                    // One that stops short of the log's end, having moved,
+                    // runs once more at once: a read the writer's last
+                    // commit began can hold it for a moment after.
+                    let mut again = false;
                     loop {
                         let started = std::time::Instant::now();
                         let found = {
                             let _running = running.lock().unwrap_or_else(|e| e.into_inner());
                             db.checkpoint()
                         };
+                        let mut short = false;
                         if let Ok((frames, copied)) = found
                             && frames >= 0
                         {
-                            counters.log.note(frames, copied);
+                            short = counters.log.note(frames, copied) && copied < frames;
                         }
                         counters.record("checkpoint", asked, started, found.is_err());
+                        if short && !again {
+                            again = true;
+                            asked = std::time::Instant::now();
+                            continue;
+                        }
                         if state.compare_exchange(1, 0, SeqCst, SeqCst).is_ok() {
                             break;
                         }
@@ -1957,10 +1968,22 @@ mod tests {
         }))
         .await
         .unwrap();
-        let checkpoints = || store.stats()["operations"]["checkpoint"]["count"].as_u64();
+        // Until a checkpoint has copied the whole log back.
+        let copied = || {
+            let found = &store.stats()["checkpoints"];
+            let (log, copied) = (
+                found["log_frames"].as_i64(),
+                found["copied_frames"].as_i64(),
+            );
+            log.is_some_and(|log| log > 1000 && copied >= Some(log))
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while checkpoints().is_none_or(|n| n == 0) {
-            assert!(std::time::Instant::now() < deadline, "no checkpoint ran");
+        while !copied() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no checkpoint copied the log back: {}",
+                store.stats()
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         // All of the log is copied back, so the next commit starts it over
