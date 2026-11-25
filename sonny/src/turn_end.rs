@@ -398,10 +398,11 @@ pub fn finished(
     // The work it opened is asked about however it ended.
     let rounds = ends().lock().unwrap().rounds(&bot, turn);
     if !rounds.is_empty() {
-        let (home, socket, bot) = (home.clone(), socket.clone(), bot.clone());
+        let (home, store, socket, bot) = (home.clone(), store.clone(), socket.clone(), bot.clone());
         tokio::spawn(async move {
             for (board, opened) in rounds {
-                crate::commons::round(&home, &socket, &board, &opened, (&bot, Some(turn))).await;
+                let daemon = (store.as_path(), socket.as_path());
+                crate::commons::round(&home, daemon, &board, &opened, (&bot, Some(turn))).await;
             }
         });
     }

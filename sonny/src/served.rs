@@ -3083,13 +3083,15 @@ fn invites_after(output: String, invocation: &Invocation) -> String {
     let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) else {
         return output;
     };
-    if let (Some(home), Some(socket)) = (
+    if let (Some(home), Some(store), Some(socket)) = (
         std::env::var_os("HOME").map(PathBuf::from),
+        invocation.store.clone(),
         invocation.socket.clone(),
     ) {
         let (started, author, turn) = (said.clone(), invocation.bot.clone(), invocation.turn);
         tokio::spawn(async move {
-            crate::commons::invite(&home, &socket, &started, (&author, turn), &invite).await;
+            let daemon = (store.as_path(), socket.as_path());
+            crate::commons::invite(&home, daemon, &started, (&author, turn), &invite).await;
         });
     }
     said.to_string()

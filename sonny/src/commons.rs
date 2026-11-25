@@ -915,9 +915,10 @@ fn filled(ranked: &[(f64, Vec<String>)], want: usize) -> Option<f64> {
 }
 
 /// The live agents besides `author` whose turns hold `word`, as its search
-/// finds them, newest first: older pages too, while a page's matches are
-/// all the author's or agents already found, so a busy poster crowds out
-/// no one.
+/// finds them, newest first. A page holds so many matches, not agents, so
+/// older pages too while one brings someone new, as a word many agents
+/// said fills a page with a few of them, or none is found yet, so a busy
+/// poster crowds out no one: up to `SEARCH_PAGES`.
 async fn holders(
     client: &agent_client::Client,
     word: &str,
@@ -944,7 +945,7 @@ async fn holders(
             }
         }
         before = said["next_before"].clone();
-        if new || before.is_null() {
+        if (!new && !found.is_empty()) || before.is_null() {
             break;
         }
     }
@@ -978,11 +979,8 @@ async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
 
 /// The agents in zen now, by name, found by the key their zen is kept
 /// under.
-async fn in_zen(client: &agent_client::Client, home: &Path) -> Vec<String> {
-    let Ok((store, _)) = crate::daemon_paths(None, None) else {
-        return Vec::new();
-    };
-    let store = std::fs::canonicalize(&store).unwrap_or(store);
+async fn in_zen(client: &agent_client::Client, home: &Path, store: &Path) -> Vec<String> {
+    let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.to_owned());
     let mut zen = Vec::new();
     let mut after = json!("");
     while let Ok(page) = client
@@ -1023,7 +1021,7 @@ async fn in_zen(client: &agent_client::Client, home: &Path) -> Vec<String> {
 /// answered.
 pub async fn invite(
     home: &Path,
-    socket: &Path,
+    daemon: (&Path, &Path),
     started: &Value,
     (author, turn): (&str, Option<i64>),
     invite: &Value,
@@ -1035,7 +1033,7 @@ pub async fn invite(
     let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
     let seats = Seats {
         request: format!("commons.invite.{thread}"),
-        socket,
+        daemon,
         words: &words,
         reach,
         golden,
@@ -1062,7 +1060,7 @@ pub async fn invite(
 /// runtime.
 pub async fn round(
     home: &Path,
-    socket: &Path,
+    daemon: (&Path, &Path),
     board: &str,
     opened: &[(String, String)],
     (author, turn): (&str, Option<i64>),
@@ -1081,7 +1079,7 @@ pub async fn round(
     };
     let seats = Seats {
         request: format!("commons.round.{first}"),
-        socket,
+        daemon,
         words: &words,
         reach,
         golden,
@@ -1133,11 +1131,11 @@ pub fn round_note(board: &str, opened: &[(String, String)], author: &str, golden
 }
 
 /// What one thread's or round's invites are: the request each is sent as,
-/// the daemon's socket they go through, the words that aim them, how many,
-/// and whether one is a golden ticket.
+/// the daemon they go through, its store and socket, the words that aim
+/// them, how many, and whether one is a golden ticket.
 struct Seats<'a> {
     request: String,
-    socket: &'a Path,
+    daemon: (&'a Path, &'a Path),
     words: &'a [(String, f64)],
     reach: usize,
     golden: bool,
@@ -1154,7 +1152,7 @@ async fn sends(
 ) -> Vec<(String, bool)> {
     let Seats {
         request,
-        socket,
+        daemon: (store, socket),
         words,
         reach,
         golden,
@@ -1182,7 +1180,7 @@ async fn sends(
         }
         // An agent in zen talks about its focus alone: invite others.
         let zen = match crate::zen::any_in(home) {
-            true => in_zen(&client, home).await,
+            true => in_zen(&client, home, store).await,
             false => Vec::new(),
         };
         // Only those it may invite count toward who is found.
