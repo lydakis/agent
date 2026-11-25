@@ -68,10 +68,9 @@ pub fn valid_board(board: &str) -> Result<(), String> {
 /// What a board's follow hears, as the commons source names each step on
 /// a board in its `event`: work opening (new, open again, or its needs
 /// met), taken, dropped, settling, a plain thread starting there, the
-/// board's last work settling, held work going quiet, and work paused.
-pub const EVENTS: [&str; 10] = [
-    "opened", "taken", "dropped", "done", "failed", "canceled", "posted", "emptied", "quiet",
-    "paused",
+/// board's last work settling, and work paused.
+pub const EVENTS: [&str; 9] = [
+    "opened", "taken", "dropped", "done", "failed", "canceled", "posted", "emptied", "paused",
 ];
 
 /// A pattern every event of the commons matches, as a steer: each post,
@@ -81,10 +80,10 @@ pub fn every() -> Value {
 }
 
 /// What follows `board` for an agent: each of its [`EVENTS`] as it comes,
-/// cutting into a busy turn, so a worker that finished one piece hears
-/// the next open and a lead hears the board as it moves. A task's agents
-/// on the board follow it, the lead that started the task, and any agent
-/// that opens or takes work there. It ends with its agent.
+/// cutting into a busy turn, so a lead hears the board as it moves. The
+/// lead that started a task on the board follows it, and any agent that
+/// opens or takes work there; a task's agents follow it as [`works_from`]
+/// says. It ends with its agent.
 pub fn follow(board: &str, owner: Option<i64>) -> Sub {
     Sub {
         name: Sub::bounded(format!("board.{}", board.replace('/', "."))),
@@ -108,11 +107,18 @@ pub fn follow(board: &str, owner: Option<i64>) -> Sub {
 /// that follow as its task's board among others it may follow.
 const WORKS_FROM: &str = "you work from the board ";
 
+/// What a task's agent hears of the board it works from, to begin with:
+/// work it could take, opening or dropped. The agent widens or narrows
+/// it with its follows tool, and Sonny leaves its change be.
+pub const WORKER_EVENTS: [&str; 2] = ["opened", "dropped"];
+
 /// The follow of the board a task works from, by an agent of it known as
-/// `owner`: [`follow`], marked as its task's.
+/// `owner`: [`follow`] of [`WORKER_EVENTS`] alone, so a worker that
+/// finished one piece hears the next open, marked as its task's.
 pub fn works_from(board: &str, owner: Option<i64>) -> Sub {
     Sub {
         about: Some(format!("{WORKS_FROM}{board}")),
+        filter: Some(json!({"board": [board], "event": WORKER_EVENTS})),
         ..follow(board, owner)
     }
 }
@@ -123,36 +129,29 @@ pub fn works_from(board: &str, owner: Option<i64>) -> Sub {
 pub const ASK_FOR: &str = "ask_for";
 
 /// Why a thread on a board reaches an agent that holds its work.
-pub const HOLDS: &str =
-    "you hold this work: once it goes quiet, say where it stands, finish it or drop it";
+pub const HOLDS: &str = "you hold this work";
 /// Why a thread on a board reaches an agent its work is for.
 pub const ASKED: &str = "you're asked to take this work";
 /// Why a thread on a board reaches an agent that posted in it.
 pub const POSTED: &str = "you posted here";
 
 /// What follows work's thread for an agent, for `about`'s reason: each
-/// post as it comes, cutting into a busy turn, and, with `quiet`, a word
-/// once nothing is posted there for that long. Unlike a plain thread an
+/// post as it comes, cutting into a busy turn. Unlike a plain thread an
 /// agent posts in, it ends when the agent closes: work is what it was
 /// there for.
-pub fn post_follow(thread: &str, owner: Option<i64>, about: &str, quiet: Option<String>) -> Sub {
+pub fn post_follow(thread: &str, owner: Option<i64>, about: &str) -> Sub {
     let mut sub = Sub::commons(thread, owner);
     sub.steer = Some(every());
     sub.about = Some(about.to_owned());
-    sub.quiet = quiet;
     sub.outlives_close = false;
     sub
 }
 
-/// `caller`, known as `id`, follows `board`, unless it already works
-/// from it: its task's board stays marked as its task's.
+/// `caller`, known as `id`, follows `board`, unless it follows it
+/// already: a follow it has, its task's or one it changed with its
+/// follows tool, stays as it is.
 pub fn follow_kept(store: &Path, caller: &str, board: &str, id: Option<i64>) {
-    let named = follow(board, id);
-    let task = (crate::lookout::subs::read(store, caller).iter())
-        .any(|sub| sub.name == named.name && sub.about.as_deref().is_some_and(works));
-    if !task {
-        let _ = crate::lookout::subs::put(store, caller, named);
-    }
+    let _ = crate::lookout::subs::ensure(store, caller, follow(board, id));
 }
 
 /// What a call to the commons tool that `said` this follows for the
@@ -180,15 +179,15 @@ pub fn follows(
     }
     if let Some(name) = said["dropped_from"]["name"].as_str() {
         let held_by = said["dropped_from"]["id"].as_i64();
-        let _ = crate::lookout::subs::put(store, name, post_follow(thread, held_by, POSTED, None));
+        let _ = crate::lookout::subs::put(store, name, post_follow(thread, held_by, POSTED));
     }
     let holds = work["state"] == "taken" && work["holder"] == caller;
     let asked = matches!(work["state"].as_str(), Some("open"))
         && (work["for"].as_array().into_iter().flatten()).any(|named| named == caller);
     let mut follow = match (holds, asked) {
-        (true, _) => post_follow(thread, id, HOLDS, hold_quiet()),
-        (false, true) => post_follow(thread, id, ASKED, None),
-        _ => post_follow(thread, id, POSTED, None),
+        (true, _) => post_follow(thread, id, HOLDS),
+        (false, true) => post_follow(thread, id, ASKED),
+        _ => post_follow(thread, id, POSTED),
     };
     // A plain thread on a board lasts while its agent is closed, as any
     // commons thread it posts in; work's thread ends with it.
@@ -228,14 +227,6 @@ pub fn mentioned(arguments: &Value, caller: &str) -> Vec<String> {
         }
     }
     named
-}
-
-/// How long work taken may go without a post before its holder is asked
-/// whether it is still on it, as a follow's `quiet`: `[sonny] hold_quiet`
-/// minutes, 15 by default; none for 0.
-pub fn hold_quiet() -> Option<String> {
-    let minutes = crate::kept::config().map_or(15, |config| config.sonny.hold_quiet);
-    (minutes > 0).then(|| format!("{minutes}m"))
 }
 
 /// What the post at `n` of a thread on a board did there, as the board's
@@ -1148,6 +1139,54 @@ fn opened_by(dir: &Path, board: &str, thread: &str) -> Vec<String> {
         })
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// The board's quiet timer is gone: a holder's follow of its work's
+/// thread carries no `quiet`, and a board's follow hears no `quiet`
+/// event (after 0.10.6).
+pub const HOLD_FOLLOWS_QUIET_GONE: &str = "hold-follows-quiet-gone";
+
+/// Why a holder followed its work's thread while the quiet timer was
+/// there, which a follow written then still says.
+const HOLDS_QUIET: &str =
+    "you hold this work: once it goes quiet, say where it stands, finish it or drop it";
+
+/// Each follow beside `store` that the board's quiet timer wrote goes
+/// without it, once for the store: a holder's follow of its work's
+/// thread, as [`post_follow`] wrote it with [`HOLDS_QUIET`], says
+/// [`HOLDS`] and loses its `quiet`, and a board's follow, as [`follow`]
+/// wrote it, no longer lists the `quiet` event the commons sends no more.
+/// Any other follow's `quiet`, which an agent or the person set, stays.
+pub fn hold_quiet_gone(store: &Path) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    let commons = format!("{}.", agent_client::config::COMMONS_SOURCE);
+    crate::upgrade::once(Path::new(&record), HOLD_FOLLOWS_QUIET_GONE, || {
+        crate::lookout::subs::files_changed(store, |sub| {
+            let name = sub["name"].as_str().unwrap_or_default().to_owned();
+            let Some(sub) = sub.as_object_mut() else {
+                return false;
+            };
+            if name.starts_with(&commons) && sub.get("about") == Some(&json!(HOLDS_QUIET)) {
+                sub.insert("about".into(), json!(HOLDS));
+                sub.remove("quiet");
+                return true;
+            }
+            let Some(events) = (sub.get_mut("filter"))
+                .and_then(|filter| filter.get_mut("event"))
+                .and_then(Value::as_array_mut)
+            else {
+                return false;
+            };
+            let quiet = |event: &Value| event == "quiet";
+            let gone =
+                name.starts_with("board.") && events.iter().any(quiet) && !events.iter().all(quiet);
+            if gone {
+                events.retain(|event| !quiet(event));
+            }
+            gone
+        })
+    });
 }
 
 /// Follows of work's threads end when their agent closes (after 0.10.4).
@@ -2156,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn a_board_s_news_names_each_step_and_says_when_it_empties_or_goes_quiet() {
+    fn a_board_s_news_names_each_step_and_says_when_it_empties() {
         let home = home("events");
         let cursor = home.join("cursor");
         let _ = commons::news(&home, &cursor).mark_read();
@@ -2219,7 +2258,8 @@ mod tests {
         said.sort();
         assert_eq!(said, pairs(&[("enum", "done"), ("-", "emptied")]));
         let _ = news.mark_read();
-        // Held work with no post for hold_quiet goes quiet, once.
+        // Held work with no post for an hour tells its board nothing:
+        // the board has no quiet timer.
         lead(work("api", "Type the api errors", json!({}))).unwrap();
         w1(act("api", "take")).unwrap();
         let path = commons::dir(&home).join("api.jsonl");
@@ -2231,7 +2271,7 @@ mod tests {
             .collect();
         std::fs::write(&path, aged).unwrap();
         let news = commons::news(&home, &cursor);
-        assert!(events(&news).contains(&("-".to_owned(), "quiet".to_owned())));
+        assert_eq!(events(&news), pairs(&[("api", "opened"), ("api", "taken")]));
         let _ = news.mark_read();
         assert!(commons::news(&home, &cursor).lines.is_empty());
         let _ = std::fs::remove_dir_all(&home);
@@ -2300,6 +2340,46 @@ mod tests {
     }
 
     #[test]
+    fn a_task_s_agent_hears_work_it_could_take_and_keeps_what_it_changes() {
+        let home = home("worker-filter");
+        let store = home.join("store");
+        let board = |agent: &str| {
+            (crate::lookout::subs::read(&store, agent).into_iter())
+                .find(|sub| sub.name == "board.shop.a")
+                .unwrap()
+        };
+        // A task's agent starts on work opening or dropped; its lead hears
+        // every step.
+        crate::lookout::subs::put(&store, "shop.w1", works_from("shop/a", Some(2))).unwrap();
+        follow_kept(&store, "shop.lead", "shop/a", Some(1));
+        assert_eq!(
+            board("shop.w1").filter,
+            Some(json!({"board": ["shop/a"], "event": ["opened", "dropped"]}))
+        );
+        assert_eq!(
+            board("shop.lead").filter,
+            Some(json!({"board": ["shop/a"], "event": EVENTS}))
+        );
+        // What each changed with its follows tool stays through opening
+        // and taking work there.
+        for (agent, id) in [("shop.w1", 2), ("shop.lead", 1)] {
+            let mut own = board(agent);
+            own.filter = Some(json!({"board": ["shop/a"], "event": ["opened", "done"]}));
+            crate::lookout::subs::put(&store, agent, own.clone()).unwrap();
+            let mut opened = work(&format!("a-{id}"), "Do it", json!({}));
+            opened["post"]["board"] = json!("shop/a");
+            opened["post"]["title"] = json!(format!("Do it {id}"));
+            let said = send(&home, agent, "shop", None, false, opened.clone()).unwrap();
+            follows(&store, agent, Some(id), &opened, &said).unwrap();
+            let take = act(&format!("a-{id}"), "take");
+            let said = send(&home, agent, "shop", None, false, take.clone()).unwrap();
+            follows(&store, agent, Some(id), &take, &said).unwrap();
+            assert_eq!(board(agent), own, "{agent}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn taking_work_follows_its_board_and_its_thread_as_its_holder() {
         let home = home("follows");
         let store = home.join("store");
@@ -2317,13 +2397,13 @@ mod tests {
         let said = send(&home, "shop.w1", "shop", None, false, take.clone()).unwrap();
         let held = follows(&store, "shop.w1", Some(2), &take, &said).unwrap();
         assert_eq!(held.about.as_deref(), Some(HOLDS));
-        assert_eq!(held.quiet.as_deref(), Some("15m"));
+        assert_eq!(held.quiet, None);
         // A reply that moves nothing keeps its holder following as one.
         let talk = json!({"reply": {"thread": "store", "text": "halfway"}});
         let said = send(&home, "shop.w1", "shop", None, false, talk.clone()).unwrap();
         let still = follows(&store, "shop.w1", Some(2), &talk, &said).unwrap();
         assert_eq!(still.about.as_deref(), Some(HOLDS));
-        assert_eq!(still.quiet.as_deref(), Some("15m"));
+        assert_eq!(still.quiet, None);
         assert_eq!(followed(&store, "shop.w1").as_deref(), Some("shop/errors"));
         // Dropped by the lead, its holder's follow says it posted there.
         crate::lookout::subs::put(&store, "shop.w1", held).unwrap();
@@ -2544,6 +2624,49 @@ mod tests {
     }
 
     #[test]
+    fn follows_the_quiet_timer_wrote_go_without_it_once() {
+        let home = home("hold-quiet-gone");
+        let store = home.join("store");
+        // As 0.10.6 wrote them: the holder's follow quiet after 15
+        // minutes, and the board's hearing work go quiet.
+        let mut held = post_follow("store", Some(1), HOLDS_QUIET);
+        held.quiet = Some("15m".into());
+        let mut board = follow("shop/errors", Some(1));
+        board.filter = Some(json!({"board": ["shop/errors"],
+            "event": ["opened", "taken", "dropped", "done", "failed", "canceled",
+                "posted", "emptied", "quiet", "paused"]}));
+        // A quiet the agent set itself on another follow stays.
+        let mut own = Sub::commons("idea", Some(1));
+        own.quiet = Some("1h".into());
+        for sub in [held, board, own] {
+            crate::lookout::subs::put(&store, "shop.w1", sub).unwrap();
+        }
+        hold_quiet_gone(&store);
+        let after = crate::lookout::subs::read(&store, "shop.w1");
+        let named = |name: &str| after.iter().find(|sub| sub.name == name).unwrap();
+        assert_eq!(named("commons.store").about.as_deref(), Some(HOLDS));
+        assert_eq!(named("commons.store").quiet, None);
+        assert_eq!(
+            named("board.shop.errors").filter,
+            follow("shop/errors", None).filter
+        );
+        assert_eq!(named("commons.idea").quiet.as_deref(), Some("1h"));
+        // Once: a follow written afterwards as before stays as it is.
+        let mut again = post_follow("store", Some(1), HOLDS_QUIET);
+        again.quiet = Some("15m".into());
+        crate::lookout::subs::put(&store, "shop.w1", again).unwrap();
+        hold_quiet_gone(&store);
+        assert!(
+            (crate::lookout::subs::read(&store, "shop.w1").iter())
+                .any(|sub| sub.name == "commons.store" && sub.quiet.is_some())
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(record);
+    }
+
+    #[test]
     fn follows_of_works_threads_written_before_end_with_their_agent_once() {
         let home = home("work-close-migrate");
         let store = home.join("store");
@@ -2554,7 +2677,7 @@ mod tests {
         .unwrap();
         // As 0.10.4 wrote them: each lasting while its agent is closed.
         let before = |thread: &str| {
-            let mut sub = post_follow(thread, Some(1), POSTED, None);
+            let mut sub = post_follow(thread, Some(1), POSTED);
             sub.outlives_close = true;
             sub
         };
