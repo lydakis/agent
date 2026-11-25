@@ -515,7 +515,8 @@ def typing(fleet, window, held, args):
     turns back to back."""
     stop, turns = threading.Event(), [0]
     free = [f'p{n}.t{t}' for n in range(fleet.projects - 1, 1, -1) for t in range(fleet.per - 1)
-            if t % 3 and f'p{n}.t{t}' not in held] or [f'p0.t{t}' for t in range(fleet.per - 1) if t % 3]
+            if t % 3 and f'p{n}.t{t}' not in held] or [f'p0.t{t}' for t in range(fleet.per - 1)
+                                                          if t % 3 and f'p0.t{t}' not in held]
 
     def work(bot):
         connection = connect(fleet.sock, fleet.daemon)
@@ -541,7 +542,7 @@ def typing(fleet, window, held, args):
     time.sleep(3)
     took = []
     cpu = (cpu_seconds(window.pid), cpu_seconds(fleet.daemon.pid))
-    began = time.monotonic()
+    began, before = time.monotonic(), turns[0]
     # Twenty letters that never repeat, the composer emptied between runs
     # of them (untimed), so what a key must bring can't already show: the
     # composer's line reading exactly what was typed so far.
@@ -558,12 +559,15 @@ def typing(fleet, window, held, args):
         took.append(got if got is not None else 5000)
         time.sleep(.05)
     spent = time.monotonic() - began
+    done = turns[0] - before
     stop.set()
     for worker in workers:
         worker.join(10)
     os.write(window.fd, b'\x15')  # ctrl+u: the composer empty again
     took.sort()
-    return {'busy': len(workers), 'keys': len(took), 'p50_ms': round(statistics.median(took), 1),
+    # The load as it ran: tasks working, and the turns they finished.
+    return {'busy': len(workers), 'turns_per_s': round(done / spent, 1), 'keys': len(took),
+            'p50_ms': round(statistics.median(took), 1),
             'p99_ms': took[min(len(took) - 1, int(len(took) * .99))], 'max_ms': took[-1],
             'over_100ms': sum(t > 100 for t in took),
             'window_cpu_pct': round((cpu_seconds(window.pid) - cpu[0]) / spent * 100, 1),
@@ -631,7 +635,8 @@ def report(out):
             elif len(values) == 1:
                 cells.append(f'{values[0]:g}')
             else:
-                cells.append(f'{statistics.median(values):g} (p95 {values[min(len(values) - 1, int(len(values) * .95))]:g})')
+                p95 = values[min(len(values) - 1, int(len(values) * .95))]
+                cells.append(f'{statistics.median(values):g} (p95 {p95:g})')
         lines.append(f'| {part} {measure} | ' + ' | '.join(cells) + ' |')
     table = '\n'.join(lines)
     (Path(out) / 'summary.md').write_text(table + '\n')
