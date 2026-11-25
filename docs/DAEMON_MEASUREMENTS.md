@@ -13330,3 +13330,95 @@ Four alternating rounds of the Perf workflow's screens.
   #1338 7.4 / 7.2 / 7.5 / 7.6, #1341 7.8 / 7.8 / 8.2 / 7.9, main d803546
   8.4 / 7.7 / 7.9 / 7.8. The step is #1341 (done is closed), about
   0.4 MiB at the median; the rest is within the rounds' spread.
+
+## Release 0.10.7 against 0.10.6
+
+This measures every change since 0.10.6 together: v0.10.6 (9d97862) against
+the release commit 535743e. The protocol is 101 against 102, so each side
+runs its own daemon with its own Sonny. Release builds (glibc) on one 4-core
+Linux container, base and head alternated, and each binary's page cache
+dropped before each `bench/ends.py` run. The benchmark ran around the tag,
+as for 0.10.6.
+
+### Low end
+
+Three rounds each; the anonymous rows are separate runs that read `Pss_Anon`.
+
+| Measure | 0.10.6 | 0.10.7 |
+| --- | ---: | ---: |
+| window start, s | 0.095 / 0.062 / 0.082 | 0.081 / 0.071 / 0.072 |
+| key p99, ms | 1.67 / 4.44 / 1.4 | 3.97 / 1.62 / 2.01 |
+| turn p50, ms | 45.75 / 47.88 / 47.79 | 47.96 / 47.87 / 48.02 |
+| turn p99, ms | 107.53 / 51.6 / 49.24 | 49.88 / 89.05 / 50.43 |
+| idle daemon PSS, MiB | 19.0 / 18.6 / 18.6 | 18.0 / 18.6 / 18.6 |
+| idle daemon anon PSS, MiB | 5.1 / 5.0 / 4.9 | 5.4 / 4.9 / 5.2 |
+| idle window PSS, MiB | 16.3 / 16.3 / 16.1 | 16.6 / 16.4 / 16.1 |
+| idle window anon PSS, MiB | 4.7 / 4.7 / 4.7 | 4.9 / 4.6 / 4.7 |
+| idle window wakeups, /s | 4.6 / 4.6 / 4.6 | 4.6 / 4.6 / 4.5 |
+
+### High end
+
+10,000 stored agents, 30 busy, 8 scripts, 20 s, windows spread over folders.
+32 windows four rounds, 100 windows six.
+
+| Measure | 0.10.6 | 0.10.7 |
+| --- | ---: | ---: |
+| 32 windows: turns finished | 8954 / 8732 / 8634 / 8872 | 8800 / 8775 / 8974 / 8936 |
+| scripts finished | 1096 / 1078 / 1059 / 1096 | 1103 / 1078 / 1122 / 1117 |
+| windows CPU, % | 4.93 / 4.8 / 5.57 / 4.58 | 4.84 / 4.98 / 4.99 / 4.44 |
+| windows PSS, MiB | 188.9 / 188.6 / 187.4 / 188.7 | 187.9 / 188.6 / 188.5 / 189.1 |
+| windows anon PSS, MiB (2 rounds) | 166.1 / 166.5 | 166.3 / 167.0 |
+| daemon CPU, % | 135.92 / 135.91 / 135.09 / 132.79 | 132.35 / 137.06 / 135.27 / 134.09 |
+| daemon PSS, MiB | 37.7 / 38.0 / 36.9 / 37.2 | 37.8 / 37.0 / 37.1 / 37.3 |
+| key p99, ms | 11.59 / 14.11 / 19.26 / 13.64 | 29.71 / 11.45 / 11.45 / 6.8 |
+| worst key, ms | 16.39 / 16.32 / 32.36 / 64.81 | 59.6 / 15.98 / 14.1 / 9.06 |
+| 100 windows: turns finished | 9027 / 8948 / 8908 / 9408 / 8883 / 9166 | 8671 / 8880 / 8903 / 8832 / 9328 / 9210 |
+| windows PSS, MiB | 501.8 / 501.8 / 501.5 / 501.8 / 499.9 / 501.7 | 501.0 / 504.4 / 504.1 / 503.3 / 503.7 / 503.3 |
+| daemon PSS, MiB | 38.6 / 38.3 / 39.4 / 38.9 / 39.0 / 39.4 | 38.5 / 38.8 / 38.8 / 38.3 / 38.8 / 38.3 |
+| key p99, ms | 8.64 / 11.26 / 38.29 / 7.11 / 14.72 / 35.02 | 13.27 / 12.66 / 13.8 / 21.34 / 7.24 / 8.18 |
+| worst key, ms | 14.4 / 17.2 / 71.46 / 22.06 / 36.84 / 126.11 | 31.56 / 27.59 / 23.66 / 64.27 / 20.99 / 11.62 |
+
+- **Turns, scripts, keys and memory are even.** At 100 windows the first two
+  rounds read about 2% fewer turns, so four more were run: over six
+  alternating rounds the paired difference is -86 ± 352 turns, inside
+  run-to-run spread (medians 8,988 and 8,892). At 32 windows 0.10.7 is
+  even or ahead in turns and scripts.
+- Windows PSS at 100 windows reads 1.9 MiB more over 100 windows (0.02 MiB
+  each); at 32 windows, anonymous PSS is even.
+
+### Daemon and Sonny screens
+
+Four alternating rounds of the Perf workflow's screens.
+
+| Bench | Measure | 0.10.6 | 0.10.7 | Change |
+| --- | --- | ---: | ---: | ---: |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 37.548 | 31.204 | -16.9% |
+| admission | burst submit p99, ms | 4.743 | 4.013 | -15.4% |
+| completion | release to terminal p99, ms | 11.448 | 11.899 | +3.9% |
+| footprint | idle RSS, MiB | 16.604 | 16.799 | +1.2% |
+| footprint | per idle bot, KiB | 2.162 | 1.976 | -8.6% |
+| footprint | RSS after a turn each, MiB | 33.09 | 33.934 | +2.5% |
+| footprint | CPU per turn, ms | 0.884 | 0.862 | -2.6% |
+| footprint | written to disk per turn, KiB | 47.48 | 44.706 | -5.8% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 37.5 | 37.5 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 6.875 | 6.25 | -9.1% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 3.44 | 3.56 | +3.5% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 5.685 | 5.625 | -1.1% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2132.5 | 2088.0 | -2.1% |
+| sonny | lookout note p95 at 100x10, ms | 2436.5 | 2380.0 | -2.3% |
+| sonny | quiet window CPU, ms/s | 0.58 | 0.395 | -31.9% |
+| sonny | quiet window reads, KiB/s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window RSS, MiB | 33.45 | 32.15 | -3.9% |
+| sonny | sky replay CPU per 1k lines, ms | 9.21 | 9.67 | +5.0% |
+| sonny | sky replay RSS, MiB | 86.15 | 85.4 | -0.9% |
+| lifecycle | CPU, s | 0.515 | 0.565 | +9.7% |
+| lifecycle | p95 turn, ms | 579.558 | 580.829 | +0.2% |
+| lifecycle | peak RSS, MiB | 27.086 | 27.414 | +1.2% |
+
+- **Nothing is over the gate's 15%.** Admission is faster (lone submit CPU
+  -16.9%, burst p99 -15.4%), and a quiet window spends a third less CPU.
+- Lifecycle CPU reads +9.7% (0.515 to 0.565 s for the whole run); its
+  p95 turn and peak RSS are even.
