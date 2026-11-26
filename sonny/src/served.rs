@@ -4310,7 +4310,7 @@ mod tests {
         let (code, why) = refused.unwrap_err();
         assert_eq!(code, "automation_refused");
         assert!(
-            why.contains("the agent it wakes (send_message) was not approved: no"),
+            why.contains("the agent it wakes (send_message) was not approved after 0 s: no"),
             "{why}"
         );
         let asked = asked.lock().unwrap();
