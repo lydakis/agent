@@ -115,12 +115,18 @@ impl<'a> Checker<'a> {
         };
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
             // Only a reference into this schema is followed; another passes.
+            // Each one looked up counts, found or not, and spends by its
+            // bytes.
             if let Some(target) = reference
                 .strip_prefix('#')
-                .filter(|_| self.refs < MAX_REFS && self.local())
-                .and_then(|pointer| self.root.pointer(pointer))
+                .filter(|pointer| {
+                    self.refs < MAX_REFS && self.spend_on(pointer.len()) && self.local()
+                })
+                .and_then(|pointer| {
+                    self.refs += 1;
+                    self.root.pointer(pointer)
+                })
             {
-                self.refs += 1;
                 self.fits(target, value, depth + 1)?;
             }
             // Drafts 4 to 7 read nothing beside a `$ref`.
@@ -156,7 +162,7 @@ impl<'a> Checker<'a> {
         if let Some(only) = schema.get("const")
             && self.same(only, value) == Some(false)
         {
-            return Err(misfit(format!("must be {only}")));
+            return Err(misfit(format!("must be {}", rendered(only))));
         }
         match value {
             Value::String(text) => self.strings(schema, text)?,
@@ -524,12 +530,47 @@ fn order(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ord
 /// The values an `enum` allows, the first few of a long list.
 fn listed(allowed: &[Value]) -> String {
     const SHOWN: usize = 8;
-    let mut named: Vec<String> = allowed.iter().take(SHOWN).map(Value::to_string).collect();
+    let mut named: Vec<String> = allowed.iter().take(SHOWN).map(rendered).collect();
     if allowed.len() > SHOWN {
         named.push(format!("{} more", allowed.len() - SHOWN));
     }
     or_list(&named)
 }
+
+/// A value as JSON, cut after [`RENDERED`] bytes: a misfit's rule names
+/// it, and rendering it whole would cost its size each time.
+fn rendered(value: &Value) -> String {
+    struct Capped(Vec<u8>);
+    impl std::io::Write for Capped {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let room = RENDERED + 1 - self.0.len().min(RENDERED + 1);
+            if room == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            let taken = bytes.len().min(room);
+            self.0.extend_from_slice(&bytes[..taken]);
+            Ok(taken)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Capped(Vec::new());
+    let _ = serde_json::to_writer(&mut out, value);
+    let mut text = String::from_utf8_lossy(&out.0).into_owned();
+    if text.len() > RENDERED {
+        let mut cut = RENDERED;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push('…');
+    }
+    text
+}
+
+/// The most bytes of a value a misfit's rule shows.
+const RENDERED: usize = 80;
 
 fn article(name: &str) -> String {
     match name {
@@ -806,6 +847,13 @@ mod tests {
         quick(json!({"items": {"allOf": open}}), json!(vec![0; 100_000]));
         let types: Vec<Value> = (0..10_000).map(|_| json!("integer")).collect();
         quick(json!({"items": {"type": types}}), json!(vec![0; 100_000]));
+        // A reference looked up spends by its bytes, found or not.
+        let far = format!("#/{}", "x".repeat(50_000));
+        quick(json!({"items": {"$ref": far}}), json!(vec![0; 40_000]));
+        // A value a rule names is shown cut.
+        let long = "y".repeat(1_000_000);
+        let ruled = said(json!({"const": long}), json!("z"));
+        assert!(ruled.len() < 100 && ruled.ends_with('…'), "{ruled}");
         // A misfit within the bound is still found.
         let early = json!([9_999, 10_000]);
         assert_eq!(
