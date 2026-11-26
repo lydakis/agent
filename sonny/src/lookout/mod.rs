@@ -14,8 +14,8 @@
 //! watches a daemon, for every subscriber on it, started by the first
 //! Sonny to open; the daemon is unchanged: this follows every bot and
 //! submits to the subscribers like any client. The tools Sonny answers
-//! are another companion's (`tool_host`), which signals it to read the
-//! subscription files a call wrote (`reread_now`).
+//! are another companion's (`tool_host`); the lookout reads the follow
+//! files a call wrote as the kernel tells it they changed (`watch`).
 pub(crate) mod activity;
 pub(crate) mod memory;
 pub(crate) mod pattern;
@@ -23,6 +23,7 @@ pub(crate) mod sources;
 pub(crate) mod subs;
 
 use agent_client::Client;
+use agent_client::watch;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -44,7 +45,10 @@ pub(crate) const GROUP_INTERVAL: Duration = Duration::from_secs(2);
 /// How often a lookout with events waiting looks whether its group
 /// interval ended.
 const NUDGE: Duration = Duration::from_millis(200);
-/// How often subscription files are read again.
+/// How often the settings are read again; and the subscription files, only
+/// where their folder cannot be watched (a platform with no inotify or
+/// kqueue, a watch the kernel refused, or a folder removed while watched,
+/// until it is watched again).
 pub(crate) const REREAD: Duration = Duration::from_secs(15);
 /// How long the daemon may be unreachable before the lookout exits: a
 /// client starts another with the next daemon.
@@ -729,6 +733,9 @@ async fn serve(settings: Settings) -> Result<(), String> {
         subscribers: HashMap::new(),
         files: subs::Read::default(),
         read_at: HashMap::new(),
+        follows: None,
+        next_until: None,
+        unwatched_why: None,
         socket: settings.socket.clone(),
         lookouts: HashMap::new(),
         log: PathBuf::from(log),
@@ -764,6 +771,9 @@ async fn serve(settings: Settings) -> Result<(), String> {
         });
     }
     service.runner.reload();
+    // Watched before the files are first read: a write after the watch is
+    // told, one before it is read.
+    service.watch_follows();
     let mut gone: Option<Instant> = None;
     loop {
         if let Ok((client, events)) = Client::connect(&service.socket).await {
@@ -854,6 +864,14 @@ struct Service {
     /// kept beside the store ([`subs::taken`]) for its `follows`
     /// listing to show.
     read_at: HashMap<String, subs::Took>,
+    /// The follows folder, watched with the kernel; none where it cannot be,
+    /// and the files are read on the timer instead.
+    follows: Option<watch::Folder>,
+    /// The soonest `until` among the subscriptions read, in seconds since
+    /// the epoch: the files are read again once it comes.
+    next_until: Option<i64>,
+    /// Why the folder could not be watched at the last try, said once.
+    unwatched_why: Option<String>,
     socket: PathBuf,
     /// By subscriber name.
     lookouts: HashMap<String, Lookout>,
@@ -1020,6 +1038,9 @@ impl Service {
         self.read_at.clear();
         subs::take(&mut self.read_at, &revisions, epoch_ms());
         subs::took(&self.store, &self.read_at);
+        self.next_until = (self.subscribers.values().flatten())
+            .filter_map(subs::Sub::ends_at)
+            .min();
         for bot in &bots {
             self.seat(bot);
         }
@@ -1094,6 +1115,8 @@ impl Service {
         nudge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut reread: Option<Instant> = None;
         loop {
+            // Readable once the kernel queued a change in the follows folder.
+            let follows = self.follows.as_ref().map(watch::Folder::ready);
             // The lookouts whose news may have changed: those an event
             // reached, or all of them.
             let mut touched: Option<Vec<String>> = None;
@@ -1110,14 +1133,20 @@ impl Service {
                         println!("{}", json!({"event": "lagged", "reason": event["reason"]}));
                     }
                     let event = whole_call(&client, event).await;
+                    // A follow written before the daemon sent this event
+                    // was queued by the kernel in the write itself: taken
+                    // now, it is live before the event is handled.
+                    self.noticed();
                     // A `follows` or `commons` call the tool
                     // host answered counts from the next event on: its end
                     // is in the stream before any event that follows it.
                     if self.rewrote(&event) {
-                        reread = Some(Instant::now());
                         self.runner.reload();
                         self.runner.wanted_by(&self.subscribers);
-                        self.reread();
+                        // Read above when the folder is watched.
+                        if self.follows.is_none() {
+                            self.reread();
+                        }
                         self.runner.poke();
                     }
                     let cursor = event["cursor"].as_i64();
@@ -1277,6 +1306,18 @@ impl Service {
                     }
                     touched = Some(vec![lead]);
                 }
+                Some(()) = async {
+                    match &follows {
+                        Some(ready) => ready.readable().await.ok().map(|mut guard| {
+                            // Cleared before the queue is read: a change
+                            // after the read makes it readable again.
+                            guard.clear_ready();
+                        }),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    touched = self.noticed();
+                }
                 _ = nudge.tick() => {
                     touched = Some((self.lookouts.iter())
                         .filter(|(_, lookout)| !lookout.heard.is_empty())
@@ -1286,7 +1327,9 @@ impl Service {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     self.save_cursor();
-                    // What the person or a script wrote since, now and then.
+                    // The settings the person or a script wrote since, now
+                    // and then; the follows too, where their folder is not
+                    // watched.
                     if reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
                         self.runner.reload();
@@ -1295,6 +1338,13 @@ impl Service {
                         for lookout in self.lookouts.values_mut() {
                             lookout.waiting = self.waiting;
                         }
+                        if self.follows.is_none() {
+                            self.watch_follows();
+                            self.reread();
+                        }
+                    }
+                    // A subscription whose `until` came ends, as on a read.
+                    if self.next_until.is_some_and(|at| (epoch_ms() / 1000) as i64 >= at) {
                         self.reread();
                     }
                     for lookout in self.lookouts.values_mut() {
@@ -1558,43 +1608,183 @@ impl Service {
     /// The subscription files as they are now: a bot that subscribed is
     /// watched, and each lookout watches what its file says.
     fn reread(&mut self) {
-        let revisions = subs::revisions(&self.store);
-        let mut read: HashMap<String, Vec<subs::Sub>> =
-            self.files.all(&self.store).into_iter().collect();
-        // A subscription whose `until` came ends, as an automation does.
-        let now_s = (epoch_ms() / 1000) as i64;
-        for (subscriber, subs) in read.iter_mut() {
-            for sub in subs.iter().filter(|sub| sub.over(now_s)) {
-                self.end_sub(subscriber, sub, "its until came");
-            }
-            subs.retain(|sub| !sub.over(now_s));
+        // What the watch holds is read now: the lookout's own writes before
+        // this read cost no second one, and a write after the take is told
+        // again.
+        if let Some(follows) = &self.follows
+            && follows.take() == watch::Changed::Ended
+        {
+            self.unwatched();
         }
-        read.retain(|_, subs| !subs.is_empty());
-        // Every revision read is kept, one that changes nothing and a
-        // file that went included, so the listing knows it was taken.
+        // Each file's revision is looked at before it is read: a write after
+        // the look leaves it newer than what is kept, so it is taken again.
+        // Only the files that changed are read, as a notice that names them.
+        // Each one read is kept as taken there, after it is live.
+        let (mut changed, revisions) = self.files.changed(&self.store);
+        // A subscriber whose file went unseen, and one with a subscription
+        // whose `until` came: it ends, as an automation does.
+        let now_s = (epoch_ms() / 1000) as i64;
+        for (name, subs) in &self.subscribers {
+            if !revisions.contains_key(name) || subs.iter().any(|sub| sub.over(now_s)) {
+                changed.insert(name.clone());
+            }
+        }
+        self.reread_files(changed);
+        self.next_until = (self.subscribers.values().flatten())
+            .filter_map(subs::Sub::ends_at)
+            .min();
+    }
+
+    /// Watch the follows folder, made if it is not there yet; said in the
+    /// log either way. Where it cannot be watched the files are read on
+    /// the timer (`REREAD`).
+    fn watch_follows(&mut self) {
+        let folder = subs::dir(&self.store);
+        let watched = make_dir(&folder).and_then(|()| watch::Folder::new(&folder));
+        match watched {
+            Ok(watch) => {
+                println!("{}", json!({"event": "follows_watched"}));
+                self.unwatched_why = None;
+                self.follows = Some(watch);
+            }
+            Err(error) => {
+                // Said once, not at each try on the timer.
+                let why = error.to_string();
+                if self.unwatched_why.as_ref() != Some(&why) {
+                    println!(
+                        "{}",
+                        json!({"event": "follows_unwatched", "why": why,
+                            "rereads_every_s": REREAD.as_secs()})
+                    );
+                    self.unwatched_why = Some(why);
+                }
+                self.follows = None;
+            }
+        }
+    }
+
+    /// The folder's watch ended, as when the folder was removed: watched
+    /// again if it can be, else read on the timer.
+    fn unwatched(&mut self) {
+        println!("{}", json!({"event": "follows_watch_ended"}));
+        self.follows = None;
+        self.watch_follows();
+    }
+
+    /// What the watch told since the last look, read: only the files it
+    /// names, or every file where it did not say which. The lookouts whose
+    /// subscriptions changed, or none for all of them.
+    fn noticed(&mut self) -> Option<Vec<String>> {
+        let Some(follows) = &self.follows else {
+            return Some(Vec::new());
+        };
+        match follows.take() {
+            watch::Changed::None => Some(Vec::new()),
+            watch::Changed::Names(names) => {
+                // Subscribers' files alone: never a partial write or the lock.
+                let names = (names.iter()).filter_map(|name| subs::subscriber(name));
+                Some(self.reread_files(names.collect()))
+            }
+            watch::Changed::Any => {
+                self.reread();
+                None
+            }
+            watch::Changed::Ended => {
+                self.unwatched();
+                self.reread();
+                None
+            }
+        }
+    }
+
+    /// The subscription files named read again, as [`Service::reread`]
+    /// reads them all: those whose subscriptions changed.
+    fn reread_files(&mut self, names: HashSet<String>) -> Vec<String> {
         let now = epoch_ms();
-        if subs::take(&mut self.read_at, &revisions, now) {
+        let now_s = (now / 1000) as i64;
+        let mut changed = Vec::new();
+        let mut took = false;
+        for name in names {
+            let (revision, mut read) = self.files.one(&self.store, &name);
+            took |= subs::take_one(&mut self.read_at, &name, revision, now);
+            for sub in read.iter().filter(|sub| sub.over(now_s)) {
+                self.end_sub(&name, sub, "its until came");
+            }
+            read.retain(|sub| !sub.over(now_s));
+            let was = self.subscribers.get(&name);
+            if was.map_or(read.is_empty(), |was| *was == read) {
+                continue;
+            }
+            if was.is_some() && !read.is_empty() {
+                self.write(&json!({"at_ms": now, "lead": name, "reloaded": true}));
+            }
+            let soonest = read.iter().filter_map(subs::Sub::ends_at).min();
+            self.next_until = self.next_until.into_iter().chain(soonest).min();
+            match read.is_empty() {
+                true => self.subscribers.remove(&name),
+                false => self.subscribers.insert(name.clone(), read),
+            };
+            changed.push(name);
+        }
+        if !changed.is_empty() {
+            self.runner.wanted_by(&self.subscribers);
+            for name in &changed {
+                if let Some(record) = self.records.get(name).cloned() {
+                    self.seat(&record);
+                }
+            }
+            self.resubscribe_some(&changed);
+        }
+        // Once for every file the notice named, after they are live: the
+        // write waits on the disk.
+        if took {
             subs::took(&self.store, &self.read_at);
         }
-        if read == self.subscribers {
-            return;
+        changed
+    }
+
+    /// [`Service::resubscribe`] for these lookouts alone, the index of who
+    /// hears whom kept up for them only.
+    fn resubscribe_some(&mut self, names: &[String]) {
+        for name in names {
+            let Some(lookout) = self.lookouts.get_mut(name) else {
+                continue;
+            };
+            let Some(file) = self.subscribers.get(name) else {
+                // One no longer subscribed to anything drops what waited
+                // for it, so subscribing again does not bring it back.
+                if let Some(lookout) = self.lookouts.remove(name) {
+                    self.unindex(name, &lookout.watched);
+                    lookout.unheld();
+                }
+                continue;
+            };
+            let subs: Vec<subs::Sub> = (file.iter())
+                .filter(|sub| sub.held_by(&lookout.record))
+                .cloned()
+                .collect();
+            if subs == lookout.subs {
+                continue;
+            }
+            let before = lookout.watched.clone();
+            lookout.resubscribed(subs);
+            lookout.roots(&self.records, &self.made);
+            lookout.rehear();
+            self.unindex(name, &before);
+            self.index_lookout(name);
         }
-        // Each file whose subscriptions changed, said once it is read, so a
-        // rewritten filter is known to be live before an event it hears comes.
-        let changed = (read.iter())
-            .filter(|(name, subs)| self.subscribers.get(*name).is_some_and(|was| was != *subs));
-        for (name, _) in changed {
-            self.write(&json!({"at_ms": now, "lead": name, "reloaded": true}));
+    }
+
+    /// One lookout taken out of the index, for the bots it watched.
+    fn unindex(&mut self, name: &str, watched: &HashSet<String>) {
+        for bot in watched {
+            if let Some(watchers) = self.watchers.get_mut(bot) {
+                watchers.retain(|watcher| watcher != name);
+                if watchers.is_empty() {
+                    self.watchers.remove(bot);
+                }
+            }
         }
-        self.subscribers = read;
-        self.runner.wanted_by(&self.subscribers);
-        let records: Vec<Value> = (self.subscribers.keys())
-            .filter_map(|name| self.records.get(name).cloned())
-            .collect();
-        for record in records {
-            self.seat(&record);
-        }
-        self.resubscribe(false);
     }
 
     /// End `subscriber`'s subscription `name`, as it says `why`, in its
@@ -4249,6 +4439,9 @@ mod tests {
             subscribers: HashMap::new(),
             files: subs::Read::default(),
             read_at: HashMap::new(),
+            follows: None,
+            next_until: None,
+            unwatched_why: None,
             socket: PathBuf::new(),
             lookouts: HashMap::new(),
             log: PathBuf::new(),
@@ -4820,6 +5013,93 @@ mod tests {
         // Posting in the commons subscribes the poster.
         assert!(!service.rewrote(&started("commons", "e")));
         assert!(service.rewrote(&event("tool_completed", "e", json!({}))));
+    }
+
+    /// Who hears whom, sorted, to compare two services' indexes.
+    fn index_of(service: &Service) -> Vec<(String, Vec<String>)> {
+        let mut index: Vec<(String, Vec<String>)> = (service.watchers.iter())
+            .map(|(bot, watchers)| {
+                let mut watchers = watchers.clone();
+                watchers.sort();
+                (bot.clone(), watchers)
+            })
+            .collect();
+        index.sort();
+        index
+    }
+
+    #[tokio::test]
+    async fn a_follow_written_is_live_before_the_next_event_as_a_whole_read_makes_it() {
+        let dir = std::env::temp_dir().join(format!("lookout-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let records = [
+            json!({"name": "shop.lead", "bot_id": 1}),
+            json!({"name": "shop.fix", "bot_id": 2, "created_by": "shop.lead"}),
+            json!({"name": "shop.docs", "bot_id": 3}),
+        ];
+        let mut watching = service(store.clone(), &records);
+        watching.watch_follows();
+        assert!(watching.follows.is_some(), "the folder is made and watched");
+        assert_eq!(watching.noticed(), Some(Vec::new()));
+        // Written as start_task or a person's script would, not by a call
+        // the lookout sees: live at the next event, with no timer.
+        subs::put(&store, "shop.lead", subs::Sub::lead("shop.lead", "shop")).unwrap();
+        let changed = watching.noticed();
+        if cfg!(target_os = "linux") {
+            assert_eq!(changed, Some(vec!["shop.lead".to_owned()]));
+        }
+        assert!(watching.lookouts.contains_key("shop.lead"));
+        assert_eq!(
+            watching.watchers.get("shop.fix").map(Vec::as_slice),
+            Some(&["shop.lead".to_owned()][..])
+        );
+        // The same as reading every file.
+        let mut whole = service(store.clone(), &records);
+        whole.reread();
+        assert_eq!(whole.subscribers, watching.subscribers);
+        assert_eq!(index_of(&whole), index_of(&watching));
+        // Another follow beside it, then the first one's file removed.
+        subs::put(&store, "shop.docs", subs::Sub::lead("shop.docs", "shop")).unwrap();
+        watching.noticed();
+        std::fs::remove_file(subs::dir(&store).join("shop.lead.json")).unwrap();
+        watching.noticed();
+        assert!(!watching.lookouts.contains_key("shop.lead"));
+        assert!(!watching.watchers.contains_key("shop.fix"));
+        let mut whole = service(store.clone(), &records);
+        whole.reread();
+        assert_eq!(whole.subscribers, watching.subscribers);
+        assert_eq!(index_of(&whole), index_of(&watching));
+        // The lookout's own write, read at once, is not read a second time.
+        let sub = watching.subscribers["shop.docs"][0].clone();
+        watching.end_sub("shop.docs", &sub, "a test ended it");
+        watching.reread();
+        assert!(watching.subscribers.is_empty());
+        let follows = watching.follows.as_ref().unwrap();
+        assert_eq!(follows.take(), watch::Changed::None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_follows_folder_removed_while_watched_is_watched_again() {
+        let dir = std::env::temp_dir().join(format!("lookout-rewatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let mut watching = service(store.clone(), &[json!({"name": "shop.lead", "bot_id": 1})]);
+        watching.watch_follows();
+        subs::put(&store, "shop.lead", subs::Sub::lead("shop.lead", "shop")).unwrap();
+        watching.noticed();
+        assert!(watching.lookouts.contains_key("shop.lead"));
+        std::fs::remove_dir_all(subs::dir(&store)).unwrap();
+        // Every file read again, and the folder made and watched anew.
+        assert_eq!(watching.noticed(), None);
+        assert!(watching.subscribers.is_empty() && watching.follows.is_some());
+        subs::put(&store, "shop.lead", subs::Sub::lead("shop.lead", "shop")).unwrap();
+        watching.noticed();
+        assert!(watching.lookouts.contains_key("shop.lead"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
