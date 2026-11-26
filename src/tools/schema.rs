@@ -1,0 +1,876 @@
+//! A call's arguments checked against the JSON Schema its tool declared,
+//! before anything else decides the call, as a function call with bad
+//! arguments fails at once. The check knows a subset of JSON Schema: `type`,
+//! `enum`, `const`, `required`, `properties`, `additionalProperties`,
+//! `minProperties`/`maxProperties`, `minLength`/`maxLength` (in characters),
+//! `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`,
+//! `minItems`/`maxItems`, `items`, `prefixItems`, `allOf`, `anyOf`, `oneOf`
+//! and a local `$ref` (followed only in a schema with no nested `$id`,
+//! since one changes what a reference inside it points at). A keyword it does not know passes: it refuses only
+//! what it can judge, so a schema it reads in part never refuses a call
+//! that fits the whole. `oneOf` is held only to "at least one", since a
+//! branch passed here may not pass in full. Its work is bounded
+//! ([`WORK`]), whatever the schema and arguments: every step of every
+//! loop spends from it, and past it, what is left passes.
+use serde_json::{Map, Value};
+
+/// How deep the check follows a schema into a value, and how many local
+/// references it follows in one call: past either, what is left passes.
+const MAX_DEPTH: usize = 64;
+const MAX_REFS: usize = 256;
+/// The most steps one check takes. Each turn of any loop in the check is
+/// a step: a schema met at a place in the value, a field, item, branch,
+/// required name or type name looked at, a value compared with one an
+/// `enum` or `const` names; and so are each [`SCAN`] bytes of a string
+/// read to count, compare or look it up. A few milliseconds at
+/// most, so a check may run beside other work.
+const WORK: usize = 100_000;
+/// The bytes of a string read in one step.
+const SCAN: usize = 256;
+
+/// Why `value` does not fit `schema`: where, as a path into the arguments
+/// (`title`, `items[2].name`), and what rule.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Misfit {
+    path: String,
+    rule: String,
+    /// The path's segments while the check unwinds, innermost first.
+    trail: Vec<String>,
+}
+
+impl std::fmt::Display for Misfit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.path.is_empty() {
+            true => f.write_str(&self.rule),
+            false => write!(f, "{}: {}", self.path, self.rule),
+        }
+    }
+}
+
+/// Check `value` against `schema`.
+pub fn check(schema: &Value, value: &Value) -> Result<(), Misfit> {
+    let mut checker = Checker {
+        root: schema,
+        older: schema
+            .get("$schema")
+            .and_then(Value::as_str)
+            .is_some_and(|dialect| {
+                ["draft-03", "draft-04", "draft-06", "draft-07"]
+                    .iter()
+                    .any(|draft| dialect.contains(draft))
+            }),
+        local: None,
+        refs: 0,
+        work: WORK,
+    };
+    checker.fits(schema, value, 0).map_err(|mut misfit| {
+        let path: String = misfit.trail.drain(..).rev().collect();
+        misfit.path = path.trim_start_matches('.').to_owned();
+        misfit
+    })
+}
+
+struct Checker<'a> {
+    root: &'a Value,
+    /// Whether the schema names a draft before 2019-09 as its `$schema`,
+    /// where a `$ref` hides the keywords beside it.
+    older: bool,
+    /// Whether a `#` reference means the root: no schema below it
+    /// declares its own `$id`. Found at the first reference.
+    local: Option<bool>,
+    refs: usize,
+    /// Steps left before the check stops judging.
+    work: usize,
+}
+
+fn misfit(rule: impl Into<String>) -> Misfit {
+    Misfit {
+        path: String::new(),
+        rule: rule.into(),
+        trail: Vec::new(),
+    }
+}
+
+/// A misfit found inside `segment` of the value: `.name` or `[2]`.
+fn inside(segment: String) -> impl FnOnce(Misfit) -> Misfit {
+    move |mut misfit| {
+        misfit.trail.push(segment);
+        misfit
+    }
+}
+
+fn field(name: &str) -> String {
+    format!(".{name}")
+}
+
+impl<'a> Checker<'a> {
+    fn fits(&mut self, schema: &'a Value, value: &Value, depth: usize) -> Result<(), Misfit> {
+        if depth > MAX_DEPTH || !self.spend() {
+            return Ok(());
+        }
+        let schema = match schema {
+            Value::Bool(false) => return Err(misfit("not allowed")),
+            Value::Object(schema) => schema,
+            _ => return Ok(()),
+        };
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            // Only a reference into this schema is followed; another passes.
+            // Each one looked up counts, found or not, and spends by its
+            // bytes.
+            if let Some(target) = reference
+                .strip_prefix('#')
+                .filter(|pointer| {
+                    self.refs < MAX_REFS && self.spend_on(pointer.len()) && self.local()
+                })
+                .and_then(|pointer| {
+                    self.refs += 1;
+                    self.root.pointer(pointer)
+                })
+            {
+                self.fits(target, value, depth + 1)?;
+            }
+            // Drafts 4 to 7 read nothing beside a `$ref`.
+            if self.older {
+                return Ok(());
+            }
+        }
+        if let Some(types) = schema.get("type") {
+            let names: Vec<&str> = match types {
+                Value::String(name) => vec![name],
+                Value::Array(names) if self.steps(names.len()) => {
+                    names.iter().filter_map(Value::as_str).collect()
+                }
+                _ => Vec::new(),
+            };
+            typed(&names, value)?;
+        }
+        if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+            let mut known = true;
+            let mut found = false;
+            for one in allowed {
+                match self.same(one, value) {
+                    Some(true) => found = true,
+                    Some(false) => continue,
+                    None => known = false,
+                }
+                break;
+            }
+            if known && !found {
+                return Err(misfit(format!("must be one of {}", listed(allowed))));
+            }
+        }
+        if let Some(only) = schema.get("const")
+            && self.same(only, value) == Some(false)
+        {
+            return Err(misfit(format!("must be {}", rendered(only))));
+        }
+        match value {
+            Value::String(text) => self.strings(schema, text)?,
+            Value::Number(_) => numbers(schema, value)?,
+            Value::Array(items) => self.arrays(schema, items, depth)?,
+            Value::Object(fields) => self.objects(schema, fields, depth)?,
+            _ => {}
+        }
+        for every in schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            self.fits(every, value, depth + 1)?;
+        }
+        for (keyword, branches) in [
+            ("anyOf", schema.get("anyOf")),
+            ("oneOf", schema.get("oneOf")),
+        ] {
+            let Some(branches) = branches.and_then(Value::as_array) else {
+                continue;
+            };
+            if !branches.is_empty()
+                && !branches
+                    .iter()
+                    .any(|branch| self.fits(branch, value, depth + 1).is_ok())
+            {
+                return Err(misfit(format!("fits none of the schemas {keyword} lists")));
+            }
+        }
+        Ok(())
+    }
+
+    fn strings(&mut self, schema: &Map<String, Value>, text: &str) -> Result<(), Misfit> {
+        let least = schema.get("minLength").and_then(Value::as_u64);
+        let most = schema.get("maxLength").and_then(Value::as_u64);
+        if least.is_none() && most.is_none() {
+            return Ok(());
+        }
+        // Characters, as JSON Schema counts a string's length: one to four
+        // bytes each, so its bytes settle most bounds without reading it.
+        let bytes = text.len() as u64;
+        if least.is_none_or(|least| bytes / 4 >= least) && most.is_none_or(|most| bytes <= most) {
+            return Ok(());
+        }
+        if !self.spend_on(text.len()) {
+            return Ok(());
+        }
+        let length = text.chars().count() as u64;
+        if let Some(least) = least
+            && length < least
+        {
+            return Err(misfit(format!(
+                "at least {least} {}, got {length}",
+                plural(least, "character")
+            )));
+        }
+        if let Some(most) = most
+            && length > most
+        {
+            return Err(misfit(format!(
+                "at most {most} {}, got {length}",
+                plural(most, "character")
+            )));
+        }
+        Ok(())
+    }
+
+    /// One step of the check's work, if any is left.
+    /// Whether a `#` reference points into the root, found once: true
+    /// when no schema below the root declares `$id`. A nested `$id` makes
+    /// such a reference inside it mean that schema, so none is followed;
+    /// so too if the work runs out before the root is read.
+    fn local(&mut self) -> bool {
+        if let Some(local) = self.local {
+            return local;
+        }
+        let mut left: Vec<&Value> = match self.root {
+            Value::Object(root) => root.values().collect(),
+            _ => Vec::new(),
+        };
+        let mut local = true;
+        while let Some(next) = left.pop() {
+            if !self.spend() {
+                local = false;
+                break;
+            }
+            match next {
+                Value::Object(schema) if schema.get("$id").is_some_and(Value::is_string) => {
+                    local = false;
+                    break;
+                }
+                Value::Object(schema) => left.extend(schema.values()),
+                Value::Array(items) => left.extend(items),
+                _ => {}
+            }
+        }
+        self.local = Some(local);
+        local
+    }
+
+    fn spend(&mut self) -> bool {
+        self.spend_on(0)
+    }
+
+    /// One step, and one more for each [`SCAN`] bytes of a string to read,
+    /// if that many are left.
+    fn spend_on(&mut self, bytes: usize) -> bool {
+        self.steps(1 + bytes / SCAN)
+    }
+
+    /// `count` steps, if that many are left.
+    fn steps(&mut self, count: usize) -> bool {
+        self.work = self.work.saturating_sub(count);
+        self.work > 0
+    }
+
+    /// Whether `a` equals `b` as JSON Schema compares, numbers by value so
+    /// `1` is `1.0`; `None` when the work ran out before it could tell.
+    fn same(&mut self, a: &Value, b: &Value) -> Option<bool> {
+        if !self.spend() {
+            return None;
+        }
+        Some(match (a, b) {
+            (Value::Number(x), Value::Number(y)) => order(x, y) == Some(std::cmp::Ordering::Equal),
+            (Value::Array(x), Value::Array(y)) => {
+                if x.len() != y.len() {
+                    return Some(false);
+                }
+                for (x, y) in x.iter().zip(y) {
+                    if !self.same(x, y)? {
+                        return Some(false);
+                    }
+                }
+                true
+            }
+            (Value::Object(x), Value::Object(y)) => {
+                if x.len() != y.len() {
+                    return Some(false);
+                }
+                for (k, v) in x {
+                    if !self.spend_on(k.len()) {
+                        return None;
+                    }
+                    let Some(w) = y.get(k) else {
+                        return Some(false);
+                    };
+                    if !self.same(v, w)? {
+                        return Some(false);
+                    }
+                }
+                true
+            }
+            (Value::String(x), Value::String(y)) => {
+                if x.len() != y.len() {
+                    return Some(false);
+                }
+                if !self.spend_on(x.len()) {
+                    return None;
+                }
+                x == y
+            }
+            _ => a == b,
+        })
+    }
+
+    fn arrays(
+        &mut self,
+        schema: &'a Map<String, Value>,
+        items: &[Value],
+        depth: usize,
+    ) -> Result<(), Misfit> {
+        let count = items.len() as u64;
+        if let Some(least) = schema.get("minItems").and_then(Value::as_u64)
+            && count < least
+        {
+            return Err(misfit(format!(
+                "at least {least} {}, got {count}",
+                plural(least, "item")
+            )));
+        }
+        if let Some(most) = schema.get("maxItems").and_then(Value::as_u64)
+            && count > most
+        {
+            return Err(misfit(format!(
+                "at most {most} {}, got {count}",
+                plural(most, "item")
+            )));
+        }
+        // `prefixItems` (or the older array form of `items`) judges items
+        // by place; `items` beside `prefixItems` judges the rest.
+        let (prefix, rest) = match (schema.get("prefixItems"), schema.get("items")) {
+            (Some(Value::Array(prefix)), rest) => (prefix.as_slice(), rest),
+            (_, Some(Value::Array(prefix))) => (prefix.as_slice(), None),
+            (_, rest) => (&[][..], rest),
+        };
+        for (at, item) in items.iter().enumerate() {
+            let schema = match prefix.get(at) {
+                Some(schema) => schema,
+                None => match rest {
+                    Some(schema) => schema,
+                    None => break,
+                },
+            };
+            self.fits(schema, item, depth + 1)
+                .map_err(inside(format!("[{at}]")))?;
+        }
+        Ok(())
+    }
+
+    fn objects(
+        &mut self,
+        schema: &'a Map<String, Value>,
+        fields: &Map<String, Value>,
+        depth: usize,
+    ) -> Result<(), Misfit> {
+        for required in schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !self.spend_on(required.len()) {
+                return Ok(());
+            }
+            if !fields.contains_key(required) {
+                return Err(misfit(format!("{required} is required")));
+            }
+        }
+        let count = fields.len() as u64;
+        if let Some(least) = schema.get("minProperties").and_then(Value::as_u64)
+            && count < least
+        {
+            return Err(misfit(format!(
+                "at least {least} {}, got {count}",
+                plural(least, "field")
+            )));
+        }
+        if let Some(most) = schema.get("maxProperties").and_then(Value::as_u64)
+            && count > most
+        {
+            return Err(misfit(format!(
+                "at most {most} {}, got {count}",
+                plural(most, "field")
+            )));
+        }
+        let properties = schema.get("properties").and_then(Value::as_object);
+        // Fields `patternProperties` may name are judged by nothing here:
+        // with it, `additionalProperties` is not held either.
+        let additional = schema
+            .get("additionalProperties")
+            .filter(|_| !schema.contains_key("patternProperties"));
+        for (name, value) in fields {
+            if !self.spend_on(name.len()) {
+                return Ok(());
+            }
+            let schema = match properties.and_then(|properties| properties.get(name)) {
+                Some(property) => property,
+                None => match additional {
+                    Some(Value::Bool(false)) => return Err(misfit(format!("no field {name}"))),
+                    Some(additional) => additional,
+                    None => continue,
+                },
+            };
+            self.fits(schema, value, depth + 1)
+                .map_err(inside(field(name)))?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether `value` is of one of the types `names` lists. A name the check
+/// does not know passes.
+fn typed(names: &[&str], value: &Value) -> Result<(), Misfit> {
+    let is = |name: &str| match name {
+        "string" => Some(value.is_string()),
+        "integer" => Some(integer(value)),
+        "number" => Some(value.is_number()),
+        "boolean" => Some(value.is_boolean()),
+        "array" => Some(value.is_array()),
+        "object" => Some(value.is_object()),
+        "null" => Some(value.is_null()),
+        _ => None,
+    };
+    if names.is_empty() || names.iter().any(|name| is(name) != Some(false)) {
+        return Ok(());
+    }
+    let named: Vec<String> = names.iter().map(|name| article(name)).collect();
+    Err(misfit(format!("must be {}", or_list(&named))))
+}
+
+/// A whole number, as JSON Schema counts one: `2.0` is.
+fn integer(value: &Value) -> bool {
+    value.is_i64() || value.is_u64() || value.as_f64().is_some_and(|n| n.fract() == 0.0)
+}
+
+fn numbers(schema: &Map<String, Value>, value: &Value) -> Result<(), Misfit> {
+    let Value::Number(number) = value else {
+        return Ok(());
+    };
+    let bound = |key: &str| match schema.get(key) {
+        Some(Value::Number(bound)) => Some(order(number, bound)),
+        _ => None,
+    };
+    // Draft 4 says an exclusive bound with `true` beside `minimum`.
+    let exclusive = |key: &str| schema.get(key) == Some(&Value::Bool(true));
+    let shown = |key: &str| schema[key].to_string();
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    if let Some(order) = bound("minimum") {
+        if exclusive("exclusiveMinimum") && matches!(order, Some(Less | Equal)) {
+            return Err(misfit(format!(
+                "more than {}, got {value}",
+                shown("minimum")
+            )));
+        }
+        if order == Some(Less) {
+            return Err(misfit(format!(
+                "at least {}, got {value}",
+                shown("minimum")
+            )));
+        }
+    }
+    if let Some(order) = bound("maximum") {
+        if exclusive("exclusiveMaximum") && matches!(order, Some(Greater | Equal)) {
+            return Err(misfit(format!(
+                "less than {}, got {value}",
+                shown("maximum")
+            )));
+        }
+        if order == Some(Greater) {
+            return Err(misfit(format!("at most {}, got {value}", shown("maximum"))));
+        }
+    }
+    if matches!(bound("exclusiveMinimum"), Some(Some(Less | Equal))) {
+        return Err(misfit(format!(
+            "more than {}, got {value}",
+            shown("exclusiveMinimum")
+        )));
+    }
+    if matches!(bound("exclusiveMaximum"), Some(Some(Greater | Equal))) {
+        return Err(misfit(format!(
+            "less than {}, got {value}",
+            shown("exclusiveMaximum")
+        )));
+    }
+    Ok(())
+}
+
+/// How `a` stands to `b`, exactly for whole numbers, which `f64` would
+/// round past 2^53; `None` for what cannot be ordered.
+fn order(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    let whole = |n: &serde_json::Number| {
+        n.as_i64()
+            .map(i128::from)
+            .or_else(|| n.as_u64().map(i128::from))
+    };
+    match (whole(a), whole(b)) {
+        (Some(a), Some(b)) => Some(a.cmp(&b)),
+        _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
+    }
+}
+
+/// The values an `enum` allows, the first few of a long list.
+fn listed(allowed: &[Value]) -> String {
+    const SHOWN: usize = 8;
+    let mut named: Vec<String> = allowed.iter().take(SHOWN).map(rendered).collect();
+    if allowed.len() > SHOWN {
+        named.push(format!("{} more", allowed.len() - SHOWN));
+    }
+    or_list(&named)
+}
+
+/// A value as JSON, cut after [`RENDERED`] bytes: a misfit's rule names
+/// it, and rendering it whole would cost its size each time.
+fn rendered(value: &Value) -> String {
+    struct Capped(Vec<u8>);
+    impl std::io::Write for Capped {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let room = RENDERED + 1 - self.0.len().min(RENDERED + 1);
+            if room == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            let taken = bytes.len().min(room);
+            self.0.extend_from_slice(&bytes[..taken]);
+            Ok(taken)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Capped(Vec::new());
+    let _ = serde_json::to_writer(&mut out, value);
+    let mut text = String::from_utf8_lossy(&out.0).into_owned();
+    if text.len() > RENDERED {
+        let mut cut = RENDERED;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push('…');
+    }
+    text
+}
+
+/// The most bytes of a value a misfit's rule shows.
+const RENDERED: usize = 80;
+
+fn article(name: &str) -> String {
+    match name {
+        "null" => "null".into(),
+        "array" | "integer" | "object" => format!("an {name}"),
+        _ => format!("a {name}"),
+    }
+}
+
+fn plural(count: u64, word: &str) -> String {
+    match count {
+        1 => word.to_owned(),
+        _ => format!("{word}s"),
+    }
+}
+
+/// `a`, `a or b`, `a, b or c`.
+fn or_list(names: &[String]) -> String {
+    match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn said(schema: Value, value: Value) -> String {
+        check(&schema, &value).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn a_string_longer_than_its_most_is_named_with_its_rule() {
+        let schema =
+            json!({"type": "object", "properties": {"title": {"type": "string", "maxLength": 30}}});
+        assert!(check(&schema, &json!({"title": "x".repeat(30)})).is_ok());
+        assert_eq!(
+            said(schema.clone(), json!({"title": "x".repeat(31)})),
+            "title: at most 30 characters, got 31"
+        );
+        // Characters, not bytes.
+        assert!(check(&schema, &json!({"title": "é".repeat(30)})).is_ok());
+        assert_eq!(
+            said(json!({"minLength": 2}), json!("a")),
+            "at least 2 characters, got 1"
+        );
+    }
+
+    #[test]
+    fn types_required_and_closed_objects() {
+        let schema = json!({"type": "object", "required": ["name"],
+            "properties": {"name": {"type": "string"}, "count": {"type": "integer"},
+                "tags": {"type": ["array", "null"]}},
+            "additionalProperties": false});
+        assert!(check(&schema, &json!({"name": "a", "count": 2.0, "tags": null})).is_ok());
+        assert_eq!(said(schema.clone(), json!({})), "name is required");
+        assert_eq!(
+            said(schema.clone(), json!({"name": 1})),
+            "name: must be a string"
+        );
+        assert_eq!(
+            said(schema.clone(), json!({"name": "a", "count": 1.5})),
+            "count: must be an integer"
+        );
+        assert_eq!(
+            said(schema.clone(), json!({"name": "a", "tags": "x"})),
+            "tags: must be an array or null"
+        );
+        assert_eq!(
+            said(schema.clone(), json!({"name": "a", "other": 1})),
+            "no field other"
+        );
+        assert_eq!(said(schema, json!([])), "must be an object");
+    }
+
+    #[test]
+    fn nested_misfits_name_their_path() {
+        let schema = json!({"type": "object", "properties": {"items": {"type": "array",
+            "maxItems": 3, "items": {"type": "object", "required": ["id"],
+                "properties": {"id": {"type": "integer", "minimum": 1}}}}}});
+        assert_eq!(
+            said(schema.clone(), json!({"items": [{"id": 1}, {"id": 0}]})),
+            "items[1].id: at least 1, got 0"
+        );
+        assert_eq!(
+            said(schema.clone(), json!({"items": [{"id": 1}, {}]})),
+            "items[1]: id is required"
+        );
+        assert_eq!(
+            said(
+                schema,
+                json!({"items": [{"id": 1}, {"id": 1}, {"id": 1}, {"id": 1}]})
+            ),
+            "items: at most 3 items, got 4"
+        );
+    }
+
+    #[test]
+    fn enums_consts_and_ranges() {
+        assert_eq!(
+            said(json!({"enum": ["low", "high"]}), json!("mid")),
+            "must be one of \"low\" or \"high\""
+        );
+        assert!(check(&json!({"enum": [1, 2]}), &json!(2.0)).is_ok());
+        assert_eq!(said(json!({"const": true}), json!(false)), "must be true");
+        assert_eq!(
+            said(json!({"maximum": 10}), json!(11)),
+            "at most 10, got 11"
+        );
+        assert_eq!(
+            said(json!({"exclusiveMinimum": 0}), json!(0)),
+            "more than 0, got 0"
+        );
+        assert_eq!(
+            said(json!({"minimum": 0, "exclusiveMinimum": true}), json!(0)),
+            "more than 0, got 0"
+        );
+    }
+
+    #[test]
+    fn what_it_cannot_judge_passes() {
+        // Keywords it does not know, types it does not know, a reference
+        // outside the schema, and `not`, whose branch may pass here only.
+        let schema = json!({"type": "object", "properties": {
+            "a": {"type": "string", "pattern": "^[0-9]+$", "format": "email"},
+            "b": {"type": "decimal"},
+            "c": {"$ref": "https://example.com/schema"},
+            "d": {"not": {"type": "string"}},
+            "e": {"if": {"type": "string"}, "then": {"maxLength": 1}}}});
+        assert!(
+            check(
+                &schema,
+                &json!({"a": "letters", "b": "x", "c": 1, "d": "s", "e": "long"})
+            )
+            .is_ok()
+        );
+        // `patternProperties` lifts `additionalProperties`.
+        let open = json!({"properties": {}, "patternProperties": {"^x": {}},
+            "additionalProperties": false});
+        assert!(check(&open, &json!({"y": 1})).is_ok());
+        assert!(check(&json!(true), &json!(1)).is_ok());
+        assert!(check(&json!({}), &json!(1)).is_ok());
+    }
+
+    #[test]
+    fn combinators_and_local_references() {
+        let schema = json!({"$defs": {"id": {"type": "string", "maxLength": 4}},
+            "type": "object", "properties": {
+                "id": {"$ref": "#/$defs/id"},
+                "either": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "both": {"allOf": [{"minimum": 1}, {"maximum": 3}]},
+                "one": {"oneOf": [{"type": "string"}, {"maxLength": 2}]},
+                "never": false}});
+        assert!(
+            check(
+                &schema,
+                &json!({"id": "abcd", "either": 3, "both": 2, "one": "abc"})
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            said(schema.clone(), json!({"id": "abcde"})),
+            "id: at most 4 characters, got 5"
+        );
+        assert_eq!(
+            said(schema.clone(), json!({"either": true})),
+            "either: fits none of the schemas anyOf lists"
+        );
+        assert_eq!(
+            said(schema.clone(), json!({"both": 4})),
+            "both: at most 3, got 4"
+        );
+        assert_eq!(said(schema, json!({"never": 1})), "never: not allowed");
+        // A reference to itself ends.
+        let looped = json!({"properties": {"next": {"$ref": "#"}}});
+        let mut deep = json!({});
+        for _ in 0..300 {
+            deep = json!({"next": deep});
+        }
+        assert!(check(&looped, &deep).is_ok());
+        // Inside a schema with its own `$id`, `#` means that schema, so
+        // no `#` reference is followed.
+        let nested = json!({"$defs": {"item": {"type": "integer"}},
+            "properties": {
+                "top": {"$ref": "#/$defs/item"},
+                "inner": {"$id": "https://example.com/inner",
+                    "$defs": {"item": {"type": "string"}},
+                    "properties": {"x": {"$ref": "#/$defs/item"}}}}});
+        assert!(check(&nested, &json!({"inner": {"x": "s"}})).is_ok());
+        assert!(check(&nested, &json!({"top": "s"})).is_ok());
+        // Before 2019-09, nothing beside a `$ref` is read.
+        let beside = |dialect: &str| {
+            json!({"$schema": dialect, "definitions": {"text": {"type": "string"}},
+                "properties": {"x": {"$ref": "#/definitions/text", "maxLength": 1}}})
+        };
+        let draft7 = beside("http://json-schema.org/draft-07/schema#");
+        assert!(check(&draft7, &json!({"x": "ab"})).is_ok());
+        assert_eq!(said(draft7, json!({"x": 1})), "x: must be a string");
+        assert_eq!(
+            said(
+                beside("https://json-schema.org/draft/2020-12/schema"),
+                json!({"x": "ab"})
+            ),
+            "x: at most 1 character, got 2"
+        );
+    }
+
+    #[test]
+    fn whole_numbers_compare_exactly() {
+        let top = json!({"type": "integer", "exclusiveMaximum": u64::MAX});
+        assert!(check(&top, &json!(u64::MAX - 1)).is_ok());
+        assert!(check(&top, &json!(u64::MAX)).is_err());
+        let least = json!({"minimum": 9_007_199_254_740_993_u64});
+        assert!(check(&least, &json!(9_007_199_254_740_992_u64)).is_err());
+        assert!(
+            check(
+                &json!({"enum": [9_007_199_254_740_993_u64]}),
+                &json!(9_007_199_254_740_992_u64)
+            )
+            .is_err()
+        );
+        assert!(check(&json!({"minimum": -1}), &json!(0.5)).is_ok());
+    }
+
+    #[test]
+    fn its_work_is_bounded_whatever_it_is_given() {
+        // 10,000 values allowed, 100,000 items each the last: a billion
+        // comparisons unbounded, a hundred thousand steps here.
+        let allowed: Vec<u64> = (0..10_000).collect();
+        let schema = json!({"type": "array", "items": {"enum": allowed}});
+        let value = json!(vec![9_999_u64; 100_000]);
+        let started = std::time::Instant::now();
+        assert!(check(&schema, &value).is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // Long strings read against many bounds spend it by their bytes.
+        let bounds: Vec<Value> = (0..3_000).map(|_| json!({"maxLength": 400_000})).collect();
+        let schema_long = json!({"allOf": bounds});
+        let text = json!("é".repeat(350_000));
+        let started = std::time::Instant::now();
+        assert!(check(&schema_long, &text).is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            said(json!({"maxLength": 3}), json!("éééé")),
+            "at most 3 characters, got 4"
+        );
+        // Every loop spends: fields no schema names, schemas that judge
+        // nothing, and long lists of type names.
+        let quick = |schema: Value, value: Value| {
+            let started = std::time::Instant::now();
+            assert!(check(&schema, &value).is_ok());
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+        };
+        let fields: Map<String, Value> = (0..50_000).map(|n| (format!("f{n}"), json!(0))).collect();
+        let named: Vec<Value> = (0..2_000)
+            .map(|_| json!({"properties": {"z": {}}}))
+            .collect();
+        quick(json!({"allOf": named}), Value::Object(fields));
+        let open: Vec<Value> = (0..2_000).map(|_| json!(true)).collect();
+        quick(json!({"items": {"allOf": open}}), json!(vec![0; 100_000]));
+        let types: Vec<Value> = (0..10_000).map(|_| json!("integer")).collect();
+        quick(json!({"items": {"type": types}}), json!(vec![0; 100_000]));
+        // A reference looked up spends by its bytes, found or not.
+        let far = format!("#/{}", "x".repeat(50_000));
+        quick(json!({"items": {"$ref": far}}), json!(vec![0; 40_000]));
+        // A value a rule names is shown cut.
+        let long = "y".repeat(1_000_000);
+        let ruled = said(json!({"const": long}), json!("z"));
+        assert!(ruled.len() < 100 && ruled.ends_with('…'), "{ruled}");
+        // A misfit within the bound is still found.
+        let early = json!([9_999, 10_000]);
+        assert_eq!(
+            said(schema, early),
+            "[1]: must be one of 0, 1, 2, 3, 4, 5, 6, 7 or 9992 more"
+        );
+    }
+
+    #[test]
+    fn items_by_place() {
+        let schema = json!({"prefixItems": [{"type": "string"}], "items": {"type": "integer"}});
+        assert!(check(&schema, &json!(["a", 1, 2])).is_ok());
+        assert_eq!(
+            said(schema, json!(["a", 1, "b"])),
+            "[2]: must be an integer"
+        );
+        let older = json!({"items": [{"type": "string"}]});
+        assert!(check(&older, &json!(["a", 1])).is_ok());
+    }
+}

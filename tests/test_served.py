@@ -1025,8 +1025,11 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.assertIn('prefers-short (feedback', (memory / 'MEMORY.md').read_text())
         shown = json.loads(self.call('calc.lead', 'memory', {'user': True}))
         self.assertIn('Short replies.', shown['user']['index'])
+        # A type the tool's schema does not list is refused by the daemon,
+        # before the host sees the call.
         refused = json.loads(self.call('calc.lead', 'memory', {'save': dict(fact, name='x', type='mood')}))
-        self.assertEqual(refused['error'], 'memory_refused')
+        self.assertEqual(refused['error'], 'invalid_arguments')
+        self.assertTrue(refused['detail'].startswith('memory: save.type: must be one of "user"'), refused)
 
     def test_a_workflow_runs_its_agents_and_tells_its_caller_once_when_it_ends(self):
         made = dict(declare=[declared('workflow')])
@@ -1336,7 +1339,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')
             time.sleep(.05)
         self.assertEqual((asked[0]['name'], asked[0]['arguments']),
-                         ('start_task', {'name': 'watch', 'brief': 'Check.', 'model': 'openai/synthetic-model'}))
+                         ('start_task', {'name': 'watch', 'title': 'watch', 'brief': 'Check.', 'model': 'openai/synthetic-model'}))
         self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
                             request=asked[0]['request'], decision='deny', by='test')
         self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')

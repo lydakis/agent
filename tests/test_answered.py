@@ -344,6 +344,40 @@ class AnsweredToolTests(ModelFixture):
         self.assertEqual(json.loads(self.output(client))['error'], 'invalid_arguments')
         self.assertNotIn('answered_by', self.events(client, turn, 'tool_started')[0])
 
+    def test_arguments_are_checked_before_the_gate_so_a_call_that_cannot_run_asks_no_one(self):
+        titled = dict(START, parameters={
+            'type': 'object', 'required': ['name'], 'additionalProperties': False,
+            'properties': {'name': {'type': 'string', 'minLength': 1, 'format': 'branch'},
+                           'title': {'type': 'string', 'maxLength': 30, 'pattern': '^[A-Z]'}}})
+        client = self.lead(tool=titled, approve=['start_task'], approver='manual')
+        self.model.call_script = [('start_task', {'name': 'fix', 'title': 'x' * 31})]
+        turn = self.submit(client)
+        # Refused at once: never announced as waiting, nobody asked.
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(json.loads(self.output(client)),
+                         {'error': 'invalid_arguments',
+                          'detail': 'start_task: title: at most 30 characters, got 31'})
+        self.assertEqual(self.events(client, turn, 'approval_requested'), [])
+        self.assertNotIn('waiting_on', self.events(client, turn, 'tool_started')[0])
+        # Thirty characters fit, and a keyword the check does not know
+        # (`pattern`, `format`) refuses nothing: the call is gated as before.
+        # The script runs on from the calls the first turn made.
+        self.model.call_script = [('start_task', {'name': 'fix', 'title': 'x' * 31}),
+                                  ('start_task', {'name': 'fix', 'title': 'é' * 30})]
+        turn = client.request('submit', bot='Lead', request_id='t2', prompt='script')['result']['message']
+        [call] = client.receive(lambda m: m.get('event') == 'approval_requested'
+                                and m.get('turn') == turn)['data']['calls']
+        self.assertEqual(call['name'], 'start_task')
+
+    def test_a_daemon_tools_arguments_are_read_before_its_gate(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Lead', workspace=str(self.path), approve=['shell'], approver='manual')
+        self.model.call_script = [('shell', {'command': 'true', 'timeout_ms': 0})]
+        turn = self.submit(client)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(json.loads(self.output(client))['error'], 'invalid_shell_arguments')
+        self.assertEqual(self.events(client, turn, 'approval_requested'), [])
+
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class StepTests(ModelFixture):
@@ -430,6 +464,39 @@ class StepTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.output(client), 'sent once')
         self.assertEqual(client.request('stats')['result']['approval_requests'], 0)
+
+    def test_a_step_whose_arguments_do_not_fit_its_schema_is_refused_before_its_gate(self):
+        client, turn, _ = self.script(approve=['exec'], approver='manual')
+        schema = {'type': 'object', 'required': ['text'], 'additionalProperties': False,
+                  'properties': {'text': {'type': 'string', 'maxLength': 5}}}
+        refused = self.reply(client, self.ask(client, turn, arguments={'text': 'everyone'}, parameters=schema))
+        self.assertEqual((refused['error'], refused['detail']),
+                         ('invalid_arguments', 'mcp__chat__send: text: at most 5 characters, got 8'))
+        self.assertEqual(client.request('approvals', bot='Lead')['result']['approvals'], [])
+        bad = client.request('approve_step', bot='Lead', turn=turn, call_id='script-0', step='2',
+                             name='mcp__chat__send', arguments={'text': 'hi'}, parameters='object')
+        self.assertEqual(bad['error'], 'invalid_step')
+        # Only recorded, a step is not checked; one that fits is asked about.
+        recorded = client.request('approve_step', bot='Lead', turn=turn, call_id='script-0', step='3',
+                                  name='mcp__chat__send', arguments={'text': 'everyone'}, parameters=schema,
+                                  record=True)
+        self.assertEqual(recorded['result']['decision'], 'allow')
+        request = self.ask(client, turn, step='4', arguments={'text': 'hi'}, parameters=schema)
+        [call] = self.announced(client, turn)['calls']
+        self.assertEqual(call['call_id'], 'script-0/4')
+        self.verdict(client, turn, 'script-0/4')
+        self.assertEqual(self.reply(client, request)['result']['decision'], 'allow')
+        self.answer(client, turn, output='done')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_a_step_of_the_bots_own_tool_is_read_before_its_gate(self):
+        client, turn, _ = self.script(client=self.client('echo,shell'), approve=['shell'], approver='manual')
+        refused = client.request('approve_step', bot='Lead', turn=turn, call_id='script-0', step='1',
+                                 name='shell', arguments={'command': 'true', 'timeout_ms': 0})
+        self.assertEqual(refused['error'], 'invalid_shell_arguments')
+        self.assertEqual(client.request('approvals', bot='Lead')['result']['approvals'], [])
+        self.answer(client, turn, output='done')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_a_judge_sees_the_steps_a_turn_was_refused(self):
         client, turn, _ = self.script(approve=['exec'], approver='manual')

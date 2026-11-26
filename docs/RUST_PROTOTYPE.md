@@ -3916,10 +3916,22 @@ Protocol version 19 lets a client declare tools of its own on a bot:
 `{name, description, parameters, result?}` taking at most 64 KiB, which
 `configure` replaces whole (`[]` removes them). The model is shown them after
 the daemon's tools, and the daemon never runs one: a call is checked against
-its `parameters` (an object schema; required fields, a closed object's extra
-fields, and each listed field's basic type) and recorded at once with the
+its `parameters` (an object schema) and recorded at once with the
 tool's fixed `result` (default `ok`), or with `invalid_arguments` when it does
-not fit. The call is otherwise like any other: `tool_started` and
+not fit. Protocol 104 checks every call's arguments first, before any gate,
+rule, load hold or sandbox decides it: a declared tool's against the JSON
+Schema it declared, as far as the daemon knows that language (`type`,
+`enum`, `const`, `required`, `properties`, `additionalProperties`,
+`minProperties` and `maxProperties`, `minLength` and `maxLength` in
+characters, `minimum`, `maximum` and their exclusive bounds, `minItems`,
+`maxItems`, `items`, `prefixItems`, `allOf`, `anyOf`, `oneOf` as "at least
+one", and a `$ref` within the schema), and the daemon's own tools' as the call
+would be read to run. A keyword it does not know passes, so it never refuses
+a call it cannot judge. A call that does not fit fails at once, its detail
+naming the field and the rule (`open_issue: title: at most 30 characters,
+got 31`); no gate holds it, so it is never announced as waiting for a
+verdict and no one is asked about it. A step put through `approve_step`
+that names one of the bot's own tools is checked the same way first. The call is otherwise like any other: `tool_started` and
 `tool_completed` events, history items, approvals never asked. What it means
 is the client's, which reads the call from events and history; a TUI's
 reaction to a message is one. A name is 1 to 64 letters, digits, `_` or `-`,
@@ -4580,7 +4592,13 @@ kinds above (`invalid_declare` otherwise), which its calls' rows carry.
 (`invalid_step` for another word), and `record: true` for a step the
 client lets run without asking: it is written and allowed at once,
 whatever the gates say, so the trail has every step and the gates judge
-only those a client puts to them. A step's `step_result` ends its row;
+only those a client puts to them. Protocol 104 lets `approve_step` take
+`parameters`, the JSON Schema of the step's tool when its client knows one
+(an MCP server's tool, say): a step to be asked about has its arguments
+checked against it before anything else, as a call's are, and one they do
+not fit is refused with `invalid_arguments`, never put to a gate; a schema
+that is not an object or a boolean is `invalid_step`. A step only recorded
+is not checked. A step's `step_result` ends its row;
 told twice, the first holds, and a step its gates allowed is told done by
 its events even once a trim took its row. A step allowed by nobody is not
 among the calls a judge reads. Approval verdicts now keep `leased` when given under a
