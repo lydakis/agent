@@ -254,11 +254,26 @@ fn press(keys: &tokio::sync::mpsc::UnboundedSender<Event>, key: Event) -> Instan
 }
 
 /// The time from each key to the first frame that shows what it typed.
+/// A key taken together with the keys after it shows in the frame that
+/// shows them: one drawn once a later key of the same run of typing was
+/// pressed, showing what that key typed.
 fn latencies(sent: &[(Instant, String)], frames: &[(Instant, String, String)]) -> Vec<Duration> {
+    let composer = |row: &str| row.split_once("› ").map(|(_, typed)| typed.to_owned());
     sent.iter()
-        .map(|(at, typed)| {
+        .enumerate()
+        .map(|(k, (at, typed))| {
+            // This key and the later ones that only add to what it typed.
+            let run: Vec<&(Instant, String)> = sent[k..]
+                .iter()
+                .take_while(|(_, later)| !typed.is_empty() && later.starts_with(typed.as_str()))
+                .collect();
             let shown = frames.iter().find(|(drawn, row, _)| {
-                drawn >= at && row.split_once("› ").map(|(_, typed)| typed) == Some(typed)
+                drawn >= at
+                    && composer(row).is_some_and(|shown| {
+                        shown == *typed
+                            || (run.iter())
+                                .any(|(pressed, later)| drawn >= pressed && shown == *later)
+                    })
             });
             match shown {
                 Some((drawn, ..)) => *drawn - *at,

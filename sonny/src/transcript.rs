@@ -692,12 +692,15 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
         KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let path = dir.join(name);
-    if let Err(error) =
-        std::fs::create_dir_all(&dir).and_then(|()| crate::cache::write_new(&path, source))
-    {
-        return vec![Line::from(format!("    could not keep the page: {error}")).dim()];
-    }
-    kept_page(path, source, width)
+    // Kept beside the window, as a slow disk can hold a write: the page is
+    // drawn from the file once it is there.
+    let (file, kept) = (path.clone(), source.to_owned());
+    let keeping = std::thread::spawn(move || {
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| crate::cache::write_new(&file, kept))
+            .map_err(|error| format!("could not keep the page: {error}"))
+    });
+    drawn_page(path, source, width, Some(keeping))
 }
 
 /// The page `source`, kept at `path`, drawn under it.
@@ -706,10 +709,26 @@ pub(crate) fn kept_page(
     source: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
+    drawn_page(path, source, width, None)
+}
+
+/// The page `source` drawn under its path, once `keeping`, when it is
+/// still being kept there, has kept it.
+fn drawn_page(
+    path: std::path::PathBuf,
+    source: &str,
+    width: usize,
+    keeping: Option<std::thread::JoinHandle<Result<(), String>>>,
+) -> Vec<Line<'static>> {
     let drawn = match crate::term::graphics() {
         true => {
             let file = path.clone();
             let drawing = crate::cache::drawn("html", source, width, move || {
+                if let Some(keeping) = keeping {
+                    keeping
+                        .join()
+                        .map_err(|_| "could not keep the page".to_owned())??;
+                }
                 let png = crate::html::render(&file, crate::image::page_width(width))?;
                 crate::image::page(&png, width)
             });
@@ -4682,7 +4701,12 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), kept.len(), "{kept:?}");
+        // Kept beside the window: each is there once its write lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         for path in kept {
+            while !std::path::Path::new(&path).exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert!(std::path::Path::new(&path).exists(), "{path}");
             let _ = std::fs::remove_file(path);
         }
