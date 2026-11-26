@@ -253,7 +253,15 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['echo', 'shell'], compaction_instructions='Summarize.',
                                                effort='low'))
-        self.model.compaction_refusals = 1
+        # The copy goes beside the turn's call, and its refusal closes the
+        # pool for its Retry-After. The turn parks only when its next call,
+        # after the call beside the copy and that call's tools, finds the
+        # pool closed for longer than a wait the gate holds: at the default
+        # 0.4 s that left about 0.15 s, some 0.1 s more than the call takes
+        # here, and on a loaded runner the call went later, waited in the
+        # gate and never parked (#1368). Two seconds leave it 1.75 s, as in
+        # test_elision's paced summary.
+        self.model.compaction_refusals, self.model.compaction_retry_after = 1, '2'
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x40')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
