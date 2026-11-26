@@ -7,6 +7,8 @@ The daemon brings a store forward by itself when it starts, one schema at a
 time. Each of those steps has its way back here, newest first, so a release
 that knows only SCHEMA opens the store with nothing lost that it can hold:
 
+    115 -> 114  the notes stopped turns left stay in history, no longer
+                marked as such
     114 -> 113  packed messages unpacked; instructions, and the texts the
                 events of kept configures hold, back in place of their
                 digests (needs Python 3.14+, or the zstandard module, when
@@ -46,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import store_lift_yields  # noqa: E402
 
-NEWEST = 114
+NEWEST = 115
 OLDEST = 106
 
 
@@ -83,6 +85,12 @@ def unpacker():
         return None
     unpack = zstandard.ZstdDecompressor()
     return lambda packed, size: unpack.decompress(packed, max_output_size=size)
+
+
+def back_115(conn):
+    """The notes a turn an interrupt stopped left stay where they are, as
+    the model reads them; only the mark that says what they are goes."""
+    run(conn, "DROP TABLE stop_notes")
 
 
 def back_114(conn):
@@ -201,7 +209,7 @@ def back_107(conn):
 
 
 # Each schema's way back to the one before it.
-BACK = {114: back_114, 113: back_113, 112: back_112, 111: back_111, 110: back_110, 109: back_109, 108: back_108, 107: back_107}
+BACK = {115: back_115, 114: back_114, 113: back_113, 112: back_112, 111: back_111, 110: back_110, 109: back_109, 108: back_108, 107: back_107}
 
 
 def back_up(conn, store, copy):

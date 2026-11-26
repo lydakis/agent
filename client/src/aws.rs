@@ -1,0 +1,1606 @@
+//! AWS Signature Version 4 and the credentials it signs with, for whatever
+//! signs requests to AWS: the runtime's Amazon Bedrock bindings and Sonny's
+//! MCP servers behind AWS IAM. One signer, so both read keys and sign alike.
+//!
+//! Credentials come from the AWS chain in its own order: static keys from the
+//! environment first, then everything else the AWS CLI resolves (profiles,
+//! SSO, assumed roles, container and instance roles) through its standard
+//! `credential_process` output. Temporary keys are re-resolved in the
+//! background shortly before they expire, and once when the caller says the
+//! service called them expired, so a long-lived process outlives any one
+//! session and no request waits on the CLI while its keys still work. Keys
+//! are held in memory only, never written anywhere.
+//!
+//! A body is digested as it streams ([`payload`]) or whole ([`digest`]), or
+//! sent as [`UNSIGNED_PAYLOAD`] where the service takes that over TLS.
+use aws_lc_rs::{digest, hmac};
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
+use serde_json::Value;
+use std::{
+    sync::{Arc, RwLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+/// Why keys could not be had: a code (`provider_aws_credentials_unavailable`
+/// or `provider_aws_credentials_expired`, the runtime's names for them) and,
+/// when there is one, the AWS CLI's own explanation. Never a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Error {
+    pub code: String,
+    pub detail: Option<String>,
+}
+impl Error {
+    pub fn new(code: &str) -> Self {
+        Self {
+            code: code.into(),
+            detail: None,
+        }
+    }
+    pub fn with(code: &str, detail: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            detail: Some(detail.into()),
+        }
+    }
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.detail {
+            Some(detail) => write!(f, "{}: {detail}", self.code),
+            None => f.write_str(&self.code),
+        }
+    }
+}
+impl std::error::Error for Error {}
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Where a process keeps the values it must never show, told each key as it
+/// is installed and each name the signer's choices come from. The runtime
+/// keeps them out of its tools' shells and output.
+pub trait Redact: Send + Sync {
+    /// `value`, held under the variable `name`, is a secret.
+    fn set(&self, name: &str, value: &str);
+    /// The variable `name` is the signer's, not a shell's.
+    fn withhold(&self, name: &str);
+}
+
+/// The error codes AWS's SDKs read as the request's clock, not its keys:
+/// signed again with the time now, the request goes through. A request
+/// signed before the machine slept and received minutes later is refused
+/// with one of these. The list is the AWS SDK for Java's clock-skew codes
+/// (`AwsErrorCode`), which it retries.
+const CLOCK_SKEW: [&str; 6] = [
+    "RequestTimeTooSkewed",
+    "RequestExpired",
+    "RequestInTheFuture",
+    "InvalidSignatureException",
+    "SignatureDoesNotMatch",
+    "AuthFailure",
+];
+
+/// How far the server's `Date` may be from when a request was signed before
+/// its refusal reads as the clock's: the AWS SDK for Java's threshold.
+const SKEW: Duration = Duration::from_secs(4 * 60);
+
+/// Whether a refusal of a request signed at `signed_at` was for the
+/// signature's time: its error type, as AWS services name it in
+/// `x-amzn-ErrorType` (`Code:namespace`), says so, or, as the AWS SDK for
+/// Java also reads it, the response's `Date` is more than [`SKEW`] from the
+/// signing time, as after a machine slept between the two.
+pub fn clock_skewed(headers: &http::HeaderMap, signed_at: SystemTime) -> bool {
+    let named = headers
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(':').next())
+        .is_some_and(|code| CLOCK_SKEW.contains(&code.trim()));
+    named
+        || headers
+            .get(http::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(http_date)
+            .is_some_and(|server| {
+                let apart = server
+                    .duration_since(signed_at)
+                    .or_else(|_| signed_at.duration_since(server))
+                    .unwrap_or_default();
+                apart > SKEW
+            })
+}
+
+/// An HTTP `Date`: `Sat, 31 Oct 2026 20:12:00 GMT` (RFC 9110's IMF-fixdate).
+fn http_date(text: &str) -> Option<SystemTime> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (_, rest) = text.trim().split_once(", ")?;
+    let mut parts = rest.split(' ');
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = parts.next()?;
+    let month = MONTHS.iter().position(|m| *m == month)? as i64 + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut clock = parts.next()?.splitn(3, ':');
+    let (hour, minute, second): (i64, i64, i64) = (
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+    );
+    if parts.next()? != "GMT" || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    {
+        return None;
+    }
+    let secs = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
+}
+
+/// Re-resolve temporary keys this long before they expire, as AWS SDKs do.
+const REFRESH_AHEAD: Duration = Duration::from_secs(300);
+/// Bound on one `aws` credential resolution; an SSO login that needs a
+/// browser fails here with the CLI's own message instead of hanging a turn.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long startup waits on the AWS CLI; a client starting the daemon
+/// gives it 10 s in all. Keys it has not given by then are resolved on the
+/// binding's first call.
+const START: Duration = Duration::from_secs(3);
+
+/// What the AWS CLI gave when the process started, asked once for every
+/// signer opened with it: they all read the same profile.
+pub type Start = tokio::sync::OnceCell<Result<Keys>>;
+/// Re-resolution runs at most this often, so neither a CLI outage nor a
+/// fleet refused for another reason (a model not enabled, a missing
+/// permission) can spawn the CLI once per request.
+const RELOAD_INTERVAL: Duration = Duration::from_secs(10);
+/// The AWS CLI's credential export, which resolves the rest of the chain for
+/// `AWS_PROFILE` or the default profile.
+const AWS_CLI: [&str; 5] = [
+    "aws",
+    "configure",
+    "export-credentials",
+    "--format",
+    "process",
+];
+/// The environment's key set: key id, secret, session token.
+pub const ENVIRONMENT: [&str; 3] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
+/// What picks the identity and region the keys are for.
+const SELECTION: [&str; 4] = [
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+];
+pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+/// Where SigV4 calls go when nothing names a region, as Claude Code does:
+/// a source region for the US and global inference profiles in AWS's
+/// support matrix.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region signed calls are made in, in Claude Code's order:
+/// `AWS_REGION`, `AWS_DEFAULT_REGION`, the active profile's `region`
+/// (`AWS_PROFILE`, else `default`) in the shared credentials file and then
+/// the config file; `None` when none names one. An empty value is unset; the first one
+/// set must be shaped like a region, or the reason names where it came
+/// from, so a typo never sends signed calls to another region. `read`
+/// reads a file; tests give it their own.
+pub fn region(
+    env: &dyn Fn(&str) -> Option<String>,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    let profile = env("AWS_PROFILE")
+        .map(|profile| profile.trim().to_owned())
+        .filter(|profile| !profile.is_empty())
+        .unwrap_or_else(|| "default".to_owned());
+    let home = env("HOME");
+    let path = |variable: &str, file: &str| {
+        env(variable)
+            .filter(|path| !path.is_empty())
+            .or_else(|| home.as_ref().map(|home| format!("{home}/.aws/{file}")))
+    };
+    // The credentials file names a profile bare; the config file names
+    // every profile but `default` as `profile NAME`.
+    let config_section = match profile.as_str() {
+        "default" => "default".to_owned(),
+        name => format!("profile {name}"),
+    };
+    let files = [
+        (
+            path("AWS_SHARED_CREDENTIALS_FILE", "credentials"),
+            profile.clone(),
+        ),
+        (path("AWS_CONFIG_FILE", "config"), config_section),
+    ];
+    let named = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .into_iter()
+        .map(|name| (name.to_owned(), env(name)));
+    let profiles = files.into_iter().map(|(path, section)| {
+        let value = path
+            .as_ref()
+            .and_then(|path| ini_value(&read(path)?, &section, "region"));
+        (format!("the region of [{section}] in the AWS files"), value)
+    });
+    let Some((source, region)) = named
+        .chain(profiles)
+        .filter_map(|(source, value)| Some((source, value?.trim().to_owned())))
+        .find(|(_, value)| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    match region
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        true => Ok(Some(region)),
+        false => Err(format!("{source} is {region:?}, which is not a region")),
+    }
+}
+
+/// `key` in `[section]` of an AWS shared config or credentials file.
+fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            inside = name.split_whitespace().eq(section.split_whitespace());
+        } else if inside
+            && let Some((name, value)) = line.split_once('=')
+            && name.trim() == key
+        {
+            return Some(value.trim().to_owned());
+        }
+    }
+    None
+}
+
+/// One set of AWS keys. The secret and session token never enter a debug
+/// string.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Keys {
+    pub access: String,
+    secret: String,
+    pub token: Option<String>,
+    /// When temporary keys stop working; `None` for long-term keys.
+    pub expires: Option<SystemTime>,
+}
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keys")
+            .field("access", &self.access)
+            .field("expires", &self.expires)
+            .finish_non_exhaustive()
+    }
+}
+impl Keys {
+    pub fn new(access: String, secret: String, token: Option<String>) -> Self {
+        Self {
+            access,
+            secret,
+            token,
+            expires: None,
+        }
+    }
+    fn stale(&self, now: SystemTime) -> bool {
+        self.expires.is_some_and(|at| at <= now + REFRESH_AHEAD)
+    }
+    fn expired(&self, now: SystemTime) -> bool {
+        self.expires.is_some_and(|at| at <= now)
+    }
+}
+
+enum Source {
+    /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, read once: the
+    /// process environment cannot change under a running process.
+    Environment,
+    /// A command printing `credential_process` output: [`AWS_CLI`].
+    Cli(Cli),
+}
+
+/// The AWS CLI as a signer runs it: its command line, and the variables it
+/// runs under over the process's own, an empty value unsetting one.
+struct Cli {
+    argv: Box<[String]>,
+    env: Box<[(String, String)]>,
+}
+impl Cli {
+    fn new(argv: Box<[String]>) -> Self {
+        Self {
+            argv,
+            env: Box::default(),
+        }
+    }
+}
+
+/// A signer: keys from the AWS chain, for one region and signing name.
+pub struct Aws {
+    region: String,
+    service: Box<str>,
+    source: Source,
+    keys: RwLock<Arc<Keys>>,
+    /// Single flight for re-resolution, and when it last began.
+    refresh: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    redaction: Option<Box<dyn Redact>>,
+}
+impl std::fmt::Debug for Aws {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Aws")
+            .field("region", &self.region)
+            .field("service", &self.service)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Aws {
+    /// A signer for `service` in `region` whose CLI keys are resolved once
+    /// now, through `start`, shared by every signer the process opens. Keys
+    /// the AWS CLI cannot resolve yet (no login, an expired SSO session) do
+    /// not stop the caller: the signer is returned with the reason, and its
+    /// first call resolves again, so `aws sso login` fixes it in place.
+    pub async fn open(
+        region: String,
+        service: &str,
+        redaction: Option<Box<dyn Redact>>,
+        start: &Start,
+    ) -> (Self, Option<Error>) {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        match Self::environment(redaction.as_deref(), var) {
+            Some(keys) => {
+                let aws = Self::unresolved(region, service, Source::Environment, redaction);
+                aws.install(keys);
+                (aws, None)
+            }
+            None => {
+                let command: Box<[String]> = AWS_CLI.map(str::to_owned).into();
+                Self::from_cli(region, service, command, redaction, start).await
+            }
+        }
+    }
+
+    /// A signer for `service` in `region` that asks the AWS CLI for keys
+    /// only when it first signs, bounded by the CLI's own timeout. `env`
+    /// holds variables that stand over the process's own, for the keys
+    /// read from it and for the CLI, as a client's kept variables stand over
+    /// its shell's: an empty value unsets one.
+    pub fn new(
+        region: String,
+        service: &str,
+        redaction: Option<Box<dyn Redact>>,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        let var = |name: &str| match env.iter().rev().find(|(key, _)| key == name) {
+            Some((_, value)) => Some(value.clone()).filter(|v| !v.is_empty()),
+            None => std::env::var(name).ok().filter(|v| !v.is_empty()),
+        };
+        match Self::environment(redaction.as_deref(), var) {
+            Some(keys) => {
+                let aws = Self::unresolved(region, service, Source::Environment, redaction);
+                aws.install(keys);
+                aws
+            }
+            None => {
+                let cli = Cli {
+                    argv: AWS_CLI.map(str::to_owned).into(),
+                    env: env.into(),
+                };
+                Self::unresolved(region, service, Source::Cli(cli), redaction)
+            }
+        }
+    }
+
+    /// The environment's key pair, when it holds one, whatever part of a
+    /// set it holds withheld first.
+    fn environment(
+        redaction: Option<&dyn Redact>,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Option<Keys> {
+        if let Some(redaction) = redaction {
+            withhold(redaction, &var);
+        }
+        let (access, secret) = var(ENVIRONMENT[0]).zip(var(ENVIRONMENT[1]))?;
+        Some(Keys::new(access, secret, var(ENVIRONMENT[2])))
+    }
+
+    async fn from_cli(
+        region: String,
+        service: &str,
+        command: Box<[String]>,
+        redaction: Option<Box<dyn Redact>>,
+        start: &Start,
+    ) -> (Self, Option<Error>) {
+        let cli = Cli::new(command);
+        let resolved = start
+            .get_or_init(|| async {
+                tokio::time::timeout(START, resolve(&cli))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::with(
+                            "provider_aws_credentials_unavailable",
+                            format!("the AWS CLI gave no keys within {START:?} of start"),
+                        ))
+                    })
+            })
+            .await
+            .clone();
+        let aws = Self::unresolved(region, service, Source::Cli(cli), redaction);
+        let unresolved = match resolved {
+            Ok(keys) if !keys.expired(SystemTime::now()) => {
+                aws.install(keys);
+                None
+            }
+            Ok(_) => Some(Error::new("provider_aws_credentials_expired")),
+            Err(error) => Some(error),
+        };
+        (aws, unresolved)
+    }
+
+    /// A signer holding no keys yet: expired placeholders, so the first
+    /// call resolves before it signs.
+    fn unresolved(
+        region: String,
+        service: &str,
+        source: Source,
+        redaction: Option<Box<dyn Redact>>,
+    ) -> Self {
+        let mut none = Keys::new(String::new(), String::new(), None);
+        none.expires = Some(UNIX_EPOCH);
+        Self {
+            region,
+            service: service.into(),
+            source,
+            keys: RwLock::new(Arc::new(none)),
+            refresh: Arc::default(),
+            redaction,
+        }
+    }
+
+    /// A signer that signs with `keys` and never resolves others, as one
+    /// given environment keys does: for tests.
+    pub fn fixed(region: &str, service: &str, keys: Keys) -> Self {
+        Self {
+            region: region.to_owned(),
+            service: service.into(),
+            source: Source::Environment,
+            keys: RwLock::new(Arc::new(keys)),
+            refresh: Arc::default(),
+            redaction: None,
+        }
+    }
+
+    /// This signer, telling `redaction` each key it installs from now on.
+    pub fn with_redaction(mut self, redaction: Box<dyn Redact>) -> Self {
+        self.redaction = Some(redaction);
+        self
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+    /// Where the keys come from, as `ready.providers` reports it.
+    pub fn source(&self) -> &'static str {
+        match self.source {
+            Source::Environment => "environment",
+            Source::Cli(_) => "aws-cli",
+        }
+    }
+
+    fn held(&self) -> Arc<Keys> {
+        self.keys.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn install(&self, keys: Keys) {
+        if let Some(redaction) = &self.redaction {
+            // The key id too: it names the account's credential, and a shell
+            // left with it alone is no use to anyone.
+            let names = match self.source {
+                Source::Environment => ENVIRONMENT,
+                Source::Cli(_) => [
+                    "AGENT_AWS_ACCESS_KEY_ID",
+                    "AGENT_AWS_SECRET_ACCESS_KEY",
+                    "AGENT_AWS_SESSION_TOKEN",
+                ],
+            };
+            redaction.set(names[0], &keys.access);
+            redaction.set(names[1], &keys.secret);
+            if let Some(token) = &keys.token {
+                redaction.set(names[2], token);
+            }
+        }
+        *self.keys.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(keys);
+    }
+
+    /// The keys to sign with now. Keys inside the refresh window keep
+    /// signing while one background task re-resolves them, so no request
+    /// waits on the CLI while they still work; a failed attempt keeps them.
+    /// Only expired keys make the caller wait for a re-resolution, and fail
+    /// the request when it fails or another has just failed.
+    pub async fn current(self: &Arc<Self>) -> Result<Arc<Keys>> {
+        let held = self.held();
+        let now = SystemTime::now();
+        let Source::Cli(command) = &self.source else {
+            return usable(held, now);
+        };
+        if !held.stale(now) {
+            return Ok(held);
+        }
+        if !held.expired(now) {
+            if let Ok(mut last) = Arc::clone(&self.refresh).try_lock_owned()
+                && due(*last)
+            {
+                *last = Some(Instant::now());
+                let aws = Arc::clone(self);
+                tokio::spawn(async move {
+                    // The lock is held until the run ends: one run at a time.
+                    let _last = last;
+                    if let Source::Cli(command) = &aws.source
+                        && let Ok(fresh) = resolve(command).await
+                    {
+                        aws.install(fresh);
+                    }
+                });
+            }
+            return Ok(held);
+        }
+        let mut last = self.refresh.lock().await;
+        if self.held().stale(SystemTime::now()) && due(*last) {
+            *last = Some(Instant::now());
+            self.install(resolve(command).await?);
+        }
+        usable(self.held(), SystemTime::now())
+    }
+
+    /// After the service refused `refused` as expired or unrecognized: use
+    /// keys another call has already installed, or re-resolve. True when
+    /// different keys are now held, so the caller may retry.
+    pub async fn reload(&self, refused: &Keys) -> Result<bool> {
+        let Source::Cli(command) = &self.source else {
+            return Ok(false);
+        };
+        let mut last = self.refresh.lock().await;
+        if *self.held() != *refused {
+            return Ok(true);
+        }
+        if !due(*last) {
+            return Ok(false);
+        }
+        *last = Some(Instant::now());
+        let fresh = resolve(command).await?;
+        let changed = fresh != *refused;
+        if changed {
+            self.install(fresh);
+        }
+        Ok(changed)
+    }
+
+    /// The headers that sign one request to `url` at `now`, whose body is
+    /// `payload`: its [`payload()`] or [`digest()`], or [`UNSIGNED_PAYLOAD`].
+    pub fn sign(
+        &self,
+        keys: &Keys,
+        method: &str,
+        url: &url::Url,
+        now: SystemTime,
+        payload: &str,
+    ) -> Vec<(&'static str, String)> {
+        sign(keys, &self.region, &self.service, method, url, now, payload)
+    }
+}
+
+/// Keep whatever part of an environment key set the process inherited out
+/// of shells and tool output, whichever source signs: an incomplete set
+/// leaves the CLI to sign, but its values are still credentials.
+fn withhold(redaction: &dyn Redact, var: impl Fn(&str) -> Option<String>) {
+    for name in ENVIRONMENT {
+        if let Some(value) = var(name) {
+            redaction.set(name, &value);
+        }
+    }
+    // The profile and region the process signs with are its own too: a
+    // bot's AWS commands choose theirs.
+    for name in SELECTION {
+        redaction.withhold(name);
+    }
+}
+
+/// `keys`, unless they have expired.
+fn usable(keys: Arc<Keys>, now: SystemTime) -> Result<Arc<Keys>> {
+    match keys.expired(now) {
+        true => Err(Error::new("provider_aws_credentials_expired")),
+        false => Ok(keys),
+    }
+}
+
+/// Whether a re-resolution that last began at `last` may run again.
+fn due(last: Option<Instant>) -> bool {
+    last.is_none_or(|at| at.elapsed() >= RELOAD_INTERVAL)
+}
+
+/// The hex SHA-256 of a whole body, as a signed request carries it.
+pub fn digest(body: &[u8]) -> String {
+    hex(digest::digest(&digest::SHA256, body).as_ref())
+}
+
+/// The hex SHA-256 of a body, read chunk by chunk as it streams.
+pub async fn payload(body: impl Stream<Item = std::io::Result<Bytes>>) -> Result<String> {
+    let mut body = std::pin::pin!(body);
+    let mut context = digest::Context::new(&digest::SHA256);
+    while let Some(chunk) = body.next().await {
+        context.update(&chunk.map_err(|error| Error::new(&error.to_string()))?);
+    }
+    Ok(hex(context.finish().as_ref()))
+}
+
+/// Run the AWS CLI's credential export. Its stdout holds the secret, so it
+/// never becomes a diagnostic; its stderr is the CLI's own explanation.
+async fn resolve(cli: &Cli) -> Result<Keys> {
+    let argv = &cli.argv;
+    let unavailable = |why: String| Error::with("provider_aws_credentials_unavailable", why);
+    let deadline = tokio::time::Instant::now() + RESOLVE_TIMEOUT;
+    let mut command = tokio::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    for (name, value) in &cli.env {
+        match value.is_empty() {
+            true => command.env_remove(name),
+            false => command.env(name, value),
+        };
+    }
+    let output = tokio::time::timeout_at(deadline, command.output())
+        .await
+        .map_err(|_| unavailable("aws configure export-credentials timed out".into()))?
+        .map_err(|error| {
+            unavailable(match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    "no AWS keys in the environment and no aws CLI on PATH".into()
+                }
+                _ => format!("could not run aws: {error}"),
+            })
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A CLI without the export (version 1, or 2 before 2.9) answers with
+        // its usage text, which says nothing of what to do. Its version,
+        // asked within the same bound, says whether that is what happened.
+        if stderr.contains("Invalid choice")
+            && let Some(version) = version(&argv[0], deadline).await.filter(|v| too_old(v))
+        {
+            return Err(unavailable(format!(
+                "{version} on PATH cannot export credentials: install AWS CLI version 2 (2.9 or later)"
+            )));
+        }
+        let reason = stderr.trim();
+        return Err(unavailable(if reason.is_empty() {
+            format!("aws configure export-credentials exited {}", output.status)
+        } else {
+            reason.chars().take(512).collect()
+        }));
+    }
+    parse_process(&output.stdout)
+        .ok_or_else(|| unavailable("aws configure export-credentials printed no keys".into()))
+}
+
+/// What `aws --version` says it is (`aws-cli/1.22.34`), if it says so by
+/// `deadline`.
+async fn version(aws: &str, deadline: tokio::time::Instant) -> Option<String> {
+    let mut command = tokio::process::Command::new(aws);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout_at(deadline, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    // Version 1 on Python 2 printed it to stderr.
+    [output.stdout, output.stderr].iter().find_map(|text| {
+        String::from_utf8_lossy(text)
+            .split_whitespace()
+            .find(|word| word.starts_with("aws-cli/"))
+            .map(str::to_owned)
+    })
+}
+
+/// Whether `aws-cli/X.Y.Z` predates `aws configure export-credentials`,
+/// which came in 2.9.
+fn too_old(version: &str) -> bool {
+    let mut parts = (version
+        .strip_prefix("aws-cli/")
+        .unwrap_or_default()
+        .split('.'))
+    .map(|part| part.parse::<u32>().ok());
+    matches!((parts.next().flatten(), parts.next().flatten()), (Some(major), Some(minor)) if (major, minor) < (2, 9))
+}
+
+/// The `credential_process` JSON: version 1, the key pair, an optional
+/// session token and an optional RFC 3339 expiration.
+fn parse_process(stdout: &[u8]) -> Option<Keys> {
+    let value: Value = serde_json::from_slice(stdout).ok()?;
+    if value["Version"].as_u64() != Some(1) {
+        return None;
+    }
+    let text = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let mut keys = Keys::new(
+        text("AccessKeyId")?,
+        text("SecretAccessKey")?,
+        text("SessionToken"),
+    );
+    keys.expires = match value.get("Expiration") {
+        None | Some(Value::Null) => None,
+        Some(at) => Some(rfc3339(at.as_str()?)?),
+    };
+    Some(keys)
+}
+
+/// `2026-09-25T02:00:00Z`, `…+00:00`, or with fractional seconds.
+fn rfc3339(text: &str) -> Option<SystemTime> {
+    let (date, time) = text.trim().split_once(['T', 't', ' '])?;
+    let mut parts = date.splitn(3, '-');
+    let (year, month, day): (i64, i64, i64) = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    let (clock, offset) = time.split_at(time.find(['Z', 'z', '+', '-'])?);
+    let offset = match offset {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = if offset.starts_with('-') { -1 } else { 1 };
+            let (hours, minutes) = offset[1..].split_once(':')?;
+            sign * (hours.parse::<i64>().ok()? * 3600 + minutes.parse::<i64>().ok()? * 60)
+        }
+    };
+    let mut clock = clock.splitn(3, ':');
+    let (hour, minute): (i64, i64) = (clock.next()?.parse().ok()?, clock.next()?.parse().ok()?);
+    let seconds = clock.next()?;
+    let whole: i64 = seconds.split('.').next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    let secs =
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + whole - offset;
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
+}
+
+/// Days since 1970-01-01, Howard Hinnant's algorithm.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `YYYYMMDDTHHMMSSZ` for `now` in UTC.
+fn amz_date(now: SystemTime) -> String {
+    let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil from days, Howard Hinnant's algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 15)] as char);
+    }
+    out
+}
+
+fn mac(key: &[u8], data: &[u8]) -> hmac::Tag {
+    hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
+}
+
+/// Percent-encode a request path as SigV4 canonicalizes it for services
+/// other than S3: the path as sent, with every byte outside the unreserved
+/// set and `/` encoded again.
+fn canonical_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if out.is_empty() { "/".into() } else { out }
+}
+
+/// The query as SigV4 canonicalizes it: each name and value encoded
+/// leaving only unreserved characters bare, sorted by name, then value.
+fn canonical_query(url: &url::Url) -> String {
+    let encode = |text: &str| {
+        let mut out = String::with_capacity(text.len());
+        for byte in text.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
+    };
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(name, value)| (encode(&name), encode(&value)))
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// The request signature: the canonical request's digest in the string to
+/// sign, under the key derived from the secret for this day, region and
+/// service.
+fn signature(secret: &str, stamp: &str, region: &str, service: &str, canonical: &str) -> String {
+    let date = &stamp[..8];
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256\n{stamp}\n{date}/{region}/{service}/aws4_request\n{}",
+        hex(digest::digest(&digest::SHA256, canonical.as_bytes()).as_ref())
+    );
+    let key = [region, service, "aws4_request"].iter().fold(
+        mac(format!("AWS4{secret}").as_bytes(), date.as_bytes()),
+        |key, part| mac(key.as_ref(), part.as_bytes()),
+    );
+    hex(mac(key.as_ref(), to_sign.as_bytes()).as_ref())
+}
+
+/// SigV4 header signing: `host`, `x-amz-content-sha256`, `x-amz-date` and,
+/// with temporary keys, `x-amz-security-token` are signed.
+fn sign(
+    keys: &Keys,
+    region: &str,
+    service: &str,
+    method: &str,
+    url: &url::Url,
+    now: SystemTime,
+    payload: &str,
+) -> Vec<(&'static str, String)> {
+    let stamp = amz_date(now);
+    let date = &stamp[..8];
+    let host = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+        None => url.host_str().unwrap_or_default().to_owned(),
+    };
+    let mut headers: Vec<(&'static str, String)> = vec![
+        ("host", host),
+        ("x-amz-content-sha256", payload.to_owned()),
+        ("x-amz-date", stamp.clone()),
+    ];
+    if let Some(token) = &keys.token {
+        headers.push(("x-amz-security-token", token.clone()));
+    }
+    let signed = headers
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(";");
+    let mut canonical = format!(
+        "{method}\n{}\n{}\n",
+        canonical_path(url.path()),
+        canonical_query(url)
+    );
+    for (name, value) in &headers {
+        canonical.push_str(name);
+        canonical.push(':');
+        canonical.push_str(value.trim());
+        canonical.push('\n');
+    }
+    canonical.push('\n');
+    canonical.push_str(&signed);
+    canonical.push('\n');
+    canonical.push_str(payload);
+    let scope = format!("{date}/{region}/{service}/aws4_request");
+    let signature = signature(&keys.secret, &stamp, region, service, &canonical);
+    headers.remove(0); // The client sends `host` itself.
+    headers.push((
+        "authorization",
+        format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={signature}",
+            keys.access
+        ),
+    ));
+    headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_for_the_signature_s_time_is_told_from_one_for_its_keys() {
+        let refused = |kind: Option<&str>| {
+            let mut headers = http::HeaderMap::new();
+            if let Some(kind) = kind {
+                headers.insert("x-amzn-errortype", kind.parse().unwrap());
+            }
+            headers.insert("date", "Sat, 31 Oct 2026 20:12:00 GMT".parse().unwrap());
+            clock_skewed(
+                &headers,
+                http_date("Sat, 31 Oct 2026 20:13:00 GMT").unwrap(),
+            )
+        };
+        assert!(refused(Some(
+            "InvalidSignatureException:http://internal.example/"
+        )));
+        assert!(refused(Some("RequestExpired")));
+        assert!(!refused(Some(
+            "AccessDeniedException:http://internal.example/"
+        )));
+        assert!(!refused(Some("UnrecognizedClientException")));
+        assert!(!refused(None));
+    }
+
+    #[test]
+    fn a_refusal_whose_date_is_far_from_the_signing_is_for_the_time() {
+        let refused = |date: &str, signed: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("date", date.parse().unwrap());
+            clock_skewed(&headers, http_date(signed).unwrap())
+        };
+        assert_eq!(
+            http_date("Thu, 01 Jan 1970 00:01:00 GMT"),
+            Some(UNIX_EPOCH + Duration::from_secs(60))
+        );
+        // Signed before the machine slept, refused once it woke.
+        assert!(refused(
+            "Sat, 31 Oct 2026 09:48:00 GMT",
+            "Sat, 31 Oct 2026 00:16:00 GMT"
+        ));
+        // A clock ahead of the server's is as wrong as one behind it.
+        assert!(refused(
+            "Sat, 31 Oct 2026 20:00:00 GMT",
+            "Sat, 31 Oct 2026 20:05:00 GMT"
+        ));
+        assert!(!refused(
+            "Sat, 31 Oct 2026 20:03:59 GMT",
+            "Sat, 31 Oct 2026 20:00:00 GMT"
+        ));
+        let mut headers = http::HeaderMap::new();
+        headers.insert("date", "yesterday".parse().unwrap());
+        assert!(!clock_skewed(&headers, UNIX_EPOCH));
+        assert_eq!(http_date("Sat, 31 Oct 2026 20:12:00 PST"), None);
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_region_comes_from_the_environment_then_the_profile() {
+        let config = "[default]\nregion = eu-west-1\n\n[profile work]\noutput = json\nregion=us-west-2\n[sso-session work]\nregion = ap-south-1\n";
+        let credentials = "[work]\naws_access_key_id = x\nregion = ca-central-1\n";
+        let read = |path: &str| match path {
+            "/h/.aws/config" => Some(config.to_owned()),
+            "/h/.aws/credentials" => Some(credentials.to_owned()),
+            "/elsewhere" => Some("[profile work]\nregion = sa-east-1\n".to_owned()),
+            "/bad" => Some("[profile work]\nregion = us east\n".to_owned()),
+            _ => None,
+        };
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let resolve = |pairs| region(&env(pairs), &read).unwrap().unwrap_or_default();
+        assert_eq!(
+            resolve(&[("AWS_REGION", "us-east-2"), ("HOME", "/h")]),
+            "us-east-2"
+        );
+        assert_eq!(
+            resolve(&[("AWS_DEFAULT_REGION", "eu-north-1")]),
+            "eu-north-1"
+        );
+        // An empty value is unset; one not shaped like a region is refused,
+        // naming where it came from, rather than sending calls elsewhere.
+        assert_eq!(
+            resolve(&[("AWS_REGION", " "), ("AWS_DEFAULT_REGION", "eu-north-1")]),
+            "eu-north-1"
+        );
+        let refused = |pairs| region(&env(pairs), &read).unwrap_err();
+        assert_eq!(
+            refused(&[
+                ("AWS_REGION", "US-EAST-1"),
+                ("AWS_DEFAULT_REGION", "eu-north-1")
+            ]),
+            "AWS_REGION is \"US-EAST-1\", which is not a region"
+        );
+        assert_eq!(
+            refused(&[("AWS_PROFILE", "work"), ("AWS_CONFIG_FILE", "/bad")]),
+            "the region of [profile work] in the AWS files is \"us east\", which is not a region"
+        );
+        assert_eq!(resolve(&[("HOME", "/h")]), "eu-west-1");
+        // The credentials file is read before the config file.
+        assert_eq!(
+            resolve(&[("HOME", "/h"), ("AWS_PROFILE", "work")]),
+            "ca-central-1"
+        );
+        assert_eq!(
+            resolve(&[
+                ("HOME", "/h"),
+                ("AWS_PROFILE", "work"),
+                ("AWS_SHARED_CREDENTIALS_FILE", "/none")
+            ]),
+            "us-west-2"
+        );
+        assert_eq!(
+            resolve(&[("AWS_PROFILE", "work"), ("AWS_CONFIG_FILE", "/elsewhere")]),
+            "sa-east-1"
+        );
+        // Nothing names one: the caller picks the fallback.
+        assert_eq!(resolve(&[("HOME", "/h"), ("AWS_PROFILE", "other")]), "");
+        assert_eq!(resolve(&[]), "");
+    }
+
+    #[test]
+    fn dates_format_in_utc_and_parse_with_offsets() {
+        assert_eq!(amz_date(at(1_440_938_160)), "20150830T123600Z");
+        assert_eq!(amz_date(at(951_782_400)), "20000229T000000Z");
+        assert_eq!(rfc3339("2015-08-30T12:36:00Z"), Some(at(1_440_938_160)));
+        assert_eq!(
+            rfc3339("2015-08-30T12:36:00.123+00:00"),
+            Some(at(1_440_938_160))
+        );
+        assert_eq!(
+            rfc3339("2015-08-30T14:36:00+02:00"),
+            Some(at(1_440_938_160))
+        );
+        assert_eq!(rfc3339("2015-08-30T12:36:00"), None);
+        assert_eq!(rfc3339("not a date"), None);
+    }
+
+    /// The AWS SigV4 test suite's `get-vanilla` and `post-vanilla` cases,
+    /// whose published signatures fix the string to sign and key chain.
+    #[test]
+    fn signatures_match_the_aws_test_suite() {
+        let empty = hex(digest::digest(&digest::SHA256, b"").as_ref());
+        for (method, expected) in [
+            (
+                "GET",
+                "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31",
+            ),
+            (
+                "POST",
+                "5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b",
+            ),
+        ] {
+            let canonical = format!(
+                "{method}\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\n{empty}"
+            );
+            assert_eq!(
+                signature(
+                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                    "20150830T123600Z",
+                    "us-east-1",
+                    "service",
+                    &canonical
+                ),
+                expected
+            );
+        }
+    }
+
+    /// The suite's `get-vanilla-query-order-key-case`: the query sorted
+    /// by name, as [`canonical_query`] puts it, before it is signed.
+    #[test]
+    fn a_query_signs_as_the_aws_test_suite_sorts_it() {
+        let url =
+            url::Url::parse("https://example.amazonaws.com/?Param2=value2&Param1=value1").unwrap();
+        let canonical = format!(
+            "GET\n/\n{}\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\n{}",
+            canonical_query(&url),
+            digest(b"")
+        );
+        assert_eq!(
+            signature(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "20150830T123600Z",
+                "us-east-1",
+                "service",
+                &canonical
+            ),
+            "b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_missing_at_start_resolves_on_first_use() {
+        let dir = std::env::temp_dir().join(format!("agent-aws-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ready = dir.join("ready");
+        let script = format!(
+            r#"test -e '{}' || {{ echo 'Token has expired' >&2; exit 255; }}
+echo '{{"Version":1,"AccessKeyId":"LATE","SecretAccessKey":"S"}}'"#,
+            ready.display()
+        );
+        let command: Box<[String]> = ["sh".into(), "-c".into(), script].into();
+        let (aws, unresolved) = Aws::from_cli(
+            "us-east-1".into(),
+            "bedrock-mantle",
+            command,
+            None,
+            &Start::new(),
+        )
+        .await;
+        assert_eq!(
+            unresolved.unwrap().code,
+            "provider_aws_credentials_unavailable"
+        );
+        let aws = Arc::new(aws);
+        std::fs::write(&ready, "").unwrap();
+        assert_eq!(aws.current().await.unwrap().access, "LATE");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Write `text` to `path` as an executable script, from a child process.
+    /// A file this process held open for writing would pass to any child
+    /// another test forks meanwhile, until that child execs, and running the
+    /// script then fails with "Text file busy".
+    #[cfg(unix)]
+    fn script(path: &std::path::Path, text: &str) {
+        use std::io::Write;
+        let mut sh = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$0" && chmod 755 "$0""#])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        sh.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        assert!(sh.wait().unwrap().success());
+    }
+
+    /// AWS CLI version 1 has no credential export and answers with its usage
+    /// text; the reason says which CLI it is and what it takes instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_without_the_export_is_named_not_quoted() {
+        let dir = std::env::temp_dir().join(format!("agent-aws-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aws = dir.join("aws");
+        // What aws-cli 1.x prints, trimmed of its list of choices.
+        script(
+            &aws,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'aws-cli/1.22.34 Python/3.9.6 Darwin/23.6.0 botocore/1.24.0'; exit 0; fi
+printf 'usage: \rNote: AWS CLI version 2, the latest major version of the AWS CLI, is now stable and recommended for general use.\n\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\naws: error: argument subcommand: Invalid choice, valid choices are:\n\nadd-model | get\n' >&2
+exit 252
+"#,
+        );
+        let mut argv = AWS_CLI.map(str::to_owned);
+        argv[0] = aws.display().to_string();
+        let error = resolve(&Cli::new(argv.clone().into())).await.unwrap_err();
+        assert_eq!(error.code, "provider_aws_credentials_unavailable");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(
+                "aws-cli/1.22.34 on PATH cannot export credentials: install AWS CLI version 2 (2.9 or later)"
+            )
+        );
+        // A current CLI whose profile's own helper says the same keeps what
+        // it said.
+        let current = std::fs::read_to_string(&aws)
+            .unwrap()
+            .replace("1.22.34", "2.31.4");
+        script(&aws, &current);
+        let error = resolve(&Cli::new(argv.clone().into())).await.unwrap_err();
+        assert!(error.detail.unwrap().starts_with("usage: "));
+        for (version, old) in [
+            ("aws-cli/1.44.2", true),
+            ("aws-cli/2.8.13", true),
+            ("aws-cli/2.9.0", false),
+            ("aws-cli/2.31.4", false),
+            ("aws-cli/x", false),
+        ] {
+            assert_eq!(too_old(version), old, "{version}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stalled CLI holds startup for `START` once, not per binding.
+    #[tokio::test]
+    async fn a_stalled_login_holds_startup_once_and_briefly() {
+        let dir = std::env::temp_dir().join(format!("agent-aws-stall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asked = dir.join("asked");
+        let script = format!("echo . >> '{}'; sleep 20", asked.display());
+        let command = || -> Box<[String]> { ["sh".into(), "-c".into(), script.clone()].into() };
+        let (start, began) = (Start::new(), Instant::now());
+        for service in ["bedrock-mantle", "bedrock"] {
+            let (_, unresolved) =
+                Aws::from_cli("us-east-1".into(), service, command(), None, &start).await;
+            assert_eq!(
+                unresolved.unwrap().code,
+                "provider_aws_credentials_unavailable"
+            );
+        }
+        assert!(began.elapsed() < START + Duration::from_secs(2));
+        assert_eq!(std::fs::read_to_string(&asked).unwrap(), ".\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Whole requests as botocore 1.43 signs them, with payload signing off
+    /// and on, with and without a session token. The digest is taken over
+    /// the body in chunks, as it streams.
+    #[tokio::test]
+    async fn requests_sign_as_botocore_signs_them() {
+        let now = at(1_790_296_697);
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let body = &br#"{"model":"global.anthropic.claude-sonnet-5","max_tokens":2048,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#[..];
+        let chunks =
+            [&body[..40], &body[40..40], &body[40..]].map(|c| Ok(Bytes::copy_from_slice(c)));
+        let digest = payload(futures_util::stream::iter(chunks)).await.unwrap();
+        assert_eq!(
+            digest,
+            "f387b3eb81779313267437e04b7d8d10fd2b7315fa4b37a2f3c0114dd189b890"
+        );
+        let cases = [
+            (
+                "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages",
+                ("us-east-1", "bedrock-mantle"),
+                None,
+                UNSIGNED_PAYLOAD,
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260925/us-east-1/bedrock-mantle/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0e2767eece6a1fbd3aab62fc4f351e7c13b3ecb410f51377592fd988f9322d81",
+            ),
+            (
+                "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1/responses",
+                ("eu-west-1", "bedrock"),
+                Some("FQoGZXIvYXdzEXAMPLE+/token="),
+                UNSIGNED_PAYLOAD,
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260925/eu-west-1/bedrock/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=af399be6054a5e9a0972d447fa9b21046857282c7ec80616c6c54fadb448e39f",
+            ),
+            (
+                "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1/messages",
+                ("us-east-1", "bedrock"),
+                Some("FQoGZXIvYXdzEXAMPLE+/token="),
+                &digest,
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260925/us-east-1/bedrock/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=46273bee2d709a948d8a505050eeb79e6f65c46f9622d9aadbeaad1d6c302886",
+            ),
+        ];
+        for (url, (region, service), token, payload, expected) in cases {
+            let url = url::Url::parse(url).unwrap();
+            let aws = Aws::fixed(
+                region,
+                service,
+                Keys::new(
+                    "AKIDEXAMPLE".into(),
+                    secret.into(),
+                    token.map(str::to_owned),
+                ),
+            );
+            let headers = aws.sign(&aws.held(), "POST", &url, now, payload);
+            let get = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(get("authorization"), Some(expected));
+            assert_eq!(get("x-amz-date"), Some("20260925T003817Z"));
+            assert_eq!(get("x-amz-content-sha256"), Some(payload));
+            assert_eq!(get("x-amz-security-token"), token);
+            // Signed, but sent by the client: a second `host` on HTTP/2
+            // breaks the signature.
+            assert_eq!(get("host"), None);
+        }
+    }
+
+    /// What a signer told its redaction, in order: `(name, Some(value))` for
+    /// a secret, `(name, None)` for a withheld name.
+    type Said = Vec<(String, Option<String>)>;
+    #[derive(Clone, Default)]
+    struct Told(Arc<std::sync::Mutex<Said>>);
+    impl Redact for Told {
+        fn set(&self, name: &str, value: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((name.into(), Some(value.into())));
+        }
+        fn withhold(&self, name: &str) {
+            self.0.lock().unwrap().push((name.into(), None));
+        }
+    }
+
+    /// The key id, secret and token are each told to the redaction under the
+    /// names that carried them, and the environment names a key set and its
+    /// choice of profile and region come from are withheld, even when they
+    /// do not make a whole set.
+    #[test]
+    fn every_part_of_the_keys_is_told_to_the_redaction() {
+        let told = Told::default();
+        let aws = Aws::fixed(
+            "us-east-1",
+            "bedrock-mantle",
+            Keys::new("A".into(), "S".into(), None),
+        )
+        .with_redaction(Box::new(told.clone()));
+        aws.install(Keys::new(
+            "AKIDEXAMPLE".into(),
+            "s3cr3t".into(),
+            Some("t0k3n".into()),
+        ));
+        let pairs = |told: &Told| told.0.lock().unwrap().clone();
+        let set = |name: &str, value: &str| (name.to_owned(), Some(value.to_owned()));
+        let held = |name: &str| (name.to_owned(), None);
+        assert_eq!(
+            pairs(&told),
+            [
+                set("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE"),
+                set("AWS_SECRET_ACCESS_KEY", "s3cr3t"),
+                set("AWS_SESSION_TOKEN", "t0k3n"),
+            ]
+        );
+        // Keys the CLI gave are told under names no shell sets.
+        let told = Told::default();
+        let mut aws = Aws::fixed(
+            "us-east-1",
+            "execute-api",
+            Keys::new("A".into(), "S".into(), None),
+        )
+        .with_redaction(Box::new(told.clone()));
+        aws.source = Source::Cli(Cli::new(AWS_CLI.map(str::to_owned).into()));
+        aws.install(Keys::new("AKID".into(), "s3".into(), None));
+        assert_eq!(
+            pairs(&told),
+            [
+                set("AGENT_AWS_ACCESS_KEY_ID", "AKID"),
+                set("AGENT_AWS_SECRET_ACCESS_KEY", "s3"),
+            ]
+        );
+        // A leftover token with no key pair beside it leaves the CLI to sign,
+        // and is withheld all the same, with the profile and region it picks.
+        let told = Told::default();
+        withhold(&told, |name| {
+            (name == "AWS_SESSION_TOKEN").then(|| "l3ft0ver".into())
+        });
+        assert_eq!(
+            pairs(&told),
+            [
+                set("AWS_SESSION_TOKEN", "l3ft0ver"),
+                held("AWS_PROFILE"),
+                held("AWS_DEFAULT_PROFILE"),
+                held("AWS_REGION"),
+                held("AWS_DEFAULT_REGION"),
+            ]
+        );
+    }
+
+    /// Variables a client keeps stand over the process's own: a kept key
+    /// pair signs, and the CLI runs under the kept profile, an empty value
+    /// unsetting a name the process has.
+    #[tokio::test]
+    async fn kept_variables_stand_over_the_process_s() {
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        let aws = Aws::new(
+            "us-east-1".into(),
+            "execute-api",
+            None,
+            vec![
+                pair("AWS_ACCESS_KEY_ID", "AKIDKEPT"),
+                pair("AWS_SECRET_ACCESS_KEY", "s"),
+            ],
+        );
+        assert_eq!(
+            (aws.source(), aws.held().access.as_str()),
+            ("environment", "AKIDKEPT")
+        );
+        let unset = Aws::new(
+            "us-east-1".into(),
+            "execute-api",
+            None,
+            vec![
+                pair("AWS_ACCESS_KEY_ID", ""),
+                pair("AWS_SECRET_ACCESS_KEY", ""),
+            ],
+        );
+        assert_eq!(unset.source(), "aws-cli");
+        let mut expired = Keys::new("OLD".into(), "S".into(), None);
+        expired.expires = Some(UNIX_EPOCH);
+        let mut aws = Aws::fixed("us-east-1", "execute-api", expired);
+        aws.source = Source::Cli(Cli {
+            argv: [
+                "sh".into(),
+                "-c".into(),
+                r#"echo "{\"Version\":1,\"AccessKeyId\":\"$AWS_PROFILE-${HOME:-unset}\",\"SecretAccessKey\":\"S\"}""#.into(),
+            ]
+            .into(),
+            env: [pair("AWS_PROFILE", "work"), pair("HOME", "")].into(),
+        });
+        let aws = Arc::new(aws);
+        assert_eq!(aws.current().await.unwrap().access, "work-unset");
+    }
+
+    /// A whole body's digest is the streamed one's.
+    #[tokio::test]
+    async fn a_whole_body_digests_as_its_stream_does() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"events/poll","params":{}}"#;
+        let chunks = [
+            Ok(Bytes::copy_from_slice(&body[..9])),
+            Ok(Bytes::copy_from_slice(&body[9..])),
+        ];
+        assert_eq!(
+            digest(body),
+            payload(futures_util::stream::iter(chunks)).await.unwrap()
+        );
+        assert_eq!(
+            digest(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// Stale keys keep signing while one background run re-resolves them,
+    /// and a failed run is not repeated within the interval. Expired keys
+    /// wait for a run and fail with the CLI's reason, or at once when a run
+    /// has just failed.
+    #[tokio::test]
+    async fn stale_keys_refresh_in_the_background_and_failures_wait_their_turn() {
+        let dir = std::env::temp_dir().join(format!("agent-aws-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (calls, fresh) = (dir.join("calls"), dir.join("fresh"));
+        let script = format!(
+            r#"echo >> '{}'; sleep 0.5; test -e '{}' || {{ echo down >&2; exit 1; }}
+echo '{{"Version":1,"AccessKeyId":"FRESH","SecretAccessKey":"S"}}'"#,
+            calls.display(),
+            fresh.display()
+        );
+        let runs = || std::fs::read_to_string(&calls).map_or(0, |text| text.lines().count());
+        let expiring = |access: &str, secs: i64| {
+            let mut keys = Keys::new(access.into(), "S".into(), None);
+            keys.expires = Some(match secs {
+                0.. => SystemTime::now() + Duration::from_secs(secs as u64),
+                _ => SystemTime::now() - Duration::from_secs(secs.unsigned_abs()),
+            });
+            keys
+        };
+        let mut aws = Aws::fixed("us-east-1", "bedrock-mantle", expiring("STALE", 60));
+        aws.source = Source::Cli(Cli::new(["sh".into(), "-c".into(), script].into()));
+        let aws = Arc::new(aws);
+        let settled = || async { drop(aws.refresh.lock().await) };
+
+        // While the CLI is down, a burst signs with the stale keys while one
+        // run is still in flight.
+        for _ in 0..20 {
+            assert_eq!(aws.current().await.unwrap().access, "STALE");
+        }
+        assert!(aws.refresh.try_lock().is_err());
+        settled().await;
+        assert_eq!(runs(), 1);
+        for _ in 0..20 {
+            assert_eq!(aws.current().await.unwrap().access, "STALE");
+        }
+        settled().await;
+        assert_eq!(runs(), 1);
+
+        // After the interval, the next call starts a run whose keys replace
+        // the stale ones.
+        std::fs::write(&fresh, "").unwrap();
+        *aws.refresh.lock().await = Some(Instant::now() - RELOAD_INTERVAL);
+        assert_eq!(aws.current().await.unwrap().access, "STALE");
+        settled().await;
+        assert_eq!(runs(), 2);
+        assert_eq!(aws.current().await.unwrap().access, "FRESH");
+
+        std::fs::remove_file(&fresh).unwrap();
+        aws.install(expiring("EXPIRED", -1));
+        *aws.refresh.lock().await = None;
+        let error = aws.current().await.unwrap_err();
+        assert_eq!(
+            (error.code.as_str(), error.detail.as_deref()),
+            ("provider_aws_credentials_unavailable", Some("down"))
+        );
+        assert_eq!(runs(), 3);
+        let error = aws.current().await.unwrap_err();
+        assert_eq!(error.code, "provider_aws_credentials_expired");
+        assert_eq!(runs(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credential_process_output_is_parsed_and_secrets_stay_out_of_debug() {
+        let keys = parse_process(
+            br#"{"Version":1,"AccessKeyId":"AKIDEXAMPLE","SecretAccessKey":"s3cr3t","SessionToken":"t0k3n","Expiration":"2015-08-30T12:36:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(keys.access, "AKIDEXAMPLE");
+        assert_eq!(keys.token.as_deref(), Some("t0k3n"));
+        assert_eq!(keys.expires, Some(at(1_440_938_160)));
+        let debug = format!("{keys:?}");
+        assert!(
+            !debug.contains("s3cr3t") && !debug.contains("t0k3n"),
+            "{debug}"
+        );
+        let long =
+            parse_process(br#"{"Version":1,"AccessKeyId":"A","SecretAccessKey":"S"}"#).unwrap();
+        assert_eq!((long.token, long.expires), (None, None));
+        for bad in [
+            &br#"{"Version":2,"AccessKeyId":"A","SecretAccessKey":"S"}"#[..],
+            br#"{"Version":1,"AccessKeyId":"A"}"#,
+            br#"{"Version":1,"AccessKeyId":"A","SecretAccessKey":"S","Expiration":"soon"}"#,
+            b"not json",
+        ] {
+            assert!(parse_process(bad).is_none());
+        }
+        assert!(keys.stale(at(1_440_938_160 - 299)));
+        assert!(!keys.stale(at(1_440_938_160 - 301)));
+        assert!(keys.expired(at(1_440_938_160)));
+    }
+
+    /// A paged control-plane listing as botocore 1.43 signs it: the query
+    /// sorted and encoded, a page token's `+`, `/` and `=` included.
+    #[test]
+    fn queries_sign_as_botocore_signs_them() {
+        let mut url = url::Url::parse(
+            "https://bedrock.us-west-2.amazonaws.com/inference-profiles?maxResults=1000&typeEquals=SYSTEM_DEFINED",
+        )
+        .unwrap();
+        url.query_pairs_mut().append_pair("nextToken", "ab+c/==");
+        assert_eq!(
+            canonical_query(&url),
+            "maxResults=1000&nextToken=ab%2Bc%2F%3D%3D&typeEquals=SYSTEM_DEFINED"
+        );
+        let keys = Keys::new(
+            "AKIDEXAMPLE".into(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            Some("FQoGZXIvYXdzEXAMPLE+/token=".into()),
+        );
+        let empty = hex(digest::digest(&digest::SHA256, b"").as_ref());
+        let headers = sign(
+            &keys,
+            "us-west-2",
+            "bedrock",
+            "GET",
+            &url,
+            at(1_790_296_697),
+            &empty,
+        );
+        let authorization = headers.iter().find(|(name, _)| *name == "authorization");
+        assert_eq!(
+            authorization.unwrap().1,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260925/us-west-2/bedrock/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=648dff91a6248b58017651740431904727f90d8ce10715e01122aa22b4adc439"
+        );
+    }
+
+    #[test]
+    fn paths_are_encoded_again_as_sigv4_canonicalizes_them() {
+        assert_eq!(
+            canonical_path("/anthropic/v1/messages"),
+            "/anthropic/v1/messages"
+        );
+        assert_eq!(canonical_path("/a%20b/c:d"), "/a%2520b/c%3Ad");
+        assert_eq!(canonical_path(""), "/");
+    }
+}

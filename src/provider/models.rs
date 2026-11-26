@@ -268,7 +268,7 @@ impl Provider {
         };
         if let Some(aws) = &self.aws {
             let keys = aws.current().await?;
-            let payload = if aws.signs_payload() {
+            let payload = if aws::signs_payload(aws) {
                 EMPTY_SHA256
             } else {
                 aws::UNSIGNED_PAYLOAD

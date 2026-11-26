@@ -613,11 +613,11 @@ pub fn built(lead: &str, pending: &Pending, read: Read) -> Option<Event> {
             if status == "completed"
                 && !done
                 && asked_by.as_deref() == Some(crate::trigger::ORIGIN)
-                && text.trim().is_empty()
+                && crate::transcript::blank(&text)
             {
                 return None;
             }
-            let mut from = match text.trim().is_empty() {
+            let mut from = match crate::transcript::blank(&text) {
                 true => format!("{task} ended"),
                 false => format!("{task} replied"),
             };
@@ -886,6 +886,52 @@ mod tests {
             made.from.as_deref(),
             Some("calc.cron ended to automation, failed: rate_limited")
         );
+    }
+
+    #[test]
+    fn a_reply_that_shows_nothing_is_an_ending_and_a_quiet_run_s_is_no_event() {
+        let mut activity = Activity::new("calc.lead");
+        let finished = |activity: &mut Activity, task: &str, turn, at| {
+            reads(activity.event(
+                &ev(task, turn, "turn_finished", json!({"status": "completed"})),
+                None,
+                at,
+            ))
+        };
+        let reply = |text: &str| Read::Reply {
+            text: text.into(),
+            asker: Some((None, None)),
+        };
+        // One zero-width space, as models write for an empty reply, or
+        // a word joiner and a byte order mark.
+        for nothing in ["\u{200B}", "\u{2060}\u{FEFF}\n"] {
+            let ended = finished(&mut activity, "calc.ui", 2, 1);
+            let made = built("calc.lead", &ended[0], reply(nothing)).unwrap();
+            assert_eq!(
+                made.from.as_deref(),
+                Some("calc.ui ended to the person, completed"),
+                "{nothing:?}"
+            );
+        }
+        // Any character that shows is a reply.
+        let ended = finished(&mut activity, "calc.ui", 3, 2);
+        let made = built("calc.lead", &ended[0], reply("\u{200B}ok")).unwrap();
+        assert_eq!(
+            made.from.as_deref(),
+            Some("calc.ui replied to the person, completed")
+        );
+        // An automation's run that went well and wrote one is no event.
+        activity.event(
+            &ev("calc.cron", 5, "accepted", json!({"origin": "automation"})),
+            None,
+            3,
+        );
+        let ended = finished(&mut activity, "calc.cron", 5, 4);
+        let quiet = Read::Reply {
+            text: "\u{200B}".into(),
+            asker: None,
+        };
+        assert_eq!(built("calc.lead", &ended[0], quiet), None);
     }
 
     #[test]

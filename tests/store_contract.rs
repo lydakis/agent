@@ -456,7 +456,12 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
             assert_eq!(events.len(), 3);
             assert_eq!(events[0]["data"]["outcome_unknown"], true);
             assert_eq!(events[1]["data"]["cancelled"], true);
-            let history = stored(&mut db, "Bob");
+            let mut history = stored(&mut db, "Bob");
+            // An interrupt's note comes after the results it closed.
+            if error == "cancelled" {
+                let note = history.pop().unwrap();
+                assert_eq!(note["role"], "user");
+            }
             for (entry, expected) in history[history.len() - 2..]
                 .iter()
                 .zip(["tool_outcome_unknown", "cancelled"])
@@ -1690,8 +1695,9 @@ fn a_long_field_hides_no_other_in_a_listing() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);
     // Keys sort, so the long field comes first, as `content` does before
-    // `path` in an Anthropic `write`.
-    let arguments = json!({"aaa":"x".repeat(5000),"command":"ls"}).to_string();
+    // `path` in an Anthropic `write`. Arguments `shell` takes: one it does
+    // not take is refused before any gate, so never listed.
+    let arguments = json!({"command":"x".repeat(5000),"workdir":"ls"}).to_string();
     let item = json!({"type":"function_call","id":"fc_1","call_id":"s1",
         "name":"shell","arguments":arguments});
     let call = ToolCall {
@@ -1712,12 +1718,12 @@ fn a_long_field_hides_no_other_in_a_listing() {
     let [listed] = &page["approvals"].as_array().unwrap()[..] else {
         panic!("{page}")
     };
-    assert_eq!(listed["arguments"]["command"], "ls");
+    assert_eq!(listed["arguments"]["workdir"], "ls");
     assert_eq!(
-        listed["arguments"]["aaa"].as_str().map(str::len),
+        listed["arguments"]["command"].as_str().map(str::len),
         Some(2048)
     );
-    assert_eq!(listed["arguments_cut"], json!(["aaa"]));
+    assert_eq!(listed["arguments_cut"], json!(["command"]));
 }
 
 #[test]
@@ -20557,6 +20563,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
             "send",
             json!({}),
             false,
+            None,
             Default::default(),
             0,
         )
@@ -22132,6 +22139,7 @@ fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
             "snapshot",
             json!({}),
             true,
+            None,
             browser,
             0,
         )
@@ -22148,6 +22156,7 @@ fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
             "send",
             json!({"to":"x"}),
             false,
+            None,
             writes,
             0,
         )
@@ -22237,6 +22246,7 @@ fn a_step_a_bot_that_never_asks_would_be_asked_is_refused_and_ran_nowhere() {
             "send",
             json!({"to":"x"}),
             false,
+            None,
             writes,
             0,
         )
@@ -22265,6 +22275,7 @@ fn a_step_under_no_gate_is_recorded_even_when_it_would_ask() {
             "click",
             json!({}),
             false,
+            None,
             Default::default(),
             0,
         )
@@ -22655,6 +22666,7 @@ fn a_gated_step_is_told_done_once_even_when_its_row_was_trimmed() {
             "send",
             json!({}),
             false,
+            None,
             Default::default(),
             0,
         )
@@ -23909,6 +23921,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
             "send",
             json!({}),
             false,
+            None,
             Default::default(),
             now,
         )
@@ -23966,6 +23979,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
             "send",
             json!({}),
             false,
+            None,
             Default::default(),
             now,
         )
@@ -25601,6 +25615,7 @@ fn a_step_naming_the_bots_own_tool_is_decided_by_its_plan() {
             tool,
             arguments,
             false,
+            None,
             Default::default(),
             now,
         )
@@ -25646,6 +25661,7 @@ fn a_step_naming_the_bots_own_tool_is_decided_by_its_plan() {
         "spawn_agent",
         json!({}),
         false,
+        None,
         Default::default(),
         now,
     );
@@ -25685,6 +25701,7 @@ fn a_rule_refuses_a_step_naming_shell_as_it_refuses_the_command() {
             "shell",
             json!({"command": "rm -rf x"}),
             false,
+            None,
             Default::default(),
             epoch_now(),
         )
@@ -25720,6 +25737,7 @@ fn a_held_step_of_a_lifted_call_ends_with_its_turn() {
                 "send",
                 json!({}),
                 false,
+                None,
                 Default::default(),
                 now,
             )
@@ -26208,6 +26226,164 @@ fn texts_bots_hold_are_kept_once_and_read_back_whole() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["data"]["configure_pending"], kept);
     assert_eq!(db.inspect("Carol").unwrap().instructions, rules);
+}
+
+/// The text of a user item in either family.
+fn user_text(item: &Value) -> Option<&str> {
+    (item["role"] == "user").then_some(())?;
+    item["content"][0]["text"].as_str()
+}
+
+/// A turn an interrupt ends leaves the model one note after all it holds,
+/// as Codex records an interrupted turn: the next turn's request reads the
+/// stopped turn, the note, then its own prompt. The note starts no turn,
+/// clients are told what it is, and a turn that ends any other way leaves
+/// none.
+#[test]
+fn an_interrupted_turn_leaves_one_note_after_its_items_and_no_other_end_does() {
+    for family in [Family::Responses, Family::Anthropic] {
+        let mut db = db();
+        db.create(
+            "Bob",
+            Some("/synthetic"),
+            Binding {
+                family,
+                ..binding()
+            },
+        )
+        .unwrap();
+        let run = |db: &mut Database, prompt: &str, error: Option<&str>| {
+            let turn = db
+                .begin(
+                    "Bob",
+                    prompt,
+                    prompt,
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            db.append(turn, vec![assistant(&format!("{prompt} reply"))], &[], None)
+                .unwrap();
+            db.finish(turn, error.map(Error::new).as_ref()).unwrap();
+        };
+        run(&mut db, "first", None);
+        run(&mut db, "second", Some("provider_failed"));
+        run(&mut db, "third", Some("process_interrupted"));
+        let notes = |db: &mut Database| {
+            (stored(db, "Bob").iter())
+                .filter(|item| user_text(item) == Some(agent_runtime::store::STOPPED))
+                .count()
+        };
+        assert_eq!(notes(&mut db), 0);
+        run(&mut db, "stopped", Some("cancelled"));
+        let head = db.inspect("Bob").unwrap().head.unwrap();
+        assert_eq!(db.inspect("Bob").unwrap().status, "interrupted");
+        let read = db.history_items("Bob", &[head]).unwrap();
+        assert_eq!(read["items"][0]["stop_note"], true);
+        assert_eq!(
+            user_text(&read["items"][0]["item"]),
+            Some(agent_runtime::store::STOPPED)
+        );
+        // No one sent it.
+        for field in ["from", "origin", "person", "message", "handle"] {
+            assert!(read["items"][0].get(field).is_none(), "{field}");
+        }
+        run(&mut db, "next", None);
+        let history = stored(&mut db, "Bob");
+        let words: Vec<&str> = history.iter().filter_map(user_text).collect();
+        assert_eq!(
+            words,
+            [
+                "first",
+                "second",
+                "third",
+                "stopped",
+                agent_runtime::store::STOPPED,
+                "next"
+            ]
+        );
+        // The stopped turn's reply, then the note, then the next prompt.
+        let at = (history.iter())
+            .position(|item| user_text(item) == Some(agent_runtime::store::STOPPED))
+            .unwrap();
+        assert_eq!(
+            history[at - 1]["content"][0]["text"],
+            "stopped reply",
+            "{history:?}"
+        );
+        assert_eq!(user_text(&history[at + 1]), Some("next"));
+        // It starts no turn: the history holds five turns, the note in the
+        // stopped one's.
+        let nodes = db.history_nodes("Bob", None, 400, None, false).unwrap();
+        let turns: std::collections::BTreeSet<i64> = (nodes["nodes"].as_array().unwrap().iter())
+            .filter_map(|node| node["turn"].as_i64())
+            .collect();
+        assert_eq!(turns.len(), 5);
+        let listed = (nodes["nodes"].as_array().unwrap().iter())
+            .find(|node| node["node"] == head)
+            .unwrap();
+        let stopped = (db.history_items("Bob", &[head - 1]).unwrap()["items"][0]["item"]["content"]
+            [0]["text"])
+            .clone();
+        assert_eq!(stopped, "stopped reply");
+        assert_eq!(
+            listed["turn"],
+            (nodes["nodes"].as_array().unwrap().iter())
+                .find(|node| node["node"] == head - 1)
+                .unwrap()["turn"]
+        );
+        // Only it is marked.
+        let ids: Vec<i64> = (nodes["nodes"].as_array().unwrap().iter())
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        let marked: Vec<i64> = (db.history_items("Bob", &ids).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter())
+        .filter(|entry| entry["stop_note"] == true)
+        .filter_map(|entry| entry["node"].as_i64())
+        .collect();
+        assert_eq!(marked, [head]);
+    }
+}
+
+/// Schema 115 marks the note an interrupted turn leaves: a store from 114
+/// opens with nothing marked and marks the next one.
+#[test]
+fn schema_115_marks_stop_notes() {
+    let path = std::env::temp_dir().join(format!("agent-schema115-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    }
+    // As 114 had it: no `stop_notes`.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE stop_notes; PRAGMA user_version=114;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(turn, Some(&Error::new("cancelled"))).unwrap();
+    let head = db.inspect("Bob").unwrap().head.unwrap();
+    assert_eq!(
+        db.history_items("Bob", &[head]).unwrap()["items"][0]["stop_note"],
+        true
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Schema 114 keeps the texts bots hold once: a store from 113 reads the

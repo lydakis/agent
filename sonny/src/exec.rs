@@ -736,6 +736,9 @@ struct Nested {
     /// One of the agent's own tools, which its daemon runs as a step of
     /// the `exec` call (`run_step`), deciding and recording it itself.
     daemon: bool,
+    /// The JSON Schema its server declares for its arguments, which the
+    /// agent's daemon checks a step against before its gate.
+    schema: Option<Arc<Value>>,
 }
 
 /// Arguments sent with a step that is only recorded: whole up to
@@ -902,6 +905,22 @@ impl Steps {
         facts: Facts,
         asks: bool,
     ) -> Result<String, String> {
+        self.ask_checked(tool, called, arguments, None, facts, asks)
+            .await
+    }
+
+    /// As [`Steps::ask`], with `parameters`, the JSON Schema `tool`
+    /// declares: the daemon checks a step it asks about against it before
+    /// anything else, and refuses one that does not fit, never asking.
+    pub async fn ask_checked(
+        &self,
+        tool: &str,
+        called: &str,
+        arguments: Value,
+        parameters: Option<Arc<Value>>,
+        facts: Facts,
+        asks: bool,
+    ) -> Result<String, String> {
         let (client, bot, turn, call_id) = match &self.via {
             Via::Daemon {
                 client,
@@ -909,7 +928,9 @@ impl Steps {
                 turn,
                 call_id,
             } => (client, bot, turn, call_id),
-            Via::Link(asker) => return asker.ask(tool, called, arguments, facts, asks).await,
+            Via::Link(asker) => {
+                return (asker.ask(tool, called, arguments, parameters, facts, asks)).await;
+            }
         };
         let step = format!(
             "{}.{}",
@@ -925,6 +946,9 @@ impl Steps {
         };
         let mut asked = json!({"bot": bot, "turn": turn, "call_id": call_id,
             "step": step, "name": tool, "arguments": arguments, "record": !asks});
+        if let Some(parameters) = parameters.filter(|_| asks) {
+            asked["parameters"] = Value::clone(&parameters);
+        }
         facts.into(&mut asked);
         match client.request("approve_step", asked).await {
             Ok(reply) if reply["decision"] == "allow" => Ok(step),
@@ -1419,6 +1443,7 @@ fn shown_tools(
                     access: None,
                 },
                 daemon: false,
+                schema: None,
             },
         );
     }
@@ -1721,6 +1746,8 @@ fn build(from: Vec<Listed>, own: Option<&[Value]>) -> Catalog {
                     access: mcp_access(&tool["annotations"]),
                 },
                 daemon: false,
+                schema: (asks && tool["inputSchema"].is_object())
+                    .then(|| Arc::new(tool["inputSchema"].clone())),
             });
         }
     }
@@ -1786,6 +1813,7 @@ fn daemon_tool(tool: &Value) -> Option<(String, Nested, Value)> {
             access: None,
         },
         daemon: true,
+        schema: None,
     };
     Some((
         name.clone(),
@@ -3011,9 +3039,10 @@ impl Caller {
             };
             let stopped = self.clock.stop();
             let asking = Arc::clone(&steps);
-            let (facts, asks) = (nested.facts, nested.asks);
+            let (facts, asks, schema) = (nested.facts, nested.asks, nested.schema.clone());
             let approval = Abort(self.host.spawn(async move {
-                (asking.ask(&id, &format!("tools.{id}"), asked, facts, asks)).await
+                let called = format!("tools.{id}");
+                (asking.ask_checked(&id, &called, asked, schema, facts, asks)).await
             }));
             let approved = approval.await;
             // Whatever the verdict, the script runs on from here, its time
@@ -3829,6 +3858,14 @@ text("done");"#;
         );
         assert_eq!(asked[0]["access"], "read", "echo says it only reads");
         assert_eq!(asked[3]["arguments"], json!({"ms": 10}));
+        // A step put to the gate carries its server's schema, which the
+        // daemon checks it against first; one only recorded carries none.
+        assert_eq!(
+            asked[1]["parameters"],
+            json!({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                "required": ["a", "b"]})
+        );
+        assert!(asked[0].get("parameters").is_none(), "{:?}", asked[0]);
         // With no gate to ask, every call runs. Its time is not what this
         // run checks: 300 ms can go waiting for one of the tool host's
         // script slots, shared with every other test running at once.
@@ -4457,6 +4494,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     fn a_tool_named_exactly_comes_first() {
         let tool = |server: &str, name: &str, description: &str| Nested {
             daemon: false,
+            schema: None,
             server: server.into(),
             tool: name.into(),
             description: description.into(),

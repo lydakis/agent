@@ -13423,6 +13423,40 @@ Four alternating rounds of the Perf workflow's screens.
 - Lifecycle CPU reads +9.7% (0.515 to 0.565 s for the whole run); its
   p95 turn and peak RSS are even.
 
+## A call's arguments checked before its gate
+
+2026-11-26. Every call's arguments are read first, before any gate, rule,
+load hold or sandbox decides it: a declared tool's against its JSON Schema,
+the daemon's own tools as they would run. A call no gate names pays
+nothing new: the check sits after the gate lookup in `Bot::held`, and the
+turn reads a call's arguments once, as before, only earlier. A gated call's
+arguments are read once more where the gate is decided, and an
+`approve_step` with `parameters` checks its step against them once.
+
+### Matched screen (perf gate's benches against main 7e6d210, three alternating rounds, one container)
+
+| Bench | Measure | Main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.942 | 36.758 | +18.8% |
+| admission | burst submit p99, ms | 3.788 | 3.792 | +0.1% |
+| completion | release to terminal p99, ms | 9.813 | 10.555 | +7.6% |
+| footprint | idle RSS, MiB | 17.691 | 17.66 | -0.2% |
+| footprint | per idle bot, KiB | 2.174 | 1.894 | -12.9% |
+| footprint | RSS after a turn each, MiB | 34.883 | 34.67 | -0.6% |
+| footprint | CPU per turn, ms | 0.739 | 0.753 | +1.9% |
+| footprint | written to disk per turn, KiB | 44.68 | 43.73 | -2.1% |
+| lifecycle | CPU, s | 0.51 | 0.5 | -2.0% |
+| lifecycle | p95 turn, ms | 578.953 | 582.307 | +0.6% |
+| lifecycle | peak RSS, MiB | 27.297 | 27.336 | +0.1% |
+
+Store work per turn is unchanged. Lone submit CPU is noise: a submit runs
+none of the changed code, its runs overlap whole (main 25.2 to 45.1 ms,
+this change 24.7 to 47.6), and two earlier rounds on the same binaries
+read it -3.5% and +6.9%. A first screen read idle RSS +0.9 MiB: the
+daemon's text had grown 680 KB, the built-in tools' argument reader
+inlined at each new caller. Kept out of line, the text is 31 KB larger
+than main's and idle RSS even.
+
 ## Freezes on a slow disk (#1409)
 
 2026-11-26. George, 11-25: typed letters showed half a second late, then all

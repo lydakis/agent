@@ -1630,7 +1630,8 @@ held when it wrote it, and one a client sent with an `origin` carries that, so a
 client can say who each message came from without reading every turn. A prompt
 sent with `delivery: "attach"` that a call took in also carries `attached: true`:
 it rode along on that call rather than reaching the bot as a message of its own,
-so a client can draw it apart from steers. The store
+so a client can draw it apart from steers. The note a stopped turn leaves
+carries `stop_note: true` (see `interrupt`). The store
 keeps these with the prompt's node (`senders`), so they last as long as the item:
 after the turn's rows go with a deleted fork source, and after its sender is
 deleted or its name reused. The reply targets
@@ -2218,6 +2219,29 @@ A turn that had already ended answers with how it ended and
 turn's own end, succeeds. A turn the bot never had is `turn_not_found`; a
 turn that is starting, or that is not the one running, is `stale_turn`.
 Protocol 8 adds the turn view.
+
+A turn an interrupt ends (error `cancelled`, running or parked) leaves one
+note in its bot's history, after everything the turn holds, in the same
+transaction that ends it, as Codex records an interrupted turn
+(openai/codex#9043, `TurnAborted` in its neutral wording, since a person,
+another agent or a client may send an interrupt):
+
+```text
+<turn_aborted>
+The previous turn was interrupted on purpose. Any background commands it started may still be running. If any tools/commands were aborted, they may have partially executed.
+</turn_aborted>
+```
+
+It is a user item, so the next request reads the stopped turn, then the
+note, then what comes next, and the model does not take up the stopped
+work again unless it is asked to. It starts no turn and holds no message:
+it is part of the stopped turn's span, counted and summarized as any item
+is, and no prompt list, title or count includes it. Only an interrupt leaves
+one: a turn the daemon's shutdown or a pause parks is continued, not
+stopped; one that fails, ends `process_interrupted` or `approval_expired`
+leaves none. `history_items` marks the note `stop_note: true`
+(`stop_notes`, schema 115), so a client can tell it from a person's words
+and leave it out of what it draws. Protocol 103.
 
 ### Delivery modes
 
@@ -3899,10 +3923,22 @@ Protocol version 19 lets a client declare tools of its own on a bot:
 `{name, description, parameters, result?}` taking at most 64 KiB, which
 `configure` replaces whole (`[]` removes them). The model is shown them after
 the daemon's tools, and the daemon never runs one: a call is checked against
-its `parameters` (an object schema; required fields, a closed object's extra
-fields, and each listed field's basic type) and recorded at once with the
+its `parameters` (an object schema) and recorded at once with the
 tool's fixed `result` (default `ok`), or with `invalid_arguments` when it does
-not fit. The call is otherwise like any other: `tool_started` and
+not fit. Protocol 104 checks every call's arguments first, before any gate,
+rule, load hold or sandbox decides it: a declared tool's against the JSON
+Schema it declared, as far as the daemon knows that language (`type`,
+`enum`, `const`, `required`, `properties`, `additionalProperties`,
+`minProperties` and `maxProperties`, `minLength` and `maxLength` in
+characters, `minimum`, `maximum` and their exclusive bounds, `minItems`,
+`maxItems`, `items`, `prefixItems`, `allOf`, `anyOf`, `oneOf` as "at least
+one", and a `$ref` within the schema), and the daemon's own tools' as the call
+would be read to run. A keyword it does not know passes, so it never refuses
+a call it cannot judge. A call that does not fit fails at once, its detail
+naming the field and the rule (`open_issue: title: at most 30 characters,
+got 31`); no gate holds it, so it is never announced as waiting for a
+verdict and no one is asked about it. A step put through `approve_step`
+that names one of the bot's own tools is checked the same way first. The call is otherwise like any other: `tool_started` and
 `tool_completed` events, history items, approvals never asked. What it means
 is the client's, which reads the call from events and history; a TUI's
 reaction to a message is one. A name is 1 to 64 letters, digits, `_` or `-`,
@@ -4560,7 +4596,13 @@ kinds above (`invalid_declare` otherwise), which its calls' rows carry.
 (`invalid_step` for another word), and `record: true` for a step the
 client lets run without asking: it is written and allowed at once,
 whatever the gates say, so the trail has every step and the gates judge
-only those a client puts to them. A step's `step_result` ends its row;
+only those a client puts to them. Protocol 104 lets `approve_step` take
+`parameters`, the JSON Schema of the step's tool when its client knows one
+(an MCP server's tool, say): a step to be asked about has its arguments
+checked against it before anything else, as a call's are, and one they do
+not fit is refused with `invalid_arguments`, never put to a gate; a schema
+that is not an object or a boolean is `invalid_step`. A step only recorded
+is not checked. A step's `step_result` ends its row;
 told twice, the first holds, and a step its gates allowed is told done by
 its events even once a trim took its row. A step allowed by nobody is not
 among the calls a judge reads. Approval verdicts now keep `leased` when given under a
