@@ -673,6 +673,13 @@ pub fn declined(
     Ok(None)
 }
 
+/// What the model is told after a turn an interrupt stopped, in the
+/// turn's own history: Codex's marker for an interrupted turn
+/// (`TurnAborted`, openai/codex#9043), in its neutral wording, since a
+/// person, another agent or a client may have sent the interrupt. One
+/// text, whatever the turn was doing.
+pub const STOPPED: &str = "<turn_aborted>\nThe previous turn was interrupted on purpose. Any background commands it started may still be running. If any tools/commands were aborted, they may have partially executed.\n</turn_aborted>";
+
 /// Why a declined request's additions are left out, with the refusal's
 /// category when it names one.
 fn refused_why(category: Option<&str>) -> String {
