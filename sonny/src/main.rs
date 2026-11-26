@@ -2234,7 +2234,7 @@ fn kept_by(listed: &[standing::Agent], bot: &str, project: &str) -> String {
 /// the window that held it let go, what it kept to be taken. None too
 /// where the lock cannot be had, and the window reads them itself, and
 /// for a window with no store, which has none to share them beside.
-async fn first_reads(kept: &std::path::Path, lead: &str) -> Option<std::fs::File> {
+async fn first_reads(kept: &std::path::Path, lead: &str) -> Option<FirstReads> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if kept.as_os_str().is_empty() {
@@ -2254,17 +2254,35 @@ async fn first_reads(kept: &std::path::Path, lead: &str) -> Option<std::fs::File
             .mode(0o600)
             .open(&path)
             .ok()?;
-        // SAFETY: flock on a descriptor `file` owns and keeps open; closing
-        // it lets go, as the process ending does.
+        // SAFETY: flock on a descriptor `file` owns and keeps open.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Some(file);
+            return Some(FirstReads(file));
         }
         // Shared: every window waiting goes on at once when it is let go.
         // SAFETY: as above.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+        // Let go of it as [`FirstReads`] does, or a command started meanwhile
+        // keeps it shared until it execs and turns the next window away.
+        drop(FirstReads(file));
         None
     })
     .await
+}
+
+/// The lock [`first_reads`] holds while a window reads, let go as it is
+/// dropped. A flock belongs to the open file, not the descriptor: a
+/// command another thread starts meanwhile holds a copy of every
+/// descriptor until it execs, and the lock with it, so closing alone
+/// would still turn the next window away. An unlock through any copy lets
+/// go for all of them.
+struct FirstReads(std::fs::File);
+
+impl Drop for FirstReads {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor the file owns and keeps open.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Keep what a window read for the next one, in `lead`'s file: in place
@@ -29067,6 +29085,84 @@ mod tests {
                 .is_none()
         );
         assert!(!std::path::Path::new(".status-reads").exists());
+    }
+
+    #[tokio::test]
+    async fn a_window_let_go_is_free_while_a_command_started_meanwhile_holds_its_descriptors() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::CommandExt;
+        let home = std::env::temp_dir().join(format!("first-reads-fork-{}", std::process::id()));
+        let store = home.join("state.sqlite");
+        let held = first_reads(&store, "shop.lead")
+            .await
+            .expect("the first reads");
+        let lock = std::fs::metadata(reads_dir(&store).join("shop.lead.lock")).unwrap();
+        let (dev, ino, holding) = (lock.dev(), lock.ino(), held.0.as_raw_fd());
+        // Another window waits for it to let go.
+        let waiting = tokio::spawn({
+            let store = store.clone();
+            async move { first_reads(&store, "shop.lead").await.is_none() }
+        });
+        // A command started on another thread, held between its fork and
+        // its exec, where it has a copy of every descriptor: it says
+        // whether one is the waiting window's, and waits to be let on.
+        // One started before that window opened the lock starts again.
+        let (started, mut go) = loop {
+            let (mut forked, forked_in) = std::io::pipe().unwrap();
+            let (go_out, mut go) = std::io::pipe().unwrap();
+            let (told, waits) = (forked_in.as_raw_fd(), go_out.as_raw_fd());
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", "exit 0"]);
+            #[allow(clippy::unnecessary_cast)] // dev_t is i32 on macOS
+            // SAFETY: only fstat, write and read, on descriptors the child has.
+            unsafe {
+                command.pre_exec(move || {
+                    let mut found = 0u8;
+                    for fd in 0..1024 {
+                        let mut stat: libc::stat = std::mem::zeroed();
+                        if fd != holding
+                            && libc::fstat(fd, &mut stat) == 0
+                            && stat.st_dev as u64 == dev
+                            && stat.st_ino as u64 == ino
+                        {
+                            found = 1;
+                        }
+                    }
+                    libc::write(told, (&raw const found).cast(), 1);
+                    let mut byte = 0u8;
+                    libc::read(waits, (&raw mut byte).cast(), 1);
+                    Ok(())
+                });
+            }
+            let started = std::thread::spawn(move || command.status());
+            let mut found = [0u8];
+            forked.read_exact(&mut found).unwrap();
+            if found[0] == 1 {
+                break (started, go);
+            }
+            go.write_all(&[0]).unwrap();
+            assert!(started.join().unwrap().unwrap().success());
+            tokio::task::yield_now().await;
+        };
+        // The first window lets go: the waiting one goes on, then lets go
+        // too, and a window opened next reads, while the command still
+        // holds both their descriptors.
+        drop(held);
+        let waited = tokio::time::timeout(Duration::from_secs(5), waiting).await;
+        // Tried as first_reads tries it, without the wait that follows.
+        let next = std::fs::OpenOptions::new()
+            .write(true)
+            .open(reads_dir(&store).join("shop.lead.lock"))
+            .unwrap();
+        // SAFETY: flock on a descriptor `next` owns and keeps open.
+        let next = unsafe { libc::flock(next.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        go.write_all(&[0]).unwrap();
+        assert!(started.join().unwrap().unwrap().success());
+        assert!(waited.expect("the window let go is still held").unwrap());
+        assert!(next, "the windows let go are still held");
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

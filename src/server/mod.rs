@@ -10836,10 +10836,15 @@ mod tests {
             })
             .await
             .unwrap();
-        let (resumed, ()) = tokio::join!(service.resume("Bob".into(), bob, false), async {
-            gate.send(()).unwrap();
-        });
-        resumed.unwrap();
+        // The claim goes to the store from its own task: let it run up to
+        // its answer, its job queued behind the creation, before the worker
+        // goes on. Opened at once, the worker could take the creation's
+        // group alone, and the claim, committed in the next, find the turn
+        // running and drop the wake-up.
+        service.claim("Bob".into(), bob, false);
+        tokio::task::yield_now().await;
+        gate.send(()).unwrap();
+        service.land_claims().await.unwrap();
         assert_eq!(held.await.unwrap_err().code, "storage_error");
         assert_eq!(lost.await.unwrap_err().code, "storage_error");
         assert!(service.active.is_empty());
