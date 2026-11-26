@@ -117,6 +117,18 @@ jobs:
             sleep $((attempt * 30))
           done
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Release smoke
+        # tests/test_smoke.py: an agent's shell and file calls, here and on
+        # a linked machine, through each permission row, on the real daemon
+        # and Sonny. release/green_gate.py requires this step by name, so a
+        # tag never ships a build where those calls do not go as the row
+        # says, as 0.10.8 did.
+        env:
+          AGENT_TEST_RUNTIME: "1"
+        run: |
+          python3 -m venv .local/venv
+          .local/venv/bin/pip install --quiet -r bench/requirements.txt
+          .local/venv/bin/python -m tests.test_smoke
       - name: Runtime tests
         env:
           AGENT_TEST_RUNTIME: "1"
@@ -124,12 +136,10 @@ jobs:
           # stores back to here.
           AGENT_RELEASE_BINARIES: ${{ github.workspace }}/.local/releases
         run: |
-          python3 -m venv .local/venv
-          .local/venv/bin/pip install --quiet -r bench/requirements.txt
           # Modules mostly wait on scripted models, so four at once take a
           # third of the time of one after another. More than that starved
           # timing-sensitive tests in local runs.
-          .local/venv/bin/python -m tests.run --jobs 4
+          .local/venv/bin/python -m tests.run --jobs 4 --skip tests.test_smoke
 
   musl:
     # The static Linux builds the release makes, on the same runners and

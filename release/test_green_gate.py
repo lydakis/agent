@@ -19,11 +19,12 @@ def run(number, status="completed", attempt=1):
             "html_url": f"https://github.com/o/r/actions/runs/{number}"}
 
 
-GREEN = [job("rust", step("Rust tests")), job("runtime", step("Install bubblewrap"), step("Runtime tests"))]
+GREEN = [job("rust", step("Rust tests")),
+         job("runtime", step("Install bubblewrap"), step("Release smoke"), step("Runtime tests"))]
 # 0.10.2's commit: the apt mirror failed the install and the tests were skipped.
 SKIPPED = [job("rust", step("Rust tests")),
-           job("runtime", step("Install bubblewrap", "failure"), step("Runtime tests", "skipped"),
-               conclusion="failure")]
+           job("runtime", step("Install bubblewrap", "failure"), step("Release smoke", "skipped"),
+               step("Runtime tests", "skipped"), conclusion="failure")]
 
 
 class GreenGateTest(unittest.TestCase):
@@ -46,6 +47,19 @@ class GreenGateTest(unittest.TestCase):
             passed, message = green_gate.verdict(COMMIT, [run(1)], {1: jobs})
             self.assertFalse(passed)
             self.assertIn(f"macos: {conclusion}", message)
+
+    def test_a_run_without_the_release_smoke_refuses(self):
+        # As a run from before the smoke was added: green, but it never ran.
+        before = [job("rust", step("Rust tests")), job("runtime", step("Install bubblewrap"), step("Runtime tests"))]
+        passed, message = green_gate.verdict(COMMIT, [run(1)], {1: before})
+        self.assertFalse(passed)
+        self.assertIn("runtime: Release smoke never ran", message)
+        failed = [job("rust", step("Rust tests")),
+                  job("runtime", step("Release smoke", "failure"), step("Runtime tests"), conclusion="failure")]
+        passed, message = green_gate.verdict(COMMIT, [run(1)], {1: failed})
+        self.assertFalse(passed)
+        self.assertIn("runtime: Release smoke failure", message)
+        self.assertNotIn("never ran", message)
 
     def test_a_re_run_that_passed_lets_the_release_go(self):
         passed, _ = green_gate.verdict(COMMIT, [run(1, attempt=2)], {1: GREEN})
