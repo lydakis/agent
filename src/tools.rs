@@ -26,6 +26,7 @@ mod fetch;
 mod files;
 mod patch;
 mod picture;
+mod schema;
 #[cfg(unix)]
 mod terminal;
 pub use patch::Patch;
@@ -763,9 +764,10 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
 /// bound but its own, so a longer call is refused at once, the model told.
 pub const ANSWERED_ARGUMENTS: usize = 768 * 1024;
 
-/// A declared tool's call checked against its parameters, as far as the
-/// daemon looks: an object, with every required field, no field the
-/// schema closes out, and each listed field of its listed basic type.
+/// A declared tool's call checked against its parameters, the JSON Schema
+/// it declared, as far as [`schema`] knows that language: what it cannot
+/// judge passes. Every call meets this first, before any gate, rule or
+/// sandbox decides it, so a call that can never run fails at once.
 pub fn check_declared(tool: &Declared, arguments: &str) -> Result<()> {
     let invalid = |detail: String| Error::with("invalid_arguments", detail);
     if tool.answered_by.is_some() && arguments.len() > ANSWERED_ARGUMENTS {
@@ -777,44 +779,33 @@ pub fn check_declared(tool: &Declared, arguments: &str) -> Result<()> {
     }
     let arguments: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|_| invalid(format!("{}: arguments are not JSON", tool.name)))?;
-    let fields = arguments
-        .as_object()
-        .ok_or_else(|| invalid(format!("{}: arguments are not an object", tool.name)))?;
-    let properties = tool.parameters["properties"].as_object();
-    for required in tool.parameters["required"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.as_str())
-    {
-        if !fields.contains_key(required) {
-            return Err(invalid(format!("{}: {required} is required", tool.name)));
-        }
+    if !arguments.is_object() {
+        return Err(invalid(format!(
+            "{}: arguments are not an object",
+            tool.name
+        )));
     }
-    for (field, value) in fields {
-        let Some(schema) = properties.and_then(|p| p.get(field)) else {
-            if tool.parameters["additionalProperties"] == false {
-                return Err(invalid(format!("{}: no field {field}", tool.name)));
-            }
-            continue;
-        };
-        let fits = match schema["type"].as_str() {
-            Some("string") => value.is_string(),
-            Some("integer") => value.is_i64() || value.is_u64(),
-            Some("number") => value.is_number(),
-            Some("boolean") => value.is_boolean(),
-            Some("array") => value.is_array(),
-            Some("object") => value.is_object(),
-            _ => true,
-        };
-        if !fits {
-            return Err(invalid(format!(
-                "{}: {field} must be {}",
-                tool.name, schema["type"]
-            )));
-        }
+    check_schema(&tool.parameters, &arguments)
+        .map_err(|detail| invalid(format!("{}: {detail}", tool.name)))
+}
+
+/// `arguments` checked against `schema`, a JSON Schema, as [`check_declared`]
+/// checks a declared tool's: why they do not fit, or nothing.
+pub fn check_schema(
+    schema: &serde_json::Value,
+    arguments: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    schema::check(schema, arguments).map_err(|misfit| misfit.to_string())
+}
+
+/// Whether a call of the daemon's own tool `name` has arguments it takes,
+/// read as the call would be and without running anything; `Ok` for a name
+/// that is none of its tools.
+pub fn check_arguments(name: &str, arguments: &str) -> Result<()> {
+    match Tool::parse(name) {
+        Some(tool) => Registry::prepare_tool(tool, arguments).map(drop),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -2057,6 +2048,15 @@ impl Registry {
     // Full access to this configured registry, within caller host permissions.
     // Validate arguments before recording intent so invalid calls never dispatch.
     pub fn prepare(&self, name: &str, args: &str) -> Result<Prepared> {
+        let tool = Tool::parse(name)
+            .filter(|tool| self.tools.contains(tool))
+            .ok_or(Error::new("unsupported_tool"))?;
+        Self::prepare_tool(tool, args)
+    }
+
+    /// A call of `tool` read as it would run, with no registry: the same
+    /// for whoever reads it.
+    fn prepare_tool(tool: Tool, args: &str) -> Result<Prepared> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Echo {
@@ -2180,9 +2180,6 @@ impl Registry {
             }
             Ok(())
         }
-        let tool = Tool::parse(name)
-            .filter(|tool| self.tools.contains(tool))
-            .ok_or(Error::new("unsupported_tool"))?;
         let invalid = |_| Error::new("invalid_tool_arguments");
         Ok(match tool {
             Tool::Echo => {

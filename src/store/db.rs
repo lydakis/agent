@@ -1292,7 +1292,8 @@ impl Bot {
     }
     /// Whether this call, of the daemon's tool or a declared one, waits
     /// for a verdict, run in the turn's `workspace` under `rules`. A call
-    /// the bot may not make is refused, never announced, and one its
+    /// the bot may not make, or whose arguments its tool does not take
+    /// ([`Bot::arguments`]), is refused, never announced, and one its
     /// sandbox confines runs without a verdict: only an escape is gated,
     /// as in Codex. A command a rule asks about waits, sandbox or not; one
     /// a rule allows or forbids doesn't. A call whose steps go to the gate
@@ -1319,6 +1320,7 @@ impl Bot {
         let held = gated(&self.gates, &call.name)
             && self.may_call(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
+            && self.arguments(call).is_ok()
             && match &ruling {
                 Ok(Ruling::Prompt(_)) => true,
                 Ok(Ruling::None) => !confines,
@@ -1335,6 +1337,17 @@ impl Bot {
             read: call.name == "read",
         }
     }
+    /// Whether this call's arguments fit what its tool takes: a declared
+    /// tool's against the schema it declared, the daemon's own as the call
+    /// would be read to run. The first thing any call meets: one that does
+    /// not fit fails at once, so no gate holds it, no rule or sandbox judges
+    /// it, and no one is asked about a call that could never run.
+    pub fn arguments(&self, call: &ToolCall) -> Result<()> {
+        match self.declared(&call.name) {
+            Some(tool) => crate::tools::check_declared(tool, &call.arguments),
+            None => crate::tools::check_arguments(&call.name, &call.arguments),
+        }
+    }
     /// Whether one of the bot's gates holds this call, from its model, back,
     /// asked or not: never a call of a tool kept for steps, which is refused.
     fn held(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
@@ -1342,6 +1355,7 @@ impl Bot {
             && self.may_call(&call.name)
             && !self.steps_only(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
+            && self.arguments(call).is_ok()
             && match self.ruling(call, rules) {
                 Ok(Ruling::Prompt(_)) => true,
                 Ok(Ruling::None) => !self.confines(call, workspace),
@@ -12191,10 +12205,6 @@ impl Database {
         if !bot.may_call(tool) {
             return Err(Error::with("tool_not_available", tool));
         }
-        let capture = self.capture(turn, call_id)?;
-        let Some(workspace) = capture.workspace.as_deref() else {
-            return fail("workspace_required");
-        };
         let text = arguments.to_string();
         let call = ToolCall {
             name: tool.to_owned(),
@@ -12202,6 +12212,13 @@ impl Database {
             arguments: text.clone(),
             custom: false,
             links: Default::default(),
+        };
+        // Its arguments first, as the same call from the model: one its
+        // tool does not take is refused before any gate or rule sees it.
+        bot.arguments(&call)?;
+        let capture = self.capture(turn, call_id)?;
+        let Some(workspace) = capture.workspace.as_deref() else {
+            return fail("workspace_required");
         };
         let plan = bot.plan(&call, std::path::Path::new(workspace), &capture.rules);
         let refusal = if plan.refused_unasked() {

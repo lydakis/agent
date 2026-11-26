@@ -840,7 +840,10 @@ async fn call_in(
                     let called = asked["called"].as_str().unwrap_or(tool);
                     let facts = crate::exec::Facts::of(asked);
                     let asks = asked["record"] != true;
-                    (steps.ask(tool, called, asked["arguments"].clone(), facts, asks)).await
+                    let parameters = (asked.get("parameters").filter(|p| p.is_object()))
+                        .map(|p| std::sync::Arc::new(p.clone()));
+                    let arguments = asked["arguments"].clone();
+                    (steps.ask_checked(tool, called, arguments, parameters, facts, asks)).await
                 }
                 None => Err(format!("{tool} asks no approval")),
             };
@@ -1319,6 +1322,7 @@ impl Asker {
         tool: &str,
         called: &str,
         arguments: Value,
+        parameters: Option<std::sync::Arc<Value>>,
         facts: crate::exec::Facts,
         asks: bool,
     ) -> Result<String, String> {
@@ -1327,6 +1331,9 @@ impl Asker {
         self.verdicts.lock().unwrap().insert((self.id, seq), tx);
         let mut step = json!({"tool": tool, "called": called, "arguments": arguments,
             "record": !asks});
+        if let Some(parameters) = parameters.filter(|_| asks) {
+            step["parameters"] = Value::clone(&parameters);
+        }
         facts.into(&mut step);
         let asked = json!({"id": self.id, "seq": seq, "ask": step});
         self.out.send(&asked).await;

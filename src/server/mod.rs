@@ -807,6 +807,12 @@ enum Command {
         /// gate: a step its client would not ask about.
         #[serde(default)]
         record: bool,
+        /// The JSON Schema the step's tool declares, when its client knows
+        /// it: a step to be asked about has its arguments checked against
+        /// it first, and one they do not fit is refused `invalid_arguments`,
+        /// never put to a gate. A step of the bot's own tool is checked
+        /// against what that tool takes either way.
+        parameters: Option<Value>,
         /// What the step is, as its client says, for its row in the audit
         /// trail: one of the trail's kinds, places and accesses.
         kind: Option<String>,
@@ -7421,6 +7427,7 @@ impl Service {
                 name: tool,
                 arguments,
                 record,
+                parameters,
                 kind,
                 place,
                 access,
@@ -7451,6 +7458,21 @@ impl Service {
                 }
                 if !arguments.is_object() {
                     return fail_with("invalid_step", "arguments must be an object");
+                }
+                // Its arguments before anything else decides it, as a call
+                // from the model: one its tool does not take is never put to
+                // a gate. A step only recorded is not checked: it is asked
+                // about by no one, and its arguments may come cut.
+                match &parameters {
+                    None | Some(Value::Object(_) | Value::Bool(_)) => {}
+                    Some(_) => {
+                        return fail_with("invalid_step", "parameters must be a JSON Schema");
+                    }
+                }
+                if let Some(parameters) = parameters.as_ref().filter(|_| !record) {
+                    agent_runtime::tools::check_schema(parameters, &arguments).map_err(
+                        |detail| Error::with("invalid_arguments", format!("{tool}: {detail}")),
+                    )?;
                 }
                 // Paused or shutting down, nothing new runs: no step is
                 // put to a gate, recorded, or allowed until the line goes on.
