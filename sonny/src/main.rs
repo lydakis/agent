@@ -6234,8 +6234,9 @@ enum Switching {
 enum AfterFirst {
     /// Picked for the emoji sent next.
     Pick,
-    /// The person's reaction clicked: taken off.
-    TakeOff(String),
+    /// The person's reaction clicked, already taken off: the notice that
+    /// says which.
+    TookBack(String),
 }
 
 /// A side chat made beside the window: its name, its head, and the
@@ -12231,8 +12232,8 @@ impl App {
             .and_then(|(node, emoji)| Some((node.parse::<i64>().ok()?, emoji)))
             && self.reactions.on(node).iter().any(|on| on == emoji)
         {
-            self.reply_first(node, AfterFirst::TakeOff(emoji.to_owned()))
-                .await;
+            let emoji = emoji.to_owned();
+            self.take_off_reaction(node, &emoji).await;
         }
         if let Some(at) = button
             .strip_prefix("fold/")
@@ -22199,9 +22200,36 @@ impl App {
                 Wrote::Reacted(node, emoji, sent.err().map(|error| error.to_string()))
             });
         }
+        if !self.show_reactions(node) {
+            self.notice = Some(match added {
+                true => format!("{emoji} on “{first}”"),
+                false => format!("took back {emoji} on “{first}”"),
+            });
+        }
+        true
+    }
+
+    /// The person's `emoji` on the reply at `node`, clicked, taken off at
+    /// once; the reply's first line is read only for the notice that says
+    /// which, when the reply is not where the person looks.
+    async fn take_off_reaction(&mut self, node: i64, emoji: &str) {
+        if let Err(error) = self.reactions.set(node, emoji, false) {
+            self.notice = Some(error);
+            return;
+        }
+        if !self.show_reactions(node) {
+            self.reply_first(node, AfterFirst::TookBack(emoji.to_owned()))
+                .await;
+        }
+    }
+
+    /// The reactions on the reply at `node` drawn under it, wherever it is
+    /// in the conversation, or under it once a reply still being written
+    /// is, or once it is drawn; whether they are, else the caller's notice
+    /// says which.
+    fn show_reactions(&mut self, node: i64) -> bool {
+        let last = self.replies.last().map(|(last, _)| *last) == Some(node);
         self.notice = None;
-        // Under the reply, wherever it is in the conversation; else, as
-        // when it is no longer there, a row of its own that says which.
         if last && self.running.is_none() {
             self.end_live(Words::Reply);
         }
@@ -22211,16 +22239,7 @@ impl App {
         if (self.screen).put_under_with(screen::Tag::End(node), tag, row, buttons) {
             return true;
         }
-        // A reply still being written gets them under it once it is; one
-        // not drawn here, once it is drawn.
-        if (self.live.as_ref()).is_some_and(|live| live.node == Some(node)) {
-            return true;
-        }
-        self.notice = Some(match added {
-            true => format!("{emoji} on “{first}”"),
-            false => format!("took back {emoji} on “{first}”"),
-        });
-        true
+        (self.live.as_ref()).is_some_and(|live| live.node == Some(node))
     }
 
     /// The first line of the bot's reply at `node`, as `/react` offers it,
@@ -22289,8 +22308,8 @@ impl App {
                 self.react_to = Some((node, first));
                 self.notice = None;
             }
-            AfterFirst::TakeOff(emoji) => {
-                self.toggle_reaction((node, first), &emoji).await;
+            AfterFirst::TookBack(emoji) => {
+                self.notice = Some(format!("took back {emoji} on “{first}”"));
             }
         }
     }
@@ -35172,6 +35191,28 @@ mod tests {
         // One no longer on it does nothing.
         app.press_row("unreact/4/🎉").await;
         assert!(app.reactions.on(4).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reaction_clicked_off_is_off_before_its_reply_is_read() {
+        let client = daemon_answering(|asked| {
+            if asked["op"] == "history_items" {
+                return json!({"items": [{"item": {"role": "assistant",
+                    "content": [{"type": "output_text", "text": "Merged it."}]}}]});
+            }
+            json!({})
+        })
+        .await;
+        let mut app = app(client);
+        app.reactions.set(4, "🎉", true).unwrap();
+        // A reply not drawn in this window: the notice says which, from its
+        // first line, read beside the window.
+        app.press_row("unreact/4/🎉").await;
+        // Off at once, though the read has not come.
+        assert!(app.reactions.on(4).is_empty());
+        assert!(!app.reading_first.is_empty());
+        app.beside_done().await;
+        assert_eq!(app.notice.as_deref(), Some("took back 🎉 on “Merged it.”"));
     }
 
     #[tokio::test]
