@@ -321,7 +321,6 @@ fn stands(found: &Found) -> String {
     let label = |option: usize| (found.ask.options.get(option)).map(|choice| choice.label.clone());
     match &found.state {
         State::Open => "open".into(),
-        State::Aside => "set aside: the person wrote past it; a pick still answers it".into(),
         State::Answered(answer) => format!("answered: {answer}"),
         State::Recorded { option, note } => {
             let going = option.and_then(label).map(|l| format!(", going with {l}"));
@@ -397,7 +396,6 @@ fn text(found: &[Found], next: Option<i64>, all: bool) -> String {
 fn to_json(found: &Found) -> Value {
     let (state, detail) = match &found.state {
         State::Open => ("open", json!({})),
-        State::Aside => ("set_aside", json!({})),
         State::Answered(answer) => ("answered", json!({"answer": answer})),
         State::Recorded { option, note } => (
             "answered",
@@ -515,7 +513,6 @@ mod tests {
         assert_eq!(asked["in_their_words"], true);
         assert_eq!(asked["option"], 2);
         assert_eq!(asked["recommended"], 1);
-        assert_eq!(to_json(&found("x", 1, State::Aside))["state"], "set_aside");
         // A list of every agent goes on as one; a yes says what it covers.
         assert!(
             super::text(&listed, Some(7), true)

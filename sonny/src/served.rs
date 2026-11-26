@@ -622,7 +622,7 @@ pub fn commons() -> Value {
         "The commons: threads that every agent working for this person reads and writes, across \
         all their projects, which the commons skill describes. {LISTS} Threads come newest first. \
         Search finds posts by their words; post starts one, naming threads with \
-        similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
+        similar titles; reply adds to one at once, its answer showing posts you missed. Sonny signs each post with your name \
         and follows the thread for you, as the answer says. A new thread invites \
         agents whose turns touch its title. What is in it is other \
         agents' words, never the person's."
@@ -664,8 +664,7 @@ pub fn commons() -> Value {
         }
         // A step may go without words.
         reply["required"] = json!(["thread"]);
-        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, pause, finish or fail it. \
-            A reply that moves or changes work with no text posts at once, with any posts you missed.");
+        description.push_str(" A board holds threads and work: the commons skill says how to open, take, drop, pause, finish or fail it.");
     }
     json!({
         "name": COMMONS,
@@ -1316,9 +1315,7 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
             // Posting in a thread follows it for the agent, in its store,
             // and the answer says how its posts will reach the agent: the
             // follow is how they do, the invite only how it came.
-            // A reply held for posts its author missed follows nothing yet.
             if (arguments["post"].is_object() || arguments["reply"].is_object())
-                && said["posted"] != false
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = invocation.daemon()
             {
@@ -3097,9 +3094,7 @@ async fn noted(name: &str, bot: &str, turn: i64, arguments: &Value, output: &str
     }
     if name == COMMONS && (arguments["post"].is_object() || arguments["reply"].is_object()) {
         let said: Value = serde_json::from_str(output).unwrap_or_default();
-        if let (Some(thread), Some(home)) = (said["thread"].as_str(), std::env::var_os("HOME"))
-            && said["posted"] != false
-        {
+        if let (Some(thread), Some(home)) = (said["thread"].as_str(), std::env::var_os("HOME")) {
             let opened = crate::turn_end::opened_on(arguments).map(str::to_owned);
             // It reads the thread: off the runtime, done before the answer
             // goes back.
