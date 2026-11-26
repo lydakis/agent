@@ -97,6 +97,10 @@
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
 //! bearer_token_env_var = "LINEAR_TOKEN"
+//! [sonny.mcp_servers.ledger]    # one behind AWS IAM: each request signed (SigV4) with keys from the AWS chain, none kept
+//! url = "https://abc123.execute-api.us-east-1.amazonaws.com/mcp"
+//! sigv4 = "execute-api"         # the service it signs for
+//! region = "us-east-1"          # the region it signs for
 //! [sonny.links.devbox]          # devbox's agents use this machine's browser, MCP servers and opens while it is connected
 //! host = "me@devbox"            # what ssh dials
 //! machine = "laptop"            # what the agents there call this machine, its hostname by default
@@ -1268,6 +1272,9 @@ pub struct McpServer {
     /// The variable whose value is sent as the bearer token.
     pub bearer_token_env_var: Option<String>,
     pub http_headers: BTreeMap<String, String>,
+    /// Each request signed with AWS Signature Version 4 for this service and
+    /// region, with keys from the AWS chain.
+    pub sigv4: Option<Sigv4>,
     pub enabled: bool,
     /// Only these of its tools, when set.
     pub enabled_tools: Option<Vec<String>>,
@@ -1283,6 +1290,14 @@ pub struct McpServer {
     pub tools: BTreeMap<String, ApprovalMode>,
 }
 
+/// What a server behind AWS IAM is signed for: `sigv4` (the service, as
+/// `execute-api` for API Gateway) and `region`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sigv4 {
+    pub service: String,
+    pub region: String,
+}
+
 impl McpServer {
     /// The approval mode of a call of `tool`: its own, else the server's.
     pub fn approval_mode(&self, tool: &str) -> ApprovalMode {
@@ -1294,9 +1309,11 @@ impl McpServer {
 }
 
 /// When a script's call of an MCP tool asks the agent's gate first, under
-/// Codex's names: `auto` when the tool says it is destructive and not that
-/// it only reads, `writes` unless it says it only reads, `prompt` always,
-/// `approve` never. An agent under no gate never asks.
+/// Codex's names and rule: `auto` unless the tool says it only reads, and
+/// then only when it says neither that it destroys nothing nor that it
+/// keeps to a closed world (a hint it leaves out counts as yes, so a tool
+/// that says nothing asks), `writes` unless it says it only reads, `prompt`
+/// always, `approve` never. An agent under no gate never asks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ApprovalMode {
     #[default]
@@ -1317,12 +1334,15 @@ impl ApprovalMode {
         }
     }
 
-    /// Whether a call of a tool with these MCP annotations asks first. A
-    /// read-only hint wins over a destructive one, as in Codex.
+    /// Whether a call of a tool with these MCP annotations asks first, as
+    /// Codex's `requires_mcp_tool_approval_for_mode` decides it: a
+    /// read-only hint wins over the others, and under `auto` a destructive
+    /// or open-world hint left out counts as true.
     pub fn asks(self, annotations: &serde_json::Value) -> bool {
-        let reads = annotations["readOnlyHint"] == true;
+        let reads = annotations["readOnlyHint"].as_bool().unwrap_or(false);
+        let says = |hint: &str| annotations[hint].as_bool().unwrap_or(true);
         match self {
-            Self::Auto => annotations["destructiveHint"] == true && !reads,
+            Self::Auto => !reads && (says("destructiveHint") || says("openWorldHint")),
             Self::Writes => !reads,
             Self::Prompt => true,
             Self::Approve => false,
@@ -1411,7 +1431,7 @@ pub fn named(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-const MCP_KEYS: [&str; 15] = [
+const MCP_KEYS: [&str; 17] = [
     "command",
     "args",
     "env",
@@ -1419,6 +1439,8 @@ const MCP_KEYS: [&str; 15] = [
     "url",
     "bearer_token_env_var",
     "http_headers",
+    "sigv4",
+    "region",
     "enabled",
     "enabled_tools",
     "disabled_tools",
@@ -1472,6 +1494,7 @@ fn mcp_server(name: &str, value: &toml::Value) -> Result<McpServer, String> {
         enabled: true,
         ..McpServer::default()
     };
+    let mut sigv4 = (None, None);
     for (key, value) in table {
         let key = key.as_str();
         if !MCP_KEYS.contains(&key) {
@@ -1519,14 +1542,43 @@ fn mcp_server(name: &str, value: &toml::Value) -> Result<McpServer, String> {
                     "cwd" => server.cwd = Some(PathBuf::from(text)),
                     "url" => server.url = Some(text),
                     "bearer_token_env_var" => server.bearer_token_env_var = Some(text),
+                    "sigv4" => sigv4.0 = Some(text),
+                    "region" => sigv4.1 = Some(text),
                     _ => server.description = Some(text),
                 }
             }
         }
     }
+    server.sigv4 = match sigv4 {
+        (Some(service), Some(region)) => {
+            let shaped = |text: &str| {
+                !text.is_empty()
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            };
+            if !shaped(&service) {
+                return Err(format!(
+                    "{at}.sigv4 is the service it signs for, as execute-api"
+                ));
+            }
+            if !shaped(&region) {
+                return Err(format!("{at}.region is an AWS region, as us-east-1"));
+            }
+            if server.bearer_token_env_var.is_some() {
+                return Err(format!(
+                    "{at} takes sigv4 or bearer_token_env_var, not both"
+                ));
+            }
+            Some(Sigv4 { service, region })
+        }
+        (Some(_), None) => return Err(format!("{at}.sigv4 goes with region")),
+        (None, Some(_)) => return Err(format!("{at}.region goes with sigv4")),
+        (None, None) => None,
+    };
     match (&server.command, &server.url) {
         (Some(_), None) => {
-            for key in ["bearer_token_env_var", "http_headers"] {
+            for key in ["bearer_token_env_var", "http_headers", "sigv4"] {
                 if table.contains_key(key) {
                     return Err(format!("{at}.{key} goes with url"));
                 }
@@ -3493,7 +3545,19 @@ mod tests {
         let docs = &config.sonny.mcp_servers["docs"];
         assert_eq!(docs.url.as_deref(), Some("https://example.com/mcp"));
         assert_eq!(docs.bearer_token_env_var.as_deref(), Some("DOCS"));
+        assert_eq!(docs.sigv4, None);
         assert!(docs.enabled);
+        let ledger = parse(
+            "[sonny.mcp_servers.ledger]\nurl = \"https://abc.execute-api.eu-west-1.amazonaws.com/mcp\"\nsigv4 = \"execute-api\"\nregion = \"eu-west-1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.sonny.mcp_servers["ledger"].sigv4,
+            Some(Sigv4 {
+                service: "execute-api".into(),
+                region: "eu-west-1".into()
+            })
+        );
         let files = &config.sonny.mcp_servers["files"];
         assert_eq!(files.args, ["-y", "server"]);
         assert_eq!(files.env["ROOT"], "/tmp");
@@ -3512,17 +3576,32 @@ mod tests {
             (chat.approval_mode("post"), chat.approval_mode("search")),
             (ApprovalMode::Prompt, ApprovalMode::Writes)
         );
-        // Codex's rule: a read-only hint wins over a destructive one.
-        let hints = |read: bool, destructive: bool| serde_json::json!({"readOnlyHint": read, "destructiveHint": destructive});
+        // Codex's rule: a read-only hint wins over the others, and under
+        // `auto` a destructive or open-world hint left out counts as true.
+        let hints = |read: bool, destructive: bool, open: bool| serde_json::json!({"readOnlyHint": read, "destructiveHint": destructive, "openWorldHint": open});
         let asks = |mode: ApprovalMode| {
-            [hints(false, false), hints(false, true), hints(true, true)]
-                .map(|annotations| mode.asks(&annotations))
+            [
+                hints(false, false, false),
+                hints(false, true, false),
+                hints(false, false, true),
+                hints(true, true, true),
+            ]
+            .map(|annotations| mode.asks(&annotations))
         };
-        assert_eq!(asks(ApprovalMode::Auto), [false, true, false]);
-        assert_eq!(asks(ApprovalMode::Writes), [true, true, false]);
-        assert_eq!(asks(ApprovalMode::Prompt), [true, true, true]);
-        assert_eq!(asks(ApprovalMode::Approve), [false, false, false]);
-        assert!(!ApprovalMode::Auto.asks(&serde_json::Value::Null));
+        assert_eq!(asks(ApprovalMode::Auto), [false, true, true, false]);
+        assert_eq!(asks(ApprovalMode::Writes), [true, true, true, false]);
+        assert_eq!(asks(ApprovalMode::Prompt), [true, true, true, true]);
+        assert_eq!(asks(ApprovalMode::Approve), [false, false, false, false]);
+        // A tool that says nothing of itself asks, as in Codex; one that
+        // says only that it destroys nothing still reaches the open world.
+        let auto = |annotations: serde_json::Value| ApprovalMode::Auto.asks(&annotations);
+        assert!(auto(serde_json::Value::Null));
+        assert!(auto(serde_json::json!({"destructiveHint": false})));
+        assert!(auto(serde_json::json!({"openWorldHint": false})));
+        assert!(!auto(
+            serde_json::json!({"destructiveHint": false, "openWorldHint": false})
+        ));
+        assert!(!auto(serde_json::json!({"readOnlyHint": true})));
         for (text, error) in [
             (
                 "[sonny.mcp_servers.x]\nenabled = true",
@@ -3535,6 +3614,30 @@ mod tests {
             (
                 "[sonny.mcp_servers.x]\ncommand = \"a\"\nbearer_token_env_var = \"T\"",
                 "sonny.mcp_servers.x.bearer_token_env_var goes with url",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\nsigv4 = \"execute-api\"\nregion = \"us-east-1\"",
+                "sonny.mcp_servers.x.sigv4 goes with url",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nsigv4 = \"execute-api\"\nregion = \"us-east-1\"\nbearer_token_env_var = \"T\"",
+                "sonny.mcp_servers.x takes sigv4 or bearer_token_env_var, not both",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nsigv4 = \"execute-api\"",
+                "sonny.mcp_servers.x.sigv4 goes with region",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nregion = \"us-east-1\"",
+                "sonny.mcp_servers.x.region goes with sigv4",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nsigv4 = \"execute-api\"\nregion = \"US East\"",
+                "sonny.mcp_servers.x.region is an AWS region, as us-east-1",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nsigv4 = \"\"\nregion = \"us-east-1\"",
+                "sonny.mcp_servers.x.sigv4 must not be empty",
             ),
             (
                 "[sonny.mcp_servers.x]\nurl = \"ftp://b\"",

@@ -116,8 +116,10 @@ bearer token, as AWS documents for runtime calls, and Mantle's as
 `x-api-key`; neither keyed route has been run live.
 
 Any Bedrock URL without a key field signs with SigV4 (**source**:
-`src/provider/aws.rs`). The signer is in-tree on `aws-lc-rs`, which rustls
-already builds, so Bedrock adds no crate to the lock file. It matches the AWS
+`client/src/aws.rs`, shared with Sonny's MCP servers behind AWS IAM, and
+`src/provider/aws.rs` for Bedrock's hosts). The signer is in-tree on
+`aws-lc-rs`, which rustls already builds, so Bedrock adds no crate to the
+lock file. It matches the AWS
 SigV4 test suite's published signatures and botocore 1.43's output for the
 same requests. The AWS SDK's signer and credential chain (`aws-sigv4`,
 `aws-config`) measured 39 more crates, before the HTTP client its SSO and

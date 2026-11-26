@@ -1681,7 +1681,7 @@ impl Provider {
         // unsigned over TLS and reads it once. Hashed under admission, which
         // already covers sending the body, so the extra read is bounded too.
         let payload = match &self.aws {
-            Some(aws) if aws.signs_payload() => {
+            Some(aws) if aws::signs_payload(aws) => {
                 Some(aws::payload(framed(prefix.clone(), &request.items)).await?)
             }
             _ => None,

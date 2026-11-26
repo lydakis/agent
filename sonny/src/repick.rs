@@ -18,8 +18,8 @@ use crate::{asks, needs};
 /// What a pick about to go does.
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
-    /// Goes, as this ask names its question whole: open, set aside or
-    /// closed by its agent, whose options still answer it.
+    /// Goes, as this ask names its question whole: open or closed by its
+    /// agent, whose options still answer it.
     Send(Box<asks::Ask>),
     /// The person answered it already, with these words: nothing goes.
     Answered(String),

@@ -307,10 +307,20 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // lead's project's, whatever project the repository's folder is in,
     // with the checkout it was made from, which removes it.
     let mut recorded = None;
+    // A worktree made now is this task's alone: a record a task of this
+    // name left with its branch kept, removed on another daemon, is not
+    // its own.
+    let fresh = matches!(place.undo, Undo::Worktree { .. });
+    if fresh
+        && at == here
+        && let Ok(record) = record_of(name)
+    {
+        let _ = std::fs::remove_file(record);
+    }
     if at != here {
         place.told = at.clone();
         if let (Some((top, _)), Ok(record)) = (&place.copy, record_of(name))
-            && !record.exists()
+            && (fresh || !record.exists())
         {
             let text = format!("{}\n{}\n", here.display(), top.display());
             let wrote = std::fs::create_dir_all(record.parent().unwrap_or(Path::new("/")))
@@ -1567,7 +1577,11 @@ enum Made {
 /// The lead's folder the task `name` was started from, as Sonny recorded
 /// it, and what Sonny made it.
 fn recorded(name: &str) -> Option<(PathBuf, Made)> {
-    let text = std::fs::read_to_string(record_of(name).ok()?).ok()?;
+    recorded_in(&home_dir().ok()?, name)
+}
+
+fn recorded_in(home: &Path, name: &str) -> Option<(PathBuf, Made)> {
+    let text = std::fs::read_to_string(home.join(".agent/worktrees/.folders").join(name)).ok()?;
     let mut lines = text.lines();
     let source = PathBuf::from(lines.next()?);
     let made = match lines.next()? {
@@ -1693,7 +1707,7 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
         };
         match confine {
             true => {
-                if let Err(e) = add_confined(sandboxer(), here, &branch, &path, base) {
+                if let Err(e) = add_confined(sandboxer(), here, &branch, &path, Some(base)) {
                     self::undo(&undo);
                     let _ = std::fs::remove_dir_all(&path);
                     return Err(e);
@@ -1744,6 +1758,138 @@ pub(crate) fn worker_tree(here: &Path, name: &str, confine: bool) -> Result<Path
             inside_tree(path, place.dir.clone()).inspect_err(|_| undo(&place.undo))
         }
         _ => Ok(place.dir),
+    }
+}
+
+/// What [`restore_in`] found of a task's worktree.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Again {
+    /// There: never gone, or made again meanwhile by another caller.
+    There,
+    /// Made again at its path from its branch, in the repository at this
+    /// folder.
+    Restored(PathBuf),
+}
+
+/// Why a task's worktree is not made again.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Lost {
+    /// Not a worktree Sonny makes again: a folder of the task's own,
+    /// another daemon's task's, or its task's folder there without the
+    /// folder asked for.
+    NotOurs,
+    /// No repository it can be of holds its branch any more.
+    NoBranch,
+    /// git could not make it: what it said.
+    Failed(String),
+}
+
+/// The worktree of the task `name`, removed past `[sonny] task_worktrees`
+/// with its branch kept, made again at its path in `home`'s
+/// `~/.agent/worktrees` from the branch `agent/NAME`, as the Codex app
+/// restores a worktree it cleaned up: `workspace` is the folder in it its
+/// agent works at, made too when the branch's last commit has none. The
+/// branch is looked for in the repository Sonny recorded the task made of,
+/// else in the folders of `places` (the agents above it), the first that
+/// holds it. As a task's worktree is made: git in the sandbox with
+/// `confine`, none of the repository's code run outside it, and no setup,
+/// since the branch's files are what a task wrote. One at a time, by the
+/// task's lock beside the worktrees, so callers at once make it once; it is then the
+/// daemon's at `store`, and counts toward `task_worktrees` again.
+pub(crate) fn restore_in<P>(
+    home: &Path,
+    name: &str,
+    workspace: &Path,
+    places: &[PathBuf],
+    confine: bool,
+    store: &Path,
+    admit: impl FnOnce() -> P,
+) -> Result<Again, Lost> {
+    let folders = home.join(".agent/worktrees");
+    let path = folders.join(name);
+    let branch = format!("agent/{name}");
+    // Its own lock, so a checkout that hangs holds up no other task's.
+    let lock = folders.join(".restoring").join(name);
+    let _lock = locked(&lock).map_err(Lost::Failed)?;
+    if workspace.is_dir() {
+        return Ok(Again::There);
+    }
+    if path.exists() {
+        return Err(Lost::NotOurs);
+    }
+    // Recorded as another daemon's task's.
+    if let Ok(text) = std::fs::read_to_string(store_record_in(home, name)) {
+        let theirs = PathBuf::from(text.trim_end_matches('\n'));
+        let canonical = |path: &Path| agent_client::socket::canonical_store(path).ok();
+        let same = theirs == store
+            || canonical(store).is_some_and(|ours| Some(ours) == canonical(&theirs));
+        if !same {
+            return Err(Lost::NotOurs);
+        }
+    }
+    let mut places = places.to_vec();
+    match recorded_in(home, name) {
+        Some((_, Made::Own)) => return Err(Lost::NotOurs),
+        Some((_, Made::Worktree(repo))) => places.insert(0, repo),
+        None => {}
+    }
+    // Its git runs in a place among the processes Sonny runs for agents,
+    // waited for only once the folder is its to make.
+    let _place = admit();
+    let held = format!("refs/heads/{branch}");
+    let Some(here) =
+        (places.iter()).find(|dir| git(dir, &["rev-parse", "--verify", "--quiet", &held]).is_ok())
+    else {
+        return Err(Lost::NoBranch);
+    };
+    let repo = PathBuf::from(git(here, &["rev-parse", "--show-toplevel"]).map_err(Lost::Failed)?);
+    let target = path.to_string_lossy();
+    // A registration left of it, as when its folder was deleted by hand,
+    // which git adds no worktree over, is let go first.
+    let _ = git(&repo, &["worktree", "remove", "--force", &target]);
+    let unwind = |e: String| {
+        let _ = git(
+            &repo,
+            &["worktree", "remove", "--force", "--force", &target],
+        );
+        let _ = std::fs::remove_dir_all(&path);
+        Lost::Failed(e)
+    };
+    match confine {
+        true => add_confined(sandboxer(), &repo, &branch, &path, None),
+        false => git(&repo, &["worktree", "add", "-q", &target, &branch]).map(drop),
+    }
+    .map_err(unwind)?;
+    // The folder in it as the worktree is spelled: the daemon records a
+    // workspace by its real path, which a link in the home's path makes
+    // other than the worktree's.
+    let real = std::fs::canonicalize(&path).map_err(|e| unwind(format!("{target}: {e}")))?;
+    let at = match workspace.strip_prefix(&real) {
+        Ok(below) => path.join(below),
+        Err(_) => workspace.to_owned(),
+    };
+    inside_tree(&path, at).map_err(unwind)?;
+    let _ = record_store_in(home, name, store);
+    Ok(Again::Restored(repo))
+}
+
+/// `file`, made when missing, locked for this caller alone until the file
+/// it gives back closes.
+fn locked(file: &Path) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    let failed = |e: std::io::Error| format!("{}: {e}", file.display());
+    std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/"))).map_err(failed)?;
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file)
+        .map_err(failed)?;
+    // SAFETY: flock on a descriptor `opened` owns and keeps open; closing
+    // it lets go.
+    match unsafe { libc::flock(opened.as_raw_fd(), libc::LOCK_EX) } {
+        0 => Ok(opened),
+        _ => Err(failed(std::io::Error::last_os_error())),
     }
 }
 
@@ -1802,8 +1948,9 @@ fn has_submodules(path: &Path) -> Result<bool, String> {
         .any(|name| agent_client::policy::git_entry(&path.join(std::ffi::OsStr::from_bytes(name)))))
 }
 
-/// A worktree of `here`'s repository at `path` on the new `branch`, made
-/// by git running none of the repository's code (no checkout, hook or
+/// A worktree of `here`'s repository at `path` on `branch`, made new from
+/// `base`, or, with none, the branch already there, made by git running
+/// none of the repository's code (no checkout, hook or
 /// fsmonitor), then checked out with `agent` (none: no sandbox here) in
 /// the sandbox, writing only the worktree and its own git folder, off the
 /// network (an LFS file comes from the objects the repository holds). The
@@ -1817,19 +1964,14 @@ fn add_confined(
     here: &Path,
     branch: &str,
     path: &Path,
-    base: &str,
+    base: Option<&str>,
 ) -> Result<(), String> {
     let target = path.to_string_lossy();
-    let add = [
-        "worktree",
-        "add",
-        "-q",
-        "--no-checkout",
-        "-b",
-        branch,
-        &target,
-        base,
-    ];
+    let add = ["worktree", "add", "-q", "--no-checkout"];
+    let add: Vec<&str> = match base {
+        Some(base) => [&add[..], &["-b", branch, &target, base]].concat(),
+        None => [&add[..], &[&*target, branch]].concat(),
+    };
     crate::git::plain(here, &add)?;
     let own = crate::git::plain(path, &["rev-parse", "--absolute-git-dir"])?;
     let own = std::fs::canonicalize(own.trim()).map_err(|e| format!("{own}: {e}"))?;
@@ -2188,9 +2330,6 @@ pub fn remove(
         // no hook runs.
         let path = path.to_string_lossy();
         crate::git::plain(repo, &["worktree", "remove", "--force", &path])?;
-        if let Ok(record) = record_of(name) {
-            let _ = std::fs::remove_file(record);
-        }
         if let Ok(record) = store_record_of(name) {
             let _ = std::fs::remove_file(record);
         }
@@ -2200,6 +2339,9 @@ pub fn remove(
             .and_then(|top| std::fs::canonicalize(top).ok())
             .is_some_and(|top| &top == repo);
         let did = did("removed");
+        // The lead's folder it was started from stays recorded with the
+        // branch kept, which its worktree is made again from when its
+        // agent runs again (`restore`).
         if crate::git::plain(repo, &["branch", delete, &branch]).is_err() {
             return Ok(match ours {
                 true => format!(
@@ -2213,6 +2355,9 @@ pub fn remove(
                     shell_quote(repo)
                 ),
             });
+        }
+        if let Ok(record) = record_of(name) {
+            let _ = std::fs::remove_file(record);
         }
         return Ok(format!("{did} worktree."));
     }
@@ -3048,7 +3193,7 @@ mod tests {
             .unwrap();
         let tree = dir.join("tree");
         // The hook's write fails, so git says the checkout failed.
-        let made = add_confined(Some(&agent), &repo, "agent/t", &tree, "HEAD");
+        let made = add_confined(Some(&agent), &repo, "agent/t", &tree, Some("HEAD"));
         assert!(made.is_err_and(|e| e.contains("touch")), "the hook ran");
         assert!(tree.join("a.txt").is_file(), "the worktree is checked out");
         assert!(!marker.exists(), "the hook ran in the sandbox");
@@ -3070,10 +3215,163 @@ mod tests {
         ];
         git(&repo, &commit).unwrap();
         let other = dir.join("other");
-        add_confined(Some(&agent), &repo, "agent/u", &other, "HEAD").unwrap();
+        add_confined(Some(&agent), &repo, "agent/u", &other, Some("HEAD")).unwrap();
         assert!(other.join("a.txt").is_file());
         assert!(other.join(".agents/AGENTS.md").is_file());
+        // Made again from the branch kept, as a removed task's is.
+        let target = other.to_string_lossy();
+        git(&repo, &["worktree", "remove", "--force", &target]).unwrap();
+        add_confined(Some(&agent), &repo, "agent/u", &other, None).unwrap();
+        assert_eq!(
+            git(&other, &["branch", "--show-current"]).unwrap(),
+            "agent/u"
+        );
+        assert!(other.join(".agents/AGENTS.md").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_worktree_recorded_by_its_real_path_is_made_again_through_a_linked_home() {
+        let dir = std::env::temp_dir().join(format!("sonny-restore-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = repository(&dir);
+        std::fs::create_dir_all(dir.join("real-home")).unwrap();
+        let home = dir.join("home");
+        std::os::unix::fs::symlink(dir.join("real-home"), &home).unwrap();
+        let tree = home.join(".agent/worktrees/shop.link");
+        let target = tree.to_string_lossy().into_owned();
+        let add = ["worktree", "add", "-q", "-b", "agent/shop.link", &target];
+        git(&repo, &add).unwrap();
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub/b.txt"), "b\n").unwrap();
+        git(&tree, &["add", "."]).unwrap();
+        let commit = [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "b",
+        ];
+        git(&tree, &commit).unwrap();
+        // The daemon records the workspace by its real path.
+        let workspace = std::fs::canonicalize(tree.join("sub")).unwrap();
+        assert!(!workspace.starts_with(&home));
+        git(&repo, &["worktree", "remove", "--force", &target]).unwrap();
+        let store = dir.join("state.sqlite");
+        let made = restore_in(
+            &home,
+            "shop.link",
+            &workspace,
+            &[repo],
+            false,
+            &store,
+            || (),
+        );
+        assert!(matches!(made, Ok(Again::Restored(_))), "{made:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("b.txt")).unwrap(),
+            "b\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_removed_task_s_worktree_is_made_again_once_from_its_kept_branch() {
+        let dir = std::env::temp_dir().join(format!("sonny-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (home, repo) = (dir.join("home"), repository(&dir));
+        let store = dir.join("state.sqlite");
+        let folders = home.join(".agent/worktrees");
+        let tree = folders.join("shop.fix");
+        let target = tree.to_string_lossy().into_owned();
+        let add = ["worktree", "add", "-q", "-b", "agent/shop.fix", &target];
+        git(&repo, &add).unwrap();
+        // The task's commit, in the folder in it it works at.
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub/b.txt"), "b\n").unwrap();
+        git(&tree, &["add", "."]).unwrap();
+        let commit = [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "b",
+        ];
+        git(&tree, &commit).unwrap();
+        // Removed past task_worktrees: its branch is kept, its commit not
+        // merged.
+        git(&repo, &["worktree", "remove", "--force", &target]).unwrap();
+        let workspace = tree.join("sub");
+        // Its branch is found in the first folder above it that holds it.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let places = [elsewhere, repo.clone()];
+        // Each caller's git waits for a place in the budget, which only the
+        // one that makes it takes.
+        let places_taken = std::sync::atomic::AtomicUsize::new(0);
+        let take = || {
+            places_taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let again = || restore_in(&home, "shop.fix", &workspace, &places, false, &store, take);
+        // Callers at once make it once; the rest find it there.
+        let done: Vec<_> = std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..4).map(|_| scope.spawn(again)).collect();
+            callers.into_iter().map(|c| c.join().unwrap()).collect()
+        });
+        let real = std::fs::canonicalize(&repo).unwrap();
+        assert_eq!(
+            done.iter()
+                .filter(|d| **d == Ok(Again::Restored(real.clone())))
+                .count(),
+            1,
+            "{done:?}"
+        );
+        assert_eq!(done.iter().filter(|d| **d == Ok(Again::There)).count(), 3);
+        assert_eq!(places_taken.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            git(&tree, &["branch", "--show-current"]).unwrap(),
+            "agent/shop.fix"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("b.txt")).unwrap(),
+            "b\n"
+        );
+        // The daemon's again, counted toward task_worktrees.
+        assert_eq!(
+            task_folders(&home, &store, "shop.new"),
+            vec![("shop.fix".to_owned(), true)]
+        );
+        // A folder deleted by hand leaves git's record of it, let go first.
+        std::fs::remove_dir_all(&tree).unwrap();
+        assert_eq!(again(), Ok(Again::Restored(real)));
+        // Another daemon's task's is not taken.
+        git(&repo, &["worktree", "remove", "--force", &target]).unwrap();
+        record_store_in(&home, "shop.fix", &dir.join("other.sqlite")).unwrap();
+        let taken = places_taken.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(again(), Err(Lost::NotOurs));
+        assert_eq!(
+            places_taken.load(std::sync::atomic::Ordering::SeqCst),
+            taken
+        );
+        record_store_in(&home, "shop.fix", &store).unwrap();
+        // With its branch gone too, there is nothing to make it from.
+        git(&repo, &["branch", "-D", "agent/shop.fix"]).unwrap();
+        assert_eq!(again(), Err(Lost::NoBranch));
+        assert!(!tree.exists());
+        // Nor is a folder of a task's own, which was never a worktree.
+        let own = folders.join(".folders/shop.own");
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, format!("{}\nown\n", repo.display())).unwrap();
+        let mine = folders.join("shop.own");
+        assert_eq!(
+            restore_in(&home, "shop.own", &mine, &places, false, &store, || ()),
+            Err(Lost::NotOurs)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

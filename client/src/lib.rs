@@ -2,6 +2,7 @@
 //! JSONL requests correlated by `id`, notifications forwarded on a channel.
 //! Shared by Sonny and the CLI; nothing here depends on the runtime crate.
 pub mod approver;
+pub mod aws;
 pub mod clock;
 pub mod config;
 pub mod env_file;
@@ -122,7 +123,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 102;
+pub const PROTOCOL: u64 = 104;
 /// The most bytes a prompt's words may have in one `submit`: 1 MiB, as
 /// Codex bounds a person's input (`MAX_USER_INPUT_TEXT_CHARS`), so a
 /// reviewer's prompt can hold a large change whole (protocol 99).

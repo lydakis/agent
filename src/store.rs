@@ -18,7 +18,9 @@ pub use pack::IDLE_MS as PACK_IDLE_MS;
 mod context;
 mod db;
 mod pack;
-pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, without_thinking};
+pub use context::{
+    ContextPrefix, ContextUsage, STOPPED, pinned_item, thinking_bytes, without_thinking,
+};
 pub use db::{
     Absorbed, AfterTurn, Answered, ApprovalPolicy, ArtifactLines, Binding, Blocked, Bot, CacheTtl,
     CallAnswer, Capture, CatchUp, Charge, Closing, CompactionPlan, CompactionView, CopiedCall,

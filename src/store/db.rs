@@ -1292,7 +1292,8 @@ impl Bot {
     }
     /// Whether this call, of the daemon's tool or a declared one, waits
     /// for a verdict, run in the turn's `workspace` under `rules`. A call
-    /// the bot may not make is refused, never announced, and one its
+    /// the bot may not make, or whose arguments its tool does not take
+    /// ([`Bot::arguments`]), is refused, never announced, and one its
     /// sandbox confines runs without a verdict: only an escape is gated,
     /// as in Codex. A command a rule asks about waits, sandbox or not; one
     /// a rule allows or forbids doesn't. A call whose steps go to the gate
@@ -1319,6 +1320,7 @@ impl Bot {
         let held = gated(&self.gates, &call.name)
             && self.may_call(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
+            && self.arguments(call).is_ok()
             && match &ruling {
                 Ok(Ruling::Prompt(_)) => true,
                 Ok(Ruling::None) => !confines,
@@ -1335,6 +1337,17 @@ impl Bot {
             read: call.name == "read",
         }
     }
+    /// Whether this call's arguments fit what its tool takes: a declared
+    /// tool's against the schema it declared, the daemon's own as the call
+    /// would be read to run. The first thing any call meets: one that does
+    /// not fit fails at once, so no gate holds it, no rule or sandbox judges
+    /// it, and no one is asked about a call that could never run.
+    pub fn arguments(&self, call: &ToolCall) -> Result<()> {
+        match self.declared(&call.name) {
+            Some(tool) => crate::tools::check_declared(tool, &call.arguments),
+            None => crate::tools::check_arguments(&call.name, &call.arguments),
+        }
+    }
     /// Whether one of the bot's gates holds this call, from its model, back,
     /// asked or not: never a call of a tool kept for steps, which is refused.
     fn held(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
@@ -1342,6 +1355,7 @@ impl Bot {
             && self.may_call(&call.name)
             && !self.steps_only(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
+            && self.arguments(call).is_ok()
             && match self.ruling(call, rules) {
                 Ok(Ruling::Prompt(_)) => true,
                 Ok(Ruling::None) => !self.confines(call, workspace),
@@ -4046,7 +4060,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 114;
+    pub const SCHEMA: i32 = 115;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -4344,6 +4358,7 @@ impl Database {
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS stop_notes(node INTEGER PRIMARY KEY REFERENCES nodes(id));
             CREATE TABLE IF NOT EXISTS openings(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 text TEXT, chars INTEGER);
             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -12035,9 +12050,18 @@ impl Database {
         tool: &str,
         arguments: Value,
         record: bool,
+        parameters: Option<Value>,
         facts: audit::Facts,
         now_ms: u64,
     ) -> Result<Stepped> {
+        // Its arguments before anything else decides it, as a call from
+        // the model: one the schema its client gave does not take is never
+        // put to a gate. A step only recorded is not checked: no one is
+        // asked about it, and its arguments may come cut.
+        if let Some(parameters) = parameters.filter(|_| !record) {
+            crate::tools::check_schema(&parameters, &arguments)
+                .map_err(|detail| Error::with("invalid_arguments", format!("{tool}: {detail}")))?;
+        }
         self.step_turn(name, turn, Some(call_id))?;
         let bot = self.call_bot(turn, call_id)?;
         let call: Option<(String, bool, Option<String>, i64, bool, bool)> = self
@@ -12191,10 +12215,6 @@ impl Database {
         if !bot.may_call(tool) {
             return Err(Error::with("tool_not_available", tool));
         }
-        let capture = self.capture(turn, call_id)?;
-        let Some(workspace) = capture.workspace.as_deref() else {
-            return fail("workspace_required");
-        };
         let text = arguments.to_string();
         let call = ToolCall {
             name: tool.to_owned(),
@@ -12202,6 +12222,13 @@ impl Database {
             arguments: text.clone(),
             custom: false,
             links: Default::default(),
+        };
+        // Its arguments first, as the same call from the model: one its
+        // tool does not take is refused before any gate or rule sees it.
+        bot.arguments(&call)?;
+        let capture = self.capture(turn, call_id)?;
+        let Some(workspace) = capture.workspace.as_deref() else {
+            return fail("workspace_required");
         };
         let plan = bot.plan(&call, std::path::Path::new(workspace), &capture.rules);
         let refusal = if plan.refused_unasked() {
@@ -14517,6 +14544,17 @@ impl Database {
                     (output, unknown)
                 },
             )?;
+        }
+        // A turn an interrupt stopped says so in its history, after all it
+        // holds, as Codex records an interrupted turn: the model reads it
+        // before whatever comes next. It starts no turn, and `stop_notes`
+        // marks it, so clients can tell it from a person's words.
+        if code == Some("cancelled") {
+            let item = bot.family()?.user_item(super::context::STOPPED)?;
+            let id = node(&tx, head, &item)?;
+            tx.prepare_cached("INSERT INTO stop_notes(node) VALUES (?)")?
+                .execute([id])?;
+            head = Some(id);
         }
         if let Some(waiting) = &waiting {
             tx.execute(
@@ -18429,10 +18467,11 @@ impl Database {
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin,
-                s.person,s.quotes,n.written_ms,s.attached,n.message,m.bot
+                s.person,s.quotes,n.written_ms,s.attached,n.message,m.bot,x.node IS NOT NULL
              FROM (SELECT id,{PICTURELESS} AS item,written_ms,message FROM
                 (SELECT n.id,COALESCE(d.item,{N_ITEM}) AS item,n.written_ms,n.message FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
-             LEFT JOIN senders s ON s.node=n.id LEFT JOIN messages m ON m.id=n.message"
+             LEFT JOIN senders s ON s.node=n.id LEFT JOIN messages m ON m.id=n.message
+             LEFT JOIN stop_notes x ON x.node=n.id"
         ))?;
         for &node in wanted {
             type Row = (
@@ -18447,6 +18486,7 @@ impl Database {
                 Option<bool>,
                 Option<i64>,
                 Option<String>,
+                bool,
             );
             let (
                 raw,
@@ -18460,6 +18500,7 @@ impl Database {
                 attached,
                 message,
                 to,
+                stop_note,
             ): Row = query.query_row(params![node, maximum as i64], |r| {
                 Ok((
                     r.get(0)?,
@@ -18473,6 +18514,7 @@ impl Database {
                     r.get(8)?,
                     r.get(9)?,
                     r.get(10)?,
+                    r.get(11)?,
                 ))
             })?;
             let mut entry = match raw {
@@ -18489,6 +18531,11 @@ impl Database {
             if let (Some(message), Some(to)) = (message, to) {
                 entry["message"] = json!(message);
                 entry["handle"] = json!(format!("{to}/{message}"));
+            }
+            // The note a stopped turn left for the model, which no one
+            // sent: a client shows it or not as it likes.
+            if stop_note {
+                entry["stop_note"] = json!(true);
             }
             sender_fields(
                 &mut entry,
@@ -22813,6 +22860,14 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     if from < 114 {
         migrate_texts_once(conn)?;
     }
+    // 114 -> 115: the note a turn an interrupt stopped leaves in its
+    // history is marked. No turn before left one. release/store_down.py
+    // takes it back.
+    if from < 115 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS stop_notes(node INTEGER PRIMARY KEY REFERENCES nodes(id));",
+        )?;
+    }
 
     Ok(())
 }
@@ -24278,6 +24333,10 @@ impl Translation {
                         conn.prepare_cached("INSERT INTO declined(node,item) VALUES (?,?)")?
                             .execute(params![new, declined])?;
                     }
+                    conn.prepare_cached(
+                        "INSERT INTO stop_notes(node) SELECT ?1 FROM stop_notes WHERE node=?2",
+                    )?
+                    .execute(params![new, old])?;
                     if let Some(result) = &result
                         && single
                         && super::context::tool_result(new_item).is_none()
@@ -24389,6 +24448,7 @@ fn free_node(conn: &Connection, id: i64, name: &str) -> Result<Option<i64>> {
         "DELETE FROM elisions WHERE node=?",
         "DELETE FROM stubs WHERE node=?",
         "DELETE FROM declined WHERE node=?",
+        "DELETE FROM stop_notes WHERE node=?",
         "DELETE FROM openings WHERE node=?",
         "DELETE FROM senders WHERE node=?",
         "DELETE FROM translated WHERE node=?",

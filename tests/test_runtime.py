@@ -157,12 +157,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             assert self.path == '/v1/responses'
             assert request['model'] in getattr(self.server, 'models', ('synthetic-model',))
             texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
-            # A `steer:` message joins the running task, which its prompt drives;
-            # Sonny's word that a question was set aside, attached to the call
-            # that takes the person's message, drives nothing either.
-            user = next((t for t in reversed(texts) if not t.startswith('steer:')
-                         and not (t.startswith('Your question "') and ' is now set aside: ' in t)),
-                        texts[-1])
+            # A `steer:` message joins the running task, which its prompt drives.
+            user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
             # An automation's message comes after its one-line header.
             if user.startswith('[automation ') and '\n' in user:
                 user = user.split('\n', 1)[1]
@@ -3424,6 +3420,42 @@ class RuntimeTests(ModelFixture):
         finished = next(e for e in events if e['event'] == 'turn_finished' and e.get('turn') == ended)
         self.assertEqual((finished['data']['error'], finished['data']['restarts']), ('process_interrupted', 1))
         self.assertTrue(self.model.requests.empty())
+
+    def test_a_turn_stopped_mid_stream_tells_the_next_request_and_a_finished_one_does_not(self):
+        # As Codex records an interrupted turn (openai/codex#9043): the
+        # next request reads the stopped turn, one note that it was
+        # stopped, then the new prompt.
+        self.model.release_headers = threading.Event()
+        self.model.release_headers.set()
+        self.model.all_streaming = threading.Event()
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        done = client.request('submit', bot='Bob', request_id='done', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(done)['data']['status'], 'completed')
+        self.model.requests.get(timeout=3)
+        stopped = client.request('submit', bot='Bob', request_id='stop', prompt='gate')['result']['message']
+        # The model has answered the headers and is streaming its reply.
+        self.model.requests.get(timeout=3)
+        client.request('interrupt', bot='Bob', turn=stopped)
+        self.assertEqual(client.finished(stopped)['data']['status'], 'interrupted')
+        self.model.all_streaming.set()
+        after = client.request('submit', bot='Bob', request_id='after', prompt='go on')['result']['message']
+        self.assertEqual(client.finished(after)['data']['status'], 'completed')
+        texts = [i['content'][0]['text'] for i in self.model.requests.get(timeout=3)['input']
+                 if i.get('role') == 'user']
+        note = ('<turn_aborted>\nThe previous turn was interrupted on purpose. Any background commands it'
+                ' started may still be running. If any tools/commands were aborted, they may have partially'
+                ' executed.\n</turn_aborted>')
+        self.assertEqual(texts, ['hello', 'gate', note, 'go on'])
+        # The note is the stopped turn's, marked for clients, sent by no one.
+        nodes = client.request('history_nodes', bot='Bob')['result']['nodes']
+        items = client.request('history_items', bot='Bob', nodes=[n['node'] for n in nodes])['result']['items']
+        marked = [(n, i) for n, i in zip(nodes, items) if i.get('stop_note')]
+        self.assertEqual(len(marked), 1)
+        listed, entry = marked[0]
+        self.assertEqual(listed['turn'], stopped)
+        self.assertEqual(entry['item']['content'][0]['text'], note)
+        self.assertFalse({'from', 'origin', 'person', 'message', 'handle'} & entry.keys())
 
     def test_a_crash_answers_the_call_it_cut_off_and_runs_the_ones_not_started(self):
         # As Pi Durable recovers a task: only the call the process was

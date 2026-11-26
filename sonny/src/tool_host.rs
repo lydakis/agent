@@ -22,9 +22,11 @@ const USAGE: &str = "usage: sonny tool-host [--store PATH] [--socket PATH]";
 /// that starts the next daemon starts its host.
 const GONE_AFTER: Duration = Duration::from_secs(30);
 
-/// The events that tell the host a call waits, or that a turn whose calls
-/// it runs ended. The calls themselves it reads from the daemon.
-const KINDS: [&str; 4] = [
+/// The events that tell the host a call waits, that a turn whose calls
+/// it runs ended, or that a turn started, whose task's worktree it makes
+/// again if it was removed. The calls themselves it reads from the daemon.
+const KINDS: [&str; 5] = [
+    "accepted",
     "tool_started",
     "turn_finished",
     "call_lifted",

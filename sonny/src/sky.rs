@@ -8955,7 +8955,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let heard_ops = asked.clone();
-        // Since node 10, `b` only worked and `c` heard from the person.
+        // Since node 10, `b` only worked and the person answered `c`.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -8983,7 +8983,8 @@ mod tests {
                     _ => {
                         let first = match bot {
                             "c" => json!({"type": "message", "role": "user",
-                                "content": [{"type": "input_text", "text": "never mind that"}]}),
+                                "content": [{"type": "input_text",
+                                    "text": "You asked (ask:1/a1): Ship it?\n\nYes"}]}),
                             _ => json!({"type": "message", "role": "user",
                                 "content": [{"type": "input_text", "text": "go on"}]}),
                         };
@@ -9030,7 +9031,7 @@ mod tests {
         assert_eq!(seen["b"].turn, Some(3));
         assert_eq!(seen["b"].through, Some(12));
         assert!(!seen["b"].itself);
-        // `c`'s person moved on: read whole again.
+        // `c`'s person answered a question: read whole again.
         assert_eq!(seen["c"].through, Some(4));
         let ops = asked.lock().unwrap();
         assert_eq!(
@@ -9152,7 +9153,9 @@ mod tests {
         );
 
         // The call allowed, the agent works again; a new turn for what
-        // failed and what asked starts afresh.
+        // failed starts afresh. What asked waits on the person still: the
+        // person's words close its question only if its history, read
+        // next, says they answered it.
         for feed in [
             live("shop.login", "tool_completed", 2, json!({"call_id": "c1"})),
             live("shop.cart", "accepted", 4, json!({})),
@@ -9169,6 +9172,9 @@ mod tests {
         view.drain();
         assert_eq!(state(&view, "shop.login"), Some(State::Working));
         assert_eq!(state(&view, "shop.cart"), Some(State::Working));
+        assert_eq!(state(&view, "shop.lead"), Some(State::NeedsYou));
+        let lead = view.index["shop.lead"];
+        view.agents[lead].waits.asked("shop.lead", None);
         assert_eq!(state(&view, "shop.lead"), None);
     }
 
@@ -9314,9 +9320,14 @@ mod tests {
         assert_eq!(state(&view, "shop.lead"), Some(State::Working));
         assert_eq!(state(&view, "shop.cart"), Some(State::Working));
         assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+        // The person's own words: open still, until its history, read at
+        // once, says they answered it.
         send.send(live("shop.login", "steered", 4, json!({})))
             .unwrap();
         view.drain();
+        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+        let login = view.index["shop.login"];
+        view.agents[login].waits.asked("shop.login", None);
         assert_eq!(state(&view, "shop.login"), Some(State::Working));
     }
 

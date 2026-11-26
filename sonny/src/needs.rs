@@ -9,8 +9,9 @@
 //! comes back ([`listing`], [`scan`]) into a [`Needs`], which its events
 //! keep current after ([`Needs::event`]). An event says for sure when a
 //! call waits and when its wait ends, and when a question is asked; that
-//! the person answered one, or wrote past it, it only suggests, so the
-//! agent is read again once that turn ends ([`Needs::due`]). A restart,
+//! the person's words answered one it only suggests, so the agent is read
+//! again then ([`Needs::due`]): words that answer none leave every
+//! question open, as only a pick or the agent's close settles one. A restart,
 //! a reconnect or a lost event is mended at the next read, never carried.
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -145,9 +146,8 @@ const SCANNED: usize = 400;
 const READ: usize = 100;
 
 /// Read `bot`'s newest history for the question it has open, and whether
-/// its turn `last`, or with none its newest, resolved it: newest first, and
-/// no further than the person's last words of their own, past which every
-/// question before is set aside. None unless every read it needed came
+/// its turn `last`, or with none its newest, resolved it: newest first, as
+/// far back as [`SCANNED`] nodes. None unless every read it needed came
 /// back whole: a history that could not be listed, or items a read gave up
 /// on, may hold the open question or the mark, so what was read is no
 /// answer, and nobody keeps it as one.
@@ -193,17 +193,7 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
         if short {
             return None;
         }
-        let past = fresh.iter().any(moves_on);
         items.extend(fresh);
-        // The person wrote past every question older than this, and the
-        // last turn, newer, is read.
-        if past
-            && in_last
-                .iter()
-                .all(|node| node > chunk.last().unwrap_or(&i64::MAX))
-        {
-            break;
-        }
     }
     Some(Seen {
         ask: crate::asks::open(&items),
@@ -215,8 +205,8 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
 
 /// [`scan`], going on from what was read before (`was`): only the nodes
 /// written since are read, and while none of them asks, closes or answers
-/// a question, nor is the person's own words, the question is the one
-/// read before and the newest turn says whether it resolved it. Anything
+/// a question, the question is the one read before and the newest turn
+/// says whether it resolved it. Anything
 /// else, or more nodes than one scan reads, is read whole again.
 pub async fn scan_since(client: &Client, bot: &str, last: Option<i64>, was: &Seen) -> Option<Seen> {
     let Some(through) = was.through else {
@@ -256,7 +246,7 @@ pub async fn scan_since(client: &Client, bot: &str, last: Option<i64>, was: &See
     for (node, item) in read {
         let of_open = item["type"] == "function_call_output"
             && open.is_some_and(|call| item["call_id"] == call);
-        if moves_on(&item) || answers(&item) || asks(&item) || of_open {
+        if answers(&item) || asks(&item) || of_open {
             return scan(client, bot, last).await;
         }
         if in_last.contains(&node) {
@@ -286,15 +276,11 @@ fn asks(item: &Value) -> bool {
         && (item["name"] == crate::asks::TOOL || item["name"] == crate::asks::CLOSE)
 }
 
-/// Whether `item` is the person's own words, past which their questions
-/// before are set aside.
-fn moves_on(item: &Value) -> bool {
-    item["role"] == "user" && crate::asks::moves_on(&crate::text(item), item["from"].as_str())
-}
-
 /// `bot`'s items kept at `nodes`, each with its node, as the transcript
-/// reads them: who sent a prompt marked on it. Whether the read came back
-/// short too, the daemon gone or the nodes pruned.
+/// reads them: who sent a prompt marked on it. The note the daemon leaves
+/// the model after a stopped turn is left out: the window already says
+/// the turn was interrupted. Whether the read came back short too, the
+/// daemon gone or the nodes pruned.
 pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Value)>, bool) {
     let mut items = Vec::new();
     let mut rest = nodes;
@@ -312,7 +298,8 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
             return (items, true);
         }
         rest = &rest[entries.len().min(rest.len())..];
-        items.extend(entries.iter().flat_map(|entry| {
+        let shown = entries.iter().filter(|entry| entry["stop_note"] != true);
+        items.extend(shown.flat_map(|entry| {
             let node = entry["node"].as_i64().unwrap_or(0);
             // Who sent a prompt, when another bot did, a client from
             // outside (the commons, an automation) or another person.
@@ -686,13 +673,12 @@ impl Needs {
                     }
                 }
             }
-            // The person's own words answer a question or go past it; which
-            // one, and whether they were words of their own (a reaction is
-            // not), the history says once the turn ends.
+            // The person's words may answer its question, or be words of
+            // their own that leave it open: their history, which holds them
+            // as the turn takes them, says which, read at once.
             "accepted" | "steered" if from_person(data) => {
-                if self.asks.remove(bot).is_some() {
-                    self.unsure.insert(bot.to_owned());
-                    self.version += 1;
+                if self.asks.contains_key(bot) {
+                    self.due.push((bot.to_owned(), event["turn"].as_i64()));
                     self.stir(bot);
                 }
             }
@@ -834,6 +820,27 @@ mod tests {
     fn ask(call: &str, question: &str) -> Value {
         let arguments = json!({"question": question, "why": "w", "options": [{"label": "a"}]});
         json!({"name": "ask", "call_id": call, "arguments": arguments.to_string()})
+    }
+
+    #[tokio::test]
+    async fn the_note_a_stopped_turn_leaves_the_model_is_not_drawn() {
+        let said =
+            |text: &str| json!({"role": "user", "content": [{"type": "input_text", "text": text}]});
+        let read = json!({"items": [
+            {"node": 3, "item": said("fix it")},
+            {"node": 4, "stop_note": true, "item": said("<turn_aborted>...</turn_aborted>")},
+            {"node": 5, "item": said("go on")}]});
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_items") => read.clone(),
+            _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+        })
+        .await;
+        let (items, short) = items(&client, "p.lead", &[3, 4, 5]).await;
+        assert!(!short);
+        let drawn: Vec<(i64, String)> = (items.iter())
+            .map(|(node, item)| (*node, crate::text(item)))
+            .collect();
+        assert_eq!(drawn, [(3, "fix it".into()), (5, "go on".into())]);
     }
 
     #[test]
@@ -1187,18 +1194,27 @@ mod tests {
         needs.event(&event("p.fix", 3, "accepted", json!({"origin": "trigger"})));
         needs.event(&event("p.fix", 3, "accepted", json!({"person": "dana"})));
         assert!(needs.waits("p.fix"), "only the person answers it");
-        assert!(needs.event(&event("p.fix", 4, "accepted", json!({}))));
-        assert!(!needs.waits("p.fix"));
+        assert!(needs.due().is_empty());
+        // The person's words: whether they answer it, its history, read
+        // at once, says. Until then it waits on them still.
+        assert!(!needs.event(&event("p.fix", 4, "accepted", json!({}))));
+        assert!(needs.waits("p.fix"));
+        assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(4))]);
         needs.event(&event(
             "p.fix",
             4,
             "turn_finished",
             json!({"status": "completed"}),
         ));
-        assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(4))]);
-        // A reaction is not words of their own: the read puts it back.
+        assert!(needs.due().is_empty(), "read already");
+        // Words of their own answer nothing: the read keeps it open.
         needs.asked("p.fix", Some(whole("Ship it?")));
         assert!(needs.waits("p.fix"));
+        // Their answer: the read lets it go.
+        needs.event(&event("p.fix", 5, "steered", json!({})));
+        assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(5))]);
+        needs.asked("p.fix", None);
+        assert!(!needs.waits("p.fix"));
     }
 
     #[test]

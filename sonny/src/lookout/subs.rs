@@ -1882,8 +1882,15 @@ fn notes(times: &[Timed]) -> usize {
                 })
                 .count()
                 .max(1);
-            for e in carried.drain(..take).filter(|e| !e.steer) {
-                last.insert(e.clock, went);
+            // A clock counts from the note its digest came due for; what
+            // steers or was due already starts none again.
+            let due: Vec<&str> = (carried.drain(..take))
+                .filter(|e| !e.steer && e.window > 0)
+                .filter(|e| last.get(e.clock).is_none_or(|told| went >= told + e.window))
+                .map(|e| e.clock)
+                .collect();
+            for clock in due {
+                last.insert(clock, went);
             }
             for e in &mut carried {
                 e.due |= !e.steer && e.window > 0;
