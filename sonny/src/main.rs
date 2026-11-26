@@ -15179,7 +15179,8 @@ impl App {
                 }
                 self.said.push_str(delta);
                 // Only whitespace so far draws no reply.
-                if !self.live.as_ref().is_some_and(|live| !live.closed) && blank(delta) {
+                if !self.live.as_ref().is_some_and(|live| !live.closed) && transcript::blank(delta)
+                {
                     self.unseen.push_str(delta);
                     return;
                 }
@@ -26593,13 +26594,6 @@ fn quiet_message(text: &str) -> bool {
 /// A message item's text: a prompt's own words, without the line the
 /// daemon adds after them naming who sent it and when, or the `[Sent …]`
 /// line an older Sonny stored with them.
-/// Whether `words` are only whitespace, as Codex draws no such reply, or
-/// zero-width spaces and other characters that show nothing, which models
-/// send for an empty reply.
-fn blank(words: &str) -> bool {
-    words.chars().all(transcript::unseen)
-}
-
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
@@ -26609,7 +26603,7 @@ fn text(item: &Value) -> String {
             .to_owned(),
         // A reply of only whitespace is no reply.
         (_, content) => Some(joined(content))
-            .filter(|words| !blank(words))
+            .filter(|words| !transcript::blank(words))
             .unwrap_or_default(),
     }
 }
@@ -30462,8 +30456,8 @@ mod tests {
             );
         }
         // Streamed, characters that show nothing are held as whitespace is.
-        assert!(blank("\u{2060}\u{AD}\u{FEFF}\n"));
-        assert!(!blank("\u{2060}ok"));
+        assert!(transcript::blank("\u{2060}\u{AD}\u{FEFF}\n"));
+        assert!(!transcript::blank("\u{2060}ok"));
         // A reply of a bullet's worth of words still draws.
         assert_eq!(transcript::reply("-", 80, folder).len(), 1);
         assert_eq!(transcript::reply("Ok.", 80, folder).len(), 1);

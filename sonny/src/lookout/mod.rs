@@ -278,7 +278,9 @@ async fn reply_text(
         (read["items"].as_array().into_iter())
             .flatten()
             .flat_map(|entry| crate::responses(&entry["item"]))
-            .find(|item| item["role"] == "assistant" && !crate::text(item).trim().is_empty())
+            .find(|item| {
+                item["role"] == "assistant" && !crate::transcript::blank(&crate::text(item))
+            })
             .map(|item| crate::text(&item))
     };
     // A turn that completed ended on its reply, its checkpoint: one read,
@@ -3808,6 +3810,22 @@ mod tests {
         let read = reply_text(&client, "calc.fix", 4, Some(41), false).await;
         assert_eq!(read.as_deref(), Some("Earlier."));
         assert_eq!(*asked.lock().unwrap(), ["history_nodes", "history_items"]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_shows_nothing_reads_as_no_words() {
+        let client = crate::tests::daemon_answering(move |request| {
+            match request["op"].as_str() {
+                Some("history_nodes") => json!({"nodes": [{"node": 42, "turn": 4}]}),
+                _ => json!({"items": [{"node": 42, "item": {"type": "message",
+                    "role": "assistant", "content": [{"type": "output_text", "text": "\u{200B}"}]}}]}),
+            }
+        })
+        .await;
+        for completed in [true, false] {
+            let read = reply_text(&client, "calc.fix", 4, Some(42), completed).await;
+            assert_eq!(read.as_deref(), Some(""), "completed: {completed}");
+        }
     }
 
     #[tokio::test]
