@@ -89,6 +89,7 @@ mod recall;
 mod repick;
 mod resolved;
 mod responsible;
+mod resume;
 mod reviewer;
 mod rex;
 mod rules;
@@ -3685,6 +3686,9 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
 fn main() -> std::process::ExitCode {
+    // While Sonny is one thread: the terminal's resume token is kept and
+    // goes from the environment, so nothing Sonny starts has it.
+    resume::at_start();
     // Before anything reads the config, which refuses a key it no longer
     // knows.
     haiku::at_start();
@@ -4169,6 +4173,9 @@ async fn run() -> Result<bool, String> {
     if options.side.is_none() && !options.embedded {
         herdr::announce(&name, reopen(&name));
         cmux::announce(&name, reopen(&name));
+        if let Ok(dir) = std::env::current_dir() {
+            resume::report(&reopen(&name), &dir);
+        }
     }
     // The daemon's `stats` names this window's connections by its agent.
     let _ = client.label(&name).await;
@@ -4424,6 +4431,11 @@ async fn run() -> Result<bool, String> {
         let_screen_go();
     }
     report_status("clear", &name);
+    // The person quit: nothing comes back in this terminal. A `/switch`
+    // or an upgrade goes on in it and says its own command.
+    if result.is_ok() && app.switch_to.is_none() && app.reopen_on.is_none() {
+        resume::clear();
+    }
     // `/switch NAME` or `/new`: that agent's window opens in this one's
     // place, in this same process, as if Sonny were opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
@@ -4497,7 +4509,14 @@ async fn run() -> Result<bool, String> {
         if let Some(draft) = &draft {
             args.extend(["--draft-file".into(), draft.display().to_string()]);
         }
-        let error = std::process::Command::new(&program).args(&args).exec();
+        let mut command = std::process::Command::new(&program);
+        command.args(&args);
+        // The same window going on as the new Sonny keeps the terminal's
+        // resume token, which no other program Sonny starts gets.
+        if let Some((var, token)) = resume::token() {
+            command.env(var, token);
+        }
+        let error = command.exec();
         if let Some(draft) = &draft {
             let _ = std::fs::remove_file(draft);
         }

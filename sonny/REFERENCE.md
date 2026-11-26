@@ -663,7 +663,7 @@ When opened inside **Rex**, **Herdr**, or **cmux**, Sonny gives each project one
 - **Tab cap (`most_task_tabs = 32`):** Past the limit, Sonny closes the least-recently-used tab—never closing unread, failed, or needs-you tabs (`~/.agent/sonny/used/`, `held/`, `aside/`).
 - **Active terminal tracking:** Agents act in whichever terminal window you last interacted with (`~/.agent/sonny/places`; agents query this via `sonny where`). Use `--rex-host HOST` for remote Rex or `--no-layout` to disable multiplexer integration.
 - **Multiplexer details:**
-  - **Rex:** Reports OSC 7501 status (`working`, `waiting`, `done`).
+  - **Rex:** Reports OSC 7501 status (`working`, `waiting`, `done`), and its resume command over OSC 7577, so Rex runs Sonny on the same agent again after a restart.
   - **Herdr:** Registers each agent via `herdr pane report-agent` (`Sonny: NAME`), supports `herdr agent wait`/`prompt`, and restores the exact bot on Herdr restart.
   - **cmux:** Emits OSC 7501/777 sidebar status and notifications, sets `cmux surface resume set` for relaunch recovery. Enable **Settings → Automation → Automation mode** in cmux so daemon-hosted agents can control cmux tabs.
 - **Skills:** Sonny installs `rex-windows`, `herdr-panes`, or `cmux-tabs` for detected multiplexers.
@@ -691,7 +691,16 @@ window, and its tab, where it has one, rings. The others, such as reviewers and 
 work without one; `/status` and the footer count them. With `[sonny]
 task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
 shows which task is working, waiting on you (an approval, or a question it
-asked) or done, as its tab and `/status` say. In Herdr, Sonny
+asked) or done, as its tab and `/status` say. Each window also tells Rex how
+to open it again (OSC 7577, Rex's program resume): `sonny` on the same
+agent, from the same folder, the command Herdr and cmux get, signed with
+the token Rex gives the block (`OSC7577_TOKEN`); a `/switch` says the new
+one, and quitting takes it back, while a closed block or a server going
+down keeps it, so Rex runs it again when it restores the block. Rex runs
+only the programs its config allows. Sonny takes the token out of its
+environment as it starts, so nothing it starts, the daemon and agents'
+commands included, can sign a command of its own; in a terminal that
+gives no token Sonny says nothing. In Herdr, Sonny
 supports Herdr the way its own agents do: each Sonny reports its bot through
 `herdr pane report-agent`, so the agent panel lists it as `Sonny: NAME`
 (working, idle, or blocked on your approval or on your answer to a question
