@@ -1617,12 +1617,8 @@ impl Service {
         // Each file's revision is looked at before it is read: a write after
         // the look leaves it newer than what is kept, so it is taken again.
         // Only the files that changed are read, as a notice that names them.
+        // Each one read is kept as taken there, after it is live.
         let (mut changed, revisions) = self.files.changed(&self.store);
-        // Every revision read is kept, one that changes nothing and a
-        // file that went included, so the listing knows it was taken.
-        if subs::take(&mut self.read_at, &revisions, epoch_ms()) {
-            subs::took(&self.store, &self.read_at);
-        }
         // A subscriber whose file went unseen, and one with a subscription
         // whose `until` came: it ends, as an automation does.
         let now_s = (epoch_ms() / 1000) as i64;
@@ -1728,20 +1724,20 @@ impl Service {
             };
             changed.push(name);
         }
-        // Once for every file the notice named.
+        if !changed.is_empty() {
+            self.runner.wanted_by(&self.subscribers);
+            for name in &changed {
+                if let Some(record) = self.records.get(name).cloned() {
+                    self.seat(&record);
+                }
+            }
+            self.resubscribe_some(&changed);
+        }
+        // Once for every file the notice named, after they are live: the
+        // write waits on the disk.
         if took {
             subs::took(&self.store, &self.read_at);
         }
-        if changed.is_empty() {
-            return changed;
-        }
-        self.runner.wanted_by(&self.subscribers);
-        for name in &changed {
-            if let Some(record) = self.records.get(name).cloned() {
-                self.seat(&record);
-            }
-        }
-        self.resubscribe_some(&changed);
         changed
     }
 
