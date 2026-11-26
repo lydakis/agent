@@ -139,9 +139,8 @@ const fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// How many of an agent's newest nodes are read for its open question,
-/// here and wherever else its open questions are read back.
-pub const SCANNED: usize = 400;
+/// How many of an agent's newest nodes are read for its open question.
+const SCANNED: usize = 400;
 
 /// How many nodes one `history_items` read takes.
 const READ: usize = 100;

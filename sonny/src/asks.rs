@@ -1594,10 +1594,11 @@ pub async fn still_open(bot: &str, turn: i64, call: &str) -> Result<bool, String
     Ok(found.is_some_and(|(_, state)| state == State::Open))
 }
 
-/// Whether `bot` waits on the person, read from its newest history as far
-/// back as [`crate::needs::scan`] reads it for every surface: one of its
-/// questions still open that does not go ahead by itself, or goes ahead
-/// only at a deadline not yet past (`now`, in seconds since the epoch).
+/// Whether `bot` waits on the person, read from its history newest first,
+/// all of it if need be, as a question stays open until a pick or the
+/// agent's close: one of its questions still open that does not go ahead
+/// by itself, or goes ahead only at a deadline not yet past (`now`, in
+/// seconds since the epoch).
 pub async fn waits(
     client: &agent_client::Client,
     bot: &str,
@@ -1605,9 +1606,7 @@ pub async fn waits(
 ) -> agent_client::Result<bool> {
     let (mut asked, mut said, mut waits) =
         (Asked::default(), std::collections::HashMap::new(), false);
-    let mut read = 0;
     crate::said::walk(client, bot, 0, |at, entry| {
-        read += 1;
         // A call's result, what Sonny took the ask as, comes after it, so
         // is read first.
         for item in crate::responses(&entry["item"]) {
@@ -1631,7 +1630,7 @@ pub async fn waits(
                     Some(Unanswered::Wait) | None => true,
                 }
         });
-        waits || read >= crate::needs::SCANNED
+        waits
     })
     .await?;
     Ok(waits)
@@ -3532,5 +3531,47 @@ mod tests {
         // A step of the person's waits for them.
         let step = json!({"question": "Sign in?", "why": "w", "one_way": false});
         assert!(waits(step, json!({"if_unanswered": "wait"})).await);
+    }
+
+    /// A question stays open however much the agent did after it: one
+    /// asked 600 nodes back still waits on the person.
+    #[tokio::test]
+    async fn a_question_under_a_long_run_of_work_still_waits() {
+        const NEWEST: i64 = 602;
+        let arguments = json!({"question": "Ship?", "why": "w", "one_way": true,
+            "options": [{"label": "Yes"}, {"label": "No"}], "recommended": 1});
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                let start = asked["from"].as_i64().unwrap_or(NEWEST);
+                let least = (start - asked["limit"].as_i64().unwrap() + 1).max(1);
+                let nodes: Vec<Value> = (least..=start)
+                    .rev()
+                    .map(|node| json!({"node": node, "turn": 4}))
+                    .collect();
+                let from = if least > 1 {
+                    json!(least - 1)
+                } else {
+                    Value::Null
+                };
+                json!({"nodes": nodes, "next_from": from})
+            }
+            _ => {
+                let items: Vec<Value> = (asked["nodes"].as_array().into_iter().flatten())
+                    .filter_map(Value::as_i64)
+                    .map(|node| match node {
+                        1 => json!({"node": 1, "item": {"type": "function_call",
+                            "call_id": "c1", "name": TOOL, "arguments": arguments.to_string()}}),
+                        2 => json!({"node": 2, "item": {"type": "function_call_output",
+                            "call_id": "c1",
+                            "output": json!({"if_unanswered": "wait"}).to_string()}}),
+                        _ => json!({"node": node, "item": {"role": "assistant",
+                            "content": [{"type": "output_text", "text": "Working."}]}}),
+                    })
+                    .collect();
+                json!({"items": items})
+            }
+        })
+        .await;
+        assert!(waits(&client, "shop.w.1", 1_000).await.unwrap());
     }
 }

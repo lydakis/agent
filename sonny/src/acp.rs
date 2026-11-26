@@ -2230,19 +2230,18 @@ impl Session {
 }
 
 /// The questions `bot` has open with options to pick from, the oldest
-/// first, as they were asked. Read back from its history, newest first,
-/// as far back as [`crate::needs::SCANNED`] nodes, as every surface reads
-/// it: a question stays open until a pick or the agent's close.
+/// first, as they were asked. Read back from its whole history, newest
+/// first: a question stays open until a pick or the agent's close, however
+/// much the agent did since.
 async fn open_asks(client: &Client, bot: &str) -> Vec<asks::Ask> {
-    let (mut asked, mut open, mut read) = (asks::Asked::default(), Vec::new(), 0);
+    let (mut asked, mut open) = (asks::Asked::default(), Vec::new());
     let _ = crate::said::walk(client, bot, 0, |at, entry| {
-        read += 1;
         open.extend(
             (asked.entry(at, entry).into_iter())
                 .filter(|(ask, state)| *state == asks::State::Open && !ask.options.is_empty())
                 .map(|(ask, _)| ask),
         );
-        read >= crate::needs::SCANNED
+        false
     })
     .await;
     open.reverse();
