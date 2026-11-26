@@ -13456,3 +13456,41 @@ read it -3.5% and +6.9%. A first screen read idle RSS +0.9 MiB: the
 daemon's text had grown 680 KB, the built-in tools' argument reader
 inlined at each new caller. Kept out of line, the text is 31 KB larger
 than main's and idle RSS even.
+
+## A background call's steps wait past its turn (#1407)
+
+2026-11-26. At turn end the daemon no longer denies the waiting steps of a
+call a message moved to the background; they wait on their gates as a
+yielded call's do. A step ended by anything other than its gates (the call
+answered first or stopped, its turn ended) is answered with a denial that
+says how, kept in memory under its turn and step until its check takes it.
+On the turn-finish path this replaces the delete of lifted calls' steps
+with a select of the turn's waiting steps, run only when the turn put
+steps to gates, and a map insert for each step the turn's end answers; a
+turn with no steps does the same store work as before.
+
+### Matched screen (perf gate's benches against main, local, 4-core Linux)
+
+Main at f9d9365 against this change at 622e991, two alternating rounds as
+the Perf workflow runs them (Sonny's screen not run).
+
+| Bench | Measure | Main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 31.986 | 30.916 | -3.3% |
+| admission | burst submit p99, ms | 3.889 | 3.891 | +0.1% |
+| completion | release to terminal p99, ms | 11.593 | 10.507 | -9.4% |
+| footprint | idle RSS, MiB | 16.863 | 17.699 | +5.0% |
+| footprint | per idle bot, KiB | 2.368 | 2.116 | -10.6% |
+| footprint | RSS after a turn each, MiB | 33.387 | 35.129 | +5.2% |
+| footprint | CPU per turn, ms | 0.816 | 0.746 | -8.6% |
+| footprint | written to disk per turn, KiB | 44.64 | 47.41 | +6.2% |
+| lifecycle | CPU, s | 0.54 | 0.47 | -13.0% |
+| lifecycle | p95 turn, ms | 584.496 | 586.08 | +0.3% |
+| lifecycle | peak RSS, MiB | 27.055 | 27.701 | +2.4% |
+
+Store work per turn is the same on both sides; the only count that moved
+is one `note_pacing` in one main run, written only when a turn waited on
+its pool, so it follows timing. Nothing is past the gate's 15%. Idle RSS
+and RSS after a turn read about 5% higher, within how much the footprint
+bench moves between runs of one build (see #1349's screen above); per idle
+bot, CPU per turn and lifecycle CPU read lower.

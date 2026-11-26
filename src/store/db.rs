@@ -3156,6 +3156,10 @@ pub struct Database {
     /// The `steps` the current group removed, put back if it does not
     /// commit, as the rows they name are.
     steps_gone: Vec<(i64, i64)>,
+    /// How each waiting step ended that something other than its gates
+    /// ended (its call answered or stopped, its turn over), by its turn
+    /// and id: its check answers with it, as a gate's verdict is.
+    steps_ended: HashMap<(i64, String), (i64, Value)>,
     /// Files of outputs whose records the current group removed, removed
     /// once it commits: a group that does not keeps both.
     files_gone: Vec<String>,
@@ -4109,6 +4113,7 @@ impl Database {
             steps: HashMap::new(),
             stepped: Vec::new(),
             steps_gone: Vec::new(),
+            steps_ended: HashMap::new(),
             files_gone: Vec::new(),
             calls_ended: Vec::new(),
             call_ends: None,
@@ -4610,6 +4615,7 @@ impl Database {
             steps: HashMap::new(),
             stepped: Vec::new(),
             steps_gone: Vec::new(),
+            steps_ended: HashMap::new(),
             files_gone: Vec::new(),
             calls_ended: Vec::new(),
             call_ends: None,
@@ -4801,6 +4807,8 @@ impl Database {
     fn restore_steps(&mut self, kept: usize) {
         for (approval, turn) in self.steps_gone.drain(kept..) {
             self.steps.insert(approval, turn);
+            // Waiting again: how it ended is not so.
+            self.steps_ended.retain(|_, (ended, _)| *ended != approval);
         }
     }
     /// A waiting step is decided or gone: no longer registered, and told of
@@ -12429,6 +12437,11 @@ impl Database {
         now_ms: u64,
         held: bool,
     ) -> Result<Stepped> {
+        // One something else ended is told how, even once its turn or
+        // its call is gone.
+        if let Some(ended) = self.step_ended_of(name, turn, id)? {
+            return Ok(ended);
+        }
         self.step_turn(name, turn, step_parent(id))?;
         let Some(request) = self.request(turn, id)? else {
             return fail("no_pending_step");
@@ -12540,6 +12553,11 @@ impl Database {
         id: &str,
         now_ms: u64,
     ) -> Result<Stepped> {
+        // One something else ended is told how, even once its turn or
+        // its call is gone.
+        if let Some(ended) = self.step_ended_of(name, turn, id)? {
+            return Ok(ended);
+        }
         self.step_turn(name, turn, step_parent(id))?;
         let Some(request) = self.request(turn, id)? else {
             return fail("no_pending_step");
@@ -13019,6 +13037,33 @@ impl Database {
             lifted: lifted.filter(|_| resumed),
         })
     }
+    /// How `name`'s step `id` of `turn` ended, when something other than
+    /// its gates ended it, as its gates' denial would say: taken, so it is
+    /// told once.
+    fn step_ended_of(&mut self, name: &str, turn: i64, id: &str) -> Result<Option<Stepped>> {
+        let key = (turn, id.to_owned());
+        if !self.steps_ended.contains_key(&key) {
+            return Ok(None);
+        }
+        let owned = (self.conn)
+            .prepare_cached("SELECT 1 FROM turns WHERE id=? AND bot=?")?
+            .exists(params![turn, name])?;
+        if !owned {
+            return Ok(None);
+        }
+        Ok(self.steps_ended.remove(&key).map(|(_, decided)| Stepped {
+            step: Step::Decided(decided),
+            notify: None,
+            wake: false,
+            lifted: None,
+        }))
+    }
+    /// Keep how a waiting step ended, `data` as its `step_decided` says,
+    /// for its check to answer with: only a step still registered, whose
+    /// check comes.
+    fn step_ended(&mut self, turn: i64, approval: i64, data: Value) {
+        keep_step_end(&self.steps, &mut self.steps_ended, (turn, approval), data);
+    }
     /// End every step still waiting for a call being answered: each one is
     /// denied, and its `approve_step` woken to say so. The call's time
     /// needs no restart, since the call is done.
@@ -13035,6 +13080,7 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         let tx = self.conn.savepoint()?;
         let now_ms = epoch_ms().max(0) as u64;
+        let mut ended = Vec::with_capacity(ids.len());
         for (approval, id) in &ids {
             let (name, arguments, facts): (String, String, Option<String>) = tx
                 .prepare_cached(
@@ -13057,13 +13103,15 @@ impl Database {
             )?;
             let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
                 "reason":reason,"approvals":[]});
-            event(&tx, &bot.name, Some(turn), "step_decided", data)?;
+            event(&tx, &bot.name, Some(turn), "step_decided", data.clone())?;
+            ended.push((*approval, data));
         }
         tx.prepare_cached("UPDATE answers SET paused_ms=NULL WHERE turn=? AND call_id=?")?
             .execute(params![turn, call_id])?;
         tx.commit()?;
         self.approvals -= ids.len() as i64;
-        for (approval, _) in ids {
+        for (approval, data) in ended {
+            self.step_ended(turn, approval, data);
             self.unstep(approval, true);
         }
         Ok(())
@@ -14563,51 +14611,22 @@ impl Database {
             )?;
         }
         // A call a message lifted waits on past its turn, as its background
-        // command, but a step of it that waited on a verdict when the message
-        // lifted it waits no longer than its turn: each is denied, as an
-        // answered call's are, and the call's time runs again, so nothing
-        // the turn asked about is decided once it is over. A call its
-        // client yielded is background work, whose steps wait on.
-        // Only a turn with a step waiting has one to end or keep: every
-        // step's approval is in `steps` while it waits.
+        // command, and so do the steps of it that wait on a verdict, as a
+        // yielded call's do: each is the call's, which still runs, and one
+        // only the person may allow waits for them. Only a turn with a
+        // step waiting has one to keep: every step's approval is in
+        // `steps` while it waits.
         let stepping = self.steps.values().any(|of| *of == turn);
-        type Lifted = (String, String, String, String, Option<String>);
-        let lifted: Vec<Lifted> = match stepping {
+        // Each step that waits on, as its turn ends, for how it ended.
+        let waiting: Vec<(i64, String, String)> = match stepping {
             false => Vec::new(),
             true => tx
                 .prepare_cached(
-                    "DELETE FROM approvals WHERE turn=?1 AND step_of IN
-                 (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL AND NOT yielded)
-                 RETURNING call_id,step_of,name,json_extract(arguments,'$.arguments'),
-                    json_extract(arguments,'$.audit')",
+                    "SELECT id,call_id,step_of FROM approvals WHERE turn=? AND step_of IS NOT NULL",
                 )?
-                .query_map([turn], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })?
+                .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?,
         };
-        let now_ms = epoch_ms().max(0) as u64;
-        for (id, parent, name, arguments, facts) in &lifted {
-            audit_step(
-                &tx,
-                &bot,
-                turn,
-                parent,
-                id,
-                name,
-                facts.as_deref(),
-                "nobody",
-                "denied",
-                arguments,
-                now_ms,
-            )?;
-            let data = json!({"call_id":id,"step_of":parent,"name":name,"decision":"deny",
-                "reason":"its turn ended","approvals":[]});
-            event(&tx, &bot.name, Some(turn), "step_decided", data)?;
-        }
-        for parent in lifted.iter().map(|(_, parent, ..)| parent) {
-            resume_call(&tx, turn, parent, now_ms)?;
-        }
         let background: Vec<i64> = match stepping {
             false => Vec::new(),
             true => tx
@@ -14618,8 +14637,7 @@ impl Database {
                 .query_map([turn], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?,
         };
-        let unstarted = lifted.len() as i64
-            + match bot.gates.is_empty() {
+        let unstarted = match bot.gates.is_empty() {
                 true => 0,
                 false => tx.execute(
                     "DELETE FROM approvals WHERE turn=?1 AND process IS NULL AND (step_of IS NULL
@@ -14627,7 +14645,7 @@ impl Database {
                     [turn],
                 )? as i64,
             };
-        // Each step still waiting is gone with its turn, but a yielded
+        // Each step still waiting is gone with its turn, but a background
         // call's: its `approve_step` is told to find so.
         let ended: Vec<i64> = self
             .steps
@@ -14637,6 +14655,13 @@ impl Database {
             .collect();
         // As `unstep` does, with the turn's savepoint open.
         for id in ended {
+            if let Some((_, call_id, step_of)) =
+                waiting.iter().find(|(approval, ..)| *approval == id)
+            {
+                let data = json!({"call_id":call_id,"step_of":step_of,"decision":"deny",
+                    "reason":"its turn ended","approvals":[]});
+                keep_step_end(&self.steps, &mut self.steps_ended, (turn, id), data);
+            }
             self.steps.remove(&id);
             self.steps_gone.push((id, turn));
             self.stepped.push(id);
@@ -15366,7 +15391,8 @@ impl Database {
     /// counts, and the daemon steps of its answered calls are told.
     fn released(&mut self, turn: i64, released: Released) {
         self.approvals -= released.requests + released.steps.len() as i64;
-        for approval in released.steps {
+        for (approval, data) in released.steps {
+            self.step_ended(turn, approval, data);
             self.unstep(approval, true);
         }
         for call_id in released.ended {
@@ -20232,9 +20258,26 @@ fn announcements(calls: Vec<Value>) -> Result<Vec<Vec<Value>>> {
 /// What a park that answered its turn's open calls let go of: their
 /// requests, the steps they asked about, the answered calls that end, and
 /// the files that held what those calls' daemon steps kept.
+/// [`Database::step_ended`], on the fields it reads and writes, for a
+/// caller holding a savepoint on the connection.
+fn keep_step_end(
+    steps: &HashMap<i64, i64>,
+    ended: &mut HashMap<(i64, String), (i64, Value)>,
+    (turn, approval): (i64, i64),
+    data: Value,
+) {
+    if !steps.contains_key(&approval) {
+        return;
+    }
+    let Some(id) = data["call_id"].as_str().map(str::to_owned) else {
+        return;
+    };
+    ended.insert((turn, id), (approval, data));
+}
 struct Released {
     requests: i64,
-    steps: Vec<i64>,
+    /// Each step let go of, with how it ended.
+    steps: Vec<(i64, Value)>,
     ended: Vec<String>,
     files: Vec<String>,
 }
@@ -20471,8 +20514,8 @@ fn release_unanswered(
         for (approval, id, name) in asked {
             let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
                 "reason":reason,"approvals":[]});
-            event(tx, &bot.name, Some(turn), "step_decided", data)?;
-            released.steps.push(approval);
+            event(tx, &bot.name, Some(turn), "step_decided", data.clone())?;
+            released.steps.push((approval, data));
         }
         released.requests += tx
             .prepare_cached("DELETE FROM approvals WHERE turn=? AND call_id=? AND step_of IS NULL")?

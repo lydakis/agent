@@ -1783,11 +1783,11 @@ facts, and its client does what was allowed, telling how it ended with
 is judged as before. A client judges a call whose parts amount to other tools
 this way, each part as its tool: Sonny's `automations` asks for an `if` as
 `shell` in the agent's sandbox, another agent as `send_message`, and an agent
-it starts as `start_task`. A step that waits on a verdict for a call a message
-lifted no longer outlives its turn: when the turn ends, interrupted or not, the
-step is denied (`step_decided`, `its turn ended`), its call's time runs again,
-and its client's `approve_step` is told; a call its client yielded is background
-work, whose steps wait on, listed under its handle. `list_agents` with
+it starts as `start_task`. A call a message lifted, or its
+client yielded, is background work: it waits on past its turn, interrupted or
+not, and so do its steps waiting on a verdict, listed under its handle until
+their gates or the person decide them (protocol 105; from 93 to 104 a lifted
+call's waiting steps were denied with its turn). `list_agents` with
 `approvals` names that handle.
 Protocol version 14 adds `configure`, which changes what a bot's client
 chose for it when it was made: its `instructions` (up to 64 KiB, as on
@@ -4138,9 +4138,12 @@ no deadline, and once the last step is decided it gets back what was left.
 A step lives only as long as the request waiting on it: asking for one
 already waiting is `step_waiting`; a client that closes its session takes
 its waiting steps with it (`step_decided` with `its client stopped
-waiting`), an answer to the call ends them (the waiting request gets
-`no_pending_step`), as does the turn's end (`stale_turn`), and a restart
-drops them all. Schema 63 adds the steps' and paused calls' columns. Protocol 24
+waiting`), an answer to the call ends them, and so does the turn's end for a
+call that ends with it: the waiting request is answered as a denial is,
+`decision` `deny` with the `reason` its `step_decided` gives (`the call was
+answered first`, `the call was stopped`, `its turn ended`) and no `denied`,
+since no gate refused it (protocol 105; before, `no_pending_step`), and a
+restart drops them all. Schema 63 adds the steps' and paused calls' columns. Protocol 24
 also adds `history_search`, the history tool's query for clients (see
 `history_nodes` above).
 

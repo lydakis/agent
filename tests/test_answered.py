@@ -616,7 +616,9 @@ class StepTests(ModelFixture):
         request = self.ask(client, turn)
         self.announced(client, turn)
         self.assertIn('result', self.answer(client, turn, output='gave up'))
-        self.assertEqual(self.reply(client, request)['error'], 'no_pending_step')
+        # Its `approve_step` is told how it ended, as a denial says it.
+        told = self.reply(client, request)['result']
+        self.assertEqual((told['decision'], told['reason']), ('deny', 'the call was answered first'))
         [ended] = self.events(client, turn, 'step_decided')
         self.assertEqual((ended['decision'], ended['reason']), ('deny', 'the call was answered first'))
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
