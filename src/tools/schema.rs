@@ -5,7 +5,8 @@
 //! `minProperties`/`maxProperties`, `minLength`/`maxLength` (in characters),
 //! `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`,
 //! `minItems`/`maxItems`, `items`, `prefixItems`, `allOf`, `anyOf`, `oneOf`
-//! and a local `$ref`. A keyword it does not know passes: it refuses only
+//! and a local `$ref` (followed only in a schema with no nested `$id`,
+//! since one changes what a reference inside it points at). A keyword it does not know passes: it refuses only
 //! what it can judge, so a schema it reads in part never refuses a call
 //! that fits the whole. `oneOf` is held only to "at least one", since a
 //! branch passed here may not pass in full. Its work is bounded
@@ -46,6 +47,7 @@ impl std::fmt::Display for Misfit {
 pub fn check(schema: &Value, value: &Value) -> Result<(), Misfit> {
     let mut checker = Checker {
         root: schema,
+        local: None,
         refs: 0,
         work: WORK,
     };
@@ -57,6 +59,9 @@ pub fn check(schema: &Value, value: &Value) -> Result<(), Misfit> {
 
 struct Checker<'a> {
     root: &'a Value,
+    /// Whether a `#` reference means the root: no schema below it
+    /// declares its own `$id`. Found at the first reference.
+    local: Option<bool>,
     refs: usize,
     /// Steps left before the check stops judging.
     work: usize,
@@ -95,7 +100,7 @@ impl<'a> Checker<'a> {
             // Only a reference into this schema is followed; another passes.
             if let Some(target) = reference
                 .strip_prefix('#')
-                .filter(|_| self.refs < MAX_REFS)
+                .filter(|_| self.refs < MAX_REFS && self.local())
                 .and_then(|pointer| self.root.pointer(pointer))
             {
                 self.refs += 1;
@@ -194,6 +199,38 @@ impl<'a> Checker<'a> {
     }
 
     /// One step of the check's work, if any is left.
+    /// Whether a `#` reference points into the root, found once: true
+    /// when no schema below the root declares `$id`. A nested `$id` makes
+    /// such a reference inside it mean that schema, so none is followed;
+    /// so too if the work runs out before the root is read.
+    fn local(&mut self) -> bool {
+        if let Some(local) = self.local {
+            return local;
+        }
+        let mut left: Vec<&Value> = match self.root {
+            Value::Object(root) => root.values().collect(),
+            _ => Vec::new(),
+        };
+        let mut local = true;
+        while let Some(next) = left.pop() {
+            if !self.spend() {
+                local = false;
+                break;
+            }
+            match next {
+                Value::Object(schema) if schema.get("$id").is_some_and(Value::is_string) => {
+                    local = false;
+                    break;
+                }
+                Value::Object(schema) => left.extend(schema.values()),
+                Value::Array(items) => left.extend(items),
+                _ => {}
+            }
+        }
+        self.local = Some(local);
+        local
+    }
+
     fn spend(&mut self) -> bool {
         self.spend_on(0)
     }
@@ -640,6 +677,16 @@ mod tests {
             deep = json!({"next": deep});
         }
         assert!(check(&looped, &deep).is_ok());
+        // Inside a schema with its own `$id`, `#` means that schema, so
+        // no `#` reference is followed.
+        let nested = json!({"$defs": {"item": {"type": "integer"}},
+            "properties": {
+                "top": {"$ref": "#/$defs/item"},
+                "inner": {"$id": "https://example.com/inner",
+                    "$defs": {"item": {"type": "string"}},
+                    "properties": {"x": {"$ref": "#/$defs/item"}}}}});
+        assert!(check(&nested, &json!({"inner": {"x": "s"}})).is_ok());
+        assert!(check(&nested, &json!({"top": "s"})).is_ok());
     }
 
     #[test]
