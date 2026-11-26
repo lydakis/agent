@@ -57,6 +57,11 @@ ALTER TABLE nodes ADD COLUMN packed INTEGER;
 ALTER TABLE bots ADD COLUMN packed_node INTEGER;
 """
 
+UP_115 = """
+CREATE TABLE stop_notes(node INTEGER PRIMARY KEY REFERENCES nodes(id));
+PRAGMA user_version=115;
+"""
+
 # What a configure kept for a turn's end carries, whole, as 113 kept it.
 KEPT = {"instructions": "New rules.", "declare": [{"name": "exec", "description": "Run it."}],
         "settings": {"speed": None}}
@@ -157,6 +162,10 @@ class StoreDownTest(unittest.TestCase):
             conn.execute("UPDATE nodes SET item=?,packed=? WHERE id=?",
                          (pack(bytes(self.item)), len(self.item), self.packed_node))
         conn.execute("PRAGMA user_version=114")
+        # 115 marks the note a stopped turn left: here, on Lead's head.
+        conn.executescript(UP_115)
+        self.stop_note = conn.execute("SELECT head FROM bots WHERE name='Lead'").fetchone()[0]
+        conn.execute("INSERT INTO stop_notes(node) VALUES (?)", (self.stop_note,))
         conn.commit()
         conn.close()
 
@@ -173,10 +182,18 @@ class StoreDownTest(unittest.TestCase):
             store_down.main([self.store, *args])
         return json.loads(out.getvalue())
 
+    def test_stop_notes_stay_in_history_unmarked(self):
+        node = self.read(f"SELECT item FROM nodes WHERE id={self.stop_note}")
+        self.assertEqual(self.down("114")["from"], 115)
+        self.assertEqual(self.read("PRAGMA user_version"), [(114,)])
+        self.assertEqual(self.read("SELECT name FROM sqlite_master WHERE name='stop_notes'"), [])
+        # The model reads the same history as before.
+        self.assertEqual(self.read(f"SELECT item FROM nodes WHERE id={self.stop_note}"), node)
+
     @unittest.skipUnless(packer(), "needs Python 3.14, or the zstandard module")
     def test_packed_messages_and_texts_come_back_whole(self):
         self.assertEqual(self.read(f"SELECT packed FROM nodes WHERE id={self.packed_node}"), [(len(self.item),)])
-        self.assertEqual(self.down("113")["from"], 114)
+        self.assertEqual(self.down("113")["from"], 115)
         self.assertEqual(self.read("PRAGMA user_version"), [(113,)])
         self.assertEqual(self.read(f"SELECT item FROM nodes WHERE id={self.packed_node}"), [(self.item,)])
         self.assertNotIn("packed", {row[1] for row in self.read("PRAGMA table_info(nodes)")})
@@ -199,23 +216,23 @@ class StoreDownTest(unittest.TestCase):
             store_down.unpacker = real
         self.assertIn("packed messages need Python 3.14", str(refused.exception))
         # Taken back as one transaction: the store is as it was.
-        self.assertEqual(self.read("PRAGMA user_version"), [(114,)])
+        self.assertEqual(self.read("PRAGMA user_version"), [(115,)])
 
     def test_prompts_lose_their_effort(self):
-        self.assertEqual(self.down("112")["from"], 114)
+        self.assertEqual(self.down("112")["from"], 115)
         self.assertEqual(self.read("PRAGMA user_version"), [(112,)])
         self.assertNotIn("effort", {row[1] for row in self.read("PRAGMA table_info(nodes)")})
         self.assertEqual(self.read(f"SELECT count(*) FROM nodes WHERE id={self.switched}"), [(1,)])
 
     def test_turns_lose_their_count_of_cut_offs(self):
-        self.assertEqual(self.down("111")["from"], 114)
+        self.assertEqual(self.down("111")["from"], 115)
         self.assertEqual(self.read("PRAGMA user_version"), [(111,)])
         columns = {row[1] for row in self.read("PRAGMA table_info(turns)")}
         self.assertFalse({"restarts", "restart_head"} & columns)
         self.assertEqual(self.read(f"SELECT count(*) FROM turns WHERE id={self.turn}"), [(1,)])
 
     def test_a_switched_agent_stays_where_it_is_and_each_turn_has_one_node(self):
-        self.assertEqual(self.down("110")["from"], 114)
+        self.assertEqual(self.down("110")["from"], 115)
         self.assertEqual(self.read("PRAGMA user_version"), [(110,)])
         self.assertEqual(self.read(f"SELECT id FROM nodes WHERE turn={self.turn}"), [(self.switched,)])
         self.assertEqual(self.read(f"SELECT turn FROM nodes WHERE id={self.original}"), [(None,)])
@@ -226,7 +243,7 @@ class StoreDownTest(unittest.TestCase):
                          [(1,)])
 
     def test_back_to_0_10_1_s_shape(self):
-        self.assertEqual(self.down("106")["from"], 114)
+        self.assertEqual(self.down("106")["from"], 115)
         self.assertEqual(self.read("PRAGMA user_version"), [(106,)])
         columns = {row[1] for row in self.read("PRAGMA table_info(bots)")}
         self.assertTrue({"instructions", "compaction_instructions"} <= columns)
@@ -244,7 +261,7 @@ class StoreDownTest(unittest.TestCase):
         # Every bot names a list the store keeps.
         self.assertEqual(self.read("SELECT count(*) FROM bots WHERE declared IS NOT NULL"
                                    " AND declared NOT IN (SELECT digest FROM tool_lists)"), [(0,)])
-        self.assertEqual(len(glob.glob(self.store + ".schema-114.*.backup")), 1)
+        self.assertEqual(len(glob.glob(self.store + ".schema-115.*.backup")), 1)
 
     def test_to_0_10_2_only_the_settings_it_refuses_go(self):
         lists = self.read("SELECT * FROM tool_lists")
@@ -282,14 +299,14 @@ class StoreDownTest(unittest.TestCase):
                     self.down("111")
                 finally:
                     store_down.back_up = vacuum
-                [copy] = glob.glob(self.store + ".schema-114.*.backup")
+                [copy] = glob.glob(self.store + ".schema-115.*.backup")
                 self.assertEqual(stat.S_IMODE(os.stat(copy).st_mode), mode)
                 # Already the store's before the copy is written.
                 self.assertEqual(made, [mode])
                 self.assertEqual(stat.S_IMODE(os.stat(self.store + ".owner-lock").st_mode), 0o600)
                 with sqlite3.connect(copy) as conn:
-                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone(), (114,))
-                # The next pass starts from 114 again.
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone(), (115,))
+                # The next pass starts from 115 again.
                 Path(self.store).write_bytes(Path(copy).read_bytes())
 
     def test_a_copy_that_fails_is_removed(self):
@@ -309,7 +326,7 @@ class StoreDownTest(unittest.TestCase):
         finally:
             store_down.back_up = back_up
         self.assertEqual(glob.glob(self.store + ".*.backup"), [])
-        self.assertEqual(self.read("PRAGMA user_version"), [(114,)])
+        self.assertEqual(self.read("PRAGMA user_version"), [(115,)])
 
     def test_help_says_how_to_use_it(self):
         out = io.StringIO()
@@ -328,13 +345,13 @@ class StoreDownTest(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX)
             with self.assertRaisesRegex(SystemExit, "a daemon holds this store"):
                 self.down("106")
-        for to in ("105", "115"):
-            with self.assertRaisesRegex(SystemExit, "goes back to 106 through 114"):
+        for to in ("105", "116"):
+            with self.assertRaisesRegex(SystemExit, "goes back to 106 through 115"):
                 self.down(to)
         os.link(self.store, self.store + ".alias")
         with self.assertRaisesRegex(SystemExit, "another hard link"):
             self.down("106")
-        self.assertEqual(self.read("PRAGMA user_version"), [(114,)])
+        self.assertEqual(self.read("PRAGMA user_version"), [(115,)])
 
 
 if __name__ == "__main__":
