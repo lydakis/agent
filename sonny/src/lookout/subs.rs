@@ -1059,15 +1059,35 @@ pub fn ensure(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> 
     Ok(true)
 }
 
-/// Put `sub` in the subscriber's file, in place of one by its name whose
-/// rules differ, or added when there is none: whether the file changed.
-/// What Sonny sets as an agent's part in work changes, as taking work
-/// changes why its thread reaches the agent.
+/// Whether Sonny made `sub` and its agent has left it as it is: it says
+/// why it reaches the agent (`about`) or lasts while the agent is closed,
+/// which only Sonny writes. A `follows` add sets neither, and an agent
+/// changes a follow only by removing it and adding its own.
+pub fn sonnys(sub: &Sub) -> bool {
+    sub.about.is_some() || sub.outlives_close
+}
+
+/// Put Sonny's `sub` in the subscriber's file, added when it has none by
+/// that name, in place of one Sonny made ([`sonnys`]) whose rules differ,
+/// and never in place of one its agent made or changed, which stays as it
+/// is: whether the file changed. What Sonny sets as an agent's part in
+/// work changes, as taking work changes why its thread reaches the agent;
+/// what the agent set for itself wins.
 pub fn put(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> {
     let _held = held(store)?;
     let mut subs = read_whole(store, subscriber)?;
+    // One made for another bot of the name gives way to this bot's own.
+    let theirs = |s: &Sub| {
+        s.name == sub.name && s.owner.is_some() && sub.owner.is_some() && s.owner != sub.owner
+    };
+    let before = subs.len();
+    subs.retain(|s| !theirs(s));
     match subs.iter_mut().find(|s| s.name == sub.name) {
-        Some(had) if *had == sub => return Ok(false),
+        Some(had) if *had == sub || !sonnys(had) => {
+            if subs.len() == before {
+                return Ok(false);
+            }
+        }
         Some(had) => *had = sub,
         None => subs.insert(0, sub),
     }

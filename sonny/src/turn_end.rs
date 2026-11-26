@@ -1,10 +1,10 @@
 //! The check at a turn's end, in the tool host: no lease, no timer. An
 //! agent whose turn completed while it holds work it wrote nothing about
-//! that turn is told once for that take; one of a board's task holding
-//! nothing, while work it may take is open there, is told once what is
-//! open, and again only when more opens. Never on a turn interrupted,
-//! failed or paused, on a closed agent, or while it waits on the person's
-//! answer to an ask. A turn that opened work on a board, however it
+//! that turn is told once for that take, by a `holding` event of the
+//! commons addressed to it (`commons::address`). Never on a turn
+//! interrupted, failed or paused, on a closed agent, or while it waits on
+//! the person's answer to an ask. Work it could take is the board's
+//! `opened` news, not this check's. A turn that opened work on a board, however it
 //! ended, sends one round of invites for each board at its end, listing
 //! the work it opened there. Each thread is read once and again only once its
 //! file changes, whichever host wrote it: a turn's end costs a look at
@@ -30,21 +30,17 @@ pub struct Ends {
     wrote: HashMap<(String, i64), HashSet<String>>,
     /// The work each agent was told it still holds, for that take.
     held: HashSet<(String, String)>,
-    /// The open work each agent was told of.
-    open: HashMap<String, HashSet<String>>,
     /// The work each agent's turn opened, by board then thread, in order.
     opened: HashMap<(String, i64), Vec<(String, String)>>,
 }
 
 /// What a completed turn's end may tell its agent, before the daemon
-/// says it is open and as what profile.
+/// says it is open.
 #[derive(Debug, Default, PartialEq)]
 pub struct Found {
-    /// The work it still holds and wrote nothing about: thread, title.
-    pub holding: Vec<(String, String)>,
-    /// Holding nothing, the open work of its boards it may take, each
-    /// with whom it is for.
-    pub open: Vec<(String, String, Value)>,
+    /// The work it still holds and wrote nothing about: thread, title,
+    /// board.
+    pub holding: Vec<(String, String, String)>,
 }
 
 fn ends() -> &'static Mutex<Ends> {
@@ -137,16 +133,8 @@ impl Ends {
     }
 
     /// `bot`, known as `id`, ended its turn `turn`, completed or not: what
-    /// its end may tell it, with `boards` the boards it works from, none
-    /// for a lead, from the commons as last looked at.
-    pub fn ended(
-        &mut self,
-        bot: &str,
-        id: Option<i64>,
-        turn: i64,
-        completed: bool,
-        boards: &[String],
-    ) -> Found {
+    /// its end may tell it, from the commons as last looked at.
+    pub fn ended(&mut self, bot: &str, id: Option<i64>, turn: i64, completed: bool) -> Found {
         let wrote = self
             .wrote
             .remove(&(bot.to_owned(), turn))
@@ -165,95 +153,69 @@ impl Ends {
                 && work["holder"] == bot
                 && (id.zip(work["holder_id"].as_i64())).is_none_or(|(id, of)| id == of)
         };
-        let mut holding: Vec<(String, String)> = (work.iter())
+        let mut holding: Vec<(String, String, String)> = (work.iter())
             .filter(|(_, thread)| mine(thread))
-            .map(|(name, thread)| ((*name).clone(), title(thread)))
+            .map(|(name, thread)| {
+                let board = thread["work"]["board"].as_str().unwrap_or_default();
+                ((*name).clone(), title(thread), board.to_owned())
+            })
             .collect();
         holding.sort();
-        let holds = !holding.is_empty();
-        let done: HashSet<&str> = (work.iter())
-            .filter(|(_, thread)| thread["work"]["state"] == "done")
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let mut open: Vec<(String, String, Value)> = match holds {
-            true => Vec::new(),
-            false => (work.iter())
-                .filter(|(_, thread)| {
-                    let work = &thread["work"];
-                    work["state"] == "open"
-                        && (work["board"].as_str()).is_some_and(|b| boards.iter().any(|o| o == b))
-                        && !crate::board::waiting(work, &|need| done.contains(need))
-                })
-                .map(|(name, thread)| {
-                    let named = (*name).clone();
-                    (named, title(thread), thread["work"]["for"].clone())
-                })
-                .collect(),
-        };
-        open.sort_by(|a, b| a.0.cmp(&b.0));
         // What it was told stays told only while it lasts: a take let go,
         // or work that closed and opened again, is news once more.
-        let still: HashSet<&String> = holding.iter().map(|(name, _)| name).collect();
+        let still: HashSet<&String> = holding.iter().map(|(name, _, _)| name).collect();
         self.held
             .retain(|(one, thread)| one != bot || still.contains(thread));
         let held = &self.held;
-        holding.retain(|(thread, _)| {
+        holding.retain(|(thread, _, _)| {
             !wrote.contains(thread) && !held.contains(&(bot.to_owned(), thread.clone()))
         });
-        Found { holding, open }
+        Found { holding }
     }
 
-    /// What `bot` would be told of `found`, its open work narrowed to
-    /// what is for it as `profile`: none when nothing is new.
-    pub fn note(&self, bot: &str, profile: Option<&str>, found: &Found) -> Option<String> {
-        let open = for_it(bot, profile, found);
-        let known = self.open.get(bot);
-        let new =
-            (open.iter()).any(|(thread, _)| known.is_none_or(|known| !known.contains(thread)));
-        let mut lines = Vec::new();
-        for (thread, title) in &found.holding {
-            lines.push(format!(
-                "[You still hold the work {thread}, \"{title}\": done, fail or drop it, or reply \
-                 there with what you're waiting on and what will wake you.]"
-            ));
+    /// The `holding` news for `bot`, known as `id`, of each work `found`
+    /// says it still holds, at the end of its turn `turn`; and each noted
+    /// told, so a take is told once.
+    pub fn told(
+        &mut self,
+        bot: &str,
+        id: Option<i64>,
+        turn: i64,
+        found: &Found,
+    ) -> Vec<crate::commons::Addressed> {
+        let mut news = Vec::new();
+        for (thread, title, board) in &found.holding {
+            self.held.insert((bot.to_owned(), thread.clone()));
+            news.push(holding(bot, id, turn, thread, title, board));
         }
-        if new {
-            let named: Vec<String> = (open.iter())
-                .map(|(thread, title)| format!("{thread}, \"{title}\""))
-                .collect();
-            lines.push(format!(
-                "[You hold no work, and work you may take is open: {}. Reply in one with do take \
-                 to hold it. You're told again only when more opens.]",
-                named.join("; ")
-            ));
-        }
-        (!lines.is_empty()).then(|| lines.join("\n"))
-    }
-
-    /// What `bot` is told of `found`, as [`Ends::note`] says it, and noted
-    /// told.
-    pub fn told(&mut self, bot: &str, profile: Option<&str>, found: Found) -> Option<String> {
-        let note = self.note(bot, profile, &found);
-        let open: HashSet<String> = (for_it(bot, profile, &found).into_iter())
-            .map(|(thread, _)| thread)
-            .collect();
-        match open.is_empty() {
-            true => _ = self.open.remove(bot),
-            false => _ = self.open.insert(bot.to_owned(), open),
-        }
-        for (thread, _) in found.holding {
-            self.held.insert((bot.to_owned(), thread));
-        }
-        note
+        news
     }
 }
 
-/// The open work of `found` that is for `bot` as `profile`: thread, title.
-fn for_it(bot: &str, profile: Option<&str>, found: &Found) -> Vec<(String, String)> {
-    (found.open.iter())
-        .filter(|(_, _, named)| crate::board::is_for(&json!({"for": named}), bot, profile))
-        .map(|(thread, title, _)| (thread.clone(), title.clone()))
-        .collect()
+/// The `holding` event that tells `bot`, known as `id`, at the end of its
+/// turn `turn`, that it still holds `thread`'s work, `title`, on `board`.
+fn holding(
+    bot: &str,
+    id: Option<i64>,
+    turn: i64,
+    thread: &str,
+    title: &str,
+    board: &str,
+) -> crate::commons::Addressed {
+    crate::commons::Addressed {
+        event: "holding",
+        id: format!("{thread}/holding/{}/{turn}", crate::commons::whom(bot, id)),
+        to: bot.to_owned(),
+        to_id: id,
+        from: None,
+        thread: thread.to_owned(),
+        board: (!board.is_empty()).then(|| board.to_owned()),
+        text: format!(
+            "{bot} still holds the work {thread}, \"{title}\", and wrote nothing there this \
+             turn: done, fail or drop it, or reply there with what you're waiting on and what \
+             will wake you."
+        ),
+    }
 }
 
 fn title(thread: &Value) -> String {
@@ -360,26 +322,11 @@ pub fn wrote(home: &Path, bot: &str, turn: Option<i64>, thread: &str, opened: Op
     ends().lock().unwrap().refreshed(thread, read);
 }
 
-/// The boards `bot` works from: those it follows, none for a lead.
-fn boards(store: &Path, bot: &str) -> Vec<String> {
-    if crate::project::is_lead(bot) {
-        return Vec::new();
-    }
-    (crate::lookout::subs::read(store, bot).into_iter())
-        .filter(|sub| sub.name.starts_with("board."))
-        .filter_map(|sub| sub.filter)
-        .flat_map(|filter| {
-            (filter["board"].as_array().into_iter().flatten())
-                .filter_map(|b| b.as_str().map(str::to_owned))
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
 /// The turn `turn` of `bot`, known as `id`, ended as `status`: a completed
-/// one may tell it what it holds or what is open, once the daemon says it
-/// is open and, read from its history, it waits on no answer of the
-/// person's.
+/// one may tell it what it holds, once the daemon says it is open and,
+/// read from its history, it waits on no answer of the person's: a
+/// `holding` event of the commons for each work, which its `to-me`
+/// follow hears.
 pub fn finished(
     daemon: (std::path::PathBuf, std::path::PathBuf),
     bot: String,
@@ -406,28 +353,16 @@ pub fn finished(
         });
     }
     tokio::spawn(async move {
-        let named = bot.clone();
+        let (named, looked) = (bot.clone(), home.clone());
         let found = tokio::task::spawn_blocking(move || {
-            let boards = match completed {
-                true => {
-                    scan(&home);
-                    boards(&store, &named)
-                }
-                false => Vec::new(),
-            };
-            ends()
-                .lock()
-                .unwrap()
-                .ended(&named, id, turn, completed, &boards)
+            if completed {
+                scan(&looked);
+            }
+            ends().lock().unwrap().ended(&named, id, turn, completed)
         })
         .await;
         let Ok(found) = found else { return };
-        if found.holding.is_empty() && found.open.is_empty() {
-            // Nothing open now: what it was told of is forgotten, so work
-            // that closes and opens again is news once more.
-            if completed {
-                ends().lock().unwrap().told(&bot, None, found);
-            }
+        if found.holding.is_empty() {
             return;
         }
         let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
@@ -436,29 +371,27 @@ pub fn finished(
         let listed = client
             .request("bots", json!({"name": bot, "open": true, "limit": 1}))
             .await;
-        let Some(record) = (listed.ok())
+        let open = (listed.ok())
             .and_then(|page| page["bots"].as_array()?.first().cloned())
-            .filter(|record| id.is_none_or(|id| record["bot_id"].as_i64() == Some(id)))
-        else {
-            return;
-        };
-        let profile = record["profile"].as_str();
-        // Only what would be said is held for an answer: its history is
-        // read then, and one it cannot read holds it too.
-        let news = ends().lock().unwrap().note(&bot, profile, &found).is_some();
-        if news
-            && crate::asks::waits(&client, &bot, now())
+            .is_some_and(|record| id.is_none_or(|id| record["bot_id"].as_i64() == Some(id)));
+        // Its history is read only when there is news, and one it cannot
+        // read waits too.
+        if !open
+            || crate::asks::waits(&client, &bot, now())
                 .await
                 .unwrap_or(true)
         {
             return;
         }
-        let Some(note) = ends().lock().unwrap().told(&bot, profile, found) else {
-            return;
-        };
-        let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
-            "origin": crate::commons::ORIGIN, "request_id": crate::commons::request_id(&format!("commons.turn_end.{bot}.{turn}"))});
-        let _ = client.request("submit", submit).await;
+        let news = ends().lock().unwrap().told(&bot, id, turn, &found);
+        let (at, kept) = (home.clone(), store.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            for one in &news {
+                crate::commons::address(&at, &kept, one);
+            }
+        })
+        .await;
+        crate::commons::poke_waiting(&store);
     });
 }
 
@@ -619,48 +552,59 @@ mod tests {
         id: Option<i64>,
         turn: i64,
         completed: bool,
-        boards: &[String],
     ) -> Found {
         let dir = crate::commons::dir(home);
         let here = listing(&dir).unwrap();
         let read = reread(&dir, ends.stale(&here));
         ends.scanned(&here, read);
-        ends.ended(bot, id, turn, completed, boards)
+        ends.ended(bot, id, turn, completed)
     }
 
     #[test]
     fn a_holder_that_wrote_nothing_is_told_once_for_that_take() {
         let home = home("holding");
         let mut ends = Ends::default();
-        let boards = ["shop/errors".to_owned()];
         send(&home, &mut ends, "shop.lead", 1, work("store", json!({})));
         send(&home, &mut ends, "shop.w.1", 1, act("store", "take"));
         // The turn that took it wrote there: nothing to say.
-        let found = end(&mut ends, &home, "shop.w.1", None, 1, true, &boards);
-        assert!(
-            found.holding.is_empty() && found.open.is_empty(),
-            "{found:?}"
+        let found = end(&mut ends, &home, "shop.w.1", None, 1, true);
+        assert!(found.holding.is_empty(), "{found:?}");
+        assert!(ends.told("shop.w.1", None, 1, &found).is_empty());
+        // A later turn that says nothing there is told, once: a `holding`
+        // event of the commons addressed to it, on the work's thread.
+        let found = end(&mut ends, &home, "shop.w.1", Some(4), 2, true);
+        let held = (
+            "store".to_owned(),
+            "Do store".to_owned(),
+            "shop/errors".to_owned(),
         );
-        assert_eq!(ends.told("shop.w.1", None, found), None);
-        // A later turn that says nothing there is told, once.
-        let found = end(&mut ends, &home, "shop.w.1", None, 2, true, &boards);
-        assert_eq!(found.holding, [("store".to_owned(), "Do store".to_owned())]);
-        let note = ends.told("shop.w.1", None, found).unwrap();
+        assert_eq!(found.holding, [held]);
+        let news = ends.told("shop.w.1", Some(4), 2, &found);
+        assert_eq!(news.len(), 1);
+        let line = news[0].line();
+        assert_eq!(line["event"], "holding");
+        assert_eq!(line["to"], "shop.w.1");
+        assert_eq!(line["thread"], "store");
+        assert_eq!(line["board"], "shop/errors");
+        assert_eq!(line["id"], "store/holding/shop.w.1/4/2");
+        assert_eq!(line["to_id"], 4);
+        assert!(line.get("from").is_none(), "{line}");
+        let text = line["text"].as_str().unwrap();
         assert!(
-            note.contains("You still hold the work store, \"Do store\""),
-            "{note}"
+            text.starts_with("shop.w.1 still holds the work store, \"Do store\""),
+            "{text}"
         );
-        let found = end(&mut ends, &home, "shop.w.1", None, 3, true, &boards);
-        assert_eq!(ends.told("shop.w.1", None, found), None);
+        let found = end(&mut ends, &home, "shop.w.1", Some(4), 3, true);
+        assert!(ends.told("shop.w.1", Some(4), 3, &found).is_empty());
         // Interrupted, failed or paused, a turn's end says nothing.
         send(&home, &mut ends, "shop.w.1", 4, act("store", "drop"));
         send(&home, &mut ends, "shop.w.1", 5, act("store", "take"));
         assert_eq!(
-            end(&mut ends, &home, "shop.w.1", None, 6, false, &boards),
+            end(&mut ends, &home, "shop.w.1", None, 6, false),
             Found::default()
         );
         // A new take is news again.
-        let found = end(&mut ends, &home, "shop.w.1", None, 7, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", None, 7, true);
         assert_eq!(found.holding.len(), 1, "{found:?}");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -671,7 +615,6 @@ mod tests {
     fn a_take_over_by_another_of_the_holders_name_is_news() {
         let home = home("same-name");
         let mut ends = Ends::default();
-        let boards = ["shop/errors".to_owned()];
         send(&home, &mut ends, "shop.lead", 1, work("store", json!({})));
         let take = |id: i64, ends: &mut Ends| {
             let caller = Caller {
@@ -700,62 +643,12 @@ mod tests {
             );
         };
         take(2, &mut ends);
-        let found = end(&mut ends, &home, "shop.w.1", Some(2), 2, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", Some(2), 2, true);
         assert_eq!(found.holding.len(), 1, "{found:?}");
-        assert!(ends.told("shop.w.1", None, found).is_some());
+        assert_eq!(ends.told("shop.w.1", Some(2), 2, &found).len(), 1);
         take(9, &mut ends);
-        let found = end(&mut ends, &home, "shop.w.1", Some(9), 1, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", Some(9), 1, true);
         assert_eq!(found.holding.len(), 1, "{found:?}");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn one_holding_nothing_hears_what_is_open_for_it_until_more_opens() {
-        let home = home("open");
-        let mut ends = Ends::default();
-        let boards = ["shop/errors".to_owned()];
-        send(&home, &mut ends, "shop.lead", 1, work("store", json!({})));
-        send(
-            &home,
-            &mut ends,
-            "shop.lead",
-            1,
-            work("api", json!({"needs": ["store"]})),
-        );
-        send(
-            &home,
-            &mut ends,
-            "shop.lead",
-            1,
-            work("docs", json!({"for": ["profile:docs"]})),
-        );
-        // Waiting work and work kept for others are not its to take.
-        let found = end(&mut ends, &home, "shop.w.1", None, 1, true, &boards);
-        let note = ends.told("shop.w.1", Some("worker"), found).unwrap();
-        assert!(note.contains("store, \"Do store\""), "{note}");
-        assert!(!note.contains("api") && !note.contains("docs"), "{note}");
-        // Choosing not to take it is not nagged.
-        let found = end(&mut ends, &home, "shop.w.1", None, 2, true, &boards);
-        assert_eq!(ends.told("shop.w.1", Some("worker"), found), None);
-        // More work opening is news.
-        send(&home, &mut ends, "shop.lead", 2, work("cli", json!({})));
-        let found = end(&mut ends, &home, "shop.w.1", None, 3, true, &boards);
-        let note = ends.told("shop.w.1", Some("worker"), found).unwrap();
-        assert!(note.contains("cli") && note.contains("store"), "{note}");
-        // A board it doesn't work from, or a lead's, tells nothing.
-        let found = end(&mut ends, &home, "shop.w.2", None, 1, true, &[]);
-        assert_eq!(found, Found::default());
-        // Work others took leaves nothing open, which is told of as
-        // nothing, as a turn's end does: once let go, it is news again.
-        for thread in ["store", "cli"] {
-            send(&home, &mut ends, "shop.w.3", 1, act(thread, "take"));
-        }
-        let found = end(&mut ends, &home, "shop.w.1", None, 4, true, &boards);
-        assert_eq!(ends.told("shop.w.1", Some("worker"), found), None);
-        send(&home, &mut ends, "shop.w.3", 2, act("store", "drop"));
-        let found = end(&mut ends, &home, "shop.w.1", None, 5, true, &boards);
-        let note = ends.told("shop.w.1", Some("worker"), found).unwrap();
-        assert!(note.contains("store"), "{note}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -818,8 +711,7 @@ mod tests {
     fn work_another_host_changed_is_read_at_the_next_turn_s_end() {
         let home = home("other-host");
         let mut ends = Ends::default();
-        let boards = ["shop/errors".to_owned()];
-        let found = end(&mut ends, &home, "shop.w.1", None, 1, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", None, 1, true);
         assert_eq!(found, Found::default());
         // Written with no word to this host.
         let mut elsewhere = Ends::default();
@@ -830,27 +722,29 @@ mod tests {
             1,
             work("store", json!({})),
         );
-        let found = end(&mut ends, &home, "shop.w.1", None, 2, true, &boards);
-        assert_eq!(found.open.len(), 1, "{found:?}");
+        // Work it could take is the board's `opened` news, not this
+        // check's.
+        let found = end(&mut ends, &home, "shop.w.1", None, 2, true);
+        assert_eq!(found, Found::default());
         send(&home, &mut elsewhere, "shop.w.1", 2, act("store", "take"));
-        let found = end(&mut ends, &home, "shop.w.1", None, 3, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", None, 3, true);
         assert_eq!(found.holding.len(), 1, "{found:?}");
-        assert!(ends.told("shop.w.1", None, found).is_some());
+        assert_eq!(ends.told("shop.w.1", None, 3, &found).len(), 1);
         // Let go there and taken again, even unseen between, it is news
         // once more.
         send(&home, &mut elsewhere, "shop.w.1", 3, act("store", "drop"));
         send(&home, &mut elsewhere, "shop.w.1", 4, act("store", "take"));
-        let found = end(&mut ends, &home, "shop.w.1", None, 5, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", None, 5, true);
         assert_eq!(found.holding.len(), 1, "{found:?}");
-        assert!(ends.told("shop.w.1", None, found).is_some());
+        assert_eq!(ends.told("shop.w.1", None, 5, &found).len(), 1);
         // A reply there is the same take, told of already.
         let reply = json!({"reply": {"thread": "store", "text": "on it"}});
         send(&home, &mut elsewhere, "shop.w.1", 5, reply);
-        let found = end(&mut ends, &home, "shop.w.1", None, 6, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", None, 6, true);
         assert!(found.holding.is_empty(), "{found:?}");
         // A thread gone is forgotten.
         std::fs::remove_file(crate::commons::dir(&home).join("store.jsonl")).unwrap();
-        let found = end(&mut ends, &home, "shop.w.1", None, 7, true, &boards);
+        let found = end(&mut ends, &home, "shop.w.1", None, 7, true);
         assert_eq!(found, Found::default());
         assert!(ends.threads.is_empty());
         let _ = std::fs::remove_dir_all(&home);
@@ -861,15 +755,16 @@ mod tests {
     fn a_thread_that_will_not_read_is_left_as_it_was() {
         let home = home("half");
         let mut ends = Ends::default();
-        let boards = ["shop/errors".to_owned()];
         send(&home, &mut ends, "shop.lead", 1, work("store", json!({})));
-        let found = end(&mut ends, &home, "shop.w.1", None, 1, true, &boards);
-        assert_eq!(found.open.len(), 1, "{found:?}");
+        let mut elsewhere = Ends::default();
+        send(&home, &mut elsewhere, "shop.w.1", 1, act("store", "take"));
+        let found = end(&mut ends, &home, "shop.w.1", None, 1, true);
+        assert_eq!(found.holding.len(), 1, "{found:?}");
         let path = crate::commons::dir(&home).join("store.jsonl");
         let whole = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, format!("{whole}{{\"by\":")).unwrap();
-        let found = end(&mut ends, &home, "shop.w.1", None, 2, true, &boards);
-        assert_eq!(found.open.len(), 1, "{found:?}");
+        let found = end(&mut ends, &home, "shop.w.1", None, 2, true);
+        assert_eq!(found.holding.len(), 1, "{found:?}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

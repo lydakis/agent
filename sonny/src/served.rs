@@ -1081,9 +1081,8 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                             if !kept.is_empty() {
                                 let id = made["bot_id"].as_i64();
                                 crate::commons::ask_started(
-                                    &client, &home, &store, &kept, &whole, id, &caller,
-                                )
-                                .await;
+                                    &home, &store, &kept, &whole, id, &caller,
+                                );
                             }
                         }
                         said.push(started)
@@ -1323,8 +1322,8 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = invocation.daemon()
             {
-                // A thread on a board is followed for why the agent is
-                // there, and work opened or taken follows its board.
+                // Work's thread is followed for why the agent is there,
+                // and work opened or taken follows its board.
                 let on_board = (crate::board::on())
                     .then(|| crate::board::follows(&store, &caller, caller_id, arguments, &said))
                     .flatten();
@@ -1343,11 +1342,12 @@ async fn called(invocation: &Invocation, name: &str, arguments: &Value) -> Answe
                     said["asked"] =
                         json!(crate::commons::ask_for(&home, &store, &ask_for, &caller).await);
                 }
-                // Each live agent a post names as @NAME hears it once.
+                // Each agent a post names as @NAME, open or closed, hears it once.
                 let mentioned = crate::board::mentioned(arguments, &caller);
                 if !mentioned.is_empty() {
-                    said["mentioned"] =
-                        json!(crate::commons::mention(&home, &said, &caller, &mentioned).await);
+                    said["mentioned"] = json!(
+                        crate::commons::mention(&home, &store, &said, &caller, &mentioned).await
+                    );
                 }
             }
             // A new thread's `invite` goes back to the tool host, which
@@ -1592,6 +1592,11 @@ impl Server {
         let (nudge, serving) = (Arc::new(Notify::new()), Arc::new(Mutex::new(held)));
         // The workflows that were running when the last host stopped.
         crate::workflow::resume(store.clone(), socket.clone());
+        // News addressed while no host ran, still waiting, and all that
+        // comes to wait while it runs.
+        if let Some(home) = std::env::var_os("HOME") {
+            tokio::spawn(crate::commons::send_waiting(home.into(), store.clone()));
+        }
         tokio::spawn(serve(
             store.clone(),
             socket.clone(),
@@ -1646,7 +1651,7 @@ impl Server {
             Some("turn_finished") => {
                 if let Some(turn) = event["turn"].as_i64() {
                     self.serving.lock().unwrap().finish(turn);
-                    // Its end may tell the agent what it holds or what's open.
+                    // Its end may tell the agent what it still holds.
                     if let Some(bot) = event["bot"].as_str()
                         && tokio::runtime::Handle::try_current().is_ok()
                     {
@@ -3042,7 +3047,7 @@ async fn answer(
             if name == COMMONS {
                 output = invites_after(output, &invocation);
             }
-            noted(name, bot, turn, &arguments, &output).await;
+            noted(name, bot, turn, &arguments, &output, store).await;
             Ok(output)
         }
         Some(said) if said["error"]["code"].is_string() => Err((
@@ -3082,8 +3087,14 @@ fn invites_after(output: String, invocation: &Invocation) -> String {
 /// What the host keeps between turns of a call it answered: the call runs
 /// in a process of its own, so what a turn's end reads is noted here, in
 /// the host, from the call and its answer: a commons post or reply wrote
-/// in its thread.
-async fn noted(name: &str, bot: &str, turn: i64, arguments: &Value, output: &str) {
+/// in its thread. News a commons call or a start addressed to an agent
+/// whose follow the lookout had not taken yet is moved on from here,
+/// where it outlives the call: the host's `commons::send_waiting` is
+/// poked.
+async fn noted(name: &str, bot: &str, turn: i64, arguments: &Value, output: &str, store: &Path) {
+    if name == COMMONS || name == START {
+        crate::commons::poke_waiting(store);
+    }
     if name == COMMONS && (arguments["post"].is_object() || arguments["reply"].is_object()) {
         let said: Value = serde_json::from_str(output).unwrap_or_default();
         if let (Some(thread), Some(home)) = (said["thread"].as_str(), std::env::var_os("HOME"))

@@ -572,7 +572,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             // The board's work reaches it as it moves.
             if let Some(board) = &start.board {
                 let follow = crate::board::works_from(board, Some(id));
-                let _ = crate::lookout::subs::put(store, name, follow);
+                let _ = crate::lookout::subs::ensure(store, name, follow);
             }
         }
     }
