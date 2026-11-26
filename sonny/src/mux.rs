@@ -2664,7 +2664,7 @@ mod tests {
         assert!(windows(&file).is_empty());
         // One note waits for the disk: uses meanwhile ride on it rather
         // than each sending another after it.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::thread::sleep(Duration::from_millis(50));
         assert!(noted.coming.load(std::sync::atomic::Ordering::SeqCst));
         drop(holding);
         let deadline = Instant::now() + Duration::from_secs(10);
