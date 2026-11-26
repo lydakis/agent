@@ -7,7 +7,7 @@
 //! that does not parse or bind, or that removes a provider agents still
 //! name or binds it to another API family, is refused whole and the old
 //! set stays. Nothing runs between
-//! changes: the file is watched by the kernel (`file_watch`).
+//! changes: the file is watched by the kernel (`agent_client::watch::file`).
 use super::{Binder, ProviderSpec};
 use agent_runtime::{
     Error, Result,

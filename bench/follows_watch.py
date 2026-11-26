@@ -25,7 +25,32 @@ import os
 import time
 from pathlib import Path
 
+import subprocess
+
+from bench import lookout_scale
 from bench.lookout_scale import Bench, Sampler
+
+
+def cpu_seconds(pid):
+    """A process's CPU seconds: from /proc on Linux, from `ps` on macOS."""
+    if Path('/proc').is_dir():
+        return proc_cpu_seconds(pid)
+    try:
+        text = subprocess.run(['ps', '-o', 'time=', '-p', str(pid)], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return 0.0
+    # [[dd-]hh:]mm:ss.ss
+    days, _, clock = text.rpartition('-')
+    seconds = 0.0
+    for part in clock.split(':'):
+        seconds = seconds * 60 + float(part)
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+proc_cpu_seconds = lookout_scale.cpu_seconds
+# The samplers count CPU this way on either system.
+lookout_scale.cpu_seconds = cpu_seconds
 
 
 class Follows(Bench):
@@ -66,7 +91,6 @@ class Follows(Bench):
     def start(self):
         log = open(self.out / 'lookout.out', 'w')
         started = time.monotonic()
-        import subprocess
         self.lookout = subprocess.Popen(
             [str(self.sonny), 'lookout', '--store', str(self.store), '--socket', str(self.socket)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=self.env, start_new_session=True)
@@ -77,7 +101,6 @@ class Follows(Bench):
             time.sleep(.2)
         seated_s = time.monotonic() - started
         # Settled once its CPU does: a replay or a first read keeps it busy.
-        from bench.lookout_scale import cpu_seconds
         last = cpu_seconds(self.lookout.pid)
         while time.monotonic() - started < 900:
             time.sleep(1)
@@ -150,6 +173,11 @@ class Follows(Bench):
 def memory(pid):
     """The lookout's own memory (anonymous) and the binary's pages it
     has in (file), which depend on which binary file was written last."""
+    if not Path('/proc').is_dir():
+        # macOS tells resident size whole.
+        rss = subprocess.run(['ps', '-o', 'rss=', '-p', str(pid)], capture_output=True,
+                             text=True).stdout.strip()
+        return {'rss_mib': round(int(rss or 0) / 1024, 1)}
     status = Path(f'/proc/{pid}/status').read_text()
     kib = {line.split(':')[0]: int(line.split()[1]) for line in status.splitlines()
            if line.startswith(('RssAnon', 'RssFile'))}

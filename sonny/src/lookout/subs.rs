@@ -792,6 +792,13 @@ pub fn dir(store: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// The subscriber an entry of the folder is the file of: `NAME.json`, never
+/// a partial write (`NAME.json.PID.partial`), the lock or the counts.
+pub(super) fn subscriber(entry: &std::ffi::OsStr) -> Option<String> {
+    let bot = entry.to_str()?.strip_suffix(".json")?;
+    (!bot.is_empty() && !bot.starts_with('.')).then(|| bot.to_owned())
+}
+
 fn file(store: &Path, subscriber: &str) -> PathBuf {
     dir(store).join(format!("{subscriber}.json"))
 }
@@ -958,6 +965,9 @@ fn read_whole(store: &Path, subscriber: &str) -> Result<Vec<Sub>, String> {
     .collect()
 }
 
+/// Each subscriber file's revision, by subscriber.
+pub(super) type Revisions = std::collections::HashMap<String, crate::kept::Stamp>;
+
 /// Each subscriber's file as the lookout last read it, by the file's
 /// stamp: a look on the lookout's timer reads only the files that changed
 /// since, so a thousand subscribers cost a thousand stats, not a thousand
@@ -967,13 +977,15 @@ pub(super) struct Read(std::collections::HashMap<String, (crate::kept::Stamp, Ve
 
 impl Read {
     /// Every subscriber with a file, and what it holds, as [`all`] says:
-    /// a file read again only once it changed.
-    pub(super) fn all(&mut self, store: &Path) -> Vec<(String, Vec<Sub>)> {
+    /// a file read again only once it changed. And each file's revision as
+    /// [`revisions`] says, from the same look: one stat a file, not two.
+    pub(super) fn all(&mut self, store: &Path) -> (Vec<(String, Vec<Sub>)>, Revisions) {
         let Ok(entries) = std::fs::read_dir(dir(store)) else {
             self.0.clear();
-            return Vec::new();
+            return Default::default();
         };
         let mut kept = std::collections::HashMap::new();
+        let mut revisions = std::collections::HashMap::new();
         let mut all: Vec<(String, Vec<Sub>)> = Vec::new();
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -987,6 +999,9 @@ impl Read {
                 (Some(now), Some((had, subs))) if now == had => subs,
                 _ => read(store, &bot),
             };
+            if let Some(stamp) = stamp {
+                revisions.insert(bot.clone(), stamp);
+            }
             if let Some(stamp) = stamp.filter(crate::kept::Stamp::settled) {
                 kept.insert(bot.clone(), (stamp, subs.clone()));
             }
@@ -996,7 +1011,7 @@ impl Read {
         }
         self.0 = kept;
         all.sort_by(|a, b| a.0.cmp(&b.0));
-        all
+        (all, revisions)
     }
 }
 
@@ -3168,7 +3183,7 @@ mod tests {
                 .unwrap();
         };
         let names = |files: &mut Read| -> Vec<String> {
-            (files.all(&store).into_iter())
+            (files.all(&store).0.into_iter())
                 .flat_map(|(_, subs)| subs.into_iter().map(|sub| sub.name))
                 .collect()
         };
@@ -3196,7 +3211,7 @@ mod tests {
         assert_eq!(names(&mut files), ["dddd"]);
         // A file gone is no subscriber.
         std::fs::remove_file(&path).unwrap();
-        assert!(files.all(&store).is_empty());
+        assert!(files.all(&store).0.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

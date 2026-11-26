@@ -21,9 +21,9 @@ pub(crate) mod memory;
 pub(crate) mod pattern;
 pub(crate) mod sources;
 pub(crate) mod subs;
-mod watch;
 
 use agent_client::Client;
+use agent_client::watch;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -864,7 +864,7 @@ struct Service {
     read_at: HashMap<String, subs::Took>,
     /// The follows folder, watched with the kernel; none where it cannot be,
     /// and the files are read on the timer instead.
-    follows: Option<watch::Watch>,
+    follows: Option<watch::Folder>,
     /// The soonest `until` among the subscriptions read, in seconds since
     /// the epoch: the files are read again once it comes.
     next_until: Option<i64>,
@@ -1114,7 +1114,7 @@ impl Service {
         let mut reread: Option<Instant> = None;
         loop {
             // Readable once the kernel queued a change in the follows folder.
-            let follows = self.follows.as_ref().map(watch::Watch::ready);
+            let follows = self.follows.as_ref().map(watch::Folder::ready);
             // The lookouts whose news may have changed: those an event
             // reached, or all of them.
             let mut touched: Option<Vec<String>> = None;
@@ -1614,9 +1614,10 @@ impl Service {
         {
             self.unwatched();
         }
-        let revisions = subs::revisions(&self.store);
-        let mut read: HashMap<String, Vec<subs::Sub>> =
-            self.files.all(&self.store).into_iter().collect();
+        // Each file's revision is looked at before it is read: a write after
+        // the look leaves it newer than what is kept, so it is taken again.
+        let (files, revisions) = self.files.all(&self.store);
+        let mut read: HashMap<String, Vec<subs::Sub>> = files.into_iter().collect();
         // A subscription whose `until` came ends, as an automation does.
         let now_s = (epoch_ms() / 1000) as i64;
         for (subscriber, subs) in read.iter_mut() {
@@ -1661,7 +1662,7 @@ impl Service {
     /// the timer (`REREAD`).
     fn watch_follows(&mut self) {
         let folder = subs::dir(&self.store);
-        let watched = make_dir(&folder).and_then(|()| watch::Watch::new(&folder));
+        let watched = make_dir(&folder).and_then(|()| watch::Folder::new(&folder));
         match watched {
             Ok(watch) => {
                 println!("{}", json!({"event": "follows_watched"}));
@@ -1701,7 +1702,11 @@ impl Service {
         };
         match follows.take() {
             watch::Changed::None => Some(Vec::new()),
-            watch::Changed::Files(names) => Some(self.reread_files(names)),
+            watch::Changed::Names(names) => {
+                // Subscribers' files alone: never a partial write or the lock.
+                let names = (names.iter()).filter_map(|name| subs::subscriber(name));
+                Some(self.reread_files(names.collect()))
+            }
             watch::Changed::Any => {
                 self.reread();
                 None

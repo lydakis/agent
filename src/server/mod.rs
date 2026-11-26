@@ -2,7 +2,6 @@
 //! the same JSONL protocol; turns run as tasks; events fan out through a hub.
 mod actives;
 mod companions;
-mod file_watch;
 mod handles;
 mod hub;
 mod lane;
@@ -3191,7 +3190,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     // The providers' config file, watched by the kernel: nothing runs
     // until it changes.
     let mut provider_changes = match service.reload.as_ref() {
-        Some(reload) => file_watch::watch(&reload.config).await,
+        Some(reload) => agent_client::watch::file(&reload.config).await,
         None => None,
     };
     let (reloaded_sender, mut reloaded) = mpsc::unbounded_channel();

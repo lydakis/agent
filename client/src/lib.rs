@@ -15,6 +15,7 @@ pub mod project;
 pub mod rules;
 pub mod socket;
 pub mod test_home;
+pub mod watch;
 
 #[cfg(test)]
 test_home!();
