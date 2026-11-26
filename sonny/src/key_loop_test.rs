@@ -804,3 +804,50 @@ async fn letters_already_waiting_are_one_frame_and_land_in_order() {
         .map(|(_, asked)| asked["prompt"].clone());
     assert_eq!(submitted, Some(json!(expected)));
 }
+
+/// The commands that read the daemon before they show anything (`/switch`
+/// and the list it opens, `/context`, `/audit`, `/usage`, a side chat, a
+/// reaction on a reply the window no longer keeps) leave the window to
+/// the person meanwhile: each is taken at once, and shows what it read
+/// once that comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commands_that_read_the_daemon_never_hold_the_window() {
+    let (client, _events, _tell, asked, socket) =
+        held_daemon(HELD, kept("A reply"), json!([])).await;
+    let mut app = window(client, socket);
+    for command in [
+        "/switch",
+        "/switch other",
+        "/context",
+        "/audit",
+        "/usage",
+        "/side what is left?",
+    ] {
+        app.input.set(command);
+        let at = Instant::now();
+        app.submit().await;
+        // A card's first read is one look round away.
+        if app.pane.as_ref().is_some_and(pane::Pane::is_card) {
+            app.reread().await;
+        }
+        at_once(at.elapsed(), HELD);
+        assert!(app.input.is_empty(), "{command}");
+    }
+    let at = Instant::now();
+    app.press_row("react/2").await;
+    at_once(at.elapsed(), HELD);
+    // What each read, once it comes back: the reply picked to react to.
+    app.beside_done().await;
+    assert_eq!(
+        app.react_to
+            .as_ref()
+            .map(|(node, first)| (*node, first.as_str())),
+        Some((2, "A reply"))
+    );
+    let ops: Vec<Value> = (asked.lock().unwrap().iter())
+        .map(|(_, asked)| asked["op"].clone())
+        .collect();
+    for op in ["bots", "inspect", "audit", "history_items"] {
+        assert!(ops.contains(&json!(op)), "{op} in {ops:?}");
+    }
+}

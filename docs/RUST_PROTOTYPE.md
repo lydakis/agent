@@ -1241,7 +1241,14 @@ its commit, in request order, and what followed the commit before (starting
 the turn, flagging a steer) happens as it is answered. A turn started this way
 is flagged at once when a steer for its bot is queued behind it, so its first
 model call can already carry the steer. Every other request
-waits until the queued admissions are answered. A submission told it may
+waits until the queued admissions are answered (a read, a wait, or a write
+that only records what its client says, until its own session's are). It
+waits beside the loop: its session is parked, as a session with a read out
+is, and the service goes on reading every other session's requests, so a
+slow commit holds only the sessions whose requests wait for it. Those that
+wait for every queued admission, and admissions, keep their order across
+sessions: one that comes while another such waits, waits behind it. A
+submission told it may
 start a turn holds one `--max-active` slot until it is answered, so queued
 submissions never start more turns than the limit; when only promised slots
 stand between a submission and the limit, it waits too, since whether one

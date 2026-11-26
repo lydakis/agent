@@ -36,6 +36,8 @@ pub const PREVIEW_CHARS: usize = 256;
 pub const PAGE: usize = 500;
 /// Rows a trim deletes per job, so other bots' work interleaves.
 pub const TRIM_PIECE: usize = 10_000;
+/// Ids one statement of a read looks through ([`read`]).
+pub const STRETCH: i64 = 4_096;
 
 /// What a call's row says it is, besides who allowed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,28 +274,39 @@ pub fn first_at(conn: &Connection, ms: i64) -> Result<i64> {
 }
 
 /// A page of the trail, newest first, and `next_before` to read older rows
-/// when there may be more.
+/// when there may be more. The trail is looked through a stretch of
+/// [`STRETCH`] ids at a time, newest first, each stretch its own statement
+/// and so its own snapshot of the store: a read whose filter matches few
+/// rows of a long trail never holds one snapshot while it looks, which
+/// would keep every commit since from being copied back into the store.
 pub fn read(conn: &Connection, query: &Query) -> Result<Value> {
     query.check()?;
     let limit = query.limit.unwrap_or(100);
+    let ends: Option<(i64, i64)> = conn.query_row(
+        "SELECT (SELECT MIN(id) FROM audit),(SELECT MAX(id) FROM audit)",
+        [],
+        |r| Ok(r.get::<_, Option<i64>>(0)?.zip(r.get::<_, Option<i64>>(1)?)),
+    )?;
+    let Some((first, last)) = ends else {
+        return Ok(json!({"rows": [], "next_before": null}));
+    };
+    // Looked through from just below `below` down to `floor`.
+    let mut below = last + 1;
+    if let Some(before) = query.before {
+        below = below.min(before);
+    }
+    if let Some(until) = query.until_ms {
+        below = below.min(first_at(conn, until)?);
+    }
+    let mut floor = first;
+    if let Some(since) = query.since_ms {
+        floor = floor.max(first_at(conn, since)?);
+    }
     let mut sql = String::from(
         "SELECT id,at_ms,bot_id,bot,turn,call_id,step,tool,kind,place,approved,access,ms,outcome,preview
-         FROM audit WHERE 1",
+         FROM audit WHERE id<? AND id>=?",
     );
     let mut args: Vec<Sql> = Vec::new();
-    let mut before = query.before;
-    if let Some(until) = query.until_ms {
-        let bound = first_at(conn, until)?;
-        before = Some(before.map_or(bound, |before| before.min(bound)));
-    }
-    if let Some(before) = before {
-        sql.push_str(" AND id<?");
-        args.push(Sql::Integer(before));
-    }
-    if let Some(since) = query.since_ms {
-        sql.push_str(" AND id>=?");
-        args.push(Sql::Integer(first_at(conn, since)?));
-    }
     // A bot by name or by a pattern of * ? and [...], as history's
     // search takes one: no name holds those.
     if let Some(bot) = &query.bot {
@@ -327,10 +340,15 @@ pub fn read(conn: &Connection, query: &Query) -> Result<Value> {
         }
     }
     sql.push_str(" ORDER BY id DESC LIMIT ?");
-    args.push(Sql::Integer(limit as i64 + 1));
     let mut statement = conn.prepare(&sql)?;
-    let mut rows: Vec<Value> = statement
-        .query_map(rusqlite::params_from_iter(args), |r| {
+    let mut rows: Vec<Value> = Vec::new();
+    // One more than the page, to know whether there are more.
+    while below > floor && rows.len() <= limit {
+        let low = below.saturating_sub(STRETCH).max(floor);
+        let stretch = [Sql::Integer(below), Sql::Integer(low)].into_iter();
+        let wanted = Sql::Integer((limit + 1 - rows.len()) as i64);
+        let given = stretch.chain(args.iter().cloned()).chain([wanted]);
+        let found = statement.query_map(rusqlite::params_from_iter(given), |r| {
             Ok(json!({
                 "id": r.get::<_, i64>(0)?,
                 "at_ms": r.get::<_, i64>(1)?,
@@ -348,8 +366,12 @@ pub fn read(conn: &Connection, query: &Query) -> Result<Value> {
                 "outcome": r.get::<_, String>(13)?,
                 "preview": r.get::<_, String>(14)?,
             }))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        })?;
+        for row in found {
+            rows.push(row?);
+        }
+        below = low;
+    }
     let more = rows.len() > limit;
     rows.truncate(limit);
     let next_before = match more {

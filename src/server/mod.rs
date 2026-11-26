@@ -2318,6 +2318,30 @@ struct Unpublished {
     events: Sends,
 }
 
+/// A request taken up while it must wait for queued admissions to be
+/// answered. Its session is parked until it is handled, as a read's is, so
+/// the loop goes on with every other session's requests meanwhile.
+struct Settling {
+    session: u64,
+    output: Output,
+    request: Result<Request>,
+    /// What a bot's own socket may not do, refused once it is handled.
+    refused: Option<Error>,
+    bound: Bound,
+    credit: session::Credit,
+    read: std::time::Instant,
+    /// Whether it keeps its place among every session's requests, not only
+    /// its own session's: all but those that wait only for their own
+    /// session's admissions (`own_admissions_only`).
+    ordered: bool,
+}
+/// What the loop takes next: a request whose admissions were answered, or
+/// what came in.
+enum Taken {
+    Again(Settling),
+    Inbound(Option<Inbound>),
+}
+
 /// A queued admission and whom to answer.
 struct Admission {
     session: u64,
@@ -2404,6 +2428,18 @@ fn forked(created: agent_runtime::store::Bot, duplicate: bool) -> Result<Value> 
         fields.remove("instructions");
     }
     Ok(created)
+}
+
+/// A read, a wait, or a lend of a bot's sandbox (a read of the bot), or a
+/// write that only records what its client says: one that waits only for
+/// its own session's queued admissions (`Service::must_settle`).
+fn own_admissions_only(command: &Command) -> bool {
+    command.observes()
+        || command.records()
+        || matches!(
+            command,
+            Command::Wait { .. } | Command::Hello { .. } | Command::Lend { .. }
+        )
 }
 
 /// Wait for the oldest admission's answer and keep it with the admission.
@@ -2935,6 +2971,11 @@ pub async fn run(config: Configuration) -> Result<()> {
     // Sessions a companion opened, known once as each opens: what they
     // send is no client's activity.
     let mut companion_sessions: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Requests waiting for queued admissions to be answered, in the order
+    // they came, and those whose admissions were answered, to take again
+    // in that order.
+    let mut settling: std::collections::VecDeque<Settling> = std::collections::VecDeque::new();
+    let mut again: std::collections::VecDeque<Settling> = std::collections::VecDeque::new();
     let (stdout, stdout_writer) = Output::stdout();
     let stdio_owner = config.socket.is_none();
     let mut socket_owner = None;
@@ -3459,6 +3500,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                     let chore = std::time::Instant::now();
                     let (session, output, id, result) = service.settled();
                     reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+                    // The requests waiting for it that wait no more are
+                    // taken again, in the order they came. One that keeps
+                    // its place among all sessions' requests stays behind
+                    // another such that still waits.
+                    let mut held = false;
+                    for waiting in std::mem::take(&mut settling) {
+                        let waits = (held && waiting.ordered)
+                            || service.must_settle(waiting.request.as_ref().ok().map(|r| &r.command), waiting.session, &waiting.output, waiting.bound);
+                        held |= waits && waiting.ordered;
+                        if waits { settling.push_back(waiting) } else { again.push_back(waiting) }
+                    }
                     service.chores.count("admission", chore);
                 }
                 // A client's write landed: answer it, and take its session's
@@ -3476,7 +3528,26 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                     inbound.unpark(asker.session);
                 }
-                message = inbound.recv() => {
+                // What came in, or a request whose admissions were answered:
+                // those go first, in the order they came.
+                taken = async {
+                    match again.pop_front() {
+                        Some(waited) => Taken::Again(waited),
+                        None => Taken::Inbound(inbound.recv().await),
+                    }
+                } => {
+                    let (waited, retaken) = match taken {
+                        Taken::Again(waited) => {
+                            // A request that may look at a running turn finds
+                            // it running if its claim is on its way.
+                            service.claims_landed().await?;
+                            match waited.request.as_ref().map(|r| r.command.turns_seen()) {
+                                Ok(Some(bots)) => service.land_claims_of(&bots).await?,
+                                _ => service.land_claims().await?,
+                            }
+                            (waited, true)
+                        }
+                        Taken::Inbound(message) => {
                     let Some(message) = message else { break };
                     // What a companion sends is no client's activity.
                     let companion = match &message {
@@ -3499,6 +3570,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             if let Some(caller) = caller { callers.insert(id, caller); }
                             if companion { companion_sessions.insert(id); }
                             service.sessions = sessions.len();
+                            continue;
                         }
                         Inbound::Closed(id) => {
                             sessions.remove(&id);
@@ -3512,6 +3584,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.abandon_steps(id);
                             service.steps_session_closed(id);
                             if id == 0 && stdio_owner { break; }
+                            continue;
                         }
                         // The line's credit goes back as this request is taken
                         // up, or a write's once it lands.
@@ -3542,122 +3615,130 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 _ => None,
                             };
                             let bound = request.as_ref().map_or(Bound::default(), |r| service.admission_sends(&r.command, &r.id, id));
-                            // Everything but an admission with room waits for the
-                            // admissions already queued, keeping request order.
-                            let settling = std::time::Instant::now();
-                            let mut settled = false;
-                            while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, bound) {
-                                arrived(&mut service.admissions).await;
-                                // The claims queued before its commit have landed too.
-                                service.claims_landed().await?;
-                                let (session, output, id, result) = service.settled();
-                                reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
-                                settled = true;
-                            }
-                            // Counted as the loop's own work: no request
-                            // is taken meanwhile.
-                            if settled {
-                                service.chores.count("settle", settling);
-                            }
-                            // Even with none queued, an admission waits for the events
-                            // of those answered before it when they and it would not
-                            // fit together: a socket whose queue overflows is closed,
-                            // and its admission must not commit first. The stdio
-                            // owner's output waits for room instead.
-                            if !(id == 0 && stdio_owner)
-                                && let Some(cursor) = service.awaits_publication(request.as_ref().ok().map(|r| &r.command), id, &output, bound)
-                            {
-                                let publishing = std::time::Instant::now();
-                                service.hub.published_through(cursor).await;
-                                service.chores.count("publication", publishing);
-                                if *output.subscribe_closed().borrow() { continue; }
-                            }
-                            if request.as_ref().is_ok_and(|r| r.command.ends_turns()) && !service.writing.lane.is_empty() {
-                                let landing = std::time::Instant::now();
-                                while let Some((session, write, done)) = service.writing.lane.next().await {
-                                    answer_write(&mut service, &mut sessions, stdio_owner, session, write, done).await?;
-                                    inbound.unpark(session);
-                                }
-                                service.chores.count("write", landing);
-                            }
-                            let (request_id, result, shutdown, serving) = match request {
-                                Ok(request) => {
-                                    let allowed = refused.is_none();
-                                    let shutdown = match request.command {
-                                        Command::Shutdown { grace_ms } if allowed => Some(grace_ms),
-                                        _ => None,
-                                    };
-                                    let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
-                                    let serves = allowed && matches!(request.command, Command::ServeApprovals { .. });
-                                    let answered = match &request.command {
-                                        Command::Answer { tag: Some(tag), lease: Some(lease), .. } if allowed => Some((tag.clone(), *lease)),
-                                        _ => None,
-                                    };
-                                    let request_id = request.id.clone();
-                                    let result = match refused {
-                                        Some(error) => Err(error),
-                                        None => {
-                                            let (op, held) = (request.command.op(), std::time::Instant::now());
-                                            let result = service.dispatch_request(request, id, &output, bound).await;
-                                            service.commands.request(op, id, &output, read, held);
-                                            result
-                                        }
-                                    };
-                                    // A session given a read or a write waits for it before its next request.
-                                    for session in service.lane.parked() { inbound.park(session); }
-                                    let mut credit = Some(credit);
-                                    for session in service.writing.lane.parked() {
-                                        inbound.park(session);
-                                        if let Some(credit) = credit.take() { service.writing.credits.insert(session, credit); }
-                                    }
-                                    if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
-                                    // A refused admission still answers after those queued before it.
-                                    if admission && !service.admissions.is_empty() {
-                                        service.admissions.push_back(Admission { session: id, output, id: request_id, bound, pending: Pending::Settled(result) });
-                                        continue;
-                                    }
-                                    let serving = result.as_ref().ok().filter(|_| serves).and_then(|page| {
-                                        Some((page["tag"].as_str()?.to_owned(), page["lease"].as_u64()?))
-                                    }).or(answered);
-                                    (request_id, result, shutdown, serving)
-                                }
-                                // A request that did not parse is answered under its id when it had one.
-                                Err(mut error) => {
-                                    let id = error.facts.as_mut().and_then(|facts| facts.remove("id"));
-                                    (id.unwrap_or(Value::Null), Err(error), None, None)
+                            let ordered = !request.as_ref().is_ok_and(|r| own_admissions_only(&r.command));
+                            (Settling { session: id, output, request, refused, bound, credit, read, ordered }, false)
+                        }
+                    }
+                        }
+                    };
+                    // Everything but an admission with room waits for the
+                    // admissions already queued, keeping request order: its
+                    // session is parked meanwhile, as a read's is, and the
+                    // loop goes on with the others. One that keeps its place
+                    // among all sessions' requests waits behind any such
+                    // already waiting, too.
+                    let waits = service.must_settle(waited.request.as_ref().ok().map(|r| &r.command), waited.session, &waited.output, waited.bound)
+                        || (!retaken && waited.ordered && settling.iter().chain(&again).any(|w| w.ordered));
+                    if waits {
+                        inbound.park(waited.session);
+                        if retaken {
+                            // Those taken again after it wait behind it.
+                            while let Some(behind) = again.pop_back() { settling.push_front(behind); }
+                            settling.push_front(waited);
+                        } else {
+                            settling.push_back(waited);
+                        }
+                        continue;
+                    }
+                    if retaken { inbound.unpark(waited.session); }
+                    let Settling { session: id, output, request, refused, bound, credit, read, .. } = waited;
+                    // Even with none queued, an admission waits for the events
+                    // of those answered before it when they and it would not
+                    // fit together: a socket whose queue overflows is closed,
+                    // and its admission must not commit first. The stdio
+                    // owner's output waits for room instead.
+                    if !(id == 0 && stdio_owner)
+                        && let Some(cursor) = service.awaits_publication(request.as_ref().ok().map(|r| &r.command), id, &output, bound)
+                    {
+                        let publishing = std::time::Instant::now();
+                        service.hub.published_through(cursor).await;
+                        service.chores.count("publication", publishing);
+                        if *output.subscribe_closed().borrow() { continue; }
+                    }
+                    if request.as_ref().is_ok_and(|r| r.command.ends_turns()) && !service.writing.lane.is_empty() {
+                        let landing = std::time::Instant::now();
+                        while let Some((session, write, done)) = service.writing.lane.next().await {
+                            answer_write(&mut service, &mut sessions, stdio_owner, session, write, done).await?;
+                            inbound.unpark(session);
+                        }
+                        service.chores.count("write", landing);
+                    }
+                    let (request_id, result, shutdown, serving) = match request {
+                        Ok(request) => {
+                            let allowed = refused.is_none();
+                            let shutdown = match request.command {
+                                Command::Shutdown { grace_ms } if allowed => Some(grace_ms),
+                                _ => None,
+                            };
+                            let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
+                            let serves = allowed && matches!(request.command, Command::ServeApprovals { .. });
+                            let answered = match &request.command {
+                                Command::Answer { tag: Some(tag), lease: Some(lease), .. } if allowed => Some((tag.clone(), *lease)),
+                                _ => None,
+                            };
+                            let request_id = request.id.clone();
+                            let result = match refused {
+                                Some(error) => Err(error),
+                                None => {
+                                    let (op, held) = (request.command.op(), std::time::Instant::now());
+                                    let result = service.dispatch_request(request, id, &output, bound).await;
+                                    service.commands.request(op, id, &output, read, held);
+                                    result
                                 }
                             };
-                            let shutdown = shutdown.filter(|_| result.is_ok());
-                            reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
-                            // What every session hears of it, such as a pause. One
-                            // too far behind to hear it is closed, as a lagging
-                            // follower is, and hears it in its next greeting.
-                            for notice in std::mem::take(&mut service.notices) {
-                                let mut notice = hub::Encoding::of(&notice);
-                                for (session, output) in &sessions {
-                                    if notice.frame().and_then(|frame| output.try_send_frame(frame)).is_err() {
-                                        service.hub.close_session(*session);
-                                        output.close();
-                                    }
-                                }
+                            // A session given a read or a write waits for it before its next request.
+                            for session in service.lane.parked() { inbound.park(session); }
+                            let mut credit = Some(credit);
+                            for session in service.writing.lane.parked() {
+                                inbound.park(session);
+                                if let Some(credit) = credit.take() { service.writing.credits.insert(session, credit); }
                             }
-                            // Start serving, or release an answer's hold, after its reply.
-                            if let Some((tag, lease)) = serving {
-                                service.hub.start(&tag, id, lease);
+                            if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
+                            // A refused admission still answers after those queued before it.
+                            if admission && !service.admissions.is_empty() {
+                                service.admissions.push_back(Admission { session: id, output, id: request_id, bound, pending: Pending::Settled(result) });
+                                continue;
                             }
-                            if let Some(grace_ms) = shutdown {
-                                // A later shutdown can only bring the deadline closer.
-                                let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
-                                drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
-                                service.draining.store(true, std::sync::atomic::Ordering::Relaxed);
-                                service.steps_held("the daemon is stopping");
-                                if grace_ms == 0 || service.active.is_empty() {
-                                    // The socket writer is a task on this runtime. Give
-                                    // it time to acknowledge shutdown before exiting.
-                                    let _ = tokio::time::timeout(Duration::from_secs(5), output.drain()).await;
-                                    break;
-                                }
+                            let serving = result.as_ref().ok().filter(|_| serves).and_then(|page| {
+                                Some((page["tag"].as_str()?.to_owned(), page["lease"].as_u64()?))
+                            }).or(answered);
+                            (request_id, result, shutdown, serving)
+                        }
+                        // A request that did not parse is answered under its id when it had one.
+                        Err(mut error) => {
+                            let id = error.facts.as_mut().and_then(|facts| facts.remove("id"));
+                            (id.unwrap_or(Value::Null), Err(error), None, None)
+                        }
+                    };
+                    let shutdown = shutdown.filter(|_| result.is_ok());
+                    reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
+                    // What every session hears of it, such as a pause. One
+                    // too far behind to hear it is closed, as a lagging
+                    // follower is, and hears it in its next greeting.
+                    for notice in std::mem::take(&mut service.notices) {
+                        let mut notice = hub::Encoding::of(&notice);
+                        for (session, output) in &sessions {
+                            if notice.frame().and_then(|frame| output.try_send_frame(frame)).is_err() {
+                                service.hub.close_session(*session);
+                                output.close();
                             }
+                        }
+                    }
+                    // Start serving, or release an answer's hold, after its reply.
+                    if let Some((tag, lease)) = serving {
+                        service.hub.start(&tag, id, lease);
+                    }
+                    if let Some(grace_ms) = shutdown {
+                        // A later shutdown can only bring the deadline closer.
+                        let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+                        drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
+                        service.draining.store(true, std::sync::atomic::Ordering::Relaxed);
+                        service.steps_held("the daemon is stopping");
+                        if grace_ms == 0 || service.active.is_empty() {
+                            // The socket writer is a task on this runtime. Give
+                            // it time to acknowledge shutdown before exiting.
+                            let _ = tokio::time::timeout(Duration::from_secs(5), output.drain()).await;
+                            break;
                         }
                     }
                 }
@@ -4365,14 +4446,7 @@ impl Service {
             // So does a write that only records what its client says: it
             // is answered once it commits, and another session's admission
             // is no more answered than it.
-            Some(command)
-                if command.observes()
-                    || command.records()
-                    || matches!(
-                        command,
-                        Command::Wait { .. } | Command::Hello { .. } | Command::Lend { .. }
-                    ) =>
-            {
+            Some(command) if own_admissions_only(command) => {
                 (self.admissions.iter()).any(|admission| admission.session == session)
             }
             _ => true,

@@ -4301,7 +4301,7 @@ async fn run() -> Result<bool, String> {
             }
         };
         if let Some(marker) = &mut app.marker {
-            marker.used();
+            marker.mark();
         }
     }
     if let Some(above) = above
@@ -6213,6 +6213,44 @@ type References = Vec<((String, String), margin::Reference)>;
 /// whether the read was cut short, and what it read for them.
 type Again = (u64, (Vec<(i64, Value)>, bool), PageRead);
 
+/// What `/switch` read beside the window ([`App::switching`]).
+enum Switching {
+    /// The agent named, found.
+    To(String),
+    /// Every agent, to list, narrowed by what was typed: what waits on the
+    /// person, the tasks' titles and the picks kept.
+    List {
+        typed: String,
+        bots: Vec<Value>,
+        held: std::collections::HashSet<String>,
+        titles: Box<crate::title::Titles>,
+        picks: Box<fuzzy::Picks>,
+    },
+    /// What the window says instead.
+    Failed(String),
+}
+
+/// What waits on a reply's first line ([`App::reply_first`]).
+enum AfterFirst {
+    /// Picked for the emoji sent next.
+    Pick,
+    /// The person's reaction clicked: taken off.
+    TakeOff(String),
+}
+
+/// A side chat made beside the window: its name, its head, and the
+/// question's refusal, if any ([`App::side_came`]).
+type Sided = Result<(String, i64, Option<String>), String>;
+/// A reply's node, what waits on its first line, and the read of that
+/// line ([`App::first_came`]).
+type FirstRead = (
+    i64,
+    AfterFirst,
+    tokio::sync::oneshot::Receiver<Result<String, String>>,
+);
+/// The agent's record, and the compaction it names ([`App::context_came`]).
+type ContextRead = Result<(Value, Option<Value>), String>;
+
 /// What a read for an open card found ([`App::reread`]).
 enum CardRead {
     Commands(Result<Value, String>),
@@ -6965,6 +7003,13 @@ struct App {
     /// The bot's latest replies, by node, with their first lines: what
     /// `/react` offers, newest last.
     replies: Vec<(i64, String)>,
+    /// `/switch`'s reads, beside the window ([`App::switch_came`]).
+    switch_reading: Option<tokio::sync::oneshot::Receiver<Switching>>,
+    /// A side chat being made beside the window: its name, its head, and
+    /// the question's refusal, if any ([`App::side_came`]).
+    siding: Vec<tokio::sync::oneshot::Receiver<Sided>>,
+    /// A reply's first line read beside the window, and what waits on it.
+    reading_first: Option<FirstRead>,
     /// `/react`'s list of the replies, open over the composer, with the
     /// replies as they were when it opened: one that comes or goes while
     /// it is open moves no row onto another reply.
@@ -7299,6 +7344,10 @@ struct App {
     config: Option<config::View>,
     /// The model listing `/model` waits on.
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
+    /// `/context`'s read of the agent's record, and of the compaction it
+    /// names, beside the window: the card opens once it comes
+    /// ([`App::context_came`]).
+    context_reading: Option<tokio::sync::oneshot::Receiver<ContextRead>>,
     /// How far a `/permissions` pick reaches, once the listing it is read
     /// from arrives, for the line under the rows.
     reach: Option<approvals::Reach>,
@@ -8081,7 +8130,7 @@ impl Fleet {
         if let Some(mut marker) =
             mux::Marker::lead(&options.socket, project, lead, Some(place.clone()))
         {
-            marker.used();
+            marker.mark();
         }
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client.request("follow", fleet_follow()).await.ok()?;
@@ -9193,6 +9242,9 @@ impl App {
             confirming: None,
             approval_left: None,
             replies: Vec::new(),
+            switch_reading: None,
+            siding: Vec::new(),
+            reading_first: None,
             quoting: false,
             quotes: Vec::new(),
             reacting: None,
@@ -9316,6 +9368,7 @@ impl App {
             searching: None,
             config: None,
             listing: None,
+            context_reading: None,
             agents_asked: None,
             menu_shut: None,
             menu_moved: false,
@@ -9763,6 +9816,10 @@ impl App {
             self.suggested_now().await;
             self.shell_ran().await;
             self.listed();
+            self.context_came();
+            self.switch_came();
+            self.side_came();
+            self.first_came().await;
             self.reached();
             self.switch_asked();
             self.follow_place().await;
@@ -10088,6 +10145,10 @@ impl App {
             self.wrote();
             self.verdicts_came();
             self.hear();
+            self.context_came();
+            self.switch_came();
+            self.side_came();
+            self.first_came().await;
             // Read every few seconds, it wakes no one: waited on here.
             if let Some(job) = self.raising.take() {
                 self.approvals_raised(job.await.expect("the calls below were read"));
@@ -10098,6 +10159,10 @@ impl App {
                 && self.verdicting.is_empty()
                 && self.unheard.is_none()
                 && self.raising.is_none()
+                && self.context_reading.is_none()
+                && self.switch_reading.is_none()
+                && self.siding.is_empty()
+                && self.reading_first.is_none()
             {
                 return;
             }
@@ -12145,13 +12210,7 @@ impl App {
             .strip_prefix("react/")
             .and_then(|node| node.parse::<i64>().ok())
         {
-            match self.reply_first(node).await {
-                Ok(first) => {
-                    self.react_to = Some((node, first));
-                    self.notice = None;
-                }
-                Err(error) => self.notice = Some(error),
-            }
+            self.reply_first(node, AfterFirst::Pick).await;
         }
         // One of the person's reactions clicked: taken off.
         if let Some((node, emoji)) = button
@@ -12160,12 +12219,8 @@ impl App {
             .and_then(|(node, emoji)| Some((node.parse::<i64>().ok()?, emoji)))
             && self.reactions.on(node).iter().any(|on| on == emoji)
         {
-            match self.reply_first(node).await {
-                Ok(first) => {
-                    self.toggle_reaction((node, first), emoji).await;
-                }
-                Err(error) => self.notice = Some(error),
-            }
+            self.reply_first(node, AfterFirst::TakeOff(emoji.to_owned()))
+                .await;
         }
         if let Some(at) = button
             .strip_prefix("fold/")
@@ -15938,36 +15993,58 @@ impl App {
     }
 
     /// What fills this agent's context, read-only: `/context` in the
-    /// pane, as `/mcp` is, until Esc. Its record is read once, now.
-    async fn context_card(&mut self) {
-        let record = match self
-            .client
-            .request("inspect", json!({"bot": self.bot}))
-            .await
-        {
-            Ok(record) => record,
+    /// pane, as `/mcp` is, until Esc. Its record is read once, beside the
+    /// window, and the card opens once it comes ([`App::context_came`]).
+    fn context_card(&mut self) {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let (client, woken, bot) = (self.client.clone(), self.woken.clone(), self.bot.clone());
+        let (socket, compacted) = (self.options.socket.clone(), self.compacted.clone());
+        tokio::spawn(async move {
+            let read = async {
+                let record = (client.request("inspect", json!({"bot": bot})).await)
+                    .map_err(|error| format!("could not read {bot}: {error}"))?;
+                // The compaction the record names: the one this window
+                // saw, or, in a fork (a side chat too), its source's, made
+                // before the fork and so in no event of this agent's.
+                let compacted = match record["compaction"].as_i64() {
+                    None => None,
+                    Some(version)
+                        if (compacted.as_ref())
+                            .is_some_and(|data| data["version"].as_i64() == Some(version)) =>
+                    {
+                        compacted
+                    }
+                    Some(version) => compaction_named(&socket, version).await,
+                };
+                Ok((record, compacted))
+            };
+            let _ = send.send(read.await);
+            woken.notify_one();
+        });
+        self.context_reading = Some(receive);
+    }
+
+    /// `/context`'s card, once its read came.
+    fn context_came(&mut self) {
+        let Some(reading) = &mut self.context_reading else {
+            return;
+        };
+        let read = match reading.try_recv() {
+            Ok(read) => read,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(_) => Err("the read was dropped".into()),
+        };
+        self.context_reading = None;
+        let (record, compacted) = match read {
+            Ok(read) => read,
             Err(error) => {
-                self.notice = Some(format!("could not read {}: {error}", self.bot));
+                self.notice = Some(error);
                 return;
             }
         };
         let mut parts = context::Parts::from_record(&record);
         (parts.used, parts.window) = (self.context, self.window);
-        // The compaction the record names: the one this window saw, or,
-        // in a fork (a side chat too), its source's, made before the fork
-        // and so in no event of this agent's.
-        parts.compacted = match record["compaction"].as_i64() {
-            None => None,
-            Some(version)
-                if self
-                    .compacted
-                    .as_ref()
-                    .is_some_and(|data| data["version"].as_i64() == Some(version)) =>
-            {
-                self.compacted.clone()
-            }
-            Some(version) => compaction_named(&self.options.socket, version).await,
-        };
+        parts.compacted = compacted;
         // Laid now as the pane lays a card, and again by a frame that
         // finds the pane another width.
         let wide = pane::width(self.full_width, kept(self.full_width));
@@ -15983,12 +16060,13 @@ impl App {
     }
 
     /// The tokens the project's agents spent, or every agent's, over
-    /// time: `/usage` in the pane, as `/status` is, until Esc.
-    async fn usage(&mut self) {
+    /// time: `/usage` in the pane, as `/status` is, until Esc. It opens
+    /// reading, and is read beside the window ([`App::reread`]).
+    fn usage(&mut self) {
         let scope = self.scope();
         let project = scope.project.clone();
-        let mut view = usage::View::new(scope);
-        self.read_usage(&mut view).await;
+        let view = usage::View::new(scope);
+        self.woken.notify_one();
         self.watch = Some(Watch {
             project,
             rows: Vec::new(),
@@ -16015,12 +16093,13 @@ impl App {
     }
 
     /// Every tool call the project's agents made, or every agent's, newest
-    /// first: `/audit` in the pane, as `/status` is, until Esc.
-    async fn audit(&mut self) {
+    /// first: `/audit` in the pane, as `/status` is, until Esc. It opens
+    /// reading, and is read beside the window ([`App::reread`]).
+    fn audit(&mut self) {
         let scope = self.scope();
         let project = scope.project.clone();
-        let mut view = audit::View::new(scope);
-        self.read_audit(&mut view).await;
+        let view = audit::View::new(scope);
+        self.woken.notify_one();
         self.watch = Some(Watch {
             project,
             rows: Vec::new(),
@@ -16044,12 +16123,6 @@ impl App {
             finding: None,
         });
         self.open_pane(pane::Pane::card("audit", STATUS_KEYS));
-    }
-
-    /// `view` read from the daemon again.
-    async fn read_audit(&self, view: &mut audit::View) {
-        let read = self.client.request("audit", view.query()).await;
-        view.loaded(read.map_err(|error| error.to_string()));
     }
 
     /// Stop `bot`'s command `handle` from `/background`, beside the
@@ -16191,23 +16264,6 @@ impl App {
             finding: None,
         });
         self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
-    }
-
-    /// `view` read from the daemon again.
-    async fn read_usage(&self, view: &mut usage::View) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let (ask, window) = view.ask(now);
-        let socket = self.options.socket.clone();
-        let read = usage::read(self.client.clone(), socket, ask, self.store()).await;
-        // The price sheet as its file says now, so an edit shows at the
-        // next read; a sheet that does not parse prices nothing.
-        let prices = agent_client::config::load()
-            .and_then(|config| agent_client::config::prices(&config))
-            .unwrap_or_default();
-        view.loaded(window, read, prices);
     }
 
     /// Whether the scheduler runs, read beside the window while
@@ -18677,7 +18733,7 @@ impl App {
             "projects" if self.projects_here() => self.open_projects().await,
             "projects" => {}
             // An agent's title button: this window becomes its Sonny.
-            "main" => self.switch_command(id).await,
+            "main" => self.switch_command(id),
             // Its name: its own tab, where the lead's tasks are laid out.
             "tab" => match &mut self.fleet {
                 Some(fleet) => fleet.go_to(id, false),
@@ -19948,7 +20004,7 @@ impl App {
             if self.options.side.is_some() {
                 self.notice = Some("/audit is for the agent itself, not a side chat".into());
             } else {
-                self.audit().await;
+                self.audit();
             }
             return;
         }
@@ -19957,7 +20013,7 @@ impl App {
             if self.options.side.is_some() {
                 self.notice = Some("/usage is for the agent itself, not a side chat".into());
             } else {
-                self.usage().await;
+                self.usage();
             }
             return;
         }
@@ -19972,7 +20028,7 @@ impl App {
         }
         if prompt == "/context" {
             self.input.clear();
-            self.context_card().await;
+            self.context_card();
             return;
         }
         if prompt == "/mcp" {
@@ -20147,7 +20203,7 @@ impl App {
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             self.input.clear();
-            self.switch_command(rest.trim()).await;
+            self.switch_command(rest.trim());
             return;
         }
         if let Some(asked) = zen::command(&prompt, self.zen.is_some()) {
@@ -20164,7 +20220,7 @@ impl App {
             let pictures = self.placed(question);
             self.input.clear();
             self.pictures.clear();
-            self.side(question.trim().to_owned(), &pictures).await;
+            self.side(question.trim().to_owned(), &pictures);
             return;
         }
         // A slash word no command took is answered, and stays to be fixed.
@@ -22137,22 +22193,71 @@ impl App {
         true
     }
 
-    /// The first line of the bot's reply at `node`, as `/react` offers it:
-    /// kept for its latest replies, else read again.
-    async fn reply_first(&self, node: i64) -> Result<String, String> {
+    /// The first line of the bot's reply at `node`, as `/react` offers it,
+    /// kept for its latest replies: at once when kept, else read again
+    /// beside the window and `then` done once it comes
+    /// ([`App::first_came`]).
+    async fn reply_first(&mut self, node: i64, then: AfterFirst) {
         if let Some((_, first)) = self.replies.iter().find(|(seen, _)| *seen == node) {
-            return Ok(first.clone());
+            let first = first.clone();
+            self.after_first(node, Ok(first), then).await;
+            return;
         }
-        let read = (self.client)
-            .request("history_items", json!({"bot": self.bot, "nodes": [node]}))
-            .await
-            .map_err(|error| error.to_string())?;
-        let said = text(&read["items"][0]["item"]);
-        let first = said
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("");
-        Ok(transcript::cut(first.trim(), QUOTED))
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let (client, woken, bot) = (self.client.clone(), self.woken.clone(), self.bot.clone());
+        tokio::spawn(async move {
+            let read = client
+                .request("history_items", json!({"bot": bot, "nodes": [node]}))
+                .await;
+            let first = read.map_err(|error| error.to_string()).map(|read| {
+                let said = text(&read["items"][0]["item"]);
+                let first = said
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("");
+                transcript::cut(first.trim(), QUOTED)
+            });
+            let _ = send.send(first);
+            woken.notify_one();
+        });
+        self.reading_first = Some((node, then, receive));
+    }
+
+    /// A reply's first line read beside the window, once it came: what
+    /// waited on it is done, unless the window moved to another agent.
+    async fn first_came(&mut self) {
+        let Some((node, _, reading)) = &mut self.reading_first else {
+            return;
+        };
+        let node = *node;
+        let first = match reading.try_recv() {
+            Ok(first) => first,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(_) => Err("the read was dropped".into()),
+        };
+        let Some((_, then, _)) = self.reading_first.take() else {
+            return;
+        };
+        self.after_first(node, first, then).await;
+    }
+
+    async fn after_first(&mut self, node: i64, first: Result<String, String>, then: AfterFirst) {
+        let first = match first {
+            Ok(first) => first,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        match then {
+            AfterFirst::Pick => {
+                self.react_to = Some((node, first));
+                self.notice = None;
+            }
+            AfterFirst::TakeOff(emoji) => {
+                self.toggle_reaction((node, first), &emoji).await;
+            }
+        }
     }
 
     /// A guess at the person's next message, after a turn of theirs ended
@@ -22240,7 +22345,7 @@ impl App {
     /// from what the bot knows. The daemon deletes it once it has been
     /// idle a quarter hour. This bot carries on, and its lines wait for the
     /// main screen.
-    async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
+    fn side(&mut self, question: String, pictures: &[attach::Picture]) {
         if self.options.side.is_some() {
             self.notice = Some("this is a side chat already".into());
             return;
@@ -22257,59 +22362,92 @@ impl App {
             .unwrap_or_default()
             .as_millis();
         let name = format!("{}.side-{:x}", self.bot, stamp % 0x100_0000);
-        // Made by the agent it copies, which is how Sonny's own tools know
-        // the copy for one rather than by its name alone.
-        let page = self
-            .client
-            .request("bots", json!({"name": self.bot, "limit": 1}));
-        let source = match page.await {
-            Ok(page) if page["bots"][0]["name"] == self.bot.as_str() => page["bots"][0].clone(),
-            Ok(_) => {
-                self.notice = Some(format!("no side chat: {} is gone", self.bot));
-                return;
+        let (client, woken, bot) = (self.client.clone(), self.woken.clone(), self.bot.clone());
+        let (store, model) = (self.options.store.clone(), self.turn_model.clone());
+        let images = attach::submitted(pictures);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        // Made and asked beside the window, which answers meanwhile; its
+        // pane opens once it is made ([`App::side_came`]).
+        tokio::spawn(async move {
+            let made = async {
+                // Made by the agent it copies, which is how Sonny's own
+                // tools know the copy for one rather than by its name alone.
+                let page = client.request("bots", json!({"name": bot, "limit": 1}));
+                let source = match page.await {
+                    Ok(page) if page["bots"][0]["name"] == bot.as_str() => page["bots"][0].clone(),
+                    Ok(_) => return Err(format!("no side chat: {bot} is gone")),
+                    Err(error) => return Err(format!("no side chat: {error}")),
+                };
+                let mut fork = json!({"source": bot, "bot": name,
+                    "created_by": bot, "created_by_id": source["bot_id"],
+                    "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name});
+                // A fork with no list keeps its source's tools.
+                if tools == agent_client::config::SideChat::Answer {
+                    fork["allow"] = json!([]);
+                }
+                let forked = (client.request("fork", fork).await)
+                    .map_err(|error| format!("no side chat: {error}"))?;
+                // Its margin starts at the copy, empty: the notes it was
+                // copied with are its source's, and count for none of its
+                // own when Sonny answers its margin calls, as its window
+                // shows none of them.
+                if let (Some(id), Some(head)) = (forked["bot_id"].as_i64(), forked["head"].as_i64())
+                {
+                    let _ = tokio::task::spawn_blocking(move || margin::start_at(&store, id, head))
+                        .await;
+                }
+                // The question is the person's words, stamped. On the model
+                // this window's turns run on, whose cache is warm.
+                let mut refused = None;
+                if !question.is_empty()
+                    && let Err(error) = client
+                        .request(
+                            "submit",
+                            json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
+                                "prompt": question, "delivery": "steer", "model": model,
+                                "images": images}),
+                        )
+                        .await
+                {
+                    refused = Some(format!("the side chat did not take the question: {error}"));
+                }
+                Ok((name, forked["head"].as_i64().unwrap_or(0), refused))
+            };
+            let _ = send.send(made.await);
+            woken.notify_one();
+        });
+        self.siding.push(receive);
+    }
+
+    /// The side chat made beside the window, once it is: beside the
+    /// conversation, on a terminal of its own.
+    fn side_came(&mut self) {
+        let mut came = Vec::new();
+        self.siding.retain_mut(|siding| match siding.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+            Ok(made) => {
+                came.push(made);
+                false
             }
+            Err(_) => false,
+        });
+        for made in came {
+            self.side_open(made);
+        }
+    }
+
+    fn side_open(&mut self, made: Result<(String, i64, Option<String>), String>) {
+        let (name, head, refused) = match made {
+            Ok(made) => made,
             Err(error) => {
-                self.notice = Some(format!("no side chat: {error}"));
+                self.notice = Some(error);
                 return;
             }
         };
-        let mut fork = json!({"source": self.bot, "bot": name,
-            "created_by": self.bot, "created_by_id": source["bot_id"],
-            "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name});
-        // A fork with no list keeps its source's tools.
-        if tools == agent_client::config::SideChat::Answer {
-            fork["allow"] = json!([]);
+        if let Some(refused) = refused {
+            self.notice = Some(refused);
         }
-        let forked = self.client.request("fork", fork).await;
-        let forked = match forked {
-            Ok(forked) => forked,
-            Err(error) => {
-                self.notice = Some(format!("no side chat: {error}"));
-                return;
-            }
-        };
-        // Its margin starts at the copy, empty: the notes it was copied
-        // with are its source's, and count for none of its own when Sonny
-        // answers its margin calls, as its window shows none of them.
-        if let (Some(id), Some(head)) = (forked["bot_id"].as_i64(), forked["head"].as_i64()) {
-            margin::start_at(&self.options.store, id, head);
-        }
-        // The question is the person's words, stamped. On the model this
-        // window's turns run on, whose cache is warm.
-        if !question.is_empty()
-            && let Err(error) = self
-                .client
-                .request(
-                    "submit",
-                    json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": question, "delivery": "steer", "model": self.turn_model,
-                        "images": attach::submitted(pictures)}),
-                )
-                .await
-        {
-            self.notice = Some(format!("the side chat did not take the question: {error}"));
-        }
-        let head = forked["head"].as_i64().unwrap_or(0).to_string();
+        let head = head.to_string();
         let mut args = [
             "--no-sound",
             "--no-layout",
@@ -22563,73 +22701,120 @@ impl App {
     /// `/switch` alone lists every agent to pick from, the one beside the
     /// conversation picked, and a name found in none lists those it
     /// narrows to.
-    async fn switch_command(&mut self, name: &str) {
+    fn switch_command(&mut self, name: &str) {
         if self.options.side.is_some() {
             self.notice = Some("a side chat keeps to its agent; /switch from its window".into());
             return;
         }
-        if name.is_empty() {
-            self.list_agents("").await;
-            return;
-        }
-        let mut names = vec![name.to_owned()];
-        if let Some(project) = &self.project
-            && !name.contains('.')
-        {
-            names.push(format!("{project}.{name}"));
-        }
-        for bot in names {
-            if bot == self.bot {
-                self.notice = Some(format!("this window is {bot}'s already"));
-                return;
-            }
-            match self.client.request("inspect", json!({"bot": bot})).await {
-                Ok(_) => {
-                    self.switch_window(bot);
-                    return;
-                }
-                Err(error) if error.code == "bot_not_found" => continue,
-                Err(error) => {
-                    self.notice = Some(error.to_string());
-                    return;
-                }
+        let mut names = Vec::new();
+        if !name.is_empty() {
+            names.push(name.to_owned());
+            if let Some(project) = &self.project
+                && !name.contains('.')
+            {
+                names.push(format!("{project}.{name}"));
             }
         }
-        self.list_agents(name).await;
+        self.switching(name, names);
     }
 
-    /// Every agent, listed over the composer to pick one, narrowed by
-    /// `typed`.
-    async fn list_agents(&mut self, typed: &str) {
-        let mut bots = Vec::new();
-        let mut after = Value::Null;
-        loop {
-            let asked = json!({"limit": 256, "after": after});
-            let page = match self.client.request("bots", asked).await {
-                Ok(page) => page,
-                Err(error) => {
-                    self.notice = Some(error.to_string());
-                    return;
+    /// `/switch`'s reads, beside the window, which answers meanwhile: the
+    /// first of `names` that is an agent, else every agent, to list
+    /// narrowed by `typed` ([`App::switch_came`]).
+    fn switching(&mut self, typed: &str, names: Vec<String>) {
+        let (client, woken, me) = (self.client.clone(), self.woken.clone(), self.bot.clone());
+        let (store, picks_kept, typed) = (self.store(), self.picks_kept, typed.to_owned());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let read = async {
+                for bot in names {
+                    if bot == me {
+                        return Switching::Failed(format!("this window is {bot}'s already"));
+                    }
+                    match client.request("inspect", json!({"bot": bot})).await {
+                        Ok(_) => return Switching::To(bot),
+                        Err(error) if error.code == "bot_not_found" => continue,
+                        Err(error) => return Switching::Failed(error.to_string()),
+                    }
+                }
+                let mut bots = Vec::new();
+                let mut after = Value::Null;
+                loop {
+                    let asked = json!({"limit": 256, "after": after});
+                    let page = match client.request("bots", asked).await {
+                        Ok(page) => page,
+                        Err(error) => return Switching::Failed(error.to_string()),
+                    };
+                    bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+                    after = page["next_after"].clone();
+                    if after.is_null() {
+                        break;
+                    }
+                }
+                // What waits on the person, as `/status` says it: a call on
+                // their approval, read now, or a question this window follows.
+                let held = (needs::listing(&client, None).await)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|held| held.bot)
+                    .collect();
+                let kept = tokio::task::spawn_blocking(move || {
+                    let picks = match picks_kept {
+                        true => fuzzy::Picks::load("agents"),
+                        false => fuzzy::Picks::default(),
+                    };
+                    (crate::title::Titles::read(&store), picks)
+                });
+                let Ok((titles, picks)) = kept.await else {
+                    return Switching::Failed("the list was dropped".into());
+                };
+                Switching::List {
+                    typed,
+                    bots,
+                    held,
+                    titles: Box::new(titles),
+                    picks: Box::new(picks),
                 }
             };
-            bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-            after = page["next_after"].clone();
-            if after.is_null() {
-                break;
+            let _ = send.send(read.await);
+            woken.notify_one();
+        });
+        self.switch_reading = Some(receive);
+    }
+
+    /// What `/switch` read, once it came: the window goes to the agent
+    /// found, or lists them all.
+    fn switch_came(&mut self) {
+        let Some(reading) = &mut self.switch_reading else {
+            return;
+        };
+        let read = match reading.try_recv() {
+            Ok(read) => read,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(_) => Switching::Failed("the list was dropped".into()),
+        };
+        self.switch_reading = None;
+        let (typed, bots, held, mut titles, picks) = match read {
+            Switching::To(bot) => {
+                self.switch_window(bot);
+                return;
             }
-        }
-        // What waits on the person, as `/status` says it: a call on their
-        // approval, read now, or a question this window follows.
-        let held: std::collections::HashSet<String> = (needs::listing(&self.client, None).await)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|held| held.bot)
-            .collect();
+            Switching::Failed(said) => {
+                self.notice = Some(said);
+                return;
+            }
+            Switching::List {
+                typed,
+                bots,
+                held,
+                titles,
+                picks,
+            } => (typed, bots, held, *titles, *picks),
+        };
         let fleet = self.fleet.as_ref();
         let waits =
             |bot: &str| held.contains(bot) || fleet.is_some_and(|fleet| fleet.needs.waits(bot));
         let beside = self.beside();
-        let mut titles = crate::title::Titles::read(&self.store());
         let mut picker = switch::Picker::new(
             &bots,
             waits,
@@ -22638,13 +22823,10 @@ impl App {
             self.project.as_deref(),
             &self.workspace,
             beside.as_deref(),
-            match self.picks_kept {
-                true => fuzzy::Picks::load("agents"),
-                false => fuzzy::Picks::default(),
-            },
+            picks,
         );
         if !typed.is_empty() {
-            picker.narrow(typed.to_owned());
+            picker.narrow(typed);
         }
         let closed: std::collections::HashSet<String> = (bots.iter())
             .filter(|bot| !bot["closed_ms"].is_null())
@@ -28027,6 +28209,7 @@ mod tests {
         // Ctrl+G opens the pane's agent at once, wherever the keys are.
         let ctrl_g = event::KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         app.key(Event::Key(ctrl_g)).await;
+        app.beside_done().await;
         assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
         // A window drawn in another's pane asks that one to show the
         // agent there instead; the main window is left as it is.

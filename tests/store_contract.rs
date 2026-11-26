@@ -10318,6 +10318,69 @@ fn history_search_follows_the_lineage_of_a_fork() {
 }
 
 #[test]
+fn a_long_history_search_reads_in_pieces_and_misses_nothing() {
+    // More nodes than one piece of the walk (256), matches spread through
+    // them: every one is found, newest first, for one bot and a pattern.
+    let mut db = db();
+    db.create("p.lead", Some("/synthetic"), binding()).unwrap();
+    db.create("p.task", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=200 {
+        let reply = if n % 40 == 0 {
+            format!("the needle at {n}")
+        } else {
+            format!("nothing at {n}")
+        };
+        searched_turn(
+            &mut db,
+            "p.lead",
+            &format!("k{n}"),
+            &format!("step {n}"),
+            &reply,
+            true,
+        );
+    }
+    for n in 1..=150 {
+        let reply = if n % 50 == 0 {
+            format!("a needle built at {n}")
+        } else {
+            format!("built {n}")
+        };
+        searched_turn(
+            &mut db,
+            "p.task",
+            &format!("k{n}"),
+            &format!("build {n}"),
+            &reply,
+            true,
+        );
+    }
+    let found = db.history_search("p.lead", "needle", None, false).unwrap();
+    let turns: Vec<i64> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["turn"].as_i64().unwrap())
+        .collect();
+    assert_eq!(turns, vec![200, 160, 120, 80, 40]);
+    assert_eq!(found["done"], true);
+    let found = db.history_search_bots("p.*", "needle", None, None).unwrap();
+    let texts: Vec<&str> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts.len(), 8, "{texts:?}");
+    for (bot, count) in [("p.lead", 5), ("p.task", 3)] {
+        let of_bot = (found["matches"].as_array().unwrap().iter())
+            .filter(|m| m["bot"] == bot)
+            .count();
+        assert_eq!(of_bot, count, "{bot}");
+    }
+    assert_eq!(found["done"], true);
+}
+
+#[test]
 fn history_search_of_a_pattern_searches_every_bot_it_matches_newest_first() {
     let mut db = db();
     db.create("p.lead", Some("/synthetic"), binding()).unwrap();
@@ -22337,6 +22400,79 @@ fn a_daemon_step_cut_short_still_names_the_files_it_changes() {
             (json!("c1/w"), json!(true), json!(["run.sh"])),
         ]
     );
+}
+
+#[test]
+fn the_trail_reads_past_many_stretches_without_a_cap() {
+    use agent_runtime::store::audit::{Query, STRETCH};
+    let path =
+        std::env::temp_dir().join(format!("agent-audit-stretch-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    // Rows over several stretches of ids, one in every 1,000 a web call.
+    let rows = 3 * STRETCH + 100;
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        for n in 1..=rows {
+            let kind = if n % 1_000 == 0 { "web" } else { "file" };
+            tx.execute(
+                "INSERT INTO audit(at_ms,bot_id,bot,turn,call_id,tool,kind,approved,access,outcome,preview)
+                 VALUES(?1,1,'Bob',1,?2,'read',?3,'nobody','read','completed','')",
+                rusqlite::params![n, format!("c{n}"), kind],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let ids = |page: &Value| -> Vec<i64> {
+        (page["rows"].as_array().unwrap().iter())
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect()
+    };
+    let webs: Vec<i64> = (1..=rows).rev().filter(|n| n % 1_000 == 0).collect();
+    // One read finds them all, though each stretch holds few or none.
+    let all = db
+        .audit(&Query {
+            kind: Some("web".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&all), webs);
+    assert!(all["next_before"].is_null());
+    // Pages of two go back through them in order and end where they do.
+    let (mut seen, mut before) = (Vec::new(), None);
+    loop {
+        let page = db
+            .audit(&Query {
+                kind: Some("web".into()),
+                limit: Some(2),
+                before,
+                ..Default::default()
+            })
+            .unwrap();
+        seen.extend(ids(&page));
+        match page["next_before"].as_i64() {
+            Some(next) => before = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, webs);
+    // A page wider than a stretch is as full as asked.
+    let wide = db
+        .audit(&Query {
+            limit: Some(500),
+            before: Some(STRETCH + 200),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        ids(&wide),
+        ((STRETCH - 300)..STRETCH + 200).rev().collect::<Vec<_>>()
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
