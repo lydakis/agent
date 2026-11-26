@@ -2111,7 +2111,13 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   another agent or a running command works in, with a call waiting on its verdict or a question open, with uncommitted
   changes or submodules, a folder of its own or another daemon's, and its
   answer names those it removed. A start in a folder already there makes
-  room for none.
+  room for none. A task whose worktree was removed, `remove_task` or
+  this, that runs again (an invite, a message) gets it back at the same
+  path from its kept branch, as the Codex app restores a worktree it
+  cleaned up: when the tool host sees its turn start, and before Sonny
+  runs one of its tools, written to the tool host's log. With its branch
+  gone too, Sonny's tools run in the agent's state folder, and their
+  answer says its folder is gone (`folder_gone`).
 - **Tasks that start their own:** every agent has `start_task` and
   `remove_task`, for help inside its own brief, such as a review or a
   watch on something; separate work still goes to its lead. How deep a
