@@ -161,23 +161,34 @@ impl Drop for UnderWay {
     }
 }
 
-/// [`folder`] for the turn of `bot` that the tool host saw start in
-/// `workspace`, from a connection of its own to the daemon at `socket`.
-pub async fn on_turn(store: PathBuf, socket: PathBuf, bot: String, workspace: PathBuf) {
+/// [`folder`] for the turn `turn` of `bot` that the tool host saw start
+/// in `workspace`, from a connection of its own to the daemon at `socket`:
+/// only while that turn still runs, so an old start the host reads again
+/// as it catches up makes no worktree removed since.
+pub async fn on_turn(store: PathBuf, socket: PathBuf, bot: String, turn: i64, workspace: PathBuf) {
     let Ok((client, _events)) = Client::connect(&socket).await else {
         return;
     };
+    turn_started(&client, &bot, turn, &workspace, &store).await;
+    client.close().await;
+}
+
+/// [`on_turn`] on `client`: what [`folder`] found, or none when `turn` no
+/// longer runs.
+async fn turn_started(
+    client: &Client,
+    bot: &str,
+    turn: i64,
+    workspace: &Path,
+    store: &Path,
+) -> Option<Folder> {
     let page = client
         .request("bots", json!({"name": bot, "limit": 1}))
         .await
         .unwrap_or_default();
-    if let Some(record) = page["bots"]
-        .get(0)
-        .filter(|found| found["name"] == bot.as_str())
-    {
-        folder(&client, record, &workspace, &store).await;
-    }
-    client.close().await;
+    let record = (page["bots"].get(0))
+        .filter(|found| found["name"] == bot && found["running_turn"] == turn)?;
+    Some(folder(client, record, workspace, store).await)
 }
 
 /// The folders of the agents above the agent `record`, each made by the
@@ -211,6 +222,20 @@ async fn above(client: &Client, record: &Value) -> Vec<PathBuf> {
         by = found["created_by"].as_str().map(str::to_owned);
     }
     places
+}
+
+/// The state folder of the agent `record`, as the daemon lists it: the one
+/// its own settings keep, read by its identity, else as `state::of` finds
+/// one for it.
+pub async fn state_folder(client: &Client, record: &Value) -> Option<String> {
+    let name = record["name"].as_str().unwrap_or_default();
+    let asked = json!({"bot": name, "bot_id": record["bot_id"]});
+    let inspected = client
+        .request("inspect", asked)
+        .await
+        .ok()
+        .filter(|inspected| inspected["name"] == name && inspected["bot_id"] == record["bot_id"]);
+    crate::state::of(inspected.as_ref().unwrap_or(record), name)
 }
 
 /// Whether Sonny's git runs in the sandbox for the agent `record`, as for
@@ -253,6 +278,22 @@ pub fn told(output: String, workspace: &Path, ran_in: &Path, why: &Gone) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_turn_start_read_again_after_its_turn_ended_restores_nothing() {
+        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [{"name": "shop.old", "bot_id": 3,
+                "running_turn": null}]}),
+            _ => json!({"error": {"code": "unexpected"}}),
+        })
+        .await;
+        let workspace = home().unwrap().join(".agent/worktrees/shop.old");
+        let store = Path::new("/nowhere/state.sqlite");
+        assert_eq!(
+            turn_started(&client, "shop.old", 9, &workspace, store).await,
+            None
+        );
+    }
 
     #[test]
     fn a_folder_a_restore_here_still_checks_out_is_not_taken_as_there() {

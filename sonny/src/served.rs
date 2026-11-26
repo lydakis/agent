@@ -1653,15 +1653,18 @@ impl Server {
             // A message taken into a turn of a task whose worktree was
             // removed: made again from its branch while the turn starts.
             Some("accepted") => {
-                if let (Some(bot), Some(workspace)) =
-                    (event["bot"].as_str(), event["data"]["workspace"].as_str())
-                    && crate::restore::wanted(Path::new(workspace))
+                if let (Some(bot), Some(turn), Some(workspace)) = (
+                    event["bot"].as_str(),
+                    event["turn"].as_i64(),
+                    event["data"]["workspace"].as_str(),
+                ) && crate::restore::wanted(Path::new(workspace))
                     && tokio::runtime::Handle::try_current().is_ok()
                 {
                     tokio::spawn(crate::restore::on_turn(
                         self.store.clone(),
                         self.socket.clone(),
                         bot.to_owned(),
+                        turn,
                         PathBuf::from(workspace),
                     ));
                 }
@@ -2934,7 +2937,10 @@ async fn answer(
     let folder = crate::restore::folder(client, record, Path::new(&workspace), store).await;
     let ran_in = match &folder {
         crate::restore::Folder::There => PathBuf::from(&workspace),
-        crate::restore::Folder::Gone(_) => crate::state::of(&caller, &str_of(&caller["name"]))
+        // The state folder its shell names, which its own settings keep:
+        // a helper's is its lead's, not its maker's.
+        crate::restore::Folder::Gone(_) => crate::restore::state_folder(client, &caller)
+            .await
             .map(PathBuf::from)
             .ok_or((
                 "tool_failed",
@@ -4507,6 +4513,10 @@ mod tests {
         git(&repo, &["worktree", "remove", "--force", &target]);
         let lead = repo.to_string_lossy().into_owned();
         let (task, workspace) = (tree.clone(), target.clone());
+        // The state folder its shell names, as its settings keep it: the
+        // head of its line's, not its maker's.
+        let state = crate::state::folder("calc.boss").unwrap();
+        let kept = state.clone();
         let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
             Some("bots") if asked["name"] == "calc.lead" => {
                 json!({"bots": [{"name": "calc.lead", "bot_id": 1, "workspace": lead}]})
@@ -4514,7 +4524,7 @@ mod tests {
             Some("bots") => json!({"bots": [{"name": "calc.mend", "bot_id": 7,
                 "workspace": workspace, "created_by": "calc.lead", "created_by_id": 1}]}),
             Some("inspect") => json!({"name": "calc.mend", "bot_id": 7,
-                "settings": {"sandbox": "danger-full-access"}}),
+                "settings": {"sandbox": "danger-full-access", "env": {"SONNY_STATE": kept}}}),
             Some("turns") => json!({"turns": []}),
             _ => json!({"error": {"code": "unexpected"}}),
         })
@@ -4535,13 +4545,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(task.join("b.txt")).unwrap(), "b\n");
         assert_eq!(git(&task, &["branch", "--show-current"]), "agent/calc.mend");
         // Removed again with its branch: the tool runs in the agent's state
-        // folder, its lead's, and its answer says the folder is gone.
+        // folder, and its answer says the folder is gone.
         git(&repo, &["worktree", "remove", "--force", &target]);
         git(&repo, &["branch", "-D", "agent/calc.mend"]);
         let said = answer(&client, &call, &me, &store, &store, Place::Free)
             .await
             .unwrap();
-        let state = crate::state::folder("calc.lead").unwrap();
         assert!(said.starts_with(&format!("{state}\n\nNote: ")), "{said}");
         assert!(
             said.contains(&format!(
