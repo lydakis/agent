@@ -839,6 +839,49 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
 }
 
 #[test]
+fn a_task_removed_with_its_branch_kept_keeps_the_record_of_its_repository() {
+    let lab = Lab::new("kept-record");
+    let ws = lab.scratch.join("ws");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    let api = ws.join("src/api");
+    std::fs::rename(&lab.repo, &api).unwrap();
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it",
+        "folder": "src/api"});
+    let (ok, said) = lab.tool(&ws, "start_task", start, false);
+    assert!(ok, "{said}");
+    let worktree = lab.home.join(".agent/worktrees/demo.fix");
+    // A commit of its own, not merged.
+    std::fs::write(worktree.join("b.txt"), "b\n").unwrap();
+    lab.git(&worktree, &["add", "b.txt"]);
+    lab.git(&worktree, &["commit", "-qm", "b"]);
+    let (ok, said) = lab.remove(&ws, false);
+    assert!(ok && said.contains("agent/demo.fix is kept"), "{said}");
+    assert!(!worktree.exists());
+    // The repository it was a worktree of stays recorded with its branch,
+    // which its worktree is made again from when its agent runs again.
+    let record = lab.home.join(".agent/worktrees/.folders/demo.fix");
+    let record = std::fs::read_to_string(&record).unwrap();
+    assert_eq!(
+        record.lines().nth(1),
+        Some(&*api.to_string_lossy()),
+        "{record}"
+    );
+}
+
+#[test]
+fn a_new_worktree_drops_a_record_a_removed_task_of_its_name_left() {
+    let lab = Lab::new("stale-record");
+    // Left by a task of this name removed on another daemon, its branch
+    // kept in a repository elsewhere.
+    let record = lab.home.join(".agent/worktrees/.folders/demo.fix");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(&record, "/elsewhere/ws\n/elsewhere/ws/api\n").unwrap();
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    assert!(!record.exists());
+}
+
+#[test]
 fn a_task_given_a_linked_checkout_in_the_lead_s_folder_is_removed_from_it() {
     let lab = Lab::new("linked");
     let ws = lab.scratch.join("ws");

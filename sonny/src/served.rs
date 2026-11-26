@@ -673,7 +673,9 @@ pub fn commons() -> Value {
             "type": "object",
             "properties": {
                 "read": {"type": "string", "minLength": 1,
-                    "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
+                    "description": "A thread's name: its posts oldest first, as many as fit, with next where the rest start. \
+                        With no from it opens at the first post you were not shown; more than fit, the opening post \
+                        and the newest, hidden saying how many between them next reads."},
                 "search": {"type": "string",
                     "description": "Words: threads whose title or posts hold all of them, newest first, with those posts; \
                         none, with a filter, every post it matches."},
@@ -1630,6 +1632,8 @@ impl Server {
     /// calls still run, so a slow setup starts no task after all. A pause
     /// stops what every call runs, as it parks every turn, and nothing
     /// starts until work resumes.
+    /// A turn that starts in a task's worktree that is gone gets it back
+    /// from its branch (`restore`).
     pub fn event(&self, event: &Value) {
         let started = event["event"] == "tool_started" && event["data"]["answered_by"] == TAG;
         if started || matches!(event["event"].as_str(), Some("follow_live" | "resumed")) {
@@ -1645,6 +1649,25 @@ impl Server {
             (event["turn"].as_i64().unwrap_or(0), call.to_owned())
         };
         match event["event"].as_str() {
+            // A message taken into a turn of a task whose worktree was
+            // removed: made again from its branch while the turn starts.
+            Some("accepted") => {
+                if let (Some(bot), Some(turn), Some(workspace)) = (
+                    event["bot"].as_str(),
+                    event["turn"].as_i64(),
+                    event["data"]["workspace"].as_str(),
+                ) && crate::restore::wanted(Path::new(workspace))
+                    && tokio::runtime::Handle::try_current().is_ok()
+                {
+                    tokio::spawn(crate::restore::on_turn(
+                        self.store.clone(),
+                        self.socket.clone(),
+                        bot.to_owned(),
+                        turn,
+                        PathBuf::from(workspace),
+                    ));
+                }
+            }
             Some("turn_finished") => {
                 if let Some(turn) = event["turn"].as_i64() {
                     self.serving.lock().unwrap().finish(turn);
@@ -2532,10 +2555,17 @@ impl Part {
         }
     }
 
-    /// The agent its first run starts.
+    /// The agent its first run starts, as the `start_task` call its gate
+    /// judges: shaped to fit that tool's schema, which the daemon checks a
+    /// step against before any gate, so its name stands for the title an
+    /// automation's agent has none of.
     fn start(name: &str, model: &str, effort: Option<&str>, brief: &str) -> Part {
-        let mut arguments = json!({"name": name, "brief": brief, "model": model});
-        if let Some(effort) = effort {
+        let title: String = name.chars().take(crate::title::WRITTEN).collect();
+        let mut arguments = json!({"name": name, "title": title, "brief": brief});
+        if !model.is_empty() {
+            arguments["model"] = json!(model);
+        }
+        if let Some(effort) = effort.filter(|effort| !effort.is_empty()) {
             arguments["effort"] = json!(effort);
         }
         Part {
@@ -2907,6 +2937,34 @@ async fn answer(
         .await
         .map_err(|e| ("caller_unknown", e))?;
     let (workspace, model, effort) = as_running(&running, record);
+    // Its folder, made again when it is a task's worktree removed with its
+    // branch kept; gone, the call runs in the agent's state folder, and
+    // its answer says so.
+    let mut place = place;
+    let folder = crate::restore::folder(
+        client,
+        record,
+        Path::new(&workspace),
+        store,
+        &str_of(&caller["name"]),
+        &mut place,
+    )
+    .await;
+    let ran_in = match &folder {
+        crate::restore::Folder::There => PathBuf::from(&workspace),
+        // The state folder its shell names, which its own settings keep:
+        // a helper's is its lead's, not its maker's.
+        crate::restore::Folder::Gone(_) => crate::restore::state_folder(client, &caller)
+            .await
+            .map(PathBuf::from)
+            .ok_or((
+                "tool_failed",
+                format!(
+                    "your folder {workspace} is gone, and Sonny could not make your state \
+                     folder to run this in"
+                ),
+            ))?,
+    };
     // A run of an automation works for the automation: an open memory
     // cleanup is the automation's, whichever run's agent started it, so a
     // run that carries on one cut short changes it as its own.
@@ -2953,7 +3011,7 @@ async fn answer(
         folder: tokio::fs::canonicalize(&workspace)
             .await
             .unwrap_or_else(|_| PathBuf::from(&workspace)),
-        pwd: PathBuf::from(&workspace),
+        pwd: ran_in.clone(),
         model,
         effort,
         automation,
@@ -2965,7 +3023,7 @@ async fn answer(
     command
         .arg("tool")
         .arg(call["name"].as_str().unwrap_or_default())
-        .current_dir(&workspace)
+        .current_dir(&ran_in)
         .envs(invocation.env())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3045,6 +3103,9 @@ async fn answer(
                 output = invites_after(output, &invocation);
             }
             noted(name, bot, turn, &arguments, &output, store).await;
+            if let crate::restore::Folder::Gone(why) = &folder {
+                output = crate::restore::told(output, Path::new(&workspace), &ran_in, why);
+            }
             Ok(output)
         }
         Some(said) if said["error"]["code"].is_string() => Err((
@@ -4273,7 +4334,7 @@ mod tests {
                 ),
                 (
                     START.to_owned(),
-                    json!({"name": "check", "brief": "Check it.", "model": "openai/gpt"})
+                    json!({"name": "check", "title": "check", "brief": "Check it.", "model": "openai/gpt"})
                 ),
             ],
             "{asked:?}"
@@ -4423,6 +4484,121 @@ mod tests {
         let hub = crate::mcp::Hub::new(None);
         let refused = script(&hub, &client, &script_call, none).await;
         assert_eq!(refused.map_err(|(code, _)| code), Err("escalation_refused"));
+    }
+
+    #[tokio::test]
+    async fn a_task_whose_worktree_was_removed_gets_it_back_or_runs_its_tools_in_its_state_folder()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sonny-served-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Sonny's tool, standing in: it answers where it ran.
+        let me = dir.join("sonny");
+        std::fs::write(
+            &me,
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"output\":\"%s\"}\\n' \"$(pwd -P)\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&me, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The lead's repository, where its task's branch is kept with a
+        // commit of the task's.
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |at: &Path, args: &[&str]| crate::git::plain(at, args).unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"];
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(
+            &repo,
+            &[&commit[..], &["--allow-empty", "-m", "a"]].concat(),
+        );
+        let tree = crate::restore::home()
+            .unwrap()
+            .join(".agent/worktrees/calc.mend");
+        let target = tree.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "agent/calc.mend", &target],
+        );
+        std::fs::write(tree.join("b.txt"), "b\n").unwrap();
+        git(&tree, &["add", "."]);
+        git(&tree, &[&commit[..], &["-m", "b"]].concat());
+        git(&repo, &["worktree", "remove", "--force", &target]);
+        let lead = repo.to_string_lossy().into_owned();
+        let (task, workspace) = (tree.clone(), target.clone());
+        // The state folder its shell names, as its settings keep it: the
+        // head of its line's, not its maker's.
+        let state = crate::state::folder("calc.boss").unwrap();
+        let kept = state.clone();
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("bots") if asked["name"] == "calc.lead" => {
+                json!({"bots": [{"name": "calc.lead", "bot_id": 1, "workspace": lead}]})
+            }
+            Some("bots") => json!({"bots": [{"name": "calc.mend", "bot_id": 7,
+                "workspace": workspace, "created_by": "calc.lead", "created_by_id": 1}]}),
+            Some("inspect") => json!({"name": "calc.mend", "bot_id": 7,
+                "settings": {"sandbox": "danger-full-access", "env": {"SONNY_STATE": kept}}}),
+            Some("turns") => json!({"turns": []}),
+            _ => json!({"error": {"code": "unexpected"}}),
+        })
+        .await;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 600_000;
+        let call = json!({"bot": "calc.mend", "turn": 3, "name": MEMORY, "arguments": {},
+            "expires_ms": expires});
+        let store = dir.join("state.sqlite");
+        // Its worktree is made again from its branch, and the tool runs in
+        // it, saying nothing of it.
+        let said = answer(&client, &call, &me, &store, &store, Place::Free).await;
+        let real = std::fs::canonicalize(&task).unwrap();
+        assert_eq!(said, Ok(real.to_string_lossy().into_owned()));
+        assert_eq!(std::fs::read_to_string(task.join("b.txt")).unwrap(), "b\n");
+        assert_eq!(git(&task, &["branch", "--show-current"]), "agent/calc.mend");
+        // Removed again with its branch: the tool runs in the agent's state
+        // folder, and its answer says the folder is gone.
+        git(&repo, &["worktree", "remove", "--force", &target]);
+        git(&repo, &["branch", "-D", "agent/calc.mend"]);
+        let said = answer(&client, &call, &me, &store, &store, Place::Free)
+            .await
+            .unwrap();
+        assert!(said.starts_with(&format!("{state}\n\nNote: ")), "{said}");
+        assert!(
+            said.contains(&format!(
+                "your folder {target} is gone: its worktree was removed and its branch \
+                 agent/calc.mend is gone too, so Sonny ran this in your state folder {state}"
+            )),
+            "{said}"
+        );
+        assert!(!task.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_gone_folder_is_a_field_of_an_answer_a_script_reads_else_a_line_after_it() {
+        use crate::restore::{Gone, told};
+        let (gone, state) = (Path::new("/w/gone"), Path::new("/s/calc.lead"));
+        let said = told(r#"{"follows": []}"#.into(), gone, state, &Gone::NotATask);
+        let said: Value = serde_json::from_str(&said).unwrap();
+        assert_eq!(said["follows"], json!([]));
+        assert_eq!(
+            said["folder_gone"],
+            "your folder /w/gone is gone, so Sonny ran this in your state folder /s/calc.lead"
+        );
+        let said = told(
+            "saved".into(),
+            gone,
+            state,
+            &Gone::Failed("agent/calc.fix".into()),
+        );
+        assert_eq!(
+            said,
+            "saved\n\nNote: your folder /w/gone is gone: its worktree was removed and could not \
+             be made again from its branch agent/calc.fix, so Sonny ran this in your state \
+             folder /s/calc.lead."
+        );
     }
 
     #[test]
