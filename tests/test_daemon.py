@@ -403,6 +403,41 @@ class DaemonTests(ModelFixture):
             self.assertEqual(everyone.finished(turn)['data']['status'], 'completed')
         self.assertEqual(len([e for e in everyone.durable if e['event'] == 'turn_finished']), 9)
 
+    def test_a_request_waiting_for_admissions_holds_only_its_own_session(self):
+        # A disk whose syncs take as long as a file says (bench/held).
+        shim, held = self.path/'slow_sync.so', self.path/'sync-ms'
+        source = Path(__file__).resolve().parents[1]/'bench/held/slow_sync.c'
+        subprocess.run(['cc', '-O2', '-shared', '-fPIC', '-o', str(shim), str(source), '-ldl'], check=True)
+        held.write_text('0')
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo',
+                              env={**clean_env(), 'LD_PRELOAD': str(shim), 'SLOW_SYNC_FILE': str(held)})
+        self.addCleanup(client.close)
+        for bot in ('Ann', 'Bob'):
+            self.assertIn('result', client.request('create', bot=bot, workspace=str(self.path), tools=['echo']))
+        admitting, waiting, reading = (Connection(client.socket_path) for _ in range(3))
+        for connection in (admitting, waiting, reading):
+            self.addCleanup(connection.close)
+        held.write_text('1500')
+        line = lambda n, **request: json.dumps(dict(id=n, **request)) + '\n'
+        # A submission is queued until its commit lands; `stats` waits for
+        # every admission queued before it, and the session's next request
+        # waits for `stats`.
+        admitting.socket.sendall(line(1, op='submit', bot='Ann', request_id='r1', prompt='hi', delivery='reject').encode())
+        time.sleep(.2)
+        waiting.socket.sendall((line(1, op='stats') + line(2, op='inspect', bot='Bob')).encode())
+        time.sleep(.2)
+        # Another session is served meanwhile.
+        began = time.monotonic()
+        self.assertIn('result', reading.request('inspect', bot='Bob'))
+        self.assertLess(time.monotonic() - began, .75)
+        answered = admitting.receive(lambda e: e.get('id') == 1)
+        replies = [waiting.receive(lambda e: 'id' in e and 'event' not in e) for _ in range(2)]
+        held.write_text('0')
+        self.assertIn('result', answered, answered)
+        self.assertEqual([r['id'] for r in replies], [1, 2])
+        for reply in replies:
+            self.assertIn('result', reply, reply)
+
     def test_large_creations_sent_together_all_answer(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)

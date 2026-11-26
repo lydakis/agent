@@ -3668,12 +3668,24 @@ fn creation(request_id: Option<&str>, request: Option<Value>) -> Option<String> 
 const HISTORY_MATCHES: usize = 20;
 /// Item bytes one history search reads before it stops at a turn's start.
 const HISTORY_SEARCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Nodes a history search walks in one read of the store: each piece is a
+/// snapshot of its own, so a search through a long history never holds one
+/// for long, as a long read would keep every commit since from being
+/// copied back into the store (a checkpoint stops at the oldest snapshot
+/// still read).
+const SEARCH_PIECE: i64 = 256;
 const HISTORY_QUERY_BYTES: usize = 256;
 /// Text shown on each side of a history search's match.
 const HISTORY_AROUND_BYTES: usize = 160;
 
 /// The match at `at`, `len` bytes long, with up to `HISTORY_AROUND_BYTES`
 /// on each side, cut at character boundaries.
+/// The end of a piece of a history search's walk: its read of the store
+/// ends, and nothing it read is kept.
+fn search_piece(snapshot: rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(snapshot.commit()?)
+}
+
 fn around(text: &str, at: usize, len: usize) -> String {
     let mut start = at.saturating_sub(HISTORY_AROUND_BYTES);
     while !text.is_char_boundary(start) {
@@ -9083,13 +9095,15 @@ impl Database {
             .ok_or(Error::new("bot_not_found"))?;
         let needle = query.to_ascii_lowercase();
         // Ordered by depth, the walk yields the head first and ends at the
-        // root, so a search that finds enough stops early.
+        // root, so a search that finds enough stops early. It is read a
+        // piece of `SEARCH_PIECE` nodes at a time, each piece and its
+        // items in a read of its own (`search_piece`).
         let mut chain = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,depth,turn_seq,size) AS (
-                SELECT id,parent,depth,turn_seq,COALESCE(packed,length(item),0) FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.depth,n.turn_seq,COALESCE(n.packed,length(n.item),0)
-                FROM nodes n JOIN chain c ON n.id=c.parent ORDER BY 3 DESC)
-             SELECT id,turn_seq,size FROM chain",
+            "WITH RECURSIVE chain(id,parent,depth,turn_seq,size,walked) AS (
+                SELECT id,parent,depth,turn_seq,COALESCE(packed,length(item),0),1 FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.turn_seq,COALESCE(n.packed,length(n.item),0),c.walked+1
+                FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.walked<?2 ORDER BY 3 DESC)
+             SELECT id,turn_seq,size,parent FROM chain",
         )?;
         // SQLite's lower() folds ASCII only, as to_ascii_lowercase does. A
         // multiline item reads with its whitespace compacted, so text the
@@ -9108,14 +9122,36 @@ impl Database {
              FROM (SELECT {PICTURELESS} AS item FROM
                 (SELECT COALESCE(d.item,{N_ITEM}) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
-        let mut rows = chain.query(params![head])?;
         let mut skipping = own || before.is_some();
         let mut found: Vec<Value> = Vec::new(); // In the turn being walked.
         let mut matches: Vec<Value> = Vec::new();
         let mut searched = 0_u64;
         let mut next_before = None;
-        while let Some(row) = rows.next()? {
-            let (id, turn, size): (i64, Option<i64>, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
+        let mut piece: std::collections::VecDeque<(i64, Option<i64>, i64, Option<i64>)> =
+            Default::default();
+        let mut next = head;
+        let mut snapshot = None;
+        loop {
+            if piece.is_empty() {
+                // The last piece's read ends before the next one's begins.
+                if let Some(snapshot) = snapshot.take() {
+                    search_piece(snapshot)?;
+                }
+                let Some(at) = next else { break };
+                snapshot = Some(self.conn.unchecked_transaction()?);
+                piece = chain
+                    .query_map(params![at, SEARCH_PIECE], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                // A node freed since the last piece (its bot deleted, or
+                // its history switched away from it) ends the walk there.
+                next = piece.back().and_then(|(.., parent)| *parent);
+                if piece.is_empty() {
+                    continue;
+                }
+            }
+            let (id, turn, size, _) = piece.pop_front().expect("a piece has its nodes");
             if skipping {
                 if let Some(turn) = turn
                     && before.is_none_or(|before| before == turn)
@@ -9144,6 +9180,9 @@ impl Database {
                 break;
             }
         }
+        if let Some(snapshot) = snapshot {
+            search_piece(snapshot)?;
+        }
         if skipping && before.is_some() {
             return fail("turn_not_in_history");
         }
@@ -9165,7 +9204,10 @@ impl Database {
     /// once the merge reaches its head. `skip` is the turn the search runs
     /// in, left out. With `before`, only older nodes are searched. Once
     /// `HISTORY_MATCHES` matches are listed or `HISTORY_SEARCH_BYTES` of
-    /// items searched, `next_before` says where to go on from.
+    /// items searched, `next_before` says where to go on from. The walks
+    /// read the store `SEARCH_PIECE` nodes at a time, each piece a read of
+    /// its own, as `history_search` does: a node freed meanwhile (its bot
+    /// deleted, its history switched away) ends the walk that reached it.
     pub fn history_search_bots(
         &self,
         pattern: &str,
@@ -9173,12 +9215,7 @@ impl Database {
         before: Option<i64>,
         skip: Option<i64>,
     ) -> Result<Value> {
-        // One read of the store throughout, so a bot deleted meanwhile
-        // takes no node from under a walk.
-        let snapshot = self.conn.unchecked_transaction()?;
-        let found = self.search_bots(pattern, query, before, skip)?;
-        snapshot.commit()?;
-        Ok(found)
+        self.search_bots(pattern, query, before, skip)
     }
     fn search_bots(
         &self,
@@ -9222,14 +9259,16 @@ impl Database {
         let mut node = self.conn.prepare_cached(
             "SELECT parent,turn,turn_seq,COALESCE(packed,length(item),0) FROM nodes WHERE id=?",
         )?;
-        let mut read = |id: i64| -> Result<Node> {
-            Ok(node.query_row([id], |r| {
-                Ok(Node {
-                    parent: r.get(0)?,
-                    starts: r.get::<_, Option<i64>>(1)?.zip(r.get::<_, Option<i64>>(2)?),
-                    size: r.get(3)?,
+        let mut read = |id: i64| -> Result<Option<Node>> {
+            Ok(node
+                .query_row([id], |r| {
+                    Ok(Node {
+                        parent: r.get(0)?,
+                        starts: r.get::<_, Option<i64>>(1)?.zip(r.get::<_, Option<i64>>(2)?),
+                        size: r.get(3)?,
+                    })
                 })
-            })?)
+                .optional()?)
         };
         /// Its matches whose turn its walk has not reached the start of
         /// yet, with their node IDs and the bots they are of.
@@ -9276,11 +9315,19 @@ impl Database {
         };
         let mut searched = 0_u64;
         let mut next_before = None;
+        let mut snapshot = Some(self.conn.unchecked_transaction()?);
+        let mut walked = 0;
         while let Some((top, std::cmp::Reverse(walk))) = heap.pop() {
             if listed >= HISTORY_MATCHES || searched >= HISTORY_SEARCH_BYTES {
                 heap.push((top, std::cmp::Reverse(walk)));
                 next_before = Some(top + 1);
                 break;
+            }
+            walked += 1;
+            if walked % SEARCH_PIECE == 0 {
+                // The last piece's read ends before the next one's begins.
+                search_piece(snapshot.take().expect("a piece is being read"))?;
+                snapshot = Some(self.conn.unchecked_transaction()?);
             }
             // The other walks here end in this one, the oldest bot's.
             while let Some(&(id, std::cmp::Reverse(other))) = heap.peek()
@@ -9290,7 +9337,13 @@ impl Database {
                 let theirs = std::mem::take(&mut found[other]);
                 found[walk].extend(theirs);
             }
-            let at = read(top)?;
+            let Some(at) = read(top)? else {
+                // Freed since its walk got here: the walk ends, and what it
+                // found in a turn it never reached the start of goes too.
+                listed -= found[walk].len();
+                found[walk].clear();
+                continue;
+            };
             if before.is_none_or(|before| top < before) {
                 searched += at.size as u64;
                 if contains.query_row(params![top, needle], |r| r.get::<_, bool>(0))? {
@@ -9315,7 +9368,15 @@ impl Database {
         // Matches whose turn starts further down: read on to its start.
         for (mut id, std::cmp::Reverse(walk)) in heap.into_vec() {
             while !found[walk].is_empty() {
-                let at = read(id)?;
+                walked += 1;
+                if walked % SEARCH_PIECE == 0 {
+                    search_piece(snapshot.take().expect("a piece is being read"))?;
+                    snapshot = Some(self.conn.unchecked_transaction()?);
+                }
+                let Some(at) = read(id)? else {
+                    found[walk].clear();
+                    break;
+                };
                 name(&mut found[walk], &at, &mut listed);
                 // A history's first nodes may start no turn.
                 match at.parent {
@@ -9324,6 +9385,7 @@ impl Database {
                 }
             }
         }
+        search_piece(snapshot.take().expect("a piece is being read"))?;
         matches.sort_unstable_by_key(|(node, _)| std::cmp::Reverse(*node));
         let matches: Vec<Value> = matches.into_iter().map(|(_, found)| found).collect();
         Ok(json!({"bots":pattern,"query":query,"matches":matches,

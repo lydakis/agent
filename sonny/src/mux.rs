@@ -530,8 +530,24 @@ fn now_ms() -> u64 {
 }
 
 /// This Sonny window of a project, noted as the one the person uses each
-/// time they do, at most once a second.
+/// time they do, at most once a second. The note is a file of the
+/// project's, written beside the window's loop, never on it: on a disk
+/// another process keeps busy syncing, opening and renaming a file can wait
+/// half a second, and every key typed meanwhile would wait with it.
 pub struct Marker {
+    noted: std::sync::Arc<Noted>,
+    last: Option<Instant>,
+}
+
+/// What a [`Marker`] notes, and whether a note is on its way to the file.
+struct Noted {
+    window: std::sync::Mutex<Noting>,
+    /// A note is on its way and not begun: a use meanwhile is in it, as its
+    /// time is read when it is written.
+    coming: std::sync::atomic::AtomicBool,
+}
+
+struct Noting {
     file: PathBuf,
     /// The agent this window shows.
     bot: String,
@@ -539,19 +555,36 @@ pub struct Marker {
     /// A window of an agent, not a lead, takes the place of the project's
     /// window used last, since it opened in that one's home.
     follows: bool,
-    last: Option<Instant>,
+    /// The window closed ([`Marker::retire`]): a note still on its way
+    /// notes nothing.
+    retired: bool,
 }
 
 impl Marker {
-    /// A lead's window, laid out at `place` or in no multiplexer.
-    pub fn lead(socket: &Path, project: &str, bot: &str, place: Option<Place>) -> Option<Self> {
-        Some(Self {
-            file: Place::file(socket, project)?,
+    fn new(file: PathBuf, bot: &str, place: Option<Place>, follows: bool) -> Self {
+        let window = Noting {
+            file,
             bot: bot.to_owned(),
             place,
-            follows: false,
+            follows,
+            retired: false,
+        };
+        Self {
+            noted: std::sync::Arc::new(Noted {
+                window: std::sync::Mutex::new(window),
+                coming: std::sync::atomic::AtomicBool::new(false),
+            }),
             last: None,
-        })
+        }
+    }
+
+    fn noting(&self) -> std::sync::MutexGuard<'_, Noting> {
+        self.noted.window.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A lead's window, laid out at `place` or in no multiplexer.
+    pub fn lead(socket: &Path, project: &str, bot: &str, place: Option<Place>) -> Option<Self> {
+        Some(Self::new(Place::file(socket, project)?, bot, place, false))
     }
 
     /// The window of one of the project's agents, not its lead: `here`
@@ -566,19 +599,20 @@ impl Marker {
         here: bool,
         given: Option<Option<Place>>,
     ) -> Option<Self> {
-        Some(Self {
-            file: Place::file(socket, project)?,
-            bot: bot.to_owned(),
-            follows: here && given.is_none(),
-            place: given.flatten(),
-            last: None,
-        })
+        let follows = here && given.is_none();
+        Some(Self::new(
+            Place::file(socket, project)?,
+            bot,
+            given.flatten(),
+            follows,
+        ))
     }
 
     /// Where this window is, once known: handed to the Sonny that
     /// replaces it in the same terminal.
     pub fn known(&self) -> Option<Option<Place>> {
-        (!self.follows).then(|| self.place.clone())
+        let noting = self.noting();
+        (!noting.follows).then(|| noting.place.clone())
     }
 
     /// Typing: noted at most once a second.
@@ -593,9 +627,56 @@ impl Marker {
     }
 
     /// A click, a paste, Enter or the window coming to the front: noted
-    /// at once, as the person may have just come back from another window.
+    /// at once, as the person may have just come back from another window,
+    /// beside the window's loop where it runs on one.
     pub fn used_now(&mut self) {
         self.last = Some(Instant::now());
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.noting().note();
+            return;
+        };
+        if self
+            .noted
+            .coming
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let noted = self.noted.clone();
+        // One note waits at most: the flag stays up until this one holds
+        // the window, so uses meanwhile ride on it, and one after it is
+        // taken notes again behind it.
+        runtime.spawn_blocking(move || {
+            let mut window = noted.window.lock().unwrap_or_else(|e| e.into_inner());
+            noted
+                .coming
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            window.note();
+        });
+    }
+
+    /// Noted now, on this thread: as a window opens, before what it opens
+    /// reads where it is.
+    pub fn mark(&mut self) {
+        self.last = Some(Instant::now());
+        self.noting().note();
+    }
+
+    /// This window is gone, though its process goes on as another
+    /// agent's Sonny, which marks itself; a note still on its way notes
+    /// nothing.
+    pub fn retire(&self) {
+        let mut noting = self.noting();
+        noting.retired = true;
+        retire_in(&noting.file, std::process::id());
+    }
+}
+
+impl Noting {
+    fn note(&mut self) {
+        if self.retired {
+            return;
+        }
         // An agent's window Sonny opens is told its home; one opened by
         // hand in a multiplexer was most likely opened in the home of the
         // window used last that is in one, open or since closed. That home
@@ -620,12 +701,6 @@ impl Marker {
             place,
         };
         mark_in(&self.file, me, alive);
-    }
-
-    /// This window is gone, though its process goes on as another
-    /// agent's Sonny, which marks itself.
-    pub fn retire(&self) {
-        retire_in(&self.file, std::process::id());
     }
 }
 
@@ -2501,17 +2576,11 @@ mod tests {
             place: Some(home.clone()),
         };
         mark_in(&file, lead, |_| true);
-        let mut task = Marker {
-            file: file.clone(),
-            bot: "shop.fix".into(),
-            place: None,
-            follows: true,
-            last: None,
-        };
+        let mut task = Marker::new(file.clone(), "shop.fix", None, true);
         // Read while the lead's window counts as open.
         let opened_in = windows(&file)[0].place.clone();
-        task.place = opened_in;
-        task.follows = false;
+        task.noting().place = opened_in;
+        task.noting().follows = false;
         task.used();
         assert_eq!(windows(&file)[0].place, Some(home.clone()));
         // The task's window used last, in the lead's home: the lead still
@@ -2567,19 +2636,47 @@ mod tests {
         let home = Place::Cmux {
             workspace: "9A".into(),
         };
-        let mut task = Marker {
-            file: file.clone(),
-            bot: "shop.fix".into(),
-            follows: false,
-            place: Some(home.clone()),
-            last: None,
-        };
+        let mut task = Marker::new(file.clone(), "shop.fix", Some(home.clone()), false);
         assert_eq!(task.known(), Some(Some(home.clone())));
         task.used_now();
         assert_eq!(windows(&file)[0].place, Some(home));
         // One still to learn its home hands nothing on.
-        task.follows = true;
+        task.noting().follows = true;
         assert_eq!(task.known(), None);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A use is noted beside the window's loop: while the note before it
+    /// is still being written (the disk slow to take it), the window goes
+    /// on at once, and the note lands once the disk lets it.
+    #[tokio::test]
+    async fn a_note_the_disk_holds_never_holds_the_window() {
+        let file =
+            std::env::temp_dir().join(format!("sonny-held-note-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let mut window = Marker::new(file.clone(), "shop.lead", None, false);
+        let noted = window.noted.clone();
+        let holding = noted.window.lock().unwrap();
+        let at = Instant::now();
+        window.used_now();
+        window.used_now();
+        assert!(at.elapsed() < Duration::from_millis(500));
+        assert!(windows(&file).is_empty());
+        // One note waits for the disk: uses meanwhile ride on it rather
+        // than each sending another after it.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(noted.coming.load(std::sync::atomic::Ordering::SeqCst));
+        drop(holding);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while windows(&file).is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(windows(&file)[0].bot, "shop.lead");
+        // Closed, a note still on its way notes nothing.
+        window.retire();
+        window.used_now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(windows(&file)[0].pid, 0);
         let _ = std::fs::remove_file(&file);
     }
 

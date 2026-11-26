@@ -195,6 +195,7 @@ async fn held_daemon(
                         Some("submit") => json!({"message":
                             message.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1}),
                         Some("inspect") => json!({"name": "b"}),
+                        Some("bots") => json!({"bots": [{"name": "b", "bot_id": 1}]}),
                         _ => json!({}),
                     };
                     let answer = json!({"id": asked["id"], "result": result});
@@ -254,11 +255,26 @@ fn press(keys: &tokio::sync::mpsc::UnboundedSender<Event>, key: Event) -> Instan
 }
 
 /// The time from each key to the first frame that shows what it typed.
+/// A key taken together with the keys after it shows in the frame that
+/// shows them: one drawn once a later key of the same run of typing was
+/// pressed, showing what that key typed.
 fn latencies(sent: &[(Instant, String)], frames: &[(Instant, String, String)]) -> Vec<Duration> {
+    let composer = |row: &str| row.split_once("› ").map(|(_, typed)| typed.to_owned());
     sent.iter()
-        .map(|(at, typed)| {
+        .enumerate()
+        .map(|(k, (at, typed))| {
+            // This key and the later ones that only add to what it typed.
+            let run: Vec<&(Instant, String)> = sent[k..]
+                .iter()
+                .take_while(|(_, later)| !typed.is_empty() && later.starts_with(typed.as_str()))
+                .collect();
             let shown = frames.iter().find(|(drawn, row, _)| {
-                drawn >= at && row.split_once("› ").map(|(_, typed)| typed) == Some(typed)
+                drawn >= at
+                    && composer(row).is_some_and(|shown| {
+                        shown == *typed
+                            || (run.iter())
+                                .any(|(pressed, later)| drawn >= pressed && shown == *later)
+                    })
             });
             match shown {
                 Some((drawn, ..)) => *drawn - *at,
@@ -803,4 +819,116 @@ async fn letters_already_waiting_are_one_frame_and_land_in_order() {
         .find(|(_, asked)| asked["op"] == "submit")
         .map(|(_, asked)| asked["prompt"].clone());
     assert_eq!(submitted, Some(json!(expected)));
+}
+
+/// The commands that read the daemon before they show anything (`/switch`
+/// and the list it opens, `/context`, `/audit`, `/usage`, a side chat, a
+/// reaction on a reply the window no longer keeps) leave the window to
+/// the person meanwhile: each is taken at once, and shows what it read
+/// once that comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commands_that_read_the_daemon_never_hold_the_window() {
+    let (client, _events, _tell, asked, socket) =
+        held_daemon(HELD, kept("A reply"), json!([])).await;
+    let mut app = window(client, socket);
+    for command in [
+        "/switch",
+        "/switch other",
+        "/context",
+        "/audit",
+        "/usage",
+        "/side what is left?",
+    ] {
+        // Typed, as the person does: each command moves on from the last.
+        let at = Instant::now();
+        for c in command.chars() {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+        app.key(key(KeyCode::Enter)).await;
+        // A card's first read is one look round away.
+        if app.pane.as_ref().is_some_and(pane::Pane::is_card) {
+            app.reread().await;
+        }
+        at_once(at.elapsed(), HELD);
+        assert!(app.input.is_empty(), "{command}");
+    }
+    let at = Instant::now();
+    app.press_row("react/2").await;
+    at_once(at.elapsed(), HELD);
+    // What each read, once it comes back: the reply picked to react to.
+    app.beside_done().await;
+    assert_eq!(
+        app.react_to
+            .as_ref()
+            .map(|(node, first)| (*node, first.as_str())),
+        Some((2, "A reply"))
+    );
+    let ops: Vec<Value> = (asked.lock().unwrap().iter())
+        .map(|(_, asked)| asked["op"].clone())
+        .collect();
+    for op in ["bots", "inspect", "audit", "history_items"] {
+        assert!(ops.contains(&json!(op)), "{op} in {ops:?}");
+    }
+    // The context card and the list `/switch` read, asked for before the
+    // person typed on, never took the window: what they did since stands.
+    assert!(app.context_read.is_none());
+    assert!(app.agents.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_list_read_beside_the_window_opens_only_if_the_person_waits_for_it() {
+    async fn type_in(app: &mut App, line: &str) {
+        for c in line.chars() {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+    }
+    let (client, _events, _tell, _asked, socket) =
+        held_daemon(Duration::from_millis(300), kept("A reply"), json!([])).await;
+    // Waited for: the list opens.
+    let mut app = window(client.clone(), socket.clone());
+    type_in(&mut app, "/switch").await;
+    app.key(key(KeyCode::Enter)).await;
+    app.beside_done().await;
+    assert!(app.agents.is_some());
+    // Typed on meanwhile: what was typed stays where it was typed.
+    let mut app = window(client, socket);
+    type_in(&mut app, "/switch").await;
+    app.key(key(KeyCode::Enter)).await;
+    type_in(&mut app, "hi").await;
+    app.beside_done().await;
+    assert!(app.agents.is_none());
+    assert_eq!(app.input.trim(), "hi");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_side_chat_asked_for_is_sent_before_the_window_quits() {
+    let (client, mut events, _tell, asked, socket) =
+        held_daemon(Duration::from_secs(1), kept("A reply"), json!([])).await;
+    let mut app = window(client, socket);
+    let mut terminal = Terminal::new(Probe {
+        screen: ratatui::backend::TestBackend::new(100, 30),
+        frames: Arc::new(Mutex::new(Vec::new())),
+    })
+    .unwrap();
+    let (keys, taken) = tokio::sync::mpsc::unbounded_channel();
+    // Asked for, then the window quits at once, while the daemon holds
+    // every answer.
+    for line in ["/side what is left?", "/quit"] {
+        for c in line.chars() {
+            keys.send(key(KeyCode::Char(c))).unwrap();
+        }
+        keys.send(key(KeyCode::Enter)).unwrap();
+    }
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        app.run(&mut terminal, &mut events, taken),
+    )
+    .await
+    .expect("the window quit")
+    .unwrap();
+    let submitted = (asked.lock().unwrap().iter()).any(|(_, asked)| {
+        asked["op"] == "submit"
+            && (asked["prompt"].as_str()).is_some_and(|prompt| prompt.contains("what is left?"))
+    });
+    assert!(submitted, "{:?}", asked.lock().unwrap());
 }
