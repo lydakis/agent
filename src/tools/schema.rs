@@ -10,17 +10,19 @@
 //! what it can judge, so a schema it reads in part never refuses a call
 //! that fits the whole. `oneOf` is held only to "at least one", since a
 //! branch passed here may not pass in full. Its work is bounded
-//! ([`WORK`]), whatever the schema and arguments: past it, what is left
-//! passes.
+//! ([`WORK`]), whatever the schema and arguments: every step of every
+//! loop spends from it, and past it, what is left passes.
 use serde_json::{Map, Value};
 
 /// How deep the check follows a schema into a value, and how many local
 /// references it follows in one call: past either, what is left passes.
 const MAX_DEPTH: usize = 64;
 const MAX_REFS: usize = 256;
-/// The most steps one check takes: a schema met at a place in the value,
-/// a value compared with one an `enum` or `const` names, or [`SCAN`]
-/// bytes of a string read to count or compare it. A few milliseconds at
+/// The most steps one check takes. Each turn of any loop in the check is
+/// a step: a schema met at a place in the value, a field, item, branch,
+/// required name or type name looked at, a value compared with one an
+/// `enum` or `const` names; and so are each [`SCAN`] bytes of a string
+/// read to count, compare or look it up. A few milliseconds at
 /// most, so a check may run beside other work.
 const WORK: usize = 100_000;
 /// The bytes of a string read in one step.
@@ -32,6 +34,8 @@ const SCAN: usize = 256;
 pub struct Misfit {
     path: String,
     rule: String,
+    /// The path's segments while the check unwinds, innermost first.
+    trail: Vec<String>,
 }
 
 impl std::fmt::Display for Misfit {
@@ -52,7 +56,8 @@ pub fn check(schema: &Value, value: &Value) -> Result<(), Misfit> {
         work: WORK,
     };
     checker.fits(schema, value, 0).map_err(|mut misfit| {
-        misfit.path = misfit.path.trim_start_matches('.').to_owned();
+        let path: String = misfit.trail.drain(..).rev().collect();
+        misfit.path = path.trim_start_matches('.').to_owned();
         misfit
     })
 }
@@ -71,13 +76,14 @@ fn misfit(rule: impl Into<String>) -> Misfit {
     Misfit {
         path: String::new(),
         rule: rule.into(),
+        trail: Vec::new(),
     }
 }
 
 /// A misfit found inside `segment` of the value: `.name` or `[2]`.
 fn inside(segment: String) -> impl FnOnce(Misfit) -> Misfit {
     move |mut misfit| {
-        misfit.path.insert_str(0, &segment);
+        misfit.trail.push(segment);
         misfit
     }
 }
@@ -88,14 +94,14 @@ fn field(name: &str) -> String {
 
 impl<'a> Checker<'a> {
     fn fits(&mut self, schema: &'a Value, value: &Value, depth: usize) -> Result<(), Misfit> {
+        if depth > MAX_DEPTH || !self.spend() {
+            return Ok(());
+        }
         let schema = match schema {
             Value::Bool(false) => return Err(misfit("not allowed")),
             Value::Object(schema) => schema,
             _ => return Ok(()),
         };
-        if depth > MAX_DEPTH || !self.spend() {
-            return Ok(());
-        }
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
             // Only a reference into this schema is followed; another passes.
             if let Some(target) = reference
@@ -108,7 +114,14 @@ impl<'a> Checker<'a> {
             }
         }
         if let Some(types) = schema.get("type") {
-            typed(types, value)?;
+            let names: Vec<&str> = match types {
+                Value::String(name) => vec![name],
+                Value::Array(names) if self.steps(names.len()) => {
+                    names.iter().filter_map(Value::as_str).collect()
+                }
+                _ => Vec::new(),
+            };
+            typed(&names, value)?;
         }
         if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
             let mut known = true;
@@ -238,8 +251,12 @@ impl<'a> Checker<'a> {
     /// One step, and one more for each [`SCAN`] bytes of a string to read,
     /// if that many are left.
     fn spend_on(&mut self, bytes: usize) -> bool {
-        let steps = 1 + bytes / SCAN;
-        self.work = self.work.saturating_sub(steps);
+        self.steps(1 + bytes / SCAN)
+    }
+
+    /// `count` steps, if that many are left.
+    fn steps(&mut self, count: usize) -> bool {
+        self.work = self.work.saturating_sub(count);
         self.work > 0
     }
 
@@ -267,6 +284,9 @@ impl<'a> Checker<'a> {
                     return Some(false);
                 }
                 for (k, v) in x {
+                    if !self.spend_on(k.len()) {
+                        return None;
+                    }
                     let Some(w) = y.get(k) else {
                         return Some(false);
                     };
@@ -346,6 +366,9 @@ impl<'a> Checker<'a> {
             .flatten()
             .filter_map(Value::as_str)
         {
+            if !self.spend_on(required.len()) {
+                return Ok(());
+            }
             if !fields.contains_key(required) {
                 return Err(misfit(format!("{required} is required")));
             }
@@ -374,6 +397,9 @@ impl<'a> Checker<'a> {
             .get("additionalProperties")
             .filter(|_| !schema.contains_key("patternProperties"));
         for (name, value) in fields {
+            if !self.spend_on(name.len()) {
+                return Ok(());
+            }
             let schema = match properties.and_then(|properties| properties.get(name)) {
                 Some(property) => property,
                 None => match additional {
@@ -389,14 +415,9 @@ impl<'a> Checker<'a> {
     }
 }
 
-/// Whether `value` is of one of the types `types` names (a name or a list
-/// of them). A name the check does not know passes.
-fn typed(types: &Value, value: &Value) -> Result<(), Misfit> {
-    let names: Vec<&str> = match types {
-        Value::String(name) => vec![name],
-        Value::Array(names) => names.iter().filter_map(Value::as_str).collect(),
-        _ => return Ok(()),
-    };
+/// Whether `value` is of one of the types `names` lists. A name the check
+/// does not know passes.
+fn typed(names: &[&str], value: &Value) -> Result<(), Misfit> {
     let is = |name: &str| match name {
         "string" => Some(value.is_string()),
         "integer" => Some(integer(value)),
@@ -735,6 +756,26 @@ mod tests {
             said(json!({"maxLength": 3}), json!("éééé")),
             "at most 3 characters, got 4"
         );
+        // Every loop spends: fields no schema names, schemas that judge
+        // nothing, and long lists of type names.
+        let quick = |schema: Value, value: Value| {
+            let started = std::time::Instant::now();
+            assert!(check(&schema, &value).is_ok());
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+        };
+        let fields: Map<String, Value> = (0..50_000).map(|n| (format!("f{n}"), json!(0))).collect();
+        let named: Vec<Value> = (0..2_000)
+            .map(|_| json!({"properties": {"z": {}}}))
+            .collect();
+        quick(json!({"allOf": named}), Value::Object(fields));
+        let open: Vec<Value> = (0..2_000).map(|_| json!(true)).collect();
+        quick(json!({"items": {"allOf": open}}), json!(vec![0; 100_000]));
+        let types: Vec<Value> = (0..10_000).map(|_| json!("integer")).collect();
+        quick(json!({"items": {"type": types}}), json!(vec![0; 100_000]));
         // A misfit within the bound is still found.
         let early = json!([9_999, 10_000]);
         assert_eq!(
