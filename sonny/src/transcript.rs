@@ -1249,7 +1249,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
     match origin {
         crate::lookout::BOUNCE_ORIGIN => return "a returned message",
         crate::project::START_ORIGIN => return "Sonny's start",
-        crate::away::ORIGIN | crate::asks::ASIDE_ORIGIN => return "Sonny",
+        crate::away::ORIGIN => return "Sonny",
         _ => {}
     }
     match origin.split('.').next() {
@@ -2100,6 +2100,14 @@ pub fn unseen(c: char) -> bool {
             c,
             '\u{AD}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
         )
+}
+
+/// Whether `words` show nothing: only whitespace, as Codex draws no such
+/// reply, or zero-width spaces and other characters that show nothing
+/// ([`unseen`]), which models send for an empty reply. The one test of
+/// whether an agent's reply said anything, wherever Sonny asks it.
+pub fn blank(words: &str) -> bool {
+    words.chars().all(unseen)
 }
 
 /// Whether a reply's `rows` show nothing past the two columns each opens

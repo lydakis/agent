@@ -178,12 +178,11 @@ fn without(text: &str) -> String {
 const SEEN: &str = ".seen";
 /// For each thread, how many of its posts each agent has been shown: by
 /// reading it, posting in it, a search that showed it whole, or the
-/// lookout's note. A reply from an agent shown fewer than the thread
-/// holds is not posted the first time, as an edit made on an old copy of
-/// a wiki page is not saved: its answer shows the posts it missed, which
-/// then count as shown, so the same reply sent again is posted. A board
-/// step with no text posts at once, its answer showing what it missed:
-/// the board's own checks guard the step.
+/// lookout's note. A reply posts at once, as a reply in a chat or an
+/// issue's comments does: a post only adds to the thread, so nothing it
+/// missed is overwritten. Its answer shows the posts its agent had not
+/// been shown (`missed`), and they then count as shown. A board step's own
+/// checks (where its work stands, who holds it) guard the step.
 const SHOWN: &str = ".shown";
 
 pub fn dir(home: &Path) -> PathBuf {
@@ -392,7 +391,7 @@ pub(crate) fn entry(
 }
 
 /// A post with no text, signed as [`entry`] signs one: a board step
-/// alone, which posts at once, as [`add_locked`] says.
+/// alone.
 pub(crate) fn signed(
     author: &str,
     author_id: Option<i64>,
@@ -1661,19 +1660,6 @@ pub(crate) fn add_locked(
     let by = post["by"].as_str().unwrap_or_default();
     let who = reader;
     let upto = shown(dir, name, who);
-    // A board step with no words says nothing that missed posts could
-    // make stale: it posts, and shows them.
-    let bare = post.get("text").is_none();
-    if upto < earlier.len() && !bare {
-        let missed = earlier.len() - upto;
-        let mut said = read_locked(dir, name, by, who, upto)?;
-        said["posted"] = json!(false);
-        said["missed"] = json!(format!(
-            "Not posted: {missed} post{} came that you had not been shown, below. The same reply sent again is posted.",
-            if missed == 1 { "" } else { "s" }
-        ));
-        return Ok(said);
-    }
     // What it missed, as `read` gives it from there, its first page now
     // shown; a later page stays unshown until read.
     let missed = (upto < earlier.len())
@@ -4545,7 +4531,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_after_posts_its_author_missed_waits_once_and_shows_them() {
+    fn a_reply_after_posts_its_author_missed_posts_at_once_and_shows_them() {
         let home = home("missed");
         let send =
             |by: &str, arguments: Value| super::call(&home, by, None, by, None, None, &arguments);
@@ -4558,42 +4544,49 @@ mod tests {
         send("b.y", json!({"read": "t"})).unwrap();
         send("c.z", json!({"read": "t"})).unwrap();
         let reply = |text: &str| json!({"reply": {"thread": "t", "text": text}});
-        assert_eq!(send("b.y", reply("Fake HOME")).unwrap()["posts"], 2);
-        // The second was not shown the first's answer: held, with it.
-        let held = send("c.z", reply("Fake HOME")).unwrap();
-        assert_eq!(held["posted"], false);
-        assert_eq!(held["from"], 1);
-        assert_eq!(held["posts"].as_array().unwrap().len(), 1);
-        assert_eq!(held["posts"][0]["by"], "b.y");
+        let first = send("b.y", reply("Fake HOME")).unwrap();
+        assert_eq!(first["posts"], 2);
+        assert!(first.get("missed").is_none(), "{first}");
+        // The second was not shown the first's answer: posted all the
+        // same, as a chat posts it, with the post it missed.
+        let second = send("c.z", reply("Fake HOME")).unwrap();
+        assert!(second.get("posted").is_none(), "{second}");
+        assert_eq!(second["posts"], 3);
+        assert_eq!(second["missed"]["from"], 1);
+        assert_eq!(second["missed"]["posts"].as_array().unwrap().len(), 1);
+        assert_eq!(second["missed"]["posts"][0]["by"], "b.y");
+        assert_eq!(posts(&dir(&home).join("t.jsonl")).unwrap().len(), 3);
+        // What it missed counts as shown, and so does its own reply.
+        assert_eq!(shown(&dir(&home), "t", "c.z"), 3);
         assert!(
-            held["missed"]
-                .as_str()
+            send("c.z", reply("As b.y says"))
                 .unwrap()
-                .starts_with("Not posted: 1 post came")
+                .get("missed")
+                .is_none()
         );
-        assert_eq!(posts(&dir(&home).join("t.jsonl")).unwrap().len(), 2);
-        // Sent again, now shown, it is posted.
-        assert_eq!(
-            send("c.z", reply("Fake HOME, as b.y says")).unwrap()["posts"],
-            3
-        );
-        // The thread's starter has not read the two since: held too.
-        assert_eq!(send("a.x", reply("Thanks")).unwrap()["posted"], false);
+        // The thread's starter has not read the replies since: posted,
+        // with the three it missed.
+        let thanks = send("a.x", reply("Thanks")).unwrap();
+        assert_eq!(thanks["posts"], 5);
+        assert_eq!(thanks["missed"]["posts"].as_array().unwrap().len(), 3);
         // An agent that never read it is shown all of it.
         let blind = send("d.w", reply("Me too")).unwrap();
-        assert_eq!(blind["posted"], false);
-        assert_eq!(blind["posts"].as_array().unwrap().len(), 3);
+        assert_eq!(blind["posts"], 6);
+        assert_eq!(blind["missed"]["posts"][0]["by"], "a.x");
+        assert_eq!(blind["missed"]["posts"].as_array().unwrap().len(), 5);
         // What the lookout told counts as shown, as a read does.
-        told(&home, "e.v", "t", &[0, 1, 2]);
-        assert_eq!(send("e.v", reply("Same")).unwrap()["posts"], 4);
+        told(&home, "e.v", "t", &[0, 1, 2, 3, 4, 5]);
+        let same = send("e.v", reply("Same")).unwrap();
+        assert_eq!(same["posts"], 7);
+        assert!(same.get("missed").is_none(), "{same}");
         // Shown counts only grow: an older note takes nothing back.
         told(&home, "e.v", "t", &[0]);
-        assert_eq!(shown(&dir(&home), "t", "e.v"), 4);
+        assert_eq!(shown(&dir(&home), "t", "e.v"), 7);
         // A note that skips a post, one a filter kept back, shows none
-        // past it.
+        // past it: the reply shows it from there.
         told(&home, "f.u", "t", &[0, 2, 3]);
         assert_eq!(shown(&dir(&home), "t", "f.u"), 1);
-        assert_eq!(send("f.u", reply("Late")).unwrap()["posted"], false);
+        assert_eq!(send("f.u", reply("Late")).unwrap()["missed"]["from"], 1);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -4617,10 +4610,11 @@ mod tests {
             json!({"post": {"name": "t", "title": "T", "text": "one"}}),
         );
         let reply = json!({"reply": {"thread": "t", "text": "two"}});
-        assert_eq!(send(1, reply.clone())["posts"], 2);
+        assert!(send(1, reply.clone()).get("missed").is_none());
         // Another agent under the same name has read nothing.
-        assert_eq!(send(2, reply.clone())["posted"], false);
-        assert_eq!(send(2, reply)["posts"], 3);
+        let other = send(2, reply);
+        assert_eq!(other["posts"], 3);
+        assert_eq!(other["missed"]["posts"].as_array().unwrap().len(), 2);
         assert_eq!(shown(&dir(&home), "t", &who("b.y", Some(1))), 2);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -4642,10 +4636,11 @@ mod tests {
         // The agent reads the new post; its side chat has not seen it.
         send(&agent, json!({"read": "t"}));
         let reply = json!({"reply": {"thread": "t", "text": "three"}});
-        let held = send(&side, reply.clone());
-        assert_eq!(held["posted"], false);
-        assert_eq!(shown(&dir(&home), "t", &side), 2);
-        assert_eq!(send(&side, reply)["posts"], 3);
+        let said = send(&side, reply);
+        assert_eq!(said["posts"], 3);
+        assert_eq!(said["missed"]["posts"].as_array().unwrap().len(), 2);
+        assert_eq!(shown(&dir(&home), "t", &side), 3);
+        assert_eq!(shown(&dir(&home), "t", &agent), 2);
         // Nor does the side chat's read count for the agent.
         other(json!({"reply": {"thread": "t", "text": "four"}}));
         send(&side, json!({"read": "t"}));

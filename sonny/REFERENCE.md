@@ -834,8 +834,8 @@ form, one pick among its options, what a yes covers, why it asks and what
 it recommends; the
 pick goes to the lead as your answer, as a click on its card in Sonny's
 window does, once whichever window answers first. Questions still open when
-a thread reopens come again, back to your own last words, before which a
-question is set aside as in the window. One you dismiss stays open. The turns the lead takes on its own, as when the lookout
+a thread reopens come again: a question stays open until you pick or the
+lead closes it, as in the window. One you dismiss stays open. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
 the agent started (the protocol's version 2 draft, which T3 Code speaks).
 Each task the lead starts opens as a T3 Code thread with the task's brief as
@@ -1664,7 +1664,8 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   review or a check that comes later still reaches it.
   A lead is closed the same way once you say its project is done: it
   closes itself, or an outer lead closes it. Its row reads done, its old
-  questions are set aside, and its automations skip their runs
+  questions leave the composer and the counts (their cards stay open, and
+  a click on one brings it back), and its automations skip their runs
   (`/background` says `last paused: web.lead is done`) until a message,
   from you or any agent, reopens it. A run you ask for with `fire` still
   runs, and reopens it. A task done before this, by the old `mark_done`
@@ -2060,9 +2061,11 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   tool: a script that calls many tools at once and returns only what it
   prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
   ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)). As in Codex, each call
-  a script makes is approved on its own: a tool its server marks
-  destructive, and not read-only, waits for the agent's verdict
-  (`/permissions`), unless the server's `approval_mode` says otherwise.
+  a script makes is approved on its own: a tool its server does not mark
+  read-only waits for the agent's verdict (`/permissions`), unless the
+  server marks it as destroying nothing and keeping to a closed world, or
+  its `approval_mode` says otherwise; a tool that says nothing of itself
+  waits.
 
   ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
 
@@ -2143,19 +2146,16 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   composer answers one at a time, the oldest first, and says which
   (`1 of 2`); ↑↓ with nothing typed switches to another, and a click on
   any card's option answers that one. Esc lets you write freely: what you
-  send then is your own message, and the conversation has moved on, so
-  the open questions are set aside. They leave the composer and the
-  `needs you` count, each card's `?` turns muted with `Set aside: you
-  wrote past it. A pick still answers it.`, and a click on a card's
-  question brings it back into the composer to answer. The agent is
-  told too, with that message: one line from Sonny for each question,
-  `Your question "QUESTION" (CALL_ID) is now set aside: the person wrote
-  past it; a pick still answers it.`, which you never see; it asks again,
-  closes it, or leaves it. When your own
-  words did answer one, or it no longer matters, the agent closes it
-  with `close_ask`: answered in your words with the option it goes with,
-  or withdrawn with why; there is no matching of your text. Each card
-  says where its question stands: open (a yellow `?`), set aside,
+  send then is your own message, and goes to the agent as it is. It
+  changes no card, as a decision card in a Claude project thread stays
+  open until you pick or the agent closes it: the open questions stay in
+  the `needs you` count, their cards stay open, and the composer stays
+  yours until a click on a card's question brings it back to answer, or
+  the agent asks a new one while nothing is typed. When your own words
+  did answer one, or it no longer matters, the agent closes it with
+  `close_ask`: answered in your words with the option it goes with, or
+  withdrawn with why; there is no matching of your text. Each card
+  says where its question stands: open (a yellow `?`),
   answered (`✓` and the answer) or withdrawn (a muted `–` and why), and a
   settled card folds to its question and that row until a click on the
   question opens it. A pick of yours on a withdrawn card, or on one the
@@ -2181,12 +2181,15 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   `[sonny] ask_wait_minutes` after the ask (60 by default; 0 goes on at
   once where it can be undone and reminds of no one-way door). Your
   answer, picked or typed, removes it once the agent
-  takes it up, as the agent's close does; it runs nothing once you answer or write to that agent, since the
-  conversation moved on, nor for an ask whose call failed and showed no card; when it runs, it is Sonny's words, never yours,
+  takes it up, as the agent's close does; it runs nothing once you pick or
+  the agent closes the question, nor for an ask whose call failed and
+  showed no card. Words of your own to that agent cancel nothing: a
+  question that can be undone goes ahead at its deadline unless the agent
+  closed it. When it runs, it is Sonny's words, never yours,
   so it allows nothing that needs your own. Pick another option later and
   the agent undoes what it did. Open
   questions are read from the history Sonny replays (its `ask` calls not
-  yet answered or moved on from), so one asked while Sonny was closed is
+  yet answered or closed), so one asked while Sonny was closed is
   answered the same way when it opens. A yellow `?` starts it and a muted
   bar runs down its left side, however narrow the window gets later,
   setting it apart from the replies around it with or without color. A task
@@ -2219,7 +2222,7 @@ Renders every agent on the daemon as a live constellation (you at the center, le
 
   ![Typing an answer: the composer's band names the question over the words, as the sent answer will show it](../docs/sonny/ask-answering.png)
 
-  ![Where each question stands: one answered, one withdrawn with why, one set aside, and the composer answering an open one in words](../docs/sonny/question-states-dark.png)
+  ![Two decisions still open after a message of the person's own about CI: both cards keep their yellow ? and Waits for your pick, the footer counts ? 1, and the composer stays theirs](../docs/sonny/cards-stay-open.png)
 
   ![A task's question: the lead's lookout note says shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/verbose`

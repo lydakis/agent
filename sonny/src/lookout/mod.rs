@@ -278,7 +278,9 @@ async fn reply_text(
         (read["items"].as_array().into_iter())
             .flatten()
             .flat_map(|entry| crate::responses(&entry["item"]))
-            .find(|item| item["role"] == "assistant" && !crate::text(item).trim().is_empty())
+            .find(|item| {
+                item["role"] == "assistant" && !crate::transcript::blank(&crate::text(item))
+            })
             .map(|item| crate::text(&item))
     };
     // A turn that completed ended on its reply, its checkpoint: one read,
@@ -2256,9 +2258,12 @@ struct Lookout {
     /// When the last note went, in epoch ms: the next waits
     /// `GROUP_INTERVAL` after.
     sent_ms: u128,
-    /// The subscriptions with a digest of their own whose news that note
-    /// tells: none tells more till it lands.
+    /// The subscriptions with a digest of their own that came due for
+    /// that note: their windows count from it once it lands.
     sourced_subs: Vec<String>,
+    /// The sources whose digest came due for that note, as
+    /// `sourced_subs`.
+    sourced_sources: Vec<String>,
     /// For each subscription with a `quiet`, by its identity: when it last
     /// heard anything, its subscriber's own words too, and whether a note
     /// has said it went quiet since.
@@ -2307,6 +2312,7 @@ impl Lookout {
             sending: None,
             sent_ms: 0,
             sourced_subs: Vec::new(),
+            sourced_sources: Vec::new(),
             quiet: HashMap::new(),
             log: None,
         }
@@ -2990,8 +2996,8 @@ impl Lookout {
             (ready.into_iter().enumerate()).partition(|(at, _)| chosen[*at]);
         let sent: Vec<sources::Heard> = sent.into_iter().map(|(_, (_, heard))| heard).collect();
         // What a due digest let go and the note had no room for goes in
-        // the next, without waiting another window: its window starts
-        // again with the last of them.
+        // the next, without waiting another window: its window counts
+        // from the note it came due for.
         let mut rest: Vec<_> = (rest.into_iter())
             .map(|(_, (place, mut heard))| {
                 heard.due |= self.digested(&heard);
@@ -3030,21 +3036,12 @@ impl Lookout {
         if !quotes.is_empty() {
             asked["quotes"] = json!(quotes);
         }
-        // Its subscriptions' digests count from it once it lands, and
-        // allow no other note meanwhile: only for what they held, as an
+        // The digests that came due count from it once it lands, as an
         // Alertmanager group's interval counts from that group's own
-        // notification. What steers waits for no digest, so it starts
-        // none's window again.
-        let mut subs: Vec<String> = Vec::new();
-        for sub in (sent.iter())
-            .filter(|heard| !heard.event.steer)
-            .flat_map(|heard| &heard.subs)
-        {
-            if self.sub_digest(sub).is_some() && !subs.contains(sub) {
-                subs.push(sub.clone());
-            }
-        }
-        self.sourced_subs = subs;
+        // notification and no other's: an event another follow let go
+        // starts no window of the rest that hear it. What steers waits
+        // for no digest, so it starts none's window again.
+        (self.sourced_subs, self.sourced_sources) = self.came_due(&sent, Instant::now());
         self.charged = self.charges(sent.iter().flat_map(|heard| &heard.subs));
         self.sending = Some((sent, key));
         self.sent_ms = epoch_ms();
@@ -3118,9 +3115,6 @@ impl Lookout {
                 self.count(&key, &heard, &steered);
                 self.spend(&key);
                 self.unkept_sent = Unkept::default();
-                for heard in sent.iter().filter(|heard| !heard.event.steer) {
-                    self.told_sources.insert(heard.event.source.clone(), now);
-                }
                 told_commons(&crate::commons::who(&self.lead, self.lead_id), &sent);
                 if submitted.is_ok() {
                     let request_id = format!("lookout-{}", digest(&key.join(",")));
@@ -3211,20 +3205,52 @@ impl Lookout {
         }
     }
 
-    /// The note landed, `told` if the daemon took it: its subscriptions'
-    /// digests count from now, or from the note before.
-    fn sourced(&mut self, told: bool) {
-        let now = Instant::now();
-        for sub in std::mem::take(&mut self.sourced_subs) {
-            if told {
-                self.told_subs.insert(sub, now);
+    /// The digests that came due for a note of `sent` at `now`: each
+    /// subscription with a digest of its own that has passed since a note
+    /// last told what it held, and each source whose digest has passed,
+    /// for events that go by it (through a subscription with none of its
+    /// own, or none at all). One that has not passed let none of them go:
+    /// they went by another's, which its window does not count from.
+    fn came_due(&self, sent: &[sources::Heard], now: Instant) -> (Vec<String>, Vec<String>) {
+        let (mut subs, mut by_source): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for heard in sent.iter().filter(|heard| !heard.event.steer) {
+            let event = &heard.event;
+            let mut sourced = heard.subs.is_empty();
+            for name in &heard.subs {
+                match (self.subs.iter()).find(|sub| sub.name == *name && sub.digest.is_some()) {
+                    Some(sub) => {
+                        let passed = (sub.digest_span()).is_some_and(|digest| {
+                            (self.told_subs.get(name)).is_none_or(|at| now >= *at + digest)
+                        });
+                        if passed && !subs.contains(name) {
+                            subs.push(name.clone());
+                        }
+                    }
+                    None => sourced = true,
+                }
+            }
+            let passed = event.digest.is_some_and(|digest| {
+                (self.told_sources.get(&event.source)).is_none_or(|at| now >= *at + digest)
+            });
+            if sourced && passed && !by_source.contains(&event.source) {
+                by_source.push(event.source.clone());
             }
         }
+        (subs, by_source)
     }
 
-    /// A subscription's own digest, by its name.
-    fn sub_digest(&self, name: &str) -> Option<Duration> {
-        (self.subs.iter().find(|sub| sub.name == name)).and_then(subs::Sub::digest_span)
+    /// The note landed, `told` if the daemon took it: the digests that
+    /// came due for it count from now, or from the note before.
+    fn sourced(&mut self, told: bool) {
+        let now = Instant::now();
+        let subs = std::mem::take(&mut self.sourced_subs);
+        let by_source = std::mem::take(&mut self.sourced_sources);
+        if told {
+            self.told_subs
+                .extend(subs.into_iter().map(|sub| (sub, now)));
+            self.told_sources
+                .extend(by_source.into_iter().map(|source| (source, now)));
+        }
     }
 
     /// Events still waiting, told through the subscriptions that hear
@@ -3808,6 +3834,22 @@ mod tests {
         let read = reply_text(&client, "calc.fix", 4, Some(41), false).await;
         assert_eq!(read.as_deref(), Some("Earlier."));
         assert_eq!(*asked.lock().unwrap(), ["history_nodes", "history_items"]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_shows_nothing_reads_as_no_words() {
+        let client = crate::tests::daemon_answering(move |request| {
+            match request["op"].as_str() {
+                Some("history_nodes") => json!({"nodes": [{"node": 42, "turn": 4}]}),
+                _ => json!({"items": [{"node": 42, "item": {"type": "message",
+                    "role": "assistant", "content": [{"type": "output_text", "text": "\u{200B}"}]}}]}),
+            }
+        })
+        .await;
+        for completed in [true, false] {
+            let read = reply_text(&client, "calc.fix", 4, Some(42), completed).await;
+            assert_eq!(read.as_deref(), Some(""), "completed: {completed}");
+        }
     }
 
     #[tokio::test]
@@ -5952,7 +5994,111 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(prompt.contains("lunch?"), "{prompt}");
-        assert!(lookout.told_subs["chat"] >= ended && lookout.told_sources["slack"] >= ended);
+        assert!(lookout.told_subs["chat"] >= ended);
+        // Its own digest took its source's place: the source's clock was
+        // not what let it go.
+        assert!(lookout.told_sources["slack"] < ended);
+    }
+
+    /// Two follows hear one source, each at most once a digest of its own:
+    /// "near" what starts "near:", each minute, "far" all of it, hourly.
+    /// What both hear goes as near's digest lets it, every ten minutes for
+    /// seven hours, and far's own news still goes once an hour, as an
+    /// Alertmanager group's interval counts from that group's own
+    /// notification and no other's.
+    #[tokio::test]
+    async fn each_follow_s_digest_counts_from_its_own_notes() {
+        let (client, mut got) = submits().await;
+        let mut lookout = lookout();
+        lookout.live = true;
+        lookout.lead_id = Some(1);
+        let mut near = hears("near");
+        near.filter = Some(json!({"text": [{"prefix": "near:"}]}));
+        near.digest = Some("1m".into());
+        let mut far = hears("far");
+        far.digest = Some("1h".into());
+        lookout.subs = vec![near, far];
+        let (minute, hour) = (Duration::from_secs(60), Duration::from_secs(3600));
+        let step = Duration::from_secs(600);
+        // Ten-minute steps of a pretend clock: each says how long ago near
+        // and far were last told. Far was told half an hour before.
+        let (mut clock, mut far_told) = (Duration::ZERO, Duration::from_secs(1800));
+        let mut held: Vec<(usize, Duration)> = Vec::new();
+        let mut longest = Duration::ZERO;
+        for k in 0..42 {
+            clock += step;
+            far_told += step;
+            let now = Instant::now();
+            lookout.told_subs.insert("near".into(), now - minute);
+            lookout
+                .told_subs
+                .insert("far".into(), now - far_told.min(hour));
+            lookout.heard_from(&slack(&format!("near: deploy {k:02}"), false));
+            lookout.heard_from(&slack(&format!("standup {k:02}"), false));
+            held.push((k, clock));
+            wake(&mut lookout, &client).await;
+            let prompt = told(got.recv().await.unwrap()["prompt"].as_str().unwrap());
+            assert!(prompt.contains(&format!("near: deploy {k:02}")), "{prompt}");
+            assert!(lookout.told_subs["near"] >= now);
+            held.retain(|(i, heard)| {
+                let gone = prompt.contains(&format!("standup {i:02}"));
+                if gone {
+                    longest = longest.max(clock - *heard);
+                }
+                !gone
+            });
+            // Far's window counts from the notes far's digest let go.
+            match lookout.told_subs["far"] >= now {
+                true => far_told = Duration::ZERO,
+                false => assert!(far_told < hour, "far was due at step {k}"),
+            }
+            assert!(
+                held.len() <= 6,
+                "{} of far's own wait at step {k}",
+                held.len()
+            );
+        }
+        assert!(longest > Duration::ZERO && longest <= hour, "{longest:?}");
+    }
+
+    /// A source's digest counts only from the notes it let go: what a
+    /// follow that waits for none let go starts no window of the source's
+    /// for what goes by it.
+    #[tokio::test]
+    async fn a_source_s_digest_counts_only_from_notes_it_let_go() {
+        let (client, mut got) = submits().await;
+        let mut lookout = lookout();
+        lookout.live = true;
+        lookout.lead_id = Some(1);
+        let mut at_once = hears("now");
+        at_once.filter = Some(json!({"text": [{"prefix": "now:"}]}));
+        at_once.digest = Some("0".into());
+        lookout.subs = vec![at_once, hears("plain")];
+        let hour = Duration::from_secs(3600);
+        let half = Instant::now() - hour / 2;
+        lookout.told_sources.insert("slack".into(), half);
+        let digested = |text: &str| sources::Event {
+            digest: Some(hour),
+            ..slack(text, false)
+        };
+        lookout.heard_from(&digested("lunch?"));
+        wake(&mut lookout, &client).await;
+        assert!(got.try_recv().is_err());
+        lookout.heard_from(&digested("now: deploy"));
+        wake(&mut lookout, &client).await;
+        let prompt = told(got.recv().await.unwrap()["prompt"].as_str().unwrap());
+        assert!(
+            prompt.contains("now: deploy") && !prompt.contains("lunch"),
+            "{prompt}"
+        );
+        assert_eq!(lookout.told_sources["slack"], half);
+        // Its window ends when it would have, and what it held goes.
+        let ended = Instant::now();
+        lookout.told_sources.insert("slack".into(), ended - hour);
+        wake(&mut lookout, &client).await;
+        let prompt = told(got.recv().await.unwrap()["prompt"].as_str().unwrap());
+        assert!(prompt.contains("lunch?"), "{prompt}");
+        assert!(lookout.told_sources["slack"] >= ended);
     }
 
     #[test]
@@ -6138,11 +6284,15 @@ mod tests {
     fn a_note_the_daemon_already_took_starts_the_digest() {
         let mut lookout = lookout();
         let sent = vec![sources::Heard {
-            event: slack("first", false),
+            event: sources::Event {
+                digest: Some(Duration::from_secs(3600)),
+                ..slack("first", false)
+            },
             subs: vec!["chat".into()],
             order: 0,
             due: false,
         }];
+        (lookout.sourced_subs, lookout.sourced_sources) = lookout.came_due(&sent, Instant::now());
         lookout.sending = Some((sent, vec!["k".into()]));
         lookout.answered(Err("idempotency_conflict".into()));
         assert!(lookout.told_sources.contains_key("slack"));
@@ -6238,8 +6388,8 @@ mod tests {
             .map(|i| i.parse().unwrap())
             .collect();
         assert_eq!(told, (0..12).collect::<Vec<_>>());
-        // Its next window starts with the last of them: what comes now
-        // waits for it.
+        // Its next window counts from the note it came due for: what
+        // comes now waits for it.
         lookout.heard_from(&event(12));
         lookout.sent_ms = 0;
         lookout.wake(&client, &woken);
