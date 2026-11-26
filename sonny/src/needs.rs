@@ -293,8 +293,10 @@ fn moves_on(item: &Value) -> bool {
 }
 
 /// `bot`'s items kept at `nodes`, each with its node, as the transcript
-/// reads them: who sent a prompt marked on it. Whether the read came back
-/// short too, the daemon gone or the nodes pruned.
+/// reads them: who sent a prompt marked on it. The note the daemon leaves
+/// the model after a stopped turn is left out: the window already says
+/// the turn was interrupted. Whether the read came back short too, the
+/// daemon gone or the nodes pruned.
 pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Value)>, bool) {
     let mut items = Vec::new();
     let mut rest = nodes;
@@ -312,7 +314,8 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
             return (items, true);
         }
         rest = &rest[entries.len().min(rest.len())..];
-        items.extend(entries.iter().flat_map(|entry| {
+        let shown = entries.iter().filter(|entry| entry["stop_note"] != true);
+        items.extend(shown.flat_map(|entry| {
             let node = entry["node"].as_i64().unwrap_or(0);
             // Who sent a prompt, when another bot did, a client from
             // outside (the commons, an automation) or another person.
@@ -834,6 +837,27 @@ mod tests {
     fn ask(call: &str, question: &str) -> Value {
         let arguments = json!({"question": question, "why": "w", "options": [{"label": "a"}]});
         json!({"name": "ask", "call_id": call, "arguments": arguments.to_string()})
+    }
+
+    #[tokio::test]
+    async fn the_note_a_stopped_turn_leaves_the_model_is_not_drawn() {
+        let said =
+            |text: &str| json!({"role": "user", "content": [{"type": "input_text", "text": text}]});
+        let read = json!({"items": [
+            {"node": 3, "item": said("fix it")},
+            {"node": 4, "stop_note": true, "item": said("<turn_aborted>...</turn_aborted>")},
+            {"node": 5, "item": said("go on")}]});
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_items") => read.clone(),
+            _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+        })
+        .await;
+        let (items, short) = items(&client, "p.lead", &[3, 4, 5]).await;
+        assert!(!short);
+        let drawn: Vec<(i64, String)> = (items.iter())
+            .map(|(node, item)| (*node, crate::text(item)))
+            .collect();
+        assert_eq!(drawn, [(3, "fix it".into()), (5, "go on".into())]);
     }
 
     #[test]

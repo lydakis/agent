@@ -1623,7 +1623,8 @@ held when it wrote it, and one a client sent with an `origin` carries that, so a
 client can say who each message came from without reading every turn. A prompt
 sent with `delivery: "attach"` that a call took in also carries `attached: true`:
 it rode along on that call rather than reaching the bot as a message of its own,
-so a client can draw it apart from steers. The store
+so a client can draw it apart from steers. The note a stopped turn leaves
+carries `stop_note: true` (see `interrupt`). The store
 keeps these with the prompt's node (`senders`), so they last as long as the item:
 after the turn's rows go with a deleted fork source, and after its sender is
 deleted or its name reused. The reply targets
@@ -2211,6 +2212,29 @@ A turn that had already ended answers with how it ended and
 turn's own end, succeeds. A turn the bot never had is `turn_not_found`; a
 turn that is starting, or that is not the one running, is `stale_turn`.
 Protocol 8 adds the turn view.
+
+A turn an interrupt ends (error `cancelled`, running or parked) leaves one
+note in its bot's history, after everything the turn holds, in the same
+transaction that ends it, as Codex records an interrupted turn
+(openai/codex#9043, `TurnAborted` in its neutral wording, since a person,
+another agent or a client may send an interrupt):
+
+```text
+<turn_aborted>
+The previous turn was interrupted on purpose. Any background commands it started may still be running. If any tools/commands were aborted, they may have partially executed.
+</turn_aborted>
+```
+
+It is a user item, so the next request reads the stopped turn, then the
+note, then what comes next, and the model does not take up the stopped
+work again unless it is asked to. It starts no turn and holds no message:
+it is part of the stopped turn's span, counted and summarized as any item
+is, and no prompt list, title or count includes it. Only an interrupt leaves
+one: a turn the daemon's shutdown or a pause parks is continued, not
+stopped; one that fails, ends `process_interrupted` or `approval_expired`
+leaves none. `history_items` marks the note `stop_note: true`
+(`stop_notes`, schema 115), so a client can tell it from a person's words
+and leave it out of what it draws. Protocol 103.
 
 ### Delivery modes
 

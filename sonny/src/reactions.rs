@@ -499,7 +499,8 @@ async fn newest_said(client: &Client, bot: &str) -> Result<Option<i64>, ()> {
 }
 
 /// The node of a history entry the person wrote: words of theirs, as an
-/// Anthropic tool result is a user message too.
+/// Anthropic tool result is a user message too. The note the daemon
+/// leaves after a stopped turn is no one's words.
 pub fn said_by_person(entry: &Value) -> Option<i64> {
     let item = &entry["item"];
     let words = crate::responses(item)
@@ -508,6 +509,7 @@ pub fn said_by_person(entry: &Value) -> Option<i64> {
     (entry["from"].is_null()
         && entry["origin"].is_null()
         && entry["person"].is_null()
+        && entry["stop_note"] != true
         && words
         && !is_reaction(&crate::text(item)))
     .then(|| entry["node"].as_i64())
@@ -611,7 +613,9 @@ mod tests {
             said(words.clone(), json!({"from": {"bot": "calc.lead"}})),
             None
         );
-        assert_eq!(said(words, json!({"origin": "lookout"})), None);
+        assert_eq!(said(words.clone(), json!({"origin": "lookout"})), None);
+        // Nor is the note the daemon leaves after a stopped turn.
+        assert_eq!(said(words, json!({"stop_note": true})), None);
         assert_eq!(
             said(
                 json!({"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}),
