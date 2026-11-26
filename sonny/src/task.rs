@@ -1796,13 +1796,14 @@ pub(crate) enum Lost {
 /// since the branch's files are what a task wrote. One at a time, by the
 /// task's lock beside the worktrees, so callers at once make it once; it is then the
 /// daemon's at `store`, and counts toward `task_worktrees` again.
-pub(crate) fn restore_in(
+pub(crate) fn restore_in<P>(
     home: &Path,
     name: &str,
     workspace: &Path,
     places: &[PathBuf],
     confine: bool,
     store: &Path,
+    admit: impl FnOnce() -> P,
 ) -> Result<Again, Lost> {
     let folders = home.join(".agent/worktrees");
     let path = folders.join(name);
@@ -1832,6 +1833,9 @@ pub(crate) fn restore_in(
         Some((_, Made::Worktree(repo))) => places.insert(0, repo),
         None => {}
     }
+    // Its git runs in a place among the processes Sonny runs for agents,
+    // waited for only once the folder is its to make.
+    let _place = admit();
     let held = format!("refs/heads/{branch}");
     let Some(here) =
         (places.iter()).find(|dir| git(dir, &["rev-parse", "--verify", "--quiet", &held]).is_ok())
@@ -3256,7 +3260,15 @@ mod tests {
         assert!(!workspace.starts_with(&home));
         git(&repo, &["worktree", "remove", "--force", &target]).unwrap();
         let store = dir.join("state.sqlite");
-        let made = restore_in(&home, "shop.link", &workspace, &[repo], false, &store);
+        let made = restore_in(
+            &home,
+            "shop.link",
+            &workspace,
+            &[repo],
+            false,
+            &store,
+            || (),
+        );
         assert!(matches!(made, Ok(Again::Restored(_))), "{made:?}");
         assert_eq!(
             std::fs::read_to_string(workspace.join("b.txt")).unwrap(),
@@ -3298,7 +3310,13 @@ mod tests {
         let elsewhere = dir.join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         let places = [elsewhere, repo.clone()];
-        let again = || restore_in(&home, "shop.fix", &workspace, &places, false, &store);
+        // Each caller's git waits for a place in the budget, which only the
+        // one that makes it takes.
+        let places_taken = std::sync::atomic::AtomicUsize::new(0);
+        let take = || {
+            places_taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let again = || restore_in(&home, "shop.fix", &workspace, &places, false, &store, take);
         // Callers at once make it once; the rest find it there.
         let done: Vec<_> = std::thread::scope(|scope| {
             let callers: Vec<_> = (0..4).map(|_| scope.spawn(again)).collect();
@@ -3313,6 +3331,7 @@ mod tests {
             "{done:?}"
         );
         assert_eq!(done.iter().filter(|d| **d == Ok(Again::There)).count(), 3);
+        assert_eq!(places_taken.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
             git(&tree, &["branch", "--show-current"]).unwrap(),
             "agent/shop.fix"
@@ -3332,7 +3351,12 @@ mod tests {
         // Another daemon's task's is not taken.
         git(&repo, &["worktree", "remove", "--force", &target]).unwrap();
         record_store_in(&home, "shop.fix", &dir.join("other.sqlite")).unwrap();
+        let taken = places_taken.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(again(), Err(Lost::NotOurs));
+        assert_eq!(
+            places_taken.load(std::sync::atomic::Ordering::SeqCst),
+            taken
+        );
         record_store_in(&home, "shop.fix", &store).unwrap();
         // With its branch gone too, there is nothing to make it from.
         git(&repo, &["branch", "-D", "agent/shop.fix"]).unwrap();
@@ -3344,7 +3368,7 @@ mod tests {
         std::fs::write(&own, format!("{}\nown\n", repo.display())).unwrap();
         let mine = folders.join("shop.own");
         assert_eq!(
-            restore_in(&home, "shop.own", &mine, &places, false, &store),
+            restore_in(&home, "shop.own", &mine, &places, false, &store, || ()),
             Err(Lost::NotOurs)
         );
         std::fs::remove_dir_all(&dir).unwrap();

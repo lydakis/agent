@@ -2934,7 +2934,16 @@ async fn answer(
     // Its folder, made again when it is a task's worktree removed with its
     // branch kept; gone, the call runs in the agent's state folder, and
     // its answer says so.
-    let folder = crate::restore::folder(client, record, Path::new(&workspace), store).await;
+    let mut place = place;
+    let folder = crate::restore::folder(
+        client,
+        record,
+        Path::new(&workspace),
+        store,
+        &str_of(&caller["name"]),
+        &mut place,
+    )
+    .await;
     let ran_in = match &folder {
         crate::restore::Folder::There => PathBuf::from(&workspace),
         // The state folder its shell names, which its own settings keep:

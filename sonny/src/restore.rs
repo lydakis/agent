@@ -76,8 +76,18 @@ pub fn wanted(workspace: &Path) -> bool {
 /// it, works in, made again when it is a task's worktree that is gone
 /// and its branch is kept: with git in the sandbox unless the agent has
 /// none, for the daemon at `store`. A restore, or one that failed, is
-/// written to the tool host's log.
-pub async fn folder(client: &Client, record: &Value, workspace: &Path, store: &Path) -> Folder {
+/// written to the tool host's log. Its git runs in a place of `owner`'s
+/// among the processes Sonny runs for agents, as a tool's process does;
+/// a caller's own `place`, held while it waits on this, is given back
+/// first, as a shared bound is never held while waiting on something else.
+pub async fn folder(
+    client: &Client,
+    record: &Value,
+    workspace: &Path,
+    store: &Path,
+    owner: &str,
+    place: &mut crate::served::Place,
+) -> Folder {
     // There, and not one a restore is still checking out: looked at after
     // the folder, which a restore makes only once it is under way.
     if workspace.is_dir() && !restoring(workspace) {
@@ -89,13 +99,16 @@ pub async fn folder(client: &Client, record: &Value, workspace: &Path, store: &P
     let Some(task) = task_of(&home, workspace) else {
         return Folder::Gone(Gone::NotATask);
     };
+    *place = crate::served::Place::Free;
     let _under_way = UnderWay::start(&task);
     let branch = format!("agent/{task}");
     let places = above(client, record).await;
     let confine = confined(client, record).await;
     let (name, at, kept) = (task.clone(), workspace.to_owned(), store.to_owned());
+    let (runtime, owner) = (tokio::runtime::Handle::current(), owner.to_owned());
+    let admit = move || runtime.block_on(crate::budget::processes().admit(&owner));
     let done = tokio::task::spawn_blocking(move || {
-        crate::task::restore_in(&home, &name, &at, &places, confine, &kept)
+        crate::task::restore_in(&home, &name, &at, &places, confine, &kept, admit)
     })
     .await
     .unwrap_or_else(|e| Err(Lost::Failed(e.to_string())));
@@ -188,7 +201,8 @@ async fn turn_started(
         .unwrap_or_default();
     let record = (page["bots"].get(0))
         .filter(|found| found["name"] == bot && found["running_turn"] == turn)?;
-    Some(folder(client, record, workspace, store).await)
+    let mut place = crate::served::Place::Free;
+    Some(folder(client, record, workspace, store, bot, &mut place).await)
 }
 
 /// The folders of the agents above the agent `record`, each made by the
