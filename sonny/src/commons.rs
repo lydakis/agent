@@ -233,10 +233,14 @@ pub fn call_as(
     let (author, author_id, reader) = (caller.name, caller.id, caller.reader);
     let (model, project) = (caller.model, caller.project);
     let dir = dir(home);
-    let from = arguments["from"].as_u64().unwrap_or(0) as usize;
+    let given = arguments["from"].as_u64().map(|from| from as usize);
+    let from = given.unwrap_or(0);
     let filter = filter(arguments)?;
     if let Some(name) = arguments["read"].as_str() {
-        return read(&dir, name, author, reader, from);
+        return match given {
+            Some(from) => read(&dir, name, author, reader, from),
+            None => read_unseen(&dir, name, author, reader),
+        };
     }
     if let Some(words) = arguments["search"].as_str() {
         return search(&dir, words, filter, author, reader, from, LIST_BYTES);
@@ -1869,6 +1873,87 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
 fn read(dir: &Path, name: &str, author: &str, who: &str, from: usize) -> Result<Value, String> {
     let _lock = lock(dir)?;
     read_locked(dir, name, author, who, from)
+}
+
+/// An agent's read of a thread with no `from`, opening where it left off,
+/// as Slack and Discourse open a channel or topic at the first unread
+/// post, posts kept oldest to newest:
+/// - the posts it has not been shown, from the first, when they fit a
+///   page (a first read of a short thread, all of them);
+/// - more than fit, as GitHub shows a long issue: the opening post, then
+///   the newest page, with `hidden` posts left out between them and
+///   `next` where they start;
+/// - none, the newest page.
+///
+/// `unseen` says how many it had not been shown. Only posts it returns
+/// count as shown, so the hidden ones stay unshown; it counts as a read
+/// from the start only when it returns the opening post.
+fn read_unseen(dir: &Path, name: &str, author: &str, who: &str) -> Result<Value, String> {
+    let _lock = lock(dir)?;
+    let mut shown = thread(dir, name)?;
+    let all = shown["posts"].take();
+    let all = all.as_array().map_or(&[][..], Vec::as_slice);
+    let size = |post: &Value| post.to_string().len();
+    let upto = self::shown(dir, name, who).min(all.len());
+    // Where a page that ends with the newest post and holds `bytes`
+    // starts, at least one post and never before `first`.
+    let newest = |first: usize, bytes: usize| {
+        let (mut start, mut held) = (all.len(), 0);
+        while start > first {
+            held += size(&all[start - 1]);
+            if start < all.len() && held > bytes {
+                break;
+            }
+            start -= 1;
+        }
+        start
+    };
+    let unseen = &all[upto..];
+    // Sized only until a page is full, so a long thread costs a page.
+    let mut held = 0;
+    let fits = unseen.len() <= 1
+        || unseen.iter().all(|post| {
+            held += size(post);
+            held <= READ_BYTES
+        });
+    let (start, hidden) = if upto == all.len() {
+        (newest(0, READ_BYTES), 0)
+    } else if fits {
+        (upto, 0)
+    } else {
+        let opening = all.first().map_or(0, size);
+        // The newest page right after the opening post hides nothing.
+        match newest(1, READ_BYTES.saturating_sub(opening)) {
+            ..=1 => (0, 0),
+            start => (start, start - 1),
+        }
+    };
+    let mut posts: Vec<Value> = Vec::new();
+    if hidden > 0 {
+        posts.push(all[0].clone());
+    }
+    posts.extend(all[start..].iter().cloned());
+    shown["posts"] = json!(posts);
+    shown["unseen"] = json!(unseen.len());
+    if hidden > 0 {
+        shown["hidden"] = json!(hidden);
+        shown["next"] = json!(1);
+        shown["of"] = json!(all.len());
+    } else if start > 0 {
+        shown["from"] = json!(start);
+    }
+    saw(dir, name, author);
+    // The hidden posts stay unshown: shown runs unbroken from the first.
+    show(
+        dir,
+        name,
+        who,
+        if hidden > 0 { upto.max(1) } else { all.len() },
+    );
+    if start == 0 || hidden > 0 {
+        count_reads(dir, &[name]);
+    }
+    Ok(shown)
 }
 
 /// `read`, under the lock the caller holds.
@@ -4677,6 +4762,149 @@ mod tests {
         assert_eq!(shown(&dir(&home), "t", "c.z"), 0);
         send("c.z", json!({"search": "T"})).unwrap();
         assert_eq!(shown(&dir(&home), "t", "c.z"), 3);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// How many reads of `thread` from the start were counted.
+    fn reads_of(home: &Path, thread: &str) -> u64 {
+        reads(&dir(home))[thread]["count"].as_u64().unwrap_or(0)
+    }
+
+    #[test]
+    fn a_read_with_no_from_opens_at_the_first_post_not_shown() {
+        let home = home("unseen");
+        let send =
+            |by: &str, arguments: Value| super::call(&home, by, None, by, None, None, &arguments);
+        let say = |text: &str| json!({"reply": {"thread": "t", "text": text}});
+        send(
+            "a.x",
+            json!({"post": {"name": "t", "title": "T", "text": "one"}}),
+        )
+        .unwrap();
+        send("a.x", say("two")).unwrap();
+        // A first read of a short thread: all of it, a read from the start.
+        let first = send("b.y", json!({"read": "t"})).unwrap();
+        assert_eq!(first["posts"].as_array().unwrap().len(), 2);
+        assert_eq!(first["unseen"], 2);
+        assert!(first["from"].is_null() && first["hidden"].is_null());
+        assert_eq!(reads_of(&home, "t"), 1);
+        assert_eq!(shown(&dir(&home), "t", "b.y"), 2);
+        // Two more come: it opens at the first of them, oldest first, and
+        // counts no read from the start.
+        send("a.x", say("three")).unwrap();
+        send("a.x", say("four")).unwrap();
+        let next = send("b.y", json!({"read": "t"})).unwrap();
+        assert_eq!(next["from"], 2);
+        assert_eq!(next["unseen"], 2);
+        let texts: Vec<&str> = (next["posts"].as_array().unwrap().iter())
+            .filter_map(|post| post["text"].as_str())
+            .collect();
+        assert_eq!(texts, ["three", "four"]);
+        assert!(next["next"].is_null());
+        assert_eq!(reads_of(&home, "t"), 1);
+        assert_eq!(shown(&dir(&home), "t", "b.y"), 4);
+        // `from: 0` reads it all, as before.
+        let all = send("b.y", json!({"read": "t", "from": 0})).unwrap();
+        assert_eq!(all["posts"].as_array().unwrap().len(), 4);
+        assert!(all["unseen"].is_null());
+        assert_eq!(reads_of(&home, "t"), 2);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_read_with_nothing_new_gives_the_newest_page_and_says_so() {
+        let home = home("unseen-none");
+        let send =
+            |by: &str, arguments: Value| super::call(&home, by, None, by, None, None, &arguments);
+        send(
+            "a.x",
+            json!({"post": {"name": "t", "title": "T", "text": "one"}}),
+        )
+        .unwrap();
+        // Short: the newest page is all of it, a read from the start.
+        let again = send("a.x", json!({"read": "t"})).unwrap();
+        assert_eq!(again["unseen"], 0);
+        assert_eq!(again["posts"].as_array().unwrap().len(), 1);
+        assert!(again["from"].is_null());
+        assert_eq!(reads_of(&home, "t"), 1);
+        // Long: the newest page alone, from where it starts, no read from
+        // the start.
+        let long = "x".repeat(POST_BYTES / 2);
+        for _ in 0..9 {
+            send("a.x", json!({"reply": {"thread": "t", "text": long}})).unwrap();
+        }
+        let newest = send("a.x", json!({"read": "t"})).unwrap();
+        assert_eq!(newest["unseen"], 0);
+        let from = newest["from"].as_u64().unwrap() as usize;
+        let posts = newest["posts"].as_array().unwrap();
+        assert!(from > 1);
+        assert_eq!(from + posts.len(), 10);
+        assert!(newest["next"].is_null() && newest["hidden"].is_null());
+        assert_eq!(reads_of(&home, "t"), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_long_read_shows_the_opening_post_and_the_newest_page_hiding_the_rest() {
+        let home = home("unseen-long");
+        let send =
+            |by: &str, arguments: Value| super::call(&home, by, None, by, None, None, &arguments);
+        let long = "x".repeat(POST_BYTES / 2);
+        send(
+            "a.x",
+            json!({"post": {"name": "t", "title": "T", "text": "opening"}}),
+        )
+        .unwrap();
+        for n in 1..12 {
+            let text = format!("{n} {long}");
+            send("a.x", json!({"reply": {"thread": "t", "text": text}})).unwrap();
+        }
+        // A first read: the opening post, then the newest page.
+        let first = send("b.y", json!({"read": "t"})).unwrap();
+        let posts = first["posts"].as_array().unwrap();
+        assert_eq!(posts[0]["text"], "opening");
+        let hidden = first["hidden"].as_u64().unwrap() as usize;
+        assert!(hidden > 0);
+        assert_eq!(first["next"], 1);
+        assert_eq!(first["of"], 12);
+        assert_eq!(first["unseen"], 12);
+        assert!(first["from"].is_null());
+        // Oldest to newest, the newest last, nothing between them twice.
+        assert_eq!(1 + hidden + posts.len() - 1, 12);
+        assert!(
+            posts[1]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{} ", 1 + hidden))
+        );
+        assert!(
+            posts.last().unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("11 ")
+        );
+        assert!(first.to_string().len() < READ_BYTES + 1024);
+        // It returned the opening post: a read from the start. Only the
+        // opening post counts as shown; the hidden ones and every one
+        // after them stay unshown.
+        assert_eq!(reads_of(&home, "t"), 1);
+        assert_eq!(shown(&dir(&home), "t", "b.y"), 1);
+        // `next` reads the hidden ones, oldest first.
+        let rest = send("b.y", json!({"read": "t", "from": 1})).unwrap();
+        assert!(rest["posts"][0]["text"].as_str().unwrap().starts_with("1 "));
+        assert_eq!(
+            shown(&dir(&home), "t", "b.y"),
+            rest["next"].as_u64().unwrap() as usize
+        );
+        // More unseen than a page, some seen: the same shape, its count
+        // of shown kept where it was.
+        let upto = shown(&dir(&home), "t", "b.y");
+        let again = send("b.y", json!({"read": "t"})).unwrap();
+        assert_eq!(again["posts"][0]["text"], "opening");
+        assert_eq!(again["unseen"], 12 - upto);
+        assert!(again["hidden"].as_u64().unwrap() > 0);
+        assert_eq!(shown(&dir(&home), "t", "b.y"), upto);
+        assert_eq!(reads_of(&home, "t"), 2);
         let _ = std::fs::remove_dir_all(&home);
     }
 

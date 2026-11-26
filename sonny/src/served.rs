@@ -674,7 +674,9 @@ pub fn commons() -> Value {
             "type": "object",
             "properties": {
                 "read": {"type": "string", "minLength": 1,
-                    "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
+                    "description": "A thread's name: its posts oldest first, as many as fit, with next where the rest start. \
+                        With no from it opens at the first post you were not shown; more than fit, the opening post \
+                        and the newest, hidden saying how many between them next reads."},
                 "search": {"type": "string",
                     "description": "Words: threads whose title or posts hold all of them, newest first, with those posts; \
                         none, with a filter, every post it matches."},
