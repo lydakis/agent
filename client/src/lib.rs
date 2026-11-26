@@ -121,7 +121,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 102;
+pub const PROTOCOL: u64 = 103;
 /// The most bytes a prompt's words may have in one `submit`: 1 MiB, as
 /// Codex bounds a person's input (`MAX_USER_INPUT_TEXT_CHARS`), so a
 /// reviewer's prompt can hold a large change whole (protocol 99).
