@@ -1690,8 +1690,9 @@ fn a_long_field_hides_no_other_in_a_listing() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);
     // Keys sort, so the long field comes first, as `content` does before
-    // `path` in an Anthropic `write`.
-    let arguments = json!({"aaa":"x".repeat(5000),"command":"ls"}).to_string();
+    // `path` in an Anthropic `write`. Arguments `shell` takes: one it does
+    // not take is refused before any gate, so never listed.
+    let arguments = json!({"command":"x".repeat(5000),"workdir":"ls"}).to_string();
     let item = json!({"type":"function_call","id":"fc_1","call_id":"s1",
         "name":"shell","arguments":arguments});
     let call = ToolCall {
@@ -1712,12 +1713,12 @@ fn a_long_field_hides_no_other_in_a_listing() {
     let [listed] = &page["approvals"].as_array().unwrap()[..] else {
         panic!("{page}")
     };
-    assert_eq!(listed["arguments"]["command"], "ls");
+    assert_eq!(listed["arguments"]["workdir"], "ls");
     assert_eq!(
-        listed["arguments"]["aaa"].as_str().map(str::len),
+        listed["arguments"]["command"].as_str().map(str::len),
         Some(2048)
     );
-    assert_eq!(listed["arguments_cut"], json!(["aaa"]));
+    assert_eq!(listed["arguments_cut"], json!(["command"]));
 }
 
 #[test]
@@ -20494,6 +20495,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
             "send",
             json!({}),
             false,
+            None,
             Default::default(),
             0,
         )
@@ -22069,6 +22071,7 @@ fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
             "snapshot",
             json!({}),
             true,
+            None,
             browser,
             0,
         )
@@ -22085,6 +22088,7 @@ fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
             "send",
             json!({"to":"x"}),
             false,
+            None,
             writes,
             0,
         )
@@ -22174,6 +22178,7 @@ fn a_step_a_bot_that_never_asks_would_be_asked_is_refused_and_ran_nowhere() {
             "send",
             json!({"to":"x"}),
             false,
+            None,
             writes,
             0,
         )
@@ -22202,6 +22207,7 @@ fn a_step_under_no_gate_is_recorded_even_when_it_would_ask() {
             "click",
             json!({}),
             false,
+            None,
             Default::default(),
             0,
         )
@@ -22519,6 +22525,7 @@ fn a_gated_step_is_told_done_once_even_when_its_row_was_trimmed() {
             "send",
             json!({}),
             false,
+            None,
             Default::default(),
             0,
         )
@@ -23773,6 +23780,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
             "send",
             json!({}),
             false,
+            None,
             Default::default(),
             now,
         )
@@ -23830,6 +23838,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
             "send",
             json!({}),
             false,
+            None,
             Default::default(),
             now,
         )
@@ -25465,6 +25474,7 @@ fn a_step_naming_the_bots_own_tool_is_decided_by_its_plan() {
             tool,
             arguments,
             false,
+            None,
             Default::default(),
             now,
         )
@@ -25510,6 +25520,7 @@ fn a_step_naming_the_bots_own_tool_is_decided_by_its_plan() {
         "spawn_agent",
         json!({}),
         false,
+        None,
         Default::default(),
         now,
     );
@@ -25549,6 +25560,7 @@ fn a_rule_refuses_a_step_naming_shell_as_it_refuses_the_command() {
             "shell",
             json!({"command": "rm -rf x"}),
             false,
+            None,
             Default::default(),
             epoch_now(),
         )
@@ -25584,6 +25596,7 @@ fn a_held_step_of_a_lifted_call_ends_with_its_turn() {
                 "send",
                 json!({}),
                 false,
+                None,
                 Default::default(),
                 now,
             )

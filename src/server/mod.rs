@@ -7459,20 +7459,13 @@ impl Service {
                 if !arguments.is_object() {
                     return fail_with("invalid_step", "arguments must be an object");
                 }
-                // Its arguments before anything else decides it, as a call
-                // from the model: one its tool does not take is never put to
-                // a gate. A step only recorded is not checked: it is asked
-                // about by no one, and its arguments may come cut.
+                // A schema for its arguments, which the store checks them
+                // against first thing, off the run loop.
                 match &parameters {
                     None | Some(Value::Object(_) | Value::Bool(_)) => {}
                     Some(_) => {
                         return fail_with("invalid_step", "parameters must be a JSON Schema");
                     }
-                }
-                if let Some(parameters) = parameters.as_ref().filter(|_| !record) {
-                    agent_runtime::tools::check_schema(parameters, &arguments).map_err(
-                        |detail| Error::with("invalid_arguments", format!("{tool}: {detail}")),
-                    )?;
                 }
                 // Paused or shutting down, nothing new runs: no step is
                 // put to a gate, recorded, or allowed until the line goes on.
@@ -7514,6 +7507,7 @@ impl Service {
                                     &tool,
                                     arguments,
                                     record,
+                                    parameters,
                                     facts,
                                     now_ms(),
                                 )

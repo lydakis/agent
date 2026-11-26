@@ -8,13 +8,19 @@
 //! and a local `$ref`. A keyword it does not know passes: it refuses only
 //! what it can judge, so a schema it reads in part never refuses a call
 //! that fits the whole. `oneOf` is held only to "at least one", since a
-//! branch passed here may not pass in full.
+//! branch passed here may not pass in full. Its work is bounded
+//! ([`WORK`]), whatever the schema and arguments: past it, what is left
+//! passes.
 use serde_json::{Map, Value};
 
 /// How deep the check follows a schema into a value, and how many local
 /// references it follows in one call: past either, what is left passes.
 const MAX_DEPTH: usize = 64;
 const MAX_REFS: usize = 256;
+/// The most steps one check takes: a schema met at a place in the value,
+/// or a value compared with one an `enum` or `const` names. A few
+/// milliseconds at most, so a check may run beside other work.
+const WORK: usize = 100_000;
 
 /// Why `value` does not fit `schema`: where, as a path into the arguments
 /// (`title`, `items[2].name`), and what rule.
@@ -38,6 +44,7 @@ pub fn check(schema: &Value, value: &Value) -> Result<(), Misfit> {
     let mut checker = Checker {
         root: schema,
         refs: 0,
+        work: WORK,
     };
     checker.fits(schema, value, 0).map_err(|mut misfit| {
         misfit.path = misfit.path.trim_start_matches('.').to_owned();
@@ -48,6 +55,8 @@ pub fn check(schema: &Value, value: &Value) -> Result<(), Misfit> {
 struct Checker<'a> {
     root: &'a Value,
     refs: usize,
+    /// Steps left before the check stops judging.
+    work: usize,
 }
 
 fn misfit(rule: impl Into<String>) -> Misfit {
@@ -76,7 +85,7 @@ impl<'a> Checker<'a> {
             Value::Object(schema) => schema,
             _ => return Ok(()),
         };
-        if depth > MAX_DEPTH {
+        if depth > MAX_DEPTH || !self.spend() {
             return Ok(());
         }
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
@@ -93,13 +102,23 @@ impl<'a> Checker<'a> {
         if let Some(types) = schema.get("type") {
             typed(types, value)?;
         }
-        if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
-            && !allowed.iter().any(|one| same(one, value))
-        {
-            return Err(misfit(format!("must be one of {}", listed(allowed))));
+        if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+            let mut known = true;
+            let mut found = false;
+            for one in allowed {
+                match self.same(one, value) {
+                    Some(true) => found = true,
+                    Some(false) => continue,
+                    None => known = false,
+                }
+                break;
+            }
+            if known && !found {
+                return Err(misfit(format!("must be one of {}", listed(allowed))));
+            }
         }
         if let Some(only) = schema.get("const")
-            && !same(only, value)
+            && self.same(only, value) == Some(false)
         {
             return Err(misfit(format!("must be {only}")));
         }
@@ -134,6 +153,49 @@ impl<'a> Checker<'a> {
             }
         }
         Ok(())
+    }
+
+    /// One step of the check's work, if any is left.
+    fn spend(&mut self) -> bool {
+        self.work = self.work.saturating_sub(1);
+        self.work > 0
+    }
+
+    /// Whether `a` equals `b` as JSON Schema compares, numbers by value so
+    /// `1` is `1.0`; `None` when the work ran out before it could tell.
+    fn same(&mut self, a: &Value, b: &Value) -> Option<bool> {
+        if !self.spend() {
+            return None;
+        }
+        Some(match (a, b) {
+            (Value::Number(x), Value::Number(y)) => order(x, y) == Some(std::cmp::Ordering::Equal),
+            (Value::Array(x), Value::Array(y)) => {
+                if x.len() != y.len() {
+                    return Some(false);
+                }
+                for (x, y) in x.iter().zip(y) {
+                    if !self.same(x, y)? {
+                        return Some(false);
+                    }
+                }
+                true
+            }
+            (Value::Object(x), Value::Object(y)) => {
+                if x.len() != y.len() {
+                    return Some(false);
+                }
+                for (k, v) in x {
+                    let Some(w) = y.get(k) else {
+                        return Some(false);
+                    };
+                    if !self.same(v, w)? {
+                        return Some(false);
+                    }
+                }
+                true
+            }
+            _ => a == b,
+        })
     }
 
     fn arrays(
@@ -294,49 +356,49 @@ fn strings(schema: &Map<String, Value>, text: &str) -> Result<(), Misfit> {
 }
 
 fn numbers(schema: &Map<String, Value>, value: &Value) -> Result<(), Misfit> {
-    let Some(number) = value.as_f64() else {
+    let Value::Number(number) = value else {
         return Ok(());
     };
-    let bound = |key: &str| schema.get(key).and_then(Value::as_f64);
+    let bound = |key: &str| match schema.get(key) {
+        Some(Value::Number(bound)) => Some(order(number, bound)),
+        _ => None,
+    };
     // Draft 4 says an exclusive bound with `true` beside `minimum`.
     let exclusive = |key: &str| schema.get(key) == Some(&Value::Bool(true));
     let shown = |key: &str| schema[key].to_string();
-    if let Some(least) = bound("minimum") {
-        if exclusive("exclusiveMinimum") && number <= least {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    if let Some(order) = bound("minimum") {
+        if exclusive("exclusiveMinimum") && matches!(order, Some(Less | Equal)) {
             return Err(misfit(format!(
                 "more than {}, got {value}",
                 shown("minimum")
             )));
         }
-        if number < least {
+        if order == Some(Less) {
             return Err(misfit(format!(
                 "at least {}, got {value}",
                 shown("minimum")
             )));
         }
     }
-    if let Some(most) = bound("maximum") {
-        if exclusive("exclusiveMaximum") && number >= most {
+    if let Some(order) = bound("maximum") {
+        if exclusive("exclusiveMaximum") && matches!(order, Some(Greater | Equal)) {
             return Err(misfit(format!(
                 "less than {}, got {value}",
                 shown("maximum")
             )));
         }
-        if number > most {
+        if order == Some(Greater) {
             return Err(misfit(format!("at most {}, got {value}", shown("maximum"))));
         }
     }
-    if let Some(least) = bound("exclusiveMinimum")
-        && number <= least
-    {
+    if matches!(bound("exclusiveMinimum"), Some(Some(Less | Equal))) {
         return Err(misfit(format!(
             "more than {}, got {value}",
             shown("exclusiveMinimum")
         )));
     }
-    if let Some(most) = bound("exclusiveMaximum")
-        && number >= most
-    {
+    if matches!(bound("exclusiveMaximum"), Some(Some(Greater | Equal))) {
         return Err(misfit(format!(
             "less than {}, got {value}",
             shown("exclusiveMaximum")
@@ -345,23 +407,17 @@ fn numbers(schema: &Map<String, Value>, value: &Value) -> Result<(), Misfit> {
     Ok(())
 }
 
-/// Equal as JSON Schema compares: numbers by value, so `1` is `1.0`.
-fn same(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
-            (Some(x), Some(y)) => x == y,
-            _ => match (x.as_u64(), y.as_u64()) {
-                (Some(x), Some(y)) => x == y,
-                _ => x.as_f64() == y.as_f64(),
-            },
-        },
-        (Value::Array(x), Value::Array(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y))
-        }
-        (Value::Object(x), Value::Object(y)) => {
-            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w)))
-        }
-        _ => a == b,
+/// How `a` stands to `b`, exactly for whole numbers, which `f64` would
+/// round past 2^53; `None` for what cannot be ordered.
+fn order(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    let whole = |n: &serde_json::Number| {
+        n.as_i64()
+            .map(i128::from)
+            .or_else(|| n.as_u64().map(i128::from))
+    };
+    match (whole(a), whole(b)) {
+        (Some(a), Some(b)) => Some(a.cmp(&b)),
+        _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
 }
 
@@ -557,6 +613,45 @@ mod tests {
             deep = json!({"next": deep});
         }
         assert!(check(&looped, &deep).is_ok());
+    }
+
+    #[test]
+    fn whole_numbers_compare_exactly() {
+        let top = json!({"type": "integer", "exclusiveMaximum": u64::MAX});
+        assert!(check(&top, &json!(u64::MAX - 1)).is_ok());
+        assert!(check(&top, &json!(u64::MAX)).is_err());
+        let least = json!({"minimum": 9_007_199_254_740_993_u64});
+        assert!(check(&least, &json!(9_007_199_254_740_992_u64)).is_err());
+        assert!(
+            check(
+                &json!({"enum": [9_007_199_254_740_993_u64]}),
+                &json!(9_007_199_254_740_992_u64)
+            )
+            .is_err()
+        );
+        assert!(check(&json!({"minimum": -1}), &json!(0.5)).is_ok());
+    }
+
+    #[test]
+    fn its_work_is_bounded_whatever_it_is_given() {
+        // 10,000 values allowed, 100,000 items each the last: a billion
+        // comparisons unbounded, a hundred thousand steps here.
+        let allowed: Vec<u64> = (0..10_000).collect();
+        let schema = json!({"type": "array", "items": {"enum": allowed}});
+        let value = json!(vec![9_999_u64; 100_000]);
+        let started = std::time::Instant::now();
+        assert!(check(&schema, &value).is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // A misfit within the bound is still found.
+        let early = json!([9_999, 10_000]);
+        assert_eq!(
+            said(schema, early),
+            "[1]: must be one of 0, 1, 2, 3, 4, 5, 6, 7 or 9992 more"
+        );
     }
 
     #[test]

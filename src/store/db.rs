@@ -12049,9 +12049,18 @@ impl Database {
         tool: &str,
         arguments: Value,
         record: bool,
+        parameters: Option<Value>,
         facts: audit::Facts,
         now_ms: u64,
     ) -> Result<Stepped> {
+        // Its arguments before anything else decides it, as a call from
+        // the model: one the schema its client gave does not take is never
+        // put to a gate. A step only recorded is not checked: no one is
+        // asked about it, and its arguments may come cut.
+        if let Some(parameters) = parameters.filter(|_| !record) {
+            crate::tools::check_schema(&parameters, &arguments)
+                .map_err(|detail| Error::with("invalid_arguments", format!("{tool}: {detail}")))?;
+        }
         self.step_turn(name, turn, Some(call_id))?;
         let bot = self.call_bot(turn, call_id)?;
         let call: Option<(String, bool, Option<String>, i64, bool, bool)> = self
