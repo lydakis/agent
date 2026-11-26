@@ -2599,9 +2599,11 @@ async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
         .find(|item| item["role"] == "assistant")
         .and_then(|item| status::pull_request(&text(item)));
     // Who sent each prompt, as `items_of` keeps it: another agent's
-    // message sets no question aside.
+    // message sets no question aside, nor does the note a stopped turn
+    // leaves the model.
     let flat: Vec<Value> = entries
         .iter()
+        .filter(|entry| entry["stop_note"] != true)
         .flat_map(|entry| {
             let from = transcript::sender(
                 entry["from"]["bot"].as_str(),

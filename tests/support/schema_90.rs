@@ -6,7 +6,8 @@ use rusqlite::Connection;
 
 macro_rules! before_114 {
     () => {
-        "CREATE TABLE plain_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
+        "DROP TABLE stop_notes;
+        CREATE TABLE plain_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
             instructions TEXT NOT NULL, compaction_instructions TEXT);
         INSERT INTO plain_instructions(id,instructions,compaction_instructions)
             SELECT i.id,t.text,c.text FROM bot_instructions i JOIN texts t ON t.id=i.instructions
