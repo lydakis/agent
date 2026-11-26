@@ -20730,8 +20730,8 @@ impl App {
             self.settle(&key, state);
         }
         for (key, found, head) in settled.watched {
-            // What changed there reads here; still open or set aside
-            // there, it stays where it is here.
+            // What changed there reads here; still open there, it stays
+            // where it is here.
             if let Some(state) = found
                 && state.settled()
                 && self.settled.get(&key) != Some(&state)
@@ -30517,8 +30517,7 @@ mod tests {
             (10, 3, say("assistant", "calc.neg is done.")),
             (11, 4, say("user", "Push it")),
             (12, 4, say("assistant", "Pushed as 4f2c1a0.")),
-            // Asked last: the person's own words after it would set it
-            // aside, the conversation having moved on past it.
+            // Asked last.
             (
                 13,
                 4,
@@ -37670,7 +37669,7 @@ mod tests {
                             "created_by": "shop.lead", "running_turn": 5}),
                     ];
                     if listed.load(std::sync::atomic::Ordering::SeqCst) {
-                        // Closed, done: what it asked is set aside here.
+                        // Closed, done: what it asked waits on nobody here.
                         bots.push(json!({"name": "shop.loose", "bot_id": 3, "head": 3,
                             "closed_ms": 1}));
                     }
@@ -38890,7 +38889,7 @@ mod tests {
         assert!(drawn(&mut app).contains(&"┃ Answered · Drop it".to_owned()));
         // A card the screen let go of is let go here too. Where its
         // question stood is kept, cut to a line, as its answer or close
-        // may be on a newer page; one set aside is let go, set aside again
+        // may be on a newer page; one unpinned is let go, unpinned again
         // when its page is read again.
         let long = "w".repeat(1000);
         for n in 0..64 {
@@ -39122,8 +39121,9 @@ mod tests {
         );
     }
 
-    /// A task's question set aside in its own window comes back to the
-    /// lead's composer with a click on its card, and stays pinned there.
+    /// A task's open question that left the pins, its task done, comes
+    /// back to the lead's composer with a click on its card, and stays
+    /// pinned there.
     #[tokio::test]
     async fn a_tasks_open_question_that_left_the_pins_comes_back_with_a_click() {
         let client = daemon_answering(|_| json!({})).await;
@@ -39703,7 +39703,7 @@ mod tests {
         app.project = Some("web".into());
         app.unpinned.clear();
         app.done_elsewhere();
-        assert_eq!(app.asks.len(), 1, "open: nothing set aside");
+        assert_eq!(app.asks.len(), 1, "open: nothing unpinned");
         app.daemon(json!({"event": "closed", "bot": "web.lead", "data": {}}))
             .await;
         app.done_elsewhere();

@@ -2220,7 +2220,7 @@ Renders every agent on the daemon as a live constellation (you at the center, le
 
   ![Typing an answer: the composer's band names the question over the words, as the sent answer will show it](../docs/sonny/ask-answering.png)
 
-  ![Where each question stands: one answered, one withdrawn with why, one still open past the person's own words, and the composer answering an open one in words](../docs/sonny/question-states-dark.png)
+  ![Two decisions still open after a message of the person's own about CI: both cards keep their yellow ? and Waits for your pick, the footer counts ? 1, and the composer stays theirs](../docs/sonny/cards-stay-open.png)
 
   ![A task's question: the lead's lookout note says shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/verbose`
