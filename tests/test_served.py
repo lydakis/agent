@@ -1143,10 +1143,11 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.assertEqual(subscribed['subscriptions'],
                          [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a,
                            'outlives_close': True}])
-        # A reply is posted once its author has been shown the thread.
-        turn('shop.b', {'read': 'fake-home'})
+        # A reply posts at once, read first or not, and its answer shows
+        # the posts its author had not been shown.
         replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
         self.assertEqual((replied['posts'], replied['follow']['name']), (2, 'commons.fake-home'), replied)
+        self.assertEqual([p['by'] for p in replied['missed']['posts']], ['calc.a'], replied)
         # A reply wakes no one itself: follows carry it.
         self.assertNotIn('told', replied)
         thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
