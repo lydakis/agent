@@ -2,7 +2,7 @@
 
 Each module starts its own daemons on its own stores and ports, so modules
 share nothing but the machine. A module's output is printed only when it
-fails. Usage: python -m tests.run [--jobs N] [MODULE ...]
+fails. Usage: python -m tests.run [--jobs N] [--skip MODULE]... [MODULE ...]
 """
 
 import argparse
@@ -25,11 +25,13 @@ def run(module):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--jobs', type=int, default=4)
+    parser.add_argument('--skip', action='append', default=[],
+                        help='a module another step runs, such as tests.test_smoke')
     parser.add_argument('modules', nargs='*')
     args = parser.parse_args()
     # The largest modules first, as the longest-running, so none starts last.
     paths = sorted((ROOT / 'tests').glob('test_*.py'), key=lambda path: -path.stat().st_size)
-    modules = args.modules or [f'tests.{path.stem}' for path in paths]
+    modules = [m for m in args.modules or [f'tests.{path.stem}' for path in paths] if m not in args.skip]
     failed = []
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for future in as_completed([pool.submit(run, module) for module in modules]):

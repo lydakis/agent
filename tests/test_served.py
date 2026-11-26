@@ -57,8 +57,11 @@ def running(pid):
         return False
 
 
-@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
-class ServedToolTests(ModelFixture):
+class ServedFixture(ModelFixture):
+    """A real daemon on a store of its own, the Sonny companions that answer
+    its tools, and a laptop linked to it: what these tests and the release
+    smoke (tests/test_smoke.py) drive. It holds no tests of its own."""
+
     def setUp(self):
         super().setUp()
         self.sonny = self.binary.parent / 'sonny'
@@ -92,6 +95,65 @@ class ServedToolTests(ModelFixture):
             pass
         self.daemon.request('configure', bot=bot, **made)
 
+    def output(self, bot, turn):
+        events, after = [], 0
+        while page := self.daemon.request('events', bot=bot, after=after, limit=256)['result']['events']:
+            events, after = events + page, page[-1]['cursor']
+        done = [e for e in events if e['turn'] == turn and e['event'] == 'tool_completed']
+        self.assertTrue(done, [e['event'] for e in events if e['turn'] == turn])
+        return node_item(self.daemon, bot, done[-1]['data']['node'])['result']['output']
+
+    def linked(self, approval_mode='auto', link='', rate=0, **extra):
+        """A laptop, its own daemon and tool host in a home of its own,
+        linked to this machine, the box, by a stand-in for ssh that runs
+        the command it is given here, in the box's home. Its MCP server
+        `test` is there for the box's agents."""
+        laptop = self.path / 'laptop'
+        (laptop / '.agent').mkdir(parents=True, exist_ok=True)
+        server = Path(__file__).with_name('mcp_server.py')
+        (laptop / '.agent/config.toml').write_text(
+            f'[sonny.links.box]\nhost = "box"\nmachine = "laptop"\ncommand = {json.dumps(str(self.sonny))}\n{link}\n'
+            f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n'
+            f'default_tools_approval_mode = "{approval_mode}"\n'
+            f'env = {{ MCP_STARTS = {json.dumps(str(laptop / "starts"))} }}\n')
+        ssh = self.path / 'ssh'
+        # At `rate` bytes a second, what the laptop sends the box comes as
+        # down a slow link.
+        ssh.write_text(f"""#!{sys.executable}
+import os, subprocess, sys, time
+args = sys.argv[1:]
+host, command = args[args.index('--') + 1], args[-1]
+assert host == 'box', host
+env = {{**os.environ, 'HOME': {json.dumps(str(self.path))}}}
+rate = {rate}
+if not rate:
+    os.execvpe('sh', ['sh', '-c', command], env)
+there = subprocess.Popen(['sh', '-c', command], stdin=subprocess.PIPE, env=env)
+while chunk := os.read(0, 16384):
+    there.stdin.write(chunk)
+    there.stdin.flush()
+    time.sleep(len(chunk) / rate)
+there.stdin.close()
+there.wait()
+""")
+        ssh.chmod(0o755)
+        lender = SocketClient(self.binary, laptop / 'state.sqlite', self.url, 'echo')
+        self.addCleanup(lender.close)
+        env = {**clean_env(), 'HOME': str(laptop), 'AGENT_BIN': str(self.binary), 'SONNY_LINK_SSH': str(ssh), **extra}
+        host = subprocess.Popen([str(self.sonny), 'tool-host', '--store', str(laptop / 'state.sqlite'),
+                                 '--socket', str(lender.socket_path)], env=env, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (host.kill(), host.wait(timeout=5), host.stdout.close()))
+        self.assertEqual(json.loads(host.stdout.readline())['event'], 'serving')
+        lent = self.path / '.agent/links/laptop.json'
+        deadline = time.monotonic() + 20
+        while not lent.exists():
+            self.assertLess(time.monotonic(), deadline, 'the laptop never linked')
+            time.sleep(.05)
+        return laptop, host
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class ServedToolTests(ServedFixture):
     def lookout(self, **extra):
         """The lookout, which tells leads."""
         return self.companion('lookout', 'watching', **extra)
@@ -106,14 +168,6 @@ class ServedToolTests(ModelFixture):
                                    prompt='script', **submit)['result']['message']
         self.assertEqual(self.daemon.finished(turn, wait)['data']['status'], 'completed')
         return self.output(bot, turn)
-
-    def output(self, bot, turn):
-        events, after = [], 0
-        while page := self.daemon.request('events', bot=bot, after=after, limit=256)['result']['events']:
-            events, after = events + page, page[-1]['cursor']
-        done = [e for e in events if e['turn'] == turn and e['event'] == 'tool_completed']
-        self.assertTrue(done, [e['event'] for e in events if e['turn'] == turn])
-        return node_item(self.daemon, bot, done[-1]['data']['node'])['result']['output']
 
     def invited(self, thread, wait=10):
         """The agents a new thread's invites went to, once sent: they go
@@ -1455,54 +1509,6 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         old.wait(timeout=10)
         self.host()
         self.assertTrue(json.loads(self.call('calc.lead', 'memory', {'user': True})))
-
-    def linked(self, approval_mode='auto', link='', rate=0, **extra):
-        """A laptop, its own daemon and tool host in a home of its own,
-        linked to this machine, the box, by a stand-in for ssh that runs
-        the command it is given here, in the box's home. Its MCP server
-        `test` is there for the box's agents."""
-        laptop = self.path / 'laptop'
-        (laptop / '.agent').mkdir(parents=True, exist_ok=True)
-        server = Path(__file__).with_name('mcp_server.py')
-        (laptop / '.agent/config.toml').write_text(
-            f'[sonny.links.box]\nhost = "box"\nmachine = "laptop"\ncommand = {json.dumps(str(self.sonny))}\n{link}\n'
-            f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n'
-            f'default_tools_approval_mode = "{approval_mode}"\n'
-            f'env = {{ MCP_STARTS = {json.dumps(str(laptop / "starts"))} }}\n')
-        ssh = self.path / 'ssh'
-        # At `rate` bytes a second, what the laptop sends the box comes as
-        # down a slow link.
-        ssh.write_text(f"""#!{sys.executable}
-import os, subprocess, sys, time
-args = sys.argv[1:]
-host, command = args[args.index('--') + 1], args[-1]
-assert host == 'box', host
-env = {{**os.environ, 'HOME': {json.dumps(str(self.path))}}}
-rate = {rate}
-if not rate:
-    os.execvpe('sh', ['sh', '-c', command], env)
-there = subprocess.Popen(['sh', '-c', command], stdin=subprocess.PIPE, env=env)
-while chunk := os.read(0, 16384):
-    there.stdin.write(chunk)
-    there.stdin.flush()
-    time.sleep(len(chunk) / rate)
-there.stdin.close()
-there.wait()
-""")
-        ssh.chmod(0o755)
-        lender = SocketClient(self.binary, laptop / 'state.sqlite', self.url, 'echo')
-        self.addCleanup(lender.close)
-        env = {**clean_env(), 'HOME': str(laptop), 'AGENT_BIN': str(self.binary), 'SONNY_LINK_SSH': str(ssh), **extra}
-        host = subprocess.Popen([str(self.sonny), 'tool-host', '--store', str(laptop / 'state.sqlite'),
-                                 '--socket', str(lender.socket_path)], env=env, stdout=subprocess.PIPE, text=True)
-        self.addCleanup(lambda: (host.kill(), host.wait(timeout=5), host.stdout.close()))
-        self.assertEqual(json.loads(host.stdout.readline())['event'], 'serving')
-        lent = self.path / '.agent/links/laptop.json'
-        deadline = time.monotonic() + 20
-        while not lent.exists():
-            self.assertLess(time.monotonic(), deadline, 'the laptop never linked')
-            time.sleep(.05)
-        return laptop, host
 
     def test_a_box_agent_s_script_runs_on_the_linked_machine_against_its_servers(self):
         laptop, lender = self.linked()

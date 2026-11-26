@@ -5,9 +5,11 @@
 
 passes when a run of test.yml pushed for COMMIT finished with every job,
 and every step of every job, a success: a skipped step or job is a failure,
-as when a failed install skipped the runtime tests. Otherwise it exits 1
-naming each job and step that was not. Reads the Actions API with
-GITHUB_TOKEN (actions: read) when set.
+as when a failed install skipped the runtime tests. The run must also hold
+the steps REQUIRED names, so a run from before one was added, or one it
+was taken out of, ships nothing. Otherwise it exits 1 naming each job and
+step that was not. Reads the Actions API with GITHUB_TOKEN (actions: read)
+when set.
 """
 
 import json
@@ -17,6 +19,12 @@ import time
 import urllib.request
 
 WORKFLOW = "test.yml"
+
+# Steps a run must hold, as (job, step): the release smoke, tests/test_smoke.py,
+# runs an agent's shell and file calls, here and on a linked machine,
+# through each permission row on the real daemon and Sonny. 0.10.8 shipped
+# with every such call on a linked machine refused while every test passed.
+REQUIRED = [("runtime", "Release smoke")]
 
 
 def red(job):
@@ -34,6 +42,12 @@ def red(job):
     return found
 
 
+def missing(jobs):
+    """Each REQUIRED step `jobs` do not hold."""
+    held = {(job["name"], step["name"]) for job in jobs for step in job.get("steps", [])}
+    return [f"{name}: {step} never ran" for name, step in REQUIRED if (name, step) not in held]
+
+
 def verdict(commit, runs, jobs):
     """(passed, message): `runs` are test.yml's push runs for `commit`,
     newest first; `jobs` maps a run's id to its jobs' latest attempts."""
@@ -42,7 +56,7 @@ def verdict(commit, runs, jobs):
     reasons = []
     for run in runs:
         listed = jobs.get(run["id"], [])
-        found = [line for job in listed for line in red(job)] if listed else ["no jobs ran"]
+        found = [line for job in listed for line in red(job)] + missing(listed) if listed else ["no jobs ran"]
         if run.get("status") != "completed":
             found.insert(0, f"run is still {run.get('status')}")
         if not found:
