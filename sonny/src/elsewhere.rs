@@ -2208,8 +2208,8 @@ mod tests {
         assert!(lanes.is_empty());
     }
 
-    /// A question the person's words went past is read again at its
-    /// turn's end, so its agent's turn's end is followed till then.
+    /// A question the person's words may have answered is read again at
+    /// once, and waits on them till then.
     #[test]
     fn an_agent_whose_question_is_unsure_is_followed_to_its_turn_end() {
         let event = |kind: &str, data: Value| json!({"bot": "site.fix", "turn": 1, "event": kind, "data": data});
@@ -2219,11 +2219,10 @@ mod tests {
         let narrow: HashMap<String, bool> = [("site.fix".to_owned(), true)].into();
         assert!(!done_with(&narrow, &needs));
         // A reaction or words of the person's: answered or not, the
-        // history says once the turn ends.
+        // history, read at once, says.
         needs.event(&event("accepted", json!({"text": "ok"})));
-        assert!(!needs.waits("site.fix"));
+        assert!(needs.waits("site.fix"));
         assert!(!done_with(&narrow, &needs));
-        needs.event(&event("turn_finished", json!({})));
         assert_eq!(needs.due().len(), 1);
         needs.asked("site.fix", None);
         assert!(done_with(&narrow, &needs));

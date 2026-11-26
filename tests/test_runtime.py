@@ -157,12 +157,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             assert self.path == '/v1/responses'
             assert request['model'] in getattr(self.server, 'models', ('synthetic-model',))
             texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
-            # A `steer:` message joins the running task, which its prompt drives;
-            # Sonny's word that a question was set aside, attached to the call
-            # that takes the person's message, drives nothing either.
-            user = next((t for t in reversed(texts) if not t.startswith('steer:')
-                         and not (t.startswith('Your question "') and ' is now set aside: ' in t)),
-                        texts[-1])
+            # A `steer:` message joins the running task, which its prompt drives.
+            user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
             # An automation's message comes after its one-line header.
             if user.startswith('[automation ') and '\n' in user:
                 user = user.split('\n', 1)[1]
