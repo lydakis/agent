@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""A stand-in AWS CLI for Sonny's tests: `aws configure export-credentials
+--format process` prints the next of the key sets $FAKE_AWS_KEYS lists
+(a JSON list of [key id, secret, seconds until they expire]), the last
+again once they run out, as `credential_process` output with a session
+token; each call is appended to $FAKE_AWS_CALLS."""
+import datetime
+import json
+import os
+import sys
+
+calls = os.environ['FAKE_AWS_CALLS']
+made = sum(1 for _ in open(calls)) if os.path.exists(calls) else 0
+with open(calls, 'a') as f:
+    f.write(' '.join(sys.argv[1:]) + '\n')
+if sys.argv[1:] != ['configure', 'export-credentials', '--format', 'process']:
+    sys.exit('fake aws: only configure export-credentials --format process')
+keys = json.loads(os.environ['FAKE_AWS_KEYS'])
+access, secret, seconds = keys[min(made, len(keys) - 1)]
+expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
+print(json.dumps({'Version': 1, 'AccessKeyId': access, 'SecretAccessKey': secret,
+                  'SessionToken': f'token-{access}', 'Expiration': expires.strftime('%Y-%m-%dT%H:%M:%SZ')}))

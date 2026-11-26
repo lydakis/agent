@@ -97,6 +97,10 @@
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
 //! bearer_token_env_var = "LINEAR_TOKEN"
+//! [sonny.mcp_servers.ledger]    # one behind AWS IAM: each request signed (SigV4) with keys from the AWS chain, none kept
+//! url = "https://abc123.execute-api.us-east-1.amazonaws.com/mcp"
+//! sigv4 = "execute-api"         # the service it signs for
+//! region = "us-east-1"          # the region it signs for
 //! [sonny.links.devbox]          # devbox's agents use this machine's browser, MCP servers and opens while it is connected
 //! host = "me@devbox"            # what ssh dials
 //! machine = "laptop"            # what the agents there call this machine, its hostname by default
@@ -1268,6 +1272,9 @@ pub struct McpServer {
     /// The variable whose value is sent as the bearer token.
     pub bearer_token_env_var: Option<String>,
     pub http_headers: BTreeMap<String, String>,
+    /// Each request signed with AWS Signature Version 4 for this service and
+    /// region, with keys from the AWS chain.
+    pub sigv4: Option<Sigv4>,
     pub enabled: bool,
     /// Only these of its tools, when set.
     pub enabled_tools: Option<Vec<String>>,
@@ -1281,6 +1288,14 @@ pub struct McpServer {
     pub default_tools_approval_mode: ApprovalMode,
     /// Each tool's own `approval_mode`.
     pub tools: BTreeMap<String, ApprovalMode>,
+}
+
+/// What a server behind AWS IAM is signed for: `sigv4` (the service, as
+/// `execute-api` for API Gateway) and `region`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sigv4 {
+    pub service: String,
+    pub region: String,
 }
 
 impl McpServer {
@@ -1411,7 +1426,7 @@ pub fn named(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-const MCP_KEYS: [&str; 15] = [
+const MCP_KEYS: [&str; 17] = [
     "command",
     "args",
     "env",
@@ -1419,6 +1434,8 @@ const MCP_KEYS: [&str; 15] = [
     "url",
     "bearer_token_env_var",
     "http_headers",
+    "sigv4",
+    "region",
     "enabled",
     "enabled_tools",
     "disabled_tools",
@@ -1472,6 +1489,7 @@ fn mcp_server(name: &str, value: &toml::Value) -> Result<McpServer, String> {
         enabled: true,
         ..McpServer::default()
     };
+    let mut sigv4 = (None, None);
     for (key, value) in table {
         let key = key.as_str();
         if !MCP_KEYS.contains(&key) {
@@ -1519,14 +1537,43 @@ fn mcp_server(name: &str, value: &toml::Value) -> Result<McpServer, String> {
                     "cwd" => server.cwd = Some(PathBuf::from(text)),
                     "url" => server.url = Some(text),
                     "bearer_token_env_var" => server.bearer_token_env_var = Some(text),
+                    "sigv4" => sigv4.0 = Some(text),
+                    "region" => sigv4.1 = Some(text),
                     _ => server.description = Some(text),
                 }
             }
         }
     }
+    server.sigv4 = match sigv4 {
+        (Some(service), Some(region)) => {
+            let shaped = |text: &str| {
+                !text.is_empty()
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            };
+            if !shaped(&service) {
+                return Err(format!(
+                    "{at}.sigv4 is the service it signs for, as execute-api"
+                ));
+            }
+            if !shaped(&region) {
+                return Err(format!("{at}.region is an AWS region, as us-east-1"));
+            }
+            if server.bearer_token_env_var.is_some() {
+                return Err(format!(
+                    "{at} takes sigv4 or bearer_token_env_var, not both"
+                ));
+            }
+            Some(Sigv4 { service, region })
+        }
+        (Some(_), None) => return Err(format!("{at}.sigv4 goes with region")),
+        (None, Some(_)) => return Err(format!("{at}.region goes with sigv4")),
+        (None, None) => None,
+    };
     match (&server.command, &server.url) {
         (Some(_), None) => {
-            for key in ["bearer_token_env_var", "http_headers"] {
+            for key in ["bearer_token_env_var", "http_headers", "sigv4"] {
                 if table.contains_key(key) {
                     return Err(format!("{at}.{key} goes with url"));
                 }
@@ -3493,7 +3540,19 @@ mod tests {
         let docs = &config.sonny.mcp_servers["docs"];
         assert_eq!(docs.url.as_deref(), Some("https://example.com/mcp"));
         assert_eq!(docs.bearer_token_env_var.as_deref(), Some("DOCS"));
+        assert_eq!(docs.sigv4, None);
         assert!(docs.enabled);
+        let ledger = parse(
+            "[sonny.mcp_servers.ledger]\nurl = \"https://abc.execute-api.eu-west-1.amazonaws.com/mcp\"\nsigv4 = \"execute-api\"\nregion = \"eu-west-1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.sonny.mcp_servers["ledger"].sigv4,
+            Some(Sigv4 {
+                service: "execute-api".into(),
+                region: "eu-west-1".into()
+            })
+        );
         let files = &config.sonny.mcp_servers["files"];
         assert_eq!(files.args, ["-y", "server"]);
         assert_eq!(files.env["ROOT"], "/tmp");
@@ -3535,6 +3594,30 @@ mod tests {
             (
                 "[sonny.mcp_servers.x]\ncommand = \"a\"\nbearer_token_env_var = \"T\"",
                 "sonny.mcp_servers.x.bearer_token_env_var goes with url",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\nsigv4 = \"execute-api\"\nregion = \"us-east-1\"",
+                "sonny.mcp_servers.x.sigv4 goes with url",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nsigv4 = \"execute-api\"\nregion = \"us-east-1\"\nbearer_token_env_var = \"T\"",
+                "sonny.mcp_servers.x takes sigv4 or bearer_token_env_var, not both",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nsigv4 = \"execute-api\"",
+                "sonny.mcp_servers.x.sigv4 goes with region",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nregion = \"us-east-1\"",
+                "sonny.mcp_servers.x.region goes with sigv4",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nsigv4 = \"execute-api\"\nregion = \"US East\"",
+                "sonny.mcp_servers.x.region is an AWS region, as us-east-1",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"https://b\"\nsigv4 = \"\"\nregion = \"us-east-1\"",
+                "sonny.mcp_servers.x.sigv4 must not be empty",
             ),
             (
                 "[sonny.mcp_servers.x]\nurl = \"ftp://b\"",

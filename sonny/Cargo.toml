@@ -52,6 +52,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # The MCP servers the lookout keeps for agents' scripts: the official Rust
 # SDK, which Codex uses too, as a client over stdio and streamable HTTP.
 rmcp = { version = "3.8", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+# The event type rmcp's HTTP client streams, named by the client that signs
+# its requests for servers behind AWS IAM (sigv4.rs): rmcp's own version.
+sse-stream = "0.2"
 # Runs agents' `exec` scripts: QuickJS, as Pi's code mode does, small
 # beside V8, with a memory limit and an interrupt for a script's time.
 rquickjs = { version = "0.14", features = ["futures", "disable-assertions"] }

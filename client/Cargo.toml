@@ -9,13 +9,22 @@ publish = false
 # The daemon's socket protocol as a library for human-facing clients.
 
 [dependencies]
+# AWS Signature Version 4 and the AWS credential chain (aws.rs), which the
+# runtime signs Bedrock calls with and Sonny MCP servers behind AWS IAM:
+# HMAC and SHA-256 from the aws-lc-rs both already build for rustls, and
+# reqwest's own URL and header types.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
+bytes = "1.11"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http = "1"
+url = "2"
 libc = "0.2"
 # Command rules as data (rules.rs), already built for the runtime.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Reads a project's name from `.agents/project.toml`.
 toml = "1.1"
-tokio = { version = "1", features = ["rt", "net", "sync", "io-util", "time"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "io-util", "time", "process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "test-util"] }
