@@ -13,9 +13,11 @@
 //! otherwise, is in the queue when the telling arrives: [`Folder::take`]
 //! reads the queue without waiting.
 //!
-//! On macOS a folder's watch says only that an entry came, went or was
-//! renamed over, never which; and a file edited in place (`>>` by hand) is
-//! told only where the file itself is watched, as [`file`] does.
+//! On Linux a folder's watch also names an entry whose permissions or
+//! times changed. On macOS it says only that an entry came, went or was
+//! renamed over, never which; and a file edited in place (`>>` by hand) or
+//! whose permissions changed is told only where the file itself is
+//! watched, as [`file`] does.
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -184,7 +186,10 @@ mod imp {
 
     pub(super) fn folder(folder: &Path) -> std::io::Result<Folder> {
         let fd = inotify()?;
-        let mask = ENTRIES | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_ONLYDIR;
+        // An entry's permissions put right is a change too: a file that
+        // could not be read is read again.
+        let entries = ENTRIES | libc::IN_ATTRIB;
+        let mask = entries | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_ONLYDIR;
         watch(fd.as_raw_fd(), folder, mask)?;
         // SAFETY: the OwnedFd is open, and it keeps the one descriptor
         // until the AsyncFd that owns it drops.
@@ -706,6 +711,12 @@ mod tests {
             .unwrap();
         file.write_all(b"\n").unwrap();
         drop(file);
+        assert_eq!(folder.take(), named(&["x.json"]));
+        // And one whose permissions changed, as one put right that could
+        // not be read.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(dir.join("x.json"), mode).unwrap();
         assert_eq!(folder.take(), named(&["x.json"]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
