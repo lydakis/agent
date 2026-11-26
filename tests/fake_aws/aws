@@ -12,7 +12,7 @@ import sys
 calls = os.environ['FAKE_AWS_CALLS']
 made = sum(1 for _ in open(calls)) if os.path.exists(calls) else 0
 with open(calls, 'a') as f:
-    f.write(' '.join(sys.argv[1:]) + '\n')
+    f.write(' '.join(sys.argv[1:]) + f" profile={os.environ.get('AWS_PROFILE', '')}\n")
 if sys.argv[1:] != ['configure', 'export-credentials', '--format', 'process']:
     sys.exit('fake aws: only configure export-credentials --format process')
 keys = json.loads(os.environ['FAKE_AWS_KEYS'])

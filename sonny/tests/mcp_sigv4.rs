@@ -29,6 +29,21 @@ fn configure(home: &Path, url: &str, region: &str) {
     .unwrap();
 }
 
+/// `text` as ~/.agent/keys/env under `home`, readable by its owner alone.
+fn keep(home: &Path, text: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = home.join(".agent/keys");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join("env"))
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
 /// The signature-checking server on a free port, logging each request to
 /// `home/signed`: it, and its URL.
 fn server(home: &Path) -> (Child, String) {
@@ -117,6 +132,9 @@ fn tools_are_signed_and_keys_are_resolved_again_before_they_expire() {
     // passed, a call signs with them while the CLI is asked again behind
     // it, and the calls after that sign with the new ones.
     let keys = r#"[["AKIDONE", "secret-one", 302], ["AKIDTWO", "secret-two", 3600]]"#;
+    // The profile setup keeps in ~/.agent/keys/env stands over the
+    // environment's, as it does for the daemon.
+    keep(&home, "AWS_PROFILE=ledger-reader\n");
     let script = r#"text((await tools.mcp__ledger__echo({text: 'one'})).content[0].text);
 await tools.mcp__ledger__wait({ms: 10500});
 await tools.mcp__ledger__echo({text: 'two'});
@@ -142,7 +160,7 @@ text((await tools.mcp__ledger__echo({text: 'three'})).content[0].text);"#;
     let calls = std::fs::read_to_string(home.join("aws-calls")).unwrap();
     assert_eq!(
         calls.lines().collect::<Vec<_>>(),
-        ["configure export-credentials --format process"; 2]
+        ["configure export-credentials --format process profile=ledger-reader"; 2]
     );
     let _ = server.kill();
     let _ = std::fs::remove_dir_all(&home);

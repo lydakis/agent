@@ -294,7 +294,22 @@ enum Source {
     /// process environment cannot change under a running process.
     Environment,
     /// A command printing `credential_process` output: [`AWS_CLI`].
-    Cli(Box<[String]>),
+    Cli(Cli),
+}
+
+/// The AWS CLI as a signer runs it: its command line, and the variables it
+/// runs under over the process's own, an empty value unsetting one.
+struct Cli {
+    argv: Box<[String]>,
+    env: Box<[(String, String)]>,
+}
+impl Cli {
+    fn new(argv: Box<[String]>) -> Self {
+        Self {
+            argv,
+            env: Box::default(),
+        }
+    }
 }
 
 /// A signer: keys from the AWS chain, for one region and signing name.
@@ -328,7 +343,8 @@ impl Aws {
         redaction: Option<Box<dyn Redact>>,
         start: &Start,
     ) -> (Self, Option<Error>) {
-        match Self::environment(redaction.as_deref()) {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        match Self::environment(redaction.as_deref(), var) {
             Some(keys) => {
                 let aws = Self::unresolved(region, service, Source::Environment, redaction);
                 aws.install(keys);
@@ -342,27 +358,44 @@ impl Aws {
     }
 
     /// A signer for `service` in `region` that asks the AWS CLI for keys
-    /// only when it first signs, bounded by the CLI's own timeout.
-    pub fn new(region: String, service: &str, redaction: Option<Box<dyn Redact>>) -> Self {
-        match Self::environment(redaction.as_deref()) {
+    /// only when it first signs, bounded by the CLI's own timeout. `env`
+    /// holds variables that stand over the process's own, for the keys
+    /// read from it and for the CLI, as a client's kept variables stand over
+    /// its shell's: an empty value unsets one.
+    pub fn new(
+        region: String,
+        service: &str,
+        redaction: Option<Box<dyn Redact>>,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        let var = |name: &str| match env.iter().rev().find(|(key, _)| key == name) {
+            Some((_, value)) => Some(value.clone()).filter(|v| !v.is_empty()),
+            None => std::env::var(name).ok().filter(|v| !v.is_empty()),
+        };
+        match Self::environment(redaction.as_deref(), var) {
             Some(keys) => {
                 let aws = Self::unresolved(region, service, Source::Environment, redaction);
                 aws.install(keys);
                 aws
             }
             None => {
-                let command: Box<[String]> = AWS_CLI.map(str::to_owned).into();
-                Self::unresolved(region, service, Source::Cli(command), redaction)
+                let cli = Cli {
+                    argv: AWS_CLI.map(str::to_owned).into(),
+                    env: env.into(),
+                };
+                Self::unresolved(region, service, Source::Cli(cli), redaction)
             }
         }
     }
 
     /// The environment's key pair, when it holds one, whatever part of a
     /// set it holds withheld first.
-    fn environment(redaction: Option<&dyn Redact>) -> Option<Keys> {
-        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    fn environment(
+        redaction: Option<&dyn Redact>,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Option<Keys> {
         if let Some(redaction) = redaction {
-            withhold(redaction, var);
+            withhold(redaction, &var);
         }
         let (access, secret) = var(ENVIRONMENT[0]).zip(var(ENVIRONMENT[1]))?;
         Some(Keys::new(access, secret, var(ENVIRONMENT[2])))
@@ -375,9 +408,10 @@ impl Aws {
         redaction: Option<Box<dyn Redact>>,
         start: &Start,
     ) -> (Self, Option<Error>) {
+        let cli = Cli::new(command);
         let resolved = start
             .get_or_init(|| async {
-                tokio::time::timeout(START, resolve(&command))
+                tokio::time::timeout(START, resolve(&cli))
                     .await
                     .unwrap_or_else(|_| {
                         Err(Error::with(
@@ -388,7 +422,7 @@ impl Aws {
             })
             .await
             .clone();
-        let aws = Self::unresolved(region, service, Source::Cli(command), redaction);
+        let aws = Self::unresolved(region, service, Source::Cli(cli), redaction);
         let unresolved = match resolved {
             Ok(keys) if !keys.expired(SystemTime::now()) => {
                 aws.install(keys);
@@ -601,7 +635,8 @@ pub async fn payload(body: impl Stream<Item = std::io::Result<Bytes>>) -> Result
 
 /// Run the AWS CLI's credential export. Its stdout holds the secret, so it
 /// never becomes a diagnostic; its stderr is the CLI's own explanation.
-async fn resolve(argv: &[String]) -> Result<Keys> {
+async fn resolve(cli: &Cli) -> Result<Keys> {
+    let argv = &cli.argv;
     let unavailable = |why: String| Error::with("provider_aws_credentials_unavailable", why);
     let deadline = tokio::time::Instant::now() + RESOLVE_TIMEOUT;
     let mut command = tokio::process::Command::new(&argv[0]);
@@ -609,6 +644,12 @@ async fn resolve(argv: &[String]) -> Result<Keys> {
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    for (name, value) in &cli.env {
+        match value.is_empty() {
+            true => command.env_remove(name),
+            false => command.env(name, value),
+        };
+    }
     let output = tokio::time::timeout_at(deadline, command.output())
         .await
         .map_err(|_| unavailable("aws configure export-credentials timed out".into()))?
@@ -1161,7 +1202,7 @@ exit 252
         );
         let mut argv = AWS_CLI.map(str::to_owned);
         argv[0] = aws.display().to_string();
-        let error = resolve(&argv).await.unwrap_err();
+        let error = resolve(&Cli::new(argv.clone().into())).await.unwrap_err();
         assert_eq!(error.code, "provider_aws_credentials_unavailable");
         assert_eq!(
             error.detail.as_deref(),
@@ -1175,7 +1216,7 @@ exit 252
             .unwrap()
             .replace("1.22.34", "2.31.4");
         script(&aws, &current);
-        let error = resolve(&argv).await.unwrap_err();
+        let error = resolve(&Cli::new(argv.clone().into())).await.unwrap_err();
         assert!(error.detail.unwrap().starts_with("usage: "));
         for (version, old) in [
             ("aws-cli/1.44.2", true),
@@ -1331,7 +1372,7 @@ exit 252
             Keys::new("A".into(), "S".into(), None),
         )
         .with_redaction(Box::new(told.clone()));
-        aws.source = Source::Cli(AWS_CLI.map(str::to_owned).into());
+        aws.source = Source::Cli(Cli::new(AWS_CLI.map(str::to_owned).into()));
         aws.install(Keys::new("AKID".into(), "s3".into(), None));
         assert_eq!(
             pairs(&told),
@@ -1356,6 +1397,51 @@ exit 252
                 held("AWS_DEFAULT_REGION"),
             ]
         );
+    }
+
+    /// Variables a client keeps stand over the process's own: a kept key
+    /// pair signs, and the CLI runs under the kept profile, an empty value
+    /// unsetting a name the process has.
+    #[tokio::test]
+    async fn kept_variables_stand_over_the_process_s() {
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        let aws = Aws::new(
+            "us-east-1".into(),
+            "execute-api",
+            None,
+            vec![
+                pair("AWS_ACCESS_KEY_ID", "AKIDKEPT"),
+                pair("AWS_SECRET_ACCESS_KEY", "s"),
+            ],
+        );
+        assert_eq!(
+            (aws.source(), aws.held().access.as_str()),
+            ("environment", "AKIDKEPT")
+        );
+        let unset = Aws::new(
+            "us-east-1".into(),
+            "execute-api",
+            None,
+            vec![
+                pair("AWS_ACCESS_KEY_ID", ""),
+                pair("AWS_SECRET_ACCESS_KEY", ""),
+            ],
+        );
+        assert_eq!(unset.source(), "aws-cli");
+        let mut expired = Keys::new("OLD".into(), "S".into(), None);
+        expired.expires = Some(UNIX_EPOCH);
+        let mut aws = Aws::fixed("us-east-1", "execute-api", expired);
+        aws.source = Source::Cli(Cli {
+            argv: [
+                "sh".into(),
+                "-c".into(),
+                r#"echo "{\"Version\":1,\"AccessKeyId\":\"$AWS_PROFILE-${HOME:-unset}\",\"SecretAccessKey\":\"S\"}""#.into(),
+            ]
+            .into(),
+            env: [pair("AWS_PROFILE", "work"), pair("HOME", "")].into(),
+        });
+        let aws = Arc::new(aws);
+        assert_eq!(aws.current().await.unwrap().access, "work-unset");
     }
 
     /// A whole body's digest is the streamed one's.
@@ -1401,7 +1487,7 @@ echo '{{"Version":1,"AccessKeyId":"FRESH","SecretAccessKey":"S"}}'"#,
             keys
         };
         let mut aws = Aws::fixed("us-east-1", "bedrock-mantle", expiring("STALE", 60));
-        aws.source = Source::Cli(["sh".into(), "-c".into(), script].into());
+        aws.source = Source::Cli(Cli::new(["sh".into(), "-c".into(), script].into()));
         let aws = Arc::new(aws);
         let settled = || async { drop(aws.refresh.lock().await) };
 

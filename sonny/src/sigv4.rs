@@ -74,18 +74,28 @@ impl Signed {
     }
 }
 
-/// One signer for each service and region in this process, so a server
-/// connected again, or several signed for the same, reuse the keys the
-/// AWS CLI gave rather than ask it again.
+/// One signer for each service, region and kept AWS variables in this
+/// process, so a server connected again, or several signed for the same,
+/// reuse the keys the AWS CLI gave rather than ask it again. The AWS
+/// variables in ~/.agent/keys/env (where setup keeps `AWS_PROFILE`) stand
+/// over Sonny's environment, as they do for the daemon it starts and for
+/// a bearer token's variable; kept anew there, they make a new signer.
 fn signer(sigv4: &Sigv4) -> Arc<Aws> {
-    static SIGNERS: Mutex<BTreeMap<(String, String), Arc<Aws>>> = Mutex::new(BTreeMap::new());
-    let key = (sigv4.service.clone(), sigv4.region.clone());
+    type Signers = BTreeMap<(String, String, Vec<(String, String)>), Arc<Aws>>;
+    static SIGNERS: Mutex<Signers> = Mutex::new(BTreeMap::new());
+    let kept: Vec<(String, String)> = agent_client::env_file::path()
+        .and_then(|file| agent_client::env_file::read(&file).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("AWS_"))
+        .collect();
     let mut signers = SIGNERS.lock().unwrap_or_else(|e| e.into_inner());
-    Arc::clone(
-        signers
-            .entry(key)
-            .or_insert_with(|| Arc::new(Aws::new(sigv4.region.clone(), &sigv4.service, None))),
-    )
+    let signer = signers
+        .entry((sigv4.service.clone(), sigv4.region.clone(), kept))
+        .or_insert_with_key(|(service, region, kept)| {
+            Arc::new(Aws::new(region.clone(), service, None, kept.clone()))
+        });
+    Arc::clone(signer)
 }
 
 impl StreamableHttpClient for Signed {
