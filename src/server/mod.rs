@@ -809,8 +809,10 @@ enum Command {
         /// The JSON Schema the step's tool declares, when its client knows
         /// it: a step to be asked about has its arguments checked against
         /// it first, and one they do not fit is refused `invalid_arguments`,
-        /// never put to a gate. A step of the bot's own tool is checked
-        /// against what that tool takes either way.
+        /// never put to a gate. A step of the bot's own tool with none is
+        /// read as that tool takes it; one with a schema, by the schema,
+        /// as its client runs it under arguments of its own (another
+        /// machine's name, say).
         parameters: Option<Value>,
         /// What the step is, as its client says, for its row in the audit
         /// trail: one of the trail's kinds, places and accesses.

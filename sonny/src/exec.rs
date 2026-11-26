@@ -718,6 +718,19 @@ pub fn parse(input: &str) -> Result<Script, String> {
     Ok(script)
 }
 
+/// `schema`, one of the agent's own tools', as a call of it on another
+/// machine takes it: with `machine`, that machine's name, too.
+fn on_a_machine(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    if let Some(fields) = schema.as_object_mut() {
+        let properties = fields.entry("properties").or_insert_with(|| json!({}));
+        if let Some(properties) = properties.as_object_mut() {
+            properties.insert("machine".into(), json!({"type": "string"}));
+        }
+    }
+    schema
+}
+
 /// Where a script's stored values and whole outputs are kept.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/exec"))
@@ -737,7 +750,9 @@ struct Nested {
     /// the `exec` call (`run_step`), deciding and recording it itself.
     daemon: bool,
     /// The JSON Schema its server declares for its arguments, which the
-    /// agent's daemon checks a step against before its gate.
+    /// agent's daemon checks a step against before its gate: for one of
+    /// the agent's own tools, the daemon's, which a call of it on another
+    /// machine is checked by, `machine` added.
     schema: Option<Arc<Value>>,
 }
 
@@ -1019,11 +1034,13 @@ impl Steps {
     /// person's linked here: put to the agent's gate as the same call on
     /// this machine would be, then run there, in its sandbox, and told
     /// how it ended. Only a call of this machine's daemon goes.
+    /// `parameters` is the schema the daemon declares for `name`.
     pub async fn run_on(
         &self,
         machine: &str,
         name: &str,
         arguments: Value,
+        parameters: Option<&Value>,
     ) -> Result<crate::mcp::Called, String> {
         if !matches!(self.via, Via::Daemon { .. }) {
             return Err(format!(
@@ -1042,15 +1059,13 @@ impl Steps {
             access: Some(if name == "read" { "read" } else { "write" }),
         };
         // The gate sees where it runs; the machine's tool, only the call.
-        let step = self
-            .ask(
-                name,
-                &format!("tools.{name}"),
-                arguments.clone(),
-                facts,
-                true,
-            )
-            .await?;
+        // The daemon checks the call as the agent made it, `machine` and
+        // all, by the schema it was made by: the tool's own, which takes
+        // `machine` too here.
+        let parameters = parameters.map(|schema| Arc::new(on_a_machine(schema)));
+        let called = format!("tools.{name}");
+        let step =
+            (self.ask_checked(name, &called, arguments.clone(), parameters, facts, true)).await?;
         let mut arguments = arguments;
         if let Some(fields) = arguments.as_object_mut() {
             fields.remove("machine");
@@ -1840,7 +1855,7 @@ fn daemon_tool(tool: &Value) -> Option<(String, Nested, Value)> {
             access: None,
         },
         daemon: true,
-        schema: None,
+        schema: (tool["parameters"].is_object()).then(|| Arc::new(tool["parameters"].clone())),
     };
     Some((
         name.clone(),
@@ -3045,9 +3060,12 @@ impl Caller {
             // on its gate.
             let stopped = self.clock.stop();
             let machine = arguments["machine"].as_str().map(str::to_owned);
+            let schema = nested.schema.clone();
             let ran = Abort(self.host.spawn(async move {
                 match machine {
-                    Some(machine) => steps.run_on(&machine, &id, arguments).await,
+                    Some(machine) => {
+                        (steps.run_on(&machine, &id, arguments, schema.as_deref())).await
+                    }
                     None => steps.run(&id, arguments).await,
                 }
             }))
@@ -3706,8 +3724,10 @@ mod tests {
         let (client, mut asked) = gate(&dir, Duration::ZERO, None).await;
         let steps = Steps::new(client, "shop.lead".into(), 7, "c1".into());
         let arguments = json!({"command": "ls", "machine": "nowhere-linked"});
+        let shell = json!({"type": "object", "properties": {"command": {"type": "string"}},
+            "required": ["command"], "additionalProperties": false});
         let ran = steps
-            .run_on("nowhere-linked", "shell", arguments.clone())
+            .run_on("nowhere-linked", "shell", arguments.clone(), Some(&shell))
             .await;
         let Err(error) = ran else {
             panic!("ran on no machine")
@@ -3735,6 +3755,14 @@ mod tests {
             (&approve["kind"], &approve["place"]),
             (&json!("shell"), &json!("external"))
         );
+        // Checked by the tool's own schema, which takes `machine` there:
+        // read as the tool alone takes it, every such call was refused.
+        assert_eq!(
+            approve["parameters"],
+            json!({"type": "object", "properties": {"command": {"type": "string"},
+                "machine": {"type": "string"}}, "required": ["command"],
+                "additionalProperties": false})
+        );
         let told = asked.recv().await.unwrap();
         assert_eq!(
             (&told["op"], &told["step"], &told["failed"]),
@@ -3742,7 +3770,12 @@ mod tests {
         );
         // Only the shell and file tools go, asked nothing first.
         let refused = steps
-            .run_on("mac", "web_fetch", json!({"url": "https://example.com"}))
+            .run_on(
+                "mac",
+                "web_fetch",
+                json!({"url": "https://example.com"}),
+                None,
+            )
             .await;
         let Err(error) = refused else {
             panic!("web_fetch went")
