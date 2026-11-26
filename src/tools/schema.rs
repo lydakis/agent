@@ -51,6 +51,14 @@ impl std::fmt::Display for Misfit {
 pub fn check(schema: &Value, value: &Value) -> Result<(), Misfit> {
     let mut checker = Checker {
         root: schema,
+        older: schema
+            .get("$schema")
+            .and_then(Value::as_str)
+            .is_some_and(|dialect| {
+                ["draft-03", "draft-04", "draft-06", "draft-07"]
+                    .iter()
+                    .any(|draft| dialect.contains(draft))
+            }),
         local: None,
         refs: 0,
         work: WORK,
@@ -64,6 +72,9 @@ pub fn check(schema: &Value, value: &Value) -> Result<(), Misfit> {
 
 struct Checker<'a> {
     root: &'a Value,
+    /// Whether the schema names a draft before 2019-09 as its `$schema`,
+    /// where a `$ref` hides the keywords beside it.
+    older: bool,
     /// Whether a `#` reference means the root: no schema below it
     /// declares its own `$id`. Found at the first reference.
     local: Option<bool>,
@@ -111,6 +122,10 @@ impl<'a> Checker<'a> {
             {
                 self.refs += 1;
                 self.fits(target, value, depth + 1)?;
+            }
+            // Drafts 4 to 7 read nothing beside a `$ref`.
+            if self.older {
+                return Ok(());
             }
         }
         if let Some(types) = schema.get("type") {
@@ -708,6 +723,21 @@ mod tests {
                     "properties": {"x": {"$ref": "#/$defs/item"}}}}});
         assert!(check(&nested, &json!({"inner": {"x": "s"}})).is_ok());
         assert!(check(&nested, &json!({"top": "s"})).is_ok());
+        // Before 2019-09, nothing beside a `$ref` is read.
+        let beside = |dialect: &str| {
+            json!({"$schema": dialect, "definitions": {"text": {"type": "string"}},
+                "properties": {"x": {"$ref": "#/definitions/text", "maxLength": 1}}})
+        };
+        let draft7 = beside("http://json-schema.org/draft-07/schema#");
+        assert!(check(&draft7, &json!({"x": "ab"})).is_ok());
+        assert_eq!(said(draft7, json!({"x": 1})), "x: must be a string");
+        assert_eq!(
+            said(
+                beside("https://json-schema.org/draft/2020-12/schema"),
+                json!({"x": "ab"})
+            ),
+            "x: at most 1 character, got 2"
+        );
     }
 
     #[test]
