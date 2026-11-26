@@ -25571,10 +25571,11 @@ fn a_rule_refuses_a_step_naming_shell_as_it_refuses_the_command() {
 }
 
 #[test]
-fn a_held_step_of_a_lifted_call_ends_with_its_turn() {
+fn a_held_step_of_a_lifted_call_waits_past_its_turn() {
     use agent_runtime::store::Step;
-    // Lifted by a message, ended by the turn or by its interruption, or
-    // yielded by its client, whose steps wait on.
+    // Lifted by a message, its turn then ended or interrupted, or yielded
+    // by its client: the call waits on past its turn as background work,
+    // and so does its step, for its gates or the person to decide.
     for (yielded, error) in [(false, None), (false, Some("cancelled")), (true, None)] {
         let mut db = db();
         stepping_bot(&mut db, false, None);
@@ -25605,25 +25606,62 @@ fn a_held_step_of_a_lifted_call_ends_with_its_turn() {
         let error = error.map(agent_runtime::Error::new);
         db.finish(turn, error.as_ref()).unwrap();
         let listed = db.approvals(None, None, 0, None, 64).unwrap();
-        if yielded {
-            assert_eq!(
-                listed["approvals"][0]["handle"],
-                format!("proc:{process}").as_str(),
-                "{listed}"
-            );
-            continue;
-        }
-        assert_eq!(listed["approvals"], json!([]), "{listed}");
+        assert_eq!(
+            listed["approvals"][0]["handle"],
+            format!("proc:{process}").as_str(),
+            "{listed}"
+        );
         let events = db.events("Lead", 0, 256).unwrap();
-        let decided = (events["events"].as_array().unwrap().iter())
-            .find(|e| e["event"] == "step_decided")
-            .unwrap_or_else(|| panic!("no step_decided: {events}"));
-        assert_eq!(decided["data"]["decision"], "deny", "{decided}");
-        assert_eq!(decided["data"]["reason"], "its turn ended", "{decided}");
-        // The call waits on for its client's answer, its time running.
-        let calls = db.tool_calls("sonny", 0, 10).unwrap();
-        assert_eq!(calls["calls"][0]["call_id"], "c1", "{calls}");
+        assert!(
+            !(events["events"].as_array().unwrap().iter()).any(|e| e["event"] == "step_decided"),
+            "{events}"
+        );
     }
+}
+
+#[test]
+fn a_held_step_its_call_ends_first_is_answered_with_how_it_ended() {
+    use agent_runtime::store::Step;
+    // Its call answered while it waits: its check says so, as its gates'
+    // denial would, rather than finding no step.
+    let mut db = db();
+    stepping_bot(&mut db, false, None);
+    let turn = running_call(&mut db);
+    let now = epoch_now();
+    let Step::Pending { .. } = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "0",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            now,
+        )
+        .unwrap()
+        .step
+    else {
+        panic!("a gated step was decided at once");
+    };
+    db.answer_call("Lead", turn, "c1", result("gave up"), now)
+        .unwrap();
+    let Step::Decided(ended) = db
+        .step_check("Lead", turn, "c1/0", now, false)
+        .unwrap()
+        .step
+    else {
+        panic!("an ended step still waits");
+    };
+    assert_eq!(ended["decision"], "deny", "{ended}");
+    assert_eq!(ended["reason"], "the call was answered first", "{ended}");
+    assert!(ended.get("denied").is_none(), "{ended}");
+    // Told once: a second check finds no step.
+    let Err(again) = db.step_check("Lead", turn, "c1/0", now, false) else {
+        panic!("an ended step was told twice");
+    };
+    assert_eq!(again.code, "no_pending_step");
 }
 
 /// Schema 110: the profile a bot was composed from, as its client named

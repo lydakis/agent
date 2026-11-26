@@ -827,6 +827,29 @@ class DaemonStepTests(ModelFixture):
         ran = self.reply(client, request, timeout=15)['result']
         self.assertEqual(json.loads(ran['output'])['stdout'], 'lifted\n')
 
+    def test_a_step_of_a_call_a_message_lifted_waits_past_its_turn(self):
+        # A message lifts the call while its step waits on a gate; the turn
+        # then ends. The step waits on, as the lifted call does and as a
+        # yielded call's steps do, still listed for whoever decides it, and
+        # runs once allowed.
+        client, turn = self.script(settings={'approval_hold_ms': 0}, approve=['shell'], approver='auto')
+        request = self.ask(client, turn, arguments={'command': 'echo after'})
+        [call] = client.receive(lambda m: m.get('event') == 'approval_requested'
+                                and m.get('turn') == turn)['data']['calls']
+        client.request('answer', bot='Lead', turn=turn, call_id=call['call_id'], request=call['request'],
+                       tag='auto', decision='ask', reason='only the person may allow', by='approver')
+        client.request('submit', bot='Lead', request_id='s', prompt='steer:look', delivery='steer')
+        lifted = client.receive(lambda m: m.get('event') == 'call_lifted' and m.get('turn') == turn)['data']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        [listed] = client.request('approvals', bot='Lead')['result']['approvals']
+        self.assertEqual((listed['call_id'], listed['handle'], listed['asked'][0]['tag']),
+                         (call['call_id'], lifted['handle'], 'auto'))
+        self.assertEqual(self.events(client, turn, 'step_decided'), [])
+        client.request('answer', bot='Lead', turn=turn, call_id=call['call_id'], request=call['request'],
+                       tag='auto', decision='allow', by='person')
+        ran = self.reply(client, request, timeout=10)['result']
+        self.assertEqual(json.loads(ran['output'])['stdout'], 'after\n', ran)
+
     def offered(self):
         return [t['name'] for t in self.model.requests.get(timeout=3)['tools']]
 

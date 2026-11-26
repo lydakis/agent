@@ -830,6 +830,21 @@ fn stepped(reply: &Value) -> crate::mcp::Called {
     crate::mcp::Called { json, is_error }
 }
 
+/// How long a step took to be decided or ended, from when it was asked.
+fn after(began: Instant) -> String {
+    format!("after {} s", began.elapsed().as_secs())
+}
+
+/// What a step refused says: `called` was not approved, after how long,
+/// and the daemon's reason, its gate's verdict or what ended it first.
+fn not_approved(called: &str, reply: &Value, began: Instant) -> String {
+    format!(
+        "{called} was not approved {}: {}",
+        after(began),
+        reply["reason"].as_str().unwrap_or("denied")
+    )
+}
+
 /// Calls answered in this process, so two answerings of one call differ.
 static ANSWERINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -926,13 +941,14 @@ impl Steps {
         let mut asked = json!({"bot": bot, "turn": turn, "call_id": call_id,
             "step": step, "name": tool, "arguments": arguments, "record": !asks});
         facts.into(&mut asked);
+        let began = Instant::now();
         match client.request("approve_step", asked).await {
             Ok(reply) if reply["decision"] == "allow" => Ok(step),
-            Ok(reply) => Err(format!(
-                "{called} was not approved: {}",
-                reply["reason"].as_str().unwrap_or("denied")
+            Ok(reply) => Err(not_approved(called, &reply, began)),
+            Err(error) if asks => Err(format!(
+                "{called} could not be approved {}: {error}",
+                after(began)
             )),
-            Err(error) if asks => Err(format!("{called} could not be approved: {error}")),
             Err(error) => Err(format!("{called} could not be recorded: {error}")),
         }
     }
@@ -959,8 +975,19 @@ impl Steps {
         );
         let asked = json!({"bot": bot, "turn": turn, "call_id": call_id,
             "step": step, "name": name, "arguments": arguments});
+        let began = Instant::now();
         let reply = (client.request("run_step", asked).await)
-            .map_err(|error| format!("tools.{name} did not run: {error}"))?;
+            .map_err(|error| format!("tools.{name} did not run {}: {error}", after(began)))?;
+        // Refused, by its gates or by what ended it first: how, and after
+        // how long, as a step put to the gate first says.
+        if reply["decision"] == "deny" {
+            let text = not_approved(&format!("tools.{name}"), &reply, began);
+            let json = json!({"content": [{"type": "text", "text": text}], "isError": true});
+            return Ok(crate::mcp::Called {
+                json: json.to_string(),
+                is_error: true,
+            });
+        }
         Ok(stepped(&reply))
     }
 
@@ -3743,7 +3770,7 @@ text("done");"#;
         assert!(said.starts_with("Script completed"), "{said}");
         assert!(
             said.ends_with(
-                "Output:\nhi\ntools.mcp__test__add was not approved: no adding\ntrue\ndone"
+                "Output:\nhi\ntools.mcp__test__add was not approved after 0 s: no adding\ntrue\ndone"
             ),
             "{said}"
         );
