@@ -89,6 +89,7 @@ mod recall;
 mod repick;
 mod resolved;
 mod responsible;
+mod restore;
 mod resume;
 mod reviewer;
 mod rex;
