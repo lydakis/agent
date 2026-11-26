@@ -101,6 +101,7 @@ mod served;
 mod settings;
 mod setup;
 mod shell;
+mod sigv4;
 mod skills;
 mod sky;
 mod sound;

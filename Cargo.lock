@@ -31,11 +31,16 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agent-client"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
+ "bytes",
+ "futures-util",
+ "http",
  "libc",
  "serde",
  "serde_json",
  "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -4124,6 +4129,7 @@ dependencies = [
  "shlex",
  "signal-hook 0.4.6",
  "similar",
+ "sse-stream",
  "starlark",
  "syntect",
  "tikv-jemallocator",

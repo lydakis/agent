@@ -618,8 +618,18 @@ pub(crate) async fn open<H: rmcp::ClientHandler>(
                 let value = value.parse().map_err(|_| "bad header value".to_owned())?;
                 transport.custom_headers.insert(name, value);
             }
-            let transport = StreamableHttpClientTransport::from_config(transport);
-            let client = handler.serve(transport).await.map_err(|e| e.to_string())?;
+            let client = match &config.sigv4 {
+                Some(sigv4) => {
+                    let signed = crate::sigv4::Signed::new(sigv4)?;
+                    let transport = StreamableHttpClientTransport::with_client(signed, transport);
+                    handler.serve(transport).await
+                }
+                None => {
+                    let transport = StreamableHttpClientTransport::from_config(transport);
+                    handler.serve(transport).await
+                }
+            };
+            let client = client.map_err(|e| e.to_string())?;
             Ok((client, Group(None), Arc::default()))
         }
         (None, None) => Err("no command or url".into()),
@@ -938,7 +948,7 @@ pub fn card() -> Vec<ratatui::text::Line<'static>> {
 
 const USAGE: &str = "sonny mcp list [--json]
 sonny mcp add NAME [--env KEY=VALUE]... [--description TEXT] -- COMMAND [ARG]...
-sonny mcp add NAME --url URL [--bearer-token-env-var VAR] [--description TEXT]
+sonny mcp add NAME --url URL [--bearer-token-env-var VAR | --sigv4 SERVICE --region REGION] [--description TEXT]
 sonny mcp remove NAME
 sonny mcp import [--yes | --json]
 sonny mcp tool
@@ -1087,6 +1097,12 @@ fn added(args: &[String]) -> Result<toml::Table, String> {
             "--bearer-token-env-var" => {
                 keys.insert("bearer_token_env_var".into(), value()?.into());
             }
+            "--sigv4" => {
+                keys.insert("sigv4".into(), value()?.into());
+            }
+            "--region" => {
+                keys.insert("region".into(), value()?.into());
+            }
             "--description" => {
                 keys.insert("description".into(), value()?.into());
             }
@@ -1111,6 +1127,9 @@ fn added(args: &[String]) -> Result<toml::Table, String> {
     }
     if !env.is_empty() {
         keys.insert("env".into(), toml::Value::Table(env));
+    }
+    if keys.contains_key("sigv4") && keys.contains_key("bearer_token_env_var") {
+        return Err("--sigv4 signs with AWS keys and --bearer-token-env-var sends a token: one or the other".into());
     }
     Ok(keys)
 }
@@ -1172,6 +1191,23 @@ fn line(server: &Value) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// `--sigv4` and `--region` write the keys of their names; a server
+    /// signed with AWS keys sends no bearer token besides.
+    #[test]
+    fn add_signs_with_aws_keys_or_sends_a_token_not_both() {
+        let args = |text: &str| text.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let keys = added(&args(
+            "--url https://x --sigv4 execute-api --region us-east-1",
+        ))
+        .unwrap();
+        assert_eq!(keys["sigv4"].as_str(), Some("execute-api"));
+        assert_eq!(keys["region"].as_str(), Some("us-east-1"));
+        let both = added(&args(
+            "--url https://x --sigv4 execute-api --region us-east-1 --bearer-token-env-var T",
+        ));
+        assert!(both.unwrap_err().contains("one or the other"));
+    }
 
     #[test]
     fn a_listing_is_kept_for_the_person_alone_without_the_config_s_secrets() {
