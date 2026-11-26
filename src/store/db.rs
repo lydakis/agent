@@ -4046,7 +4046,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 114;
+    pub const SCHEMA: i32 = 115;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -4344,6 +4344,7 @@ impl Database {
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS stop_notes(node INTEGER PRIMARY KEY REFERENCES nodes(id));
             CREATE TABLE IF NOT EXISTS openings(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 text TEXT, chars INTEGER);
             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -14518,6 +14519,17 @@ impl Database {
                 },
             )?;
         }
+        // A turn an interrupt stopped says so in its history, after all it
+        // holds, as Codex records an interrupted turn: the model reads it
+        // before whatever comes next. It starts no turn, and `stop_notes`
+        // marks it, so clients can tell it from a person's words.
+        if code == Some("cancelled") {
+            let item = bot.family()?.user_item(super::context::STOPPED)?;
+            let id = node(&tx, head, &item)?;
+            tx.prepare_cached("INSERT INTO stop_notes(node) VALUES (?)")?
+                .execute([id])?;
+            head = Some(id);
+        }
         if let Some(waiting) = &waiting {
             tx.execute(
                 "UPDATE turns SET waiting=NULL,paced_ms=paced_ms+? WHERE id=?",
@@ -18429,10 +18441,11 @@ impl Database {
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin,
-                s.person,s.quotes,n.written_ms,s.attached,n.message,m.bot
+                s.person,s.quotes,n.written_ms,s.attached,n.message,m.bot,x.node IS NOT NULL
              FROM (SELECT id,{PICTURELESS} AS item,written_ms,message FROM
                 (SELECT n.id,COALESCE(d.item,{N_ITEM}) AS item,n.written_ms,n.message FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
-             LEFT JOIN senders s ON s.node=n.id LEFT JOIN messages m ON m.id=n.message"
+             LEFT JOIN senders s ON s.node=n.id LEFT JOIN messages m ON m.id=n.message
+             LEFT JOIN stop_notes x ON x.node=n.id"
         ))?;
         for &node in wanted {
             type Row = (
@@ -18447,6 +18460,7 @@ impl Database {
                 Option<bool>,
                 Option<i64>,
                 Option<String>,
+                bool,
             );
             let (
                 raw,
@@ -18460,6 +18474,7 @@ impl Database {
                 attached,
                 message,
                 to,
+                stop_note,
             ): Row = query.query_row(params![node, maximum as i64], |r| {
                 Ok((
                     r.get(0)?,
@@ -18473,6 +18488,7 @@ impl Database {
                     r.get(8)?,
                     r.get(9)?,
                     r.get(10)?,
+                    r.get(11)?,
                 ))
             })?;
             let mut entry = match raw {
@@ -18489,6 +18505,11 @@ impl Database {
             if let (Some(message), Some(to)) = (message, to) {
                 entry["message"] = json!(message);
                 entry["handle"] = json!(format!("{to}/{message}"));
+            }
+            // The note a stopped turn left for the model, which no one
+            // sent: a client shows it or not as it likes.
+            if stop_note {
+                entry["stop_note"] = json!(true);
             }
             sender_fields(
                 &mut entry,
@@ -22813,6 +22834,14 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     if from < 114 {
         migrate_texts_once(conn)?;
     }
+    // 114 -> 115: the note a turn an interrupt stopped leaves in its
+    // history is marked. No turn before left one. release/store_down.py
+    // takes it back.
+    if from < 115 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS stop_notes(node INTEGER PRIMARY KEY REFERENCES nodes(id));",
+        )?;
+    }
 
     Ok(())
 }
@@ -24278,6 +24307,10 @@ impl Translation {
                         conn.prepare_cached("INSERT INTO declined(node,item) VALUES (?,?)")?
                             .execute(params![new, declined])?;
                     }
+                    conn.prepare_cached(
+                        "INSERT INTO stop_notes(node) SELECT ?1 FROM stop_notes WHERE node=?2",
+                    )?
+                    .execute(params![new, old])?;
                     if let Some(result) = &result
                         && single
                         && super::context::tool_result(new_item).is_none()
@@ -24389,6 +24422,7 @@ fn free_node(conn: &Connection, id: i64, name: &str) -> Result<Option<i64>> {
         "DELETE FROM elisions WHERE node=?",
         "DELETE FROM stubs WHERE node=?",
         "DELETE FROM declined WHERE node=?",
+        "DELETE FROM stop_notes WHERE node=?",
         "DELETE FROM openings WHERE node=?",
         "DELETE FROM senders WHERE node=?",
         "DELETE FROM translated WHERE node=?",
