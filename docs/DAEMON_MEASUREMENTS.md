@@ -13423,7 +13423,7 @@ Four alternating rounds of the Perf workflow's screens.
 - Lifecycle CPU reads +9.7% (0.515 to 0.565 s for the whole run); its
   p95 turn and peak RSS are even.
 
-## Freezes on a slow disk (#PRNUM)
+## Freezes on a slow disk (#1409)
 
 2026-11-26. George, 11-25: typed letters showed half a second late, then all
 at once, and scrolling went choppy, while the store's commits took 1 to 4 s.
