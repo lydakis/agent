@@ -495,6 +495,19 @@ class StepTests(ModelFixture):
                                  name='shell', arguments={'command': 'true', 'timeout_ms': 0})
         self.assertEqual(refused['error'], 'invalid_shell_arguments')
         self.assertEqual(client.request('approvals', bot='Lead')['result']['approvals'], [])
+        # A client that runs the step elsewhere, under a field of its own,
+        # gives the schema it takes it by: checked by that, not refused.
+        shell = next(t for t in client.request('tools')['result']['tools'] if t['name'] == 'shell')['parameters']
+        there = {**shell, 'properties': {**shell['properties'], 'machine': {'type': 'string'}}}
+        misfit = client.request('approve_step', bot='Lead', turn=turn, call_id='script-0', step='2',
+                                name='shell', arguments={'machine': 'mac'}, parameters=there)
+        self.assertEqual(misfit['error'], 'invalid_arguments')
+        request = self.ask(client, turn, step='3', name='shell', arguments={'command': 'touch made', 'machine': 'mac'},
+                           parameters=there)
+        [call] = self.announced(client, turn)['calls']
+        self.assertEqual((call['call_id'], call['name']), ('script-0/3', 'shell'))
+        self.verdict(client, turn, 'script-0/3')
+        self.assertEqual(self.reply(client, request)['result']['decision'], 'allow')
         self.answer(client, turn, output='done')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 

@@ -4605,7 +4605,10 @@ only those a client puts to them. Protocol 104 lets `approve_step` take
 checked against it before anything else, as a call's are, and one they do
 not fit is refused with `invalid_arguments`, never put to a gate; a schema
 that is not an object or a boolean is `invalid_step`. A step only recorded
-is not checked. A step's `step_result` ends its row;
+is not checked. A step of the bot's own tool is read as that tool takes it
+when its client gives no schema; with one, by the schema alone, then judged
+by its gates as the same call: its client runs it, perhaps on another
+machine, under a field of its own (Sonny's `machine`). A step's `step_result` ends its row;
 told twice, the first holds, and a step its gates allowed is told done by
 its events even once a trim took its row. A step allowed by nobody is not
 among the calls a judge reads. Approval verdicts now keep `leased` when given under a

@@ -1313,6 +1313,18 @@ impl Bot {
     /// decides from this one plan, so a step and the same call from the
     /// model are decided alike.
     pub fn plan(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> Plan {
+        self.plan_fitting(call, workspace, rules, || self.arguments(call).is_ok())
+    }
+    /// As [`Bot::plan`], with `fits` saying whether the call's arguments
+    /// fit, where they were checked already: a step its client gave a
+    /// schema for, by that schema.
+    pub fn plan_fitting(
+        &self,
+        call: &ToolCall,
+        workspace: &std::path::Path,
+        rules: &Rules,
+        fits: impl FnOnce() -> bool,
+    ) -> Plan {
         let ruling = self.ruling(call, rules);
         let confinable = self.sandboxed() && crate::sandbox::confinable(&call.name);
         // As `confines` finds it: false for a tool no sandbox holds.
@@ -1320,7 +1332,7 @@ impl Bot {
         let held = gated(&self.gates, &call.name)
             && self.may_call(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
-            && self.arguments(call).is_ok()
+            && fits()
             && match &ruling {
                 Ok(Ruling::Prompt(_)) => true,
                 Ok(Ruling::None) => !confines,
@@ -12127,7 +12139,11 @@ impl Database {
         // Its arguments before anything else decides it, as a call from
         // the model: one the schema its client gave does not take is never
         // put to a gate. A step only recorded is not checked: no one is
-        // asked about it, and its arguments may come cut.
+        // asked about it, and its arguments may come cut. A step its
+        // client gave a schema for is checked by that alone, the bot's own
+        // tool's included: its client runs it, perhaps elsewhere, under
+        // arguments of its own (another machine's name).
+        let checked = !record && parameters.is_some();
         if let Some(parameters) = parameters.filter(|_| !record) {
             crate::tools::check_schema(&parameters, &arguments)
                 .map_err(|detail| Error::with("invalid_arguments", format!("{tool}: {detail}")))?;
@@ -12185,7 +12201,7 @@ impl Database {
         // plan every caller shares; its client does what it allows.
         if !record && tool != parent && own_step(&bot, tool) {
             return self.step_planned(
-                bot, turn, call_id, step, &id, tool, arguments, &parent, lifted, now_ms,
+                bot, turn, call_id, step, &id, tool, arguments, checked, &parent, lifted, now_ms,
             );
         }
         let gates: Vec<CallGate> = bot
@@ -12268,6 +12284,8 @@ impl Database {
     /// (and its call's, when that tool says they judge its daemon steps)
     /// when the plan gates it; otherwise allowed and recorded, its row in
     /// the audit trail finished when its client says how it ended.
+    /// Its arguments are read as that tool takes them unless `checked`
+    /// already, against the schema its client gave.
     #[allow(clippy::too_many_arguments)]
     fn step_planned(
         &mut self,
@@ -12278,6 +12296,7 @@ impl Database {
         id: &str,
         tool: &str,
         arguments: Value,
+        checked: bool,
         parent: &str,
         lifted: bool,
         now_ms: u64,
@@ -12295,12 +12314,18 @@ impl Database {
         };
         // Its arguments first, as the same call from the model: one its
         // tool does not take is refused before any gate or rule sees it.
-        bot.arguments(&call)?;
+        if !checked {
+            bot.arguments(&call)?;
+        }
         let capture = self.capture(turn, call_id)?;
         let Some(workspace) = capture.workspace.as_deref() else {
             return fail("workspace_required");
         };
-        let plan = bot.plan(&call, std::path::Path::new(workspace), &capture.rules);
+        // Its arguments fit, by its tool or by its client's schema, so its
+        // gates judge it as the same call from the model: never passed
+        // over as one that could not run.
+        let workspace = std::path::Path::new(workspace);
+        let plan = bot.plan_fitting(&call, workspace, &capture.rules, || true);
         let refusal = if plan.refused_unasked() {
             Some((Error::with("approval_refused", NEVER_ASKS), true))
         } else if let Some(error) = plan.ruled_out() {

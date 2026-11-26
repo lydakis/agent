@@ -1621,6 +1621,49 @@ there.wait()
                                        wait=30))
         self.assertEqual(refused['error'], 'desktop_refused')
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_box_agent_s_shell_and_file_calls_on_the_linked_machine_go_through_its_real_gate(self):
+        # The whole path, as 0.10.8 broke it: the box's real daemon checks
+        # the call before its gate, the gate asks, and the laptop runs it.
+        laptop, _ = self.linked(link='writable = ["~/lent"]')
+        (laptop / 'lent').mkdir()
+        (laptop / 'lent/notes.txt').write_text('on the laptop\n')
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
+                                           check=True, capture_output=True, text=True).stdout)
+        self.assertIn('# On other machines', script['description'])
+        made = dict(tools=['echo', 'shell', 'read'], declare=[script], settings={'steps_only': ['*']},
+                    approve=['shell'], approver='manual')
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', **made)
+        self.keeps_its_tools(self.host(), 'calc.lead', **made)
+
+        def run(code):
+            self.script.append(('exec', code))
+            self.model.call_script = self.script
+            return self.daemon.request('submit', bot='calc.lead', request_id=f'linked-{len(self.script)}',
+                                       prompt='script')['result']['message']
+
+        # A command there waits on the box agent's gate, which sees where it runs.
+        turn = run('const r = await tools.shell({command: "touch seen && cat notes.txt", machine: "laptop"});\n'
+                   'text(JSON.parse(r.content[0].text).stdout.trim());')
+        asked = self.gate(turn, None)
+        self.assertEqual((asked['name'], asked['arguments']), ('shell', {'command': 'touch seen && cat notes.txt',
+                                                             'machine': 'laptop'}))
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked['call_id'],
+                            request=asked.get('request', 1), decision='allow', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertTrue(self.output('calc.lead', turn).endswith('Output:\non the laptop'), self.output('calc.lead', turn))
+        self.assertTrue((laptop / 'lent/seen').exists())
+        # A file call no gate holds runs there at once.
+        turn = run('const r = await tools.read({path: "notes.txt", machine: "laptop"});\ntext(r.content[0].text);')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertIn('on the laptop', self.output('calc.lead', turn))
+        # One its tool does not take is still refused before the gate, asking no one.
+        turn = run('const r = await tools.shell({machine: "laptop"}).then(() => "ran", e => e.message);\ntext(r);')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertIn('invalid_arguments', self.output('calc.lead', turn))
+        self.assertEqual(self.daemon.request('approvals', bot='calc.lead')['result']['approvals'], [])
+
     def test_one_tool_host_of_a_home_holds_its_link_and_tells_the_host_what_changes(self):
         laptop, _ = self.linked()
         sock = self.path / '.agent/links/laptop.sock'
