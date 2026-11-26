@@ -969,53 +969,43 @@ fn read_whole(store: &Path, subscriber: &str) -> Result<Vec<Sub>, String> {
 pub(super) type Revisions = std::collections::HashMap<String, crate::kept::Stamp>;
 
 /// Each subscriber's file as the lookout last read it, by the file's
-/// stamp: a look on the lookout's timer reads only the files that changed
-/// since, so a thousand subscribers cost a thousand stats, not a thousand
-/// reads.
+/// stamp: a look at the folder reads only the files that changed since,
+/// so a thousand subscribers cost a thousand stats, not a thousand reads.
 #[derive(Default)]
 pub(super) struct Read(std::collections::HashMap<String, (crate::kept::Stamp, Vec<Sub>)>);
 
 impl Read {
-    /// Every subscriber with a file, and what it holds, as [`all`] says:
-    /// a file read again only once it changed. And each file's revision as
-    /// [`revisions`] says, from the same look: one stat a file, not two.
-    pub(super) fn all(&mut self, store: &Path) -> (Vec<(String, Vec<Sub>)>, Revisions) {
+    /// The subscribers whose files may differ from what was read last:
+    /// those whose stamp is not the one kept, came, or went. One look at
+    /// the folder and one stat a file; nothing is read. And each file's
+    /// revision, as [`revisions`] says.
+    pub(super) fn changed(&self, store: &Path) -> (std::collections::HashSet<String>, Revisions) {
+        let mut changed = std::collections::HashSet::new();
+        let mut revisions = Revisions::new();
         let Ok(entries) = std::fs::read_dir(dir(store)) else {
-            self.0.clear();
-            return Default::default();
+            changed.extend(self.0.keys().cloned());
+            return (changed, revisions);
         };
-        let mut kept = std::collections::HashMap::new();
-        let mut revisions = std::collections::HashMap::new();
-        let mut all: Vec<(String, Vec<Sub>)> = Vec::new();
         for entry in entries.filter_map(Result::ok) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(bot) = name.strip_suffix(".json").map(str::to_owned) else {
+            let Some(bot) = subscriber(&entry.file_name()) else {
                 continue;
             };
-            // Stamped before the read, so a change during it is read next
-            // time.
             let stamp = crate::kept::stamp(&entry.path());
-            let subs = match (stamp, self.0.remove(&bot)) {
-                (Some(now), Some((had, subs))) if now == had => subs,
-                _ => read(store, &bot),
-            };
+            if stamp.is_none() || self.0.get(&bot).map(|(had, _)| *had) != stamp {
+                changed.insert(bot.clone());
+            }
             if let Some(stamp) = stamp {
-                revisions.insert(bot.clone(), stamp);
-            }
-            if let Some(stamp) = stamp.filter(crate::kept::Stamp::settled) {
-                kept.insert(bot.clone(), (stamp, subs.clone()));
-            }
-            if !subs.is_empty() {
-                all.push((bot, subs));
+                revisions.insert(bot, stamp);
             }
         }
-        self.0 = kept;
-        all.sort_by(|a, b| a.0.cmp(&b.0));
-        (all, revisions)
+        changed.extend(
+            (self.0.keys())
+                .filter(|bot| !revisions.contains_key(*bot))
+                .cloned(),
+        );
+        (changed, revisions)
     }
-}
 
-impl Read {
     /// One subscriber's file, as [`Read::all`] reads each: read again only
     /// once its stamp changed. Its stamp, none for a file that is gone,
     /// and what it holds.
@@ -3182,36 +3172,42 @@ mod tests {
                 .set_modified(past)
                 .unwrap();
         };
-        let names = |files: &mut Read| -> Vec<String> {
-            (files.all(&store).0.into_iter())
-                .flat_map(|(_, subs)| subs.into_iter().map(|sub| sub.name))
+        let changed =
+            |files: &Read| -> Vec<String> { files.changed(&store).0.into_iter().collect() };
+        let read = |files: &mut Read| -> Vec<String> {
+            (files.one(&store, "shop.lead").1.into_iter())
+                .map(|sub| sub.name)
                 .collect()
         };
         let mut files = Read::default();
         write("aaaa", 60);
-        assert_eq!(names(&mut files), ["aaaa"]);
+        assert_eq!(changed(&files), ["shop.lead"]);
+        assert_eq!(read(&mut files), ["aaaa"]);
         // Kept under its stamp, so the next look reads nothing.
         let kept = |files: &Read| files.0.get("shop.lead").map(|(stamp, _)| *stamp);
         assert_eq!(kept(&files), crate::kept::stamp(&path));
-        assert_eq!(names(&mut files), ["aaaa"]);
+        assert!(changed(&files).is_empty());
         // Read again once it changed.
         write("bbbb", 30);
-        assert_eq!(names(&mut files), ["bbbb"]);
+        assert_eq!(changed(&files), ["shop.lead"]);
+        assert_eq!(read(&mut files), ["bbbb"]);
         // A permission put right, which changes neither its time nor its
         // size, is a change too: what read as nothing is read again.
         use std::os::unix::fs::PermissionsExt;
         let before = crate::kept::stamp(&path);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_ne!(crate::kept::stamp(&path), before);
+        assert_eq!(changed(&files), ["shop.lead"]);
         // Just written: no proof a change in the same tick is not missed,
         // so it is read each look until it settles.
         std::fs::write(&path, named("cccc")).unwrap();
-        assert_eq!(names(&mut files), ["cccc"]);
+        assert_eq!(read(&mut files), ["cccc"]);
+        assert_eq!(changed(&files), ["shop.lead"]);
         std::fs::write(&path, named("dddd")).unwrap();
-        assert_eq!(names(&mut files), ["dddd"]);
+        assert_eq!(read(&mut files), ["dddd"]);
         // A file gone is no subscriber.
         std::fs::remove_file(&path).unwrap();
-        assert!(files.all(&store).0.is_empty());
+        assert_eq!(files.one(&store, "shop.lead"), (None, Vec::new()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

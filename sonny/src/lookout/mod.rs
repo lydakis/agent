@@ -1616,45 +1616,25 @@ impl Service {
         }
         // Each file's revision is looked at before it is read: a write after
         // the look leaves it newer than what is kept, so it is taken again.
-        let (files, revisions) = self.files.all(&self.store);
-        let mut read: HashMap<String, Vec<subs::Sub>> = files.into_iter().collect();
-        // A subscription whose `until` came ends, as an automation does.
-        let now_s = (epoch_ms() / 1000) as i64;
-        for (subscriber, subs) in read.iter_mut() {
-            for sub in subs.iter().filter(|sub| sub.over(now_s)) {
-                self.end_sub(subscriber, sub, "its until came");
-            }
-            subs.retain(|sub| !sub.over(now_s));
-        }
-        read.retain(|_, subs| !subs.is_empty());
+        // Only the files that changed are read, as a notice that names them.
+        let (mut changed, revisions) = self.files.changed(&self.store);
         // Every revision read is kept, one that changes nothing and a
         // file that went included, so the listing knows it was taken.
-        let now = epoch_ms();
-        if subs::take(&mut self.read_at, &revisions, now) {
+        if subs::take(&mut self.read_at, &revisions, epoch_ms()) {
             subs::took(&self.store, &self.read_at);
         }
-        self.next_until = (read.values().flatten())
+        // A subscriber whose file went unseen, and one with a subscription
+        // whose `until` came: it ends, as an automation does.
+        let now_s = (epoch_ms() / 1000) as i64;
+        for (name, subs) in &self.subscribers {
+            if !revisions.contains_key(name) || subs.iter().any(|sub| sub.over(now_s)) {
+                changed.insert(name.clone());
+            }
+        }
+        self.reread_files(changed);
+        self.next_until = (self.subscribers.values().flatten())
             .filter_map(subs::Sub::ends_at)
             .min();
-        if read == self.subscribers {
-            return;
-        }
-        // Each file whose subscriptions changed, said once it is read, so a
-        // rewritten filter is known to be live before an event it hears comes.
-        let changed = (read.iter())
-            .filter(|(name, subs)| self.subscribers.get(*name).is_some_and(|was| was != *subs));
-        for (name, _) in changed {
-            self.write(&json!({"at_ms": now, "lead": name, "reloaded": true}));
-        }
-        self.subscribers = read;
-        self.runner.wanted_by(&self.subscribers);
-        let records: Vec<Value> = (self.subscribers.keys())
-            .filter_map(|name| self.records.get(name).cloned())
-            .collect();
-        for record in records {
-            self.seat(&record);
-        }
-        self.resubscribe(false);
     }
 
     /// Watch the follows folder, made if it is not there yet; said in the

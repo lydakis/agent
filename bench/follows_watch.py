@@ -219,8 +219,9 @@ def main():
         results['singles'] = bench.singles(args.singles, 0)
         first = args.singles
         results['bursts'] = {}
-        for size in [int(s) for s in args.bursts.split(',')]:
-            size = min(size, args.agents)
+        # A burst larger than the follows there are is all of them, once.
+        sizes = sorted({min(int(s), args.agents) for s in args.bursts.split(',')})
+        for size in sizes:
             first = first if first + size <= args.agents else 0
             results['bursts'][str(size)] = bench.burst(size, first, args.window_s)
             first += size
