@@ -2055,7 +2055,9 @@ impl Registry {
     }
 
     /// A call of `tool` read as it would run, with no registry: the same
-    /// for whoever reads it.
+    /// for whoever reads it. Kept out of line: inlined at each caller, its
+    /// size added some 650 KiB to the daemon.
+    #[inline(never)]
     fn prepare_tool(tool: Tool, args: &str) -> Result<Prepared> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
