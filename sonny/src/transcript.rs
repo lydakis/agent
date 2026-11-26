@@ -1249,7 +1249,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
     match origin {
         crate::lookout::BOUNCE_ORIGIN => return "a returned message",
         crate::project::START_ORIGIN => return "Sonny's start",
-        crate::away::ORIGIN | crate::asks::ASIDE_ORIGIN => return "Sonny",
+        crate::away::ORIGIN => return "Sonny",
         _ => {}
     }
     match origin.split('.').next() {
