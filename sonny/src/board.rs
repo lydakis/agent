@@ -1907,11 +1907,12 @@ mod tests {
             json!({"reply": {"thread": "store", "text": "Wait."}}),
         );
         assert_eq!(said.unwrap()["posts"], 4);
-        // A read shows the step with no text; the lookout's line ends at
-        // the title.
+        // A read shows the step with no text, opening at it, the first
+        // post w1 was not shown; the lookout's line ends at the title.
         let read = w1(json!({"read": "store"})).unwrap();
-        assert!(read["posts"][2].get("text").is_none(), "{read}");
-        assert_eq!(read["posts"][2]["do"], "pause");
+        assert_eq!(read["from"], 2, "{read}");
+        assert!(read["posts"][0].get("text").is_none(), "{read}");
+        assert_eq!(read["posts"][0]["do"], "pause");
         let news = commons::news(&home, &cursor);
         let line: Value = serde_json::from_str(&news.lines[2]).unwrap();
         assert_eq!(line["text"], "pause in store, \"Type the store errors\"");
