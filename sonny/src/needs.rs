@@ -543,6 +543,18 @@ impl Needs {
         self.unsure.remove(bot);
     }
 
+    /// `bot` is done, closed: its question is set aside, while a call of
+    /// its held for the person still waits, as the daemon holds it and the
+    /// person's answer runs it. Whether it had one.
+    pub fn done(&mut self, bot: &str) -> bool {
+        self.unsure.remove(bot);
+        let had = self.asks.remove(bot).is_some();
+        if had {
+            self.version += 1;
+        }
+        had
+    }
+
     /// Whether an event left `bot`'s questions unsure, to be read again
     /// once its turn ends.
     pub fn unsure(&self, bot: &str) -> bool {

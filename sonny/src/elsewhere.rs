@@ -21,8 +21,8 @@
 //!
 //! Every agent is followed only for the events that can start a wait on
 //! the person ([`WIDE`]): a call held for a verdict, a call starting (a
-//! question is the ask tool's call), an agent closed (done, it needs no
-//! one), a fork
+//! question is the ask tool's call), an agent closed (done: its question
+//! is set aside, while a call it holds for the person still waits), a fork
 //! made (it keeps its source's history, and any question open in it), and
 //! an agent made (the event names who made it, so who is above whom is
 //! known with nothing read). The
@@ -843,8 +843,9 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
         narrow.insert(bot, waited);
     }
     // The agents closed (those holding a call when the follow started,
-    // then those it hears close): a turn still running in one can ask,
-    // and needs no one until a message opens it again.
+    // then those it hears close): done, so a question of theirs is set
+    // aside once their turn ends, until a message opens them again. A call
+    // one holds for the person waits on them all the same.
     tell_waiting(&needs, &order, &made_by, tell);
     loop {
         // The next event in the order of the cursors, once every follow
@@ -864,7 +865,7 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             continue;
         };
         let bot = bot.to_owned();
-        let mut ours = theirs(&bot);
+        let ours = theirs(&bot);
         match event["event"].as_str() {
             // Who made it, as it was made: a name made again is another's.
             Some("created") => {
@@ -878,14 +879,15 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
                 closed.remove(&bot);
                 made_by.gone(&bot);
             }
-            // A wait from an agent closed: only if a message opened it
-            // again since, as `/status` reads it done until then.
+            // A wait from an agent closed waits all the same: the daemon
+            // holds the call for the person, and their answer runs it, as
+            // a question waits while the turn that closed it runs on. A
+            // message may have opened it again since: it is done no more.
             _ if ours && closed.contains(&bot) && waits_from(&event) => {
-                match standing::rows(&client, std::slice::from_ref(&bot)).await {
-                    Ok(rows) if rows.iter().any(|row| row.name == bot && !row.closed) => {
-                        _ = closed.remove(&bot)
-                    }
-                    _ => ours = false,
+                if let Ok(rows) = standing::rows(&client, std::slice::from_ref(&bot)).await
+                    && rows.iter().any(|row| row.name == bot && !row.closed)
+                {
+                    closed.remove(&bot);
                 }
             }
             _ => {}
@@ -947,10 +949,10 @@ async fn follow(socket: &Path, store: &Path, tell: &watch::Sender<Shared>) {
             changed |= was != needs.waits(&bot);
         }
         changed |= ours && (held != needs.held_by(&bot) || asked != needs.version());
-        // Closed, it needs no one, as `/status` lists it no more.
+        // Closed, it is done: its question is set aside, as `/status`
+        // files it under Done. A call it holds still waits on the person.
         if ours && event["event"] == "closed" {
-            changed |= needs.waits(&bot);
-            needs.forget(&bot);
+            changed |= needs.done(&bot);
             seen_of.remove(&bot);
         }
         // A turn that may have asked or answered, read once it ends.
@@ -1112,7 +1114,8 @@ struct Seeded {
     seen_of: HashMap<String, Seen>,
     /// The agents whose turn ran, read once it ends.
     running: Vec<String>,
-    /// The agents closed that hold a call for the person.
+    /// The agents closed that hold a call for the person, or whose turn
+    /// runs: done once it ends, so a question of theirs is set aside.
     closed: HashSet<String>,
     /// Who made each agent listed.
     made_by: Makers,
@@ -1134,8 +1137,10 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
         .map(|bot| bot.name.clone())
         .collect();
     let theirs = |bot: &str| other(bot, &named_as_sides);
-    // A call held by an agent closed needs no one: it is done. The listing
-    // is in the order of the names.
+    // A call held for the person waits on them whether its agent is
+    // closed or not: the daemon holds it, and their answer runs it, as the
+    // agent's own window and the sky show it. The listing is in the order
+    // of the names.
     let open = |bot: &str| {
         (listed.binary_search_by(|row| row.name.as_str().cmp(bot)))
             .is_ok_and(|at| !listed[at].closed)
@@ -1146,7 +1151,7 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
         .collect();
     // Those closed while their turn runs, which can still ask.
     closed.extend(closed_running(client).await?);
-    needs.held(held, |bot| theirs(bot) && !closed.contains(bot));
+    needs.held(held, theirs);
     let mut seen_of: HashMap<String, Seen> = HashMap::new();
     let mut running = Vec::new();
     let identity = client.identity().map(str::to_owned);
@@ -1202,6 +1207,20 @@ async fn seed(client: &Client, store: &Path) -> Option<Seeded> {
     let mut made_by = Makers::default();
     for bot in &listed {
         made_by.made(&bot.name, bot.maker(), &order);
+    }
+    // The listing leaves out the agents closed, which may hold a call for
+    // the person: who made each, from its own row, so its call shows in
+    // the windows above it as any other's.
+    let unlisted: Vec<String> = (closed.iter())
+        .filter(|bot| needs.holds(bot))
+        .cloned()
+        .collect();
+    if !unlisted.is_empty()
+        && let Ok(rows) = standing::rows(client, &unlisted).await
+    {
+        for bot in rows {
+            made_by.made(&bot.name, bot.maker(), &order);
+        }
     }
     Some(Seeded {
         needs,
@@ -1847,7 +1866,7 @@ mod tests {
     /// store follows, the others hear it, and one of them follows on once
     /// it closes.
     #[tokio::test]
-    async fn an_approval_in_another_project_is_told_as_its_event_comes_and_not_once_closed() {
+    async fn an_approval_in_another_project_is_told_as_its_event_comes_closed_or_not() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = std::env::temp_dir().join(format!("elsewhere-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1886,10 +1905,7 @@ mod tests {
                                     Some("bots") => json!({"bots": [
                                         {"name": "site.lead", "bot_id": 2},
                                         {"name": "tally.lead", "bot_id": 1}], "cursor": 1}),
-                                    // Held by an agent closed: no one's.
-                                    Some("approvals") => json!({"approvals": [
-                                        {"bot": "site.gone", "turn": 1, "call_id": "c0",
-                                            "gates": ["manual"]}]}),
+                                    Some("approvals") => json!({"approvals": []}),
                                     _ => json!({}),
                                 };
                                 let _ = asked.send((at, request.clone()));
@@ -2018,36 +2034,25 @@ mod tests {
             heard.borrow().calls,
             [("tally.readme".to_owned(), 1, "c3b".to_owned())].into()
         );
-        // Closed while its turn runs, it needs no one, and what that turn
-        // asks after needs no one either, till a message opens it again.
+        // Closed while its turn runs, it is done once that turn ends, but
+        // the call it holds for the person waits on them all the same, and
+        // so does what that turn holds after, as the sky and its own
+        // window show them; and so does a closed agent's at work.
         let closed = json!({"cursor": 14, "bot": "tally.readme", "event": "closed",
             "data": {"closed_ms": 1}});
         go.send(closed).unwrap();
-        tokio::time::timeout(wait, heard.wait_for(|shared| shared.agents.is_empty()))
-            .await
-            .unwrap()
-            .unwrap();
-        // No one waits: a new connection, which the next events go to.
-        loop {
-            let (at, follow) = tokio::time::timeout(wait, requests.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            if at == 4 && op(&follow) == "follow" {
-                break;
-            }
-        }
         go.send(held("tally.readme", "c4", 15)).unwrap();
-        go.send(held("site.shut", "c6", 15)).unwrap();
-        go.send(held("site.fix", "c5", 16)).unwrap();
-        tokio::time::timeout(wait, heard.wait_for(|shared| !shared.agents.is_empty()))
+        go.send(held("site.shut", "c6", 16)).unwrap();
+        go.send(held("site.fix", "c5", 17)).unwrap();
+        tokio::time::timeout(wait, heard.wait_for(|shared| shared.calls.len() == 4))
             .await
             .unwrap()
             .unwrap();
         let bots: Vec<String> = (heard.borrow().agents.iter())
             .map(|(_, _, bot)| bot.clone())
             .collect();
-        assert_eq!(bots, ["site.fix"]);
+        assert_eq!(bots, ["site.fix", "site.shut", "tally.readme"]);
+        assert_eq!(names(&heard.borrow().outside("site")), ["tally.readme"]);
         drop(second);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2168,6 +2173,153 @@ mod tests {
             }
         }
         assert!(follows.contains(&(json!("site.fix"), json!(7))));
+        drop(open);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A helper that closed itself while a call of its waited on the
+    /// person, as its reviewer handed it over: the call still waits on
+    /// them (the daemon holds it, and their answer runs it), so it goes up
+    /// to every window above the helper, the superlead's too, whether the
+    /// follow started before it closed or after (Sonny opened later). Its
+    /// question, once its turn is over, is set aside: it is done.
+    #[tokio::test]
+    async fn a_call_held_by_an_agent_closed_still_goes_up_to_the_superlead() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("elsewhere-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (go, gone) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let gone = Arc::new(tokio::sync::Mutex::new(gone));
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let gone = gone.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                    let ready = format!("{ready}\n");
+                    write.write_all(ready.as_bytes()).await.unwrap();
+                    let mut lines = BufReader::new(read).lines();
+                    let mut gone = gone.lock().await;
+                    loop {
+                        tokio::select! {
+                            line = lines.next_line() => {
+                                let Ok(Some(line)) = line else { return };
+                                let request: Value = serde_json::from_str(&line).unwrap();
+                                let result = match request["op"].as_str() {
+                                    Some("bots") if request["active"] == true => {
+                                        json!({"bots": []})
+                                    }
+                                    // Read by name: closed, made by its task.
+                                    Some("bots") if request["names"].is_array() => {
+                                        json!({"bots": [{"name": "site.help", "bot_id": 4,
+                                            "created_by": "site.fix", "closed_ms": 1}]})
+                                    }
+                                    // The listing leaves the closed out.
+                                    Some("bots") => json!({"bots": [
+                                        {"name": "home.lead", "bot_id": 1},
+                                        {"name": "site.fix", "bot_id": 3,
+                                            "created_by": "site.lead"},
+                                        {"name": "site.lead", "bot_id": 2}], "cursor": 1}),
+                                    // Handed to the person by its reviewer,
+                                    // before the follow began.
+                                    Some("approvals") => json!({"approvals": [
+                                        {"bot": "site.help", "turn": 3, "call_id": "s1",
+                                            "step_of": "x1", "gates": ["auto"],
+                                            "asked": {"tag": "auto"}}]}),
+                                    _ => json!({}),
+                                };
+                                let out = json!({"id": request["id"], "result": result});
+                                write.write_all(format!("{out}\n").as_bytes()).await.unwrap();
+                                if request["op"] == "follow" {
+                                    let live = json!({"event": "follow_live",
+                                        "bot": request["bot"], "cursor": 0});
+                                    write.write_all(format!("{live}\n").as_bytes()).await.unwrap();
+                                }
+                            }
+                            Some(mut event) = gone.recv() => {
+                                if (event["event"].as_str()).is_some_and(|kind| WIDE.contains(&kind)) {
+                                    event["following"] = json!("*.*");
+                                }
+                                write.write_all(format!("{event}\n").as_bytes()).await.unwrap();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let store = dir.join("state.sqlite");
+        let open = Elsewhere::start(socket, store, "home".into(), Arc::new(Notify::new()));
+        let mut waiting = open.waiting.clone();
+        let wait = std::time::Duration::from_secs(5);
+        // Held when the follow began, by a helper closed since: it waits,
+        // with its task and its lead above it, so the superlead that
+        // follows the lead shows it.
+        tokio::time::timeout(wait, waiting.wait_for(|shared| !shared.calls.is_empty()))
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let shared = waiting.borrow();
+            assert_eq!(
+                shared.calls,
+                [("site.help".to_owned(), 3, "s1".to_owned())].into()
+            );
+            assert_eq!(shared.above["site.help"], ["site.fix", "site.lead"]);
+            let follows = ["site.lead".to_owned()];
+            assert!(shared.is_below("site.help", "home.lead", &follows));
+            assert!(shared.is_below("site.help", "site.fix", &[]));
+            let outside: Vec<String> = (shared.outside("home").agents.into_iter())
+                .map(|(_, bot)| bot)
+                .collect();
+            assert_eq!(outside, ["site.help"]);
+        }
+        // Another helper made, it closes itself, and its turn's next call
+        // is handed to the person: it waits too.
+        let at = |cursor: i64, bot: &str, kind: &str, data: Value| json!({"cursor": cursor, "bot": bot, "turn": 5, "event": kind, "data": data});
+        go.send(at(
+            5,
+            "site.tidy",
+            "created",
+            json!({"created_by": "site.fix"}),
+        ))
+        .unwrap();
+        go.send(at(6, "site.tidy", "closed", json!({"closed_ms": 2})))
+            .unwrap();
+        go.send(at(
+            7,
+            "site.tidy",
+            "approval_asked",
+            json!({"call_id": "x2", "tag": "auto"}),
+        ))
+        .unwrap();
+        tokio::time::timeout(wait, waiting.wait_for(|shared| shared.calls.len() == 2))
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let shared = waiting.borrow();
+            assert!(
+                shared
+                    .calls
+                    .contains(&("site.tidy".to_owned(), 5, "x2".to_owned()))
+            );
+            assert!(shared.is_below("site.tidy", "home.lead", &["site.lead".to_owned()]));
+        }
+        // Answered, it waits no more; the other still does.
+        go.send(at(8, "site.tidy", "step_decided", json!({"call_id": "x2"})))
+            .unwrap();
+        tokio::time::timeout(wait, waiting.wait_for(|shared| shared.calls.len() == 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let bots: Vec<String> = (waiting.borrow().agents.iter())
+            .map(|(_, _, bot)| bot.clone())
+            .collect();
+        assert_eq!(bots, ["site.help"]);
         drop(open);
         std::fs::remove_dir_all(dir).unwrap();
     }
