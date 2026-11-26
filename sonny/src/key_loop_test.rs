@@ -195,6 +195,7 @@ async fn held_daemon(
                         Some("submit") => json!({"message":
                             message.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1}),
                         Some("inspect") => json!({"name": "b"}),
+                        Some("bots") => json!({"bots": [{"name": "b", "bot_id": 1}]}),
                         _ => json!({}),
                     };
                     let answer = json!({"id": asked["id"], "result": result});
@@ -865,4 +866,40 @@ async fn commands_that_read_the_daemon_never_hold_the_window() {
     for op in ["bots", "inspect", "audit", "history_items"] {
         assert!(ops.contains(&json!(op)), "{op} in {ops:?}");
     }
+    // The context card asked for before `/audit` opened the pane never
+    // took it: what the person opened since stands.
+    assert!(app.context_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_side_chat_asked_for_is_sent_before_the_window_quits() {
+    let (client, mut events, _tell, asked, socket) =
+        held_daemon(Duration::from_secs(1), kept("A reply"), json!([])).await;
+    let mut app = window(client, socket);
+    let mut terminal = Terminal::new(Probe {
+        screen: ratatui::backend::TestBackend::new(100, 30),
+        frames: Arc::new(Mutex::new(Vec::new())),
+    })
+    .unwrap();
+    let (keys, taken) = tokio::sync::mpsc::unbounded_channel();
+    // Asked for, then the window quits at once, while the daemon holds
+    // every answer.
+    for line in ["/side what is left?", "/quit"] {
+        for c in line.chars() {
+            keys.send(key(KeyCode::Char(c))).unwrap();
+        }
+        keys.send(key(KeyCode::Enter)).unwrap();
+    }
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        app.run(&mut terminal, &mut events, taken),
+    )
+    .await
+    .expect("the window quit")
+    .unwrap();
+    let submitted = (asked.lock().unwrap().iter()).any(|(_, asked)| {
+        asked["op"] == "submit"
+            && (asked["prompt"].as_str()).is_some_and(|prompt| prompt.contains("what is left?"))
+    });
+    assert!(submitted, "{:?}", asked.lock().unwrap());
 }

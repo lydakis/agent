@@ -7347,7 +7347,10 @@ struct App {
     /// `/context`'s read of the agent's record, and of the compaction it
     /// names, beside the window: the card opens once it comes
     /// ([`App::context_came`]).
-    context_reading: Option<tokio::sync::oneshot::Receiver<ContextRead>>,
+    context_reading: Option<(u64, tokio::sync::oneshot::Receiver<ContextRead>)>,
+    /// Counts the pane's openings and closings: a card read beside the
+    /// window opens only on the pane it was asked over.
+    pane_moves: u64,
     /// How far a `/permissions` pick reaches, once the listing it is read
     /// from arrives, for the line under the rows.
     reach: Option<approvals::Reach>,
@@ -9369,6 +9372,7 @@ impl App {
             config: None,
             listing: None,
             context_reading: None,
+            pane_moves: 0,
             agents_asked: None,
             menu_shut: None,
             menu_moved: false,
@@ -9619,6 +9623,11 @@ impl App {
                 // did when each write was awaited where it was made.
                 if let Some(lane) = self.lane.take() {
                     let _ = lane.await;
+                }
+                // So does a side chat asked for and still being made: its
+                // question is sent before the window goes.
+                for siding in std::mem::take(&mut self.siding) {
+                    let _ = siding.await;
                 }
                 return Ok(());
             }
@@ -16021,20 +16030,26 @@ impl App {
             let _ = send.send(read.await);
             woken.notify_one();
         });
-        self.context_reading = Some(receive);
+        self.context_reading = Some((self.pane_moves, receive));
     }
 
     /// `/context`'s card, once its read came.
     fn context_came(&mut self) {
-        let Some(reading) = &mut self.context_reading else {
+        let Some((asked, reading)) = &mut self.context_reading else {
             return;
         };
+        let asked = *asked;
         let read = match reading.try_recv() {
             Ok(read) => read,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
             Err(_) => Err("the read was dropped".into()),
         };
         self.context_reading = None;
+        // The pane opened or closed meanwhile: what the person did since
+        // stands.
+        if asked != self.pane_moves {
+            return;
+        }
         let (record, compacted) = match read {
             Ok(read) => read,
             Err(error) => {
@@ -18391,6 +18406,7 @@ impl App {
     /// the pane already holds, stepped back or forward through or opened
     /// again, stays reachable after the window narrows.
     fn show_pane(&mut self, mut pane: pane::Pane) {
+        self.pane_moves += 1;
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
         // open goes.
@@ -18414,6 +18430,7 @@ impl App {
     /// keys stay there, and is put aside for Ctrl+]; the margin itself
     /// stays closed until asked for.
     fn close_pane(&mut self, keep: bool) {
+        self.pane_moves += 1;
         self.keep_asked();
         match self.pane.take() {
             Some(open) if open.is_margin() => {
