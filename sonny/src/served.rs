@@ -2535,10 +2535,17 @@ impl Part {
         }
     }
 
-    /// The agent its first run starts.
+    /// The agent its first run starts, as the `start_task` call its gate
+    /// judges: shaped to fit that tool's schema, which the daemon checks a
+    /// step against before any gate, so its name stands for the title an
+    /// automation's agent has none of.
     fn start(name: &str, model: &str, effort: Option<&str>, brief: &str) -> Part {
-        let mut arguments = json!({"name": name, "brief": brief, "model": model});
-        if let Some(effort) = effort {
+        let title: String = name.chars().take(crate::title::WRITTEN).collect();
+        let mut arguments = json!({"name": name, "title": title, "brief": brief});
+        if !model.is_empty() {
+            arguments["model"] = json!(model);
+        }
+        if let Some(effort) = effort.filter(|effort| !effort.is_empty()) {
             arguments["effort"] = json!(effort);
         }
         Part {
@@ -4278,7 +4285,7 @@ mod tests {
                 ),
                 (
                     START.to_owned(),
-                    json!({"name": "check", "brief": "Check it.", "model": "openai/gpt"})
+                    json!({"name": "check", "title": "check", "brief": "Check it.", "model": "openai/gpt"})
                 ),
             ],
             "{asked:?}"

@@ -361,8 +361,10 @@ class AnsweredToolTests(ModelFixture):
         self.assertNotIn('waiting_on', self.events(client, turn, 'tool_started')[0])
         # Thirty characters fit, and a keyword the check does not know
         # (`pattern`, `format`) refuses nothing: the call is gated as before.
-        self.model.call_script = [('start_task', {'name': 'fix', 'title': 'é' * 30})]
-        turn = client.request('submit', bot='Lead', request_id='t2', prompt='again')['result']['message']
+        # The script runs on from the calls the first turn made.
+        self.model.call_script = [('start_task', {'name': 'fix', 'title': 'x' * 31}),
+                                  ('start_task', {'name': 'fix', 'title': 'é' * 30})]
+        turn = client.request('submit', bot='Lead', request_id='t2', prompt='script')['result']['message']
         [call] = client.receive(lambda m: m.get('event') == 'approval_requested'
                                 and m.get('turn') == turn)['data']['calls']
         self.assertEqual(call['name'], 'start_task')
@@ -488,7 +490,7 @@ class StepTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_a_step_of_the_bots_own_tool_is_read_before_its_gate(self):
-        client, turn, _ = self.script(approve=['shell'], approver='manual')
+        client, turn, _ = self.script(client=self.client('echo,shell'), approve=['shell'], approver='manual')
         refused = client.request('approve_step', bot='Lead', turn=turn, call_id='script-0', step='1',
                                  name='shell', arguments={'command': 'true', 'timeout_ms': 0})
         self.assertEqual(refused['error'], 'invalid_shell_arguments')
