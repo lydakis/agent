@@ -1786,7 +1786,7 @@ this way, each part as its tool: Sonny's `automations` asks for an `if` as
 it starts as `start_task`. A call a message lifted, or its
 client yielded, is background work: it waits on past its turn, interrupted or
 not, and so do its steps waiting on a verdict, listed under its handle until
-their gates or the person decide them (protocol 103; from 93 to 102 a lifted
+their gates or the person decide them (protocol 105; from 93 to 104 a lifted
 call's waiting steps were denied with its turn). `list_agents` with
 `approvals` names that handle.
 Protocol version 14 adds `configure`, which changes what a bot's client
@@ -4130,7 +4130,7 @@ waiting`), an answer to the call ends them, and so does the turn's end for a
 call that ends with it: the waiting request is answered as a denial is,
 `decision` `deny` with the `reason` its `step_decided` gives (`the call was
 answered first`, `the call was stopped`, `its turn ended`) and no `denied`,
-since no gate refused it (protocol 103; before, `no_pending_step`), and a
+since no gate refused it (protocol 105; before, `no_pending_step`), and a
 restart drops them all. Schema 63 adds the steps' and paused calls' columns. Protocol 24
 also adds `history_search`, the history tool's query for clients (see
 `history_nodes` above).
