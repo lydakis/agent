@@ -13430,10 +13430,10 @@ call a message moved to the background; they wait on their gates as a
 yielded call's do. A step ended by anything other than its gates (the call
 answered first or stopped, its turn ended) is answered with a denial that
 says how, kept in memory under its turn and step until its check takes it.
-On the turn-finish path this replaces a delete and a re-check of lifted
-calls' steps with one more column in the select it already ran, and a map
-insert only when a step was waiting; a turn with no waiting steps does the
-same store work as before.
+On the turn-finish path this replaces the delete of lifted calls' steps
+with a select of the turn's waiting steps, run only when the turn put
+steps to gates, and a map insert for each step the turn's end answers; a
+turn with no steps does the same store work as before.
 
 ### Matched screen (perf gate's benches against main, local, 4-core Linux)
 
