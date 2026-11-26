@@ -869,6 +869,19 @@ fn a_task_removed_with_its_branch_kept_keeps_the_record_of_its_repository() {
 }
 
 #[test]
+fn a_new_worktree_drops_a_record_a_removed_task_of_its_name_left() {
+    let lab = Lab::new("stale-record");
+    // Left by a task of this name removed on another daemon, its branch
+    // kept in a repository elsewhere.
+    let record = lab.home.join(".agent/worktrees/.folders/demo.fix");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(&record, "/elsewhere/ws\n/elsewhere/ws/api\n").unwrap();
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    assert!(!record.exists());
+}
+
+#[test]
 fn a_task_given_a_linked_checkout_in_the_lead_s_folder_is_removed_from_it() {
     let lab = Lab::new("linked");
     let ws = lab.scratch.join("ws");

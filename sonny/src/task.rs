@@ -307,10 +307,20 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // lead's project's, whatever project the repository's folder is in,
     // with the checkout it was made from, which removes it.
     let mut recorded = None;
+    // A worktree made now is this task's alone: a record a task of this
+    // name left with its branch kept, removed on another daemon, is not
+    // its own.
+    let fresh = matches!(place.undo, Undo::Worktree { .. });
+    if fresh
+        && at == here
+        && let Ok(record) = record_of(name)
+    {
+        let _ = std::fs::remove_file(record);
+    }
     if at != here {
         place.told = at.clone();
         if let (Some((top, _)), Ok(record)) = (&place.copy, record_of(name))
-            && !record.exists()
+            && (fresh || !record.exists())
         {
             let text = format!("{}\n{}\n", here.display(), top.display());
             let wrote = std::fs::create_dir_all(record.parent().unwrap_or(Path::new("/")))
@@ -1844,7 +1854,15 @@ pub(crate) fn restore_in(
         false => git(&repo, &["worktree", "add", "-q", &target, &branch]).map(drop),
     }
     .map_err(unwind)?;
-    inside_tree(&path, workspace.to_owned()).map_err(unwind)?;
+    // The folder in it as the worktree is spelled: the daemon records a
+    // workspace by its real path, which a link in the home's path makes
+    // other than the worktree's.
+    let real = std::fs::canonicalize(&path).map_err(|e| unwind(format!("{target}: {e}")))?;
+    let at = match workspace.strip_prefix(&real) {
+        Ok(below) => path.join(below),
+        Err(_) => workspace.to_owned(),
+    };
+    inside_tree(&path, at).map_err(unwind)?;
     let _ = record_store_in(home, name, store);
     Ok(Again::Restored(repo))
 }
@@ -3204,6 +3222,45 @@ mod tests {
         );
         assert!(other.join(".agents/AGENTS.md").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_worktree_recorded_by_its_real_path_is_made_again_through_a_linked_home() {
+        let dir = std::env::temp_dir().join(format!("sonny-restore-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = repository(&dir);
+        std::fs::create_dir_all(dir.join("real-home")).unwrap();
+        let home = dir.join("home");
+        std::os::unix::fs::symlink(dir.join("real-home"), &home).unwrap();
+        let tree = home.join(".agent/worktrees/shop.link");
+        let target = tree.to_string_lossy().into_owned();
+        let add = ["worktree", "add", "-q", "-b", "agent/shop.link", &target];
+        git(&repo, &add).unwrap();
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub/b.txt"), "b\n").unwrap();
+        git(&tree, &["add", "."]).unwrap();
+        let commit = [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "b",
+        ];
+        git(&tree, &commit).unwrap();
+        // The daemon records the workspace by its real path.
+        let workspace = std::fs::canonicalize(tree.join("sub")).unwrap();
+        assert!(!workspace.starts_with(&home));
+        git(&repo, &["worktree", "remove", "--force", &target]).unwrap();
+        let store = dir.join("state.sqlite");
+        let made = restore_in(&home, "shop.link", &workspace, &[repo], false, &store);
+        assert!(matches!(made, Ok(Again::Restored(_))), "{made:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("b.txt")).unwrap(),
+            "b\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

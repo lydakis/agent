@@ -78,7 +78,9 @@ pub fn wanted(workspace: &Path) -> bool {
 /// none, for the daemon at `store`. A restore, or one that failed, is
 /// written to the tool host's log.
 pub async fn folder(client: &Client, record: &Value, workspace: &Path, store: &Path) -> Folder {
-    if workspace.is_dir() {
+    // There, and not one a restore is still checking out: looked at after
+    // the folder, which a restore makes only once it is under way.
+    if workspace.is_dir() && !restoring(workspace) {
         return Folder::There;
     }
     let Some(home) = home() else {
@@ -87,6 +89,7 @@ pub async fn folder(client: &Client, record: &Value, workspace: &Path, store: &P
     let Some(task) = task_of(&home, workspace) else {
         return Folder::Gone(Gone::NotATask);
     };
+    let _under_way = UnderWay::start(&task);
     let branch = format!("agent/{task}");
     let places = above(client, record).await;
     let confine = confined(client, record).await;
@@ -115,6 +118,45 @@ pub async fn folder(client: &Client, record: &Value, workspace: &Path, store: &P
                     "folder": workspace, "error": error})
             );
             Folder::Gone(Gone::Failed(branch))
+        }
+    }
+}
+
+/// The tasks whose worktree this host is making again now, each with how
+/// many callers make it: a caller that finds its folder there waits for
+/// the restore under way to end, as its folder is checked out only then.
+static UNDER_WAY: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether a restore here is making the worktree `workspace` is in. With
+/// none under way, as nearly always, nothing more is read.
+fn restoring(workspace: &Path) -> bool {
+    let under_way = UNDER_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    !under_way.is_empty()
+        && home()
+            .and_then(|home| task_of(&home, workspace))
+            .is_some_and(|task| under_way.contains_key(&task))
+}
+
+/// A caller's restore of a task's worktree, under way until dropped.
+struct UnderWay(String);
+
+impl UnderWay {
+    fn start(task: &str) -> UnderWay {
+        let mut under_way = UNDER_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        *under_way.entry(task.to_owned()).or_default() += 1;
+        UnderWay(task.to_owned())
+    }
+}
+
+impl Drop for UnderWay {
+    fn drop(&mut self) {
+        let mut under_way = UNDER_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = under_way.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                under_way.remove(&self.0);
+            }
         }
     }
 }
@@ -205,5 +247,25 @@ pub fn told(output: String, workspace: &Path, ran_in: &Path, why: &Gone) -> Stri
             Value::Object(said).to_string()
         }
         _ => format!("{output}\n\nNote: {gone}."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_a_restore_here_still_checks_out_is_not_taken_as_there() {
+        let home = home().unwrap();
+        let workspace = home.join(".agent/worktrees/shop.slow/sub");
+        assert!(!restoring(&workspace));
+        let one = UnderWay::start("shop.slow");
+        let two = UnderWay::start("shop.slow");
+        assert!(restoring(&workspace));
+        assert!(!restoring(&home.join(".agent/worktrees/shop.other")));
+        drop(one);
+        assert!(restoring(&workspace), "another caller's is still under way");
+        drop(two);
+        assert!(!restoring(&workspace));
     }
 }
