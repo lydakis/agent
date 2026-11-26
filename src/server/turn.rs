@@ -5099,6 +5099,26 @@ impl Turn {
                     .await?;
                 continue;
             }
+            // A tool failure is a result the model can act on. Only the
+            // scheduler closing is a runtime failure. The bot's selection is
+            // enforced here, not only by what the model was shown. Its
+            // arguments are read first, before any gate, rule or sandbox
+            // decides it: one its tool does not take fails at once, and no
+            // gate holds it (`Bot::arguments`), so no one is asked about a
+            // call that could never run.
+            let prepared = if record.steps_only(&call.name) {
+                Err(Error::with(
+                    "tool_not_available",
+                    format!("{}: callable only as a step of a script", call.name),
+                ))
+            } else if let Some(tool) = record.declared(&call.name) {
+                agent_runtime::tools::check_declared(tool, &call.arguments)
+                    .map(|()| Prepared::Declared(tool.result.clone()))
+            } else if record.calls(&call.name) {
+                self.registry.prepare(&call.name, &call.arguments)
+            } else {
+                Err(Error::with("tool_not_available", call.name.as_str()))
+            };
             // One plan decides it, as it decides the same call beside others
             // or as a daemon step. An escape from a sandbox runs unconfined
             // only once a gate allowed it. A call a gate would hold back, of
@@ -5152,22 +5172,6 @@ impl Turn {
                     })
                     .await?;
             }
-            // A tool failure is a result the model can act on. Only the
-            // scheduler closing is a runtime failure. The bot's selection is
-            // enforced here, not only by what the model was shown.
-            let prepared = if record.steps_only(&call.name) {
-                Err(Error::with(
-                    "tool_not_available",
-                    format!("{}: callable only as a step of a script", call.name),
-                ))
-            } else if let Some(tool) = record.declared(&call.name) {
-                agent_runtime::tools::check_declared(tool, &call.arguments)
-                    .map(|()| Prepared::Declared(tool.result.clone()))
-            } else if record.calls(&call.name) {
-                self.registry.prepare(&call.name, &call.arguments)
-            } else {
-                Err(Error::with("tool_not_available", call.name.as_str()))
-            };
             // The command rules come next, as in Codex: a forbidden command
             // is refused, and one a rule asks about with no gate to ask is
             // refused too, as Codex refuses it under a policy that never
