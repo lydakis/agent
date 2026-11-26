@@ -3145,7 +3145,7 @@ pub struct Database {
     /// How each waiting step ended that something other than its gates
     /// ended (its call answered or stopped, its turn over), by its turn
     /// and id: its check answers with it, as a gate's verdict is.
-    steps_ended: HashMap<(i64, String), Value>,
+    steps_ended: HashMap<(i64, String), (i64, Value)>,
     /// Files of outputs whose records the current group removed, removed
     /// once it commits: a group that does not keeps both.
     files_gone: Vec<String>,
@@ -4793,6 +4793,8 @@ impl Database {
     fn restore_steps(&mut self, kept: usize) {
         for (approval, turn) in self.steps_gone.drain(kept..) {
             self.steps.insert(approval, turn);
+            // Waiting again: how it ended is not so.
+            self.steps_ended.retain(|_, (ended, _)| *ended != approval);
         }
     }
     /// A waiting step is decided or gone: no longer registered, and told of
@@ -12409,11 +12411,15 @@ impl Database {
         now_ms: u64,
         held: bool,
     ) -> Result<Stepped> {
+        // One something else ended is told how, even once its turn or
+        // its call is gone.
+        if let Some(ended) = self.step_ended_of(name, turn, id)? {
+            return Ok(ended);
+        }
         self.step_turn(name, turn, step_parent(id))?;
         let Some(request) = self.request(turn, id)? else {
-            return self.step_gone(turn, id);
+            return fail("no_pending_step");
         };
-        self.steps_ended.remove(&(turn, id.to_owned()));
         let lapse = request.expires_ms();
         let denial = request
             .denial()
@@ -12521,11 +12527,15 @@ impl Database {
         id: &str,
         now_ms: u64,
     ) -> Result<Stepped> {
+        // One something else ended is told how, even once its turn or
+        // its call is gone.
+        if let Some(ended) = self.step_ended_of(name, turn, id)? {
+            return Ok(ended);
+        }
         self.step_turn(name, turn, step_parent(id))?;
         let Some(request) = self.request(turn, id)? else {
-            return self.step_gone(turn, id);
+            return fail("no_pending_step");
         };
-        self.steps_ended.remove(&(turn, id.to_owned()));
         let bot = self.call_bot(turn, step_parent(id).unwrap_or(id))?;
         let data = json!({"call_id":id,"decision":"deny","reason":"its client stopped waiting",
             "approvals":request.approvals()});
@@ -13001,19 +13011,26 @@ impl Database {
             lifted: lifted.filter(|_| resumed),
         })
     }
-    /// A step no longer waiting: how it ended, when something other than
-    /// its gates ended it, as its gates' denial would say, else
-    /// `no_pending_step`.
-    fn step_gone(&mut self, turn: i64, id: &str) -> Result<Stepped> {
-        match self.steps_ended.remove(&(turn, id.to_owned())) {
-            Some(decided) => Ok(Stepped {
-                step: Step::Decided(decided),
-                notify: None,
-                wake: false,
-                lifted: None,
-            }),
-            None => fail("no_pending_step"),
+    /// How `name`'s step `id` of `turn` ended, when something other than
+    /// its gates ended it, as its gates' denial would say: taken, so it is
+    /// told once.
+    fn step_ended_of(&mut self, name: &str, turn: i64, id: &str) -> Result<Option<Stepped>> {
+        let key = (turn, id.to_owned());
+        if !self.steps_ended.contains_key(&key) {
+            return Ok(None);
         }
+        let owned = (self.conn)
+            .prepare_cached("SELECT 1 FROM turns WHERE id=? AND bot=?")?
+            .exists(params![turn, name])?;
+        if !owned {
+            return Ok(None);
+        }
+        Ok(self.steps_ended.remove(&key).map(|(_, decided)| Stepped {
+            step: Step::Decided(decided),
+            notify: None,
+            wake: false,
+            lifted: None,
+        }))
     }
     /// Keep how a waiting step ended, `data` as its `step_decided` says,
     /// for its check to answer with: only a step still registered, whose
@@ -20219,7 +20236,7 @@ fn announcements(calls: Vec<Value>) -> Result<Vec<Vec<Value>>> {
 /// caller holding a savepoint on the connection.
 fn keep_step_end(
     steps: &HashMap<i64, i64>,
-    ended: &mut HashMap<(i64, String), Value>,
+    ended: &mut HashMap<(i64, String), (i64, Value)>,
     (turn, approval): (i64, i64),
     data: Value,
 ) {
@@ -20229,7 +20246,7 @@ fn keep_step_end(
     let Some(id) = data["call_id"].as_str().map(str::to_owned) else {
         return;
     };
-    ended.insert((turn, id), data);
+    ended.insert((turn, id), (approval, data));
 }
 struct Released {
     requests: i64,

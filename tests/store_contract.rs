@@ -25664,6 +25664,50 @@ fn a_held_step_its_call_ends_first_is_answered_with_how_it_ended() {
     assert_eq!(again.code, "no_pending_step");
 }
 
+#[test]
+fn a_held_step_its_stopped_call_ended_after_its_turn_is_told_so() {
+    use agent_runtime::store::Step;
+    // Lifted, its turn over, then its handle stopped: the step's check is
+    // told how it ended, though its turn and its call are gone, and once.
+    let mut db = db();
+    stepping_bot(&mut db, false, None);
+    let turn = running_call(&mut db);
+    let now = epoch_now();
+    let Step::Pending { .. } = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "0",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            now,
+        )
+        .unwrap()
+        .step
+    else {
+        panic!("a gated step was decided at once");
+    };
+    let (process, _) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
+    db.finish(turn, None).unwrap();
+    db.lifted_stop("Lead", process).unwrap();
+    let Err(other) = db.step_check("Other", turn, "c1/0", now, false) else {
+        panic!("another bot was told of the step");
+    };
+    assert_eq!(other.code, "turn_not_found");
+    let Step::Decided(ended) = db
+        .step_check("Lead", turn, "c1/0", now, false)
+        .unwrap()
+        .step
+    else {
+        panic!("a stopped step still waits");
+    };
+    assert_eq!(ended["reason"], "the call was stopped", "{ended}");
+    assert!(db.step_check("Lead", turn, "c1/0", now, false).is_err());
+}
+
 /// Schema 110: the profile a bot was composed from, as its client named
 /// it, is kept on the bot when it is made, shown by `inspect`, its
 /// `created` event and `bots` pages, and kept by a fork; a keyed resend
