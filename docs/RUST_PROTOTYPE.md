@@ -3918,7 +3918,7 @@ Protocol version 19 lets a client declare tools of its own on a bot:
 the daemon's tools, and the daemon never runs one: a call is checked against
 its `parameters` (an object schema) and recorded at once with the
 tool's fixed `result` (default `ok`), or with `invalid_arguments` when it does
-not fit. Protocol 103 checks every call's arguments first, before any gate,
+not fit. Protocol 104 checks every call's arguments first, before any gate,
 rule, load hold or sandbox decides it: a declared tool's against the JSON
 Schema it declared, as far as the daemon knows that language (`type`,
 `enum`, `const`, `required`, `properties`, `additionalProperties`,
@@ -4589,7 +4589,7 @@ kinds above (`invalid_declare` otherwise), which its calls' rows carry.
 (`invalid_step` for another word), and `record: true` for a step the
 client lets run without asking: it is written and allowed at once,
 whatever the gates say, so the trail has every step and the gates judge
-only those a client puts to them. Protocol 103 lets `approve_step` take
+only those a client puts to them. Protocol 104 lets `approve_step` take
 `parameters`, the JSON Schema of the step's tool when its client knows one
 (an MCP server's tool, say): a step to be asked about has its arguments
 checked against it before anything else, as a call's are, and one they do
