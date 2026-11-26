@@ -13480,16 +13480,25 @@ conversation, layout on, 20 tasks running turns back to back and 8 held
 open. Once the window is open every daemon sync takes `--sync-ms` and every
 change the window makes to the file system takes 150 ms (the shim,
 `bench/held/slow_sync.c`). 100 keys (key to character) and 90 wheel
-notches (notch to the conversation moving). Two alternating rounds each.
+notches (notch to the conversation moving: the rows naming its turns move,
+left of the task pane, so the bar and elapsed times do not count). Two
+alternating rounds each.
 
 | Syncs | Measure | main | Sonny only | both |
 | --- | --- | ---: | ---: | ---: |
-| 1 s | typing p99, ms | 452.4 / 454.2 | 3.3 / 3.3 | 1.7 / 3.8 |
+| 1 s | typing p99, ms | 456.1 / 501.1 | 2.5 / 3.4 | 1.4 / 1.4 |
 | 1 s | keys over 250 ms | 12 / 12 | 0 / 0 | 0 / 0 |
-| 1 s | scroll p99, ms | 2.6 / 7.8 | 1.8 / 4.5 | 3.6 / 6.7 |
-| 3 s | typing p99, ms | 455.3 / 456.6 | 2.0 / 4.7 | 4.6 / 7.1 |
-| 3 s | keys over 250 ms | 11 / 12 | 0 / 0 | 0 / 0 |
-| 3 s | scroll p99, ms | 3.2 / 12.0 | 4.9 / 10.7 | 2.4 / 3.8 |
+| 1 s | scroll p99, ms | 2.8 / 3.0 | 2.9 / 5.4 | 1.5 / 2.7 |
+| 1 s | window CPU, % | 1.0 / 1.0 | 1.4 / 1.5 | 1.6 / 1.6 |
+| 3 s | typing p99, ms | 452.7 / 458.6 | 3.2 / 4.3 | 3.3 / 5.8 |
+| 3 s | keys over 250 ms | 12 / 12 | 0 / 0 | 0 / 0 |
+| 3 s | scroll p99, ms | 2.0 / 106.5 | 3.7 / 3.8 | 1.8 / 1.9 |
+| 3 s | window CPU, % | 1.0 / 1.0 | 1.4 / 1.6 | 1.5 / 1.6 |
+
+The window's CPU is lower on main here because main's window waits in its
+own writes: on a normal disk (no held syncs or writes, two rounds) main's
+window spends 1.4 / 1.4% and this change's 1.4 / 1.5%, and typing p99 is
+2.2 / 3.6 against 3.0 / 3.4 ms.
 
 With slow commits alone (no slow writes for the window) typing p99 stayed
 under 5 ms on main too, at 1 and 3 s syncs and 5,000 agents: the daemon's

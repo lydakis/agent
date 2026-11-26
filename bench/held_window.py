@@ -14,8 +14,8 @@ open), in a real pseudo-terminal:
   typing   key to character: each letter until the composer's line
            reads what was typed so far
   scroll   wheel notch to the conversation moving: each notch until the
-           screen's rows differ from those before it, up a run of notches
-           and back down
+           rows that name the conversation's turns are on other rows than
+           before it, up a run of notches and back down
 
 A key or notch that never shows counts as the five seconds waited. Builds
 alternate on the same seed as in `bench.ui_loads`.
@@ -27,6 +27,7 @@ alternate on the same seed as in `bench.ui_loads`.
 import argparse
 import json
 import os
+import re
 import signal
 import statistics
 import subprocess
@@ -81,6 +82,16 @@ class Held(Fleet):
         return Term([self.sonny, '--store', str(self.store), '--socket', str(self.sock),
                      '--agent', 'p0.lead', '--no-sound', *(() if layout else ('--no-layout',))],
                     env, str(self.folders[0]))
+
+
+def where(lines):
+    """Where the lead's conversation sits on the screen: each of its rows
+    that names a turn (`turn N`, from the person's message), and the row it
+    is on. Only the conversation's own rows, left of the task pane: the
+    bar, the pane and elapsed times change on their own while the
+    conversation stays put."""
+    return [(at, found.group(0)) for at, line in enumerate(lines)
+            if (found := re.search(r'turn \d+', line.split('│')[0]))]
 
 
 def summary(took):
@@ -172,8 +183,8 @@ def busy(fleet, window, held, args):
     window.expect(empty=composer_reads('')).wait(10, need_all=False)
     for _ in range(args.scrolls):
         for notch in [WHEEL_UP] * args.notches + [WHEEL_DOWN] * args.notches:
-            shown = window.shown()
-            got = window.press(notch, moved=lambda lines, shown=shown: lines != shown).wait(
+            at = where(window.shown())
+            got = window.press(notch, moved=lambda lines, at=at: where(lines) != at).wait(
                 5, need_all=False)['moved']
             scrolled_ms.append(got if got is not None else 5000)
             time.sleep(.05)
