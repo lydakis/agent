@@ -839,9 +839,12 @@ async fn commands_that_read_the_daemon_never_hold_the_window() {
         "/usage",
         "/side what is left?",
     ] {
-        app.input.set(command);
+        // Typed, as the person does: each command moves on from the last.
         let at = Instant::now();
-        app.submit().await;
+        for c in command.chars() {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+        app.key(key(KeyCode::Enter)).await;
         // A card's first read is one look round away.
         if app.pane.as_ref().is_some_and(pane::Pane::is_card) {
             app.reread().await;
@@ -866,9 +869,35 @@ async fn commands_that_read_the_daemon_never_hold_the_window() {
     for op in ["bots", "inspect", "audit", "history_items"] {
         assert!(ops.contains(&json!(op)), "{op} in {ops:?}");
     }
-    // The context card asked for before `/audit` opened the pane never
-    // took it: what the person opened since stands.
+    // The context card and the list `/switch` read, asked for before the
+    // person typed on, never took the window: what they did since stands.
     assert!(app.context_read.is_none());
+    assert!(app.agents.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_list_read_beside_the_window_opens_only_if_the_person_waits_for_it() {
+    async fn type_in(app: &mut App, line: &str) {
+        for c in line.chars() {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+    }
+    let (client, _events, _tell, _asked, socket) =
+        held_daemon(Duration::from_millis(300), kept("A reply"), json!([])).await;
+    // Waited for: the list opens.
+    let mut app = window(client.clone(), socket.clone());
+    type_in(&mut app, "/switch").await;
+    app.key(key(KeyCode::Enter)).await;
+    app.beside_done().await;
+    assert!(app.agents.is_some());
+    // Typed on meanwhile: what was typed stays where it was typed.
+    let mut app = window(client, socket);
+    type_in(&mut app, "/switch").await;
+    app.key(key(KeyCode::Enter)).await;
+    type_in(&mut app, "hi").await;
+    app.beside_done().await;
+    assert!(app.agents.is_none());
+    assert_eq!(app.input.trim(), "hi");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

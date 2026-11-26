@@ -6241,11 +6241,13 @@ enum AfterFirst {
 /// A side chat made beside the window: its name, its head, and the
 /// question's refusal, if any ([`App::side_came`]).
 type Sided = Result<(String, i64, Option<String>), String>;
-/// A reply's node, what waits on its first line, and the read of that
-/// line ([`App::first_came`]).
+/// A reply's node, what waits on its first line, the person's acts when
+/// it was asked ([`App::acted`]), and the read of that line
+/// ([`App::first_came`]).
 type FirstRead = (
     i64,
     AfterFirst,
+    u64,
     tokio::sync::oneshot::Receiver<Result<String, String>>,
 );
 /// The agent's record, and the compaction it names ([`App::context_came`]).
@@ -7004,12 +7006,12 @@ struct App {
     /// `/react` offers, newest last.
     replies: Vec<(i64, String)>,
     /// `/switch`'s reads, beside the window ([`App::switch_came`]).
-    switch_reading: Option<tokio::sync::oneshot::Receiver<Switching>>,
+    switch_reading: Option<(u64, tokio::sync::oneshot::Receiver<Switching>)>,
     /// A side chat being made beside the window: its name, its head, and
     /// the question's refusal, if any ([`App::side_came`]).
     siding: Vec<tokio::sync::oneshot::Receiver<Sided>>,
     /// A reply's first line read beside the window, and what waits on it.
-    reading_first: Option<FirstRead>,
+    reading_first: std::collections::VecDeque<FirstRead>,
     /// `/react`'s list of the replies, open over the composer, with the
     /// replies as they were when it opened: one that comes or goes while
     /// it is open moves no row onto another reply.
@@ -7348,9 +7350,10 @@ struct App {
     /// names, beside the window: the card opens once it comes
     /// ([`App::context_came`]).
     context_reading: Option<(u64, tokio::sync::oneshot::Receiver<ContextRead>)>,
-    /// Counts the pane's openings and closings: a card read beside the
-    /// window opens only on the pane it was asked over.
-    pane_moves: u64,
+    /// Counts the person's keys, pastes and clicks: what a read beside
+    /// the window would open over the composer opens only if none came
+    /// since it was asked, as the person has moved on.
+    acted: u64,
     /// How far a `/permissions` pick reaches, once the listing it is read
     /// from arrives, for the line under the rows.
     reach: Option<approvals::Reach>,
@@ -9247,7 +9250,7 @@ impl App {
             replies: Vec::new(),
             switch_reading: None,
             siding: Vec::new(),
-            reading_first: None,
+            reading_first: std::collections::VecDeque::new(),
             quoting: false,
             quotes: Vec::new(),
             reacting: None,
@@ -9372,7 +9375,7 @@ impl App {
             config: None,
             listing: None,
             context_reading: None,
-            pane_moves: 0,
+            acted: 0,
             agents_asked: None,
             menu_shut: None,
             menu_moved: false,
@@ -10171,7 +10174,7 @@ impl App {
                 && self.context_reading.is_none()
                 && self.switch_reading.is_none()
                 && self.siding.is_empty()
-                && self.reading_first.is_none()
+                && self.reading_first.is_empty()
             {
                 return;
             }
@@ -16030,7 +16033,7 @@ impl App {
             let _ = send.send(read.await);
             woken.notify_one();
         });
-        self.context_reading = Some((self.pane_moves, receive));
+        self.context_reading = Some((self.acted, receive));
     }
 
     /// `/context`'s card, once its read came.
@@ -16045,9 +16048,8 @@ impl App {
             Err(_) => Err("the read was dropped".into()),
         };
         self.context_reading = None;
-        // The pane opened or closed meanwhile: what the person did since
-        // stands.
-        if asked != self.pane_moves {
+        // The person moved on meanwhile: what they did since stands.
+        if asked != self.acted {
             return;
         }
         let (record, compacted) = match read {
@@ -18406,7 +18408,6 @@ impl App {
     /// the pane already holds, stepped back or forward through or opened
     /// again, stays reachable after the window narrows.
     fn show_pane(&mut self, mut pane: pane::Pane) {
-        self.pane_moves += 1;
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
         // open goes.
@@ -18430,7 +18431,6 @@ impl App {
     /// keys stay there, and is put aside for Ctrl+]; the margin itself
     /// stays closed until asked for.
     fn close_pane(&mut self, keep: bool) {
-        self.pane_moves += 1;
         self.keep_asked();
         match self.pane.take() {
             Some(open) if open.is_margin() => {
@@ -19091,6 +19091,19 @@ impl App {
 
     async fn key(&mut self, mut event: Event) {
         self.lettered = false;
+        if matches!(
+            &event,
+            Event::Key(event::KeyEvent {
+                kind: event::KeyEventKind::Press,
+                ..
+            }) | Event::Paste(_)
+                | Event::Mouse(event::MouseEvent {
+                    kind: event::MouseEventKind::Down(_),
+                    ..
+                })
+        ) {
+            self.acted += 1;
+        }
         // The terminal answering: its colors, or its light and dark.
         if let Event::Reply(reply) = &event {
             term::heard(reply);
@@ -22237,25 +22250,30 @@ impl App {
             let _ = send.send(first);
             woken.notify_one();
         });
-        self.reading_first = Some((node, then, receive));
+        self.reading_first
+            .push_back((node, then, self.acted, receive));
     }
 
     /// A reply's first line read beside the window, once it came: what
     /// waited on it is done, unless the window moved to another agent.
+    /// Each in the order it was asked, as clicks were taken one after
+    /// another; a pick the person moved on from opens nothing.
     async fn first_came(&mut self) {
-        let Some((node, _, reading)) = &mut self.reading_first else {
-            return;
-        };
-        let node = *node;
-        let first = match reading.try_recv() {
-            Ok(first) => first,
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
-            Err(_) => Err("the read was dropped".into()),
-        };
-        let Some((_, then, _)) = self.reading_first.take() else {
-            return;
-        };
-        self.after_first(node, first, then).await;
+        while let Some((node, _, asked, reading)) = self.reading_first.front_mut() {
+            let (node, asked) = (*node, *asked);
+            let first = match reading.try_recv() {
+                Ok(first) => first,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+                Err(_) => Err("the read was dropped".into()),
+            };
+            let Some((_, then, ..)) = self.reading_first.pop_front() else {
+                return;
+            };
+            if matches!(then, AfterFirst::Pick) && asked != self.acted {
+                continue;
+            }
+            self.after_first(node, first, then).await;
+        }
     }
 
     async fn after_first(&mut self, node: i64, first: Result<String, String>, then: AfterFirst) {
@@ -22796,21 +22814,26 @@ impl App {
             let _ = send.send(read.await);
             woken.notify_one();
         });
-        self.switch_reading = Some(receive);
+        self.switch_reading = Some((self.acted, receive));
     }
 
     /// What `/switch` read, once it came: the window goes to the agent
     /// found, or lists them all.
     fn switch_came(&mut self) {
-        let Some(reading) = &mut self.switch_reading else {
+        let Some((asked, reading)) = &mut self.switch_reading else {
             return;
         };
+        let asked = *asked;
         let read = match reading.try_recv() {
             Ok(read) => read,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
             Err(_) => Switching::Failed("the list was dropped".into()),
         };
         self.switch_reading = None;
+        // The list opens over the composer: not once the person moved on.
+        if matches!(read, Switching::List { .. }) && asked != self.acted {
+            return;
+        }
         let (typed, bots, held, mut titles, picks) = match read {
             Switching::To(bot) => {
                 self.switch_window(bot);
