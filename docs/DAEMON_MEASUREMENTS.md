@@ -13422,3 +13422,110 @@ Four alternating rounds of the Perf workflow's screens.
   -16.9%, burst p99 -15.4%), and a quiet window spends a third less CPU.
 - Lifecycle CPU reads +9.7% (0.515 to 0.565 s for the whole run); its
   p95 turn and peak RSS are even.
+
+## Freezes on a slow disk (#PRNUM)
+
+2026-11-26. George, 11-25: typed letters showed half a second late, then all
+at once, and scrolling went choppy, while the store's commits took 1 to 4 s.
+The window wrote the project's places file on its key loop (once a second
+while typing, at once on a click or Enter), and a write waits while another
+process's sync holds the disk's journal. Sonny now writes it beside the
+loop, and reads `/switch`, a side chat, `/audit`, `/usage`, `/context` and a
+reaction's first reply beside it too. In the daemon, a request that must
+wait for queued admissions parks its session instead of waiting on the
+only loop (a), and audit and history-search reads go in short pieces, each
+its own snapshot, rather than one snapshot that pins the log (c).
+
+Local, 4-CPU Linux cloud box. `main` is 7e6d210; "Sonny only" is this
+change's Sonny on main's daemon; "both" is this change's Sonny and daemon.
+
+### The window on a slow disk (`bench.held_window`)
+
+50 projects from `bench.ui_loads`, the window on a lead with a 40-turn
+conversation, layout on, 20 tasks running turns back to back and 8 held
+open. Once the window is open every daemon sync takes `--sync-ms` and every
+change the window makes to the file system takes 150 ms (the shim,
+`bench/held/slow_sync.c`). 100 keys (key to character) and 90 wheel
+notches (notch to the conversation moving). Two alternating rounds each.
+
+| Syncs | Measure | main | Sonny only | both |
+| --- | --- | ---: | ---: | ---: |
+| 1 s | typing p99, ms | 452.4 / 454.2 | 3.3 / 3.3 | 1.7 / 3.8 |
+| 1 s | keys over 250 ms | 12 / 12 | 0 / 0 | 0 / 0 |
+| 1 s | scroll p99, ms | 2.6 / 7.8 | 1.8 / 4.5 | 3.6 / 6.7 |
+| 3 s | typing p99, ms | 455.3 / 456.6 | 2.0 / 4.7 | 4.6 / 7.1 |
+| 3 s | keys over 250 ms | 11 / 12 | 0 / 0 | 0 / 0 |
+| 3 s | scroll p99, ms | 3.2 / 12.0 | 4.9 / 10.7 | 2.4 / 3.8 |
+
+With slow commits alone (no slow writes for the window) typing p99 stayed
+under 5 ms on main too, at 1 and 3 s syncs and 5,000 agents: the daemon's
+slowness did not reach the keys, the window's own writes did.
+
+### The daemon's loop on a slow disk (`bench.held_reads`)
+
+424 agents, 30 running turns back to back, 4 code-mode scripts, every sync
+300 ms, 20 s, two alternating rounds.
+
+| Measure | main | this change |
+| --- | ---: | ---: |
+| loop held waiting for admissions (`settle`), total / longest, ms | 589 / 304, 596 / 305 | none |
+| a window's `approvals` read, longest, ms | 263.1 / 313.3 | 4.5 / 4.0 |
+| a new connection's `ready`, p99, ms | 286.4 / 605.1 | 2.4 / 0.9 |
+| turns finished | 300 / 272 | 299 / 300 |
+
+### Low and high end (`bench.ends`)
+
+Low: one window on 10 agents. High: 10,000 stored agents, 32 windows on one
+project, 30 agents busy and 8 running scripts, 20 s; then the same on a
+slow disk (every sync 300 ms). Two alternating rounds; each side with its
+own Sonny.
+
+| End | Measure | main | this change |
+| --- | --- | ---: | ---: |
+| low | key p99, ms | 1.16 / 0.95 | 0.63 / 0.86 |
+| low | turn p50, ms | 47.88 / 47.82 | 47.74 / 48.01 |
+| low | daemon / window PSS, MiB | 21.0, 17.8 / 21.5, 16.3 | 20.0, 18.2 / 19.9, 18.5 |
+| high | key p99 (worst), ms | 7.32 (9.97) / 9.63 (119.83) | 7.61 (18.01) / 9.66 (14.56) |
+| high | turns / scripts finished | 9,231, 1,151 / 9,111, 1,130 | 9,283, 1,158 / 9,417, 1,189 |
+| high | daemon CPU, %, PSS, MiB | 138.4, 38.4 / 136.7, 40.2 | 137.6, 38.3 / 137.0, 38.3 |
+| high | windows CPU, %, PSS, MiB | 4.09, 193.2 / 3.83, 192.5 | 4.44, 192.7 / 3.85, 193.0 |
+| slow disk | key p99 (worst), ms | 2.35 (5.09) / 7.31 (86.58) | 1.60 (3.00) / 1.20 (4.00) |
+| slow disk | turns / scripts finished | 318, 23 / 359, 24 | 336, 24 / 345, 24 |
+| slow disk | loop held waiting for admissions, ms | 629 / 359 | none |
+| slow disk | daemon CPU, % | 16.7 / 18.3 | 10.8 / 8.4 |
+| slow disk | windows CPU, %, `inspect` requests | 10.1, 19,422 / 10.9, 19,756 | 6.0, 11,145 / 5.4, 8,862 |
+
+On the slow disk the windows asked for about half as many `inspect`s and
+spent about half the CPU; turns and scripts finished are even.
+
+### Daemon and Sonny screens (the Perf workflow's, `bench.perf_gate`)
+
+Four alternating rounds.
+
+| Bench | Measure | main | this change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 31.393 | 33.887 | +7.9% |
+| admission | burst submit p99, ms | 4.306 | 4.246 | -1.4% |
+| completion | release to terminal p99, ms | 10.47 | 10.413 | -0.5% |
+| footprint | idle RSS, MiB | 18.584 | 17.648 | -5.0% |
+| footprint | per idle bot, KiB | 1.94 | 1.902 | -2.0% |
+| footprint | RSS after a turn each, MiB | 35.402 | 34.182 | -3.4% |
+| footprint | CPU per turn, ms | 0.869 | 0.802 | -7.7% |
+| footprint | written to disk per turn, KiB | 46.736 | 45.822 | -2.0% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 37.5 | 31.25 | -16.7% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 6.25 | 6.875 | +10.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 3.5 | 3.565 | +1.9% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 5.25 | 5.56 | +5.9% |
+| sonny | lookout note p95 at 10x100, ms | 2096.0 | 2138.5 | +2.0% |
+| sonny | lookout note p95 at 100x10, ms | 2305.0 | 2208.0 | -4.2% |
+| sonny | quiet window CPU, ms/s | 0.575 | 0.585 | +1.7% |
+| sonny | quiet window RSS, MiB | 32.05 | 32.2 | +0.5% |
+| sonny | sky replay CPU per 1k lines, ms | 10.59 | 9.25 | -12.7% |
+| sonny | sky replay RSS, MiB | 82.0 | 87.85 | +7.1% |
+| lifecycle | CPU, s | 0.53 | 0.54 | +1.9% |
+| lifecycle | p95 turn, ms | 581.707 | 579.712 | -0.3% |
+| lifecycle | peak RSS, MiB | 27.9 | 27.275 | -2.2% |
+
+- **Nothing is over the gate's 15%**, and store work per turn is unchanged.
+- A quiet window's CPU reads 0.38 or 0.77 ms/s from round to round on both
+  builds (a tick of CPU time over 26 s); the medians are even.
