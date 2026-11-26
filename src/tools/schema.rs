@@ -18,9 +18,12 @@ use serde_json::{Map, Value};
 const MAX_DEPTH: usize = 64;
 const MAX_REFS: usize = 256;
 /// The most steps one check takes: a schema met at a place in the value,
-/// or a value compared with one an `enum` or `const` names. A few
-/// milliseconds at most, so a check may run beside other work.
+/// a value compared with one an `enum` or `const` names, or [`SCAN`]
+/// bytes of a string read to count or compare it. A few milliseconds at
+/// most, so a check may run beside other work.
 const WORK: usize = 100_000;
+/// The bytes of a string read in one step.
+const SCAN: usize = 256;
 
 /// Why `value` does not fit `schema`: where, as a path into the arguments
 /// (`title`, `items[2].name`), and what rule.
@@ -123,7 +126,7 @@ impl<'a> Checker<'a> {
             return Err(misfit(format!("must be {only}")));
         }
         match value {
-            Value::String(text) => strings(schema, text)?,
+            Value::String(text) => self.strings(schema, text)?,
             Value::Number(_) => numbers(schema, value)?,
             Value::Array(items) => self.arrays(schema, items, depth)?,
             Value::Object(fields) => self.objects(schema, fields, depth)?,
@@ -155,9 +158,51 @@ impl<'a> Checker<'a> {
         Ok(())
     }
 
+    fn strings(&mut self, schema: &Map<String, Value>, text: &str) -> Result<(), Misfit> {
+        let least = schema.get("minLength").and_then(Value::as_u64);
+        let most = schema.get("maxLength").and_then(Value::as_u64);
+        if least.is_none() && most.is_none() {
+            return Ok(());
+        }
+        // Characters, as JSON Schema counts a string's length: one to four
+        // bytes each, so its bytes settle most bounds without reading it.
+        let bytes = text.len() as u64;
+        if least.is_none_or(|least| bytes / 4 >= least) && most.is_none_or(|most| bytes <= most) {
+            return Ok(());
+        }
+        if !self.spend_on(text.len()) {
+            return Ok(());
+        }
+        let length = text.chars().count() as u64;
+        if let Some(least) = least
+            && length < least
+        {
+            return Err(misfit(format!(
+                "at least {least} {}, got {length}",
+                plural(least, "character")
+            )));
+        }
+        if let Some(most) = most
+            && length > most
+        {
+            return Err(misfit(format!(
+                "at most {most} {}, got {length}",
+                plural(most, "character")
+            )));
+        }
+        Ok(())
+    }
+
     /// One step of the check's work, if any is left.
     fn spend(&mut self) -> bool {
-        self.work = self.work.saturating_sub(1);
+        self.spend_on(0)
+    }
+
+    /// One step, and one more for each [`SCAN`] bytes of a string to read,
+    /// if that many are left.
+    fn spend_on(&mut self, bytes: usize) -> bool {
+        let steps = 1 + bytes / SCAN;
+        self.work = self.work.saturating_sub(steps);
         self.work > 0
     }
 
@@ -193,6 +238,15 @@ impl<'a> Checker<'a> {
                     }
                 }
                 true
+            }
+            (Value::String(x), Value::String(y)) => {
+                if x.len() != y.len() {
+                    return Some(false);
+                }
+                if !self.spend_on(x.len()) {
+                    return None;
+                }
+                x == y
             }
             _ => a == b,
         })
@@ -326,33 +380,6 @@ fn typed(types: &Value, value: &Value) -> Result<(), Misfit> {
 /// A whole number, as JSON Schema counts one: `2.0` is.
 fn integer(value: &Value) -> bool {
     value.is_i64() || value.is_u64() || value.as_f64().is_some_and(|n| n.fract() == 0.0)
-}
-
-fn strings(schema: &Map<String, Value>, text: &str) -> Result<(), Misfit> {
-    let least = schema.get("minLength").and_then(Value::as_u64);
-    let most = schema.get("maxLength").and_then(Value::as_u64);
-    if least.is_none() && most.is_none() {
-        return Ok(());
-    }
-    // Characters, as JSON Schema counts a string's length.
-    let length = text.chars().count() as u64;
-    if let Some(least) = least
-        && length < least
-    {
-        return Err(misfit(format!(
-            "at least {least} {}, got {length}",
-            plural(least, "character")
-        )));
-    }
-    if let Some(most) = most
-        && length > most
-    {
-        return Err(misfit(format!(
-            "at most {most} {}, got {length}",
-            plural(most, "character")
-        )));
-    }
-    Ok(())
 }
 
 fn numbers(schema: &Map<String, Value>, value: &Value) -> Result<(), Misfit> {
@@ -645,6 +672,21 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "{:?}",
             started.elapsed()
+        );
+        // Long strings read against many bounds spend it by their bytes.
+        let bounds: Vec<Value> = (0..3_000).map(|_| json!({"maxLength": 400_000})).collect();
+        let schema_long = json!({"allOf": bounds});
+        let text = json!("é".repeat(350_000));
+        let started = std::time::Instant::now();
+        assert!(check(&schema_long, &text).is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            said(json!({"maxLength": 3}), json!("éééé")),
+            "at most 3 characters, got 4"
         );
         // A misfit within the bound is still found.
         let early = json!([9_999, 10_000]);
