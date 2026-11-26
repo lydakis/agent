@@ -1793,8 +1793,8 @@ pub(crate) enum Lost {
 /// else in the folders of `places` (the agents above it), the first that
 /// holds it. As a task's worktree is made: git in the sandbox with
 /// `confine`, none of the repository's code run outside it, and no setup,
-/// since the branch's files are what a task wrote. One at a time, by a lock
-/// beside the worktrees, so callers at once make it once; it is then the
+/// since the branch's files are what a task wrote. One at a time, by the
+/// task's lock beside the worktrees, so callers at once make it once; it is then the
 /// daemon's at `store`, and counts toward `task_worktrees` again.
 pub(crate) fn restore_in(
     home: &Path,
@@ -1807,7 +1807,9 @@ pub(crate) fn restore_in(
     let folders = home.join(".agent/worktrees");
     let path = folders.join(name);
     let branch = format!("agent/{name}");
-    let _lock = locked(&folders.join(".restore.lock")).map_err(Lost::Failed)?;
+    // Its own lock, so a checkout that hangs holds up no other task's.
+    let lock = folders.join(".restoring").join(name);
+    let _lock = locked(&lock).map_err(Lost::Failed)?;
     if workspace.is_dir() {
         return Ok(Again::There);
     }

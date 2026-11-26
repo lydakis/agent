@@ -193,10 +193,12 @@ async fn turn_started(
 
 /// The folders of the agents above the agent `record`, each made by the
 /// next, its lead's last: where its task's branch may be. Those that are
-/// there.
+/// there. Each by the id it was made by, so an agent given a removed
+/// maker's name since is none of them, and the line ends there.
 async fn above(client: &Client, record: &Value) -> Vec<PathBuf> {
     let mut places = Vec::new();
     let mut by = record["created_by"].as_str().map(str::to_owned);
+    let mut by_id = record["created_by_id"].clone();
     // A line is a few deep: as deep as the config lets tasks start helpers.
     for _ in 0..16 {
         let Some(name) = by.take() else {
@@ -210,7 +212,7 @@ async fn above(client: &Client, record: &Value) -> Vec<PathBuf> {
         };
         let Some(found) = page["bots"]
             .get(0)
-            .filter(|found| found["name"] == name.as_str())
+            .filter(|found| found["name"] == name.as_str() && found["bot_id"] == by_id)
         else {
             break;
         };
@@ -220,6 +222,7 @@ async fn above(client: &Client, record: &Value) -> Vec<PathBuf> {
             .filter(|folder| folder.is_dir());
         places.extend(folder);
         by = found["created_by"].as_str().map(str::to_owned);
+        by_id = found["created_by_id"].clone();
     }
     places
 }
@@ -293,6 +296,28 @@ mod tests {
             turn_started(&client, "shop.old", 9, &workspace, store).await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_maker_given_a_removed_one_s_name_is_not_looked_in() {
+        let dir = std::env::temp_dir().join(format!("sonny-above-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let there = dir.to_string_lossy().into_owned();
+        let client = crate::tests::daemon_answering(move |asked| match asked["name"].as_str() {
+            Some("shop.lead") => json!({"bots": [{"name": "shop.lead", "bot_id": 1,
+                "workspace": there}]}),
+            _ => json!({"bots": []}),
+        })
+        .await;
+        let task = |by_id: i64| {
+            json!({"name": "shop.fix", "bot_id": 5,
+            "created_by": "shop.lead", "created_by_id": by_id})
+        };
+        assert_eq!(above(&client, &task(1)).await, vec![dir.clone()]);
+        // Made by a shop.lead removed since: the one of that name now is not
+        // its maker.
+        assert_eq!(above(&client, &task(9)).await, Vec::<PathBuf>::new());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
