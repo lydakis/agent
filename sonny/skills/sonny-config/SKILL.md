@@ -33,7 +33,10 @@ each setting is; what to set is the person's call.
   every permissions row that writes, and keep there what outlives a task,
   such as a monitor's files. Settings and skills stay where they are above.
 - `[sonny.mcp_servers.NAME]` in the config: MCP servers, kept with
-  `sonny mcp add|remove|list|import`.
+  `sonny mcp add|remove|list|import`. One behind AWS IAM takes `sigv4` (the
+  service, `execute-api` for API Gateway) and `region`
+  (`sonny mcp add NAME --url URL --sigv4 SERVICE --region REGION`): each
+  request is signed with keys from the AWS chain, none stored.
 - `[sonny.sources.NAME]` in the config: news from outside for the lookout,
   a `command` run `every` so often, in its own folder (`$SONNY_SOURCE_DIR`),
   where a path it names relative is kept. Each line it prints is an event;

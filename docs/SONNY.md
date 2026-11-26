@@ -1656,6 +1656,7 @@ approval_mode = "approve"
 ### Managing and importing servers
 
 - `sonny mcp add NAME -- COMMAND ARGS` (or `--url URL`), `sonny mcp remove NAME`, `sonny mcp list`, `sonny mcp tool`, or `/mcp` in Sonny.
+- A server behind AWS IAM: `sonny mcp add NAME --url URL --sigv4 SERVICE --region REGION` (`sigv4` and `region` in its entry). Every request to it, tools and events alike, is signed with AWS Signature Version 4 over its body, with keys from the AWS chain; Sonny stores none.
 - `sonny mcp import` discovers servers from Codex (`~/.codex/config.toml`), Claude Code (`~/.claude.json`, `.mcp.json`), OpenCode (`opencode.json`), and Kiro (`.kiro/settings/mcp.json`). Project-local servers start unticked for safety; literal secrets are extracted into `~/.agent/keys/env` rather than `config.toml`. (Legacy SSE servers are skipped.)
 
 ![sonny mcp import](sonny/mcp-import.png)
@@ -1678,7 +1679,7 @@ Scripts are never approved as a black box—every tool call inside `exec` goes t
 
 | `approval_mode` | When it asks the agent's gate |
 | --- | --- |
-| `auto` *(default)* | Tools marked `destructiveHint` (unless also `readOnlyHint`) |
+| `auto` *(default)* | Every tool except `readOnlyHint`, unless it marks both `destructiveHint` and `openWorldHint` false (a hint left out counts as true) |
 | `writes` | Every tool except `readOnlyHint` |
 | `prompt` | Every call |
 | `approve` | Never asks |
@@ -1711,8 +1712,35 @@ A server takes `command`, `args`, `env` and `cwd` (stdio), or `url`,
 `bearer_token_env_var` and `http_headers` (streamable HTTP), and either way
 `enabled`, `enabled_tools`, `disabled_tools`, `startup_timeout_sec`,
 `tool_timeout_sec`, `description`, `default_tools_approval_mode` and
-`tools.TOOL.approval_mode` (next section). `sonny mcp add NAME -- COMMAND ARGS`
-(or `--url URL`) writes one and lists its tools, `sonny mcp remove NAME`
+`tools.TOOL.approval_mode` (next section).
+
+A streamable HTTP server behind AWS IAM, such as one on API Gateway with
+IAM auth, takes `sigv4`, the service it signs for (`execute-api` for API
+Gateway), and `region`, in place of `bearer_token_env_var`:
+
+```toml
+[sonny.mcp_servers.ledger]
+url = "https://abc123.execute-api.us-east-1.amazonaws.com/mcp"
+sigv4 = "execute-api"
+region = "us-east-1"
+```
+
+Every request to it is signed with AWS Signature Version 4 over its body's
+SHA-256, as API Gateway requires: its tools, and its
+[events](LOOKOUT.md#mcp-servers-events) too, which go down the same connection. The keys come
+from the AWS chain as the runtime's Bedrock bindings read them, with the
+same signer: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and
+`AWS_SESSION_TOKEN`) in Sonny's environment, else what
+`aws configure export-credentials` gives for the profile `AWS_PROFILE`
+names (SSO, assumed roles, instance roles and the rest, AWS CLI 2.9 or
+later). Temporary keys are asked for again shortly before they expire,
+and keys are held in memory only: Sonny writes none anywhere. A signed
+server follows no redirects, so its signature and session token go to the
+URL configured and nowhere else.
+
+`sonny mcp add NAME -- COMMAND ARGS`
+(or `--url URL`, with `--bearer-token-env-var VAR` or
+`--sigv4 SERVICE --region REGION`) writes one and lists its tools, `sonny mcp remove NAME`
 drops it, and `sonny mcp list` starts each and says what it offers or why
 it did not start. `/mcp` in Sonny shows the same from the last listings,
 and `sonny mcp tool` prints the `exec` tool agents are given, as JSON.
@@ -1811,9 +1839,11 @@ interrupts, stops its script and the calls it has in flight.
 
 As in Codex, a script is not approved as a whole: each call it makes is
 checked on its own, by its server's `approval_mode`, Codex's names and
-rule. `auto`, the default, asks first for a call of a tool the server marks
-destructive (`destructiveHint`) unless it also marks it read-only
-(`readOnlyHint`, which wins), and runs the rest; `writes` asks for every
+rule. `auto`, the default, runs a call of a tool the server marks
+read-only (`readOnlyHint`, which wins) or marks both as destroying nothing
+(`destructiveHint` false) and keeping to a closed world (`openWorldHint`
+false), and asks first for the rest, so a tool that says nothing of itself
+asks, as one that sends mail does; `writes` asks for every
 call but a read-only tool's; `prompt` asks for every call; `approve` never
 asks. Asking puts the call to the agent's own gate, through the daemon's
 `approve_step`: in `full` nothing waits, in `auto` the reviewer decides it, in

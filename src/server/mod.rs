@@ -2592,7 +2592,7 @@ impl Binder {
             let url = reqwest::Url::parse(&spec.url)
                 .map_err(|_| Error::with("invalid_provider_url", "the base URL does not parse"))?;
             let (aws, unresolved) =
-                agent_runtime::provider::aws::Aws::open(&url, Some(credentials.clone()), aws_start)
+                agent_runtime::provider::aws::open(&url, Some(credentials.clone()), aws_start)
                     .await
                     .map_err(named)?;
             let mut signed = json!({"auth":"sigv4","region":aws.region(),
