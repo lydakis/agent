@@ -5940,7 +5940,7 @@ impl TasksAsked {
                             // Its own close holds once its turn completed.
                             done = (seen.itself && turn["status"] == "completed")
                                 || resolved::done(closed, false);
-                            // One its lead closed set its question aside.
+                            // One its lead closed, done, waits on nobody.
                             needs.asked(&bot, seen.open(closed, false));
                             ended.push(bot.clone());
                             asked.push(bot.clone());
@@ -6751,17 +6751,17 @@ struct App {
     /// How many were kept at the last look for ones trimmed away.
     written_kept: usize,
     /// The lead's open questions for the person, oldest first: its `ask`
-    /// calls not yet answered, nor set aside, and its tasks' open ones,
-    /// pinned here as they come ([`App::pin_task_asks`]).
+    /// calls not yet answered nor closed, and its tasks' open ones, pinned
+    /// here as they come ([`App::pin_task_asks`]).
     asks: Vec<asks::Ask>,
     /// Which of them what is typed answers, by id, so it stays on that
     /// question as others close or the conversation is drawn again; the
     /// oldest when none was picked or the one picked is gone.
     focus: Option<String>,
-    /// Questions the conversation went on past, the person writing a
-    /// message of their own after them: out of the composer and the
-    /// count, their options still answering them.
-    aside: Vec<asks::Ask>,
+    /// This agent's own open questions, out of the composer while it is
+    /// closed, done, as they are out of the count: their cards stay open,
+    /// their options answering them, and a click pins one again.
+    unpinned: Vec<asks::Ask>,
     /// The questions' cards drawn here, by [`asks::Ask::key`]: the number
     /// their rows are tagged with, the ask, and whether a settled one is
     /// open whole.
@@ -6776,11 +6776,12 @@ struct App {
     /// The tasks' questions that left this window's pins without an
     /// answer from here: where each stands is read from its task.
     unsettled: Vec<asks::Ask>,
-    /// Tasks' questions set aside in their own windows that a click on
-    /// the card brought back here: pinned though the task no longer is.
+    /// Tasks' questions still open that left the pins, their task done,
+    /// that a click on the card brought back here: pinned though the task
+    /// no longer is.
     reopened: std::collections::HashSet<String>,
-    /// Tasks' questions set aside, or reopened here, whose task could
-    /// still answer or close them: each with its task's newest node when
+    /// Tasks' questions that left the pins still open, or reopened here,
+    /// whose task could still answer or close them: each with its task's newest node when
     /// it was last read, read again once the task's history moves on.
     watched: HashMap<String, (asks::Ask, Option<i64>)>,
     /// When the watched questions' tasks were last looked at.
@@ -6788,10 +6789,6 @@ struct App {
     /// The asks this window answered and closed, by call, until their
     /// answers land.
     sent_answers: Vec<String>,
-    /// The agent's own open questions a message from here told it were
-    /// set aside ([`asks::set_aside`]), by id, while they are still open
-    /// here: told once, though more messages go before that one lands.
-    told_aside: Vec<String>,
     /// The tasks' asks this window answered, by [`asks::Ask::key`], until
     /// their tasks read them: none is pinned again meanwhile.
     task_answers: Vec<TaskAnswer>,
@@ -6814,9 +6811,9 @@ struct App {
     /// at the start and its events since: closed by itself, its lead or
     /// the person, until a turn of its opens it again.
     own_closed: bool,
-    /// Its own questions were set aside for being closed, until a turn of
-    /// its opens it again.
-    closed_aside: bool,
+    /// Its own questions left the pins for its being closed, until a turn
+    /// of its opens it again.
+    closed_unpinned: bool,
     /// A task's window, kept open by its lead once the task is done
     /// because the person was using it.
     kept: Kept,
@@ -8027,7 +8024,7 @@ const FLEET_KINDS: [&str; 15] = [
     "created",
     "forked",
     "deleted",
-    // Done: a question it left open is set aside.
+    // Done: a question it left open waits on nobody.
     "closed",
     "accepted",
     // The person's words steered into a running turn answer its question.
@@ -8253,7 +8250,7 @@ impl Fleet {
                 continue;
             }
             self.lineage.insert(name.to_owned());
-            // Closed, done, as the listing says: what it asked is set aside.
+            // Closed, done, as the listing says: what it asked waits on nobody.
             match resolved::closed(bot) {
                 true => _ = self.closed.insert(name.to_owned()),
                 false => _ = self.closed.remove(name),
@@ -8416,7 +8413,7 @@ impl Fleet {
             self.needs.forget(gone);
             self.scanned.remove(gone);
         }
-        // Theirs closed, done, as listed: what they asked is set aside.
+        // Theirs closed, done, as listed: what they asked waits on nobody.
         for bot in &raised {
             match read.closed.contains(bot) {
                 true => _ = self.closed.insert(bot.clone()),
@@ -8805,7 +8802,7 @@ impl Fleet {
             && self.activity.get(task) != Some(&"working")
             && !self.needs.holds(task)
         {
-            // Resolved, a question it left open is set aside.
+            // Resolved, a question it left open waits on nobody.
             self.needs.forget(task);
             self.ended.remove(task);
             // Kept until new work: closed again, it is still in use.
@@ -8937,7 +8934,7 @@ impl Fleet {
             match kind {
                 "closed" => {
                     self.closed.insert(bot.to_owned());
-                    // At rest, it is done: what it asked is set aside.
+                    // At rest, it is done: what it asked waits on nobody.
                     if self.activity.get(bot) != Some(&"working") {
                         self.needs.asked(bot, None);
                         let waits = self.needs.waits(bot);
@@ -9107,7 +9104,7 @@ impl App {
             written_kept: 0,
             asks: Vec::new(),
             focus: None,
-            aside: Vec::new(),
+            unpinned: Vec::new(),
             cards: HashMap::new(),
             card_count: 0,
             cards_kept: 0,
@@ -9117,7 +9114,6 @@ impl App {
             watched: HashMap::new(),
             watched_at: None,
             sent_answers: Vec::new(),
-            told_aside: Vec::new(),
             task_answers: Vec::new(),
             rechecking: None,
             settling: None,
@@ -9125,7 +9121,7 @@ impl App {
             hub_asks: 0,
             follows: Follows::default(),
             own_closed: resolved::closed(record),
-            closed_aside: false,
+            closed_unpinned: false,
             kept: Kept::default(),
             task_needs: Default::default(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
@@ -11040,10 +11036,10 @@ impl App {
         // away: the record says which.
         self.compact_next = record["compaction_requested"] == true;
         // Closed or opened while away, as the record says now: a close
-        // missed sets its questions aside, below, as one heard would.
+        // missed unpins its questions, below, as one heard would.
         self.own_closed = resolved::closed(&record);
         if !self.own_closed {
-            self.closed_aside = false;
+            self.closed_unpinned = false;
         }
         // What happened while away is not known turn by turn: a kept
         // done window stays open from here on, as any other.
@@ -12260,9 +12256,9 @@ impl App {
             .and_then(|rest| rest.split_once('/'))
             .and_then(|(at, id)| Some((at.parse::<usize>().ok()?, id)))
         {
-            // One set aside, or closed by its agent, is still answered by
-            // its options: only the person's own answer is final.
-            let Some(ask) = (self.asks.iter().chain(&self.aside))
+            // One unpinned, or closed by its agent, is still answered by its
+            // options: only the person's own answer is final.
+            let Some(ask) = (self.asks.iter().chain(&self.unpinned))
                 .find(|ask| ask.key() == id)
                 .or_else(|| {
                     (self.cards.get(id))
@@ -14100,7 +14096,6 @@ impl App {
                     // the reply: no hint hangs on either.
                     let steer = item["role"] == "user"
                         && !reactions::is_reaction(&text(&item))
-                        && !asks::told_aside(&text(&item))
                         && turns
                             .get(&node)
                             .is_some_and(|turn| turns.get(&at) == Some(turn));
@@ -14113,9 +14108,6 @@ impl App {
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
                     (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
-                    // What Sonny told the agent of its questions set
-                    // aside: the cards say it.
-                    (_, Some("user")) if asks::told_aside(&text(&item)) => {}
                     // The person took a note away: the margin shows it.
                     (_, Some("user")) if margin::closed(&text(&item)).is_some() => {
                         self.note_closed(node, &text(&item));
@@ -14269,12 +14261,11 @@ impl App {
                         if name == asks::CLOSE && !failed && !reactions::refused(&item) {
                             self.ask_closed(&arguments);
                         }
-                        // A card a page read later draws, its question no
-                        // longer pinned, is set aside, unless answered or
-                        // closed after it.
+                        // A card a page read later draws, unless answered or
+                        // closed after it, is open, and pinned.
                         if older && name == asks::TOOL && !failed {
                             let turn = turns.get(&node).copied();
-                            self.set_aside_unless_settled(&Self::ask_id(turn, id));
+                            self.pin_unless_settled(&Self::ask_id(turn, id));
                         }
                         if older {
                             continue;
@@ -15032,7 +15023,7 @@ impl App {
             "accepted" => {
                 // A turn of its own opens it again.
                 self.own_closed = false;
-                self.closed_aside = false;
+                self.closed_unpinned = false;
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 self.end_live(Words::Reply);
                 self.live_item = None;
@@ -15824,7 +15815,7 @@ impl App {
         };
         for agent in closed {
             if agent == self.bot {
-                self.set_aside_own(None);
+                self.unpin_own();
             } else if now && let Some(fleet) = &mut self.fleet {
                 fleet.resolved(&agent);
             }
@@ -20316,12 +20307,6 @@ impl App {
         let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
-        // An answer sets nothing aside, though a card read with no turn
-        // names its ask by the call alone until it goes ([`repick`]).
-        let aside = match pick {
-            Some(_) => None,
-            None => self.tell_aside(&prompt, origin),
-        };
         // Shown where it will land while it goes, under a number of its own.
         self.unsent_rows += 1;
         let sending = -self.unsent_rows;
@@ -20337,29 +20322,7 @@ impl App {
             submitted,
             then,
             pick,
-            aside,
         }
-    }
-
-    /// What the agent is told with `prompt`, sent from `origin`, when its
-    /// words set the agent's own open questions aside, as every reader of
-    /// its history will ([`asks::moves_on`]): its tasks' wait on the
-    /// person still. Each question is told once.
-    fn tell_aside(&mut self, prompt: &str, origin: Option<&str>) -> Option<String> {
-        let own = |ask: &&asks::Ask| ask.task.is_none();
-        let open: Vec<&asks::Ask> = self.asks.iter().filter(own).collect();
-        self.told_aside
-            .retain(|told| open.iter().any(|ask| ask.id == *told));
-        if !asks::moves_on(prompt, origin) {
-            return None;
-        }
-        let untold: Vec<asks::Ask> = (open.into_iter())
-            .filter(|ask| !self.told_aside.contains(&ask.id))
-            .cloned()
-            .collect();
-        self.told_aside
-            .extend(untold.iter().map(|ask| ask.id.clone()));
-        asks::set_aside(&untold)
     }
 
     /// `prompt` sent as the person's words and the daemon's answer
@@ -20698,8 +20661,8 @@ impl App {
 
     /// The tasks' questions that left the pins with no answer from here,
     /// each read once from its task: answered in the task's window, closed
-    /// by the task, or set aside there; their cards say so. One read per
-    /// question gone, never per pass.
+    /// by the task, or still open, its task done; their cards say so. One
+    /// read per question gone, never per pass.
     async fn settle_task_asks(&mut self) {
         if let Some(job) = self.settling.take_if(|job| job.is_finished())
             && let Ok(settled) = job.await
@@ -20725,14 +20688,11 @@ impl App {
                 let call = ask.id.split_once('/').map_or("", |(_, call)| call);
                 let state = match asks::standing(&client, &task.bot, turn, call, None).await {
                     Ok(Some((_, state))) => state,
-                    // Unread, or the task gone: it waits on nobody here.
-                    _ => asks::State::Aside,
+                    // Unread, or the task gone: nothing settled it.
+                    _ => asks::State::Open,
                 };
-                // Still open there, it is no longer pinned here: set aside.
-                let state = match state {
-                    asks::State::Open => asks::State::Aside,
-                    state => state,
-                };
+                // Still open there, its card stays open, and a click pins
+                // it here again.
                 settled.gone.push((ask.key(), state));
             }
             settled.watched = reread_watched(&client, watched).await;
@@ -20772,8 +20732,8 @@ impl App {
             self.settle(&key, state);
         }
         for (key, found, head) in settled.watched {
-            // What changed there reads here; still open or set aside
-            // there, it stays where it is here.
+            // What changed there reads here; still open there, it stays
+            // where it is here.
             if let Some(state) = found
                 && state.settled()
                 && self.settled.get(&key) != Some(&state)
@@ -21202,8 +21162,8 @@ impl App {
         for key in gone {
             self.cards.remove(&key);
             self.watched.remove(&key);
-            // Set aside, it is set aside again when its page is read again.
-            self.aside.retain(|ask| ask.key() != key);
+            // Unpinned, it is unpinned again when its page is read again.
+            self.unpinned.retain(|ask| ask.key() != key);
             // Where it stands is kept, cut to a line: its answer or close
             // may be on a newer page, not read again when its own is.
             if let Some(state) = self.settled.remove(&key) {
@@ -21268,17 +21228,9 @@ impl App {
             .replace_tagged(screen::Tag::Ask(tag), lines, marks);
     }
 
-    /// Where `ask` stands: answered or closed as last heard, else open
-    /// while it is among the open ones here, else set aside.
+    /// Where `ask` stands: answered or closed as last heard, else open.
     fn card_state(&self, ask: &asks::Ask) -> asks::State {
-        let key = ask.key();
-        if let Some(state) = self.settled.get(&key) {
-            return state.clone();
-        }
-        match (self.aside.iter()).any(|aside| aside.key() == key) {
-            true => asks::State::Aside,
-            false => asks::State::Open,
-        }
+        (self.settled.get(&ask.key()).cloned()).unwrap_or(asks::State::Open)
     }
 
     /// The question at `key` answered or closed, `state` saying how: let
@@ -21303,7 +21255,7 @@ impl App {
         self.settled.insert(key.to_owned(), state);
         let before = self.asks.len();
         self.asks.retain(|open| open.key() != key);
-        self.aside.retain(|open| open.key() != key);
+        self.unpinned.retain(|open| open.key() != key);
         if self.asks.len() < before {
             self.settle_asks();
         }
@@ -21311,18 +21263,26 @@ impl App {
     }
 
     /// The card of ask `id`, drawn from a page read later and pinned
-    /// nowhere, set aside unless it was answered or closed.
-    fn set_aside_unless_settled(&mut self, id: &str) {
-        if self.settled.contains_key(id) || self.asks.iter().any(|ask| ask.id == id) {
+    /// nowhere: open unless it was answered or closed after it, and so
+    /// pinned where its turn puts it, as a question asked on the page
+    /// first read is; unpinned while this agent is closed.
+    fn pin_unless_settled(&mut self, id: &str) {
+        let known = (self.asks.iter().chain(&self.unpinned)).any(|ask| ask.id == id);
+        if self.settled.contains_key(id) || known {
             return;
         }
         let Some((_, ask, _)) = self.cards.get(id).cloned() else {
             return;
         };
-        if !self.aside.iter().any(|aside| aside.id == id) {
-            self.aside.push(ask);
+        if self.own_closed {
+            self.unpinned.push(ask);
+            return;
         }
-        self.draw_card(id);
+        self.keep_draft();
+        let to = (self.asks.iter())
+            .position(|open| asks::turn_of(&open.id) > asks::turn_of(&ask.id))
+            .unwrap_or(self.asks.len());
+        self.asks.insert(to, ask);
     }
 
     /// A `close_ask` call of this window's agent, with `arguments`: the
@@ -21337,9 +21297,9 @@ impl App {
         }
     }
 
-    /// A click on a card's question: an open or set-aside question comes
-    /// to the composer, what is typed next answering it; a settled one
-    /// opens whole, or folds again.
+    /// A click on a card's question: an open question comes to the
+    /// composer, what is typed next answering it, pinned again where it
+    /// had left the pins; a settled one opens whole, or folds again.
     fn card_clicked(&mut self, key: &str) {
         let Some((tag, ask, open)) = self.cards.get(key).cloned() else {
             return;
@@ -21349,20 +21309,20 @@ impl App {
             self.draw_card(key);
             return;
         }
-        // Set aside, it is open again, where its turn puts it.
-        if let Some(at) = self.aside.iter().position(|aside| aside.key() == key) {
-            let ask = self.aside.remove(at);
+        // Unpinned, it is pinned again, where its turn puts it.
+        if let Some(at) = self.unpinned.iter().position(|open| open.key() == key) {
+            let ask = self.unpinned.remove(at);
             let to = (self.asks.iter())
                 .position(|open| asks::turn_of(&open.id) > asks::turn_of(&ask.id))
                 .unwrap_or(self.asks.len());
             self.asks.insert(to, ask);
             self.draw_card(key);
-        } else if self.settled.get(key) == Some(&asks::State::Aside)
+        } else if self.settled.get(key) == Some(&asks::State::Open)
             && ask.task.is_some()
             && !self.asks.iter().any(|open| open.key() == key)
         {
-            // A task's question set aside in its own window: a pick there
-            // still answers it, so it is pinned here again.
+            // A task's question still open that left the pins, its task
+            // done: a pick still answers it, so it is pinned here again.
             self.settled.remove(key);
             self.reopened.insert(key.to_owned());
             // Still watched: its task can still answer or close it.
@@ -21453,18 +21413,18 @@ impl App {
             ask.task.is_none() || keys.contains(&ask.key()) || reopened.contains(&ask.key())
         };
         // One that closed elsewhere: where it stands is read from its task.
-        let gone: Vec<asks::Ask> = (self.asks.iter().chain(&self.aside))
+        let gone: Vec<asks::Ask> = (self.asks.iter().chain(&self.unpinned))
             .filter(|ask| !still(ask) && !self.settled.contains_key(&ask.key()))
             .cloned()
             .collect();
         self.unsettled.extend(gone);
         self.asks.retain(still);
-        self.aside.retain(still);
+        self.unpinned.retain(still);
         self.task_answers
             .retain(|answer| keys.contains(&answer.key));
         for ask in open {
             let key = ask.key();
-            let known = (self.asks.iter().chain(&self.aside)).any(|have| have.key() == key)
+            let known = (self.asks.iter().chain(&self.unpinned)).any(|have| have.key() == key)
                 || self.task_answers.iter().any(|answer| answer.key == key);
             if !known {
                 // Pinned again, as an answer taken back unread: open anew.
@@ -21550,7 +21510,7 @@ impl App {
     /// what they read has not changed.
     fn forget_asks(&mut self) {
         self.asks.clear();
-        self.aside.clear();
+        self.unpinned.clear();
         self.sent_answers.clear();
         self.task_asks_read = None;
         self.cards.clear();
@@ -21570,15 +21530,21 @@ impl App {
         }
     }
 
-    /// The question an `ask` call put, open until it is answered or the
-    /// conversation goes on past it. One newly asked takes no focus from
+    /// The question an `ask` call put, open until it is answered or its
+    /// agent closes it. One newly asked takes no focus from
     /// the one being answered, as Codex's questions take none, nor the
-    /// words being typed ([`App::keep_draft`]).
+    /// words being typed ([`App::keep_draft`]); with nothing typed after
+    /// Esc, none is being answered, and the composer answers it.
     fn asked(&mut self, id: &str, turn: Option<i64>, arguments: &Value) {
         if let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
-            && !(self.asks.iter().chain(&self.aside)).any(|open| open.id == ask.id)
+            && !(self.asks.iter().chain(&self.unpinned)).any(|open| open.id == ask.id)
         {
+            let idle = self.chatting && self.blank();
             self.keep_draft();
+            if idle {
+                self.chatting = false;
+                self.focus = Some(ask.key());
+            }
             self.asks.push(ask);
         }
     }
@@ -21678,8 +21644,8 @@ impl App {
     }
 
     /// The question a message answered, from this window or another,
-    /// closed; or, the person's own words that answer none, every
-    /// question open set aside, as the conversation went on past them.
+    /// closed. Words of the person's own that answer none close nothing:
+    /// a card stays open until a pick or its agent's close.
     fn answered(&mut self, message: &str, from: Option<&str>) {
         // An answer sent from here closed its question when it was sent.
         if let Some(call) = asks::answer_of(message, from)
@@ -21688,9 +21654,7 @@ impl App {
             self.sent_answers.remove(at);
             return;
         }
-        if asks::moves_on(message, from) {
-            self.set_aside_own(None);
-        } else if let Some(id) = asks::answer_of(message, from)
+        if let Some(id) = asks::answer_of(message, from)
             && let Some((_, answer)) = asks::split(message)
         {
             let id = id.to_owned();
@@ -21699,22 +21663,14 @@ impl App {
         self.settle_asks();
     }
 
-    /// This agent's own open questions set aside, as words past them or
-    /// its being closed leave them, those asked up to its turn
-    /// `upto` if named; its tasks' wait on the person still.
-    fn set_aside_own(&mut self, upto: Option<i64>) {
-        let covered = |ask: &asks::Ask| {
-            ask.task.is_none()
-                && upto.is_none_or(|upto| asks::turn_of(&ask.id).is_some_and(|turn| turn <= upto))
-        };
+    /// This agent's own open questions out of the composer, as its being
+    /// closed, done, leaves them out of the count: their cards stay open,
+    /// a click pinning one again. Its tasks' wait on the person still.
+    fn unpin_own(&mut self) {
         let (own, rest): (Vec<_>, Vec<_>) =
-            (std::mem::take(&mut self.asks).into_iter()).partition(covered);
+            (std::mem::take(&mut self.asks).into_iter()).partition(|ask| ask.task.is_none());
         self.asks = rest;
-        let keys: Vec<String> = own.iter().map(asks::Ask::key).collect();
-        self.aside.extend(own);
-        for key in keys {
-            self.draw_card(&key);
-        }
+        self.unpinned.extend(own);
         self.settle_asks();
     }
 
@@ -21809,19 +21765,19 @@ impl App {
     }
 
     /// A lead closed from elsewhere, by whoever made it or the person:
-    /// done, its own questions set aside here too, as its own close sets
-    /// them aside, once while it stays closed.
+    /// done, its own questions out of the composer here too, as its own
+    /// close leaves them, once while it stays closed.
     fn done_elsewhere(&mut self) {
         if self.options.side.is_some()
             || !project::is_lead(&self.bot)
             || !self.own_closed
-            || self.closed_aside
+            || self.closed_unpinned
             || !self.asks.iter().any(|ask| ask.task.is_none())
         {
             return;
         }
-        self.closed_aside = true;
-        self.set_aside_own(None);
+        self.closed_unpinned = true;
+        self.unpin_own();
     }
 
     /// The composer's focus on the next open question, or the one
@@ -21960,7 +21916,7 @@ impl App {
         let key = ask.key();
         if ask.task.is_some()
             || self.settled.contains_key(&key)
-            || self.aside.iter().any(|aside| aside.key() == key)
+            || self.unpinned.iter().any(|open| open.key() == key)
         {
             return None;
         }
@@ -25978,9 +25934,6 @@ struct Sent {
     then: Then,
     /// The question it answers, checked as it goes ([`repick`]).
     pick: Option<Pick>,
-    /// What the agent is told first, attached to the model call that
-    /// takes this message: the questions of its own this sets aside.
-    aside: Option<String>,
 }
 
 /// A message answering a question, as it goes: the ask its card names,
@@ -26127,14 +26080,6 @@ async fn submit_message(client: &Client, message: &mut Sent) -> Result<Value, St
         }
     }
     let submitted = message.submitted.clone();
-    // Ahead of the message, so the call that takes it has both: attached,
-    // it joins whichever call the agent makes next, as a reaction does.
-    // Not told, the message goes all the same.
-    if let Some(told) = &message.aside {
-        let attached = json!({"bot": submitted["bot"], "request_id": unique("tui"),
-            "prompt": told, "delivery": "attach", "origin": asks::ASIDE_ORIGIN});
-        let _ = client.request("submit", attached).await;
-    }
     match asks::answer_of(&message.prompt, message.origin) {
         Some(ask) => answer_once(client, ask, submitted).await,
         None => {
@@ -26586,10 +26531,9 @@ fn note_marker(title: String, beside: bool) -> Line<'static> {
 }
 
 /// Whether a message of the person's is drawn elsewhere than as a
-/// message: a reaction under its reply, a note taken away in the margin,
-/// questions set aside on their cards.
+/// message: a reaction under its reply, a note taken away in the margin.
 fn quiet_message(text: &str) -> bool {
-    reactions::is_reaction(text) || margin::closed(text).is_some() || asks::told_aside(text)
+    reactions::is_reaction(text) || margin::closed(text).is_some()
 }
 
 /// A message item's text: a prompt's own words, without the line the
@@ -30211,12 +30155,7 @@ mod tests {
             [
                 "You asked (ask:1/c0): Bump it?\n\nnot yet",
                 "You asked (ask:1/c1): Keep the old API?\n\nDrop it",
-                // The agent told first of the two its words set aside.
-                &asks::set_aside(&[
-                    ask("ask:1/c2", "Tag it?"),
-                    ask("ask:1/c3", "Keep the old API?")
-                ])
-                .unwrap(),
+                // Nothing else goes with the person's own words.
                 "how is it going?"
             ]
         );
@@ -30238,11 +30177,18 @@ mod tests {
         );
         app.step_ask(true);
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c2"));
-        // The person's own words landing move on past them: out of the
-        // composer and the count, their options still answering them.
+        // The person's own words landing close nothing: both stay open,
+        // pinned and counted, until a pick or the agent's close.
         app.answered("how is it going?", None);
-        assert!(app.asks.is_empty() && app.asking().is_none());
-        assert_eq!(app.aside.len(), 2);
+        assert_eq!(
+            app.asks,
+            [
+                ask("ask:1/c2", "Tag it?"),
+                ask("ask:1/c3", "Keep the old API?")
+            ]
+        );
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c2"));
+        assert!(app.unpinned.is_empty());
         app.input.clear();
         app.press("answer/0/ask:1/c2").await;
         app.beside_done().await;
@@ -30250,7 +30196,14 @@ mod tests {
             sent.lock().unwrap().last().unwrap(),
             "You asked (ask:1/c2): Tag it?\n\nKeep it"
         );
-        assert_eq!(app.aside, [ask("ask:1/c3", "Keep the old API?")]);
+        assert_eq!(app.asks, [ask("ask:1/c3", "Keep the old API?")]);
+        // The agent's close closes it.
+        app.ask_closed(&json!({"id": "ask:1/c3", "outcome": "withdrawn", "note": "moot"}));
+        assert!(app.asks.is_empty());
+        assert_eq!(
+            app.card_state(&ask("ask:1/c3", "Keep the old API?")),
+            asks::State::Withdrawn("moot".into())
+        );
         // Another agent's words, or a reaction, move nothing on.
         app.asks = vec![ask("ask:1/c4", "Ship it?")];
         app.answered("Done: tests pass", Some("tally.halves"));
@@ -30566,8 +30519,7 @@ mod tests {
             (10, 3, say("assistant", "calc.neg is done.")),
             (11, 4, say("user", "Push it")),
             (12, 4, say("assistant", "Pushed as 4f2c1a0.")),
-            // Asked last: the person's own words after it would set it
-            // aside, the conversation having moved on past it.
+            // Asked last.
             (
                 13,
                 4,
@@ -32286,12 +32238,14 @@ mod tests {
         assert!(app.answering_over(80).is_none());
         app.submit().await;
         app.beside_done().await;
-        // Landing, they went on past it, as words after Esc do.
+        // Landing, they leave it open, and the composer theirs, as words
+        // after Esc do.
         app.answered("also rename the crate", None);
-        assert!(app.asks.is_empty());
+        assert_eq!(app.asks.len(), 1);
+        assert!(app.asking().is_none());
         // With nothing typed, the next one asked is answered as ever.
         app.asked("c1", Some(3), &question);
-        assert!(app.asking().is_some());
+        assert_eq!(app.asking().unwrap().id, "ask:3/c1");
         // One asked while another is being answered takes neither its
         // focus nor what is typed for it.
         app.input.set("not yet");
@@ -32302,9 +32256,6 @@ mod tests {
         assert_eq!(
             *sent.lock().unwrap(),
             [
-                // The agent told first: the question goes aside.
-                "Your question \"Bump it?\" (ask:1/c0) is now set aside: the person wrote past \
-                 it; a pick still answers it.",
                 "also rename the crate",
                 "You asked (ask:3/c1): Bump it?\n\nnot yet"
             ]
@@ -35818,47 +35769,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_the_agent_was_told_of_a_question_set_aside_is_not_drawn() {
-        let told = asks::set_aside(&[asks::Ask {
-            id: "ask:1/c1".into(),
-            ..asks::call("c1", &json!({"question": "Keep it?"})).unwrap()
-        }])
-        .unwrap();
-        // The page drawn with what the agent was told, and without.
-        let drawn = async |told: Option<&str>| {
-            let items = json!({
-                "1": {"type": "message", "role": "assistant",
-                      "content": [{"type": "output_text", "text": "Merged it."}]},
-                "2": {"type": "message", "role": "user",
-                      "content": [{"type": "input_text", "text": told}]},
-                "3": {"type": "message", "role": "user",
-                      "content": [{"type": "input_text", "text": "what next?"}]},
-            });
-            let nodes: Vec<Value> = [3, 2, 1]
-                .into_iter()
-                .filter(|node| *node != 2 || told.is_some())
-                .map(|node| json!({"node": node}))
-                .collect();
-            let client = daemon_answering(move |asked| match asked["op"].as_str() {
-                Some("history_nodes") => json!({"nodes": nodes, "next_from": null}),
-                _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
-                    .map(|node| json!({"node": node, "item": items[node.to_string()],
-                        "origin": (node == 2).then_some(asks::ASIDE_ORIGIN)}))
-                    .collect::<Vec<_>>()}),
-            })
-            .await;
-            let mut app = app(client);
-            app.history().await;
-            (app.pending.iter())
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-        };
-        let with = drawn(Some(&told)).await;
-        assert!(with.iter().any(|row| row.contains("what next?")));
-        assert_eq!(with, drawn(None).await);
-    }
-
-    #[tokio::test]
     async fn the_clean_view_keeps_the_words_and_a_task_started_but_not_a_command() {
         let started = r#"{"bot":"b.fix","handle":"b.fix/1","status":"running","turn":1}"#;
         let client = daemon_answering(move |asked| {
@@ -37761,7 +37671,7 @@ mod tests {
                             "created_by": "shop.lead", "running_turn": 5}),
                     ];
                     if listed.load(std::sync::atomic::Ordering::SeqCst) {
-                        // Closed, done: what it asked is set aside here.
+                        // Closed, done: what it asked waits on nobody here.
                         bots.push(json!({"name": "shop.loose", "bot_id": 3, "head": 3,
                             "closed_ms": 1}));
                     }
@@ -38916,10 +38826,10 @@ mod tests {
         assert_eq!(app.asks.len(), 1);
     }
 
-    /// A card says where its question stands as that changes: set aside by
-    /// the person's words, back in the composer on a click, withdrawn by
-    /// its agent and folded, opened whole on a click, and answered by a
-    /// pick on it after all, which only the person's own answer stops.
+    /// A card says where its question stands as that changes: open past
+    /// the person's own words, withdrawn by its agent and folded, opened
+    /// whole on a click, and answered by a pick on it after all, which
+    /// only the person's own answer stops.
     #[tokio::test]
     async fn a_cards_state_follows_its_question_and_a_click_brings_it_back() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -38941,15 +38851,13 @@ mod tests {
         app.commit_call("c1", Some(1), asks::TOOL, &arguments, "{}", false);
         app.asked("c1", Some(1), &arguments);
         assert!(drawn(&mut app).contains(&"? Keep the old API?".to_owned()));
-        // Words of the person's own set it aside, and its card says so.
+        // Words of the person's own leave it open, in the composer, its
+        // card as it was.
+        let before = drawn(&mut app);
         app.answered("how is it going?", None);
-        let aside = "┃ Set aside: you wrote past it. A pick still answers it.".to_owned();
-        assert!(drawn(&mut app).contains(&aside));
-        assert!(app.asking().is_none());
-        // A click on its question brings it back to the composer.
-        app.press("card/ask:1/c1").await;
         assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("ask:1/c1"));
-        assert!(!drawn(&mut app).contains(&aside));
+        assert_eq!(drawn(&mut app), before);
+        assert!(!before.iter().any(|row| row.contains("Set aside")));
         // Its agent withdraws it: folded to its question and why.
         app.ask_closed(&json!({"id": "ask:1/c1", "outcome": "withdrawn",
             "note": "settled elsewhere"}));
@@ -38983,7 +38891,7 @@ mod tests {
         assert!(drawn(&mut app).contains(&"┃ Answered · Drop it".to_owned()));
         // A card the screen let go of is let go here too. Where its
         // question stood is kept, cut to a line, as its answer or close
-        // may be on a newer page; one set aside is let go, set aside again
+        // may be on a newer page; one unpinned is let go, unpinned again
         // when its page is read again.
         let long = "w".repeat(1000);
         for n in 0..64 {
@@ -38995,13 +38903,13 @@ mod tests {
         }
         let aside = asks::call("ask:99/aside", &arguments).unwrap();
         (app.cards).insert(aside.key(), (20_000, aside.clone(), false));
-        app.aside.push(aside);
+        app.unpinned.push(aside);
         // Kept while an older page is drawn, the newer rows held aside.
         app.newer = Some(std::mem::take(&mut app.screen));
         app.forget_trimmed_cards();
         app.screen = app.newer.take().unwrap();
         assert_eq!(app.cards.keys().collect::<Vec<_>>(), ["ask:1/c1"]);
-        assert!(app.aside.is_empty());
+        assert!(app.unpinned.is_empty());
         assert_eq!(app.settled.len(), 65);
         let Some(asks::State::Withdrawn(why)) = app.settled.get("ask:100/gone") else {
             panic!("kept");
@@ -39215,10 +39123,11 @@ mod tests {
         );
     }
 
-    /// A task's question set aside in its own window comes back to the
-    /// lead's composer with a click on its card, and stays pinned there.
+    /// A task's open question that left the pins, its task done, comes
+    /// back to the lead's composer with a click on its card, and stays
+    /// pinned there.
     #[tokio::test]
-    async fn a_tasks_question_set_aside_in_its_window_comes_back_with_a_click() {
+    async fn a_tasks_open_question_that_left_the_pins_comes_back_with_a_click() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
         app.width = 80;
@@ -39231,9 +39140,10 @@ mod tests {
         let key = ask.key();
         app.commit_ask(&ask);
         app.asks.push(ask);
-        // It left the pins: the person wrote past it in the task's window.
-        app.settle(&key, asks::State::Aside);
+        // It left the pins still open, its task done: its card stays open.
+        app.settle(&key, asks::State::Open);
         assert!(app.asking().is_none());
+        assert_eq!(app.card_state(&app.cards[&key].1), asks::State::Open);
         app.press(&format!("card/{key}")).await;
         assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
         app.pin_task_asks();
@@ -39245,10 +39155,11 @@ mod tests {
         assert!(app.watched.contains_key(&key));
     }
 
-    /// A task's question set aside is watched: once its task writes on and
-    /// has withdrawn it, its card in the lead's window says so.
+    /// A task's question that left the pins still open is watched: once
+    /// its task writes on and has withdrawn it, its card in the lead's
+    /// window says so.
     #[tokio::test]
-    async fn a_tasks_question_set_aside_follows_what_its_task_does_after() {
+    async fn a_tasks_open_question_off_the_pins_follows_what_its_task_does_after() {
         let arguments = json!({"question": "Signed in?", "why": "w", "command": "gh auth login"});
         let asked = arguments.clone();
         let client = daemon_answering(move |request| match request["op"].as_str() {
@@ -39278,7 +39189,7 @@ mod tests {
         });
         let key = ask.key();
         app.commit_ask(&ask);
-        app.settle(&key, asks::State::Aside);
+        app.settle(&key, asks::State::Open);
         assert!(app.watched.contains_key(&key));
         app.settle_task_asks_through().await;
         assert!(
@@ -39777,7 +39688,7 @@ mod tests {
         let lead = json!({"name": "calc.lead"});
         app.resolve(resolved::TOOL, &lead, &closed("calc.lead"), Some(12), true);
         assert!(app.asks.is_empty());
-        assert_eq!(app.aside.len(), 1);
+        assert_eq!(app.unpinned.len(), 1);
         // Closing another sets none aside, nor does itself among others,
         // which the daemon refuses: what the output says it closed counts.
         app.asked("q2", Some(13), &json!({"question": "Ship it?"}));
@@ -39792,18 +39703,18 @@ mod tests {
         // questions aside too, once while it stays closed.
         app.bot = "web.lead".into();
         app.project = Some("web".into());
-        app.aside.clear();
+        app.unpinned.clear();
         app.done_elsewhere();
-        assert_eq!(app.asks.len(), 1, "open: nothing set aside");
+        assert_eq!(app.asks.len(), 1, "open: nothing unpinned");
         app.daemon(json!({"event": "closed", "bot": "web.lead", "data": {}}))
             .await;
         app.done_elsewhere();
         assert!(app.asks.is_empty());
-        assert_eq!(app.aside.len(), 1);
+        assert_eq!(app.unpinned.len(), 1);
     }
 
     #[tokio::test]
-    async fn a_resolved_tasks_old_question_stays_set_aside_after_a_restart() {
+    async fn a_resolved_tasks_old_question_waits_on_nobody_after_a_restart() {
         // The lead closed it after the turn that asked.
         let (client, events) = project_waiting_closed(Some("calc.ask")).await;
         let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
@@ -39852,7 +39763,7 @@ mod tests {
         let asking = |fleet: &Fleet| fleet.needs.asks().any(|(bot, _)| bot == "calc.new");
         assert!(asking(&fleet));
         // Closed by the person, its history unmoved: done, its question
-        // set aside at once.
+        // waits on nobody at once.
         fleet.event(&json!({"event": "closed", "bot": "calc.new", "data": {}}));
         assert!(!asking(&fleet));
         assert_ne!(fleet.doing["calc.new"], "needs you");
@@ -39874,8 +39785,8 @@ mod tests {
         );
         fleet.event(&event("accepted", 3, json!({})));
         assert_eq!(
-            fleet.doing["calc.new"], "working",
-            "the person wrote past it"
+            fleet.doing["calc.new"], "needs you",
+            "the person's words leave its question open"
         );
         let ask = json!({"name": "ask", "call_id": "q2", "arguments": "{}"});
         fleet.event(&event("tool_started", 3, ask));
@@ -39888,11 +39799,14 @@ mod tests {
         assert_eq!(fleet.ended.get("calc.new"), Some(&3));
         fleet.rescan_through().await;
         assert_eq!(fleet.doing["calc.new"], "needs you");
-        // The person's words steered into a turn running then answer it,
-        // as the fleet follows steers too.
+        // The person's words steered into a turn running then may answer
+        // it, as the fleet follows steers too: its history, read at once,
+        // says they did not.
         assert!(FLEET_KINDS.contains(&"steered"));
         fleet.event(&event("steered", 4, json!({"message": 5})));
-        assert_eq!(fleet.doing["calc.new"], "idle");
+        assert_eq!(fleet.doing["calc.new"], "needs you");
+        fleet.rescan_through().await;
+        assert_eq!(fleet.doing["calc.new"], "needs you");
     }
 
     /// A question a task asked and goes on working past is read as its
@@ -44285,8 +44199,65 @@ mod tests {
         assert!(quiet_message(told));
     }
 
+    /// A question drawn from a page read later, answered or closed on no
+    /// page read since, is open: pinned where its turn puts it, or, its
+    /// agent closed, left out of the composer, its card open and a click
+    /// pinning it again.
     #[tokio::test]
-    async fn words_past_its_questions_tell_the_agent_each_set_aside_once() {
+    async fn an_open_question_from_an_older_page_is_pinned_where_it_was_asked() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.width = 80;
+        let question = |words: &str| {
+            json!({"question": words, "options": [{"label": "Yes", "explanation": "e"},
+                {"label": "No", "explanation": "e"}]})
+        };
+        app.commit_call("c2", Some(5), asks::TOOL, &question("Tag it?"), "{}", false);
+        app.asked("c2", Some(5), &question("Tag it?"));
+        // Older, open: pinned before the one asked later.
+        app.commit_call(
+            "c1",
+            Some(2),
+            asks::TOOL,
+            &question("Bump it?"),
+            "{}",
+            false,
+        );
+        app.pin_unless_settled(&asks::id(2, "c1"));
+        let pinned: Vec<&str> = app.asks.iter().map(|ask| ask.id.as_str()).collect();
+        assert_eq!(pinned, ["ask:2/c1", "ask:5/c2"]);
+        // Answered on a newer page: settled, pinned nowhere.
+        app.settle(&asks::id(1, "c0"), asks::State::Answered("Yes".into()));
+        app.commit_call(
+            "c0",
+            Some(1),
+            asks::TOOL,
+            &question("Ship it?"),
+            "{}",
+            false,
+        );
+        app.pin_unless_settled(&asks::id(1, "c0"));
+        assert_eq!(app.asks.len(), 2);
+        // Its agent closed, done: open, out of the composer; a click pins it.
+        app.own_closed = true;
+        app.commit_call(
+            "c9",
+            Some(1),
+            asks::TOOL,
+            &question("Rename it?"),
+            "{}",
+            false,
+        );
+        app.pin_unless_settled(&asks::id(1, "c9"));
+        assert_eq!(app.asks.len(), 2);
+        let card = app.cards[&asks::id(1, "c9")].1.clone();
+        assert_eq!(app.card_state(&card), asks::State::Open);
+        app.press(&format!("card/{}", asks::id(1, "c9"))).await;
+        assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("ask:1/c9"));
+        assert!(app.unpinned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn words_of_the_persons_own_go_alone_and_leave_every_card_open() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
         let client = daemon_answering(move |asked| {
@@ -44307,50 +44278,28 @@ mod tests {
             bot: "b.fix".into(),
             name: "fix".into(),
         });
-        app.asks = vec![ask("c1", "Keep the old API?\nIt has two users."), tasks];
+        let open = vec![ask("c1", "Keep the old API?\nIt has two users."), tasks];
+        app.asks = open.clone();
+        app.chatting = true;
         app.send_now("Meanwhile, why so slow?".into(), (false, false))
             .await
             .unwrap();
+        app.answered("Meanwhile, why so slow?", None);
         app.send_now("And the tests?".into(), (false, false))
             .await
             .unwrap();
+        app.answered("And the tests?", None);
+        // Each goes as the person wrote it, alone: nothing is attached.
         let sent = sent.lock().unwrap();
-        // Told first, attached, by Sonny; its task's question waits still.
-        assert_eq!(sent[0]["delivery"], "attach");
-        assert_eq!(sent[0]["origin"], asks::ASIDE_ORIGIN);
-        let told = sent[0]["prompt"].as_str().unwrap();
-        assert_eq!(
-            told,
-            "Your question \"Keep the old API?\" (ask:3/c1) is now set aside: the person \
-             wrote past it; a pick still answers it."
-        );
-        assert!(quiet_message(told));
-        assert!(!asks::moves_on(told, None));
-        assert_eq!(sent[1]["prompt"], "Meanwhile, why so slow?");
-        // Told once, though the first message has not landed yet.
-        assert_eq!(sent.len(), 3);
-        assert_eq!(sent[2]["prompt"], "And the tests?");
-    }
-
-    #[tokio::test]
-    async fn an_answer_or_a_shell_line_tells_the_agent_nothing_set_aside() {
-        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = sent.clone();
-        let client = daemon_answering(move |asked| {
-            if asked["op"] == "submit" {
-                seen.lock().unwrap().push(asked.clone());
-            }
-            json!({"message": 12, "turn": 12})
-        })
-        .await;
-        let mut app = app(client);
-        let mut ask = asks::call("c1", &json!({"question": "Keep it?"})).unwrap();
-        ask.id = asks::id(3, "c1");
-        app.asks = vec![ask.clone()];
-        assert_eq!(app.tell_aside(&asks::answer(&ask, "yes"), None), None);
-        assert_eq!(app.tell_aside("ls", Some(SHELL)), None);
-        assert_eq!(app.tell_aside(&reactions::message("👍", None), None), None);
-        assert!(app.tell_aside("Meanwhile, why so slow?", None).is_some());
+        let prompts: Vec<&str> = sent.iter().filter_map(|s| s["prompt"].as_str()).collect();
+        assert_eq!(prompts, ["Meanwhile, why so slow?", "And the tests?"]);
+        assert!(sent.iter().all(|s| s["delivery"] != "attach"));
+        // Every card stays open, pinned and counted.
+        assert_eq!(app.asks, open);
+        assert!(app.unpinned.is_empty());
+        for ask in &open {
+            assert_eq!(app.card_state(ask), asks::State::Open);
+        }
     }
 
     #[tokio::test]
