@@ -2102,6 +2102,14 @@ pub fn unseen(c: char) -> bool {
         )
 }
 
+/// Whether `words` show nothing: only whitespace, as Codex draws no such
+/// reply, or zero-width spaces and other characters that show nothing
+/// ([`unseen`]), which models send for an empty reply. The one test of
+/// whether an agent's reply said anything, wherever Sonny asks it.
+pub fn blank(words: &str) -> bool {
+    words.chars().all(unseen)
+}
+
 /// Whether a reply's `rows` show nothing past the two columns each opens
 /// with: what an HTML comment, or characters that show nothing, draw. Such
 /// a reply is no reply, as an empty one is: no `↳` or `└` hangs on nothing.
