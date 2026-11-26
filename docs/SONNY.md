@@ -1677,7 +1677,7 @@ Scripts are never approved as a black box—every tool call inside `exec` goes t
 
 | `approval_mode` | When it asks the agent's gate |
 | --- | --- |
-| `auto` *(default)* | Tools marked `destructiveHint` (unless also `readOnlyHint`) |
+| `auto` *(default)* | Every tool except `readOnlyHint`, unless it marks both `destructiveHint` and `openWorldHint` false (a hint left out counts as true) |
 | `writes` | Every tool except `readOnlyHint` |
 | `prompt` | Every call |
 | `approve` | Never asks |
@@ -1810,9 +1810,11 @@ interrupts, stops its script and the calls it has in flight.
 
 As in Codex, a script is not approved as a whole: each call it makes is
 checked on its own, by its server's `approval_mode`, Codex's names and
-rule. `auto`, the default, asks first for a call of a tool the server marks
-destructive (`destructiveHint`) unless it also marks it read-only
-(`readOnlyHint`, which wins), and runs the rest; `writes` asks for every
+rule. `auto`, the default, runs a call of a tool the server marks
+read-only (`readOnlyHint`, which wins) or marks both as destroying nothing
+(`destructiveHint` false) and keeping to a closed world (`openWorldHint`
+false), and asks first for the rest, so a tool that says nothing of itself
+asks, as one that sends mail does; `writes` asks for every
 call but a read-only tool's; `prompt` asks for every call; `approve` never
 asks. Asking puts the call to the agent's own gate, through the daemon's
 `approve_step`: in `full` nothing waits, in `auto` the reviewer decides it, in

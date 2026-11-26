@@ -2060,9 +2060,11 @@ Renders every agent on the daemon as a live constellation (you at the center, le
   tool: a script that calls many tools at once and returns only what it
   prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
   ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)). As in Codex, each call
-  a script makes is approved on its own: a tool its server marks
-  destructive, and not read-only, waits for the agent's verdict
-  (`/permissions`), unless the server's `approval_mode` says otherwise.
+  a script makes is approved on its own: a tool its server does not mark
+  read-only waits for the agent's verdict (`/permissions`), unless the
+  server marks it as destroying nothing and keeping to a closed world, or
+  its `approval_mode` says otherwise; a tool that says nothing of itself
+  waits.
 
   ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
 

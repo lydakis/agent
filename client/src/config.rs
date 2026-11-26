@@ -1294,9 +1294,11 @@ impl McpServer {
 }
 
 /// When a script's call of an MCP tool asks the agent's gate first, under
-/// Codex's names: `auto` when the tool says it is destructive and not that
-/// it only reads, `writes` unless it says it only reads, `prompt` always,
-/// `approve` never. An agent under no gate never asks.
+/// Codex's names and rule: `auto` unless the tool says it only reads, and
+/// then only when it says neither that it destroys nothing nor that it
+/// keeps to a closed world (a hint it leaves out counts as yes, so a tool
+/// that says nothing asks), `writes` unless it says it only reads, `prompt`
+/// always, `approve` never. An agent under no gate never asks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ApprovalMode {
     #[default]
@@ -1317,12 +1319,15 @@ impl ApprovalMode {
         }
     }
 
-    /// Whether a call of a tool with these MCP annotations asks first. A
-    /// read-only hint wins over a destructive one, as in Codex.
+    /// Whether a call of a tool with these MCP annotations asks first, as
+    /// Codex's `requires_mcp_tool_approval_for_mode` decides it: a
+    /// read-only hint wins over the others, and under `auto` a destructive
+    /// or open-world hint left out counts as true.
     pub fn asks(self, annotations: &serde_json::Value) -> bool {
-        let reads = annotations["readOnlyHint"] == true;
+        let reads = annotations["readOnlyHint"].as_bool().unwrap_or(false);
+        let says = |hint: &str| annotations[hint].as_bool().unwrap_or(true);
         match self {
-            Self::Auto => annotations["destructiveHint"] == true && !reads,
+            Self::Auto => !reads && (says("destructiveHint") || says("openWorldHint")),
             Self::Writes => !reads,
             Self::Prompt => true,
             Self::Approve => false,
@@ -3512,17 +3517,32 @@ mod tests {
             (chat.approval_mode("post"), chat.approval_mode("search")),
             (ApprovalMode::Prompt, ApprovalMode::Writes)
         );
-        // Codex's rule: a read-only hint wins over a destructive one.
-        let hints = |read: bool, destructive: bool| serde_json::json!({"readOnlyHint": read, "destructiveHint": destructive});
+        // Codex's rule: a read-only hint wins over the others, and under
+        // `auto` a destructive or open-world hint left out counts as true.
+        let hints = |read: bool, destructive: bool, open: bool| serde_json::json!({"readOnlyHint": read, "destructiveHint": destructive, "openWorldHint": open});
         let asks = |mode: ApprovalMode| {
-            [hints(false, false), hints(false, true), hints(true, true)]
-                .map(|annotations| mode.asks(&annotations))
+            [
+                hints(false, false, false),
+                hints(false, true, false),
+                hints(false, false, true),
+                hints(true, true, true),
+            ]
+            .map(|annotations| mode.asks(&annotations))
         };
-        assert_eq!(asks(ApprovalMode::Auto), [false, true, false]);
-        assert_eq!(asks(ApprovalMode::Writes), [true, true, false]);
-        assert_eq!(asks(ApprovalMode::Prompt), [true, true, true]);
-        assert_eq!(asks(ApprovalMode::Approve), [false, false, false]);
-        assert!(!ApprovalMode::Auto.asks(&serde_json::Value::Null));
+        assert_eq!(asks(ApprovalMode::Auto), [false, true, true, false]);
+        assert_eq!(asks(ApprovalMode::Writes), [true, true, true, false]);
+        assert_eq!(asks(ApprovalMode::Prompt), [true, true, true, true]);
+        assert_eq!(asks(ApprovalMode::Approve), [false, false, false, false]);
+        // A tool that says nothing of itself asks, as in Codex; one that
+        // says only that it destroys nothing still reaches the open world.
+        let auto = |annotations: serde_json::Value| ApprovalMode::Auto.asks(&annotations);
+        assert!(auto(serde_json::Value::Null));
+        assert!(auto(serde_json::json!({"destructiveHint": false})));
+        assert!(auto(serde_json::json!({"openWorldHint": false})));
+        assert!(!auto(
+            serde_json::json!({"destructiveHint": false, "openWorldHint": false})
+        ));
+        assert!(!auto(serde_json::json!({"readOnlyHint": true})));
         for (text, error) in [
             (
                 "[sonny.mcp_servers.x]\nenabled = true",
