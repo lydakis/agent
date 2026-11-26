@@ -191,7 +191,12 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(held['data']['blocked']['code'], 'provider_unavailable')
         view = client.request('messages', bot='Cancelled', after=active['Cancelled'])['result']['messages'][0]
         self.assertEqual((view['status'], view['waiting_on']['blocked']['code']), ('ready', 'provider_unavailable'))
-        self.assertEqual(client.request('inspect', bot='Cancelled')['result']['head'], head)
+        # The interrupt leaves its note after the stopped turn, and nothing more.
+        noted = client.request('inspect', bot='Cancelled')['result']['head']
+        read = client.request('history_items', bot='Cancelled', nodes=[noted])['result']['items'][0]
+        self.assertTrue(read.get('stop_note'), read)
+        listed = client.request('history_nodes', bot='Cancelled', limit=2)['result']['nodes']
+        self.assertEqual([n['node'] for n in listed], [noted, head])
         client.request('interrupt', bot='Cancelled', turn=steers['Cancelled'])
         self.assertEqual(client.finished(steers['Cancelled'])['data']['status'], 'withdrawn')
         self.model.release_headers.set()
