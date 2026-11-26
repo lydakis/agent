@@ -1318,19 +1318,16 @@ pub(crate) mod tests {
     #[test]
     fn the_arrows_pass_from_the_head_s_links_to_a_post_s_and_enter_follows_the_one_picked() {
         let home = &commons("post-links");
-        // Sent twice: the first shows the lead the posts it missed.
-        for _ in 0..2 {
-            crate::commons::call(
-                home,
-                "shop.lead",
-                None,
-                "shop.lead",
-                None,
-                Some("shop"),
-                &json!({"reply": {"thread": "api", "text": "See [the spec](https://spec.example/errors)."}}),
-            )
-            .unwrap();
-        }
+        crate::commons::call(
+            home,
+            "shop.lead",
+            None,
+            "shop.lead",
+            None,
+            Some("shop"),
+            &json!({"reply": {"thread": "api", "text": "See [the spec](https://spec.example/errors)."}}),
+        )
+        .unwrap();
         let mut view = View::open(home, "shop".into());
         press(&mut view, KeyCode::Down);
         press(&mut view, KeyCode::Enter);

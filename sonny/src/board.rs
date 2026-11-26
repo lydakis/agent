@@ -1078,36 +1078,33 @@ pub fn reply(
     // leaves the work stuck where it stands.
     let moves = action.is_some();
     let mut said = commons::add_locked(dir, thread, &post, caller.reader, !moves)?;
-    if said["posted"] != false {
-        let mut after = posts;
-        after.push(post);
-        let work = standing(&after).unwrap_or_default();
-        // What the work it needed made, so its taker starts from it.
-        if answer_needs {
-            let made: Vec<Value> = (work["needs"].as_array().into_iter().flatten())
-                .filter_map(Value::as_str)
-                .filter_map(|need| {
-                    let (_, it) = items.iter().find(|(name, _)| name == need)?;
-                    let it = &it["work"];
-                    let mut made =
-                        json!({"thread": need, "by": it["holder"], "result": it["result"]});
-                    for key in MADE.into_iter().filter(|key| !it[*key].is_null()) {
-                        made[key] = it[key].clone();
-                    }
-                    Some(made)
-                })
-                .collect();
-            if !made.is_empty() {
-                said["needs_made"] = json!(made);
-            }
+    let mut after = posts;
+    after.push(post);
+    let work = standing(&after).unwrap_or_default();
+    // What the work it needed made, so its taker starts from it.
+    if answer_needs {
+        let made: Vec<Value> = (work["needs"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .filter_map(|need| {
+                let (_, it) = items.iter().find(|(name, _)| name == need)?;
+                let it = &it["work"];
+                let mut made = json!({"thread": need, "by": it["holder"], "result": it["result"]});
+                for key in MADE.into_iter().filter(|key| !it[*key].is_null()) {
+                    made[key] = it[key].clone();
+                }
+                Some(made)
+            })
+            .collect();
+        if !made.is_empty() {
+            said["needs_made"] = json!(made);
         }
-        said["work"] = shown(dir, work);
-        if let Some(from) = dropped_from {
-            said["dropped_from"] = from;
-        }
-        if !ask_for.is_empty() {
-            said[ASK_FOR] = json!(ask_for);
-        }
+    }
+    said["work"] = shown(dir, work);
+    if let Some(from) = dropped_from {
+        said["dropped_from"] = from;
+    }
+    if !ask_for.is_empty() {
+        said[ASK_FOR] = json!(ask_for);
     }
     Ok(said)
 }
@@ -1786,7 +1783,7 @@ mod tests {
     }
 
     #[test]
-    fn a_step_after_posts_its_agent_missed_waits_once_as_a_reply_does() {
+    fn a_step_after_posts_its_agent_missed_posts_at_once_as_a_reply_does() {
         let home = home("missed");
         send(
             &home,
@@ -1807,11 +1804,10 @@ mod tests {
             lead: false,
             folder: None,
         };
-        // Never shown the work's post: held once, then taken.
-        let held = commons::call_as(&home, &caller, &act("store", "take"), &|_, _| false).unwrap();
-        assert_eq!(held["posted"], false);
+        // Never shown the work's post: taken at once, with the post.
         let taken = commons::call_as(&home, &caller, &act("store", "take"), &|_, _| false).unwrap();
         assert_eq!(taken["work"]["holder"], "shop.w1");
+        assert_eq!(taken["missed"]["posts"][0]["by"], "shop.lead");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1919,17 +1915,17 @@ mod tests {
         let news = commons::news(&home, &cursor);
         let line: Value = serde_json::from_str(&news.lines[2]).unwrap();
         assert_eq!(line["text"], "pause in store, \"Type the store errors\"");
-        // A step with words still waits once for what its agent missed.
+        // A step with words posts at once too, and shows what it missed.
         w1(json!({"reply": {"thread": "store", "text": "Sure."}})).unwrap();
         let worded = unread(
             "shop.lead",
             json!({"reply": {"thread": "store", "do": "open", "text": "Go."}}),
         )
         .unwrap();
-        assert_eq!(worded["posted"], false, "{worded}");
-        assert_eq!(worded["work"]["state"], "paused", "{worded}");
+        assert!(worded["posted"].is_null(), "{worded}");
+        assert_eq!(worded["work"]["state"], "open", "{worded}");
+        assert_eq!(worded["missed"]["posts"][0]["text"], "Sure.", "{worded}");
         // Fields alone are a step too.
-        lead(json!({"reply": {"thread": "store", "do": "open", "text": "Go."}})).unwrap();
         w1(json!({"reply": {"thread": "store", "text": "Taking it."}})).unwrap();
         let labeled = unread(
             "shop.lead",
