@@ -205,8 +205,9 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
 
 /// [`scan`], going on from what was read before (`was`): only the nodes
 /// written since are read, and while none of them asks, closes or answers
-/// a question, the question is the one read before and the newest turn
-/// says whether it resolved it. Anything
+/// a question, nor sets aside one asked before cards stayed open, the
+/// question is the one read before and the newest turn says whether it
+/// resolved it. Anything
 /// else, or more nodes than one scan reads, is read whole again.
 pub async fn scan_since(client: &Client, bot: &str, last: Option<i64>, was: &Seen) -> Option<Seen> {
     let Some(through) = was.through else {
@@ -243,10 +244,13 @@ pub async fn scan_since(client: &Client, bot: &str, last: Option<i64>, was: &See
     // The call that asked what was open, whose output, should it come
     // late, may say it failed.
     let open = (was.ask.as_ref()).and_then(|ask| ask.id.rsplit_once('/').map(|(_, call)| call));
+    // Asked before cards stayed open, it is set aside by the person's own
+    // words since.
+    let asked_before = (was.ask.as_ref()).is_some_and(|ask| !ask.stays_open);
     for (node, item) in read {
         let of_open = item["type"] == "function_call_output"
             && open.is_some_and(|call| item["call_id"] == call);
-        if answers(&item) || asks(&item) || of_open {
+        if answers(&item) || asks(&item) || of_open || (asked_before && moves_on(&item)) {
             return scan(client, bot, last).await;
         }
         if in_last.contains(&node) {
@@ -268,6 +272,12 @@ pub async fn scan_since(client: &Client, bot: &str, last: Option<i64>, was: &See
 fn answers(item: &Value) -> bool {
     item["role"] == "user"
         && crate::asks::answer_of(&crate::text(item), item["from"].as_str()).is_some()
+}
+
+/// Whether `item` is the person's own words, which set aside a question
+/// asked before cards stayed open ([`crate::asks::moves_on`]).
+fn moves_on(item: &Value) -> bool {
+    item["role"] == "user" && crate::asks::moves_on(&crate::text(item), item["from"].as_str())
 }
 
 /// Whether `item` asks a question or closes one.

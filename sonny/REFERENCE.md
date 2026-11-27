@@ -835,7 +835,9 @@ it recommends; the
 pick goes to the lead as your answer, as a click on its card in Sonny's
 window does, once whichever window answers first. Questions still open when
 a thread reopens come again: a question stays open until you pick or the
-lead closes it, as in the window. One you dismiss stays open. The turns the lead takes on its own, as when the lookout
+lead closes it, as in the window. One you dismiss stays open. One asked
+before questions stayed open, that your own words went past, was set aside
+then and stays so: it does not come again, and a pick still answers it. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
 the agent started (the protocol's version 2 draft, which T3 Code speaks).
 Each task the lead starts opens as a T3 Code thread with the task's brief as

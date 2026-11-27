@@ -1576,6 +1576,7 @@ mod tests {
             deadline: None,
             covers: None,
             task: None,
+            stays_open: true,
         };
         let chain = |bots: &[&str]| bots.iter().map(|bot| (*bot).to_owned()).collect();
         let shared = Shared {

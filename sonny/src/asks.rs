@@ -79,6 +79,24 @@ pub struct Ask {
     /// goes to the task, the same answer to the same ask its own window
     /// sends.
     pub task: Option<Asker>,
+    /// Whether it was asked under the rule that a card stays open until a
+    /// pick or the agent's close, as its call's result says
+    /// ([`STAYS_OPEN`]). One asked before that rule was settled, as every
+    /// window showed it then, by the person's own words after it
+    /// ([`State::Aside`]), and is read so still. One whose result is not
+    /// read yet is asked under the rule of now.
+    #[serde(default = "stays_open")]
+    pub stays_open: bool,
+}
+
+/// What an ask's result says it was asked under, from the release on
+/// that keeps a card open until a pick or a close: an ask's result
+/// without it was asked before, under the rule that the person's own
+/// words after it set it aside.
+pub const STAYS_OPEN: &str = "stays_open";
+
+fn stays_open() -> bool {
+    true
 }
 
 impl Ask {
@@ -109,11 +127,16 @@ pub enum State {
     Recorded { option: Option<usize>, note: String },
     /// The agent took it back as no longer needed, and why.
     Withdrawn(String),
+    /// Asked before cards stayed open until a pick or a close
+    /// ([`Ask::stays_open`]), the person wrote words of their own past it:
+    /// set aside then, as every window showed it, and so it stays. A pick
+    /// still answers it.
+    Aside,
 }
 
 impl State {
-    /// Whether it is answered or closed: its card folds, and it waits on
-    /// nobody.
+    /// Whether it is answered, closed or set aside: its card folds, and
+    /// it waits on nobody.
     pub fn settled(&self) -> bool {
         *self != Self::Open
     }
@@ -453,6 +476,7 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         deadline: None,
         covers: Covers::of(&arguments["covers"]),
         task: None,
+        stays_open: true,
     })
 }
 
@@ -466,7 +490,29 @@ pub fn settled(mut ask: Ask, output: &str) -> Ask {
         ask.unanswered = Some(plan);
     }
     ask.deadline = said["deadline_s"].as_i64();
+    ask.stays_open = said[STAYS_OPEN] == true;
     ask
+}
+
+/// Whether a call's kept result `output` says its ask was asked under the
+/// rule that a card stays open until a pick or a close ([`STAYS_OPEN`]):
+/// only an ask's result is read so, once its call is known to be one.
+pub fn says_stays_open(output: &str) -> bool {
+    output.contains(STAYS_OPEN)
+        && serde_json::from_str::<Value>(output).is_ok_and(|said| said[STAYS_OPEN] == true)
+}
+
+/// Whether a message is the person's own words, answering no question:
+/// not another agent's or a client's, nor a reaction, a note taken away
+/// or what they ran. Before cards stayed open until a pick or a close,
+/// such words set aside every question asked before them; an ask asked
+/// then is read so still ([`Ask::stays_open`]).
+pub fn moves_on(text: &str, from: Option<&str>) -> bool {
+    answered(text).is_none()
+        && !crate::transcript::relays(text, from)
+        && !crate::reactions::is_reaction(text)
+        && crate::margin::closed(text).is_none()
+        && crate::user_shell::read(text).is_none()
 }
 
 /// The oldest question still open among `bot`'s `items`, newest first,
@@ -474,7 +520,8 @@ pub fn settled(mut ask: Ask, output: &str) -> Ask {
 /// `turn` each call is marked with: an `ask` call that was
 /// taken, with no answer to it after, as the pinned questions are closed:
 /// by the person's `You asked` message naming that ask, one answer to one
-/// ask, or by the agent's close. Words of the person's own close none.
+/// ask, or by the agent's close. Words of the person's own close none,
+/// but set aside one asked before cards stayed open ([`Ask::stays_open`]).
 /// Asks are told apart by turn and call, never by wording: two asking the
 /// same question are two decisions.
 pub fn open(items: &[Value]) -> Option<Ask> {
@@ -482,12 +529,16 @@ pub fn open(items: &[Value]) -> Option<Ask> {
     // Each call's result, by turn and call, as provider IDs repeat across
     // turns: what Sonny took an ask as, its plan and deadline, is there.
     let mut results: Vec<((Value, Value), String)> = Vec::new();
+    // The person wrote words of their own after what is read now.
+    let mut moved_on = false;
     for item in items {
         let at = (item["turn"].clone(), item["call_id"].clone());
-        if item["role"] == "user"
-            && let Some(call) = answer_of(&crate::text(item), item["from"].as_str())
-        {
-            answers.push(call.to_owned());
+        if item["role"] == "user" {
+            let (text, from) = (crate::text(item), item["from"].as_str());
+            match answer_of(&text, from) {
+                Some(call) => answers.push(call.to_owned()),
+                None => moved_on |= moves_on(&text, from),
+            }
         }
         if item["type"] == "function_call_output" {
             match item["failed"] == true || crate::reactions::refused(item) {
@@ -524,7 +575,11 @@ pub fn open(items: &[Value]) -> Option<Ask> {
                     if let Some((_, said)) = results.iter().find(|(of, _)| *of == at) {
                         ask = settled(ask, said);
                     }
-                    open = Some(ask);
+                    // Asked before cards stayed open, the person's words
+                    // after it set it aside then.
+                    if ask.stays_open || !moved_on {
+                        open = Some(ask);
+                    }
                 }
             }
         }
@@ -762,6 +817,7 @@ pub fn card(ask: &Ask, state: &State, folded: bool, width: usize) -> Card {
             (Span::raw(TICK).fg(Color::Green), Style::new())
         }
         State::Withdrawn(_) => (Span::raw(DASH).dim(), Style::new()),
+        State::Aside => (Span::raw(GLYPH).dim(), Style::new()),
     };
     rows.extend(markdown(
         &ask.question,
@@ -870,6 +926,9 @@ fn stands(ask: &Ask, state: &State) -> Option<Vec<Span<'static>>> {
     Some(match state {
         State::Open => return None,
         State::Answered(answer) => vec![muted("Answered · "), plain(answer)],
+        State::Aside => vec![muted(
+            "Set aside: you wrote past it. A pick still answers it.",
+        )],
         State::Recorded { option, note } => {
             let label = "Answered in your words";
             match option.and_then(|at| ask.options.get(at)) {
@@ -1100,7 +1159,7 @@ pub fn served(
     };
     Ok(
         json!({"id": ask.id, "if_unanswered": plan.name(), "deadline_s": deadline,
-        "deadline": when, "deadline_error": unset, "next": next})
+        "deadline": when, "deadline_error": unset, STAYS_OPEN: true, "next": next})
         .to_string(),
     )
 }
@@ -1336,7 +1395,8 @@ pub fn reminder(gate: &str, when: &str, message: &str) -> Option<Reminder> {
 
 /// Where an ask stands, read from its agent's history newest first, one
 /// entry at a time, back to the call that asked it, as [`open`] reads it:
-/// answered by the person, closed by the agent, or open.
+/// answered by the person, closed by the agent, set aside by the person's
+/// own words after it when asked before cards stayed open, or open.
 #[derive(Default)]
 struct Standing {
     /// The person's answers after the call, by ask, newest first.
@@ -1351,6 +1411,11 @@ struct Standing {
     /// The calls that failed or were refused whose call is not read yet,
     /// by turn and call, let go the same way.
     refused: Vec<(i64, Value)>,
+    /// Of `taken`, those whose result says its ask stays open until a
+    /// pick or a close ([`says_stays_open`]), let go the same way.
+    marked: Vec<(i64, Value)>,
+    /// The person wrote words of their own after what is read now.
+    moved_on: bool,
     /// The one ask read for, when only its answers and closes are kept,
     /// so a long history costs no more than that ask's.
     wanted: Option<String>,
@@ -1375,8 +1440,8 @@ impl Standing {
         if at != turn {
             return None;
         }
-        let (made, came) = (items.iter())
-            .find(|(item, _)| item["type"] == "function_call" && item["call_id"] == call)?;
+        let (made, came, stays_open) = (items.iter())
+            .find(|(item, ..)| item["type"] == "function_call" && item["call_id"] == call)?;
         let asked = id(turn, call);
         // A call that failed or was refused put no question, as no card
         // shows one: its deadline, set as it was answered, has nothing
@@ -1385,16 +1450,18 @@ impl Standing {
             .filter(|_| *came != Came::Refused)
             .and_then(|a| serde_json::from_str::<Value>(a).ok())
             .and_then(|arguments| self::call(&asked, &arguments));
-        Some(ask.map(|ask| {
-            let state = self.state(&asked);
+        Some(ask.map(|mut ask| {
+            ask.stays_open = *stays_open;
+            let state = self.state(&asked, *stays_open);
             (ask, state)
         }))
     }
 
     /// Takes in what `entry`, of turn `at`, says of the asks before it:
-    /// answers, closes and results. Its calls,
-    /// each with what came of it.
-    fn read(&mut self, at: i64, entry: &Value) -> Vec<(Value, Came)> {
+    /// answers, closes, results and the person's own words. Its calls,
+    /// each with what came of it and whether its result says its ask
+    /// stays open until a pick or a close (one not taken yet does).
+    fn read(&mut self, at: i64, entry: &Value) -> Vec<(Value, Came, bool)> {
         let items = crate::responses(&entry["item"]);
         let mut read = Vec::with_capacity(items.len());
         let wanted = |of: &str| self.wanted.as_deref().is_none_or(|wanted| wanted == of);
@@ -1406,7 +1473,12 @@ impl Standing {
             let made = (at, item["call_id"].clone());
             match item["failed"] == true || crate::reactions::refused(item) {
                 true => self.refused.push(made),
-                false => self.taken.push(made),
+                false => {
+                    if item["output"].as_str().is_some_and(says_stays_open) {
+                        self.marked.push(made.clone());
+                    }
+                    self.taken.push(made)
+                }
             }
         }
         let mut closes = Vec::new();
@@ -1422,7 +1494,14 @@ impl Standing {
                     came = so;
                 }
             }
-            read.push((item.clone(), came));
+            let stays_open = match self.marked.iter().position(|result| *result == made) {
+                Some(at) => {
+                    self.marked.swap_remove(at);
+                    true
+                }
+                None => came != Came::Taken,
+            };
+            read.push((item.clone(), came, stays_open));
             if let Some((closed, state)) = closed_by(item)
                 && self.skip.as_ref() != Some(&made)
                 && came == Came::Taken
@@ -1434,11 +1513,14 @@ impl Standing {
         self.closes.extend(closes);
         if crate::reactions::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
-            if let (Some(answered), Some((_, answer))) = (answer_of(&text, None), split(&text))
-                && wanted(answered)
-            {
-                self.answers
-                    .push((answered.to_owned(), answer.trim().to_owned()));
+            match (answer_of(&text, None), split(&text)) {
+                (Some(answered), Some((_, answer))) => {
+                    if wanted(answered) {
+                        self.answers
+                            .push((answered.to_owned(), answer.trim().to_owned()));
+                    }
+                }
+                _ => self.moved_on |= moves_on(&text, None),
             }
         }
         read
@@ -1446,14 +1528,17 @@ impl Standing {
 
     /// Where ask `asked` stands by what was read after it. The person's
     /// first answer counts, as the daemon takes only the first, over any
-    /// close; then the agent's first close that was taken.
-    fn state(&self, asked: &str) -> State {
+    /// close; then the agent's first close that was taken; then, for one
+    /// asked before cards stayed open (not `stays_open`), the person's own
+    /// words after it, which set it aside.
+    fn state(&self, asked: &str, stays_open: bool) -> State {
         if let Some((_, answer)) = (self.answers.iter().rev()).find(|(of, _)| of == asked) {
             return State::Answered(answer.clone());
         }
         let closed = (self.closes.iter().rev()).find(|(of, _)| of == asked);
         match closed {
             Some((_, state)) => state.clone(),
+            None if !stays_open && self.moved_on => State::Aside,
             None => State::Open,
         }
     }
@@ -1481,12 +1566,13 @@ impl Asked {
     pub fn entry(&mut self, at: i64, entry: &Value) -> Vec<(Ask, State)> {
         let items = self.0.read(at, entry);
         (items.iter())
-            .filter(|(item, came)| *came == Came::Taken && item["name"] == TOOL)
-            .filter_map(|(item, _)| {
+            .filter(|(item, came, _)| *came == Came::Taken && item["name"] == TOOL)
+            .filter_map(|(item, _, stays_open)| {
                 let asked = id(at, item["call_id"].as_str()?);
                 let arguments = serde_json::from_str::<Value>(item["arguments"].as_str()?).ok()?;
-                let ask = self::call(&asked, &arguments)?;
-                Some((ask, self.0.state(&asked)))
+                let mut ask = self::call(&asked, &arguments)?;
+                ask.stays_open = *stays_open;
+                Some((ask, self.0.state(&asked, *stays_open)))
             })
             .collect()
     }
@@ -1553,7 +1639,7 @@ pub async fn served_close(
         State::Recorded { .. } | State::Withdrawn(_) => {
             Some(format!("closed: {asked} is closed already"))
         }
-        State::Open => None,
+        State::Open | State::Aside => None,
     };
     if let Some(refusal) = settled {
         let (bot, gone) = (bot.to_owned(), asked.clone());
@@ -2615,7 +2701,7 @@ mod tests {
         };
         let taken = |call: &str| {
             json!({"type": "function_call_output", "call_id": call,
-                "output": json!({"id": call}).to_string()})
+                "output": json!({"id": call, STAYS_OPEN: true}).to_string()})
         };
         // Newest first: a fourth not taken yet and a refused third, which
         // put nothing yet; words past the second, which leave it open, an
@@ -2643,6 +2729,94 @@ mod tests {
                 ("ask:2/a1".to_owned(), State::Answered("yes".into()))
             ]
         );
+    }
+
+    /// A question asked before cards stayed open until a pick or a close
+    /// was set aside by the person's own words after it, as every window
+    /// showed it then: every reader reads it so still, and does not raise
+    /// it again. One asked since, its result saying so, stays open past
+    /// their words. Reproduces George's report of 11-27: after the upgrade,
+    /// every old question answered in words came back open.
+    #[test]
+    fn a_question_asked_before_cards_stayed_open_is_set_aside_by_words_after_it() {
+        let result = |stays_open: bool| {
+            let mut said = json!({"id": "ask:2/a1", "if_unanswered": "wait"});
+            if stays_open {
+                said[STAYS_OPEN] = json!(true);
+            }
+            json!({"type": "function_call_output", "call_id": "a1", "turn": 2,
+                "output": said.to_string()})
+        };
+        let asking = json!({"type": "function_call", "name": TOOL, "call_id": "a1", "turn": 2,
+            "arguments": asked(true).to_string()});
+        let words = |text: &str| {
+            json!({"role": "user", "turn": 3,
+                "content": [{"type": "input_text", "text": text}]})
+        };
+        let ask = call(&id(2, "a1"), &asked(true)).unwrap();
+        // The window's question and the count, newest first.
+        let past = |stays_open: bool| {
+            open(&[
+                words("Hold on, ship it Monday"),
+                result(stays_open),
+                asking.clone(),
+            ])
+        };
+        assert_eq!(past(false), None, "set aside, as it was then");
+        assert!(
+            past(true).is_some_and(|open| open.stays_open),
+            "asked since"
+        );
+        assert!(
+            open(&[result(false), asking.clone()]).is_some_and(|open| !open.stays_open),
+            "no words after it: open, as it was then"
+        );
+        // Words of another agent's, a reaction or an answer to it set
+        // nothing aside.
+        let mut relayed = words("Build is green");
+        relayed["from"] = json!("shop.fix");
+        assert!(open(&[relayed, result(false), asking.clone()]).is_some());
+        assert_eq!(
+            open(&[words(&answer(&ask, "Now")), result(false), asking.clone()]),
+            None
+        );
+        // Read whole, as the Slack route and `sonny ask list` read it:
+        // set aside, a pick on it still answering it.
+        let entry = |node: i64, item: &Value| json!({"node": node, "item": item});
+        let person = |text: &str| {
+            json!({"node": 9, "from": null, "origin": null,
+            "item": {"role": "user", "content": [{"type": "input_text", "text": text}]}})
+        };
+        let stands = |stays_open: bool, entries: &[(i64, Value)]| {
+            let mut reading = Asked::default();
+            (entries.iter())
+                .flat_map(|(at, entry)| reading.entry(*at, entry))
+                .map(|(ask, state)| (ask.stays_open, state))
+                .next()
+                .filter(|(read, _)| *read == stays_open)
+                .map(|(_, state)| state)
+        };
+        for stays_open in [false, true] {
+            let entries = [
+                (3, person("Hold on, ship it Monday")),
+                (2, entry(2, &result(stays_open))),
+                (2, entry(1, &asking)),
+            ];
+            let want = match stays_open {
+                false => State::Aside,
+                true => State::Open,
+            };
+            assert_eq!(stands(stays_open, &entries), Some(want));
+            // Its deadline's gate reads it the same way.
+            let mut reading = Standing::default();
+            let found = (entries.iter()).find_map(|(at, entry)| reading.entry(*at, entry, 2, "a1"));
+            assert_eq!(
+                found.flatten().map(|(_, state)| state.settled()),
+                Some(!stays_open)
+            );
+        }
+        // Set aside, a pick still answers it.
+        assert!(State::Aside.settled() && State::Aside.takes_a_pick());
     }
 
     #[test]

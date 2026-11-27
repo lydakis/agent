@@ -6823,6 +6823,15 @@ struct App {
     /// closed, done, as they are out of the count: their cards stay open,
     /// their options answering them, and a click pins one again.
     unpinned: Vec<asks::Ask>,
+    /// Whether the person's own words were drawn here, live or from a page,
+    /// since the conversation was last drawn from the start: a question of
+    /// its own asked before cards stayed open, drawn from an older page,
+    /// is set aside by them ([`asks::Ask::stays_open`]).
+    moved_on: bool,
+    /// Of this agent's questions asked before cards stayed open, those an
+    /// older page being drawn pinned: words of the person's later on that
+    /// page set them aside.
+    page_pinned: Vec<String>,
     /// The questions' cards drawn here, by [`asks::Ask::key`]: the number
     /// their rows are tagged with, the ask, and whether a settled one is
     /// open whole.
@@ -9181,6 +9190,8 @@ impl App {
             asks: Vec::new(),
             focus: None,
             unpinned: Vec::new(),
+            moved_on: false,
+            page_pinned: Vec::new(),
             cards: HashMap::new(),
             card_count: 0,
             cards_kept: 0,
@@ -14060,6 +14071,11 @@ impl App {
         mut page: Option<PageRead>,
     ) -> Vec<(i64, Value)> {
         let short = self.short_read.replace(false);
+        // What an older page pins, words later on it set aside; none of
+        // what a newer page pinned.
+        if older {
+            self.page_pinned.clear();
+        }
         // Read beside the loop already, the page draws without waiting.
         if page.as_ref().is_some_and(|page| page.short) {
             self.short_read.set(true);
@@ -14235,6 +14251,15 @@ impl App {
                                     let id = id.to_owned();
                                     self.settle(&id, asks::State::Answered(answer.trim().into()));
                                 }
+                                // Words of the person's own set aside what
+                                // this page asked before them, before cards
+                                // stayed open, and all it asked before.
+                                if asks::moves_on(&said, item["from"].as_str()) {
+                                    self.moved_on = true;
+                                    for id in std::mem::take(&mut self.page_pinned) {
+                                        self.settle(&id, asks::State::Aside);
+                                    }
+                                }
                             }
                         }
                         self.dated(node, &item);
@@ -14351,9 +14376,10 @@ impl App {
                         }
                         // A card a page read later draws, unless answered or
                         // closed after it, is open, and pinned.
+                        let stays_open = item["output"].as_str().is_some_and(asks::says_stays_open);
                         if older && name == asks::TOOL && !failed {
                             let turn = turns.get(&node).copied();
-                            self.pin_unless_settled(&Self::ask_id(turn, id));
+                            self.pin_unless_settled(&Self::ask_id(turn, id), stays_open);
                         }
                         if older {
                             continue;
@@ -14368,7 +14394,7 @@ impl App {
                             );
                         }
                         if name == asks::TOOL && !failed && !reactions::refused(&item) {
-                            self.asked(id, turns.get(&node).copied(), &arguments);
+                            self.asked(id, turns.get(&node).copied(), &arguments, stays_open);
                         }
                     }
                     _ => {}
@@ -15600,8 +15626,9 @@ impl App {
                     }
                     self.commit_call(id, turn, &name, &arguments, &shown.0, shown.1);
                 }
+                // Asked now, it stays open until a pick or a close.
                 if name == asks::TOOL && !shown.1 {
-                    self.asked(id, turn, &arguments);
+                    self.asked(id, turn, &arguments, true);
                 }
                 if name == asks::CLOSE
                     && !shown.1
@@ -21373,15 +21400,25 @@ impl App {
     /// The card of ask `id`, drawn from a page read later and pinned
     /// nowhere: open unless it was answered or closed after it, and so
     /// pinned where its turn puts it, as a question asked on the page
-    /// first read is; unpinned while this agent is closed.
-    fn pin_unless_settled(&mut self, id: &str) {
+    /// first read is; unpinned while this agent is closed. One asked
+    /// before cards stayed open (not `stays_open`) is set aside instead
+    /// when the person's own words were drawn after it.
+    fn pin_unless_settled(&mut self, id: &str, stays_open: bool) {
         let known = (self.asks.iter().chain(&self.unpinned)).any(|ask| ask.id == id);
         if self.settled.contains_key(id) || known {
             return;
         }
-        let Some((_, ask, _)) = self.cards.get(id).cloned() else {
+        let Some((_, mut ask, _)) = self.cards.get(id).cloned() else {
             return;
         };
+        if !stays_open {
+            if self.moved_on {
+                self.settle(id, asks::State::Aside);
+                return;
+            }
+            ask.stays_open = false;
+            self.page_pinned.push(id.to_owned());
+        }
         if self.own_closed {
             self.unpinned.push(ask);
             return;
@@ -21619,6 +21656,8 @@ impl App {
     fn forget_asks(&mut self) {
         self.asks.clear();
         self.unpinned.clear();
+        self.moved_on = false;
+        self.page_pinned.clear();
         self.sent_answers.clear();
         self.task_asks_read = None;
         self.cards.clear();
@@ -21643,10 +21682,11 @@ impl App {
     /// the one being answered, as Codex's questions take none, nor the
     /// words being typed ([`App::keep_draft`]); with nothing typed after
     /// Esc, none is being answered, and the composer answers it.
-    fn asked(&mut self, id: &str, turn: Option<i64>, arguments: &Value) {
-        if let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
+    fn asked(&mut self, id: &str, turn: Option<i64>, arguments: &Value, stays_open: bool) {
+        if let Some(mut ask) = asks::call(&Self::ask_id(turn, id), arguments)
             && !(self.asks.iter().chain(&self.unpinned)).any(|open| open.id == ask.id)
         {
+            ask.stays_open = stays_open;
             let idle = self.chatting && self.blank();
             self.keep_draft();
             if idle {
@@ -21767,6 +21807,18 @@ impl App {
         {
             let id = id.to_owned();
             self.settle(&id, asks::State::Answered(answer.trim().to_owned()));
+        }
+        // Its own questions asked before cards stayed open, the person's
+        // own words set aside, as they did then.
+        if asks::moves_on(message, from) {
+            self.moved_on = true;
+            let before: Vec<String> = (self.asks.iter().chain(&self.unpinned))
+                .filter(|ask| ask.task.is_none() && !ask.stays_open)
+                .map(asks::Ask::key)
+                .collect();
+            for key in before {
+                self.settle(&key, asks::State::Aside);
+            }
         }
         self.settle_asks();
     }
@@ -32567,7 +32619,7 @@ mod tests {
         // Words typed before the question came stay the person's: nothing
         // names it over them, and sending them answers nothing.
         app.input.set("also rename the crate");
-        app.asked("c0", Some(1), &question);
+        app.asked("c0", Some(1), &question, true);
         assert!(app.asking().is_none());
         assert!(app.answering_over(80).is_none());
         app.submit().await;
@@ -32578,12 +32630,12 @@ mod tests {
         assert_eq!(app.asks.len(), 1);
         assert!(app.asking().is_none());
         // With nothing typed, the next one asked is answered as ever.
-        app.asked("c1", Some(3), &question);
+        app.asked("c1", Some(3), &question, true);
         assert_eq!(app.asking().unwrap().id, "ask:3/c1");
         // One asked while another is being answered takes neither its
         // focus nor what is typed for it.
         app.input.set("not yet");
-        app.asked("c2", Some(3), &json!({"question": "Tag it?"}));
+        app.asked("c2", Some(3), &json!({"question": "Tag it?"}), true);
         assert_eq!(app.asking().unwrap().id, "ask:3/c1");
         app.submit().await;
         app.beside_done().await;
@@ -32601,7 +32653,7 @@ mod tests {
         let mut app = app(daemon_answering(|_| json!({})).await);
         // A quote over the composer is a reply begun before any words.
         app.quote("Merge it?");
-        app.asked("c0", Some(1), &json!({"question": "Bump it?"}));
+        app.asked("c0", Some(1), &json!({"question": "Bump it?"}), true);
         assert!(app.asking().is_none());
         assert!(app.answering_over(80).is_none());
     }
@@ -32618,7 +32670,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.asked("c0", Some(1), &json!({"question": "Bump it?"}));
+        app.asked("c0", Some(1), &json!({"question": "Bump it?"}), true);
         app.quote("Keep the old one.");
         // The row over the composer says it answers, as words would.
         assert!(app.answering_over(80).is_some());
@@ -39205,7 +39257,7 @@ mod tests {
             "options": [{"label": "Keep it", "explanation": "e"},
                         {"label": "Drop it", "explanation": "e"}]});
         app.commit_call("c1", Some(1), asks::TOOL, &arguments, "{}", false);
-        app.asked("c1", Some(1), &arguments);
+        app.asked("c1", Some(1), &arguments, true);
         assert!(drawn(&mut app).contains(&"? Keep the old API?".to_owned()));
         // Words of the person's own leave it open, in the composer, its
         // card as it was.
@@ -39355,7 +39407,7 @@ mod tests {
             app.bot = "shop.lead".into();
             app.width = 80;
             app.commit_call("c1", None, asks::TOOL, &ship_it(), "{}", false);
-            app.asked("c1", None, &ship_it());
+            app.asked("c1", None, &ship_it(), true);
             assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("c1"));
             // Typed, as words, or picked on the card: the same.
             match answered {
@@ -39431,12 +39483,12 @@ mod tests {
         app.fleet = Some(fleet);
         // Both cards drawn from the conversation, the first not yet seen
         // answered: its answer is on a page not read.
-        app.asked("c1", Some(4), &ship_it());
+        app.asked("c1", Some(4), &ship_it(), true);
         app.commit_ask(&app.asks[0].clone());
         let tag = json!({"question": "Tag it?", "why": "w",
             "options": [{"label": "Now", "explanation": "e"},
                         {"label": "Later", "explanation": "e"}]});
-        app.asked("c2", Some(6), &tag);
+        app.asked("c2", Some(6), &tag, true);
         app.commit_ask(&app.asks[1].clone());
         let reads = |asked: &Arc<std::sync::Mutex<Vec<Value>>>| {
             let asked = asked.lock().unwrap();
@@ -40038,7 +40090,7 @@ mod tests {
         app.project = Some("calc".into());
         // Closing itself, by its own name alone, a lead sets its own open
         // question aside.
-        app.asked("q1", Some(11), &json!({"question": "Tag it?"}));
+        app.asked("q1", Some(11), &json!({"question": "Tag it?"}), true);
         assert_eq!(app.asks.len(), 1);
         let closed = |bot: &str| json!({"closed": [{"bot": bot, "was_open": true}]}).to_string();
         let lead = json!({"name": "calc.lead"});
@@ -40047,7 +40099,7 @@ mod tests {
         assert_eq!(app.unpinned.len(), 1);
         // Closing another sets none aside, nor does itself among others,
         // which the daemon refuses: what the output says it closed counts.
-        app.asked("q2", Some(13), &json!({"question": "Ship it?"}));
+        app.asked("q2", Some(13), &json!({"question": "Ship it?"}), true);
         let fix = json!({"name": "calc.fix"});
         app.resolve(resolved::TOOL, &fix, &closed("calc.fix"), Some(14), true);
         let both = json!({"names": ["calc.lead", "calc.fix"]});
@@ -41534,7 +41586,7 @@ mod tests {
                 "{}",
                 false,
             );
-            app.asked(&call, Some(turn), &two_options(question));
+            app.asked(&call, Some(turn), &two_options(question), true);
             app.commit(
                 (0..under)
                     .map(|at| Line::from(format!("worked on {turn}.{at}")))
@@ -44555,6 +44607,90 @@ mod tests {
         assert!(quiet_message(told));
     }
 
+    /// A question asked before cards stayed open, the person's own words
+    /// after it, was set aside then, and is drawn so still, pinned nowhere:
+    /// on the page first read, and on an older one, whether the words are
+    /// on a newer page or later on its own. One asked since stays open
+    /// past their words. Reproduces George's report of 11-27: every old
+    /// question answered in words came back open after the upgrade.
+    #[tokio::test]
+    async fn a_question_asked_before_cards_stayed_open_stays_set_aside() {
+        let question = json!({"question": "Ship it?", "why": "w",
+            "options": [{"label": "Now", "explanation": "e"},
+                        {"label": "Later", "explanation": "e"}]});
+        let call = |id: &str| {
+            json!({"type": "function_call", "name": asks::TOOL, "call_id": id,
+                "arguments": question.to_string()})
+        };
+        let taken = |id: &str, stays_open: bool| {
+            let mut said = json!({"id": id, "if_unanswered": "wait"});
+            if stays_open {
+                said[asks::STAYS_OPEN] = json!(true);
+            }
+            json!({"type": "function_call_output", "call_id": id, "output": said.to_string()})
+        };
+        let said = |text: &str| {
+            json!({"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": text}]})
+        };
+        // Newest first: words of the person's own after two asks, one
+        // asked before cards stayed open and one since.
+        let history = vec![
+            (5, 3, said("Hold on, Monday")),
+            (4, 2, taken("c2", true)),
+            (3, 2, call("c2")),
+            (2, 1, taken("c1", false)),
+            (1, 1, call("c1")),
+        ];
+        let window = |history: Vec<(i64, i64, Value)>| async move {
+            let mut window =
+                app(daemon_answering(move |asked| history_read(&history, asked).unwrap()).await);
+            window.width = 80;
+            window
+        };
+        let mut first = window(history.clone()).await;
+        first.history().await;
+        let pinned: Vec<&str> = first.asks.iter().map(|ask| ask.id.as_str()).collect();
+        assert_eq!(pinned, ["ask:2/c2"]);
+        assert_eq!(first.settled.get("ask:1/c1"), Some(&asks::State::Aside));
+        let shown = drawn(&mut first);
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.contains("Set aside: you wrote past it")),
+            "{shown:?}"
+        );
+        // A page read later: words on a newer page set aside what it asked
+        // before cards stayed open.
+        let mut later = window(vec![
+            (5, 3, said("Hold on, Monday")),
+            (-1, 0, taken("c0", false)),
+            (-2, 0, call("c0")),
+        ])
+        .await;
+        later.history().await;
+        let turns: HashMap<i64, i64> = [(-2, 0), (-1, 0)].into();
+        (later.draw_nodes(&[-2, -1], &turns, true, Vec::new(), None, None)).await;
+        assert_eq!(later.settled.get("ask:0/c0"), Some(&asks::State::Aside));
+        assert!(later.asks.iter().all(|ask| ask.id != "ask:0/c0"));
+        // Words later on its own page do too, and leave what a newer page
+        // pinned open.
+        let mut own = window(vec![
+            (-3, 0, said("Later then")),
+            (-1, 0, taken("c0", false)),
+            (-2, 0, call("c0")),
+        ])
+        .await;
+        own.asked("c9", Some(9), &question, false);
+        let turns: HashMap<i64, i64> = [(-2, 0), (-1, 0), (-3, 0)].into();
+        (own.draw_nodes(&[-2, -1, -3], &turns, true, Vec::new(), None, None)).await;
+        assert_eq!(own.settled.get("ask:0/c0"), Some(&asks::State::Aside));
+        let pinned: Vec<&str> = own.asks.iter().map(|ask| ask.id.as_str()).collect();
+        assert_eq!(pinned, ["ask:9/c9"]);
+        // Set aside, a pick on its card still answers it.
+        assert!(own.card_state(&own.cards["ask:0/c0"].1).takes_a_pick());
+    }
+
     /// A question drawn from a page read later, answered or closed on no
     /// page read since, is open: pinned where its turn puts it, or, its
     /// agent closed, left out of the composer, its card open and a click
@@ -44568,7 +44704,7 @@ mod tests {
                 {"label": "No", "explanation": "e"}]})
         };
         app.commit_call("c2", Some(5), asks::TOOL, &question("Tag it?"), "{}", false);
-        app.asked("c2", Some(5), &question("Tag it?"));
+        app.asked("c2", Some(5), &question("Tag it?"), true);
         // Older, open: pinned before the one asked later.
         app.commit_call(
             "c1",
@@ -44578,7 +44714,7 @@ mod tests {
             "{}",
             false,
         );
-        app.pin_unless_settled(&asks::id(2, "c1"));
+        app.pin_unless_settled(&asks::id(2, "c1"), true);
         let pinned: Vec<&str> = app.asks.iter().map(|ask| ask.id.as_str()).collect();
         assert_eq!(pinned, ["ask:2/c1", "ask:5/c2"]);
         // Answered on a newer page: settled, pinned nowhere.
@@ -44591,7 +44727,7 @@ mod tests {
             "{}",
             false,
         );
-        app.pin_unless_settled(&asks::id(1, "c0"));
+        app.pin_unless_settled(&asks::id(1, "c0"), true);
         assert_eq!(app.asks.len(), 2);
         // Its agent closed, done: open, out of the composer; a click pins it.
         app.own_closed = true;
@@ -44603,7 +44739,7 @@ mod tests {
             "{}",
             false,
         );
-        app.pin_unless_settled(&asks::id(1, "c9"));
+        app.pin_unless_settled(&asks::id(1, "c9"), true);
         assert_eq!(app.asks.len(), 2);
         let card = app.cards[&asks::id(1, "c9")].1.clone();
         assert_eq!(app.card_state(&card), asks::State::Open);
