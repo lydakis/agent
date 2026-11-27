@@ -2998,10 +2998,12 @@ async fn started_call(client: &Client, bot: &str, data: &Value) -> (String, Stri
 }
 
 /// The calls an `approval_requested` event puts to their gates, by turn
-/// and call, with the node that planned each.
+/// and call, with the node that planned each. A script's steps are not
+/// calls a turn planned: they end with `step_decided`, never lifted.
 fn planned(event: &Value) -> Vec<((Option<i64>, String), i64)> {
     let turn = event["turn"].as_i64();
     (event["data"]["calls"].as_array().into_iter().flatten())
+        .filter(|call| call["step_of"].is_null())
         .filter_map(|call| {
             let id = call["call_id"].as_str()?.to_owned();
             Some(((turn, id), call["node"].as_i64()?))
