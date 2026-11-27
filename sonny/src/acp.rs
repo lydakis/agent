@@ -964,7 +964,7 @@ impl Session {
             }
         }
         for key in answering {
-            if let Some((name, arguments)) = call_of(&client, &bot, &key.1).await
+            if let Some((name, arguments)) = call_of(&client, &bot, key.0, &key.1).await
                 && name != reactions::TOOL
                 && name != plan::TOOL
             {
@@ -1823,7 +1823,8 @@ impl Session {
                     true if data["waits_for"] == "answer" => {
                         if data["outcome"] == "allowed"
                             && !state.calls.contains_key(&key)
-                            && let Some((name, arguments)) = call_of(&client, &bot, &call).await
+                            && let Some((name, arguments)) =
+                                call_of(&client, &bot, turn, &call).await
                             && name != reactions::TOOL
                             && name != plan::TOOL
                         {
@@ -2983,13 +2984,19 @@ async fn started_call(client: &Client, bot: &str, data: &Value) -> (String, Stri
 /// Call `id`'s whole arguments, from the bot's newest items, for one whose
 /// event carried only their start.
 async fn whole_arguments(client: &Client, bot: &str, id: &str) -> Value {
-    call_of(client, bot, id)
+    call_of(client, bot, None, id)
         .await
         .map_or(Value::Null, |(_, arguments)| arguments)
 }
 
-/// Call `id`'s name and arguments, from the bot's newest items.
-async fn call_of(client: &Client, bot: &str, id: &str) -> Option<(String, Value)> {
+/// Call `id`'s name and arguments, from the bot's newest items: of
+/// `turn`'s, when given, as a later turn's call may have its id.
+async fn call_of(
+    client: &Client,
+    bot: &str,
+    turn: Option<i64>,
+    id: &str,
+) -> Option<(String, Value)> {
     let page = client
         .request("history_nodes", json!({"bot": bot, "limit": 64}))
         .await
@@ -2998,6 +3005,7 @@ async fn call_of(client: &Client, bot: &str, id: &str) -> Option<(String, Value)
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|node| turn.is_none() || node["turn"].as_i64() == turn)
         .filter_map(|node| node["node"].as_i64())
         .collect();
     let call = items(client, bot, &nodes)
