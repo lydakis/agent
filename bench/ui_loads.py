@@ -471,7 +471,8 @@ def run(build, size, args, tapped=False):
             back(window)
         for name, ready in (('usage', has('By model')), ('background', has('Follows')),
                             ('commons', has('threads')),
-                            ('sky', both(sky_counted, lacks_row('reading…')))):
+                            ('sky', both(sky_counted, lacks('Catching up'), lacks('Reading what happened'),
+                                         lacks_row('reading…')))):
             for _ in range(args.repeat):
                 timed(name, f'/{name}\r'.encode(), page=ready)
                 back(window)
