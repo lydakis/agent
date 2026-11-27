@@ -10777,21 +10777,28 @@ impl App {
         self.seen_node = 0;
         self.bar = None;
         self.barred = false;
+        // The cleared window says it is reading while the items are read
+        // again (on the loop still: keys wait for it).
+        self.notice = Some(READING.into());
+        self.draw(terminal).map_err(|e| e.to_string())?;
         if let Some(newest) = newest {
             // What calls older than the oldest page returned stays its own.
             let unpaired = std::mem::take(&mut self.unpaired);
             self.history_since(newest, true).await;
             self.unpaired = unpaired;
             self.screen.prepend_blank(pages);
-            return Ok(());
-        }
-        // Back to the first node this window drew, not only the newest page.
-        match self.first_node {
-            Some(first) => {
-                self.commit_welcome();
-                self.history_since(first - 1, true).await;
+        } else {
+            // Back to the first node this window drew, not only the newest page.
+            match self.first_node {
+                Some(first) => {
+                    self.commit_welcome();
+                    self.history_since(first - 1, true).await;
+                }
+                None => self.history().await,
             }
-            None => self.history().await,
+        }
+        if self.notice.as_deref() == Some(READING) {
+            self.notice = None;
         }
         Ok(())
     }
@@ -15986,11 +15993,6 @@ impl App {
     }
 
     async fn status(&mut self) {
-        // Where each task's window sits as of now, not as when the card was
-        // last open: windows closed for room and opened since included.
-        if let Some(fleet) = &self.fleet {
-            fleet.layout.places_now(PLACES_NOW).await;
-        }
         // The card draws at once, and its rows as soon as they are listed:
         // each history read beside the loop fills in its row. What an
         // earlier window read is taken on the first open here; what this
@@ -16010,7 +16012,11 @@ impl App {
             take: self.status_read.is_empty(),
             keep: std::mem::take(&mut self.reads_unkept),
         };
-        let job = self.read_status_beside(Some(fill));
+        // Where each task's window sits as of now, not as when the card was
+        // last open: windows closed for room and opened since included,
+        // read beside the loop with the rest.
+        let now = (self.fleet.as_ref()).map(|fleet| fleet.layout.places_now(PLACES_NOW));
+        let job = self.read_status_beside(Some(fill), now);
         self.filling = Some((filling, job));
         self.watch = Some(Watch {
             project: self.scope().project,
@@ -16493,12 +16499,16 @@ impl App {
         }
         // The card's rows read again once it has filled in.
         if self.filling.is_none() {
-            self.card_read = Some(self.read_status_beside(None));
+            self.card_read = Some(self.read_status_beside(None, None::<std::future::Ready<mux::Places>>));
         }
     }
 
     /// `/status` read again beside the loop: its alerts, then its rows.
-    fn read_status_beside(&mut self, fill: Option<Fill>) -> tokio::task::JoinHandle<CardRead> {
+    fn read_status_beside(
+        &mut self,
+        fill: Option<Fill>,
+        places_now: Option<impl std::future::Future<Output = mux::Places> + Send + 'static>,
+    ) -> tokio::task::JoinHandle<CardRead> {
         let (client, woken) = (self.client.clone(), self.woken.clone());
         let readers = self.readers.clone();
         let (store, scope, turns) = (self.options.store.clone(), self.scope(), self.turns.clone());
@@ -16514,6 +16524,10 @@ impl App {
         let logs = tilde(&format!("{}.companions", self.store().display()));
         let temp_due = (self.temp_read.as_ref()).is_none_or(|(at, _)| at.elapsed() >= TEMP_READ);
         tokio::spawn(async move {
+            let places = match places_now {
+                Some(now) => now.await,
+                None => places,
+            };
             let view = StatusView {
                 bot: &bot,
                 asks: &asks,
@@ -22532,6 +22546,7 @@ impl App {
             woken.notify_one();
         });
         self.siding.push(receive);
+        self.notice = Some(READING.into());
     }
 
     /// The side chat made beside the window, once it is: beside the
@@ -22552,6 +22567,9 @@ impl App {
     }
 
     fn side_open(&mut self, made: Result<(String, i64, Option<String>), String>) {
+        if self.notice.as_deref() == Some(READING) && self.siding.is_empty() {
+            self.notice = None;
+        }
         let (name, head, refused) = match made {
             Ok(made) => made,
             Err(error) => {
@@ -24170,6 +24188,7 @@ impl App {
                     frame.set_cursor_position(cursor);
                 }
             }
+            let whole = history;
             let history = ratatui::layout::Rect {
                 y: history.bottom().saturating_sub(rows as u16),
                 width: column,
@@ -24178,6 +24197,18 @@ impl App {
             };
             if self.projects.is_none() {
                 self.screen.render(history, frame.buffer_mut(), file);
+                // Read back to the first row drawn while older ones are
+                // read: the sign where they will go, above it if there is
+                // room, else on it until they come.
+                if self.older_read.is_some() && history.height > 0 && self.screen.at_first_row() {
+                    let y = match history.y > whole.y {
+                        true => history.y - 1,
+                        false => history.y,
+                    };
+                    let row = Rect { y, height: 1, ..history };
+                    frame.render_widget(ratatui::widgets::Clear, row);
+                    frame.render_widget(Paragraph::new(Line::from(READING).dim()), row);
+                }
                 if let Some(eyes) = &mut self.eyes
                     && let Some(y) = self.screen.drawn_at(screen::Tag::Eyes)
                 {
