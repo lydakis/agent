@@ -761,6 +761,10 @@ struct State {
     /// The calls a message lifted from their turn, which end later, as
     /// `lifted_ended` says: kept past their turn's end.
     lifted: HashSet<(Option<i64>, String)>,
+    /// Calls waiting on a gate, by turn and call, with the node that
+    /// planned them: one a message lifts gets no `tool_started`, so it is
+    /// known from here once it is allowed.
+    gated: HashMap<(Option<i64>, String), i64>,
     /// Calls put to the person, by call and request, and the lead's
     /// questions, by ask.
     asked: HashSet<String>,
@@ -907,9 +911,7 @@ impl Session {
         // Calls started before this thread came and not done yet: a task a
         // lead is starting still opens its thread when it is done.
         let (mut started, mut lifted) = (HashMap::new(), HashSet::new());
-        // Lifted while they waited on a gate, then allowed: they started
-        // with no `tool_started`, and their answer ends them.
-        let mut answering = HashSet::new();
+        let (mut gated, mut answering) = (HashMap::new(), HashSet::new());
         let cursor = live(&mut events, |event| {
             let data = &event["data"];
             let call = (
@@ -917,15 +919,22 @@ impl Session {
                 data["call_id"].as_str().unwrap_or("").to_owned(),
             );
             match event["event"].as_str() {
+                Some("approval_requested") => {
+                    gated.extend(planned(&event));
+                }
                 Some("tool_started") => {
+                    gated.remove(&call);
                     started.insert(call, data.clone());
                 }
-                Some("call_lifted") if started.contains_key(&call) => {
+                Some("call_lifted") if started.contains_key(&call) || gated.contains_key(&call) => {
                     lifted.insert(call);
                 }
                 Some("tool_completed") if !lifted.contains(&call) => {
+                    gated.remove(&call);
                     started.remove(&call);
                 }
+                // Lifted while it waited on its gate and allowed: it
+                // started with no `tool_started`, and its answer ends it.
                 Some("lifted_ended") if data["waits_for"] == "answer" => {
                     if data["outcome"] == "allowed" && !started.contains_key(&call) {
                         answering.insert(call);
@@ -934,6 +943,7 @@ impl Session {
                 Some("lifted_ended") => {
                     lifted.remove(&call);
                     started.remove(&call);
+                    gated.remove(&call);
                     answering.remove(&call);
                 }
                 _ => {}
@@ -964,15 +974,15 @@ impl Session {
             }
         }
         for key in answering {
-            if let Some((name, arguments)) = call_of(&client, &bot, key.0, &key.1).await
+            if let Some(node) = gated.remove(&key)
+                && let Some((name, arguments)) = planned_call(&client, &bot, node, &key.1).await
                 && name != reactions::TOOL
                 && name != plan::TOOL
             {
-                calls.insert(key.clone(), (name, arguments));
-                lifted.insert(key);
+                calls.insert(key, (name, arguments));
             }
         }
-        lifted.retain(|call| calls.contains_key(call));
+        lifted.retain(|call| calls.contains_key(call) || gated.contains_key(call));
         let pinned = t3::Pinned {
             bot: bot.clone(),
             bot_id,
@@ -993,6 +1003,7 @@ impl Session {
             state.running = running;
             state.calls = calls;
             state.lifted = lifted;
+            state.gated = gated;
             state.cursor = cursor;
             // A task keeps the model its lead gave it, whatever T3 Code
             // picked for the thread it opened.
@@ -1792,13 +1803,14 @@ impl Session {
                     return;
                 }
                 out.update(id, tool_call(&shown_id(turn, &call), &name, &arguments));
+                state.gated.remove(&(turn, call.clone()));
                 state.calls.insert((turn, call), (name, arguments));
             }
             // A call a message lifted goes on in the background: its
             // turn's answer to it is its handle, and it ends later.
             "call_lifted" => {
                 let key = (turn, data["call_id"].as_str().unwrap_or("").to_owned());
-                if state.calls.contains_key(&key) {
+                if state.calls.contains_key(&key) || state.gated.contains_key(&key) {
                     state.lifted.insert(key);
                 }
             }
@@ -1809,6 +1821,7 @@ impl Session {
                 if !lifted && state.lifted.contains(&key) {
                     return;
                 }
+                let gated = state.gated.remove(&key);
                 // Its approval is decided: a call of a later turn under the
                 // same id is put to the person afresh.
                 let prompted = asked_key(turn, &call, "");
@@ -1818,19 +1831,19 @@ impl Session {
                     // answer; any other runs as a background command,
                     // whose end this thread does not show. One lifted
                     // while it waited on its gate had no `tool_started`:
-                    // it starts here, as the window hears it allowed, so
-                    // its answer ends it as any call's does.
+                    // it starts here, and its answer ends it as any
+                    // call's does.
                     true if data["waits_for"] == "answer" => {
                         if data["outcome"] == "allowed"
                             && !state.calls.contains_key(&key)
+                            && let Some(node) = gated
                             && let Some((name, arguments)) =
-                                call_of(&client, &bot, turn, &call).await
+                                planned_call(&client, &bot, node, &call).await
                             && name != reactions::TOOL
                             && name != plan::TOOL
                         {
                             out.update(id, tool_call(&shown_id(turn, &call), &name, &arguments));
-                            state.calls.insert(key.clone(), (name, arguments));
-                            state.lifted.insert(key);
+                            state.calls.insert(key, (name, arguments));
                         }
                         return;
                     }
@@ -1956,6 +1969,9 @@ impl Session {
                 }
             }
             "approval_requested" | "approval_asked" => {
+                if event["event"] == "approval_requested" {
+                    state.gated.extend(planned(event));
+                }
                 // Calls announced only for the reviewer, as in auto mode,
                 // wait on no person: nothing to list.
                 if event["event"] == "approval_requested"
@@ -2981,58 +2997,51 @@ async fn started_call(client: &Client, bot: &str, data: &Value) -> (String, Stri
     (call, name, arguments)
 }
 
+/// The calls an `approval_requested` event puts to their gates, by turn
+/// and call, with the node that planned each.
+fn planned(event: &Value) -> Vec<((Option<i64>, String), i64)> {
+    let turn = event["turn"].as_i64();
+    (event["data"]["calls"].as_array().into_iter().flatten())
+        .filter_map(|call| {
+            let id = call["call_id"].as_str()?.to_owned();
+            Some(((turn, id), call["node"].as_i64()?))
+        })
+        .collect()
+}
+
+/// Call `id`'s name and arguments, from `node`, which planned it.
+async fn planned_call(client: &Client, bot: &str, node: i64, id: &str) -> Option<(String, Value)> {
+    let call = items(client, bot, &[node])
+        .await
+        .into_iter()
+        .find(|item| item["type"] == "function_call" && item["call_id"] == id)?;
+    let arguments = (call["arguments"].as_str())
+        .and_then(|arguments| serde_json::from_str(arguments).ok())
+        .unwrap_or(Value::Null);
+    Some((call["name"].as_str()?.to_owned(), arguments))
+}
+
 /// Call `id`'s whole arguments, from the bot's newest items, for one whose
 /// event carried only their start.
 async fn whole_arguments(client: &Client, bot: &str, id: &str) -> Value {
-    call_of(client, bot, None, id)
+    let Ok(page) = client
+        .request("history_nodes", json!({"bot": bot, "limit": 64}))
         .await
-        .map_or(Value::Null, |(_, arguments)| arguments)
-}
-
-/// Call `id`'s name and arguments, from the bot's newest items; with
-/// `turn`, from that turn's, page by page back to its start, as a later
-/// turn's call may have its id and a lifted call may wait long after.
-async fn call_of(
-    client: &Client,
-    bot: &str,
-    turn: Option<i64>,
-    id: &str,
-) -> Option<(String, Value)> {
-    let mut from = Value::Null;
-    loop {
-        let page = client
-            .request(
-                "history_nodes",
-                json!({"bot": bot, "from": from, "limit": 64}),
-            )
-            .await
-            .ok()?;
-        let listed = page["nodes"].as_array().cloned().unwrap_or_default();
-        let nodes: Vec<i64> = (listed.iter())
-            .filter(|node| turn.is_none() || node["turn"].as_i64() == turn)
-            .filter_map(|node| node["node"].as_i64())
-            .collect();
-        let call = match nodes.is_empty() {
-            true => None,
-            false => (items(client, bot, &nodes).await.into_iter())
-                .find(|item| item["type"] == "function_call" && item["call_id"] == id),
-        };
-        if let Some(call) = call {
-            let arguments = (call["arguments"].as_str())
-                .and_then(|arguments| serde_json::from_str(arguments).ok())
-                .unwrap_or(Value::Null);
-            return Some((call["name"].as_str()?.to_owned(), arguments));
-        }
-        // Newest first: a page that reached an earlier turn passed the
-        // call's start.
-        let passed = turn.is_none_or(|turn| {
-            (listed.iter()).any(|node| node["turn"].as_i64().is_some_and(|at| at < turn))
-        });
-        from = page["next_from"].clone();
-        if passed || from.is_null() {
-            return None;
-        }
-    }
+    else {
+        return Value::Null;
+    };
+    let nodes: Vec<i64> = page["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node["node"].as_i64())
+        .collect();
+    items(client, bot, &nodes)
+        .await
+        .into_iter()
+        .find(|item| item["type"] == "function_call" && item["call_id"] == id)
+        .and_then(|call| serde_json::from_str(call["arguments"].as_str()?).ok())
+        .unwrap_or(Value::Null)
 }
 
 /// What marks call `call` of `turn`'s approval request `request` as put
