@@ -13713,3 +13713,109 @@ Four alternating rounds of the Perf workflow's screens.
   completion p99 and burst submit p99 are about 5% faster.
 - Footprint per idle bot reads +7.1%; its runs overlap whole (0.10.7 1.97 to
   2.37 KiB, 0.10.8 1.83 to 2.31), noise.
+
+
+## Release 0.10.9 against 0.10.8
+
+0.10.9 is a patch release: it changes only how a shell or file call on a
+linked machine is checked before its gate (#1412). This measures v0.10.8
+(b88a82e) against the release commit 1f41df1. The protocol (105) and schema
+(115) are the same, but each side still runs its own daemon with its own
+Sonny. Release builds (glibc) on one 4-core Linux container, base and head
+alternated, and each binary's page cache dropped before each `bench/ends.py`
+run. The benchmark ran around the tag, as for 0.10.8.
+
+### Low end
+
+Three rounds each; the anonymous rows are separate runs that read `Pss_Anon`.
+
+| Measure | 0.10.8 | 0.10.9 |
+| --- | ---: | ---: |
+| window start, s | 0.078 / 0.087 / 0.075 | 0.077 / 0.073 / 0.071 |
+| key p99, ms | 1.31 / 1.63 / 1.36 | 1.35 / 1.27 / 1.23 |
+| turn p50, ms | 47.91 / 47.97 / 47.97 | 47.91 / 47.78 / 48.08 |
+| turn p99, ms | 49.06 / 59.72 / 52.45 | 49.95 / 50.48 / 51.88 |
+| idle daemon PSS, MiB | 18.3 / 18.9 / 18.3 | 18.9 / 19.1 / 18.3 |
+| idle daemon anon PSS, MiB | 4.9 / 4.8 / 5.0 | 5.3 / 4.9 / 5.1 |
+| idle window PSS, MiB | 16.9 / 16.3 / 16.5 | 15.9 / 16.3 / 16.4 |
+| idle window anon PSS, MiB | 4.7 / 4.7 / 4.6 | 4.9 / 4.7 / 4.7 |
+| idle window wakeups, /s | 4.5 / 4.6 / 4.6 | 4.6 / 4.5 / 4.5 |
+
+### High end
+
+10,000 stored agents, 30 busy, 8 scripts, 20 s, windows spread over folders.
+32 windows four rounds, 100 windows two.
+
+| Measure | 0.10.8 | 0.10.9 |
+| --- | ---: | ---: |
+| 32 windows: turns finished | 8508 / 8438 / 8576 / 8270 | 8786 / 8642 / 8341 / 8538 |
+| scripts finished | 1048 / 1015 / 1048 / 1020 | 1066 / 1043 / 1010 / 1032 |
+| windows CPU, % | 4.59 / 4.52 / 4.39 / 4.69 | 4.04 / 4.14 / 4.64 / 4.39 |
+| windows PSS, MiB | 189.8 / 189.0 / 189.5 / 189.2 | 188.6 / 190.2 / 189.5 / 189.9 |
+| windows anon PSS, MiB (2 rounds) | 167.7 / 165.9 | 167.6 / 167.8 |
+| daemon CPU, % | 135.64 / 137.98 / 136.28 / 136.07 | 137.29 / 138.46 / 136.59 / 137.15 |
+| daemon PSS, MiB | 37.2 / 37.0 / 37.1 / 37.1 | 37.5 / 37.5 / 37.8 / 37.1 |
+| daemon anon PSS, MiB (2 rounds) | 22.8 / 22.1 | 22.1 / 22.5 |
+| key p99, ms | 6.99 / 5.96 / 7.98 / 9.43 | 6.76 / 10.04 / 11.66 / 6.61 |
+| window start p99, ms | 180.21 / 160.5 / 162.2 / 187.26 | 162.38 / 172.48 / 161.8 / 206.01 |
+| 100 windows: turns finished | 8661 / 8607 | 8546 / 8653 |
+| scripts finished | 1060 / 1036 | 1051 / 1039 |
+| windows PSS, MiB | 503.8 / 504.8 | 504.1 / 505.6 |
+| daemon PSS, MiB | 38.3 / 38.1 | 38.1 / 38.4 |
+| key p50, ms | 1.22 / 1.25 | 1.35 / 1.3 |
+| key p99, ms | 8.42 / 14.16 | 11.02 / 9.37 |
+| window start p50, ms | 19.76 / 21.25 | 20.29 / 19.38 |
+| window start p99, ms | 170.56 / 152.94 | 162.97 / 176.59 |
+
+- **Everything is even.** Turns, scripts, keys, window starts and memory
+  overlap round for round at both ends, as expected from a change that only
+  touches a linked machine's calls, which these benches don't make. The
+  binaries are within 3 KB of each other (Sonny 62,689,000 bytes against
+  62,686,312).
+- The daemon's PSS at 32 windows reads up to 0.4 MiB more in three of four
+  rounds; its anonymous PSS is even (22.1 and 22.5 MiB against 22.8 and
+  22.1), and at 100 windows PSS is even (38.1 / 38.4 against 38.3 / 38.1),
+  so the difference is shared file pages, not memory the daemon holds.
+
+### Daemon and Sonny screens
+
+Eight alternating rounds of the admission and Sonny screens, four of the
+others.
+
+| Bench | Measure | 0.10.8 | 0.10.9 | Change |
+| --- | --- | ---: | ---: | ---: |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.47 | 39.504 | +0.1% |
+| admission | burst submit p99, ms | 6.097 | 5.944 | -2.5% |
+| completion | release to terminal p99, ms | 13.418 | 13.427 | +0.1% |
+| footprint | idle RSS, MiB | 16.564 | 16.74 | +1.1% |
+| footprint | per idle bot, KiB | 2.09 | 2.094 | +0.2% |
+| footprint | RSS after a turn each, MiB | 31.666 | 32.324 | +2.1% |
+| footprint | CPU per turn, ms | 1.023 | 0.965 | -5.7% |
+| footprint | written to disk per turn, KiB | 43.662 | 45.204 | +3.5% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 25.0 | 31.25 | +25.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 7.5 | 7.5 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.5 | 4.5 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 6.38 | 6.62 | +3.8% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2153.0 | 2154.0 | +0.0% |
+| sonny | lookout note p95 at 100x10, ms | 2237.0 | 2300.0 | +2.8% |
+| sonny | quiet window CPU, ms/s | 0.575 | 0.57 | -0.9% |
+| sonny | quiet window reads, KiB/s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window RSS, MiB | 32.5 | 32.5 | +0.0% |
+| sonny | sky replay CPU per 1k lines, ms | 12.315 | 12.41 | +0.8% |
+| sonny | sky replay RSS, MiB | 73.9 | 72.5 | -1.9% |
+| lifecycle | CPU, s | 0.65 | 0.65 | +0.0% |
+| lifecycle | p95 turn, ms | 585.504 | 584.754 | -0.1% |
+| lifecycle | peak RSS, MiB | 27.076 | 27.148 | +0.3% |
+
+- **Nothing is over the gate's 15%, and nothing reads worse beyond noise.**
+- After four rounds a quiet window's CPU read +35% (0.565 against 0.765
+  ms/s). It is read in 10 ms ticks, so each run is 0.38 or 0.75: the first
+  four runs were 2 and 3 of 4 at 0.75. Four more rounds make it even (median
+  0.575 against 0.57 over 8 runs each).
+- The lookout's CPU at 10x1 (one 10 ms tick per run, 25.0 or 37.5) is 37.5 in
+  3 of 8 base runs and 4 of 8 head runs, the same tick noise. Disk written
+  per turn overlaps whole (0.10.8 41.4 to 48.3 KiB, 0.10.9 42.7 to 48.6), as
+  does RSS after a turn each (30.6 to 34.0 MiB against 28.7 to 34.6).
