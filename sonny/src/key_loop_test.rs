@@ -845,12 +845,18 @@ async fn commands_that_read_the_daemon_never_hold_the_window() {
             app.key(key(KeyCode::Char(c))).await;
         }
         app.key(key(KeyCode::Enter)).await;
-        // A card's first read is one look round away.
-        if app.pane.as_ref().is_some_and(pane::Pane::is_card) {
+        // A card's first read is one look round away, as the loop reads
+        // a card that has a view to read (`/context` reads its own).
+        if app.pane.as_ref().is_some_and(pane::Pane::is_card) && app.watch.is_some() {
             app.reread().await;
         }
         at_once(at.elapsed(), HELD);
         assert!(app.input.is_empty(), "{command}");
+        // A card that opened at once has the keys: closed, so the next
+        // command is typed in the composer.
+        if app.pane_keys && app.pane.as_ref().is_some_and(pane::Pane::is_card) {
+            app.key(key(KeyCode::Esc)).await;
+        }
     }
     let at = Instant::now();
     app.press_row("react/2").await;

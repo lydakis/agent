@@ -36001,7 +36001,7 @@ mod tests {
         app.beside_done().await;
         for _ in 0..400 {
             app.listed();
-            if app.picker.is_some() {
+            if app.picker.as_ref().is_some_and(|picker| !picker.reading) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
