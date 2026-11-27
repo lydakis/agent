@@ -297,6 +297,12 @@ fn kept(window: u16) -> u16 {
     kept_at(window, measure())
 }
 
+/// Whether a window `width` columns wide has room for the conversation
+/// and the pane side by side, rather than one at a time.
+fn side_by_side(width: u16) -> bool {
+    pane::width(width, kept(width)) < width
+}
+
 /// [`kept`] at `measure`.
 fn kept_at(window: u16, measure: usize) -> u16 {
     match measure {
@@ -19186,7 +19192,16 @@ impl App {
             _ => {}
         }
         match &event {
-            Event::Resize(..) => self.stale = true,
+            Event::Resize(width, _) => {
+                self.stale = true;
+                // A window narrowed past the room for the conversation and
+                // the pane side by side folds to the conversation, wherever
+                // the keys were: they come back to it, the pane Ctrl+\ away.
+                if side_by_side(self.full_width) && !side_by_side(*width) {
+                    self.pane_keys = false;
+                }
+                self.full_width = *width;
+            }
             // A terminal that sends no colour-scheme reports may have
             // switched while elsewhere: its colors are asked again.
             Event::FocusGained => {
@@ -44352,6 +44367,43 @@ mod tests {
         app.follow("sonny:jump/repro");
         let (chat, _) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!(chat.width, 126);
+    }
+
+    #[tokio::test]
+    async fn a_window_narrowed_to_room_for_one_shows_the_conversation() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None, None);
+        app.margin_back();
+        // The keys in the margin, beside the conversation.
+        app.full_width = 170;
+        app.pane_keys = true;
+        // A pane opened beside the window narrows it: the conversation
+        // shows, the keys back to it.
+        app.key(Event::Resize(130, 40)).await;
+        assert!(!app.pane_keys);
+        let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, margin), (126, None));
+        // The margin asked for again has the narrow window to itself, and
+        // keeps it through a resize that leaves room for one only.
+        app.pane_keys = true;
+        app.key(Event::Resize(120, 40)).await;
+        app.key(Event::Resize(120, 30)).await;
+        assert!(app.pane_keys);
+        let (chat, margin) = app.split(Rect::new(0, 0, 120, 30));
+        assert_eq!((chat.width, margin.map(|m| m.width)), (0, Some(120)));
+        // Room for both again: side by side, the keys where they were.
+        app.key(Event::Resize(170, 40)).await;
+        assert!(app.pane_keys);
+        // Anything else open in the pane folds the same way.
+        app.open_pane(pane::Pane::card("status", "esc close"));
+        app.pane_keys = true;
+        app.key(Event::Resize(130, 40)).await;
+        assert!(!app.pane_keys);
+        let (chat, pane) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, pane), (126, None));
+        // The footer says how over to it.
+        assert!(app.footer(130).0.to_string().contains("ctrl+\\ status"));
     }
 
     #[tokio::test]

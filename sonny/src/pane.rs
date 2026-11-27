@@ -37,7 +37,8 @@ const ABOVE: usize = 3;
 /// conversation leaves when it keeps all it is written at, as the margin
 /// takes, so opening a file or a card never moves it. A window with less
 /// room than [`MARGIN`] beside it shows one at a time: all pane while the
-/// keys are in it, [`SWITCH`] back to the conversation.
+/// keys are in it, [`SWITCH`] back to the conversation. A window narrowed
+/// to that shows the conversation, wherever the keys were.
 pub fn width(width: u16, prose: u16) -> u16 {
     margin_width(width, prose).unwrap_or(width)
 }

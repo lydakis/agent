@@ -2718,7 +2718,8 @@ outrank `ctrl+\ conversation` in its title: it is the first to give way.
 A view's foot (a confirm, or what a key did) wraps onto as many rows as it
 needs rather than being cut. Sonny binds no Shift+Tab: multiplexers
 switch tabs with it. A window too narrow for
-both shows the one the keys are in. With nothing typed, Home goes up to
+both shows the one the keys are in; one narrowed to that from room for
+both shows the conversation, the keys back to it. With nothing typed, Home goes up to
 the conversation's first turn, drawing the turns over it on the way, and
 End comes back to the newest. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
