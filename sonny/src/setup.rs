@@ -786,7 +786,7 @@ pub async fn model(client: &Client) -> Result<String, String> {
         println!("Welcome to Sonny. A question or two and it's set up.\n");
     }
     let model = loop {
-        print!("{DIM}listing models…{RESET}");
+        print!("{DIM}reading…{RESET}");
         let _ = std::io::stdout().flush();
         let listing = client
             .request("provider_models", json!({}))

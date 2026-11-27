@@ -1916,11 +1916,11 @@ Renders every agent on the daemon as a live constellation (you at the center, le
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle,
   on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
-  as wide as high). It opens whole: "Catching up with who is here…" until
+  as wide as high). It opens whole: `reading…` until
   every agent, what each did and holds, and what each asks are read, then
   the sky, its counts and its log at once. An idle agent whose question
   was never read, as every agent on a store's first sky, does not hold it:
-  the sky shows, the footer says `reading what 182 agents ask`, and each
+  the sky shows, the footer says `reading…`, and each
   `?` appears as its read lands; what was read is kept as it comes, so a
   sky closed halfway leaves the next one less. Projects keep their places in
   the order they started,

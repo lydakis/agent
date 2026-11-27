@@ -153,6 +153,27 @@ const GRID_WIDTH: usize = COLUMNS * 2 - 1;
 /// Columns between the grid and the list beside it.
 const GAP: usize = 3;
 
+/// The card while the agent's record is read: its head, then `reading…`
+/// where the total will be (the Rulebook's Reading).
+pub fn reading(name: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![Span::raw(" "), Span::raw(name.to_owned()).bold()]),
+        Line::from(vec![Span::raw(" "), Span::raw("reading…").dim()]),
+    ]
+}
+
+/// The card when the record could not be read: its head, then why.
+pub fn failed(name: &str, why: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![Span::raw(" "), Span::raw(name.to_owned()).bold()]),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::raw("✗ ").fg(Color::Red),
+            Span::raw(why.to_owned()),
+        ]),
+    ]
+}
+
 /// The card at `width`: the total against the window; a grid of what
 /// fills it, a cell to each hundredth, as Claude Code's `/context` draws
 /// one, with the parts listed beside it (under it when too narrow), each

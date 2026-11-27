@@ -3340,7 +3340,7 @@ impl View {
         // once, so no star moves for what was only late. A follow lost on
         // the way shows what it read, and says so.
         if self.opening() {
-            lines.push(Line::from("Catching up with who is here…"));
+            lines.push(Line::from("reading…").dim());
             return lines;
         }
         let now = Instant::now();
@@ -3349,11 +3349,11 @@ impl View {
         let cols = cols.max(20);
         let shown = self.agents.iter().filter(|a| !a.gone).count();
         if shown == 0 {
-            lines.push(Line::from(match (&self.down, self.live) {
-                (Some(why), _) => format!("Couldn't follow the agents: {why}"),
-                (None, false) if self.replay.is_some() => "Reading what happened…".into(),
-                _ => "No agents yet.".into(),
-            }));
+            lines.push(match (&self.down, self.live) {
+                (Some(why), _) => Line::from(format!("Couldn't follow the agents: {why}")),
+                (None, false) if self.replay.is_some() => Line::from("reading…").dim(),
+                _ => Line::from("No agents yet."),
+            });
             return lines;
         }
         // The list's rows say what the ticker would, agent by agent.
@@ -3880,7 +3880,7 @@ impl View {
             } else if self.live {
                 "Quiet. Messages light up here as they go."
             } else {
-                "Catching up with who is here…"
+                "reading…"
             };
             // A narrow column wraps the words, as a hint read whole; dim on
             // the words, as the column keeps a span's style, not a line's.
@@ -4300,18 +4300,10 @@ impl View {
                 spans.push(Span::raw(format!(" {n} {word}")).dim());
             }
         }
-        // A first sky shows before every question is read: how many are
-        // left, until none is.
+        // A first sky shows before every question is read: it says so
+        // until none is left (the Rulebook's Reading).
         if !self.filling.is_empty() {
-            let n = self.filling.len();
-            spans.push(Span::raw(" · ").dim());
-            spans.push(
-                Span::raw(format!(
-                    "reading what {n} {}",
-                    if n == 1 { "agent asks" } else { "agents ask" }
-                ))
-                .dim(),
-            );
+            spans.push(Span::raw(" · reading…").dim());
         }
         // Who is in the middle.
         let mut seen = String::new();
@@ -4348,7 +4340,7 @@ impl View {
 fn replay_line(replay: &Replay, width: usize) -> Line<'static> {
     let mut spans = vec![Span::raw("  replay").dim()];
     if !replay.ready {
-        spans.push(Span::raw(format!(" · reading from {}…", clock(replay.from))).dim());
+        spans.push(Span::raw(" · reading…").dim());
         return Line::from(spans);
     }
     let mark = if replay.playing { "▶" } else { "‖" };
@@ -6610,7 +6602,7 @@ mod tests {
         // Before it's all in, only the footer says so.
         view.drain();
         assert!(view.agents.is_empty());
-        assert!(text(&[view.footer(80)]).contains("reading from"));
+        assert!(text(&[view.footer(80)]).contains("reading…"));
         send.send(Feed::Ready).unwrap();
         view.drain();
         // Who was here, all idle, and nothing yet said.
@@ -8819,7 +8811,7 @@ mod tests {
         .unwrap();
         view.drain();
         let waiting = text(&view.card(80, 30));
-        assert_eq!(waiting.trim(), "Catching up with who is here…");
+        assert_eq!(waiting.trim(), "reading…");
         // What they hold is in and their questions are asked for, what was
         // read before first: still one line, ready or not, until that is
         // read again.
@@ -8833,20 +8825,20 @@ mod tests {
         assert_eq!(sent, ["a", "c", "b"]);
         assert_eq!(
             text(&view.card(80, 30)).trim(),
-            "Catching up with who is here…"
+            "reading…"
         );
         send.send(Feed::Asked("a".into(), None)).unwrap();
         view.drain();
         assert_eq!(
             text(&view.card(80, 30)).trim(),
-            "Catching up with who is here…"
+            "reading…"
         );
         // The sky shows while what was never read of an idle agent is
         // read, the footer counting it, until it is in.
         send.send(Feed::Asked("c".into(), None)).unwrap();
         view.drain();
         let open = text(&view.card(80, 30));
-        assert!(!open.contains("Catching up"), "{open}");
+        assert!(!open.contains("reading…"), "{open}");
         assert!(
             open.contains("you") && open.contains("Quiet. Messages"),
             "{open}"
@@ -8859,7 +8851,7 @@ mod tests {
                 .collect()
         };
         assert!(
-            footer(&view).contains("reading what 1 agent asks"),
+            footer(&view).contains("reading…"),
             "{}",
             footer(&view)
         );
@@ -8871,7 +8863,7 @@ mod tests {
         view.resume();
         assert_eq!(
             text(&view.card(80, 30)).trim(),
-            "Catching up with who is here…"
+            "reading…"
         );
     }
 
@@ -9345,7 +9337,7 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("⠤⠤ shell  ⡇ files  ⡁⢈ web"), "{shown}");
-        assert!(!shown.contains("Catching up"), "{shown}");
+        assert!(!shown.contains("reading…"), "{shown}");
         let listed = text(&view.card(40, 12));
         assert!(listed.contains("✦ just talked"), "{listed}");
         // Beside a wide sky, the legend and the counts take the chat log's

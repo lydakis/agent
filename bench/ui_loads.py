@@ -174,6 +174,12 @@ def lacks(*words):
     return lambda lines: not any(all(w in line for w in words) for line in lines)
 
 
+def lacks_row(text):
+    """No row of the screen (the whole line, or the pane after its `│`)
+    says only `text`: a page still opening says `reading…` alone."""
+    return lambda lines: not any(line.split('│')[-1].strip() == text for line in lines)
+
+
 def picked(term, *words):
     """The list's pick, the row in reverse video, holds these words."""
     return lambda lines: any(all(w in row for w in words) for row in getattr(term, 'reversed', []))
@@ -465,7 +471,7 @@ def run(build, size, args, tapped=False):
             back(window)
         for name, ready in (('usage', has('By model')), ('background', has('Follows')),
                             ('commons', has('threads')),
-                            ('sky', both(sky_counted, lacks('Catching up')))):
+                            ('sky', both(sky_counted, lacks_row('reading…')))):
             for _ in range(args.repeat):
                 timed(name, f'/{name}\r'.encode(), page=ready)
                 back(window)

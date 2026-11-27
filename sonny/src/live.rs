@@ -214,7 +214,7 @@ impl Watch {
 
 /// `filled`'s rows `width` wide after `lead`, its pictures read from
 /// `folder`: what it follows, its text cut at `most` lines, then why its
-/// last fill failed, when it did; `…` before its first fill.
+/// last fill failed, when it did; `reading…` before its first fill.
 pub fn lines(
     filled: Option<&Filled>,
     width: usize,
@@ -223,7 +223,7 @@ pub fn lines(
     lead: &'static str,
 ) -> Vec<Line<'static>> {
     let Some(filled) = filled else {
-        return vec![Line::from(format!("{lead}…")).dim()];
+        return vec![Line::from(format!("{lead}reading…")).dim()];
     };
     let mut out = follows(&filled.reads, &filled.folder, width, lead);
     if let Some(text) = &filled.text {

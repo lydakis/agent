@@ -834,6 +834,12 @@ impl Output {
         read.said = said;
     }
 
+    /// Whether nothing was read for `handle` yet.
+    fn waits(&self, handle: &str) -> bool {
+        let read = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        read.handle != handle
+    }
+
     /// What was last read for `handle`.
     fn of(&self, handle: &str) -> Option<Value> {
         let read = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -1881,8 +1887,11 @@ impl View {
         }
         let mut at = 0;
         // Said empty once the commands are read too, a moment after it
-        // opens.
+        // opens; until then it says it is reading them (the Rulebook's
+        // Reading).
         if self.rows() == 0 && !self.commands.read() {
+            out.push(Line::default());
+            out.push(Line::from("reading…").dim());
             return (out, 0, Vec::new(), links);
         }
         if self.rows() == 0 && self.commands.error.is_none() {
@@ -1971,6 +1980,10 @@ impl View {
                 Span::raw("✗ ").fg(Color::Red),
                 Span::raw(format!("could not read what runs: {error}")),
             ]));
+        } else if !self.commands.read() {
+            // The commands, still being read, under what is listed.
+            out.push(Line::default());
+            out.push(Line::from("reading…").dim());
         } else if shown > 0 {
             out.push(Line::default());
             out.push(Line::from(vec![
@@ -2156,15 +2169,21 @@ impl View {
                 about.push(vec![(format!("pid {pid}"), None)]);
             }
             let handle = row["handle"].as_str().unwrap_or_default();
-            if let Some(said) = self.output.of(handle) {
+            let fields = match self.output.of(handle) {
+                Some(said) => output_fields(&said),
+                // Its output, in the place it will take, until first read.
+                None if self.output.waits(handle) => vec![(
+                    "output",
+                    vec![Field {
+                        spans: vec![Span::raw("reading…").dim()],
+                        link: None,
+                    }],
+                )],
+                None => Vec::new(),
+            };
+            if !fields.is_empty() {
                 let pick = self.page.as_ref().and_then(|page| page.pick);
-                lay(
-                    output_fields(&said),
-                    width,
-                    pick,
-                    &mut body,
-                    &mut body_links,
-                );
+                lay(fields, width, pick, &mut body, &mut body_links);
             }
         } else if let Some((item, reminder)) = (self.items.get(self.selected))
             .and_then(|item| Some((item.clone(), item.reminder.clone()?)))

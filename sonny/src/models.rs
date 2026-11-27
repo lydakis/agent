@@ -21,6 +21,9 @@ pub struct Picker {
     pub on_speed: bool,
     /// Why a provider listed nothing.
     pub refused: Vec<String>,
+    /// Opened before the listing came: the model in use alone, and
+    /// `reading…` under it until the rest land.
+    pub reading: bool,
 }
 
 /// A spot on `/model`'s footer a click acts on.
@@ -110,6 +113,7 @@ impl Picker {
             speed: "standard",
             on_speed: false,
             refused,
+            reading: false,
         }
     }
 

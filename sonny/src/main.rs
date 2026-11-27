@@ -4991,6 +4991,10 @@ pub fn side_copy(record: &Value) -> Option<&str> {
 /// How long `/status` waits, as it opens, for where the windows sit now.
 const PLACES_NOW: Duration = Duration::from_millis(500);
 
+/// What shows where an answer will appear while Sonny reads it: the one
+/// word for every read the person waits on (the Rulebook's Reading).
+const READING: &str = "reading…";
+
 /// Whether a call of tool `name` closes the agents it names, done:
 /// `close_agent`, and `remove_task`, which closes its task as it cleans up.
 fn resolves(name: &str) -> bool {
@@ -10652,31 +10656,49 @@ impl App {
             Err(_) => Err("the listing was dropped".into()),
         };
         self.listing = None;
+        // Closed while it read: what the person did since stands.
+        let Some(open) = self.picker.as_ref().filter(|picker| picker.reading) else {
+            return;
+        };
+        let (filter, on_speed) = (open.filter.clone(), open.on_speed);
         match answer {
             Ok(listing) => {
-                self.notice = None;
-                let (model, effort) = match &self.switch {
-                    Some((model, effort)) => (model.as_str(), effort.as_deref()),
-                    None => (self.model.as_str(), self.effort.as_deref()),
-                };
-                // Read as the picker opens, never while the window idles.
-                let hidden = agent_client::models::path()
-                    .map(|path| agent_client::models::hidden(&path))
-                    .unwrap_or_default();
-                let mut picker =
-                    models::Picker::new(&listing, self.client.providers(), &hidden, model, effort);
-                // On the pick still waiting for the turn to end, if any.
-                picker.speed = (self.pace).unwrap_or(match self.speed_shown() {
-                    Some(speed) => SPEEDS
-                        .into_iter()
-                        .find(|s| *s == speed)
-                        .unwrap_or("standard"),
-                    None => "standard",
-                });
+                let mut picker = self.model_picker(&listing);
+                // What was typed meanwhile still narrows it.
+                picker.on_speed = on_speed;
+                picker.narrow(filter);
                 self.picker = Some(picker);
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => {
+                if let Some(picker) = &mut self.picker {
+                    picker.reading = false;
+                    picker.refused = vec![error];
+                }
+            }
         }
+    }
+
+    /// `/model`'s list from the daemon's `listing`, on the model in use.
+    fn model_picker(&self, listing: &Value) -> models::Picker {
+        let (model, effort) = match &self.switch {
+            Some((model, effort)) => (model.as_str(), effort.as_deref()),
+            None => (self.model.as_str(), self.effort.as_deref()),
+        };
+        // Read as the picker opens, never while the window idles.
+        let hidden = agent_client::models::path()
+            .map(|path| agent_client::models::hidden(&path))
+            .unwrap_or_default();
+        let mut picker =
+            models::Picker::new(listing, self.client.providers(), &hidden, model, effort);
+        // On the pick still waiting for the turn to end, if any.
+        picker.speed = (self.pace).unwrap_or(match self.speed_shown() {
+            Some(speed) => SPEEDS
+                .into_iter()
+                .find(|s| *s == speed)
+                .unwrap_or("standard"),
+            None => "standard",
+        });
+        picker
     }
 
     /// The conversation drawn again in the background's new colours, or
@@ -16049,28 +16071,44 @@ impl App {
             woken.notify_one();
         });
         self.context_reading = Some((self.acted, receive));
+        // The card opens at once, its head the agent's, reading until the
+        // record comes (the Rulebook's Reading).
+        self.context_read = None;
+        let mut pane = pane::Pane::card("context", "esc close");
+        pane.set_card(context::reading(&spoken(&self.bot)), "esc close");
+        self.watch = None;
+        self.open_pane(pane);
     }
 
-    /// `/context`'s card, once its read came.
+    /// Whether `/context`'s card shows, still reading.
+    fn context_waits(&self) -> bool {
+        self.context_read.is_none()
+            && (self.pane.as_ref()).is_some_and(|pane| pane.is_card() && pane.title() == "context")
+    }
+
+    /// `/context`'s card, once its read came: filled where it still shows.
     fn context_came(&mut self) {
-        let Some((asked, reading)) = &mut self.context_reading else {
+        let Some((_, reading)) = &mut self.context_reading else {
             return;
         };
-        let asked = *asked;
         let read = match reading.try_recv() {
             Ok(read) => read,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
             Err(_) => Err("the read was dropped".into()),
         };
         self.context_reading = None;
-        // The person moved on meanwhile: what they did since stands.
-        if asked != self.acted {
+        // Closed meanwhile, or another view took its place: what the
+        // person did since stands.
+        if !self.context_waits() {
             return;
         }
+        let name = spoken(&self.bot);
         let (record, compacted) = match read {
             Ok(read) => read,
             Err(error) => {
-                self.notice = Some(error);
+                if let Some(pane) = &mut self.pane {
+                    pane.set_card(context::failed(&name, &error), "esc close");
+                }
                 return;
             }
         };
@@ -16081,14 +16119,10 @@ impl App {
         // finds the pane another width.
         let wide = pane::width(self.full_width, kept(self.full_width));
         let width = card_width(wide);
-        let mut pane = pane::Pane::card("context", "esc close");
-        pane.set_card(
-            context::card(&spoken(&self.bot), &parts, width),
-            "esc close",
-        );
+        if let Some(pane) = &mut self.pane {
+            pane.set_card(context::card(&name, &parts, width), "esc close");
+        }
         self.context_read = Some((parts, Some(width)));
-        self.watch = None;
-        self.open_pane(pane);
     }
 
     /// The tokens the project's agents spent, or every agent's, over
@@ -20103,7 +20137,11 @@ impl App {
                 let _ = send.send(listing.map_err(|error| error.to_string()));
             });
             self.listing = Some(receive);
-            self.notice = Some("listing models…".into());
+            // The list opens at once on the model in use, reading the rest
+            // (the Rulebook's Reading).
+            let mut picker = self.model_picker(&json!({}));
+            picker.reading = true;
+            self.picker = Some(picker);
             return;
         }
         if prompt == "/resume" {
@@ -22250,6 +22288,9 @@ impl App {
         });
         self.reading_first
             .push_back((node, then, self.acted, receive));
+        // Where the reply will be named, until its first line comes (the
+        // Rulebook's Reading).
+        self.notice = Some(READING.into());
     }
 
     /// A reply's first line read beside the window, once it came: what
@@ -22268,6 +22309,9 @@ impl App {
                 return;
             };
             if matches!(then, AfterFirst::Pick) && asked != self.acted {
+                if self.notice.as_deref() == Some(READING) {
+                    self.notice = None;
+                }
                 continue;
             }
             self.after_first(node, first, then).await;
@@ -24392,6 +24436,13 @@ impl App {
                     .collect();
                 let room = composer.y as usize;
                 let mut rows = list::lines(&items, at, width, room);
+                // The rest of the models, still being read.
+                if picker.reading && rows.len() < (list::ROWS + 1).min(room) {
+                    rows.push(Line::from(vec![
+                        Span::raw(" ".repeat(list::INDENT)),
+                        Span::raw("reading…").dim(),
+                    ]));
+                }
                 // Why the list is short, in the rows it leaves: muted
                 // beside models to pick, in ink when it is the whole answer.
                 let alone = items.is_empty();
@@ -25574,6 +25625,12 @@ fn lay_out_card(watch: &Watch, width: usize, since: u64) -> Card {
             card.push(Line::default());
             card.push(Line::from(format!("nothing here matches {query}")).dim());
         }
+    }
+    // Until its agents are listed the card says it is reading them, under
+    // the head and what is broken (the Rulebook's Reading).
+    if !watch.listed && rows.is_empty() {
+        card.push(Line::default());
+        card.push(Line::from("reading…").dim());
     }
     // Each agent a row names, a row waits on or a window sits beside,
     // opens it as its name does anywhere.
