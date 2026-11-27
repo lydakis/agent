@@ -373,6 +373,35 @@ fn let_screen_go() {
     term::restore();
     let _ = disable_raw_mode();
 }
+/// The window's first frame, as soon as its agent is known: the composer
+/// on that agent, and `reading…` over it where the conversation will
+/// come, until the window draws whole (the Rulebook's Reading). Over
+/// whatever the screen held, a window `/switch` left included.
+fn draw_opening(name: &str) {
+    let Ok(mut terminal) = Terminal::new(frames::Backend::screen()) else {
+        return;
+    };
+    let _ = frames::frame(|| {
+        wipe(&mut terminal)?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            if area.height < 6 || area.width < 20 {
+                return;
+            }
+            let row = |y: u16| Rect::new(0, y, area.width, 1);
+            let reading = Line::from(vec![Span::raw("  "), Span::raw(READING).dim()]);
+            frame.render_widget(Paragraph::new(reading), row(area.height - 5));
+            let composer = Line::from(vec![
+                Span::raw("  "),
+                Span::raw("› ").bold(),
+                Span::raw(format!("Message {}", spoken(name))).dim(),
+            ]);
+            frame.render_widget(Paragraph::new(composer), row(area.height - 3));
+        })?;
+        Ok(())
+    });
+}
+
 /// Into the alternate screen with the mouse, which Sonny owns while it
 /// runs, or out of it, the keys told apart on the screen it is on, and the
 /// terminal's colour-scheme reports heard while it is there.
@@ -4120,6 +4149,13 @@ async fn run() -> Result<bool, String> {
     let held = SCREEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
+    // Opened in another's place, on an agent named: the window becomes its
+    // at once, reading (the Rulebook's Reading).
+    let ours = options.side.is_none() && !options.embedded;
+    let opened = held && ours && options.bot.is_some();
+    if let Some(bot) = options.bot.as_deref().filter(|_| opened) {
+        draw_opening(bot);
+    }
     // What Sonny does as it starts, done once.
     if !held {
         // The program this window runs, so one installed over it later is
@@ -4199,6 +4235,22 @@ async fn run() -> Result<bool, String> {
             resume::report(&reopen(&name), &dir);
         }
     }
+    // The screen, the terminal asked what it draws, once: a window opened
+    // in another's place keeps them. Up as soon as the agent is known, so
+    // the window says it is reading while the rest is read.
+    if !held {
+        enable_raw_mode().map_err(|e| e.to_string())?;
+        SCREEN_HELD.store(true, std::sync::atomic::Ordering::Relaxed);
+        term::detect();
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+        keys_apart(true);
+        own_screen(true);
+    }
+    // A side chat opens on its window's alternate screen, still drawn on;
+    // an agent in another's pane draws there.
+    if ours && !opened {
+        draw_opening(&name);
+    }
     // The daemon's `stats` names this window's connections by its agent.
     let _ = client.label(&name).await;
     // Everything after now arrives live; history is read from the bot's
@@ -4215,28 +4267,14 @@ async fn run() -> Result<bool, String> {
         trigger::cleanup_by_default(&bot, &options.store, &options.socket);
     }
 
-    // The screen, the terminal asked what it draws, once: a window opened
-    // in another's place keeps them.
-    let held = SCREEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
-    if !held {
-        enable_raw_mode().map_err(|e| e.to_string())?;
-        SCREEN_HELD.store(true, std::sync::atomic::Ordering::Relaxed);
-        term::detect();
-        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-        keys_apart(true);
-        own_screen(true);
-    }
     let mut terminal = Terminal::new(frames::Backend::screen()).map_err(|e| e.to_string())?;
-    // A side chat opens on its window's alternate screen, still drawn on.
-    if !held {
-        let _ = wipe(&mut terminal);
-    }
     let mut app = App::new(client, &name, &bot, options.clone());
-    // The window this one opened in place of stays on the screen until
-    // this one's first frame clears it and draws whole, in one update; its
-    // **Projects** open on what it read.
+    // What is on the screen (the opening frame, or the window this one
+    // opened in place of) stays until this one's first frame clears it and
+    // draws whole, in one update; **Projects** open on what the window
+    // before read.
+    app.stale = true;
     if held {
-        app.stale = true;
         app.projects_kept = PROJECTS_LEFT
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -22799,6 +22837,7 @@ impl App {
     /// first of `names` that is an agent, else every agent, to list
     /// narrowed by `typed` ([`App::switch_came`]).
     fn switching(&mut self, typed: &str, names: Vec<String>) {
+        let named = !names.is_empty();
         let (client, woken, me) = (self.client.clone(), self.woken.clone(), self.bot.clone());
         let (store, picks_kept, typed) = (self.store(), self.picks_kept, typed.to_owned());
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -22856,6 +22895,11 @@ impl App {
             let _ = send.send(read.await);
             woken.notify_one();
         });
+        // A name is looked up before the window goes to it: said meanwhile
+        // (the Rulebook's Reading).
+        if named {
+            self.notice = Some(READING.into());
+        }
         self.switch_reading = Some((self.acted, receive));
     }
 
@@ -22872,6 +22916,9 @@ impl App {
             Err(_) => Switching::Failed("the list was dropped".into()),
         };
         self.switch_reading = None;
+        if self.notice.as_deref() == Some(READING) {
+            self.notice = None;
+        }
         // The list opens over the composer: not once the person moved on.
         if matches!(read, Switching::List { .. }) && asked != self.acted {
             return;
