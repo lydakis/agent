@@ -294,10 +294,15 @@ class AcpTests(ModelFixture):
         second = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('and the tests')})
         answered, _ = thread.answer_of(first)
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        # The steer lifts the call's wait out of the turn, which ends; the
+        # person allows it after, as a person does.
+        deadline = time.monotonic() + 30
+        while self.daemon.request('inspect', bot='calc.lead')['result'].get('running_turn') is not None:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
         answered, updates = thread.answer_of(second)
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
-        # Idle before the answer, which waited for the task's thread.
         self.assertIn('idle', [u.get('state') for u in updates if u['sessionUpdate'] == 'state_update'])
         # One turn ran; the second prompt was taken into it.
         turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
@@ -308,13 +313,41 @@ class AcpTests(ModelFixture):
         sent = [m for m in sent if m.get('origin') != 'lookout']
         self.assertEqual([(m['status'], m['turn']) for m in sent],
                          [('completed', turns[0]['turn']), ('taken', turns[0]['turn'])])
-        # T3 Code would not take the task as a child: it opens as a thread of
-        # its own, in its worktree.
+        # The task's start, lifted and allowed, still opens its thread once
+        # it ends. T3 Code would not take the task as a child: it opens as a
+        # thread of its own, in its worktree.
         self.assertEqual(self.t3.calls.get(timeout=30)['name'], 'delegate_task')
         launch = self.t3.calls.get(timeout=30)
         self.assertEqual(launch['name'], 't3_thread_launch')
         self.assertEqual(launch['arguments']['workspaceStrategy'],
                          {'type': 'existing_worktree', 'worktreePath': str(self.path / '.agent/worktrees/calc.fix')})
+
+    def test_a_task_allowed_long_after_a_message_lifted_its_start_opens_its_thread(self):
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)],
+                            approve=['start_task'], approver='manual')
+        thread, session = self.open(repo)
+        self.adopt(thread, session)
+        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
+        thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
+        [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
+                   if m.get('method') == 'session/request_permission']
+        # A message lifts the start's wait out of its turn; the lead works
+        # on through more history than one page of it before the person
+        # allows the start.
+        self.daemon.request('submit', bot='calc.lead', request_id='m', prompt='look', delivery='steer')
+        for n in range(40):
+            deadline = time.monotonic() + 30
+            while self.daemon.request('inspect', bot='calc.lead')['result'].get('running_turn') is not None:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+            self.daemon.request('submit', bot='calc.lead', request_id=f'more-{n}', prompt=f'more {n}',
+                                delivery='queue')
+        nodes = self.daemon.request('history_nodes', bot='calc.lead', limit=64)['result']['nodes']
+        self.assertNotIn(1, [node['turn'] for node in nodes])
+        thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
+        self.assertEqual(self.t3.calls.get(timeout=30)['name'], 'delegate_task')
 
     def test_a_prompt_cancelled_while_it_waits_in_line_is_answered(self):
         repo = self.repo()
