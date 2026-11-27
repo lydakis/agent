@@ -2116,8 +2116,10 @@ pages, an open card's refresh and the reads Sonny repeats every few seconds
 too, as Codex's TUI sends its ops and hears back as events. A reconnect's
 catching up (what came since the last item drawn, the turn still running, its
 approvals and companions) is read beside the loop too, and drawn when it has
-all come. Opening a card (its first read) and `/switch` still read before they
-show.
+all come. Opening a card and going to another agent show at once and say
+`reading…` until their read comes ([below](#what-a-read-shows)). Drawing the
+conversation again after `/verbose` or a theme change still reads on the loop,
+with `reading…` on the cleared window.
 
 The window holds only the event it is showing, as Codex's TUI takes one at a
 time. The rest wait in the connection's own queue (4,096 events or 8 MiB), so a fast
@@ -2134,6 +2136,31 @@ and the person types on while the reply streams:
 ![Before: with the daemon's answers held, Enter freezes the window, the steer still in the composer](sonny/keys-held-daemon-main.png)
 
 </details>
+
+### What a read shows
+
+Whatever waits on a read says so where its answer will appear, from the key
+until the answer lands: one muted word, `reading…`, with no spinner, clock or
+count. A view opens at once with what it already knows and puts `reading…`
+under it; the answer replaces the word, and so does a failure, in red.
+
+- Going to another agent (`/switch NAME`, Projects, alt+arrows) and a window's
+  start draw the new window at once: its composer, and `reading…` where the
+  conversation will be.
+- `/status`, `/context`, `/model`, `/background` and a command's output, `/sky`,
+  a margin live note, `/side`, `/react` and `/reply` on a reply not yet read, and
+  `/verbose` or a theme's repaint show it while their read is out.
+- Read back to the first row while older rows are read, the top row says
+  `reading…` until they come.
+
+Reads the person did not ask for (a card's refresh, the reads repeated every
+few seconds) show nothing.
+
+![A window starting behind a daemon that answers in 1.5 s, as going to another agent draws too: the window's composer and `reading…` at once](sonny/reading-start.png)
+
+![/status as it opens behind the same daemon: the project's head, then `reading…`](sonny/reading-status.png)
+
+![Read back to the first row while older rows are read](sonny/reading-scroll.png)
 
 ## Checks
 
