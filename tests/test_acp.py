@@ -322,6 +322,33 @@ class AcpTests(ModelFixture):
         self.assertEqual(launch['arguments']['workspaceStrategy'],
                          {'type': 'existing_worktree', 'worktreePath': str(self.path / '.agent/worktrees/calc.fix')})
 
+    def test_a_task_allowed_long_after_a_message_lifted_its_start_opens_its_thread(self):
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)],
+                            approve=['start_task'], approver='manual')
+        thread, session = self.open(repo)
+        self.adopt(thread, session)
+        self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
+        thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
+        [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
+                   if m.get('method') == 'session/request_permission']
+        # A message lifts the start's wait out of its turn; the lead works
+        # on through more history than one page of it before the person
+        # allows the start.
+        self.daemon.request('submit', bot='calc.lead', request_id='m', prompt='look', delivery='steer')
+        for n in range(40):
+            deadline = time.monotonic() + 30
+            while self.daemon.request('inspect', bot='calc.lead')['result'].get('running_turn') is not None:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+            self.daemon.request('submit', bot='calc.lead', request_id=f'more-{n}', prompt=f'more {n}',
+                                delivery='queue')
+        nodes = self.daemon.request('history_nodes', bot='calc.lead', limit=64)['result']['nodes']
+        self.assertNotIn(1, [node['turn'] for node in nodes])
+        thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
+        self.assertEqual(self.t3.calls.get(timeout=30)['name'], 'delegate_task')
+
     def test_a_prompt_cancelled_while_it_waits_in_line_is_answered(self):
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',

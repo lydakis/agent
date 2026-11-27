@@ -2989,33 +2989,50 @@ async fn whole_arguments(client: &Client, bot: &str, id: &str) -> Value {
         .map_or(Value::Null, |(_, arguments)| arguments)
 }
 
-/// Call `id`'s name and arguments, from the bot's newest items: of
-/// `turn`'s, when given, as a later turn's call may have its id.
+/// Call `id`'s name and arguments, from the bot's newest items; with
+/// `turn`, from that turn's, page by page back to its start, as a later
+/// turn's call may have its id and a lifted call may wait long after.
 async fn call_of(
     client: &Client,
     bot: &str,
     turn: Option<i64>,
     id: &str,
 ) -> Option<(String, Value)> {
-    let page = client
-        .request("history_nodes", json!({"bot": bot, "limit": 64}))
-        .await
-        .ok()?;
-    let nodes: Vec<i64> = page["nodes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|node| turn.is_none() || node["turn"].as_i64() == turn)
-        .filter_map(|node| node["node"].as_i64())
-        .collect();
-    let call = items(client, bot, &nodes)
-        .await
-        .into_iter()
-        .find(|item| item["type"] == "function_call" && item["call_id"] == id)?;
-    let arguments = (call["arguments"].as_str())
-        .and_then(|arguments| serde_json::from_str(arguments).ok())
-        .unwrap_or(Value::Null);
-    Some((call["name"].as_str()?.to_owned(), arguments))
+    let mut from = Value::Null;
+    loop {
+        let page = client
+            .request(
+                "history_nodes",
+                json!({"bot": bot, "from": from, "limit": 64}),
+            )
+            .await
+            .ok()?;
+        let listed = page["nodes"].as_array().cloned().unwrap_or_default();
+        let nodes: Vec<i64> = (listed.iter())
+            .filter(|node| turn.is_none() || node["turn"].as_i64() == turn)
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        let call = match nodes.is_empty() {
+            true => None,
+            false => (items(client, bot, &nodes).await.into_iter())
+                .find(|item| item["type"] == "function_call" && item["call_id"] == id),
+        };
+        if let Some(call) = call {
+            let arguments = (call["arguments"].as_str())
+                .and_then(|arguments| serde_json::from_str(arguments).ok())
+                .unwrap_or(Value::Null);
+            return Some((call["name"].as_str()?.to_owned(), arguments));
+        }
+        // Newest first: a page that reached an earlier turn passed the
+        // call's start.
+        let passed = turn.is_none_or(|turn| {
+            (listed.iter()).any(|node| node["turn"].as_i64().is_some_and(|at| at < turn))
+        });
+        from = page["next_from"].clone();
+        if passed || from.is_null() {
+            return None;
+        }
+    }
 }
 
 /// What marks call `call` of `turn`'s approval request `request` as put
