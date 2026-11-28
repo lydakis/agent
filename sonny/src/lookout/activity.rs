@@ -1,12 +1,20 @@
 //! The agent source: what happens in the tasks a subscriber watches, as
 //! events in the one envelope every source uses (`sources::Event`). Its
-//! topic is always the task's bot name, and it has five kinds:
+//! topic is the task's bot name, and it has six kinds:
 //!
 //! - `wrote`: someone other than the subscriber wrote in the task.
 //! - `turn.ended`: a turn ended, with the task's reply.
 //! - `question`: the task asked the person with the ask tool.
 //! - `approval`: a call reached the person for approval.
 //! - `margin`: the task put a margin note, or took one away.
+//! - `answered`: a question an agent below the task asked was answered.
+//!   Its topic is the agent above the asker that the subscriber watches,
+//!   the nearest one: an answer goes up its makers as the question went
+//!   up to the person, so one who follows a lead by name hears what was
+//!   answered under it. One who watches the asker itself hears the
+//!   answer there, as `wrote`, and not again. The lookout hands this
+//!   source the events that may carry an answer up ([`rises`]) with the
+//!   asker's makers; which, and to whom, is said here ([`Activity::below`]).
 //!
 //! It holds the logic of this source alone, as any source holds its own:
 //! who asked for each turn, whose words are whose, and two things it does
@@ -27,10 +35,10 @@ pub const PERSON: &str = "the person";
 
 /// The fields its events have, as the `follows` tool lists them for an
 /// agent to filter on.
-pub const FIELDS: [(&str, &str); 15] = [
+pub const FIELDS: [(&str, &str); 16] = [
     (
         "type",
-        "string: wrote, turn.ended, question, approval or margin",
+        "string: wrote, turn.ended, question, approval, margin or answered",
     ),
     (
         "bot",
@@ -41,7 +49,10 @@ pub const FIELDS: [(&str, &str); 15] = [
         "from",
         "string, who wrote it: \"the person\", an agent's name, a client or \"someone\"; for the other kinds, the task",
     ),
-    ("turn", "number, the turn's number in its task"),
+    (
+        "turn",
+        "number, the turn's number in its task, for answered in the asker",
+    ),
     (
         "text",
         "string, what was written, the task's reply, the question, what waits for approval, or the margin note's handle",
@@ -70,6 +81,10 @@ pub const FIELDS: [(&str, &str); 15] = [
     ),
     ("id", "string, a margin note's id"),
     ("removed", "boolean, the margin note was taken away"),
+    (
+        "asker",
+        "string, for answered: the agent below that asked the question",
+    ),
 ];
 
 type Key = (String, i64);
@@ -104,6 +119,14 @@ pub enum Kind {
         name: Option<String>,
         node: Option<i64>,
         reason: Option<String>,
+    },
+    /// The answer to a question `asker`, an agent below the event's task,
+    /// asked, by `from` as `wrote` names them: their words at its history
+    /// node, or still queued in its turn's record.
+    Answered {
+        asker: String,
+        node: Option<i64>,
+        from: String,
     },
 }
 
@@ -417,6 +440,74 @@ impl Activity {
         out
     }
 
+    /// One of the daemon's events in a task the subscriber does not watch,
+    /// whose makers are `above`, nearest first ([`rises`]): an answer to
+    /// its question is news on the nearest of them the subscriber
+    /// `watches`, told as it reaches the asker, as its words would be.
+    pub fn below(
+        &mut self,
+        event: &Value,
+        above: &[String],
+        watches: impl Fn(&str) -> bool,
+        order: i64,
+    ) -> Vec<Out> {
+        let (Some(kind), Some(asker)) = (event["event"].as_str(), event["bot"].as_str()) else {
+            return Vec::new();
+        };
+        let Some(at) = above.iter().position(|bot| watches(bot)) else {
+            return Vec::new();
+        };
+        let Some(turn) = super::number(event) else {
+            return Vec::new();
+        };
+        let data = &event["data"];
+        let key = (asker.to_owned(), turn);
+        let answered = |turn: i64, node: Option<i64>, from: String| {
+            vec![Out::Read(Pending {
+                task: above[at].clone(),
+                maker: above.get(at + 1).cloned(),
+                turn,
+                order,
+                kind: Kind::Answered {
+                    asker: asker.to_owned(),
+                    node,
+                    from,
+                },
+            })]
+        };
+        // Who answered, as `wrote` names them.
+        let from = (answer(data).then(|| self.author(data)).flatten())
+            .unwrap_or_else(|| PERSON.to_owned());
+        match kind {
+            "accepted" if answer(data) && !self.queued.remove(&key) => {
+                answered(turn, data["node"].as_i64(), from)
+            }
+            "queued" if answer(data) && data["delivery"] == "steer" => {
+                self.steers.insert(key, Some(from));
+                Vec::new()
+            }
+            "queued" if answer(data) => {
+                self.queued.insert(key);
+                answered(turn, None, from)
+            }
+            "steered" => {
+                let Some(message) = data["message"].as_i64() else {
+                    return Vec::new();
+                };
+                match self.steers.remove(&(asker.to_owned(), message)) {
+                    Some(Some(from)) => answered(message, data["node"].as_i64(), from),
+                    _ => Vec::new(),
+                }
+            }
+            "message_ended" => {
+                self.steers.remove(&key);
+                self.queued.remove(&key);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Whether a call waiting on the person is told now: once a turn.
     fn approval(&mut self, task: &str, call: &str) -> bool {
         if self.approvals.len() >= CALLS {
@@ -435,6 +526,25 @@ impl Activity {
 pub(super) fn note(data: &Value) -> bool {
     (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
         || (data["origin"] == crate::commons::ORIGIN && data["from"]["bot"].is_null())
+}
+
+/// Whether a message is an answer to a question an agent asked, from no
+/// agent: every answer goes under a request id [`crate::asks::request_id`]
+/// gives, from Sonny or a client.
+pub fn answer(data: &Value) -> bool {
+    data["from"]["bot"].is_null()
+        && (data["request_id"].as_str()).is_some_and(|id| id.starts_with(crate::asks::ANSWER))
+}
+
+/// Whether one of the daemon's events may carry an answer up to the
+/// agents above its bot ([`Activity::below`]): an answer taken in or put
+/// in line, or a steer taken in or ended in line, which may be one.
+pub fn rises(event: &Value) -> bool {
+    match event["event"].as_str() {
+        Some("accepted" | "queued") => answer(&event["data"]),
+        Some("steered" | "message_ended") => true,
+        _ => false,
+    }
 }
 
 /// Who asked for a turn, as its end names them: `you` for the subscriber,
@@ -642,6 +752,30 @@ pub fn built(lead: &str, pending: &Pending, read: Read) -> Option<Event> {
                 json!({"status": status, "done": done, "asked_by": asked_by, "error": error}),
             ))
         }
+        // The person's words go as the daemon quotes them from the
+        // asker's turn, as `wrote` has them; a client's, as written.
+        (Kind::Answered { asker, from, .. }, Read::Words { text, .. }) => {
+            let person = from == PERSON;
+            let said = match person {
+                true => format!("(their words are quoted below, from {asker}/{turn})"),
+                false => text.clone(),
+            };
+            let mut made = event(
+                task,
+                maker,
+                *turn,
+                "answered",
+                format!("{task}/answered/{asker}/{turn}"),
+                format!("{from} answered {asker}'s question"),
+                said,
+                json!({"from": from, "asker": asker}),
+            );
+            if person {
+                made.quote = Some((asker.clone(), *turn));
+                Arc::make_mut(&mut made.fields)["text"] = json!(cut(&text));
+            }
+            Some(made)
+        }
         (
             Kind::Call {
                 call, name, reason, ..
@@ -747,6 +881,82 @@ mod tests {
         assert!(!made.text.contains("blue"), "the daemon quotes it");
         assert_eq!(made.fields["text"], "make the button blue");
         assert_eq!(made.fields["type"], "wrote");
+    }
+
+    #[test]
+    fn an_answer_below_is_told_once_on_the_nearest_agent_watched_above() {
+        let mut activity = Activity::new("home.lead");
+        let above = ["calc.parser".to_owned(), "calc.lead".to_owned()];
+        let watches = |bot: &str| bot == "calc.lead";
+        let mut below = |event: Value| reads(activity.below(&event, &above, watches, 1));
+        let answer = |delivery: &str| json!({"request_id": "answer-0a1b", "delivery": delivery});
+        let in_line = |kind: &str, data: Value| json!({"bot": "calc.ui", "turn": null, "message": 4, "event": kind, "data": data});
+        // Taken in as a turn starts: on the lead, the nearest watched.
+        let started = json!({"request_id": "answer-0a1b", "node": 9});
+        let told = below(ev("calc.ui", 3, "accepted", started));
+        assert_eq!(told.len(), 1);
+        assert_eq!(
+            (
+                told[0].task.as_str(),
+                told[0].maker.as_deref(),
+                told[0].turn
+            ),
+            ("calc.lead", None, 3)
+        );
+        assert_eq!(
+            told[0].kind,
+            Kind::Answered {
+                asker: "calc.ui".into(),
+                node: Some(9),
+                from: PERSON.into()
+            }
+        );
+        // Put in line: told then, not again as its turn starts.
+        assert_eq!(below(in_line("queued", answer("queue"))).len(), 1);
+        let taken = json!({"request_id": "answer-0a1b"});
+        assert!(below(ev("calc.ui", 4, "accepted", taken)).is_empty());
+        // A steer is told once taken in; one that ends in line never.
+        assert!(below(in_line("queued", answer("steer"))).is_empty());
+        let steered = json!({"message": 4, "node": 11});
+        let told = below(ev("calc.ui", 5, "steered", steered.clone()));
+        assert_eq!((told.len(), told[0].turn), (1, 4));
+        assert!(below(in_line("queued", answer("steer"))).is_empty());
+        assert!(below(in_line("message_ended", json!({}))).is_empty());
+        assert!(below(ev("calc.ui", 5, "steered", steered)).is_empty());
+        // Another request, or an agent's message, is no answer.
+        let person = json!({"request_id": "r-1", "node": 12});
+        assert!(below(ev("calc.ui", 6, "accepted", person)).is_empty());
+        let agent = json!({"request_id": "answer-0a1b", "from": {"bot": "calc.lead"}});
+        assert!(below(ev("calc.ui", 7, "accepted", agent)).is_empty());
+        // A person a client named answered: by their name, as written.
+        let named = json!({"request_id": "answer-0a1b", "person": "Dana", "node": 14});
+        let told = below(ev("calc.ui", 8, "accepted", named));
+        let made = built(
+            "home.lead",
+            &told[0],
+            Read::Words {
+                text: "the spec".into(),
+                someone: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            made.from.as_deref(),
+            Some("Dana answered calc.ui's question")
+        );
+        assert_eq!(
+            (made.fields["from"].as_str(), made.quote.as_ref()),
+            (Some("Dana"), None)
+        );
+        assert_eq!(made.text, "the spec");
+        // Nothing above it watched: nothing.
+        let none = activity.below(
+            &ev("calc.ui", 9, "accepted", json!({"request_id": "answer-1"})),
+            &above,
+            |_| false,
+            1,
+        );
+        assert!(none.is_empty());
     }
 
     #[test]

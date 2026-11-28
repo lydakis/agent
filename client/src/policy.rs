@@ -1468,18 +1468,11 @@ fn append(
     push(text, path, header, &body, reserve)
 }
 
-/// Append a memory index's head ([`crate::memory::head`]): an index holds
-/// every fact, and a new bot starts with the most needed and searches for
-/// the rest, each live fact's description filled from `workspace` as it is
-/// now. Reads at most [`MEMORY_READ`] of it, enough for thousands of
-/// facts; past that, only those count toward the facts it leaves out.
-fn append_memory(
-    text: &mut String,
-    path: PathBuf,
-    workspace: &Path,
-    reserve: usize,
-) -> Result<Option<Source>, Failure> {
-    let mut bytes = read_head(&path, MEMORY_READ)?;
+/// A memory index as composing reads it: at most [`MEMORY_READ`], enough
+/// for thousands of facts; past that, only those count toward the facts
+/// its head leaves out.
+fn read_index(path: &Path) -> Result<String, Failure> {
+    let mut bytes = read_head(path, MEMORY_READ)?;
     if bytes.len() > MEMORY_READ {
         let end = bytes
             .iter()
@@ -1487,18 +1480,93 @@ fn append_memory(
             .map_or(0, |at| at + 1);
         bytes.truncate(end);
     }
-    let index = String::from_utf8(bytes).map_err(|e| Failure::Unreadable {
-        path: path.clone(),
+    String::from_utf8(bytes).map_err(|e| Failure::Unreadable {
+        path: path.to_path_buf(),
         reason: e.utf8_error().to_string(),
-    })?;
-    push(
-        text,
-        path,
-        "\n\n",
-        &crate::memory::head(&index, workspace),
-        reserve,
-    )
+    })
 }
+
+/// Append the memory indexes' heads ([`crate::memory::head`]): an index
+/// holds every fact, and a new bot starts with the most needed and
+/// searches for the rest, each live fact's description filled from
+/// `workspace` as it is now. Each head takes at most [`HEAD`], and
+/// together they take at most the room `text` has beside `reserve`: when
+/// they do not fit, the indexes share that room evenly, the smaller head
+/// whole when it fits its share and what it leaves going to the other, and
+/// a head past its share shortens by [`crate::memory::head`]'s steps, as
+/// Codex cuts an AGENTS.md to its budget rather than dropping it. Only an
+/// index whose head fits no room at all, not even the line saying how
+/// many facts it leaves out, is left out.
+///
+/// [`HEAD`]: crate::memory::HEAD
+fn append_memory(
+    text: &mut String,
+    memory: &[PathBuf],
+    workspace: &Path,
+    reserve: usize,
+    leave: &mut Leave,
+) -> Result<Vec<Source>, Failure> {
+    // Each index there is, read, with its head at full size.
+    let mut heads = Vec::new();
+    for path in memory {
+        let read = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                not_dangling(path).map(|()| None)
+            }
+            _ => read_index(path).map(Some),
+        };
+        match read {
+            Ok(Some(index)) => {
+                let head = crate::memory::head(&index, workspace);
+                heads.push((path.clone(), index, head));
+            }
+            Ok(None) => {}
+            Err(failure) => leave.out(failure)?,
+        }
+    }
+    // What one takes in the instructions, its separator included.
+    let taken = |head: &str| match head.trim() {
+        "" => 0,
+        body => MEMORY_HEADER.len() + body.len(),
+    };
+    let room = MAX_INSTRUCTIONS.saturating_sub(text.len() + reserve);
+    if heads.iter().map(|(_, _, head)| taken(head)).sum::<usize>() > room {
+        // Smallest first: each takes an even share of what is left.
+        let mut order: Vec<usize> = (0..heads.len()).collect();
+        order.sort_by_key(|&at| taken(&heads[at].2));
+        let mut left = room;
+        for (done, &at) in order.iter().enumerate() {
+            let share = left / (order.len() - done);
+            let (path, index, head) = &mut heads[at];
+            if taken(head) > share {
+                let fits = share.saturating_sub(MEMORY_HEADER.len());
+                match crate::memory::head_within(index, workspace, fits) {
+                    Some(shorter) => *head = shorter,
+                    // Not even its closing line fits: left out whole.
+                    None => {
+                        leave.out(Failure::TooLong {
+                            path: path.clone(),
+                            total: text.len() + taken(head) + reserve,
+                        })?;
+                        head.clear();
+                        continue;
+                    }
+                }
+            }
+            left -= taken(head);
+        }
+    }
+    let mut sources = Vec::new();
+    for (path, _, head) in heads {
+        // Each fits now, so only one left out above is empty.
+        sources.extend(push(text, path, MEMORY_HEADER, &head, reserve)?);
+    }
+    Ok(sources)
+}
+
+/// What comes before each memory index's head: an index carries its own
+/// heading.
+const MEMORY_HEADER: &str = "\n\n";
 
 /// How much of a memory index composing reads.
 const MEMORY_READ: usize = 4 * 1024 * 1024;
@@ -1640,25 +1708,18 @@ fn compose(
             Err(failure) => leave.out(failure)?,
         }
     }
-    // Memory and the role go whole, so they are composed first, and the
-    // skill and profile lists take the room they leave: shortened, then
-    // cut, rather than failing, as Codex and Claude Code size their skill
-    // lists. The text keeps its order: files, lists, memory, role.
+    // Memory and the role are composed first, and the skill and profile
+    // lists take the room they leave: shortened, then cut, rather than
+    // failing, as Codex and Claude Code size their skill lists. The text
+    // keeps its order: files, lists, memory, role.
     let mut after = text.clone();
     // Memory follows: what earlier agents saved, as it stands when the bot
     // is made. An index carries its own heading, so its head goes in as it
-    // is; one not written yet is none.
-    let mut indexes = Vec::new();
-    for path in memory {
-        let appended = match std::fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path),
-            _ => append_memory(&mut after, path.clone(), workspace, reserve)
-                .map(|index| indexes.extend(index)),
-        };
-        if let Err(failure) = appended {
-            leave.out(failure)?;
-        }
-    }
+    // is; one not written yet is none. Heads shorten to the room left
+    // beside the role, whether or not a caller refuses, so memory never
+    // costs a bot its role.
+    let role_room = role_block.as_ref().map_or(0, String::len);
+    let indexes = append_memory(&mut after, memory, workspace, role_room, &mut leave)?;
     // The role comes last: the most specific text a bot is given.
     if let (Some(role), Some(block)) = (role, role_block) {
         if after.len() + block.len() > MAX_INSTRUCTIONS {
@@ -2936,6 +2997,136 @@ mod tests {
         ));
         assert!(composed.text.contains("# Role: lead"));
         assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A synthetic index of `facts` facts, each description `long` bytes.
+    fn synthetic_index(scope: &str, facts: usize, long: usize) -> String {
+        let mut index = format!("# Memory in {scope}\n\n");
+        for n in 0..facts {
+            let words = "a fact of some length ".repeat(long / 22 + 1);
+            index += &format!(
+                "- {scope}-fact-{n:02} (project, verified 2026-11-05): {}\n",
+                &words[..long]
+            );
+        }
+        index
+    }
+
+    /// An AGENTS.md that leaves `room` bytes beside `role` for memory.
+    fn agents_leaving(root: &Path, role: &Profile, room: usize) {
+        let role_block = format!("{ROLE_HEADING}{}\n\n{}", role.name, role.body);
+        let fill = MAX_INSTRUCTIONS
+            - PREAMBLE.len()
+            - agents_header(&root.join("AGENTS.md")).len()
+            - role_block.len()
+            - room;
+        std::fs::write(root.join("AGENTS.md"), "x".repeat(fill)).unwrap();
+    }
+
+    #[test]
+    fn a_memory_index_past_the_room_left_shortens_rather_than_being_left_out() {
+        let root = temp("memory-room");
+        let role = Profile::parse("lead", None, &"You lead. ".repeat(100));
+        // A project index of 33 facts, about 10 KiB, as the lead's was.
+        let index = synthetic_index("p", 33, 280);
+        assert!(index.len() > 10_000 && index.len() < crate::memory::HEAD);
+        let project = root.join("MEMORY.md");
+        std::fs::write(&project, &index).unwrap();
+        let memory = std::slice::from_ref(&project);
+        // With 85 bytes less than it takes, it was left out whole.
+        agents_leaving(&root, &role, "\n\n".len() + index.trim().len() - 85);
+        let composed = instructions_leaving_out(&root, Some(&role), memory).unwrap();
+        assert!(composed.left_out.is_empty(), "{:?}", composed.left_out);
+        assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        assert!(composed.text.ends_with("You lead."));
+        assert_eq!(composed.memory.len(), 1);
+        // Shortened by the head's steps: every fact still named, the
+        // descriptions cut alike.
+        assert!(composed.memory[0].bytes < index.trim().len());
+        for n in 0..33 {
+            assert!(composed.text.contains(&format!("- p-fact-{n:02} (")));
+        }
+        assert!(composed.text.contains("…\n"));
+        // A caller that refuses gets the same, rather than failing on the
+        // role.
+        assert_eq!(
+            instructions(&root, Some(&role), memory).unwrap().text,
+            composed.text
+        );
+        // Far less room: names alone from the top, and how many are left.
+        agents_leaving(&root, &role, 600);
+        let composed = instructions_leaving_out(&root, Some(&role), memory).unwrap();
+        assert!(composed.left_out.is_empty(), "{:?}", composed.left_out);
+        assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        assert!(
+            composed
+                .text
+                .contains("- p-fact-00 (project, verified 2026-11-05)\n")
+        );
+        assert!(composed.text.contains(
+            "more facts are in this folder's MEMORY.md, not shown here; the memory tool's search finds them."
+        ));
+        assert!(composed.text.ends_with("You lead."));
+        // No room even for that line: left out whole, as before.
+        agents_leaving(&root, &role, 40);
+        let composed = instructions_leaving_out(&root, Some(&role), memory).unwrap();
+        assert!(matches!(
+            &composed.left_out[..],
+            [Failure::TooLong { path, .. }] if *path == project
+        ));
+        assert!(composed.memory.is_empty());
+        assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        assert!(composed.text.ends_with("You lead."));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_memory_indexes_share_the_room_left_and_the_smaller_stays_whole() {
+        let root = temp("memory-share");
+        let role = Profile::parse("lead", None, "You lead.");
+        let user_index = synthetic_index("u", 12, 200);
+        let project_index = synthetic_index("p", 33, 280);
+        let user = root.join("user.md");
+        let project = root.join("project.md");
+        std::fs::write(&user, &user_index).unwrap();
+        std::fs::write(&project, &project_index).unwrap();
+        let memory = [user.clone(), project.clone()];
+        let whole = |index: &str| "\n\n".len() + index.trim().len();
+        // Everything fits: both whole, in order, as before.
+        agents_leaving(&root, &role, whole(&user_index) + whole(&project_index));
+        let composed = instructions_leaving_out(&root, Some(&role), &memory).unwrap();
+        assert!(composed.left_out.is_empty());
+        assert!(composed.text.ends_with(&format!(
+            "\n\n{}\n\n{}\n\n# Role: lead\n\nYou lead.",
+            user_index.trim(),
+            project_index.trim()
+        )));
+        // A little less: the person's, smaller than half, stays whole and
+        // the project's takes the rest.
+        let room = whole(&user_index) + whole(&project_index) - 1000;
+        agents_leaving(&root, &role, room);
+        let composed = instructions_leaving_out(&root, Some(&role), &memory).unwrap();
+        assert!(composed.left_out.is_empty(), "{:?}", composed.left_out);
+        assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        assert!(composed.text.contains(user_index.trim()));
+        assert_eq!(composed.memory.len(), 2);
+        assert!(composed.memory[1].bytes < project_index.trim().len());
+        assert!(whole(&user_index) + "\n\n".len() + composed.memory[1].bytes <= room);
+        assert!(composed.text.contains("- p-fact-32 ("));
+        // Room for half of the smaller: each gets half, both shortened,
+        // neither left out.
+        agents_leaving(&root, &role, whole(&user_index));
+        let composed = instructions_leaving_out(&root, Some(&role), &memory).unwrap();
+        assert!(composed.left_out.is_empty(), "{:?}", composed.left_out);
+        assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        assert_eq!(composed.memory.len(), 2);
+        assert!(composed.memory[0].bytes <= whole(&user_index) / 2);
+        assert!(composed.memory[1].bytes <= whole(&user_index) / 2 + 1);
+        assert!(composed.text.contains("- u-fact-00 (") && composed.text.contains("- p-fact-00 ("));
+        let user_at = composed.text.find("# Memory in u").unwrap();
+        assert!(user_at < composed.text.find("# Memory in p").unwrap());
+        assert!(composed.text.ends_with("You lead."));
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -9,6 +9,7 @@
 //! short `└` look at the result, and a status row says how long the turn
 //! has run and how to stop it.
 mod acp;
+mod answered;
 mod approvals;
 mod asked;
 mod asks;
@@ -79,6 +80,7 @@ mod needs;
 mod new;
 mod pane;
 mod picker;
+mod pinned;
 mod place;
 mod plan;
 mod project;
@@ -514,13 +516,19 @@ struct Options {
     /// window's own, handed from each of its agents to the next and kept
     /// nowhere else.
     before: Option<String>,
+    /// The agent is the one `[sonny] opens` names, a bare `sonny` opening
+    /// it: one that is not there is said, and nothing opens.
+    by_setting: bool,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--agent NAME [--new [--folder DIR]] | --lead NAME | --new-lead [NAME]]\n\
+     \x20      [DIR | --agent NAME [--new [--folder DIR]] | --lead NAME | --new-lead [NAME]]\n\
      With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
-     first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
+     first time; --lead opens another of the folder's leads, --new-lead makes one. A bare\n\
+     sonny opens what [sonny] opens says: this folder's lead, the default, or one agent from\n\
+     any folder; sonny . or sonny DIR opens that folder's lead either way. Sonny makes no\n\
+     project in your home folder. Its\n\
      tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
      for the project's agents, /switch to open any agent, /new to start one.\n\
      Agents start tasks, put windows where the person looks, make projects\n\
@@ -726,6 +734,10 @@ struct ProjectsOpen {
     waiting: std::collections::HashSet<String>,
     /// The rows' version the last read counted ([`elsewhere::Rows`]).
     version: Option<u64>,
+    /// The pins the last read counted with: once they are not this
+    /// window's, each project that holds a pin found or let go is counted
+    /// again, though the page closed between.
+    pins: Vec<String>,
     /// Where the page and the pane beside it were drawn, for the mouse.
     page: Rect,
     side: Rect,
@@ -766,6 +778,9 @@ struct ProjectsKept {
     whole: bool,
     waiting: std::collections::HashSet<String>,
     version: Option<u64>,
+    pins: Vec<String>,
+    /// The pins the last read did not find listed.
+    gone: Vec<String>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
     /// The project picked to go to, as the page showed it: the window
     /// opened on its lead shows its counts and agents from its first
@@ -797,6 +812,8 @@ impl ProjectsKept {
         self.whole = read.whole;
         self.waiting = read.waiting;
         self.version = Some(read.version);
+        self.pins = read.pins;
+        self.gone = read.gone;
     }
 }
 
@@ -840,6 +857,10 @@ impl App {
     async fn open_projects(&mut self) {
         let here = self.scope().lead;
         let mut view = projects::View::new(&here).showing(&self.bot);
+        // The pins as this window knows them, so a number goes at once;
+        // read again beside it, as another window may have pinned since.
+        view.set_pins(self.pins.names().to_vec(), now_ms());
+        self.pins.read_again(&self.woken);
         // What it read when last open shows at once, and is read again
         // from a new snapshot: only what moved since is.
         let kept = match self.projects_kept.take() {
@@ -848,6 +869,7 @@ impl App {
                 if !kept.projects.is_empty() {
                     view.set(std::mem::take(&mut kept.projects), now_ms());
                 }
+                view.set_gone(std::mem::take(&mut kept.gone));
                 *kept
             }
             // The projects as any window last showed them show at once,
@@ -885,6 +907,7 @@ impl App {
             whole: kept.whole,
             waiting: kept.waiting,
             version: kept.version,
+            pins: kept.pins,
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -910,6 +933,8 @@ impl App {
             whole: open.whole,
             waiting: std::mem::take(&mut open.waiting),
             version: open.version,
+            pins: std::mem::take(&mut open.pins),
+            gone: open.view.take_gone(),
             job: open.job.take(),
             picked: None,
         };
@@ -1110,10 +1135,12 @@ impl App {
             match job.await {
                 Ok(Some(read)) => {
                     open.view.set(read.projects, now_ms());
+                    open.view.set_gone(read.gone);
                     open.state = read.state;
                     open.whole = read.whole;
                     open.waiting = read.waiting;
                     open.version = Some(read.version);
+                    open.pins = read.pins;
                 }
                 _ => open.version = None,
             }
@@ -1126,8 +1153,12 @@ impl App {
         };
         // Every agent's row, once in and moved since the last read (or the
         // questions open did, or the last read was short).
+        let pins = self.pins.names();
         let again = |rows: &elsewhere::Rows| {
-            Some(rows.version) != open.version || waiting != open.waiting || !open.whole
+            Some(rows.version) != open.version
+                || waiting != open.waiting
+                || !open.whole
+                || open.pins != pins
         };
         let Some((version, listed)) = shared.rows(|rows| {
             rows.filter(|rows| again(rows)).map(|rows| {
@@ -1143,10 +1174,11 @@ impl App {
         let (client, woken) = (self.client.clone(), self.woken.clone());
         let store = self.options.store.clone();
         let (bot, asks, approvals) = (self.bot.clone(), self.asks.clone(), self.approvals.clone());
+        let pins = self.pins.names().to_vec();
         let mut state = std::mem::take(&mut open.state);
         open.job = Some(tokio::spawn(async move {
             let read = read_projects(
-                &client, &store, &listed, &bot, &asks, &approvals, &waiting, &mut state,
+                &client, &store, &listed, &bot, &asks, &approvals, &waiting, &pins, &mut state,
             )
             .await
             .map(|(projects, whole)| ProjectsRead {
@@ -1155,6 +1187,12 @@ impl App {
                 whole,
                 waiting,
                 version,
+                // The pins no agent listed is: not there any more.
+                gone: (pins.iter())
+                    .filter(|pin| !listed.iter().any(|agent| agent.name == **pin))
+                    .cloned()
+                    .collect(),
+                pins,
             });
             woken.notify_one();
             read
@@ -1189,6 +1227,25 @@ impl App {
                         open.view.scroll(mouse.kind == MouseEventKind::ScrollDown);
                         return;
                     }
+                    // A pinned agent's name goes to it, as a name does
+                    // everywhere; a right click takes the other route.
+                    MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right))
+                        if open.page.contains(at)
+                            && let Some(bot) = (open.view.links().iter())
+                                .find(|(line, columns, _)| {
+                                    *line == (mouse.row - open.page.y) as usize
+                                        && columns
+                                            .contains(&((mouse.column - open.page.x) as usize))
+                                })
+                                .map(|(_, _, bot)| bot.clone()) =>
+                    {
+                        let link = format!("{}{bot}", links::AGENT);
+                        if let Some(link) = clicked(&link, button == MouseButton::Right) {
+                            self.close_projects();
+                            self.follow(&link);
+                        }
+                        return;
+                    }
                     MouseEventKind::Down(MouseButton::Left) if open.page.contains(at) => {
                         open.view.click((mouse.row - open.page.y) as usize, now)
                     }
@@ -1214,6 +1271,13 @@ impl App {
         match act {
             projects::Act::Stay => {}
             projects::Act::Close => self.close_projects(),
+            // A pin shows as its row; only a tenth is answered.
+            projects::Act::Pin(bot) => {
+                if let came @ pinned::Came::Full = self.toggle_pin(&bot) {
+                    self.notice = Some(came.said());
+                }
+            }
+            projects::Act::Gone(bot) => self.notice = Some(format!("{bot} is not there")),
             projects::Act::Go(lead) => {
                 let picked = (self.projects.as_ref())
                     .and_then(|open| open.view.picked())
@@ -1226,6 +1290,33 @@ impl App {
                 self.switch_picked(lead);
             }
         }
+    }
+
+    /// `bot` pinned, or unpinned where it is: at once in this window and
+    /// in **Projects** if open, and in the pins' file beside the window.
+    fn toggle_pin(&mut self, bot: &str) -> pinned::Came {
+        let came = self.pins.toggle(bot, &self.woken);
+        if let Some(open) = &mut self.projects {
+            open.view.set_pins(self.pins.names().to_vec(), now_ms());
+        }
+        came
+    }
+
+    /// The pins read when the window starts, and what a read or write of
+    /// them beside the window found once it lands: **Projects**, if open,
+    /// shows them. Whether they changed.
+    fn pins_tick(&mut self) -> bool {
+        if !self.pins_read && self.options.side.is_none() {
+            self.pins_read = true;
+            self.pins.read_again(&self.woken);
+        }
+        if !self.pins.landed(&self.woken) {
+            return false;
+        }
+        if let Some(open) = &mut self.projects {
+            open.view.set_pins(self.pins.names().to_vec(), now_ms());
+        }
+        true
     }
 
     /// Where **Projects** and the pane beside it go in `area`: two
@@ -1268,6 +1359,10 @@ struct ProjectsRead {
     waiting: std::collections::HashSet<String>,
     /// The rows' version it counted ([`elsewhere::Rows`]).
     version: u64,
+    /// The pins it counted with.
+    pins: Vec<String>,
+    /// The pinned agents it did not find listed.
+    gone: Vec<String>,
 }
 
 /// The pattern that names every project's agents: a project's are
@@ -1293,6 +1388,7 @@ async fn read_projects(
     asks: &[asks::Ask],
     approvals: &[Value],
     waiting: &std::collections::HashSet<String>,
+    pins: &[String],
     state: &mut ProjectsState,
 ) -> Option<(Vec<projects::Project>, bool)> {
     let now = std::time::SystemTime::now()
@@ -1356,7 +1452,13 @@ async fn read_projects(
             .map(|bot| bot.name.as_str())
             .collect();
         let titled = titles.named(&lead.name, lead.bot_id, lead.workspace.as_deref());
-        let mark = project_mark(&theirs, &asking, titled.as_deref());
+        // Its pinned agents, whose rows it keeps: one pinned or unpinned
+        // since counts it again.
+        let pinned: Vec<&str> = (theirs.iter())
+            .filter(|bot| pins.contains(&bot.name))
+            .map(|bot| bot.name.as_str())
+            .collect();
+        let mark = project_mark(&theirs, &asking, &pinned, titled.as_deref());
         std::hash::Hash::hash(&(&lead.name, mark), &mut shown);
         let keeps = !theirs
             .iter()
@@ -1430,6 +1532,15 @@ async fn read_projects(
             false => spoken(&lead.name),
         };
         let agents = status::agents(if title.is_empty() { &called } else { &title }, &read.rows);
+        // Each pinned agent's row as counted: its mark and its title.
+        let pinned = (read.rows.iter())
+            .filter(|row| row.run.is_none() && pinned.contains(&row.bot.as_str()))
+            .map(|row| projects::Pin {
+                bot: row.bot.clone(),
+                title: row.title.clone(),
+                state: row.state.clone(),
+            })
+            .collect();
         let project = projects::Project {
             lead: lead.name.clone(),
             name: called,
@@ -1440,6 +1551,7 @@ async fn read_projects(
             state: projects::pressing(&read.rows),
             last,
             agents,
+            pinned,
         };
         found.push(project.clone());
         if keeps && read.whole {
@@ -1472,7 +1584,12 @@ async fn read_projects(
 /// The mark of what a project is counted from ([`ProjectRead`]): every
 /// field of its agents as listed (whether each is closed, done, among
 /// them), those waiting on the person, and its file's title.
-fn project_mark(agents: &[standing::Agent], asking: &[&str], title: Option<&str>) -> u64 {
+fn project_mark(
+    agents: &[standing::Agent],
+    asking: &[&str],
+    pinned: &[&str],
+    title: Option<&str>,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut mark = std::hash::DefaultHasher::new();
     for agent in agents {
@@ -1500,6 +1617,7 @@ fn project_mark(agents: &[standing::Agent], asking: &[&str], title: Option<&str>
         (model, provider, workspace, profile, closed).hash(&mut mark);
     }
     asking.hash(&mut mark);
+    pinned.hash(&mut mark);
     title.hash(&mut mark);
     mark.finish()
 }
@@ -3616,6 +3734,7 @@ fn parse() -> Result<Options, String> {
     let (mut side, mut embedded) = (None, false);
     let (mut window_place, mut send, mut draft, mut reopened) = (None, None, None, false);
     let (mut land, mut before) = (false, None);
+    let mut folder = None;
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -3654,8 +3773,33 @@ fn parse() -> Result<Options, String> {
             // Unlisted: how a window hands on the agent it showed, for
             // `ctrl+6` to go back to.
             "--before" => before = Some(value()?),
+            // A folder, `.` or DIR: its lead, whatever `opens` says.
+            dir if !dir.starts_with('-') && folder.is_none() => folder = Some(dir.to_owned()),
             _ => return Err(usage()),
         }
+    }
+    let mut by_setting = false;
+    match folder {
+        // A folder and an agent named are two answers to one question.
+        Some(_) if bot.is_some() || new => return Err(usage()),
+        // As `cd DIR && sonny`, in folder mode: whatever the window or the
+        // terminal's multiplexer runs again opens from it.
+        Some(dir) => std::env::set_current_dir(&dir).map_err(|e| format!("{dir}: {e}"))?,
+        // Bare: what `[sonny] opens` says, which is `--agent NAME` when it
+        // names one, for every window it opens in this one's place too. A
+        // config that does not read opens the folder's lead, as every
+        // setting stands at its default until it reads, and is said there.
+        None if bot.is_none() && lead == project::Pick::Last => {
+            let opens = agent_client::config::load().map(|c| c.sonny.opens);
+            if let Some(name) = opens.ok().and_then(setting_agent) {
+                let mut given = self::args();
+                given.extend(["--agent".into(), name.clone()]);
+                *ARGS.lock().unwrap_or_else(|e| e.into_inner()) = given;
+                bot = Some(name);
+                by_setting = true;
+            }
+        }
+        None => {}
     }
     let (store, socket) = daemon_paths(store, socket)?;
     Ok(Options {
@@ -3677,7 +3821,28 @@ fn parse() -> Result<Options, String> {
         reopened,
         land,
         before,
+        by_setting,
     })
+}
+
+/// The agent a bare `sonny` opens by `[sonny] opens`, from any folder;
+/// none for the folder's lead.
+fn setting_agent(opens: agent_client::config::Opens) -> Option<String> {
+    match opens {
+        agent_client::config::Opens::Agent(name) => Some(name),
+        agent_client::config::Opens::Folder => None,
+    }
+}
+
+/// `bot`, named by `[sonny] opens`, is there: never the folder's lead in
+/// its place, so `sonny` means one thing.
+async fn setting_agent_there(client: &Client, bot: &str) -> Result<(), String> {
+    match project::find(client, bot).await? {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "{bot} is not there; sonny . opens this folder's lead"
+        )),
+    }
 }
 
 /// What runs this Sonny again on `bot`, from the same folder: `sonny`
@@ -3685,8 +3850,12 @@ fn parse() -> Result<Options, String> {
 /// setting, naming `bot` when the folder would not open it on its own, and
 /// with the daemon the environment named.
 fn reopen(bot: &str) -> Vec<String> {
+    reopen_from(&args(), bot)
+}
+
+/// [`reopen`], for a Sonny `given` these arguments.
+fn reopen_from(given: &[String], bot: &str) -> Vec<String> {
     let mut command = vec!["sonny".to_owned()];
-    let given = args();
     let mut args = given.iter().skip(1).cloned().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3698,6 +3867,12 @@ fn reopen(bot: &str) -> Vec<String> {
             "--new-lead" => {
                 args.next_if(|next| !next.starts_with("--"));
             }
+            "--store" | "--socket" | "--model" | "--rex-host" | "--side" => {
+                command.push(arg);
+                command.extend(args.next());
+            }
+            // The folder `sonny DIR` opened in, which this one runs in.
+            dir if !dir.starts_with('-') => {}
             _ => command.push(arg),
         }
     }
@@ -4190,6 +4365,9 @@ async fn run() -> Result<bool, String> {
         Some(bot) => {
             if options.new {
                 create(&client, &options, bot).await?;
+            }
+            if options.by_setting {
+                setting_agent_there(&client, bot).await?;
             }
             // Sonny on a project's lead is that lead's Sonny, wherever it
             // was opened, as by `show_agent` in the project's own home.
@@ -4757,7 +4935,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
 /// person's `--new` or a trigger's `--start`. Its tools and Sonny's, gated
 /// and sandboxed as the default row confines them, and the
 /// person's settings for its model. One way in, so no kind of agent gets
-/// another policy by being made elsewhere (#404).
+/// another policy by being made elsewhere (#404): a lead takes the same
+/// settings ([`starts_with`]).
 pub(crate) fn made(
     client: &Client,
     asked: &mut Value,
@@ -4770,7 +4949,7 @@ pub(crate) fn made(
     // writing `state`, the state folder of the agent that makes it, or its
     // own.
     let mode = approvals::default();
-    let mut settings = approvals::sandbox(mode, workspace, state);
+    let mut settings = starts_with(&config, rules::given().as_ref(), mode, workspace, state);
     let role = served::Role::TASK.within(&json!(settings));
     let declare = json!(declared::tools(role));
     let tools = agent_client::default_tools(
@@ -4782,35 +4961,12 @@ pub(crate) fn made(
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
-    // Named in its shell too; one another bot makes takes its maker's.
-    if let Some(state) = &state {
-        settings.insert("env".into(), json!({state::VAR: state}));
-    }
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
-    }
-    if let Some(outputs) = outputs() {
-        settings.insert("outputs".into(), json!(outputs));
-    }
-    settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
-    settings.insert("steps_only".into(), crate::exec::steps_only(&config));
-    if let Some(ms) = config.hold_ms {
-        settings.insert("hold_ms".into(), json!(ms));
     }
     // The agents of its project, which its agent tools list and name.
     if let Some(namespace) = asked["bot"].as_str().and_then(project::namespace) {
         settings.insert("namespace".into(), json!(namespace));
-    }
-    // The command rules in ~/.agent/rules, which the daemon applies.
-    if let Some(rules) = rules::given() {
-        settings.insert("rules".into(), json!(rules));
-    }
-    // The tiers and windows the person says models have; the tool host
-    // sends them again as they change ([`tool_host`]).
-    for (key, table) in agent_client::config::model_tables(&config) {
-        if !table.is_null() {
-            settings.insert(key.into(), table);
-        }
     }
     asked["settings"] = Value::Object(settings);
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
@@ -4819,6 +4975,46 @@ pub(crate) fn made(
         fields.extend(approvals::gate(mode, &tools));
     }
     Ok(())
+}
+
+/// The settings every agent Sonny makes starts with, whichever way it is
+/// made, a lead included ([`made`], `project::make`): confined as the row
+/// `mode` confines it in `workspace`, writing `state`, and the person's
+/// settings as `config` and the command `rules` give them. Its model's
+/// `cache_ttl` and its project's `namespace` go on with the model and name
+/// it is made with.
+pub(crate) fn starts_with(
+    config: &agent_client::config::Config,
+    rules: Option<&agent_client::rules::Policy>,
+    mode: &str,
+    workspace: &Path,
+    state: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut settings = approvals::sandbox(mode, workspace, state);
+    // Named in its shell too; one another bot makes takes its maker's.
+    if let Some(state) = &state {
+        settings.insert("env".into(), json!({state::VAR: state}));
+    }
+    if let Some(outputs) = outputs() {
+        settings.insert("outputs".into(), json!(outputs));
+    }
+    settings.insert("trailer".into(), json!(crate::stamp::trailer(config)));
+    settings.insert("steps_only".into(), crate::exec::steps_only(config));
+    if let Some(ms) = config.hold_ms {
+        settings.insert("hold_ms".into(), json!(ms));
+    }
+    // The command rules in ~/.agent/rules, which the daemon applies.
+    if let Some(rules) = rules {
+        settings.insert("rules".into(), json!(rules));
+    }
+    // The tiers and windows the person says models have; the tool host
+    // sends them again as they change ([`tool_host`]).
+    for (key, table) in agent_client::config::model_tables(config) {
+        if !table.is_null() {
+            settings.insert(key.into(), table);
+        }
+    }
+    settings
 }
 
 /// The prompt-cache lifetime Sonny gives the model of `bot`, as `inspect`
@@ -5705,7 +5901,7 @@ fn unknown_command(prompt: &str) -> Option<String> {
 /// the slash: name and what it does, in the Sonny Rulebook's order (talk,
 /// agents, this agent, work without you, every project, Sonny). Each
 /// has one name.
-const COMMANDS: [(&str, &str); 27] = [
+const COMMANDS: [(&str, &str); 28] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/zen", "Talk about one thing and keep the rest for later"),
     ("/reply", "Quote one of the agent's replies to answer it"),
@@ -5714,6 +5910,7 @@ const COMMANDS: [(&str, &str); 27] = [
     ("/status", "Show this project's agents"),
     ("/projects", "Show every project and go to one"),
     ("/switch", "Open any agent in this window"),
+    ("/pin", "Pin this agent at the top of projects"),
     ("/new", "Start a lead or a task here"),
     (
         "/memory",
@@ -5755,6 +5952,9 @@ const COMMANDS: [(&str, &str); 27] = [
 
 /// `/zen`'s line while zen is on.
 const ZEN_ENDS: &str = "End zen and hear what was kept";
+
+/// `/pin`'s line while this window's agent is pinned.
+const UNPIN: &str = "Unpin this agent";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
@@ -6863,6 +7063,13 @@ struct App {
     cards: HashMap<String, (u64, asks::Ask, bool)>,
     /// How many cards were drawn, which numbers the next.
     card_count: u64,
+    /// The questions of agents below answered from this agent's windows,
+    /// kept beside its reactions so a replay draws each where it was
+    /// ([`answered`]).
+    answered: answered::Answered,
+    /// The node each question of an agent below was drawn after here, by
+    /// key: where an answer to it given here is kept.
+    drawn_after: HashMap<String, i64>,
     /// How many cards were kept at the last look for ones trimmed away.
     cards_kept: usize,
     /// Where the questions stand that were answered or closed, by key,
@@ -7248,6 +7455,12 @@ struct App {
     /// What **Projects** read, kept once it closes: it opens again on
     /// what it showed, and reads only the projects that moved since.
     projects_kept: Option<Box<ProjectsKept>>,
+    /// The agents pinned at the top of **Projects**, as this window knows
+    /// them: read when the window starts and when **Projects** opens,
+    /// beside the window.
+    pins: pinned::Pins,
+    /// Whether the pins were read since the window started.
+    pins_read: bool,
     /// The project's agents as last read, kept current by `follower`,
     /// with their [`rows_mark`] once counted; the count holds it while it
     /// runs, so there is one copy.
@@ -9171,7 +9384,9 @@ impl App {
             record["provider"].as_str().unwrap_or("?"),
             record["model"].as_str().unwrap_or("?")
         );
+        let pins = pinned::Pins::new(&options.store);
         Self {
+            pins,
             client,
             bot: bot.to_owned(),
             project: None,
@@ -9227,6 +9442,8 @@ impl App {
             unpinned: Vec::new(),
             cards: HashMap::new(),
             card_count: 0,
+            answered: answered::Answered::default(),
+            drawn_after: HashMap::new(),
             cards_kept: 0,
             settled: HashMap::new(),
             unsettled: Vec::new(),
@@ -9384,6 +9601,7 @@ impl App {
             follower: None,
             projects: None,
             projects_kept: None,
+            pins_read: false,
             listed: None,
             listed_lead: None,
             rows_mark: None,
@@ -9519,6 +9737,18 @@ impl App {
         self.recall = recall::Recall::load(attach::MOST_BYTES);
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
+        self.answered = answered::Answered::load(self.reactions_key.as_deref());
+        // Answers kept here that may still be taken back unread are read
+        // again, as when they were sent.
+        let due = Instant::now().checked_sub(Duration::from_secs(3));
+        for (key, bot, sent) in self.answered.unsettled() {
+            self.task_answers.push(TaskAnswer {
+                key,
+                bot,
+                turn: Some(sent),
+                checked: due.unwrap_or_else(Instant::now),
+            });
+        }
         self.open_on_picked();
         self.history().await;
         // What was sent and still waits, wherever it was sent from.
@@ -9695,6 +9925,8 @@ impl App {
                 for siding in std::mem::take(&mut self.siding) {
                     let _ = siding.await;
                 }
+                // And the pins it answered: the next window reads them.
+                self.pins.flush().await;
                 return Ok(());
             }
             let every = tick_every(self.moving(), heard.elapsed());
@@ -9920,6 +10152,7 @@ impl App {
             self.recheck_task_answers().await;
             self.settle_task_asks().await;
             self.count_agents().await;
+            changed |= self.pins_tick();
             changed |= self.projects_tick().await;
             self.elsewhere_tick();
             self.read_references().await;
@@ -11017,6 +11250,7 @@ impl App {
         let bar = (self.bar.take(), std::mem::take(&mut self.barred));
         if paged.first {
             self.commit_welcome();
+            self.draw_answers_before(paged.nodes.first().copied());
         }
         let unpaired = self
             .draw_nodes(&paged.nodes, &paged.turns, true, after, None, Some(page))
@@ -14016,6 +14250,11 @@ impl App {
         if !every {
             self.commit_welcome();
         }
+        // The page starts the history: answers kept before its first node
+        // go first.
+        if from_start && self.older.is_none() {
+            self.draw_answers_before(nodes.first().copied());
+        }
         let unpaired = (self.draw_nodes(&nodes, &turns, false, Vec::new(), caught_up, page)).await;
         if from_start {
             self.unpaired = unpaired;
@@ -14188,6 +14427,20 @@ impl App {
             self.turn_hints.turn = Some(turn);
             began.insert(turn);
         }
+        // The answers given here to agents below, each drawn after the
+        // node it was drawn after live: those before the first node, by
+        // the page that starts the history ([`App::draw_answers_before`]),
+        // and those past the last, by the newest page.
+        let mut kept: std::collections::VecDeque<answered::Entry> = match nodes.first() {
+            Some(&first) => {
+                let last = match older {
+                    true => nodes.last().copied().unwrap_or(first),
+                    false => i64::MAX,
+                };
+                self.answered.within(first, last).into()
+            }
+            None => Default::default(),
+        };
         // A chunk read at a time, what it held let go before the next.
         let mut chunks = nodes.chunks(DRAW_CHUNK);
         let mut after = Some(after);
@@ -14236,6 +14489,12 @@ impl App {
                         (false, true) => self.commit_words(at, lines, false),
                         (false, false) => self.commit_said(at, lines),
                     }
+                }
+                while let Some(entry) = kept.pop_front_if(|entry| entry.after < node) {
+                    if let Some((at, lines)) = said.take() {
+                        self.commit_said(at, lines);
+                    }
+                    self.draw_kept_answer(entry);
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
@@ -14421,6 +14680,9 @@ impl App {
         }
         if let Some((at, lines)) = said {
             self.commit_said(at, lines);
+        }
+        for entry in kept {
+            self.draw_kept_answer(entry);
         }
         // The newest page's turn, still running, ends its hints when it
         // ends: the page's end is not the turn's. An older page ending in
@@ -17321,25 +17583,22 @@ impl App {
                     call["call_id"].as_str().unwrap_or_default(),
                 ) =>
             {
-                let decided = match decision.as_str() {
-                    "allow" => transcript::Decided::Allowed { you: true, kept },
-                    _ => transcript::Decided::Denied { you: true },
-                };
-                if let Some(written) = self.written.get_mut(&self.aside_key(&call)) {
-                    match (&mut written.decided, decided) {
-                        // Its own verdict came first and is final: what the
-                        // person kept is only added to an allow.
-                        (
-                            Some(transcript::Decided::Allowed { kept: heard, .. }),
-                            transcript::Decided::Allowed { kept, .. },
-                        ) if written.heard => {
-                            if heard.is_none() {
-                                *heard = kept;
-                            }
-                        }
-                        _ if written.heard => {}
-                        (_, decided) => written.decided = Some(decided),
-                    }
+                self.decide_written(&call, &decision, kept);
+            }
+            // A call below whose rows here the screen let go: what was
+            // answered is still kept, and said under it as for one's own.
+            Ok(_) if !own && self.written.contains_key(&self.aside_key(&call)) => {
+                self.decide_written(&call, &decision, kept.clone());
+                if decision == "allow" {
+                    let name = call["name"].as_str().unwrap_or("tool");
+                    let lines = transcript::allowed(
+                        name,
+                        &call["arguments"],
+                        kept.as_deref(),
+                        &self.workspace,
+                        self.width,
+                    );
+                    self.commit(lines);
                 }
             }
             Ok(_) if decision == "allow" => {
@@ -17405,11 +17664,14 @@ impl App {
             return Vec::new();
         }
         // `/resume` is listed only while the agents are paused; `/zen`
-        // says it ends zen while it is on.
+        // says it ends zen while it is on; `/pin` is not offered in a side
+        // chat, and says it unpins while this agent is pinned.
         let listed: Vec<(&'static str, &'static str)> = (COMMANDS.iter())
             .filter(|(name, _)| *name != "/resume" || self.paused.is_some())
+            .filter(|(name, _)| *name != "/pin" || self.options.side.is_none())
             .map(|&(name, about)| match name {
                 "/zen" if self.zen.is_some() => (name, ZEN_ENDS),
+                "/pin" if self.pins.has(&self.bot) => (name, UNPIN),
                 _ => (name, about),
             })
             .collect();
@@ -18172,6 +18434,20 @@ impl App {
                         watch.stop = Some(run.to_owned());
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    // `p` on an agent picked in the pane's list of the
+                    // project's agents pins it, or unpins it: its row
+                    // stays as it is, as a pin shows in **Projects** alone.
+                    KeyCode::Char('p')
+                        if !ctrl
+                            && !key.modifiers.contains(KeyModifiers::ALT)
+                            && pane.is_margin()
+                            && let Some(bot) = (pane.screen.picked_link())
+                                .and_then(|link| link.strip_prefix(screen::BUTTON))
+                                .and_then(|what| what.strip_prefix("task/")) =>
+                    {
+                        let bot = bot.to_owned();
+                        self.notice = Some(self.toggle_pin(&bot).said());
+                    }
                     // The picture or drawing shown, opened bigger outside Sonny.
                     KeyCode::Char('o')
                         if let Some(path) = pane.bigger().map(std::path::Path::to_path_buf) =>
@@ -20077,6 +20353,16 @@ impl App {
             }
             return;
         }
+        if prompt == "/pin" {
+            self.input.clear();
+            if self.options.side.is_some() {
+                self.notice = Some("/pin is for the agent itself, not a side chat".into());
+            } else {
+                let bot = self.bot.clone();
+                self.notice = Some(self.toggle_pin(&bot).said());
+            }
+            return;
+        }
         if prompt == "/memory" {
             self.input.clear();
             self.memory_view();
@@ -20136,7 +20422,7 @@ impl App {
         }
         if prompt == "/config" {
             self.input.clear();
-            match config::View::open() {
+            match config::View::open(&self.bot) {
                 Ok(view) => self.config = Some(view),
                 Err(error) => self.notice = Some(error),
             }
@@ -20809,10 +21095,138 @@ impl App {
             checked: Instant::now(),
         });
         self.close_ask(&ask, &prompt);
+        self.keep_answer(&ask, reply["message"].as_i64());
         if let Some(whole) = sent_as {
             self.close_ask(&whole, &prompt);
         }
         self.fleet_said(format!("your answer went to {}", task.name));
+    }
+
+    /// The answer just given here to `ask`, a question of an agent below,
+    /// kept by this window's agent where its card was drawn, as its card
+    /// now says it: a replay draws it there again. `sent` is the message
+    /// it went as, which the task may still take back unread.
+    fn keep_answer(&mut self, ask: &asks::Ask, sent: Option<i64>) {
+        let key = ask.key();
+        let Some(asks::State::Answered(answer)) = self.settled.get(&key).cloned() else {
+            return;
+        };
+        let after = (self.drawn_after.get(&key).copied()).unwrap_or(self.seen_node);
+        let entry = answered::Entry {
+            after,
+            what: answered::What::Ask {
+                ask: ask.clone(),
+                answer,
+                sent,
+            },
+        };
+        if let Err(error) = self.answered.keep(entry) {
+            self.notice = Some(error);
+        }
+    }
+
+    /// The answers kept here drawn after nodes before `first`, the first
+    /// node of the history; every one when it has none yet.
+    fn draw_answers_before(&mut self, first: Option<i64>) {
+        let before = first.map_or(i64::MAX, |first| first - 1);
+        for entry in self.answered.within(i64::MIN, before) {
+            self.draw_kept_answer(entry);
+        }
+    }
+
+    /// An answer kept here ([`App::keep_answer`]) drawn in its place in a
+    /// replay, folded as it was left: one still pinned here is drawn by
+    /// its pin.
+    /// The person answered `call` here, written out by this window: its
+    /// copy says so until the call's own verdict, and an agent's below is
+    /// kept here too ([`App::keep_call_answer`]).
+    fn decide_written(&mut self, call: &Value, decision: &str, kept: Option<String>) {
+        let decided = match decision {
+            "allow" => transcript::Decided::Allowed { you: true, kept },
+            _ => transcript::Decided::Denied { you: true },
+        };
+        let key = self.aside_key(call);
+        if let Some(written) = self.written.get_mut(&key) {
+            match (&mut written.decided, decided) {
+                // Its own verdict came first and is final: what the
+                // person kept is only added to an allow.
+                (
+                    Some(transcript::Decided::Allowed { kept: heard, .. }),
+                    transcript::Decided::Allowed { kept, .. },
+                ) if written.heard => {
+                    if heard.is_none() {
+                        *heard = kept;
+                    }
+                }
+                _ if written.heard => {}
+                (_, decided) => written.decided = Some(decided),
+            }
+        }
+        self.keep_call_answer(&key, true);
+    }
+
+    fn draw_kept_answer(&mut self, entry: answered::Entry) {
+        let answered::Entry { after, what } = entry;
+        match what {
+            answered::What::Ask { ask, answer, .. } => {
+                let key = ask.key();
+                if (self.asks.iter().chain(&self.unpinned)).any(|open| open.key() == key) {
+                    return;
+                }
+                self.settled
+                    .insert(key.clone(), asks::State::Answered(answer));
+                self.commit_ask(&ask);
+                self.drawn_after.insert(key, after);
+            }
+            answered::What::Call {
+                bot,
+                turn,
+                call,
+                name,
+                arguments,
+                rows,
+                decided,
+                heard,
+                at_ms,
+            } => {
+                let key = (bot.clone(), turn, call.clone());
+                // Still drawn here, its own copy stands.
+                if (self.written.get(&key)).is_some_and(|written| self.drawn(written.tag)) {
+                    return;
+                }
+                let tag = self.written_count;
+                self.written_count += 1;
+                let written = Written {
+                    tag,
+                    gap: self.any_history,
+                    rows: rows.into_iter().map(|row| Line::from(row).dim()).collect(),
+                    name,
+                    arguments,
+                    from: Some(bot.clone()),
+                    decided: Some(decided),
+                    heard,
+                    folded: true,
+                    open: false,
+                    at_ms,
+                };
+                let (shown, marks) = self.written_rows(&written);
+                let at = self.pending.len();
+                self.commit_after(shown, false);
+                (self.marks).extend(marks.into_iter().map(|(row, mark)| (at + row, mark)));
+                let mark = screen::Mark::Tag(screen::Tag::Request(tag));
+                (self.marks).extend((at..self.pending.len()).map(|row| (row, mark.clone())));
+                self.drawn_after
+                    .insert(answered::call_key(&bot, turn, &call), after);
+                self.written.insert(key, written);
+            }
+        }
+    }
+
+    /// Whether the request tagged `tag` is drawn here, on the screen or
+    /// on its way there.
+    fn drawn(&self, tag: u64) -> bool {
+        let tag = screen::Tag::Request(tag);
+        self.screen.has(tag) || (self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag))
     }
 
     /// The tasks' questions that left the pins with no answer from here,
@@ -20960,7 +21374,11 @@ impl App {
                 continue;
             };
             if asks::undelivered(&row) {
-                self.task_answers.remove(at);
+                let answer = self.task_answers.remove(at);
+                // Taken back unread, it answered nothing: not kept here.
+                if let Err(error) = self.answered.forget(&answer.key) {
+                    self.notice = Some(error);
+                }
                 released = true;
             } else if !matches!(
                 row["status"].as_str(),
@@ -20968,6 +21386,10 @@ impl App {
             ) {
                 // Taken, or ended some other way: nothing to read again.
                 self.task_answers[at].turn = None;
+                let key = self.task_answers[at].key.clone();
+                if let Err(error) = self.answered.delivered(&key) {
+                    self.notice = Some(error);
+                }
             }
         }
         if released {
@@ -21280,6 +21702,11 @@ impl App {
         let tag = self.card_count;
         self.card_count += 1;
         self.forget_trimmed_cards();
+        // A question of an agent below is drawn after the newest node
+        // drawn here: where an answer to it from here is kept.
+        if ask.task.is_some() {
+            self.drawn_after.insert(key.clone(), self.seen_node);
+        }
         self.cards.insert(key, (tag, ask.clone(), false));
         let state = self.card_state(ask);
         let (rows, marks) = self.card_lines(ask, &state, false);
@@ -21576,8 +22003,10 @@ impl App {
         self.unsettled.extend(gone);
         self.asks.retain(still);
         self.unpinned.retain(still);
+        // An answer whose question closed is let go once nothing can take
+        // it back: one still in line is read until it is taken or ends.
         self.task_answers
-            .retain(|answer| keys.contains(&answer.key));
+            .retain(|answer| keys.contains(&answer.key) || answer.turn.is_some());
         for ask in open {
             let key = ask.key();
             let known = (self.asks.iter().chain(&self.unpinned)).any(|have| have.key() == key)
@@ -23271,6 +23700,12 @@ impl App {
             let head = self.pending.len() - count;
             self.marks.push((head, screen::Mark::Buttons(buttons)));
         }
+        // A call of an agent below is drawn after the newest node drawn
+        // here: where an answer to it from here is kept.
+        if let Some(bot) = &from {
+            let kept = answered::call_key(bot, key.1, &key.2);
+            self.drawn_after.insert(kept, self.seen_node);
+        }
         self.written.insert(
             key,
             Written {
@@ -23321,6 +23756,18 @@ impl App {
         let Some(written) = self.written.get(key) else {
             return;
         };
+        let (rows, marks) = self.written_rows(written);
+        let tag = screen::Tag::Request(written.tag);
+        self.flush();
+        if !self.screen.replace_tagged(tag, rows, marks) {
+            // Trimmed away: nothing of it is left to fold.
+            self.written.remove(key);
+        }
+    }
+
+    /// The rows of a folded request, with the marks on them by row: its
+    /// verdict, and the request whole under it while open.
+    fn written_rows(&self, written: &Written) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
         let decided = (written.decided.clone()).unwrap_or(transcript::Decided::Gone);
         let line = transcript::decided(
             &written.name,
@@ -23350,12 +23797,7 @@ impl App {
             marks.extend(buttons.map(|buttons| (rows.len(), screen::Mark::Buttons(buttons))));
             rows.extend(open);
         }
-        let tag = screen::Tag::Request(written.tag);
-        self.flush();
-        if !self.screen.replace_tagged(tag, rows, marks) {
-            // Trimmed away: nothing of it is left to fold.
-            self.written.remove(key);
-        }
+        (rows, marks)
     }
 
     /// What came of a call written out here, as an event of `bot`'s says
@@ -23427,6 +23869,43 @@ impl App {
         // gone first: drawn again to say it.
         if written.folded && written.decided.is_some() {
             self.draw_written(&key);
+        }
+        // Answered here, what is kept says its own verdict now.
+        self.keep_call_answer(&key, false);
+    }
+
+    /// What came of the call below at `key`, answered here, kept by this
+    /// window's agent where its request was written out ([`answered`]):
+    /// a replay draws it there, folded. Kept once the person answers
+    /// (`answered`), and kept again as the call's own verdict comes.
+    fn keep_call_answer(&mut self, key: &CallKey, answered: bool) {
+        let Some(written) = self.written.get(key) else {
+            return;
+        };
+        let (Some(bot), Some(decided)) = (&written.from, &written.decided) else {
+            return;
+        };
+        let kept = answered::call_key(bot, key.1, &key.2);
+        if !answered && !self.answered.has(&kept) {
+            return;
+        }
+        let after = (self.drawn_after.get(&kept).copied()).unwrap_or(self.seen_node);
+        let entry = answered::Entry {
+            after,
+            what: answered::What::Call {
+                bot: bot.clone(),
+                turn: key.1,
+                call: key.2.clone(),
+                name: written.name.clone(),
+                arguments: written.arguments.clone(),
+                rows: written.rows.iter().map(Line::to_string).collect(),
+                decided: decided.clone(),
+                heard: written.heard,
+                at_ms: written.at_ms,
+            },
+        };
+        if let Err(error) = self.answered.keep(entry) {
+            self.notice = Some(error);
         }
     }
 
@@ -23530,6 +24009,8 @@ impl App {
                     self.draw_written(&key);
                 }
             }
+            // Answered here, what is kept says its own verdict now.
+            self.keep_call_answer(&key, false);
         }
     }
 
@@ -27639,6 +28120,7 @@ mod tests {
             reopened: false,
             land: false,
             before: None,
+            by_setting: false,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -31503,10 +31985,19 @@ mod tests {
             state: &mut ProjectsState,
         ) -> Vec<String> {
             let waiting = waiting.iter().map(|bot| bot.to_string()).collect();
-            let (found, whole) =
-                read_projects(client, store, listed, "x.lead", &[], &[], &waiting, state)
-                    .await
-                    .unwrap();
+            let (found, whole) = read_projects(
+                client,
+                store,
+                listed,
+                "x.lead",
+                &[],
+                &[],
+                &waiting,
+                &[],
+                state,
+            )
+            .await
+            .unwrap();
             assert!(whole);
             assert!(asked.lock().unwrap().is_empty(), "a history was read");
             if let Some(writing) = state.writing.take() {
@@ -31619,6 +32110,7 @@ mod tests {
             &[],
             &[],
             &waiting,
+            &[],
             &mut state,
         )
         .await
@@ -31641,6 +32133,7 @@ mod tests {
             &[],
             &[],
             &waiting,
+            &[],
             &mut state,
         )
         .await
@@ -31656,6 +32149,7 @@ mod tests {
             &[],
             &[],
             &waiting,
+            &[],
             &mut state,
         )
         .await
@@ -31700,6 +32194,7 @@ mod tests {
             whole: true,
             waiting: Default::default(),
             version: None,
+            pins: Vec::new(),
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -31739,6 +32234,8 @@ mod tests {
                 whole: true,
                 waiting: Default::default(),
                 version: 7,
+                gone: Vec::new(),
+                pins: Vec::new(),
             })
         });
         while !job.is_finished() {
@@ -31753,6 +32250,7 @@ mod tests {
             whole: true,
             waiting: Default::default(),
             version: None,
+            pins: Vec::new(),
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -31779,6 +32277,8 @@ mod tests {
                     whole: true,
                     waiting: Default::default(),
                     version: 7,
+                    gone: Vec::new(),
+                    pins: Vec::new(),
                 })
             })),
             ..Default::default()
@@ -31793,6 +32293,244 @@ mod tests {
         assert!(kept.job.is_none());
         assert_eq!(kept.version, Some(7));
         assert_eq!(kept.projects[0].lead, "alpha.lead");
+    }
+
+    /// A window of `bot` whose pins are kept beside `store`.
+    async fn pinning(bot: &str, store: &std::path::Path) -> App {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.bot = bot.into();
+        app.pins = pinned::Pins::new(store);
+        app
+    }
+
+    #[tokio::test]
+    async fn pin_in_a_task_s_window_then_left_and_its_number_in_another_opens_it() {
+        let dir = std::env::temp_dir().join(unique("pins"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        // Another window, open before the pin.
+        let mut lead = pinning("tally.lead", &store).await;
+        lead.pins_tick();
+        lead.pins.settled(&lead.woken.clone()).await;
+        let mut task = pinning("tally.readme", &store).await;
+        task.input.set("/pin");
+        task.submit().await;
+        assert_eq!(task.notice.as_deref(), Some("pinned as 1 · ← 1 opens it"));
+        task.pins.settled(&task.woken.clone()).await;
+        assert_eq!(pinned::read(&pinned::file(&store)), ["tally.readme"]);
+        // `←` with nothing typed, then `1`: the window is the task's,
+        // once Projects read the pins as it opened.
+        lead.key(pressed(KeyCode::Left)).await;
+        assert!(lead.projects.is_some());
+        lead.pins.settled(&lead.woken.clone()).await;
+        assert!(lead.pins_tick());
+        assert_eq!(
+            lead.projects.as_ref().unwrap().view.pins(),
+            ["tally.readme"]
+        );
+        lead.key(pressed(KeyCode::Char('1'))).await;
+        assert!(lead.projects.is_none());
+        assert_eq!(lead.switch_to.as_deref(), Some("tally.readme"));
+        // In the task's own window, `/pin` again unpins.
+        task.input.set("/pin");
+        task.submit().await;
+        assert_eq!(task.notice.as_deref(), Some("unpinned"));
+        task.pins.settled(&task.woken.clone()).await;
+        assert!(pinned::read(&pinned::file(&store)).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pin_reads_unpin_while_pinned_a_tenth_is_refused_and_a_side_chat_has_none() {
+        let mut app = pinning("shop.fix", std::path::Path::new("")).await;
+        let pin = |app: &App| {
+            (app.menu().into_iter())
+                .find(|(name, _, _)| *name == "/pin")
+                .map(|(_, about, _)| about)
+        };
+        app.input.set("/pi");
+        assert_eq!(pin(&app), Some("Pin this agent at the top of projects"));
+        app.input.set("/pin");
+        app.submit().await;
+        app.input.set("/pi");
+        assert_eq!(pin(&app), Some(UNPIN));
+        // Nine pinned: a tenth is answered, and nine stay.
+        let mut full = pinning("shop.tenth", std::path::Path::new("")).await;
+        for n in 1..=9 {
+            full.toggle_pin(&format!("shop.t{n}"));
+        }
+        full.input.set("/pin");
+        full.submit().await;
+        assert_eq!(full.notice.as_deref(), Some("9 pinned · unpin one first"));
+        assert_eq!(full.pins.names().len(), 9);
+        assert!(!full.pins.has("shop.tenth"));
+        // Not offered in a side chat, and answered there.
+        let mut side = pinning("shop.fix", std::path::Path::new("")).await;
+        side.options.side = Some(1);
+        side.input.set("/pi");
+        assert_eq!(pin(&side), None);
+        side.input.set("/pin");
+        side.submit().await;
+        assert_eq!(
+            side.notice.as_deref(),
+            Some("/pin is for the agent itself, not a side chat")
+        );
+        assert!(side.pins.names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn p_in_projects_pins_a_lead_and_a_number_not_there_is_answered() {
+        let mut app = pinning("tally.lead", std::path::Path::new("")).await;
+        app.open_projects().await;
+        let tally = projects::Project {
+            lead: "tally.lead".into(),
+            name: "tally".into(),
+            title: "Tally invoices".into(),
+            last: now_ms(),
+            ..Default::default()
+        };
+        let open = app.projects.as_mut().unwrap();
+        open.view.set(vec![tally], now_ms());
+        app.key(pressed(KeyCode::Char('p'))).await;
+        assert_eq!(app.pins.names(), ["tally.lead"]);
+        let open = app.projects.as_ref().unwrap();
+        assert_eq!(open.view.pins(), ["tally.lead"]);
+        // The next read counts the project again, to find the pin's row.
+        assert_ne!(open.pins, app.pins.names());
+        assert_eq!(app.notice, None);
+        // A pin not there any more: its number is answered, the page stays.
+        app.toggle_pin("tally.gone");
+        let open = app.projects.as_mut().unwrap();
+        open.view.set_gone(vec!["tally.gone".into()]);
+        app.key(pressed(KeyCode::Char('2'))).await;
+        assert!(app.projects.is_some());
+        assert_eq!(app.notice.as_deref(), Some("tally.gone is not there"));
+        // Closed and opened again, it is still not there, before any read.
+        app.close_projects();
+        app.open_projects().await;
+        app.notice = None;
+        app.key(pressed(KeyCode::Char('2'))).await;
+        assert!(app.projects.is_some());
+        assert_eq!(app.notice.as_deref(), Some("tally.gone is not there"));
+        // p on the project's row again unpins its lead.
+        app.key(pressed(KeyCode::Char('p'))).await;
+        assert_eq!(app.pins.names(), ["tally.gone"]);
+    }
+
+    #[tokio::test]
+    async fn p_in_the_pane_s_list_pins_the_picked_task_and_its_row_stays() {
+        let mut app = pinning("calc.lead", std::path::Path::new("")).await;
+        let row = |name: &str, bot: &str, title: &str| status::Row {
+            name: name.into(),
+            bot: bot.into(),
+            title: title.into(),
+            state: "working".into(),
+            group: status::Group::Working,
+            ..Default::default()
+        };
+        let rows = [
+            row("lead", "calc.lead", ""),
+            row("halves", "calc.halves", "Round half cents to even"),
+        ];
+        app.margin
+            .set_agents(status::agents("Calculator", &rows), "calc.lead");
+        app.margin_back();
+        let mut terminal =
+            Terminal::new(Shot(ratatui::backend::TestBackend::new(150, 30))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        let before = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        app.pane_keys = true;
+        // ↓ picks the lead's name, then the task's.
+        app.key(pressed(KeyCode::Down)).await;
+        app.key(pressed(KeyCode::Down)).await;
+        assert_eq!(
+            app.pane.as_ref().unwrap().screen.picked_link(),
+            Some("sonny:task/calc.halves")
+        );
+        app.key(pressed(KeyCode::Char('p'))).await;
+        assert_eq!(app.pins.names(), ["calc.halves"]);
+        assert_eq!(app.notice.as_deref(), Some("pinned as 1 · ← 1 opens it"));
+        assert!(app.pane_keys);
+        // Its row there does not change: a pin shows in Projects alone.
+        assert_eq!(
+            app.margin.lines(60, std::path::Path::new("/"), None).0,
+            before
+        );
+        app.key(pressed(KeyCode::Char('p'))).await;
+        assert!(app.pins.names().is_empty());
+        assert_eq!(app.notice.as_deref(), Some("unpinned"));
+    }
+
+    #[tokio::test]
+    async fn a_read_finds_each_pin_s_mark_and_title_and_counts_a_project_again_once_pinned() {
+        let client = daemon_answering(|_| json!({"approvals": [], "nodes": [], "items": []})).await;
+        let home = std::env::temp_dir().join(unique("pinned-read"));
+        let store = home.join("state.sqlite");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = |name: &str, id: i64, maker: Option<&str>, closed: bool| {
+            Arc::new(standing::Agent {
+                name: name.into(),
+                bot_id: Some(id),
+                head: Some(1),
+                created_by: maker.map(str::to_owned),
+                closed,
+                workspace: Some(home.to_string_lossy().into_owned()),
+                last: Some(standing::Ended {
+                    turn: 1,
+                    status: "completed".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let listed = vec![
+            agent("tally.lead", 1, None, false),
+            agent("tally.halves", 2, Some("tally.lead"), true),
+        ];
+        let waiting = Default::default();
+        let mut state = ProjectsState::default();
+        let (found, _) = read_projects(
+            &client,
+            &store,
+            &listed,
+            "x.lead",
+            &[],
+            &[],
+            &waiting,
+            &[],
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(found[0].pinned.is_empty());
+        let mark = state.each["tally.lead"].mark;
+        // Pinned since: the project is counted again, and the done task's
+        // row found with its mark; the lead's too.
+        let pins = ["tally.halves".to_owned(), "tally.lead".to_owned()];
+        let (found, _) = read_projects(
+            &client,
+            &store,
+            &listed,
+            "x.lead",
+            &[],
+            &[],
+            &waiting,
+            &pins,
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_ne!(state.each["tally.lead"].mark, mark);
+        let mut pinned = found[0].pinned.clone();
+        pinned.sort_by(|a, b| a.bot.cmp(&b.bot));
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0].bot, "tally.halves");
+        assert_eq!(pinned[0].state, "done");
+        assert_eq!(pinned[1].bot, "tally.lead");
+        if let Some(writing) = state.writing.take() {
+            writing.await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -31834,7 +32572,7 @@ mod tests {
                 .collect()
         };
         let all = listed(&app);
-        assert_eq!(all.len(), 26);
+        assert_eq!(all.len(), 27);
         assert_eq!(
             all[0],
             ("/side", "Start a side chat with a copy of this agent")
@@ -38773,8 +39511,132 @@ mod tests {
         app.raise_approvals_through().await;
         app.flush();
         let texts = app.screen.texts();
+        let denied = "✗ The reviewer denied cargo publish · shop.fix".to_owned();
+        assert!(texts.contains(&denied), "{texts:?}");
+        // Answered here, it is kept by the lead, with the call's own
+        // verdict: drawn again from the start, as coming back to the lead
+        // after another agent does, it is there, folded to that verdict.
+        assert!(app.answered.has(&answered::call_key("shop.fix", 4, "c1")));
+        app.screen = screen::Screen::default();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(
+            texts.iter().filter(|text| **text == denied).count(),
+            1,
+            "{texts:?}"
+        );
+    }
+
+    /// A call below answered after the screen let its rows go is kept all
+    /// the same; and kept before its own verdict came, drawn again from the
+    /// start, it still reads that verdict from the trail once it comes.
+    #[tokio::test]
+    async fn a_tasks_request_answered_with_its_rows_gone_or_its_verdict_unheard_is_kept() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        // The lead wrote on: the request's rows went off the screen.
+        app.screen = screen::Screen::default();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
+        let kept = answered::call_key("shop.fix", 4, "c1");
+        assert!(app.answered.has(&kept));
+        app.flush();
+        // Closed before its verdict came, and opened again.
+        app.raised.clear();
+        app.written.clear();
+        app.screen = screen::Screen::default();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(
+            texts,
+            ["✓ You allowed cargo publish · shop.fix"],
+            "{texts:?}"
+        );
+        // The reviewer's gate denied it meanwhile: read from the trail.
+        app.raise_approvals_through().await;
+        app.flush();
+        let denied = "✗ The reviewer denied cargo publish · shop.fix".to_owned();
+        let texts = app.screen.texts();
+        assert!(texts.contains(&denied), "{texts:?}");
+        app.screen = screen::Screen::default();
+        app.written.clear();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        assert_eq!(app.screen.texts(), [denied]);
+    }
+
+    /// A call below answered here is kept where it was written out: drawn
+    /// again from the start, it is folded to what came of it there, its
+    /// request whole a click away; one answered elsewhere is not kept.
+    #[tokio::test]
+    async fn a_tasks_request_answered_here_stays_in_the_leads_history() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.seen_node = 12;
+        for call in ["c1", "c2"] {
+            app.raised
+                .push(json!({"bot": "shop.fix", "turn": 4, "call_id": call,
+                "name": "shell", "gates": ["manual"], "arguments": {"command": "cargo test"}}));
+        }
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
+        // The other answered in its own window: its verdict heard here.
+        app.raised.retain(|call| call["call_id"] == "c2");
+        app.heard_verdict(
+            "shop.fix",
+            Some(4),
+            &json!({"call_id": "c1",
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}),
+        );
+        app.raised.clear();
+        app.heard_verdict(
+            "shop.fix",
+            Some(4),
+            &json!({"call_id": "c2",
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}),
+        );
+        app.fold_written();
+        assert!(app.answered.has(&answered::call_key("shop.fix", 4, "c1")));
+        assert!(!app.answered.has(&answered::call_key("shop.fix", 4, "c2")));
+        assert_eq!(app.answered.within(12, 12).len(), 1);
+        app.screen = screen::Screen::default();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(texts, ["✓ You allowed cargo test · shop.fix"], "{texts:?}");
+        // A click opens the request whole under it.
+        let tag = app.written[&("shop.fix".to_owned(), 4, "c1".to_owned())].tag;
+        app.press(&format!("request/{tag}")).await;
+        app.flush();
+        let texts = app.screen.texts();
         assert!(
-            texts.contains(&"✗ The reviewer denied cargo publish · shop.fix".to_owned()),
+            texts.len() > 1 && texts[1..].iter().any(|text| text.contains("cargo test")),
             "{texts:?}"
         );
     }
@@ -39361,13 +40223,16 @@ mod tests {
         );
         assert!(app.asks.is_empty());
         // The fleet reads it open until the task takes the answer: it is
-        // not pinned again meanwhile, and once closed there it is let go.
+        // not pinned again meanwhile, and once closed there it is let go;
+        // its answer is still read until the task is known to have taken it.
         app.pin_task_asks();
         assert!(app.asks.is_empty());
         let fleet = app.fleet.as_mut().unwrap();
         fleet.needs.asked("calc.ask", None);
         app.pin_task_asks();
-        assert!(app.task_answers.is_empty() && app.asks.is_empty());
+        assert!(app.asks.is_empty());
+        assert_eq!(app.task_answers.len(), 1);
+        app.task_answers.clear();
         // Read late, an older question goes where it was asked, before the
         // lead's own newer one, which keeps the focus.
         let own = asks::call(&asks::id(5, "c9"), &json!({"question": "Tag it?"})).unwrap();
@@ -39406,6 +40271,106 @@ mod tests {
         app.pin_task_asks();
         assert_eq!(whose(app.asking()), "calc.ask");
         assert_eq!(app.asks.len(), 1);
+    }
+
+    /// A task's question answered in its lead's window stays there: drawn
+    /// again from the start, as coming back to the lead after another
+    /// agent does, its card is where it was, after the lead's node it was
+    /// drawn after, folded to the answer given. One its task took back
+    /// unread answered nothing and is not kept.
+    #[tokio::test]
+    async fn a_tasks_question_answered_in_its_leads_window_stays_in_its_history() {
+        let asked = json!({"question": "Ship it?", "why": "w",
+            "options": [{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]});
+        let (client, events) = daemon_with_events(json!({}), move |asked_for| {
+            let bot = asked_for["bot"].as_str().unwrap_or("");
+            match (asked_for["op"].as_str().unwrap_or(""), bot) {
+                ("bots", _) => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 9},
+                    {"name": "calc.ask", "bot_id": 3, "created_by": "calc.lead", "head": 7},
+                ]}),
+                ("submit", _) => json!({"message": 3, "turn": 3}),
+                ("history_nodes", "calc.ask") => json!({"nodes": [{"node": 7, "turn": 2}]}),
+                ("history_nodes", _) => {
+                    json!({"nodes": [{"node": 9, "turn": 1}, {"node": 3, "turn": 1}]})
+                }
+                ("turns", "calc.ask") => json!({"turns": [{"turn": 2, "status": "completed"}]}),
+                ("history_items", "calc.ask") => json!({"items": [{"node": 7, "item": {
+                    "type": "function_call", "name": "ask", "call_id": "q1",
+                    "arguments": asked.to_string()}}]}),
+                ("history_items", _) => json!({"items": [
+                    {"node": 3, "item": {"role": "user", "content": [
+                        {"type": "input_text", "text": "Plan the release"}]}},
+                    {"node": 9, "item": {"role": "assistant", "content": [
+                        {"type": "output_text", "text": "The release is planned."}]}},
+                ]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        fleet.reconcile().await;
+        while !fleet.unread.is_empty() {
+            fleet.rescan_through().await;
+        }
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.fleet = Some(fleet);
+        // Drawn live after the lead's node 3.
+        app.seen_node = 3;
+        app.pin_task_asks();
+        assert_eq!(app.asks.len(), 1);
+        app.input.set("2");
+        app.submit().await;
+        app.beside_done().await;
+        assert!(app.asks.is_empty());
+        let key = "@calc.ask/ask:2/q1";
+        assert!(app.answered.has(key));
+        assert_eq!(app.answered.within(3, 3).len(), 1);
+        // Kept with the message it went as, which a window that opens the
+        // lead before the task takes it reads again.
+        let unsettled = vec![(key.to_owned(), "calc.ask".to_owned(), 3)];
+        assert_eq!(app.answered.unsettled(), unsettled);
+        // The task took it: the fleet reads it closed.
+        let fleet = app.fleet.as_mut().unwrap();
+        fleet.needs.asked("calc.ask", None);
+        app.pin_task_asks();
+        assert!(app.asks.is_empty());
+        // Its question closed, its answer is still read until the task
+        // is known to have taken it.
+        assert_eq!(app.task_answers.len(), 1);
+        // Back on the lead: its history drawn from the start.
+        app.seen_node = 0;
+        app.pending.clear();
+        app.history().await;
+        app.pin_task_asks();
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        let at = |text: &str| rows.iter().position(|row| row.contains(text));
+        let (Some(said), Some(card), Some(reply)) = (
+            at("Plan the release"),
+            at("Ship it?"),
+            at("The release is planned."),
+        ) else {
+            panic!("{rows:#?}");
+        };
+        assert!(said < card && card < reply, "{rows:#?}");
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("Ship it?")).count(),
+            1,
+            "{rows:#?}"
+        );
+        assert_eq!(
+            app.card_state(&app.cards[key].1),
+            asks::State::Answered("No".into())
+        );
+        assert!(app.asks.is_empty());
+        // An answer taken back unread answered nothing: not kept.
+        app.task_answers_read(vec![(
+            "calc.ask".into(),
+            3,
+            json!({"status": "withdrawn", "turn": null}),
+        )]);
+        assert!(!app.answered.has(key));
     }
 
     /// A card says where its question stands as that changes: open past
@@ -42402,6 +43367,7 @@ mod tests {
                 whole: true,
                 waiting: Default::default(),
                 version: None,
+                pins: Vec::new(),
                 page: Rect::default(),
                 side: Rect::default(),
             }));
@@ -45078,5 +46044,50 @@ mod tests {
             .flat_map(|at| [format!("• Steered calc.t{at}"), format!("└ Check {at}.")])
             .collect();
         assert_eq!(calls, want);
+    }
+
+    #[test]
+    fn a_bare_sonny_opens_the_agent_the_setting_names_and_a_folder_its_lead() {
+        use agent_client::config::Opens;
+        assert_eq!(setting_agent(Opens::Folder), None);
+        assert_eq!(
+            setting_agent(Opens::Agent("work.lead".into())).as_deref(),
+            Some("work.lead")
+        );
+        let given = |args: &[&str]| -> Vec<String> {
+            std::iter::once("sonny")
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect()
+        };
+        // Opened by the setting, as `--agent NAME`: reopened on the agent
+        // by its name, whatever folder the terminal is in.
+        let again = reopen_from(&given(&["--no-sound", "--agent", "work.lead"]), "work.lead");
+        assert_eq!(again[..4], ["sonny", "--no-sound", "--agent", "work.lead"]);
+        // `sonny DIR` runs in DIR: what runs it again leaves the folder
+        // out, its other values in, and names the lead as the folder does.
+        let again = reopen_from(
+            &given(&["--model", "a/b", "../app", "--no-sound"]),
+            "app.lead.fix",
+        );
+        assert_eq!(
+            again[..6],
+            ["sonny", "--model", "a/b", "--no-sound", "--lead", "fix"]
+        );
+        assert!(!again.iter().any(|arg| arg == "../app"), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_the_setting_names_that_is_not_there_is_said_and_nothing_opens() {
+        let client = daemon_answering(|asked| match asked["name"].as_str() {
+            Some("work.lead") => json!({"bots": [{"name": "work.lead"}]}),
+            _ => json!({"bots": []}),
+        })
+        .await;
+        assert_eq!(setting_agent_there(&client, "work.lead").await, Ok(()));
+        assert_eq!(
+            setting_agent_there(&client, "gone.lead").await,
+            Err("gone.lead is not there; sonny . opens this folder's lead".into())
+        );
     }
 }

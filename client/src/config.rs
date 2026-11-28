@@ -58,6 +58,7 @@
 //! margin_notes = 8              # the most notes a margin holds, 6 by default; past it a new one is refused
 //! margin_note_lines = 20         # the most rows a note draws, at the margin's own width, 40 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
+//! opens = "work.lead"           # what a bare `sonny` opens: "folder", the default, the lead of the folder it runs in; or an agent by its whole name, from any folder
 //! suggest = false               # no guess at the next message, on by default
 //! suggest_ideas = false         # a guess never offers an idea or a tip in its place, on by default
 //! commons = false               # agents go without the commons, on by default
@@ -688,6 +689,9 @@ pub struct Sonny {
     /// Where a click on an agent's name takes the person; a right click
     /// takes them to the other.
     pub agent_opens: AgentOpens,
+    /// What a bare `sonny` opens: its folder's lead, or one agent from any
+    /// folder. `sonny .` and `sonny DIR` open a folder's lead either way.
+    pub opens: Opens,
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
@@ -1079,6 +1083,7 @@ impl Default for Sonny {
             margin_notes: MARGIN_NOTES,
             margin_note_lines: MARGIN_NOTE_LINES,
             agent_opens: AgentOpens::default(),
+            opens: Opens::default(),
             sources: Vec::new(),
             notes: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
@@ -1168,6 +1173,16 @@ pub enum AgentOpens {
     #[default]
     Tab,
     Beside,
+}
+
+/// What a bare `sonny` opens, as a browser's "on startup" setting picks
+/// its first page: `"folder"`, the default, the lead of the folder it runs
+/// in; or an agent by its whole name, from any folder, making nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Opens {
+    #[default]
+    Folder,
+    Agent(String),
 }
 
 /// Which tasks open in a tab of their own in the lead's multiplexer:
@@ -1961,6 +1976,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "margin_notes",
                 "margin_note_lines",
                 "agent_opens",
+                "opens",
                 "suggest",
                 "suggest_ideas",
                 "start_at_boot",
@@ -2214,6 +2230,20 @@ fn parse(text: &str) -> Result<Config, String> {
                     "every" => TaskTabs::Every,
                     other => {
                         return Err(format!("sonny.task_tabs is asked or every, not {other}"));
+                    }
+                };
+                continue;
+            }
+            if key == "opens" {
+                config.sonny.opens = match value.as_str() {
+                    "folder" => Opens::Folder,
+                    name if !name.is_empty() && !name.contains(char::is_whitespace) => {
+                        Opens::Agent(name.to_owned())
+                    }
+                    other => {
+                        return Err(format!(
+                            "sonny.opens is folder or an agent's whole name, not {other:?}"
+                        ));
                     }
                 };
                 continue;
@@ -3261,6 +3291,13 @@ mod tests {
         let beside = parse("[sonny]\nagent_opens = \"beside\"").unwrap();
         assert_eq!(beside.sonny.agent_opens, AgentOpens::Beside);
         assert!(parse("[sonny]\nagent_opens = \"window\"").is_err());
+        assert_eq!(config.sonny.opens, Opens::Folder);
+        let agent = parse("[sonny]\nopens = \"work.lead\"").unwrap();
+        assert_eq!(agent.sonny.opens, Opens::Agent("work.lead".into()));
+        let folder = parse("[sonny]\nopens = \"folder\"").unwrap();
+        assert_eq!(folder.sonny.opens, Opens::Folder);
+        assert!(parse("[sonny]\nopens = \"\"").is_err());
+        assert!(parse("[sonny]\nopens = \"work lead\"").is_err());
         assert_eq!(config.sonny.task_tabs, TaskTabs::Asked);
         let every = parse("[sonny]\ntask_tabs = \"every\"").unwrap();
         assert_eq!(every.sonny.task_tabs, TaskTabs::Every);

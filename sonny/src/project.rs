@@ -787,7 +787,20 @@ pub async fn open(
     model: Option<&str>,
     pick: &Pick,
 ) -> Result<Lead, String> {
-    let (project, dir) = folder_project(dir)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    open_in(client, dir, model, pick, home.as_deref()).await
+}
+
+/// [`open`], with `home` the home folder.
+async fn open_in(
+    client: &Client,
+    dir: &Path,
+    model: Option<&str>,
+    pick: &Pick,
+    home: Option<&Path>,
+) -> Result<Lead, String> {
+    let dir = folder_in(&dir.canonicalize().map_err(|e| e.to_string())?, home)?;
+    let project = default_name(&dir)?;
     let first = format!("{project}.lead");
     let chosen = match pick {
         Pick::Made { profile, .. } => profile.as_deref(),
@@ -831,7 +844,7 @@ pub async fn open(
                 return Err(format!("lead_missing: {project} has no lead {name} yet"));
             }
         }
-        create(client, &dir, model, None, chosen).await?;
+        create(client, &dir, model, None, chosen, home).await?;
         return Ok(Lead {
             project,
             bot: first,
@@ -860,7 +873,7 @@ pub async fn open(
                 ));
             }
             // Made by another thread since the look above: theirs.
-            if !create(client, &dir, model, Some(&bot), chosen).await? {
+            if !create(client, &dir, model, Some(&bot), chosen, home).await? {
                 return Err(format!(
                     "lead_exists: {bot} is there already; /switch {} opens it",
                     lead_short(&bot)
@@ -1008,6 +1021,14 @@ fn folder_in(dir: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
     Ok(folder)
 }
 
+/// Whether `dir` (canonical) is the home folder itself, where no project
+/// is made, as git makes no repository outside one: its `.agents` is the
+/// person's own (skills, profiles, memory). A lead made there before
+/// still opens; the folders below are folders like any other.
+fn is_home(dir: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|home| home.canonicalize().unwrap_or_else(|_| home.to_owned()) == dir)
+}
+
 /// The project folder above `folder` that keeps the folders below it as
 /// its own (`subfolders = "project"`), when `folder` has no project file:
 /// the nearest project above decides, looking no higher than the home
@@ -1035,7 +1056,8 @@ fn above(dir: &Path) -> Option<String> {
     Some(format!("{name}.lead"))
 }
 
-async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
+/// The agent named `bot`, when the daemon keeps one.
+pub async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
     let page = client
         .request("bots", json!({"name": bot, "limit": 1}))
         .await
@@ -1078,14 +1100,22 @@ async fn newest(client: &Client) -> Result<Option<String>, String> {
 }
 
 /// Make the folder's first lead, or `bot`, another lead of it: whether
-/// this made it, not found it there already.
+/// this made it, not found it there already. None is made in `home`.
 async fn create(
     client: &Client,
     dir: &Path,
     model: Option<&str>,
     bot: Option<&str>,
     chosen: Option<&str>,
+    home: Option<&Path>,
 ) -> Result<bool, String> {
+    if is_home(dir, home) {
+        return Err(
+            "home_folder: ~ is your home folder, not a project; run sonny in a \
+                    project's folder, or set opens to an agent"
+                .into(),
+        );
+    }
     // What it was made without is said where it opens, as each window
     // reviews its instructions.
     let role = role_or_shipped(dir, chosen, &mut Vec::new())?;
@@ -1143,9 +1173,58 @@ async fn make(
     chosen: Option<&str>,
 ) -> Result<Value, String> {
     let instructions = folder(dir, role, &memory(dir)?)?.text;
-    // Gated and confined from the start, as a new lead's mode makes it,
-    // whoever opens it first.
-    let mode = crate::approvals::default();
+    // Writing its own state folder, by the name it is made under.
+    let lead = (bot.map(str::to_owned)).or_else(|| {
+        let info = read(dir).ok()?;
+        info["lead"].as_str().map(str::to_owned)
+    });
+    let state = lead.as_deref().and_then(crate::state::folder);
+    // As in `create`: a config that does not read is said where the lead
+    // opens, and the defaults stand until it reads.
+    let config = agent_client::config::load().unwrap_or_default();
+    let given = Given {
+        config: &config,
+        rules: crate::rules::given(),
+        mode: crate::approvals::default(),
+        providers: client.providers(),
+    };
+    let policy = lead_policy(
+        &given,
+        dir,
+        role,
+        picks,
+        state.as_deref(),
+        chosen,
+        instructions,
+    );
+    agent_client::project::create(client, dir, &policy, client.providers(), picks, bot).await
+}
+
+/// What a lead is made with that is the person's: their config, their
+/// command rules, the row a new lead's mode is, and the providers' tools.
+struct Given<'a> {
+    config: &'a agent_client::config::Config,
+    rules: Option<agent_client::rules::Policy>,
+    mode: &'static str,
+    providers: &'a Value,
+}
+
+/// A lead's policy, for `agent_client::project::create`: its role's
+/// model, tools and `instructions`, Sonny's tools a lead declares, gated
+/// and confined from the start as a new lead's mode makes it, whoever
+/// opens it first, and the settings every agent Sonny makes starts with
+/// ([`crate::starts_with`]), so its first turn already goes by the
+/// person's rules and model tables. Its model's `cache_ttl` and its
+/// project's `namespace` go on where the model and name are settled.
+fn lead_policy(
+    given: &Given<'_>,
+    dir: &Path,
+    role: &agent_client::policy::Profile,
+    picks: &agent_client::project::Picks,
+    state: Option<&str>,
+    chosen: Option<&str>,
+    instructions: String,
+) -> Value {
     let tools: Vec<String> = match &role.tools {
         Some(tools) => tools.clone(),
         // The tools the client will give it; one the gate names that the
@@ -1153,7 +1232,7 @@ async fn make(
         None => {
             let model = picks.model.as_deref().or(role.model.as_deref());
             agent_client::default_tools(
-                client.providers(),
+                given.providers,
                 model.unwrap_or(""),
                 picks.web_search,
                 &picks.web_search_off,
@@ -1163,31 +1242,11 @@ async fn make(
             .collect()
         }
     };
-    // Writing its own state folder, by the name it is made under.
-    let lead = (bot.map(str::to_owned)).or_else(|| {
-        let info = read(dir).ok()?;
-        info["lead"].as_str().map(str::to_owned)
-    });
-    let state = lead.as_deref().and_then(crate::state::folder);
-    let mut settings = crate::approvals::sandbox(mode, dir, state.as_deref());
+    let settings = crate::starts_with(given.config, given.rules.as_ref(), given.mode, dir, state);
     let held = crate::served::Role::LEAD.within(&json!(settings));
     let declare = json!(crate::declared::tools(held));
-    let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
-    if let Some(state) = &state {
-        settings.insert("env".into(), json!({crate::state::VAR: state}));
-    }
-    // As in `create`: a config that does not read is said where the lead
-    // opens, and the defaults stand until it reads.
-    let config = agent_client::config::load().unwrap_or_default();
-    settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
-    settings.insert("steps_only".into(), crate::exec::steps_only(&config));
-    if let Some(ms) = config.hold_ms {
-        settings.insert("hold_ms".into(), json!(ms));
-    }
-    if let Some(outputs) = crate::outputs() {
-        settings.insert("outputs".into(), json!(outputs));
-    }
-    let policy = json!({
+    let gate = crate::approvals::gate(given.mode, &crate::approvals::gateable(&tools, &declare));
+    json!({
         "instructions": instructions,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "model": role.model,
@@ -1196,8 +1255,7 @@ async fn make(
         "gate": gate,
         "settings": settings,
         "profile": chosen,
-    });
-    agent_client::project::create(client, dir, &policy, client.providers(), picks, bot).await
+    })
 }
 
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
@@ -1205,6 +1263,12 @@ async fn make(
 /// already), its lead opened in a workspace of its own.
 pub async fn add(caller: &str, model: Option<&str>, arguments: &Value) -> Result<Value, String> {
     let (dir, mut picks) = picks(arguments, model)?;
+    if is_home(&dir, std::env::var_os("HOME").as_deref().map(Path::new)) {
+        return Err(format!(
+            "home_folder: {} is the person's home folder, not a project; name a project's folder",
+            dir.display()
+        ));
+    }
     let config = agent_client::config::load()?;
     if picks.effort.is_none() {
         picks.effort = config.sonny.lead_effort;
@@ -1317,6 +1381,56 @@ fn picks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new lead, made for a folder or by `new_project`, starts with what
+    /// every agent Sonny makes starts with: the person's command rules and
+    /// model tables are its from its first turn, not only once the tool host
+    /// next reads a changed config (#404).
+    #[test]
+    fn a_new_lead_starts_with_the_person_s_rules_and_model_tables() {
+        let mut config = agent_client::config::Config::default();
+        config
+            .speeds
+            .insert("openai/gpt-6.2-*".into(), vec!["fast".into()]);
+        config.context_windows.insert("openai/*".into(), 400_000);
+        config.hold_ms = Some(1_500);
+        let mut rules = agent_client::rules::Policy::default();
+        crate::rules::parse(
+            &mut rules,
+            "synthetic.rules",
+            r#"prefix_rule(pattern = ["cargo", "test"])"#,
+        )
+        .unwrap();
+        let given = Given {
+            config: &config,
+            rules: Some(rules.clone()),
+            mode: "auto",
+            providers: &json!({}),
+        };
+        let role = agent_client::policy::Profile {
+            name: "lead".into(),
+            path: None,
+            model: None,
+            tools: None,
+            sandbox: None,
+            body: String::new(),
+        };
+        let picks = agent_client::project::Picks {
+            model: Some("openai/gpt-6.2-astra".into()),
+            ..Default::default()
+        };
+        let dir = Path::new("/work/synthetic-shop");
+        let state = Some("/state/synthetic-shop.lead");
+        let policy = lead_policy(&given, dir, &role, &picks, state, None, "Lead.".into());
+        let settings = &policy["settings"];
+        assert_eq!(settings["rules"], json!(rules));
+        assert_eq!(settings["speeds"], json!({"openai/gpt-6.2-*": ["fast"]}));
+        assert_eq!(settings["context_windows"], json!({"openai/*": 400_000}));
+        assert_eq!(settings["hold_ms"], json!(1_500));
+        // One way in: the same settings an agent `made` starts with.
+        let made = crate::starts_with(&config, Some(&rules), "auto", dir, state);
+        assert_eq!(*settings, Value::Object(made));
+    }
 
     #[test]
     fn a_lead_is_one_no_agent_made_whatever_its_name() {
@@ -1636,6 +1750,77 @@ mod tests {
         assert!(error.starts_with("task_folder: "), "{error}");
         assert!(error.contains("sonny --agent ws.fix"), "{error}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn only_the_home_folder_itself_is_home() {
+        let base = std::env::temp_dir().join(format!("sonny-is-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join("code/app")).unwrap();
+        // The home folder by another name is the home folder.
+        std::os::unix::fs::symlink(&home, base.join("link")).unwrap();
+        let real = home.canonicalize().unwrap();
+        assert!(is_home(&real, Some(&home)));
+        assert!(is_home(&real, Some(&base.join("link"))));
+        // A folder below it is a folder like any other, its own project.
+        let app = real.join("code/app");
+        assert!(!is_home(&app, Some(&home)));
+        assert_eq!(folder_in(&app, Some(&home)).unwrap(), app);
+        assert!(!is_home(&real, None));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn no_project_is_made_in_the_home_folder_but_a_lead_there_opens() {
+        let base = std::env::temp_dir().join(format!("sonny-home-lead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let open = |leads: Value, pick: Pick| {
+            let home = home.clone();
+            async move {
+                let client =
+                    crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+                        Some("bots") => leads.clone(),
+                        _ => json!({"error": {"code": "unexpected", "message": "asked"}}),
+                    })
+                    .await;
+                open_in(&client, &home, Some("a/b"), &pick, Some(&home)).await
+            }
+        };
+        // None there: refused, and nothing written in the home folder.
+        let error = open(json!({"bots": []}), Pick::Last).await.err().unwrap();
+        assert!(
+            error.starts_with("home_folder: ~ is your home folder"),
+            "{error}"
+        );
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+        // One made there before opens, as it always did.
+        let lead = json!({"bots": [{"name": "home.lead", "workspace": home}]});
+        let opened = open(lead.clone(), Pick::Last).await.unwrap();
+        assert_eq!((opened.bot.as_str(), opened.new), ("home.lead", false));
+        // Another lead is not made there either.
+        let error = open(lead, Pick::New(Some("fix".into())))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with("home_folder: "), "{error}");
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn new_project_refuses_the_home_folder() {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        // Refused before any daemon is reached.
+        let named = json!({"folder": home, "title": "Home"});
+        let error = add("work.lead", Some("a/b"), &named).await.unwrap_err();
+        assert!(error.starts_with("home_folder: "), "{error}");
+        assert!(error.contains("the person's home folder"), "{error}");
     }
 
     #[test]

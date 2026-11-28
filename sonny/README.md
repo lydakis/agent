@@ -92,7 +92,7 @@ Closing the window leaves the daemon and every running turn alive. Reopen `sonny
 
 ### Leads, tasks, and projects
 
-- **One lead per folder (or several):** Opening `sonny` connects to `<project>.lead`. Start extra peer leads with `sonny --new-lead [NAME]`, switch agents with `/switch`, or jump across all projects with `/projects` (`←` on an empty composer).
+- **One lead per folder (or several):** Opening `sonny` connects to `<project>.lead` (or, with `[sonny] opens = "NAME"`, to that agent from any folder; `sonny .` is always the folder's lead). Start extra peer leads with `sonny --new-lead [NAME]`, switch agents with `/switch`, or jump across all projects with `/projects` (`←` on an empty composer).
 - **Isolated worktrees:** Each task runs in its own git worktree (`agent/NAME` branch) so parallel tasks never collide. Inside Rex, Herdr, or cmux, Sonny can also lay tasks out in tabs ([terminal layout](REFERENCE.md#terminal-layout)).
 - **At-a-glance status:** The side pane shows active tasks, plans, and live notes beside your chat. Press `/status` for the full grouped view (`Needs you`, `Failed`, `Working`, `Idle`, `Done`), or `/sky` for a live constellation map and replay of your entire fleet.
 

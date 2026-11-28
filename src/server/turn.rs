@@ -8057,14 +8057,16 @@ fn pieces(text: &str, most: usize) -> impl Iterator<Item = &str> {
 /// Failures of the provider's pace, capacity, or transport, none of which say
 /// anything about the request. Every 5xx is one, as Anthropic's SDK treats it
 /// (anthropic-sdk-python 4421d56, `_should_retry`): a CDN's 520 says no more
-/// than a 502. Model-level outcomes (`provider_incomplete`) and client errors
-/// are final.
+/// than a 502. A response the provider failed for a cause of its own
+/// (`provider_response_failed`) is one, as Codex retries it. Model-level
+/// outcomes (`provider_incomplete`) and client errors are final.
 fn retryable(code: &str) -> bool {
     matches!(
         code,
         "provider_rate_limited"
             | "provider_overloaded"
             | "provider_server_error"
+            | "provider_response_failed"
             | "provider_http_429"
             | "provider_stream_failed"
             | "provider_stream_stalled"

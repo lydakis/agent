@@ -477,6 +477,11 @@ impl Lasting {
             health.since_ms = Some(down.since_ms);
             health.told = Some(std::time::Instant::now());
         }
+        if let Some(last) = read_last(health_file)
+            && let Ok(mut health) = lasting.health.lock()
+        {
+            health.last = Some(last);
+        }
         lasting
     }
 }
@@ -497,10 +502,33 @@ pub fn health_file(dir: &Path, source: &str) -> PathBuf {
     dir.join(".health").join(format!("{source}.json"))
 }
 
+/// The last time a source was told down and worked again: when the first
+/// of its failed runs in a row ended, and when it worked again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Spell {
+    down_ms: u128,
+    back_ms: u128,
+}
+
+/// What a source's health file holds, whatever it says.
+fn read_word(file: &Path) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(file).ok()?).ok()
+}
+
+/// When a source's health file says it last worked again after it was
+/// told down; none in a file that predates it.
+fn read_last(file: &Path) -> Option<Spell> {
+    let word = read_word(file)?;
+    Some(Spell {
+        down_ms: u128::from(word["last_down_ms"].as_u64()?),
+        back_ms: u128::from(word["last_back_ms"].as_u64()?),
+    })
+}
+
 /// What a source's health file says, while the lookout's last word there
 /// is that it is down.
 fn read_down(file: &Path) -> Option<Down> {
-    let word: Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    let word = read_word(file)?;
     (word["down"] == true).then(|| Down {
         since_ms: u128::from(word["since_ms"].as_u64().unwrap_or_default()),
         why: word["failed"].as_str().unwrap_or_default().to_owned(),
@@ -531,12 +559,18 @@ pub fn down(store: &Path) -> HashMap<String, Down> {
 }
 
 /// The lookout's word on a source as its health file keeps it: whether
-/// it is down, since when, and why, with its stderr's last lines.
-fn health_word(told: &Event, since_ms: Option<u128>) -> String {
+/// it is down, since when, and why, with its stderr's last lines, and
+/// when it last worked again after it was told down.
+fn health_word(told: &Event, since_ms: Option<u128>, last: Option<Spell>) -> String {
     let down = (told.id.as_deref()).is_some_and(|id| id.starts_with("lookout.down."));
-    json!({"down": down, "since_ms": since_ms.map(|ms| ms as u64), "at_ms": told.at_ms as u64,
-        "failed": told.fields["failed"], "stderr": told.fields["stderr"]})
-    .to_string()
+    let mut word = json!({"down": down, "since_ms": since_ms.map(|ms| ms as u64),
+        "at_ms": told.at_ms as u64, "failed": told.fields["failed"],
+        "stderr": told.fields["stderr"]});
+    if let Some(last) = last {
+        word["last_down_ms"] = json!(last.down_ms as u64);
+        word["last_back_ms"] = json!(last.back_ms as u64);
+    }
+    word.to_string()
 }
 
 impl Runner {
@@ -793,6 +827,8 @@ struct Health {
     since_ms: Option<u128>,
     /// When its subscribers last heard it is down.
     told: Option<std::time::Instant>,
+    /// The last time they heard it is down and then works again.
+    last: Option<Spell>,
 }
 
 impl Health {
@@ -809,6 +845,10 @@ impl Health {
             self.failed = 0;
             let since = self.since_ms.take();
             self.told.take()?;
+            if let Some(down_ms) = since {
+                let back_ms = super::epoch_ms();
+                self.last = Some(Spell { down_ms, back_ms });
+            }
             let since = since.map(clock).unwrap_or_default();
             return Some(Event::of_lookout(
                 source,
@@ -826,18 +866,32 @@ impl Health {
             return None;
         }
         self.told = Some(now);
+        let mut fields = json!({"failed": why, "stderr": stderr});
+        let last = match self.last {
+            Some(Spell { down_ms, back_ms }) => {
+                fields["last_down_ms"] = json!(down_ms as u64);
+                fields["last_back_ms"] = json!(back_ms as u64);
+                format!(
+                    " It was last down at {} and worked again at {}, {} later.",
+                    clock(down_ms),
+                    clock(back_ms),
+                    lasted(back_ms.saturating_sub(down_ms))
+                )
+            }
+            None => String::new(),
+        };
         Some(Event::of_lookout(
             source,
             "down",
             format!(
                 "The source {} is down: its last {} runs failed, since {}, so nothing from it \
-                 reaches you until it works again, which you will hear. Tell the person, who \
-                 set it up.",
+                 reaches you until it works again, which you will hear.{last} Tell the person, \
+                 who set it up.",
                 source.name,
                 self.failed,
                 clock(since)
             ),
-            json!({"failed": why, "stderr": stderr}),
+            fields,
         ))
     }
 }
@@ -845,6 +899,26 @@ impl Health {
 /// `ms` since the epoch in local time, as messages are stamped.
 pub fn clock(ms: u128) -> String {
     crate::stamp::when((ms / 1000) as i64)
+}
+
+/// How long `ms` lasted, in words: `less than a minute`, `12 minutes`,
+/// `3 hours 5 minutes`, `2 days 4 hours`.
+fn lasted(ms: u128) -> String {
+    let count = |n: u128, unit: &str| match n {
+        1 => format!("1 {unit}"),
+        n => format!("{n} {unit}s"),
+    };
+    let both = |big: String, small: u128, unit: &str| match small {
+        0 => big,
+        small => format!("{big} {}", count(small, unit)),
+    };
+    let minutes = ms / 60_000;
+    match minutes {
+        0 => "less than a minute".to_owned(),
+        1..60 => count(minutes, "minute"),
+        60..1440 => both(count(minutes / 60, "hour"), minutes % 60, "minute"),
+        _ => both(count(minutes / 1440, "day"), minutes % 1440 / 60, "hour"),
+    }
 }
 
 /// Run a source's command again and again, sending each new event, until
@@ -916,9 +990,9 @@ fn tell(
 ) {
     let told = (health.lock().ok()).and_then(|mut health| {
         let told = health.after(source, failed, stderr, std::time::Instant::now())?;
-        Some((told, health.since_ms))
+        Some((told, health.since_ms, health.last))
     });
-    let Some((told, since_ms)) = told else {
+    let Some((told, since_ms, last)) = told else {
         // Given back at once, so it holds no place meanwhile.
         return drop(place);
     };
@@ -929,7 +1003,10 @@ fn tell(
     }
     // And on its own, so a view knows it is down without reading what it
     // printed.
-    shapes::write(health_file.to_path_buf(), health_word(&told, since_ms));
+    shapes::write(
+        health_file.to_path_buf(),
+        health_word(&told, since_ms, last),
+    );
     place.send(Said::Event(Box::new(told)));
 }
 
@@ -3443,6 +3520,115 @@ mod tests {
             assert_eq!(mine.0[0].0, PathBuf::from(home).join("poll.py"));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_source_down_again_says_when_it_last_came_back() {
+        let source = source(None);
+        let mut health = Health::default();
+        let now = std::time::Instant::now();
+        let fail_thrice = |health: &mut Health| {
+            let failed = || Some("exit status: 1".to_owned());
+            assert!(health.after(&source, failed(), Vec::new(), now).is_none());
+            assert!(health.after(&source, failed(), Vec::new(), now).is_none());
+            health.after(&source, failed(), Vec::new(), now).unwrap()
+        };
+        // Down for the first time: nothing of an earlier spell.
+        let first = fail_thrice(&mut health);
+        assert!(!first.text.contains("last down"), "{}", first.text);
+        assert!(
+            first
+                .text
+                .ends_with("which you will hear. Tell the person, who set it up.")
+        );
+        assert_eq!(
+            (&first.fields["last_down_ms"], &first.fields["last_back_ms"]),
+            (&Value::Null, &Value::Null)
+        );
+        let down_ms = health.since_ms.unwrap();
+        // Back, then down again: the note says the spell before.
+        assert!(health.after(&source, None, Vec::new(), now).is_some());
+        let spell = health.last.unwrap();
+        assert_eq!(spell.down_ms, down_ms);
+        assert!(spell.back_ms >= spell.down_ms);
+        let again = fail_thrice(&mut health);
+        let said = format!(
+            "which you will hear. It was last down at {} and worked again at {}, less than a \
+             minute later. Tell the person, who set it up.",
+            clock(spell.down_ms),
+            clock(spell.back_ms)
+        );
+        assert!(again.text.ends_with(&said), "{}", again.text);
+        assert_eq!(again.fields["last_down_ms"], json!(spell.down_ms as u64));
+        assert_eq!(again.fields["last_back_ms"], json!(spell.back_ms as u64));
+        // Back again, the newest spell is the one kept.
+        assert!(health.after(&source, None, Vec::new(), now).is_some());
+        assert!(health.last.unwrap().down_ms >= spell.back_ms);
+    }
+
+    #[test]
+    fn a_sources_last_recovery_is_kept_in_its_health_file_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("lookout-last-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = health_file(&dir, "slack");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        // A file from before kept no recovery: none, and the note says none.
+        let older = json!({"down": false, "since_ms": null, "at_ms": 9000,
+            "failed": null, "stderr": null});
+        std::fs::write(&file, older.to_string()).unwrap();
+        assert_eq!(read_last(&file), None);
+        assert_eq!(Lasting::after(&file).health.lock().unwrap().last, None);
+        // Back after a spell, as the lookout writes it.
+        let source = source(None);
+        let mut health = Health::default();
+        let now = std::time::Instant::now();
+        for _ in 0..DOWN_AFTER {
+            health.after(&source, Some("exit status: 1".into()), Vec::new(), now);
+        }
+        let back = health.after(&source, None, Vec::new(), now).unwrap();
+        let word = health_word(&back, health.since_ms, health.last);
+        std::fs::write(&file, word).unwrap();
+        let spell = health.last.unwrap();
+        assert_eq!(read_last(&file), Some(spell));
+        assert_eq!(read_down(&file), None);
+        // A new lookout reads it, and its next down note says it.
+        let lasting = Lasting::after(&file);
+        let mut health = lasting.health.lock().unwrap();
+        assert_eq!(health.last, Some(spell));
+        for _ in 1..DOWN_AFTER {
+            health.after(&source, Some("exit status: 1".into()), Vec::new(), now);
+        }
+        let down = health
+            .after(&source, Some("exit status: 1".into()), Vec::new(), now)
+            .unwrap();
+        assert!(
+            down.text
+                .contains(&format!("It was last down at {}", clock(spell.down_ms)))
+        );
+        // Still kept while it is down, so a restart then says it too.
+        let word = health_word(&down, health.since_ms, health.last);
+        std::fs::write(&file, word).unwrap();
+        assert!(read_down(&file).is_some());
+        assert_eq!(read_last(&file), Some(spell));
+        drop(health);
+        let lasting = Lasting::after(&file);
+        assert_eq!(lasting.health.lock().unwrap().last, Some(spell));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn how_long_a_spell_lasted_is_said_in_words() {
+        let minute = 60_000;
+        assert_eq!(lasted(59_999), "less than a minute");
+        assert_eq!(lasted(minute), "1 minute");
+        assert_eq!(lasted(12 * minute), "12 minutes");
+        assert_eq!(lasted(60 * minute), "1 hour");
+        assert_eq!(lasted(185 * minute), "3 hours 5 minutes");
+        assert_eq!(lasted(24 * 60 * minute), "1 day");
+        assert_eq!(
+            lasted((2 * 24 + 4) * 60 * minute + 7 * minute),
+            "2 days 4 hours"
+        );
     }
 
     #[test]

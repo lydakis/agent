@@ -21,7 +21,22 @@ pub const VERBS: [&str; 6] = ["open", "take", "drop", "done", "fail", "pause"];
 pub const TITLE_CHARS: usize = 30;
 
 /// Work's fields that its steps change or clear after it is made.
-pub const CHANGING: [&str; 6] = ["for", "labels", "needs", "holder", "holder_id", "result"];
+pub const CHANGING: [&str; 9] = [
+    "for",
+    "labels",
+    "needs",
+    "holder",
+    "holder_id",
+    "result",
+    "paused_by",
+    "paused_at",
+    "paused_why",
+];
+
+/// What paused work keeps of the post that paused it: who wrote it, when,
+/// and its text, which says what the work waits on. Work no longer paused
+/// keeps none of them.
+pub const PAUSED: [&str; 3] = ["paused_by", "paused_at", "paused_why"];
 
 /// Names a label never takes: what Sonny writes of work.
 pub const PROTECTED: [&str; 7] = ["state", "holder", "board", "by", "project", "at", "do"];
@@ -289,10 +304,12 @@ pub fn valid_title(title: &str) -> Result<(), String> {
 /// needs is [`waiting`]'s, which knows the other work.
 ///
 /// `{board, state, by, by_id?, at, labels, needs, for?, title?, holder?, holder_id?, result?,
-/// branch?, commit?, uncommitted?}`: `by` made it, as the daemon knew it by `by_id`, `at` is its
-/// last step's time, `holder` holds taken work and did done or failed work, `result` is a closing
-/// post's text, `branch`, `commit` and `uncommitted` the checkout a done post recorded
-/// ([`MADE`]), and `title` is the short one a reply opening a thread already there gave it.
+/// branch?, commit?, uncommitted?, paused_by?, paused_at?, paused_why?}`: `by` made it, as the
+/// daemon knew it by `by_id`, `at` is its last step's time, `holder` holds taken work and did done
+/// or failed work, `result` is a closing post's text, `branch`, `commit` and `uncommitted` the
+/// checkout a done post recorded ([`MADE`]), `paused_by`, `paused_at` and `paused_why` who paused
+/// paused work, when, and what its pause post said ([`PAUSED`]), and `title` is the short one a
+/// reply opening a thread already there gave it.
 pub fn standing(posts: &[Value]) -> Option<Value> {
     let mut item: Option<Value> = None;
     for post in posts {
@@ -346,13 +363,24 @@ pub fn standing(posts: &[Value]) -> Option<Value> {
                 set("state", json!("done"));
                 set("result", post["text"].clone());
             }
-            "pause" => set("state", json!("paused")),
+            "pause" => {
+                set("state", json!("paused"));
+                set("paused_by", post["by"].clone());
+                set("paused_at", post["at"].clone());
+                set("paused_why", post["text"].clone());
+            }
             // Its maker's fail while nobody holds it takes it back.
             "fail" => {
                 set("state", json!(if unheld { "canceled" } else { "failed" }));
                 set("result", post["text"].clone());
             }
             _ => {}
+        }
+        // Work no longer paused waits on nothing its pause said.
+        if it.get("state").and_then(Value::as_str) != Some("paused") {
+            for key in PAUSED {
+                it.remove(key);
+            }
         }
         // What a done post recorded of its author's checkout.
         if action == "done" {
@@ -2696,6 +2724,57 @@ mod tests {
         w1(act("docs", "pause")).unwrap();
         let canceled = w1(act("docs", "fail")).unwrap();
         assert_eq!(canceled["work"]["state"], "canceled", "{canceled}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn paused_work_says_who_paused_it_when_and_what_it_waits_on_until_opened() {
+        let home = home("pause-why");
+        let lead = |args| send(&home, "shop.lead", "shop", None, false, args);
+        let w1 = |args| send(&home, "shop.w1", "shop", None, false, args);
+        lead(work("store", "Type the store errors", json!({}))).unwrap();
+        let why = "Waits on PR #12 merging";
+        let pause = json!({"reply": {"thread": "store", "do": "pause", "text": why}});
+        let paused = lead(pause.clone()).unwrap();
+        assert_eq!(paused["work"]["paused_by"], "shop.lead", "{paused}");
+        assert_eq!(paused["work"]["paused_why"], why, "{paused}");
+        let at = paused["work"]["paused_at"].as_i64().unwrap();
+        assert!(at > 0, "{paused}");
+        // A label set later moves the work's time, never when it paused.
+        lead(set("store", json!({"labels": {"area": "store"}}))).unwrap();
+        // The listing and a read alike carry them.
+        let listing = send(
+            &home,
+            "x.y",
+            "x",
+            None,
+            false,
+            json!({"filter": {"board": ["shop/errors"]}}),
+        )
+        .unwrap();
+        let work = &listing["threads"][0]["work"];
+        assert_eq!(work["paused_by"], "shop.lead", "{listing}");
+        assert_eq!(work["paused_why"], why, "{listing}");
+        assert_eq!(work["paused_at"], at, "{listing}");
+        assert_eq!(work["labels"]["area"], "store", "{listing}");
+        let read = w1(json!({"read": "store"})).unwrap();
+        assert_eq!(read["work"]["paused_why"], why, "{read}");
+        // Opened again, it waits on nothing.
+        let opened = lead(act("store", "open")).unwrap();
+        for key in PAUSED {
+            assert!(opened["work"][key].is_null(), "{key}: {opened}");
+        }
+        // A pause with no words keeps who and when alone.
+        lead(json!({"reply": {"thread": "store", "do": "pause"}})).unwrap();
+        let read = w1(json!({"read": "store"})).unwrap();
+        assert_eq!(read["work"]["paused_by"], "shop.lead", "{read}");
+        assert!(read["work"]["paused_why"].is_null(), "{read}");
+        // Canceled, its pause is gone with it.
+        let canceled = lead(act("store", "fail")).unwrap();
+        assert_eq!(canceled["work"]["state"], "canceled", "{canceled}");
+        for key in PAUSED {
+            assert!(canceled["work"][key].is_null(), "{key}: {canceled}");
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 

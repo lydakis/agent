@@ -74,7 +74,8 @@ each other and the daemon through their tools (`send_message`, `wait`,
 ## Projects and leads
 
 ```sh
-sonny                              # Open this folder's last-messaged lead (creates one if needed)
+sonny                              # Open what [sonny] opens says: this folder's last-messaged lead (creates one if needed), the default, or one agent from any folder
+sonny . | sonny DIR                # Open that folder's lead, whatever [sonny] opens says
 sonny --model PROVIDER/MODEL       # Same, choosing the model on first creation
 sonny --lead NAME                  # Open a specific peer lead in this folder
 sonny --new-lead [NAME]            # Create a new peer lead (auto-numbered as lead.2 if omitted)
@@ -86,12 +87,14 @@ sonny --agent NAME                 # Open any specific agent directly
 - **Git repositories:** Sonny resolves the nearest `.agents/project.toml` in the repo (or creates one at the repo root), so running inside `src/` or a task worktree reaches the main checkout's lead. Subfolders become separate projects once they have their own `.agents/project.toml` (created by `new_project`).
 - **Outside git:** The current directory is its own project.
 - **Umbrella folders:** Setting `subfolders = "project"` in `.agents/project.toml` routes subfolders without their own project file (including nested git repos) to that parent lead.
-- Sonny refuses to create a lead inside `~/.agent` task folders.
+- Sonny refuses to create a lead inside `~/.agent` task folders, or in your home folder itself (`home_folder:`); a lead made there before still opens, and the folders below are folders like any other.
+- `[sonny] opens = "work.lead"` (or picked in `sonny setup` or `/config`) makes a bare `sonny` open that agent from any folder, making nothing; one that is not there is said in one line and nothing opens. `"folder"`, the default, is this folder's lead.
 
 <details>
 <summary><strong>Full details: projects and leads</strong></summary>
 
-    sonny                                    # this folder's lead, the one last written to
+    sonny                                    # this folder's lead, the one last written to, or what [sonny] opens names
+    sonny . | sonny DIR                      # that folder's lead, whatever [sonny] opens says
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --lead NAME                        # another of the folder's leads
     sonny --new-lead [NAME]                  # a new lead for the folder
@@ -111,7 +114,25 @@ them that has no project file of its own, a repository among them, opens
 that project's lead (the nearest project above decides; the home folder's
 file never does). A lead made below another project's folder says which
 lead holds the folder above. Sonny refuses to make a lead in a task's own
-folder under `~/.agent`.
+folder under `~/.agent`, and in the home folder itself, whose `.agents` is
+your own (skills, profiles, memory), as git makes no repository outside
+one: `home_folder: ~ is your home folder, not a project`. A lead made there
+before still opens, and the folders below it are folders like any other;
+the new_project tool refuses the home folder too.
+
+A bare `sonny` opens what `[sonny] opens` says, as a browser's "on
+startup" setting picks its first page: `"folder"`, the default, the lead of
+the folder it runs in, as above; or an agent by its whole name, such as
+`"work.lead"`, from any folder, making nothing, as `sonny --agent NAME`
+does. An agent named that is not there is said
+(`work.lead is not there; sonny . opens this folder's lead`) and nothing
+opens: it never falls back to the folder. `sonny .` or `sonny DIR` opens
+that folder's lead whatever the setting, as `code .` does; `--lead` and
+`--new-lead` are the start folder's leads either way, and a folder named as
+one of Sonny's commands is `./status`. Setup asks for it after the model
+(this folder's lead, each lead on the daemon, or a name typed), `sonny
+setup --opens folder|AGENT` sets it without asking, and `/config` steps it
+between the folder and the agent its window shows.
 
 </details>
 
@@ -170,12 +191,15 @@ Press `/projects` (or `←` on an empty composer) to browse all projects in plac
 
 - Rows stay in stable title order; nested projects indent beneath parent folders; `superlead` projects are tagged `superlead`; projects inactive for 7+ days fold into `▸ N idle projects`.
 - **Keys:** `↑`/`↓` select, `Enter`/`→` open lead, `←` jump to parent project, `Ctrl+F` filter, `Esc` return.
+- **Pinned agents:** `/pin` in any agent's window (or `p` on a project's row, or on an agent picked in the pane's list) pins it at the top of Projects, numbered; `←` then its number (`1`–`9`) opens it from anywhere. The same again unpins; nine at most.
 - **Fast switching inside a project (empty composer):**
   - `Alt+←` / `Alt+→` (or `Ctrl+←` / `Ctrl+→`): step through agents in this project.
   - `→` (or `Tab`): move keyboard focus to the side pane (`←` returns from page 1).
   - `Alt+N` (or click `← ? N` in the footer): jump to the next agent needing your approval or answer across **any** project, landing on its card.
 
 ![Projects at 150, 120, 60 and 44 columns: a superlead with two projects under it, a third outside it, four idle projects folded; the pane shows the picked project's agents where there is room](../docs/sonny/projects-projects.png)
+
+![Projects with three agents pinned above the projects, one of them not there any more, and none, at 150, 120, 60 and 44 columns](../docs/sonny/projects-pinned.png)
 
 <details>
 <summary><strong>Full details: projects</strong></summary>
@@ -196,6 +220,30 @@ row under the page's title, and `esc` puts back the
 conversation and what the pane showed. The empty composer says
 `← projects`. Zen, a side chat and an agent shown beside keep you where you
 are: `←` there does nothing.
+
+**Pinned agents** are the few you want closer than their project: a lead
+or a task from any project. Each is a numbered row at the top of
+Projects, under a muted `Pinned`: its number, its state mark, its title
+and its name, a link. `1` to `9` go to that agent at once, wherever the
+pick is, by the name the pin holds, so `←` then a number works before
+Projects has read anything (on the agent you are on, the view closes;
+while you find, a number is typed). `↑` from the first project goes into
+Pinned and the pane follows to that agent's project; `enter` or `→` goes
+to it. `/pin` in any agent's window pins that agent (`pinned as 3 · ← 3
+opens it`), and reads "Unpin this agent" while it is pinned; `p` on a
+project's row in Projects pins its lead, `p` on a pinned row unpins it,
+and `p` on the agent picked in the pane's list of agents pins it there,
+its row unchanged. Nine at most (`9 pinned · unpin one first`). Numbers
+are the order you pinned in and move only when you unpin. Nothing pins or
+unpins for you: a done agent keeps its row and mark, and one not there any
+more keeps its row in muted words, its number answered `NAME is not
+there`, until `p` clears it. With nothing pinned the section is not drawn.
+The pins are one small file beside the store (`STORE.pinned`, a name a
+line), shared by every window and replaced whole by a rename under a
+lock beside it; a window
+reads it as it starts and as Projects opens, and writes it, beside the
+window, never while drawing or taking a key. Their marks and titles come
+from what Projects already reads.
 
 Inside a project, with nothing typed, `→` gives the keys to the pane as
 `tab` does, and `←` at the pane's first page, with nothing left to close,
@@ -611,6 +659,7 @@ Settings live in `~/.agent/config.toml` (editable via `/config`) and can be over
 | Margin behavior & limits | `[sonny] margin_opens`, `margin_notes`, `margin_note_lines` | — | `"always"` (`unless-closed`, `never`); `6` notes; `40` rows |
 | Custom margin notes | `[sonny.notes.NAME]` | — | `markdown`, `live`, `title` |
 | Where agent links open | `[sonny] agent_opens` | — | `"tab"` or `"beside"` |
+| What a bare `sonny` opens | `[sonny] opens` | — | `"folder"` (this folder's lead) or an agent's whole name |
 | Task tab policy | `[sonny] task_tabs`, `most_task_tabs` | — | `"asked"` (`every`); `32` tabs (`0` = unlimited) |
 | Task worktree retention | `[sonny] task_worktrees` | — | `15` (min `1`; oldest idle clean worktrees pruned) |
 | Decision deadline | `[sonny] ask_wait_minutes` | — | `60` (`0` = always wait) |
@@ -1251,7 +1300,7 @@ has something on it, or is off the screen, no time shows.
 
 Type `/` to open the fuzzy command menu (ranked by frequency and recency in `~/.agent/sonny/picks.json`). Typos like `/stauts` stay in the composer instead of sending; paths like `/etc/hosts is wrong` send normally.
 
-**Quick commands:** `/copy` (copy last reply) · `/verbose` (toggle all tool calls in this window) · `/compact` (confirm & summarize conversation now; daemon also auto-compacts at `compact_tokens` and between turns at 70% context) · `/retry` (inspect and allow one retry of a reviewer-denied call) · `/margin` (reopen margin) · `/mcp` (list MCP servers & tools) · `/audit` (view tool audit trail: `a` all agents, `t`/`p`/`w` filters, `Ctrl+F` finds) · `/pause REASON` & `/resume` (fleet-wide andon cord) · `/quit` (exit window, leaving daemon and turns running).
+**Quick commands:** `/copy` (copy last reply) · `/verbose` (toggle all tool calls in this window) · `/compact` (confirm & summarize conversation now; daemon also auto-compacts at `compact_tokens` and between turns at 70% context) · `/retry` (inspect and allow one retry of a reviewer-denied call) · `/margin` (reopen margin) · `/mcp` (list MCP servers & tools) · `/audit` (view tool audit trail: `a` all agents, `t`/`p`/`w` filters, `Ctrl+F` finds) · `/pause REASON` & `/resume` (fleet-wide andon cord) · `/pin` (pin this agent at the top of Projects, `←` then its number opens it; again unpins) · `/quit` (exit window, leaving daemon and turns running).
 
 ### `/side` — Mid-turn side chats
 
