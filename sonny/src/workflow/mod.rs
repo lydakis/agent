@@ -713,8 +713,9 @@ pub fn resume(store: PathBuf, socket: PathBuf) {
             // that cannot be picked up ends failed, saying why: one whose
             // journal cannot be written, or whose script no longer reads, is
             // loaded broken and ends through `finish`, its workers
-            // interrupted; this is one whose plan or journal cannot be read,
-            // so whose workers are unknown.
+            // interrupted; this is one whose journal cannot be read, so
+            // whose workers' turns are unknown. Its workers, known by their
+            // names, are closed all the same before it is recorded ended.
             None => match load(&path, &store, &socket) {
                 Ok(run) => {
                     let _ = run.note(json!({"t": "replay", "at_ms": now_ms()}));
@@ -722,13 +723,17 @@ pub fn resume(store: PathBuf, socket: PathBuf) {
                 }
                 Err(why) => {
                     if let Ok(plan) = read_plan(&path) {
-                        let mut ended = json!({"status": "failed", "result": null,
-                            "error": format!("the run could not be picked up again: {why}"),
-                            "agents": 0, "nulls": 0, "reused": 0, "output_tokens": 0,
-                            "kept": [], "ended_ms": now_ms(), "told": false});
-                        let kept = keep_result(&path, &ended);
-                        unsaved(&mut ended, kept);
-                        deliver(plan, ended, path, socket.clone());
+                        let socket = socket.clone();
+                        tokio::spawn(async move {
+                            close_workers(&plan, &socket, None).await;
+                            let mut ended = json!({"status": "failed", "result": null,
+                                "error": format!("the run could not be picked up again: {why}"),
+                                "agents": 0, "nulls": 0, "reused": 0, "output_tokens": 0,
+                                "kept": [], "ended_ms": now_ms(), "told": false});
+                            let kept = keep_result(&path, &ended);
+                            unsaved(&mut ended, kept);
+                            deliver(plan, ended, path, socket);
+                        });
                     }
                 }
             },
@@ -1657,8 +1662,8 @@ async fn halted(run: &Run) {
     }
 }
 
-/// Record how `run` ended, take away the worktrees it left clean, and tell
-/// its caller.
+/// Record how `run` ended, close its workers, take away the worktrees it
+/// left clean, and tell its caller.
 async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
     let plan = &run.plan;
     // Every worktree being made is made, and known, before any is taken.
@@ -1703,6 +1708,11 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
             .ok()
             .map(|(client, _)| client);
     }
+    // Done with, as a subagent is once it returns: every worker of the run
+    // is closed, its history kept whole, before the run is recorded ended,
+    // so a host gone meanwhile runs it to its end again and closes them
+    // then. Its turns were interrupted above, so no close cuts one short.
+    close_workers(plan, &run.socket, client).await;
     let (mut status, result, mut error) = match ended {
         script::Ended::Returned(value) => ("completed", value, None),
         script::Ended::Threw(error) => ("failed", Value::Null, Some(error)),
@@ -1751,6 +1761,41 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
     let kept = keep_result(&run.dir, &ended);
     unsaved(&mut ended, kept);
     deliver(plan.clone(), ended, run.dir.clone(), run.socket.clone());
+}
+
+/// Close every worker of `plan`'s run with the daemon's `close`, which
+/// keeps each one's history whole and is undone by a turn of its: all the
+/// open bots its workers' names match, `PROJECT.wf-RUN-*`, a page at a
+/// time, on `client` or a new connection until the daemon has heard it.
+async fn close_workers(plan: &Plan, socket: &Path, mut client: Option<Arc<Client>>) {
+    let pattern = format!("{}.{WORKER}{}-*", plan.project, plan.id);
+    let mut after: Option<String> = None;
+    let mut wait = AGAIN;
+    loop {
+        if client.is_none() {
+            client = Client::connect(socket).await.ok().map(|(client, _)| client);
+        }
+        if let Some(open) = &client {
+            let mut asked = json!({"bot": pattern, "limit": 256});
+            if let Some(after) = &after {
+                asked["after"] = json!(after);
+            }
+            match open.request("close", asked).await {
+                Ok(page) => match page["next_after"].as_str() {
+                    Some(next) => {
+                        after = Some(next.to_owned());
+                        continue;
+                    }
+                    None => return,
+                },
+                Err(error) if lost(&error) => client = None,
+                // Refused outright: asking again changes nothing.
+                Err(_) => return,
+            }
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(60));
+    }
 }
 
 /// Tell `plan`'s caller how its run ended, trying until the daemon takes
@@ -2203,6 +2248,7 @@ mod tests {
         let run_dir = dir.join("r1");
         make(&run_dir, &plan, source, None).unwrap();
         let socket = dir.join("socket");
+        let _asked = daemon(&socket, 1, run_dir.join("result.json"));
         // A journal that cannot be read is no run to pick up, and no run
         // to resume from: never an empty one.
         let journal = run_dir.join("events.jsonl");
@@ -2284,6 +2330,182 @@ mod tests {
         assert!(run.live.lock().unwrap().contains_key("shop.wf-r1-k2"));
         let why = run.broken.lock().unwrap().clone().unwrap();
         assert!(why.contains("its script could not be read again"), "{why}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A run `id` of project shop, as its caller started it.
+    fn plan_of(id: &str) -> Plan {
+        serde_json::from_value(json!({"id": id, "caller": "shop.lead",
+            "caller_id": 1, "turn": 1, "project": "shop", "roles": "/", "workspace": "/",
+            "model": "openai/m", "effort": null, "mode": "auto", "held": null, "state": null,
+            "args": null, "budget": null, "meta": {}, "resumed_from": null, "started_ms": 0,
+            "max_agents": 1000, "at_once": 4}))
+        .unwrap()
+    }
+
+    /// A daemon on `socket` that keeps every ask it is sent, with whether
+    /// `result` was written by then, and answers as a run's end needs: a
+    /// worker runs turn 3 until it is interrupted, which then spent 5
+    /// output tokens; a close by pattern answers `pages` pages; anything
+    /// else, an empty answer.
+    fn daemon(socket: &Path, pages: usize, result: PathBuf) -> Arc<Mutex<Vec<Value>>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let asked = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let kept = Arc::clone(&asked);
+        let interrupted = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (kept, interrupted, result) =
+                    (Arc::clone(&kept), Arc::clone(&interrupted), result.clone());
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL,
+                        "providers": {}});
+                    let _ = write.write_all(format!("{ready}\n").as_bytes()).await;
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let mut ask: Value = serde_json::from_str(&line).unwrap();
+                        ask["result_written"] = json!(result.exists());
+                        let closes = {
+                            let mut kept = kept.lock().unwrap();
+                            kept.push(ask.clone());
+                            kept.iter().filter(|ask| ask["op"] == "close").count()
+                        };
+                        let bot = str_of(&ask["bot"]);
+                        let said = match ask["op"].as_str() {
+                            Some("turns") => match interrupted.load(Ordering::SeqCst) {
+                                false => json!({"turns": [{"turn": 3, "status": "running",
+                                    "handle": format!("{bot}/3"), "output_tokens": 0}]}),
+                                true => json!({"turns": [{"turn": 3, "status": "interrupted",
+                                    "output_tokens": 5}]}),
+                            },
+                            Some("messages") => json!({"messages": []}),
+                            Some("interrupt") => {
+                                interrupted.store(true, Ordering::SeqCst);
+                                json!({"interrupt_requested": true})
+                            }
+                            Some("wait") => {
+                                let handle = str_of(&ask["handles"][0]);
+                                json!({"results": {handle: {"pending": false,
+                                    "status": "interrupted", "output_tokens": 5}}})
+                            }
+                            Some("close") => json!({"closed": [], "refused": [],
+                                "next_after": (closes < pages).then(|| format!("{bot}{closes}"))}),
+                            _ => json!({}),
+                        };
+                        let said = json!({"id": ask["id"], "result": said});
+                        let _ = write.write_all(format!("{said}\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        asked
+    }
+
+    /// The asks of `asked` that are `op`.
+    fn of(asked: &Mutex<Vec<Value>>, op: &str) -> Vec<Value> {
+        (asked.lock().unwrap().iter())
+            .filter(|ask| ask["op"] == op)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_run_s_end_closes_its_workers_once_their_turns_are_stopped() {
+        let dir = std::env::temp_dir().join(format!("sonny-wf-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plan = plan_of("c1");
+        let run_dir = dir.join("c1");
+        let source = "export const meta = {name: 'c1', description: 'x'}\nreturn 1\n";
+        make(&run_dir, &plan, source, None).unwrap();
+        // A worker it asked, whose answer never came: its turn still runs.
+        std::fs::write(
+            run_dir.join("events.jsonl"),
+            "{\"t\": \"submit\", \"worker\": \"shop.wf-c1-k1\"}\n",
+        )
+        .unwrap();
+        let socket = dir.join("socket");
+        let asked = daemon(&socket, 2, run_dir.join("result.json"));
+        let run = load(&run_dir, &dir, &socket).unwrap();
+        finish(&run, script::Ended::Returned(json!(1)), None).await;
+        // Its turn is interrupted and counted, then every worker of the run
+        // is closed by its name's pattern, page by page, before the run is
+        // recorded ended.
+        let ops: Vec<String> = (asked.lock().unwrap().iter())
+            .map(|ask| str_of(&ask["op"]))
+            .collect();
+        let interrupted = ops.iter().position(|op| op == "interrupt").unwrap();
+        let closed = ops.iter().position(|op| op == "close").unwrap();
+        assert!(interrupted < closed, "{ops:?}");
+        let closes = of(&asked, "close");
+        assert_eq!(closes.len(), 2, "{closes:?}");
+        assert_eq!(closes[0]["bot"], "shop.wf-c1-*");
+        assert_eq!(closes[0]["after"], Value::Null);
+        assert_eq!(closes[1]["bot"], "shop.wf-c1-*");
+        assert_eq!(closes[1]["after"], "shop.wf-c1-*1");
+        assert!(closes.iter().all(|ask| ask["result_written"] == false));
+        let ended: Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("result.json")).unwrap()).unwrap();
+        assert_eq!(
+            (&ended["status"], &ended["output_tokens"]),
+            (&json!("completed"), &json!(5))
+        );
+        // Its history stays whole: nothing but reads, the interrupt and
+        // the close reached a worker.
+        let touched: BTreeSet<String> = (asked.lock().unwrap().iter())
+            .filter(|ask| {
+                ask["bot"]
+                    .as_str()
+                    .is_some_and(|bot| bot.starts_with("shop.wf-"))
+            })
+            .map(|ask| str_of(&ask["op"]))
+            .collect();
+        let allowed = ["close", "interrupt", "messages", "turns"];
+        assert!(
+            touched.iter().all(|op| allowed.contains(&op.as_str())),
+            "{touched:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_gone_before_a_run_s_end_closes_its_workers_when_it_starts_again() {
+        let dir = std::env::temp_dir().join(format!("sonny-wf-again-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("store");
+        let source = |id: &str| {
+            format!("export const meta = {{name: '{id}', description: 'x'}}\nreturn 1\n")
+        };
+        // One the host was running, and one whose journal can no longer be
+        // read: neither recorded its end, so neither closed its workers.
+        let (going, unread) = (runs(&store).join("c2"), runs(&store).join("c3"));
+        make(&going, &plan_of("c2"), &source("c2"), None).unwrap();
+        make(&unread, &plan_of("c3"), &source("c3"), None).unwrap();
+        std::fs::remove_file(unread.join("events.jsonl")).unwrap();
+        let socket = dir.join("socket");
+        let asked = daemon(&socket, 1, dir.join("none"));
+        resume(store, socket);
+        let ended = |run: &Path| -> Option<Value> {
+            serde_json::from_slice(&std::fs::read(run.join("result.json")).ok()?).ok()
+        };
+        for _ in 0..500 {
+            if ended(&going).is_some() && ended(&unread).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(ended(&going).unwrap()["status"], "completed");
+        assert_eq!(ended(&unread).unwrap()["status"], "failed");
+        let closed: BTreeSet<String> = of(&asked, "close")
+            .iter()
+            .map(|ask| str_of(&ask["bot"]))
+            .collect();
+        assert_eq!(
+            closed,
+            BTreeSet::from(["shop.wf-c2-*".to_owned(), "shop.wf-c3-*".to_owned()])
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
