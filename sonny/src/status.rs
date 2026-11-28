@@ -1273,6 +1273,7 @@ pub fn cause(code: &str) -> String {
         "provider_unavailable" => "provider not set up",
         "workspace_required" => "no folder to work in",
         "provider_overloaded" | "provider_http_529" => "provider overloaded",
+        "provider_response_failed" => "provider failed",
         "provider_rate_limited" | "provider_http_429" => "rate limited",
         "provider_models_limit" | "provider_response_limit" => "reply too large",
         _ if code.starts_with("provider_connection_") || code.starts_with("provider_stream_") => {
@@ -1720,6 +1721,7 @@ mod tests {
             ("provider_stream_failed", "provider unreachable"),
             ("provider_http_501", "HTTP 501"),
             ("provider_http_529", "provider overloaded"),
+            ("provider_response_failed", "provider failed"),
             // Reached fine, its answer too big: not "unreachable".
             ("provider_models_limit", "reply too large"),
             ("provider_response_limit", "reply too large"),

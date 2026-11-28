@@ -46,18 +46,18 @@ class Errors(http.server.BaseHTTPRequestHandler):
                 body = json.dumps({'error': {'message': 'quota exhausted'}})
         else:
             if mode == 'responses_cutoff':
-                event = {'type':'response.failed', 'response':{'error':{'message':'x'*490+KEY}}}
+                event = {'type':'response.failed', 'response':{'error':{'code':'invalid_prompt', 'message':'x'*490+KEY}}}
             elif mode == 'responses_quoted_key':
-                event = {'type':'response.failed', 'response':{'error':{'message':json.dumps(KEY)}}}
+                event = {'type':'response.failed', 'response':{'error':{'code':'invalid_prompt', 'message':json.dumps(KEY)}}}
             elif mode == 'responses_reason':
                 event = {'type':'response.incomplete', 'response':{'incomplete_details':{'reason':message}}}
             elif mode == 'responses_error':
-                event = {'type':'error', 'message':message}
+                event = {'type':'error', 'code':'invalid_prompt', 'message':message}
             elif mode == 'anthropic_stop':
                 events = [{'type':'message_delta','delta':{'stop_reason':message}}, {'type':'message_stop'}]
                 event = None
             else:
-                event = {'type':'error','error':{'message':message}}
+                event = {'type':'error','error':{'code':'invalid_prompt', 'message':message}}
             if event is not None:
                 events = [event]
             body = ''.join('data: '+json.dumps(event)+'\n\n' for event in events)

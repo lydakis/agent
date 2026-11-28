@@ -194,8 +194,16 @@ impl State {
             "provider_overloaded"
         } else if named(|code| code == "server_error") {
             "provider_server_error"
-        } else {
+        } else if kind == "response.incomplete" || named(super::terminal) {
             "provider_incomplete"
+        } else {
+            // The provider failed the response, for a cause it names with
+            // a code none of ours knows or with none: its own failure, not
+            // the request's, which Codex retries (`parse_failed_response`,
+            // `ApiError::Retryable` and `ApiError::Stream`). An `error`
+            // event Codex does not know it reads past to the stream's end,
+            // which it retries too.
+            "provider_response_failed"
         };
         // The model's own output cap: what it was writing is the newest
         // item the response began, or the last it holds.
@@ -448,7 +456,7 @@ mod tests {
             r#"{"type":"error","output_index":null,"error":{"message":"The request was rejected by target."}}"#,
         ] {
             let error = State::default().frame(frame.as_bytes()).unwrap_err();
-            assert_eq!(error.code, "provider_incomplete", "{frame}");
+            assert_eq!(error.code, "provider_response_failed", "{frame}");
             assert_eq!(
                 error.detail.as_deref(),
                 Some("The request was rejected by target."),
@@ -622,7 +630,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             (failed.code.as_str(), failed.detail.as_deref()),
-            ("provider_incomplete", Some("quota"))
+            ("provider_response_failed", Some("quota"))
         );
         let spent = State::default()
             .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached."}}}"#)
@@ -700,7 +708,50 @@ mod tests {
         let error = State::default()
             .frame(br#"{"type":"error","code":"invalid_request_error","message":"Invalid input."}"#)
             .unwrap_err();
-        assert_eq!(error.code, "provider_incomplete");
+        assert_eq!(error.code, "provider_response_failed");
+    }
+    #[test]
+    fn a_response_the_provider_failed_is_its_own_unless_the_code_is_terminal() {
+        // A code none of ours knows, or none at all, as a failed response
+        // or an error event: the provider's failure, retried as Codex does.
+        for frame in [
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"service_unavailable","message":"The service is temporarily unavailable."}}}"#,
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"The service is temporarily unavailable."}}}"#,
+            r#"{"type":"error","error":{"code":"policy_capacity_unavailable","message":"The service is temporarily unavailable."}}"#,
+            r#"{"type":"error","message":"The service is temporarily unavailable."}"#,
+        ] {
+            let error = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(error.code, "provider_response_failed", "{frame}");
+            assert_eq!(
+                error.detail.as_deref(),
+                Some("The service is temporarily unavailable."),
+                "{frame}"
+            );
+        }
+        let bare = State::default()
+            .frame(br#"{"type":"response.failed","response":{"status":"failed"}}"#)
+            .unwrap_err();
+        assert_eq!(
+            (bare.code.as_str(), bare.detail),
+            ("provider_response_failed", None)
+        );
+        // The same words decide nothing: a terminal code is final whatever
+        // the message, and so is a response that ended incomplete.
+        for code in [
+            "invalid_prompt",
+            "content_policy_violation",
+            "model_not_found",
+        ] {
+            let frame = format!(
+                r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}","message":"The service is temporarily unavailable."}}}}}}"#
+            );
+            let error = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(error.code, "provider_incomplete", "{frame}");
+        }
+        let incomplete = State::default()
+            .frame(br#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}"#)
+            .unwrap_err();
+        assert_eq!(incomplete.code, "provider_incomplete");
     }
     #[test]
     fn overloads_and_server_errors_inside_the_stream_are_the_providers() {

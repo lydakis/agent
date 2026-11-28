@@ -903,7 +903,14 @@ A rate limit the provider reports inside the stream (a Responses `error` or
 `code` on `error` events regardless of message wording) is
 `provider_rate_limited` with the provider's message as detail, distinct from
 `provider_incomplete`, which remains a response the model could not finish; a
-rate limit refused at the HTTP layer stays `provider_http_429`. A complete
+rate limit refused at the HTTP layer stays `provider_http_429`. A failed
+response (`response.failed`, or an `error` event) whose code none of these
+names, or that names none, is the provider's own failure,
+`provider_response_failed` with its message as detail, and is retried as Codex
+retries it (`parse_failed_response`); one with a code Codex treats as terminal
+(`invalid_prompt`, a policy, a spend limit, `model_not_found`, ...) stays
+`provider_incomplete`, as does a response that ended `incomplete`. The event's
+kind and code decide it, never its words. A complete
 HTTP 429 body with `error.code` or `error.type` equal to `insufficient_quota`
 becomes `provider_quota_exhausted`, without retrying or pausing the shared pool;
 the turn is held on it ([held turns](#held-turns)).
@@ -2716,7 +2723,9 @@ the request from the store: within 5 minutes, up to 8 attempts for capacity
 (any 5xx, as `_should_retry` in anthropic-sdk-python 4421d56 treats it,
 observed 2026-09-26), transport failures, or a stalled stream and up to 64 for refusals for pace, which the pool
 spaces and which are not the request's fault; never for a response the model
-could not finish (`provider_incomplete`) or a client error. A view past the
+could not finish (`provider_incomplete`) or a client error. A response the
+provider failed for a cause of its own (`provider_response_failed`) is
+capacity, as Codex retries it. A view past the
 model's window is sent once more after a summary instead (see below). The providers'
 reset headers are only how long a full refill takes; the pool learns the level
 and refills continuously, so it never idles waiting for a reset. Rate limits wait on
