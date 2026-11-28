@@ -1,19 +1,21 @@
-//! `sonny acp`: Sonny as an agent of the Agent Client Protocol, for T3
-//! Code, which runs it as a provider ("Local command"), a process for each
-//! thread. A thread in a folder is that folder's lead, as `sonny` there
-//! finds or makes it, set up the same way: its rules and skills, its tools,
-//! its permissions row, and the lookout. Each task the lead starts opens as a
-//! thread through T3 Code's tools, the lead thread's child while the
-//! person's prompt runs, and that thread is the task's.
+//! `sonny acp`: Sonny as an agent of the Agent Client Protocol, version 2
+//! (`schema-v2.0.0-beta.4`), for T3 Code, which runs it as a provider
+//! ("Local command"), a process for each thread. A thread in a folder is
+//! that folder's lead, as `sonny` there finds or makes it, set up the same
+//! way: its rules and skills, its tools, its permissions row, and the
+//! lookout. Each task the lead starts opens as a thread through T3 Code's
+//! tools, the lead thread's child while the person's prompt runs, and that
+//! thread is the task's.
 //!
 //! Any other client, such as a bridge from a chat app, is served the same
-//! way: it picks the lead behind a session with the Agent option, and
-//! finds the leads to reopen with `session/list`.
+//! way: it picks the lead behind a session with the Agent option, finds
+//! the leads to reopen with `session/list`, and sees each task the lead
+//! starts as the protocol's subagent of the lead's session.
 //!
-//! It speaks the protocol's version 2 draft as T3 Code does: the turns a
-//! bot takes on its own, as when the lookout wakes a lead because a task
-//! finished, reach the thread between the person's prompts, as work the
-//! agent started.
+//! A prompt is answered once the daemon has taken it in, and the work it
+//! starts ends with an idle `state_update`; the turns a bot takes on its
+//! own, as when the lookout wakes a lead because a task finished, reach
+//! the session between the person's prompts, as work the agent started.
 use crate::{approvals, asks, declared, lookout, plan, project, reactions, t3};
 use agent_client::{Client, Events};
 use serde_json::{Value, json};
@@ -26,23 +28,26 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell, oneshot};
 
 pub const VERB: &str = "acp";
 
-/// The protocol version Sonny speaks: the draft that lets an agent start
-/// work of its own between prompts.
+/// The protocol version Sonny speaks, the only one.
 const VERSION: i64 = 2;
 
 /// The most of a call's output a thread is shown.
 const OUTPUT_BYTES: usize = 8 * 1024;
 
-/// The longest the person's prompt waits for its tasks' threads to open.
+/// The longest the person's work waits for its tasks' threads to open.
 const OPENING: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The longest a thread's start waits for the providers to list models.
 const LISTING: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// JSON-RPC's codes for what Sonny refuses.
+/// JSON-RPC's codes, and the protocol's, for what Sonny refuses.
+const INVALID_REQUEST: i64 = -32600;
+const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-const NOT_FOUND: i64 = -32601;
 const FAILED: i64 = -32603;
+const SESSION_NOT_FOUND: i64 = -32002;
+const UNSUPPORTED_VERSION: i64 = -32022;
+const REQUEST_CANCELLED: i64 = -32800;
 /// Sonny's extension for reactions, both ways: a client reacts to one of
 /// the bot's replies, and is told when the bot reacts.
 const REACT: &str = "_sonny/react";
@@ -76,35 +81,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         // SAFETY: nothing else runs yet: no thread is started before this.
         unsafe { std::env::remove_var(name) };
     }
-    let options = crate::Options {
-        store,
-        socket,
-        bot: None,
-        new: false,
-        model: None,
-        workspace: None,
-        layout: false,
-        rex_host: None,
-        sound: false,
-        side: None,
-        embedded: false,
-        window_place: None,
-        lead: project::Pick::Last,
-        send: None,
-        draft: None,
-        reopened: false,
-        land: false,
-    };
-    let agent = Arc::new(Agent {
-        out: Arc::new(Out::default()),
-        options,
-        t3,
-        sessions: Mutex::new(HashMap::new()),
-        ready: OnceCell::new(),
-        offer: Mutex::new(Offer::default()),
-        version: AtomicI64::new(VERSION),
-        forms: AtomicBool::new(false),
-    });
+    let agent = Agent::new(store, socket, t3);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -120,10 +97,37 @@ struct Out {
     stdout: Mutex<()>,
     next: AtomicI64,
     waiting: Mutex<HashMap<i64, oneshot::Sender<Value>>>,
+    /// Sessions whose history is being replayed, with what else was sent
+    /// for them meanwhile: it waits until the replay is over, as the
+    /// protocol has it, requests too.
+    held: Mutex<HashMap<String, Vec<Value>>>,
+    /// What a test's agent wrote, in order, in place of stdout.
+    #[cfg(test)]
+    written: Mutex<Vec<Value>>,
 }
 
 impl Out {
+    /// Send `message`, or keep it while its session's history replays.
     fn send(&self, message: Value) {
+        if let Some(session) = message["params"]["sessionId"].as_str()
+            && let Ok(mut held) = self.held.lock()
+            && let Some(kept) = held.get_mut(session)
+        {
+            kept.push(message);
+            return;
+        }
+        self.write(&message);
+    }
+
+    fn write(&self, message: &Value) {
+        #[cfg(test)]
+        {
+            if let Ok(mut written) = self.written.lock() {
+                written.push(message.clone());
+            }
+            return;
+        }
+        #[allow(unreachable_code)]
         let _held = self.stdout.lock();
         let mut stdout = std::io::stdout().lock();
         let _ = writeln!(stdout, "{message}");
@@ -131,11 +135,15 @@ impl Out {
     }
 
     fn answer(&self, id: &Value, result: Value) {
-        self.send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
+        self.write(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
 
-    fn fail(&self, id: &Value, code: i64, message: &str) {
-        self.send(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}));
+    fn fail(&self, id: &Value, code: i64, message: &str, data: Option<Value>) {
+        let mut error = json!({"code": code, "message": message});
+        if let Some(data) = data {
+            error["data"] = data;
+        }
+        self.write(&json!({"jsonrpc": "2.0", "id": id, "error": error}));
     }
 
     fn update(&self, session: &str, update: Value) {
@@ -143,21 +151,59 @@ impl Out {
             "params": {"sessionId": session, "update": update}}));
     }
 
-    /// Ask the client: its answer, or `None` when it gave an error or none.
-    async fn ask(&self, method: &str, params: Value) -> Option<Value> {
-        Self::answer_to(self.asking(method, params)).await
+    /// Hold what is sent for `session` from now until [`Out::release`].
+    fn hold(&self, session: &str) {
+        if let Ok(mut held) = self.held.lock() {
+            held.insert(session.to_owned(), Vec::new());
+        }
+    }
+
+    /// A replayed update of a held session, sent ahead of what is held.
+    fn replayed(&self, session: &str, update: Value) {
+        self.write(&json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": session, "update": update}}));
+    }
+
+    /// Send what was held for `session`, in order, and stop holding: while
+    /// it goes, nothing else for the session overtakes it.
+    fn release(&self, session: &str) {
+        let Ok(mut held) = self.held.lock() else {
+            return;
+        };
+        for message in held.remove(session).unwrap_or_default() {
+            self.write(&message);
+        }
     }
 
     /// Ask the client now, to wait on its answer later: questions put
     /// together reach it in the order they were put.
     fn asking(&self, method: &str, params: Value) -> oneshot::Receiver<Value> {
+        let (id, answer) = self.reserve();
+        self.request(id, method, params);
+        answer
+    }
+
+    /// An id for a request to the client, and where its answer comes.
+    fn reserve(&self) -> (i64, oneshot::Receiver<Value>) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         if let Ok(mut waiting) = self.waiting.lock() {
             waiting.insert(id, tx);
         }
+        (id, rx)
+    }
+
+    fn request(&self, id: i64, method: &str, params: Value) {
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        rx
+    }
+
+    /// Take back request `id`: the client is told to dismiss it, and
+    /// whatever waits on its answer gets none.
+    fn withdraw(&self, id: i64) {
+        let waiting = self.waiting.lock().ok().and_then(|mut w| w.remove(&id));
+        drop(waiting);
+        self.write(&json!({"jsonrpc": "2.0", "method": "$/cancel_request",
+            "params": {"requestId": id}}));
     }
 
     /// The client's answer to what [`Out::asking`] asked.
@@ -187,14 +233,48 @@ struct Agent {
     ready: OnceCell<()>,
     /// The models the providers list, and the daemon's providers.
     offer: Mutex<Offer>,
-    /// The version the client asked for, when older.
-    version: AtomicI64,
+    /// Whether the client said `initialize`, which comes first.
+    initialized: AtomicBool,
     /// Whether the client fills in forms (`elicitation/create`), which
     /// put the lead's questions to the person.
     forms: AtomicBool,
 }
 
 impl Agent {
+    /// Sonny's agent for the daemon at `store` and `socket`, run by T3
+    /// Code when `t3` reaches it.
+    fn new(store: PathBuf, socket: PathBuf, t3: Option<t3::T3>) -> Arc<Self> {
+        let options = crate::Options {
+            store,
+            socket,
+            bot: None,
+            new: false,
+            model: None,
+            workspace: None,
+            layout: false,
+            rex_host: None,
+            sound: false,
+            side: None,
+            embedded: false,
+            window_place: None,
+            lead: project::Pick::Last,
+            send: None,
+            draft: None,
+            reopened: false,
+            land: false,
+        };
+        Arc::new(Agent {
+            out: Arc::new(Out::default()),
+            options,
+            t3,
+            sessions: Mutex::new(HashMap::new()),
+            ready: OnceCell::new(),
+            offer: Mutex::new(Offer::default()),
+            initialized: AtomicBool::new(false),
+            forms: AtomicBool::new(false),
+        })
+    }
+
     async fn serve(self: Arc<Self>) -> Result<(), String> {
         let (tx, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
         // Stdin is read on a thread of its own: tokio's stdin is too.
@@ -230,83 +310,158 @@ impl Agent {
     async fn request(self: Arc<Self>, message: Value) {
         let id = &message["id"];
         let params = &message["params"];
-        let answered = match message["method"].as_str().unwrap_or("") {
-            "initialize" => Ok(self.initialize(params)),
-            "authenticate" | "auth/login" => Ok(json!({})),
+        let method = message["method"].as_str().unwrap_or("");
+        let answered = match method {
+            "initialize" => self.initialize(params),
+            _ if !self.initialized.load(Ordering::Relaxed) => {
+                Err((INVALID_REQUEST, "initialize comes first".into()))
+            }
             "session/new" => self.open(params, None).await,
-            "session/resume" | "session/load" => match params["sessionId"].as_str() {
+            "session/resume" => match params["sessionId"].as_str() {
                 Some(session) => self.open(params, Some(session)).await,
                 None => Err((INVALID_PARAMS, "sessionId is missing".into())),
             },
             "session/prompt" => match self.session(params) {
-                Some(session) => session.prompt(&self, id, params).await,
-                None => Err((INVALID_PARAMS, "no such session".into())),
+                Ok(session) => session.prompt(&self, params).await,
+                Err(error) => Err(error),
             },
             "session/list" => self.listed(params).await,
             REACT => match self.session(params) {
-                Some(session) => session.react(&self, params).await,
-                None => Err((INVALID_PARAMS, "no such session".into())),
+                Ok(session) => session.react(&self, params).await,
+                Err(error) => Err(error),
             },
             "session/set_config_option" => match self.session(params) {
-                Some(session) => session.set_option(&self, params).await,
-                None => Err((INVALID_PARAMS, "no such session".into())),
+                Ok(session) => session.set_option(&self, params).await,
+                Err(error) => Err(error),
             },
-            "session/close" => {
-                let closed = params["sessionId"].as_str().and_then(|session| {
-                    self.sessions
-                        .lock()
-                        .ok()
-                        .and_then(|mut s| s.remove(session))
-                });
-                if let Some(closed) = closed {
-                    closed.stop();
-                }
-                Ok(json!({}))
-            }
-            other => Err((NOT_FOUND, format!("{other} is not a method Sonny has"))),
+            "session/close" => self.close(params),
+            other => Err((
+                METHOD_NOT_FOUND,
+                format!("{other} is not a method Sonny has"),
+            )),
         };
         match answered {
-            Ok(Value::Null) => {}
             Ok(result) => self.out.answer(id, result),
-            Err((code, message)) => self.out.fail(id, code, &message),
+            Err((code, message)) => {
+                // The data each of these codes carries, from what was asked.
+                let data = match code {
+                    SESSION_NOT_FOUND => Some(json!({"sessionId": params["sessionId"]})),
+                    UNSUPPORTED_VERSION => Some(json!({"requested": params["protocolVersion"],
+                        "supported": [VERSION]})),
+                    _ => None,
+                };
+                self.out.fail(id, code, &message, data)
+            }
         }
     }
 
     async fn notified(&self, message: &Value) {
+        // A subagent's session is cancelled as any other: it says it may be.
         if message["method"] == "session/cancel"
-            && let Some(session) = self.session(&message["params"])
+            && let Some(session) = self.find(&message["params"])
         {
-            session.cancel().await;
+            session.cancel(&self.out).await;
         }
     }
 
-    fn session(&self, params: &Value) -> Option<Arc<Session>> {
+    fn find(&self, params: &Value) -> Option<Arc<Session>> {
         let id = params["sessionId"].as_str()?;
         self.sessions.lock().ok()?.get(id).cloned()
     }
 
-    fn initialize(&self, params: &Value) -> Value {
-        let asked = params["protocolVersion"].as_i64().unwrap_or(VERSION);
-        let version = asked.clamp(1, VERSION);
-        self.version.store(version, Ordering::Relaxed);
-        let forms = params["clientCapabilities"]["elicitation"]["form"].is_object();
-        self.forms.store(forms, Ordering::Relaxed);
-        json!({
-            "protocolVersion": version,
-            "agentCapabilities": {
-                "loadSession": false,
-                "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
-                "mcpCapabilities": {"http": false, "sse": false, "acp": false},
-                "sessionCapabilities": {"resume": {}, "close": {}, "list": {}}
-            },
-            "authMethods": [],
-            "agentInfo": {"name": "sonny", "title": "Sonny", "version": env!("CARGO_PKG_VERSION")}
-        })
+    /// The session a request names, which the client may ask things of: a
+    /// subagent's it only watches and may cancel.
+    fn session(&self, params: &Value) -> Result<Arc<Session>, (i64, String)> {
+        let session = self
+            .find(params)
+            .ok_or((SESSION_NOT_FOUND, "no such session".to_owned()))?;
+        if session.parent.is_some() {
+            return Err((
+                INVALID_PARAMS,
+                "a task's session is its lead's subagent: it takes only session/cancel".into(),
+            ));
+        }
+        Ok(session)
     }
 
-    /// Whether the client follows work the agent starts on its own.
-    fn v2(&self) -> bool {
-        self.version.load(Ordering::Relaxed) >= 2
+    /// The protocol's handshake: version 2 or none.
+    fn initialize(&self, params: &Value) -> Reply {
+        let asked = params["protocolVersion"]
+            .as_i64()
+            .filter(|version| (0..=65535).contains(version))
+            .ok_or((
+                INVALID_PARAMS,
+                "protocolVersion must be a whole number from 0 to 65535".to_owned(),
+            ))?;
+        if asked < VERSION {
+            return Err((UNSUPPORTED_VERSION, "Unsupported protocol version".into()));
+        }
+        let forms = !params["capabilities"]["elicitation"]["form"].is_null();
+        self.forms.store(forms, Ordering::Relaxed);
+        self.initialized.store(true, Ordering::Relaxed);
+        // The `mcpServers` a client gives a session are not used, so no
+        // transport is offered; T3 Code gives its own anyway, which Sonny
+        // reaches through the endpoint it names in the environment.
+        Ok(json!({
+            "protocolVersion": VERSION,
+            "info": {"name": "sonny", "title": "Sonny", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"session": {"prompt": {"image": {}, "embeddedContext": {}}}},
+            "authMethods": []
+        }))
+    }
+
+    /// Stop following a task's session, which its lead's no longer lists.
+    fn forget(&self, child: &str) {
+        let removed = self.sessions.lock().ok().and_then(|mut s| s.remove(child));
+        let Some(removed) = removed else { return };
+        if let Some((parent, _)) = &removed.parent
+            && let Some(parent) = self
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|s| s.get(parent).cloned())
+            && let Ok(mut children) = parent.children.lock()
+        {
+            children.remove(child);
+        }
+        removed.stop(&self.out);
+    }
+
+    /// `session/close`: Sonny stops following the session's bot, and its
+    /// subagents', and withdraws what it asked there. The bots work on, as
+    /// when a window of Sonny's closes. One unknown is closed already.
+    fn close(&self, params: &Value) -> Reply {
+        let id = params["sessionId"]
+            .as_str()
+            .ok_or((INVALID_PARAMS, "sessionId is missing".to_owned()))?;
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return Ok(json!({}));
+        };
+        match sessions.get(id) {
+            None => return Ok(json!({})),
+            Some(session) if session.parent.is_some() => {
+                return Err((
+                    INVALID_PARAMS,
+                    "a task's session closes with its lead's".into(),
+                ));
+            }
+            Some(_) => {}
+        }
+        let closed: Vec<Arc<Session>> = sessions
+            .values()
+            .filter(|session| {
+                session.id == id || session.parent.as_ref().is_some_and(|(p, _)| p == id)
+            })
+            .cloned()
+            .collect();
+        for session in &closed {
+            sessions.remove(&session.id);
+        }
+        drop(sessions);
+        for session in closed {
+            session.stop(&self.out);
+        }
+        Ok(json!({}))
     }
 
     /// A thread's options: its model, picked from what the providers list
@@ -352,11 +507,9 @@ impl Agent {
         if !efforts.iter().any(|choice| choice["value"] == effort) {
             efforts.push(json!({"value": effort, "name": effort}));
         }
-        // Both names: version 2's schema says `configId`, but T3 Code finds
-        // an option by `id` whatever the version.
-        json!([{"id": "model", "configId": "model", "name": "Model", "category": "model",
+        json!([{"configId": "model", "name": "Model", "category": "model",
             "type": "select", "currentValue": model, "options": models},
-        {"id": "effort", "configId": "effort", "name": "Effort", "category": "thought_level",
+        {"configId": "effort", "name": "Effort", "category": "thought_level",
             "type": "select", "currentValue": effort, "options": efforts}])
     }
 
@@ -430,13 +583,38 @@ impl Agent {
 
     /// A thread starts (`session/new`) or comes back (`session/resume`).
     /// A new one is not a bot yet: its first prompt says whether it is a
-    /// task's thread or its folder's lead.
+    /// task's thread or its folder's lead. One that comes back is the bot
+    /// it was, its history replayed first when the client asks, then where
+    /// it stands now.
     async fn open(self: &Arc<Self>, params: &Value, resumed: Option<&str>) -> Reply {
         let cwd = params["cwd"]
             .as_str()
             .map(PathBuf::from)
             .filter(|cwd| cwd.is_absolute())
             .ok_or((INVALID_PARAMS, "cwd must be an absolute path".to_owned()))?;
+        // Only from the start: Sonny keeps no other cursor.
+        let replay = match &params["replayFrom"] {
+            Value::Null => false,
+            from if resumed.is_some() && from["type"] == "start" => true,
+            _ if resumed.is_none() => false,
+            _ => return Err((INVALID_PARAMS, "Sonny replays from the start only".into())),
+        };
+        // A listed id names a lead; a task shows as its lead's subagent.
+        let listed = resumed.and_then(listed_bot);
+        if let Some(pinned) = &listed
+            && !project::is_lead(&pinned.bot)
+        {
+            return Err((
+                INVALID_PARAMS,
+                format!("{} is a task: it shows as its lead's subagent", pinned.bot),
+            ));
+        }
+        if let Some(id) = resumed
+            && (self.sessions.lock().ok())
+                .is_some_and(|s| s.get(id).is_some_and(|s| s.parent.is_some()))
+        {
+            return Err((INVALID_PARAMS, "a task's session is not resumed".into()));
+        }
         self.ready().await.map_err(|e| (FAILED, e))?;
         // One connection for what the thread's pickers list.
         let lister = Client::connect(&self.options.socket).await.ok();
@@ -446,19 +624,9 @@ impl Agent {
             Some(client) if self.t3.is_none() => folder_leads(client, &cwd).await,
             _ => Vec::new(),
         };
-        // A listed id names a lead, or a task one of them started.
-        let listed = resumed.and_then(listed_bot);
-        let known = match (&listed, lister) {
-            (Some(pinned), lister) if !project::is_lead(&pinned.bot) => match lister {
-                Some(client) => a_task(client, pinned).await,
-                None => false,
-            },
-            _ => true,
-        };
         if let Some(client) = lister {
             client.close().await;
         }
-        let listed = listed.filter(|_| known);
         let id = match resumed {
             Some(id) => id.to_owned(),
             None => crate::unique("sonny"),
@@ -466,13 +634,19 @@ impl Agent {
         let session = Arc::new(Session {
             id: id.clone(),
             cwd,
+            parent: None,
             state: AsyncMutex::new(State {
                 leads,
                 ..State::default()
             }),
             follower: Mutex::new(None),
             switching: AsyncMutex::new(()),
+            children: Mutex::new(HashMap::new()),
         });
+        // What the session's bot does is held while its history replays.
+        if resumed.is_some() {
+            self.out.hold(&id);
+        }
         // Open before it follows its bot; one it replaces stops following.
         let replaced = self
             .sessions
@@ -480,18 +654,14 @@ impl Agent {
             .ok()
             .and_then(|mut sessions| sessions.insert(id.clone(), session.clone()));
         if let Some(old) = replaced {
-            old.stop();
+            old.stop(&self.out);
         }
         // A thread comes back as the bot it was, or not at all.
         let bound = match resumed {
             // A listed id names its lead itself, whatever the session was
             // moved to since.
             Some(id) => match listed.or_else(|| t3::recall(id)) {
-                Some(pinned) => {
-                    session
-                        .bind(self, Some(pinned), false, &project::Pick::Last)
-                        .await
-                }
+                Some(pinned) => session.bind(self, Some(pinned), &project::Pick::Last).await,
                 None => Err(format!("Sonny does not know thread {id}")),
             },
             None => Ok(()),
@@ -500,7 +670,17 @@ impl Agent {
             if let Ok(mut sessions) = self.sessions.lock() {
                 sessions.remove(&id);
             }
+            self.out.release(&id);
             return Err((FAILED, error));
+        }
+        if resumed.is_some() {
+            if replay {
+                session.replay(&self.out).await;
+                self.out
+                    .replayed(&id, json!({"sessionUpdate": "replay_complete"}));
+            }
+            self.out.release(&id);
+            session.current(self).await;
         }
         let options = session.options(self).await;
         Ok(match resumed {
@@ -510,11 +690,11 @@ impl Agent {
     }
 
     /// `session/list`: the leads Sonny can open a session on, the one
-    /// folder's when the client names a `cwd`, each with the tasks it
-    /// started, else every project's leads, a page at a time. Each is
-    /// listed by an id `session/resume` takes, which names the bot and its
-    /// identity, so one removed and made again under its name is not the
-    /// one reopened.
+    /// folder's when the client names a `cwd`, else every project's, a
+    /// page at a time. Each is listed by an id `session/resume` takes,
+    /// which names the bot and its identity, so one removed and made again
+    /// under its name is not the one reopened. Tasks are their leads'
+    /// subagents, not sessions of their own.
     async fn listed(&self, params: &Value) -> Reply {
         self.ready().await.map_err(|e| (FAILED, e))?;
         let (client, _events) = Client::connect(&self.options.socket)
@@ -526,18 +706,10 @@ impl Agent {
                 Err((INVALID_PARAMS, "cwd must be an absolute path".to_owned()))
             }
             Some(cwd) => match project::folder_project(cwd) {
-                Ok((project, dir)) => {
-                    let leads = project::leads(&client, &project, &dir)
-                        .await
-                        .map_err(|e| (FAILED, e));
-                    match leads {
-                        Ok(leads) => with_tasks(&client, leads)
-                            .await
-                            .map(|listed| (listed, None))
-                            .map_err(|e| (FAILED, e)),
-                        Err(error) => Err(error),
-                    }
-                }
+                Ok((project, dir)) => project::leads(&client, &project, &dir)
+                    .await
+                    .map(|leads| (leads, None))
+                    .map_err(|e| (FAILED, e)),
                 // A folder no lead can work in has none.
                 Err(_) => Ok((Vec::new(), None)),
             },
@@ -548,23 +720,14 @@ impl Agent {
         let store = client.store().map(str::to_owned);
         client.close().await;
         let (bots, next) = listing?;
-        let id = |bot: &Value| {
-            let (name, bot_id) = (bot["name"].as_str()?, bot["bot_id"].as_i64()?);
-            Some(lead_session(name, bot_id, store.as_deref()))
-        };
         let sessions: Vec<Value> = bots
             .iter()
             .filter_map(|bot| {
-                let mut listed = json!({"sessionId": id(bot)?, "cwd": bot["workspace"],
-                    "title": bot["name"]});
-                // A task names the lead that started it.
-                if !project::is_lead(bot["name"].as_str()?)
-                    && let (Some(lead), Some(by)) =
-                        (bot["created_by"].as_str(), bot["created_by_id"].as_i64())
-                {
-                    listed["_meta"] = json!({"lead": lead_session(lead, by, store.as_deref())});
-                }
-                Some(listed)
+                let (name, bot_id) = (bot["name"].as_str()?, bot["bot_id"].as_i64()?);
+                Some(
+                    json!({"sessionId": lead_session(name, bot_id, store.as_deref()),
+                    "cwd": bot["workspace"], "title": name}),
+                )
             })
             .collect();
         let mut listed = json!({"sessions": sessions});
@@ -588,7 +751,7 @@ fn agent_option(leads: &[String], current: &str) -> Value {
     if current != DEFAULT && !leads.iter().any(|lead| lead == current) {
         choices.push(json!({"value": current, "name": current}));
     }
-    json!({"id": AGENT, "configId": AGENT, "name": "Agent",
+    json!({"configId": AGENT, "name": "Agent",
         "description": "The lead behind this thread", "type": "select",
         "currentValue": current, "options": choices})
 }
@@ -638,18 +801,6 @@ fn listed_bot(session: &str) -> Option<t3::Pinned> {
     })
 }
 
-/// Whether `pinned`, no lead, is a task a lead started: made by a lead,
-/// and not a side chat of it. That one of that identity, or none.
-async fn a_task(client: &Client, pinned: &t3::Pinned) -> bool {
-    let inspected = client
-        .request(
-            "inspect",
-            json!({"bot": pinned.bot, "bot_id": pinned.bot_id}),
-        )
-        .await;
-    inspected.is_ok_and(|record| task(&record))
-}
-
 /// Whether `record`, a bot as `bots` or `inspect` gives it, is a task a
 /// lead started.
 fn task(record: &Value) -> bool {
@@ -683,20 +834,6 @@ async fn tasks_of(client: &Client, lead_id: i64) -> Result<Vec<Value>, String> {
     }
 }
 
-/// `leads`, each followed by the tasks it started.
-async fn with_tasks(client: &Client, leads: Vec<Value>) -> Result<Vec<Value>, String> {
-    let mut listed = Vec::with_capacity(leads.len());
-    for lead in leads {
-        let tasks = match lead["bot_id"].as_i64() {
-            Some(lead_id) => tasks_of(client, lead_id).await?,
-            None => Vec::new(),
-        };
-        listed.push(lead);
-        listed.extend(tasks);
-    }
-    Ok(listed)
-}
-
 /// The bot a lead's `start_task` call names, as `start_task` names it.
 fn task_bot(project: &str, arguments: &Value) -> Option<String> {
     let short = arguments["name"].as_str()?.trim();
@@ -722,33 +859,51 @@ async fn folder_leads(client: &Client, cwd: &Path) -> Vec<String> {
 
 type Reply = Result<Value, (i64, String)>;
 
-/// A thread: the bot it is, once its first prompt says, and the person's
-/// prompt waiting for its turn's end.
+/// A thread: the bot it is, once its first prompt says, and where its
+/// work stands.
 struct Session {
     id: String,
     cwd: PathBuf,
+    /// For a task's session, the lead's whose subagent it is, by session
+    /// and by bot.
+    parent: Option<(String, String)>,
     state: AsyncMutex<State>,
     /// What follows its bot, stopped when the thread closes.
     follower: Mutex<Option<tokio::task::AbortHandle>>,
     /// Held while the bot's model changes: one change at a time.
     switching: AsyncMutex<()>,
+    /// The subagents of a lead's session, by session, each with the state
+    /// it last reported.
+    children: Mutex<HashMap<String, Value>>,
 }
 
 impl Session {
-    fn stop(&self) {
+    /// Stop following the bot, and take back what was asked for it.
+    fn stop(&self, out: &Out) {
         if let Some(follower) = self.follower.lock().ok().and_then(|mut f| f.take()) {
             follower.abort();
         }
+        if let Ok(mut state) = self.state.try_lock() {
+            for (request, _) in state.asking.drain() {
+                out.withdraw(request);
+            }
+        }
     }
+}
+
+/// A choice put to the person and not made yet: the call it is about, by
+/// turn and id, and the turn it holds up, none once a message lifted the
+/// call out of its turn, which then waits as background work.
+#[derive(Debug)]
+struct Waiting {
+    holds: Option<i64>,
+    call: (Option<i64>, String),
 }
 
 #[derive(Default)]
 struct State {
     bound: Option<Bound>,
-    /// The person's prompt, answered when its turn ends; its turn once the
-    /// daemon named it.
-    prompt: Option<(Value, Option<i64>)>,
-    /// The turn running, and whether this thread said it started.
+    /// The turn running.
     running: Option<i64>,
     /// Words since the last call, by kind, and the part of the turn they
     /// are in: a new message after each call.
@@ -759,7 +914,8 @@ struct State {
     /// lifted call's id again.
     calls: HashMap<(Option<i64>, String), (String, Value)>,
     /// The calls a message lifted from their turn, which end later, as
-    /// `lifted_ended` says: kept past their turn's end.
+    /// `lifted_ended` says: kept past their turn's end, as the session's
+    /// background work.
     lifted: HashSet<(Option<i64>, String)>,
     /// Calls waiting on a gate, by turn and call, with the node that
     /// planned them: one a message lifts gets no `tool_started`, so it is
@@ -768,14 +924,21 @@ struct State {
     /// Calls put to the person, by call and request, and the lead's
     /// questions, by ask.
     asked: HashSet<String>,
+    /// The person's choices asked for and not made, by request.
+    asking: HashMap<i64, Waiting>,
+    /// This session's messages no turn has taken in yet: a cancel takes
+    /// them back.
+    queued: HashSet<i64>,
     /// The last of the bot's kept events this thread handled, to follow on
     /// from when its stream drops.
     cursor: i64,
-    /// The person stopped the prompt before its turn was known.
+    /// Prompts being sent, and whether the person stopped one meanwhile.
+    sending: usize,
     cancelled: bool,
-    /// The last steer a running turn took in, and that turn: for a prompt
-    /// whose steer went in before its turn was named.
-    steered: Option<(i64, i64)>,
+    /// The messages this session sent, which it showed when it sent them.
+    sent: HashSet<i64>,
+    /// The state last reported, as `state_update` has it.
+    reported: Option<Value>,
     /// The model and effort the person picked, which the bot takes when
     /// it is next idle; a new lead starts on the model.
     picked: Option<String>,
@@ -785,11 +948,10 @@ struct State {
     agent: Option<String>,
     /// The leads of the thread's folder, as the agent picker lists them.
     leads: Vec<String>,
-    /// Tasks whose threads are opening, as children of the person's prompt
-    /// while it runs, and the answers of the prompts whose turns ended
-    /// meanwhile, held until they are open.
+    /// Tasks whose threads are opening in T3 Code, as children of the work
+    /// running, and the end of that work, held until they are open.
     opening: usize,
-    held: Vec<(Value, Value)>,
+    held: Vec<Value>,
     /// The bot's replies this thread showed, newest last, each by its
     /// `messageId` with the bot's identity, its node and first line: what
     /// a client reacts to, while the thread is still that bot.
@@ -800,10 +962,57 @@ struct State {
 const REPLIES: usize = 64;
 
 impl State {
-    /// A turn's calls are over with it, but for those a message lifted.
-    fn end_calls(&mut self) {
+    /// A turn's calls are over with it, but for those a message lifted:
+    /// each still shown running ends as `ended` says, `failed` or
+    /// `cancelled`, or is let go of unsaid.
+    fn end_calls(&mut self, out: &Out, session: &str, ended: Option<&str>) {
         let lifted = &self.lifted;
-        self.calls.retain(|call, _| lifted.contains(call));
+        let over: Vec<_> = (self.calls.keys())
+            .filter(|call| !lifted.contains(*call))
+            .cloned()
+            .collect();
+        for (turn, call) in over {
+            self.calls.remove(&(turn, call.clone()));
+            if let Some(status) = ended {
+                out.update(
+                    session,
+                    json!({"sessionUpdate": "tool_call_update",
+                    "toolCallId": shown_id(turn, &call), "status": status}),
+                );
+            }
+        }
+    }
+
+    /// The session's state as `state_update` reports it: idle, running, or
+    /// waiting on the person, with its background work: the calls a
+    /// message lifted, shown, and the subagents at work.
+    fn snapshot(&self, children: &HashMap<String, Value>) -> Value {
+        let phase = match self.running {
+            None => "idle",
+            Some(turn) if self.asking.values().any(|w| w.holds == Some(turn)) => "requires_action",
+            Some(_) => "running",
+        };
+        let mut background: Vec<Value> = (self.lifted.iter())
+            .filter(|call| self.calls.contains_key(*call) || self.gated.contains_key(*call))
+            .map(|(turn, call)| json!({"type": "tool_call", "toolCallId": shown_id(*turn, call)}))
+            .collect();
+        background.sort_by(|a, b| a["toolCallId"].as_str().cmp(&b["toolCallId"].as_str()));
+        let mut working: Vec<&String> = (children.iter())
+            .filter(|(_, child)| {
+                matches!(
+                    child["state"]["state"].as_str(),
+                    Some("running" | "requires_action")
+                )
+            })
+            .map(|(child, _)| child)
+            .collect();
+        working.sort();
+        background.extend(
+            working
+                .into_iter()
+                .map(|child| json!({"type": "subagent", "sessionId": child})),
+        );
+        json!({"state": phase, "background": background})
     }
 }
 
@@ -859,17 +1068,112 @@ fn choice(id: &str, name: Option<&str>, note: Option<&str>) -> Value {
 }
 
 impl Session {
+    /// The session's subagents, each as its last `subagent_update` said.
+    fn children(&self) -> HashMap<String, Value> {
+        self.children.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Report the session's state, if it changed.
+    fn report(&self, agent: &Arc<Agent>, state: &mut State) {
+        let now = state.snapshot(&self.children());
+        if state.reported.as_ref() != Some(&now) {
+            self.say_state(agent, state, now);
+        }
+    }
+
+    /// Report `now`, which may say how the work ended: on the session, and
+    /// for a task, as its subagent's state on its lead's session. An end
+    /// waits while tasks' threads open in T3 Code, as children of the work.
+    fn say_state(&self, agent: &Arc<Agent>, state: &mut State, now: Value) {
+        let mut plain = now.clone();
+        if let Value::Object(fields) = &mut plain {
+            fields.remove("stopReason");
+            fields.remove("error");
+        }
+        state.reported = Some(plain);
+        let mut update = now.clone();
+        update["sessionUpdate"] = json!("state_update");
+        if state.opening > 0 && now["state"] == "idle" {
+            state.held.push(update);
+        } else {
+            agent.out.update(&self.id, update);
+        }
+        if let Some((parent, _)) = &self.parent {
+            self.mirror(agent, parent, now);
+        }
+    }
+
+    /// A subagent's state, on its lead's session too, whose background
+    /// work it is while it works.
+    fn mirror(&self, agent: &Arc<Agent>, parent: &str, now: Value) {
+        agent.out.update(
+            parent,
+            json!({"sessionUpdate": "subagent_update", "sessionId": self.id, "state": now}),
+        );
+        let parent = (agent.sessions.lock().ok()).and_then(|s| s.get(parent).cloned());
+        let Some(parent) = parent else { return };
+        if let Ok(mut children) = parent.children.lock()
+            && let Some(child) = children.get_mut(&self.id)
+        {
+            child["state"] = now;
+        }
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            let mut state = parent.state.lock().await;
+            parent.report(&agent, &mut state);
+        });
+    }
+
+    /// Where the session stands, once it comes back: each piece of
+    /// background work as it is now, then its state.
+    async fn current(&self, agent: &Arc<Agent>) {
+        let mut state = self.state.lock().await;
+        let mut lifted: Vec<_> = state.lifted.iter().cloned().collect();
+        lifted.sort();
+        for key in lifted {
+            if let Some((name, arguments)) = state.calls.get(&key) {
+                let shown = shown_id(key.0, &key.1);
+                (agent.out).update(&self.id, tool_call(&shown, name, arguments, "in_progress"));
+            }
+        }
+        let mut children: Vec<(String, Value)> = self.children().into_iter().collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, child) in children {
+            let mut update = child;
+            update["sessionUpdate"] = json!("subagent_update");
+            agent.out.update(&self.id, update);
+        }
+        let now = state.snapshot(&self.children());
+        self.say_state(agent, &mut state, now);
+    }
+
+    /// Let go of the session's subagents: they stop being followed here.
+    fn drop_children(&self, agent: &Agent) {
+        let ids: Vec<String> = self
+            .children
+            .lock()
+            .map(|mut c| c.drain().map(|(id, _)| id).collect())
+            .unwrap_or_default();
+        let dropped: Vec<Arc<Session>> = match agent.sessions.lock() {
+            Ok(mut sessions) => ids.iter().filter_map(|id| sessions.remove(id)).collect(),
+            Err(_) => Vec::new(),
+        };
+        for child in dropped {
+            child.stop(&agent.out);
+        }
+    }
+
     /// Make this thread `bot`'s, or its folder's lead's, and follow it.
-    /// `claimed`: a task that waited for this thread, whose first turn
-    /// runs already. With no bot, `pick` picks which of the folder's leads.
-    /// A bot pinned to its identity and store is that one or none.
+    /// With no bot, `pick` picks which of the folder's leads. A bot pinned
+    /// to its identity and store is that one or none.
     async fn bind(
         self: &Arc<Self>,
         agent: &Arc<Agent>,
         bot: Option<t3::Pinned>,
-        claimed: bool,
         pick: &project::Pick,
     ) -> Result<(), String> {
+        // The subagents of the lead it was are not this one's.
+        self.drop_children(agent);
         let (client, mut events) = Client::connect(&agent.options.socket)
             .await
             .map_err(|e| e.to_string())?;
@@ -988,7 +1292,10 @@ impl Session {
             bot_id,
             store: client.store().map(str::to_owned),
         };
-        t3::remember(&self.id, &pinned);
+        // A thread T3 Code may resume; a task's session is its lead's.
+        if self.parent.is_none() {
+            t3::remember(&self.id, &pinned);
+        }
         // A lead made just now joins the picker's list.
         let leads = match agent.t3 {
             None => Some(folder_leads(&client, &self.cwd).await),
@@ -1023,13 +1330,11 @@ impl Session {
                 model,
                 effort,
             });
-            // The thread T3 Code opened for a task stands for its first
-            // turn, which runs already.
-            if claimed && let Some(turn) = state.running {
-                state.prompt = state.prompt.take().map(|(id, _)| (id, Some(turn)));
-            }
         }
-        self.show_options(agent).await;
+        // A task's model is its lead's to pick: its session offers none.
+        if self.parent.is_none() {
+            self.show_options(agent).await;
+        }
         let (session, agent) = (self.clone(), agent.clone());
         // Calls already waiting for the person, whose events were before
         // this thread came, are put to it too.
@@ -1038,16 +1343,10 @@ impl Session {
             (state.bound.as_ref()).map(|b| (b.client.clone(), b.bot.clone(), state.running))
         };
         let follower = self.clone();
-        // A lead's tasks' questions come to its thread too, as Sonny's lead
-        // window pins them; T3 Code shows each task's in its own thread.
-        let tasks = match &waiting {
-            Some((_, bot, _))
-                if agent.forms.load(Ordering::Relaxed)
-                    && agent.t3.is_none()
-                    && project::is_lead(bot) =>
-            {
-                Some(bot.clone()).zip(bot_id)
-            }
+        // A lead's tasks are its subagents, for a client that shows them:
+        // T3 Code shows each task in a thread of its own.
+        let lead = match &waiting {
+            Some((_, bot, _)) if agent.t3.is_none() && project::is_lead(bot) => bot_id,
             _ => None,
         };
         let handle = tokio::spawn(async move {
@@ -1058,14 +1357,11 @@ impl Session {
                 if agent.forms.load(Ordering::Relaxed) {
                     follower.questions(&agent, client, bot).await;
                 }
-            }
-            match tasks {
-                Some(lead) => {
-                    let watching = follower.clone().watch_tasks(&agent, lead);
-                    tokio::join!(follower.follow(&agent, events), watching);
+                if let Some(lead) = lead {
+                    follower.adopt_tasks(&agent, client, lead).await;
                 }
-                None => follower.follow(&agent, events).await,
             }
+            follower.follow(&agent, events).await;
         });
         if let Ok(mut old) = session.follower.lock()
             && let Some(old) = old.replace(handle.abort_handle())
@@ -1186,9 +1482,15 @@ impl Session {
     /// next turn when it is not; a thread that is no bot yet keeps it for
     /// the lead it makes.
     async fn set_option(self: &Arc<Self>, agent: &Arc<Agent>, params: &Value) -> Reply {
-        let option = params.get("configId").unwrap_or(&params["id"]);
-        let Some(value) = params["value"].as_str() else {
-            return Err((INVALID_PARAMS, "an option is picked by its value".into()));
+        let option = &params["configId"];
+        let (Some(value), "id") = (
+            params["value"].as_str(),
+            params["type"].as_str().unwrap_or(""),
+        ) else {
+            return Err((
+                INVALID_PARAMS,
+                "an option is picked by its value's id (type `id`)".into(),
+            ));
         };
         let _one = self.switching.lock().await;
         if option == AGENT && agent.t3.is_none() {
@@ -1266,7 +1568,7 @@ impl Session {
         if value == DEFAULT || value == bound.bot {
             return Ok(());
         }
-        if state.prompt.is_some() {
+        if state.running.is_some() || state.sending > 0 {
             return Err((
                 INVALID_PARAMS,
                 format!("{} is answering; pick another lead once it has", bound.bot),
@@ -1274,7 +1576,7 @@ impl Session {
         }
         drop(state);
         let pick = project::Pick::Named(project::lead_short(value).to_owned());
-        self.bind(agent, None, false, &pick)
+        self.bind(agent, None, &pick)
             .await
             .map_err(|error| (FAILED, error))
     }
@@ -1365,11 +1667,18 @@ impl Session {
         }
     }
 
-    async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
+    /// The person's prompt, answered with its message's id once the bot has
+    /// it: the work it starts or joins is reported as the session's state.
+    async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, params: &Value) -> Reply {
         let person = person(params).map_err(|error| (INVALID_PARAMS, error))?;
-        let (text, images) = words(&params["prompt"]);
+        let key = idempotency(params).map_err(|error| (INVALID_PARAMS, error))?;
+        let shown = &params["prompt"];
+        accepted_blocks(shown).map_err(|error| (INVALID_PARAMS, error))?;
+        let (text, images) = words(shown);
+        // T3 Code's note that a child thread ended starts nothing: the lead
+        // hears of its tasks from the lookout.
         if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
-            return Ok(json!({"stopReason": "end_turn"}));
+            return Ok(self.handled(agent, shown, None).await);
         }
         let bound = {
             let mut state = self.state.lock().await;
@@ -1384,10 +1693,6 @@ impl Session {
             // that task's brief.
             let claimed = t3::claim(&text, &self.cwd);
             let task = claimed.is_some();
-            // A task's thread stands for the turn the task runs already.
-            if task {
-                self.state.lock().await.prompt = Some((id.clone(), None));
-            }
             // A new thread is a new lead of its folder, named after these
             // words, unless they are `/switch NAME`, which opens one there,
             // or `/new [NAME]`, which makes one so named.
@@ -1399,44 +1704,29 @@ impl Session {
                 (None, None) => project::Pick::Thread(text.clone()),
             };
             let claimed = claimed.map(t3::Pinned::named);
-            if let Err(error) = self.bind(agent, claimed, task, &pick).await {
-                self.state.lock().await.prompt = None;
-                return Err((FAILED, error));
-            }
+            self.state.lock().await.sending += 1;
+            let bound = self.bind(agent, claimed, &pick).await;
+            let cancelled = {
+                let mut state = self.state.lock().await;
+                state.sending -= 1;
+                std::mem::take(&mut state.cancelled)
+            };
+            bound.map_err(|error| (FAILED, error))?;
             // The agent they wrote to, now that the thread has one.
             let bot = (self.state.lock().await.bound.as_ref()).map(|b| b.bot.clone());
             crate::away::here(bot.as_deref());
             if chosen.is_some() {
                 let said = format!("This thread is {}.", bot.unwrap_or_default());
-                agent.out.update(
-                    &self.id,
-                    json!({"sessionUpdate": "agent_message_chunk",
-                        "messageId": format!("{}-lead", self.id), "content": {"type": "text", "text": said}}),
-                );
-                return Ok(json!({"stopReason": "end_turn"}));
+                return Ok(self.handled(agent, shown, Some(&said)).await);
             }
             if task {
-                let mut state = self.state.lock().await;
-                match &state.prompt {
-                    // Its turn ended before the thread came: nothing to
-                    // wait for.
-                    Some((prompt, None)) if prompt == id => {
-                        state.prompt = None;
-                        drop(state);
-                        self.say_last(agent).await;
-                        return Ok(json!({"stopReason": "end_turn"}));
-                    }
-                    Some((prompt, Some(_))) if prompt == id => {}
-                    // It ended since, and the follower answered it.
-                    _ => return Ok(Value::Null),
-                }
-                if agent.v2() {
-                    agent.out.update(
-                        &self.id,
-                        json!({"sessionUpdate": "state_update", "state": "running"}),
-                    );
-                }
-                return Ok(Value::Null);
+                return self.claimed(agent, shown).await;
+            }
+            if cancelled {
+                return Err((
+                    REQUEST_CANCELLED,
+                    "the prompt was cancelled before it was sent".into(),
+                ));
             }
         }
         // A model or effort picked while the bot worked: the bot takes it
@@ -1444,7 +1734,10 @@ impl Session {
         self.settle(agent).await;
         let mut state = self.state.lock().await;
         if std::mem::take(&mut state.cancelled) {
-            return Ok(json!({"stopReason": "cancelled"}));
+            return Err((
+                REQUEST_CANCELLED,
+                "the prompt was cancelled before it was sent".into(),
+            ));
         }
         let Some(bound) = &state.bound else {
             return Err((FAILED, "the thread has no bot".into()));
@@ -1455,8 +1748,14 @@ impl Session {
         // queues.
         let steer = state.running.is_some();
         let moving = (!steer).then_some(bound.moving.as_ref()).flatten();
+        // A key the client sends again with its prompt names the message
+        // it sent first: the daemon takes one message for one request id.
+        let request = match &key {
+            Some(key) => keyed(key),
+            None => crate::unique("acp"),
+        };
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
-            "request_id": crate::unique("acp"),
+            "request_id": request,
             "prompt": text,
             "delivery": if moving.is_some() { "queue" } else { "steer" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
@@ -1466,66 +1765,153 @@ impl Session {
         if let Some(dir) = moving {
             asked["workspace"] = json!(dir);
         }
-        let client = bound.client.clone();
+        let (client, bot) = (bound.client.clone(), bound.bot.clone());
         // The lead its folder opens next in Sonny.
         project::wrote_to(bound.client.store(), &bound.workspace, &bound.bot);
-        // A prompt that steers joins the turn an earlier one waits on,
-        // which is answered now: its words are in. Its own turn is the one
-        // the daemon names for it, which the running turn may take in.
-        if let Some((earlier, _)) = state.prompt.replace((id.clone(), None)) {
-            agent
-                .out
-                .answer(&earlier, json!({"stopReason": "end_turn"}));
-        }
+        state.sending += 1;
         drop(state);
-        match client.request("submit", asked).await {
-            Ok(reply) => {
-                let mut state = self.state.lock().await;
-                if let Some(bound) = &mut state.bound
-                    && !steer
-                {
-                    bound.moving = None;
-                }
-                // Stopped while it was being sent.
-                if std::mem::take(&mut state.cancelled)
-                    && let (Some(bound), Some(turn)) = (&state.bound, reply["message"].as_i64())
-                {
-                    let _ = (bound.client)
-                        .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
-                        .await;
-                }
-                let steered = state.steered;
-                if let Some((prompt, turn)) = &mut state.prompt
-                    && prompt == id
-                {
-                    *turn = match (reply["message"].as_i64(), steered) {
-                        (Some(sent), Some((steer, into))) if sent == steer => Some(into),
-                        (sent, _) => sent,
-                    };
-                }
-                Ok(Value::Null)
+        let reply = client.request("submit", asked).await;
+        let mut state = self.state.lock().await;
+        state.sending -= 1;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) if error.code == "idempotency_conflict" => {
+                return Err((INVALID_PARAMS, error.to_string()));
             }
-            Err(error) => {
-                self.state.lock().await.prompt = None;
-                Err((FAILED, error.to_string()))
-            }
+            Err(error) => return Err((FAILED, error.to_string())),
+        };
+        if let Some(bound) = &mut state.bound
+            && !steer
+        {
+            bound.moving = None;
         }
+        let message = reply["message"].as_i64();
+        // Stopped while it was being sent: it is in, so it is answered,
+        // and its work stopped.
+        if std::mem::take(&mut state.cancelled)
+            && let (Some(bound), Some(turn)) = (&state.bound, message)
+        {
+            let _ = (bound.client)
+                .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
+                .await;
+        }
+        let inserted = user_id(&bot, message);
+        // Shown already when its turn took it before the daemon answered.
+        let fresh = message.is_none_or(|message| state.sent.insert(message));
+        if fresh && let Some(message) = message {
+            state.queued.insert(message);
+        }
+        if fresh && reply["duplicate"] != true {
+            agent.out.update(
+                &self.id,
+                json!({"sessionUpdate": "user_message", "messageId": inserted, "content": shown}),
+            );
+        }
+        Ok(json!({"messageId": inserted}))
     }
 
-    async fn cancel(&self) {
+    /// A message Sonny takes in itself, as a command it answers: shown,
+    /// with what Sonny says to it, as work of its own when the bot is idle.
+    async fn handled(&self, agent: &Arc<Agent>, content: &Value, said: Option<&str>) -> Value {
+        let message = crate::unique(&format!("{}-said", self.id));
         let mut state = self.state.lock().await;
-        let turn = state
-            .running
-            .or(state.prompt.as_ref().and_then(|(_, turn)| *turn));
-        match (&state.bound, turn) {
-            (Some(bound), Some(turn)) => {
+        let out = &agent.out;
+        out.update(
+            &self.id,
+            json!({"sessionUpdate": "user_message", "messageId": message, "content": content}),
+        );
+        let idle = state.running.is_none();
+        if idle {
+            out.update(
+                &self.id,
+                json!({"sessionUpdate": "state_update", "state": "running",
+                "background": state.snapshot(&self.children())["background"]}),
+            );
+        }
+        if let Some(said) = said {
+            out.update(
+                &self.id,
+                json!({"sessionUpdate": "agent_message_chunk",
+                "messageId": format!("{message}-reply"), "content": {"type": "text", "text": said}}),
+            );
+        }
+        if idle {
+            let mut now = state.snapshot(&self.children());
+            now["stopReason"] = json!("end_turn");
+            self.say_state(agent, &mut state, now);
+        }
+        json!({"messageId": message})
+    }
+
+    /// The first prompt of the thread T3 Code opened for a task: its
+    /// brief, which the task's first turn took in already. It is that
+    /// message, and its work is that turn's.
+    async fn claimed(&self, agent: &Arc<Agent>, shown: &Value) -> Reply {
+        let (client, bot) = {
+            let state = self.state.lock().await;
+            let bound = state
+                .bound
+                .as_ref()
+                .ok_or((FAILED, "the thread has no bot".to_owned()))?;
+            (bound.client.clone(), bound.bot.clone())
+        };
+        let first = client
+            .request("messages", json!({"bot": bot, "after": 0, "limit": 1}))
+            .await
+            .ok()
+            .and_then(|page| page["messages"][0]["message"].as_i64());
+        let message = user_id(&bot, first);
+        let mut state = self.state.lock().await;
+        if let Some(first) = first {
+            state.sent.insert(first);
+        }
+        agent.out.update(
+            &self.id,
+            json!({"sessionUpdate": "user_message", "messageId": message, "content": shown}),
+        );
+        if state.running.is_some() {
+            self.report(agent, &mut state);
+        } else {
+            // Its turn ended before the thread came: its reply, as the
+            // work this prompt stands for.
+            let mut now = state.snapshot(&self.children());
+            now["state"] = json!("running");
+            self.say_state(agent, &mut state, now);
+            drop(state);
+            self.say_last(agent).await;
+            let mut state = self.state.lock().await;
+            let mut now = state.snapshot(&self.children());
+            now["stopReason"] = json!("end_turn");
+            self.say_state(agent, &mut state, now);
+        }
+        Ok(json!({"messageId": message}))
+    }
+
+    /// `session/cancel`: the work running stops, and with it what it asks
+    /// of the person; a prompt still being sent stops once it is in.
+    async fn cancel(&self, out: &Out) {
+        let mut state = self.state.lock().await;
+        let running = state.running;
+        let stopped: Vec<i64> = (state.asking.iter())
+            .filter(|(_, w)| w.holds.is_some() && w.holds == running)
+            .map(|(request, _)| *request)
+            .collect();
+        for request in stopped {
+            state.asking.remove(&request);
+            out.withdraw(request);
+        }
+        if state.sending > 0 {
+            state.cancelled = true;
+        }
+        // The turn running, and the session's messages waiting in line,
+        // each stopped by its number, which a turn takes from its opener.
+        let stopping: Vec<i64> = running.into_iter().chain(state.queued.drain()).collect();
+        if let Some(bound) = &state.bound {
+            for turn in stopping {
                 let _ = (bound.client)
                     .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
                     .await;
             }
-            // Its turn is not known yet: it is stopped once it is.
-            _ if state.prompt.is_some() || state.bound.is_none() => state.cancelled = true,
-            _ => {}
         }
     }
 
@@ -1596,21 +1982,23 @@ impl Session {
                     self.settle(agent).await;
                 }
             }
-            let mut failed = false;
+            let mut lost = false;
             events = loop {
                 if !open() {
                     return;
                 }
                 match self.reattach(agent).await {
                     Ok(events) => break events,
-                    Err(error) => {
-                        // The person's prompt is not left waiting while the
-                        // daemon comes back.
-                        if !failed && let Some((prompt, _)) = self.state.lock().await.prompt.take()
-                        {
-                            agent.out.fail(&prompt, FAILED, &error);
+                    Err(_) => {
+                        // While the daemon comes back, the session's work
+                        // is not known: said once, not left as running.
+                        if !lost {
+                            let mut state = self.state.lock().await;
+                            let mut now = state.snapshot(&self.children());
+                            now["state"] = json!("unknown");
+                            self.say_state(agent, &mut state, now);
                         }
-                        failed = true;
+                        lost = true;
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
@@ -1655,24 +2043,20 @@ impl Session {
             let mut state = self.state.lock().await;
             state.cursor = state.cursor.max(cursor);
             // The replay ended what it saw end; a turn it could not show
-            // (its events gone) ended if the daemon runs another.
+            // (its events gone) ended if the daemon runs another, how is
+            // not known.
             let was = state.running;
             if was.is_some() && running != was {
-                if agent.v2() {
-                    agent.out.update(
-                        &self.id,
-                        json!({"sessionUpdate": "state_update",
-                        "state": "idle", "stopReason": "end_turn"}),
-                    );
-                }
-                if matches!(&state.prompt, Some((_, at)) if *at == was)
-                    && let Some((prompt, _)) = state.prompt.take()
-                {
-                    agent.out.answer(&prompt, json!({"stopReason": "end_turn"}));
-                }
-                state.end_calls();
+                state.end_calls(&agent.out, &self.id, Some("failed"));
+                state.running = None;
+                let mut now = state.snapshot(&self.children());
+                now["stopReason"] = Value::Null;
+                self.say_state(agent, &mut state, now);
             }
             state.running = running;
+            // Where it stands now, which was not known while it was away.
+            state.reported = None;
+            self.report(agent, &mut state);
         }
         self.approvals(agent, &client, &bot, running).await;
         Ok(events)
@@ -1685,6 +2069,7 @@ impl Session {
             return;
         }
         let (client, bot) = (bound.client.clone(), bound.bot.clone());
+        let workspace = bound.workspace.clone();
         if let Some(cursor) = event["cursor"].as_i64() {
             state.cursor = state.cursor.max(cursor);
         }
@@ -1698,36 +2083,38 @@ impl Session {
                 if state.running != turn {
                     state.part = 0;
                     state.streamed.clear();
-                    state.end_calls();
+                    state.end_calls(out, id, None);
                 }
                 state.running = turn;
-                let ours = match &mut state.prompt {
-                    Some((_, at @ None)) => {
-                        *at = turn;
-                        true
-                    }
-                    Some((_, at)) => *at == turn,
-                    None => false,
-                };
-                if agent.v2() {
-                    out.update(
-                        id,
-                        json!({"sessionUpdate": "state_update", "state": "running"}),
-                    );
+                if let Some(turn) = turn {
+                    state.queued.remove(&turn);
                 }
+                self.report(agent, &mut state);
                 // A turn the bot took on its own, as one the lookout woke
                 // it for: what started it, as the thread's next message.
-                if !ours
+                // Shown once: a prompt of this session's, whose answer is
+                // still on its way, is not shown again.
+                if let Some(message) = turn
+                    && state.sent.insert(message)
                     && let Some(node) = data["node"].as_i64()
-                    && let Some(item) = items(&client, &bot, &[node]).await.into_iter().next()
-                    && !reactions::is_reaction(&crate::text(&item))
                 {
-                    out.update(
-                        id,
-                        json!({"sessionUpdate": "user_message",
-                        "messageId": format!("{bot}-{node}"),
-                        "content": [{"type": "text", "text": crate::text(&item)}]}),
-                    );
+                    self.show_message(out, &client, &bot, message, node, data)
+                        .await;
+                }
+            }
+            "steered" => {
+                if let Some(message) = data["message"].as_i64() {
+                    state.queued.remove(&message);
+                }
+                // A message the running turn took in from elsewhere, as
+                // from another window: the thread's next message too.
+                if data["attached"] != true
+                    && let Some(message) = data["message"].as_i64()
+                    && state.sent.insert(message)
+                    && let Some(node) = data["node"].as_i64()
+                {
+                    self.show_message(out, &client, &bot, message, node, data)
+                        .await;
                 }
             }
             "text_delta" => {
@@ -1796,13 +2183,13 @@ impl Session {
                     return;
                 }
                 if name == plan::TOOL {
-                    out.update(
-                        id,
-                        json!({"sessionUpdate": "plan", "entries": plan_entries(&arguments)}),
-                    );
+                    out.update(id, plan_update(&bot, &arguments));
                     return;
                 }
-                out.update(id, tool_call(&shown_id(turn, &call), &name, &arguments));
+                out.update(
+                    id,
+                    tool_call(&shown_id(turn, &call), &name, &arguments, "in_progress"),
+                );
                 state.gated.remove(&(turn, call.clone()));
                 state.calls.insert((turn, call), (name, arguments));
             }
@@ -1810,9 +2197,16 @@ impl Session {
             // turn's answer to it is its handle, and it ends later.
             "call_lifted" => {
                 let key = (turn, data["call_id"].as_str().unwrap_or("").to_owned());
+                // Its question to the person, if any, waits on with it.
+                for waiting in state.asking.values_mut() {
+                    if waiting.call == key {
+                        waiting.holds = None;
+                    }
+                }
                 if state.calls.contains_key(&key) || state.gated.contains_key(&key) {
                     state.lifted.insert(key);
                 }
+                self.report(agent, &mut state);
             }
             "tool_completed" | "lifted_ended" => {
                 let call = data["call_id"].as_str().unwrap_or("").to_owned();
@@ -1828,11 +2222,9 @@ impl Session {
                 state.asked.retain(|asked| !asked.starts_with(&prompted));
                 match lifted {
                     // Allowed, one its client answers waits on for that
-                    // answer; any other runs as a background command,
-                    // whose end this thread does not show. One lifted
-                    // while it waited on its gate had no `tool_started`:
-                    // it starts here, and its answer ends it as any
-                    // call's does.
+                    // answer. One lifted while it waited on its gate had
+                    // no `tool_started`: it starts here, and its answer
+                    // ends it as any call's does.
                     true if data["waits_for"] == "answer" => {
                         if data["outcome"] == "allowed"
                             && !state.calls.contains_key(&key)
@@ -1842,32 +2234,34 @@ impl Session {
                             && name != reactions::TOOL
                             && name != plan::TOOL
                         {
-                            out.update(id, tool_call(&shown_id(turn, &call), &name, &arguments));
+                            let shown = shown_id(turn, &call);
+                            out.update(id, tool_call(&shown, &name, &arguments, "in_progress"));
                             state.calls.insert(key, (name, arguments));
                         }
-                        return;
-                    }
-                    true if data["outcome"] == "allowed" => {
-                        if state.lifted.remove(&key) {
-                            state.calls.remove(&key);
-                        }
+                        self.report(agent, &mut state);
                         return;
                     }
                     true if !state.lifted.remove(&key) => return,
                     _ => {}
                 }
                 let Some((name, arguments)) = state.calls.remove(&key) else {
+                    if lifted {
+                        self.report(agent, &mut state);
+                    }
                     return;
                 };
                 // The client knows the call by its turn too: a later turn's
                 // call of the same id is another.
                 let shown_call = shown_id(turn, &call);
                 let (mut shown, mut failed) = (String::new(), data["failed"] == true);
+                let mut result = None;
                 if lifted {
-                    let result = &data["result"];
-                    shown = (result["answer"].as_str())
-                        .or(result["output"].as_str())
-                        .or(result["detail"].as_str())
+                    // Allowed and run as a background command, its end is
+                    // the bot's to hear: the call's own part is over.
+                    let ended = &data["result"];
+                    shown = (ended["answer"].as_str())
+                        .or(ended["output"].as_str())
+                        .or(ended["detail"].as_str())
                         .unwrap_or_default()
                         .to_owned();
                 } else if let Some(node) = data["node"].as_i64()
@@ -1878,16 +2272,30 @@ impl Session {
                 {
                     (shown, failed) = crate::output(&item);
                     failed |= data["failed"] == true;
+                    result = Some(item);
                 }
                 if data["denied"] == true {
                     failed = true;
                 }
                 let status = if failed { "failed" } else { "completed" };
+                let ran = Ran {
+                    call: &shown_call,
+                    name: &name,
+                    arguments: &arguments,
+                    shown: &shown,
+                    result: result.as_ref(),
+                    failed,
+                    workspace: &workspace,
+                };
+                let content = ended_content(out, id, &ran, true);
                 out.update(
                     id,
                     json!({"sessionUpdate": "tool_call_update", "toolCallId": shown_call,
-                    "status": status, "content": [text_content(&cut(&shown))]}),
+                    "status": status, "content": content}),
                 );
+                if lifted {
+                    self.report(agent, &mut state);
+                }
                 // A question the lead put, taken: put to the person as a
                 // form, where the client fills them in.
                 if name == asks::TOOL
@@ -1904,68 +2312,56 @@ impl Session {
                     tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
                     return;
                 }
-                // A task the lead started, which a client opens as a
-                // thread of its own by the session id it is given.
-                if name == crate::served::START
-                    && !failed
-                    && shown.starts_with("Started ")
+                let started =
+                    name == crate::served::START && !failed && shown.starts_with("Started ");
+                let project = state.bound.as_ref().and_then(|b| b.project.clone());
+                let this = (agent.sessions.lock().ok())
+                    .and_then(|sessions| sessions.get(&self.id).cloned());
+                // A task the lead started: the lead session's subagent, for
+                // a client that shows them.
+                if started
                     && agent.t3.is_none()
-                    && let Some(project) = state.bound.as_ref().and_then(|b| b.project.as_deref())
+                    && let Some(project) = &project
                     && let Some(task) = task_bot(project, &arguments)
-                    && let Ok(record) = client.request("inspect", json!({"bot": task})).await
-                    && let Some(bot_id) = record["bot_id"].as_i64()
+                    && let Some(lead) = this
                 {
-                    let session = lead_session(&task, bot_id, client.store());
-                    out.update(
-                        id,
-                        json!({"sessionUpdate": "tool_call_update", "toolCallId": shown_call,
-                        "_meta": {"task": {"sessionId": session, "title": task,
-                        "cwd": record["workspace"]}}}),
-                    );
+                    let agent = agent.clone();
+                    let linked = Some((shown_call, cut(&shown)));
+                    tokio::spawn(async move { lead.adopt(&agent, &client, &task, linked).await });
                     return;
                 }
                 // A task the lead started opens as a thread of its own.
-                if name == crate::served::START
-                    && !failed
-                    && shown.starts_with("Started ")
-                    && let Some(project) = state.bound.as_ref().and_then(|b| b.project.clone())
+                if started
+                    && let Some(project) = project
                     && agent.t3.is_some()
+                    && let Some(session) = this
                 {
-                    let workspace = state
-                        .bound
-                        .as_ref()
-                        .map(|b| b.workspace.clone())
-                        .unwrap_or_default();
-                    let this = (agent.sessions.lock().ok())
-                        .and_then(|sessions| sessions.get(&self.id).cloned());
-                    if let Some(session) = this {
-                        state.opening += 1;
+                    state.opening += 1;
+                    let agent = agent.clone();
+                    tokio::spawn(async move {
+                        let (opener, thread) = (agent.clone(), session.cwd.clone());
                         let session_id = session.id.clone();
-                        let agent = agent.clone();
-                        tokio::spawn(async move {
-                            let (opener, thread) = (agent.clone(), session.cwd.clone());
-                            let opening = tokio::spawn(async move {
-                                let at = Where {
-                                    project: &project,
-                                    workspace: &workspace,
-                                    thread: &thread,
-                                };
-                                let session = &session_id;
-                                let call = &shown_call;
-                                open_task(&opener, session, &client, &at, &arguments, call).await;
-                            });
-                            // The person's prompt waits for its tasks' threads,
-                            // not for ever: one still opening opens on its own.
-                            let _ = tokio::time::timeout(OPENING, opening).await;
-                            let mut state = session.state.lock().await;
-                            state.opening -= 1;
-                            if state.opening == 0 {
-                                for (prompt, result) in std::mem::take(&mut state.held) {
-                                    agent.out.answer(&prompt, result);
-                                }
-                            }
+                        let opening = tokio::spawn(async move {
+                            let at = Where {
+                                project: &project,
+                                workspace: &workspace,
+                                thread: &thread,
+                            };
+                            let session = &session_id;
+                            let call = &shown_call;
+                            open_task(&opener, session, &client, &at, &arguments, call).await;
                         });
-                    }
+                        // The work waits for its tasks' threads, not for
+                        // ever: one still opening opens on its own.
+                        let _ = tokio::time::timeout(OPENING, opening).await;
+                        let mut state = session.state.lock().await;
+                        state.opening -= 1;
+                        if state.opening == 0 {
+                            for update in std::mem::take(&mut state.held) {
+                                agent.out.update(&session.id, update);
+                            }
+                        }
+                    });
                 }
             }
             "approval_requested" | "approval_asked" => {
@@ -1982,83 +2378,114 @@ impl Session {
                 drop(state);
                 self.approvals(agent, &client, &bot, turn).await;
             }
-            "steered" => {
-                // A message the running turn took in: the prompt that sent
-                // it waits on that turn now.
-                let steer = data["message"].as_i64();
-                if let (Some(steer), Some(into)) = (steer, turn) {
-                    state.steered = Some((steer, into));
-                }
-                if let Some((_, at)) = &mut state.prompt
-                    && *at == steer
-                {
-                    *at = turn;
-                }
-            }
             "turn_finished" => {
                 if state.running.is_some() && state.running != turn {
                     return;
                 }
-                state.running = None;
-                state.end_calls();
-                let reason = match data["status"].as_str().unwrap_or("") {
-                    "interrupted" | "cancelled" => "cancelled",
-                    _ => "end_turn",
+                let (reason, error) = stop_reason(data);
+                let unfinished = if reason == "cancelled" {
+                    "cancelled"
+                } else {
+                    "failed"
                 };
-                let failed = data["status"] == "failed";
-                let mut ended =
-                    json!({"sessionUpdate": "state_update", "state": "idle", "stopReason": reason});
-                if failed {
-                    let detail = data["error"].as_str().unwrap_or("the turn failed");
-                    ended["error"] = json!({"code": FAILED, "message": detail});
+                state.end_calls(out, id, Some(unfinished));
+                // What the work asked of the person and was not answered
+                // is taken back with it.
+                let stale: Vec<i64> = (state.asking.iter())
+                    .filter(|(_, w)| w.holds.is_some() && w.holds == turn)
+                    .map(|(request, _)| *request)
+                    .collect();
+                for request in stale {
+                    state.asking.remove(&request);
+                    out.withdraw(request);
                 }
-                if agent.v2() {
-                    out.update(id, ended);
+                state.running = None;
+                let mut now = state.snapshot(&self.children());
+                now["stopReason"] = json!(reason);
+                if let Some(error) = error {
+                    now["error"] = error;
                 }
-                // A prompt whose turn is not named yet waits: the turn that
-                // ended may be one it was sent behind.
-                let ours = matches!(&state.prompt, Some((_, at)) if at.is_some() && *at == turn);
-                if ours && let Some((prompt, _)) = state.prompt.take() {
-                    let mut result = json!({"stopReason": reason});
-                    if failed {
-                        result["error"] = json!({"code": FAILED,
-                            "message": data["error"].as_str().unwrap_or("the turn failed")});
-                    }
-                    // A task T3 Code opens as a child of this prompt opens
-                    // while its run is on.
-                    if state.opening > 0 {
-                        state.held.push((prompt, result));
-                    } else {
-                        out.answer(&prompt, result);
-                    }
-                }
+                self.say_state(agent, &mut state, now);
             }
             "message_ended" => {
-                // A prompt that ended in line, withdrawn or failed before
-                // any turn took it in: answered now. A turn running for
-                // another message goes on.
+                // A message this session sent that ended in line, withdrawn
+                // or failed before any turn took it in: the work it was
+                // to start ended so. One queued behind a running turn is
+                // that turn's to end.
                 let ended = event["message"].as_i64();
-                let ours = matches!(&state.prompt, Some((_, at)) if at.is_some() && *at == ended);
-                if ours && let Some((prompt, _)) = state.prompt.take() {
-                    let result = match data["status"].as_str() {
-                        Some("withdrawn") => json!({"stopReason": "cancelled"}),
-                        _ => json!({"stopReason": "end_turn", "error": {"code": FAILED,
-                            "message": data["error"].as_str().unwrap_or("the message failed")}}),
-                    };
-                    if state.opening > 0 {
-                        state.held.push((prompt, result));
-                    } else {
-                        out.answer(&prompt, result);
+                if let Some(ended) = ended {
+                    state.queued.remove(&ended);
+                }
+                if ended.is_some_and(|ended| state.sent.contains(&ended)) && state.running.is_none()
+                {
+                    let mut now = state.snapshot(&self.children());
+                    match data["status"].as_str() {
+                        Some("withdrawn") => now["stopReason"] = json!("cancelled"),
+                        _ => {
+                            now["stopReason"] = json!("error");
+                            now["error"] = json!({"code": FAILED,
+                                "message": data["error"].as_str().unwrap_or("the message failed")});
+                        }
                     }
+                    self.say_state(agent, &mut state, now);
                 }
             }
             "deleted" => {
-                if let Some((prompt, _)) = state.prompt.take() {
-                    out.fail(&prompt, FAILED, &format!("{bot} was deleted"));
+                let gone = format!("{bot} was deleted");
+                if state.running.take().is_some() {
+                    state.end_calls(out, id, Some("failed"));
+                    let mut now = state.snapshot(&self.children());
+                    now["stopReason"] = json!("error");
+                    now["error"] = json!({"code": FAILED, "message": gone});
+                    self.say_state(agent, &mut state, now);
+                } else {
+                    out.update(
+                        id,
+                        json!({"sessionUpdate": "notice", "severity": "warning", "title": gone}),
+                    );
+                }
+                // A task removed is done: its session is not followed on,
+                // so another bot made under its name is not taken for it.
+                if self.parent.is_some() {
+                    let (agent, child) = (agent.clone(), self.id.clone());
+                    tokio::spawn(async move { agent.forget(&child) });
                 }
             }
             _ => {}
         }
+    }
+
+    /// A message the session did not send, by its number and node: from
+    /// the lead, for a task's session, as the lead's message to it; else
+    /// as the session's next message, as one the lookout sent.
+    async fn show_message(
+        &self,
+        out: &Out,
+        client: &Client,
+        bot: &str,
+        message: i64,
+        node: i64,
+        data: &Value,
+    ) {
+        let Some(item) = items(client, bot, &[node]).await.into_iter().next() else {
+            return;
+        };
+        let text = crate::text(&item);
+        if reactions::is_reaction(&text) {
+            return;
+        }
+        let content = json!([{"type": "text", "text": text}]);
+        let messaged = user_id(bot, Some(message));
+        let update = match &self.parent {
+            Some((parent, lead)) if data["from"]["bot"] == lead.as_str() => {
+                json!({"sessionUpdate": "session_message", "messageId": messaged,
+                    "senderSessionId": parent, "content": content})
+            }
+            _ => {
+                json!({"sessionUpdate": "user_message", "messageId": messaged, "content": content})
+            }
+        };
+        out.update(&self.id, update);
     }
 
     /// The calls of `turn` waiting for the person, and those a message
@@ -2107,9 +2534,12 @@ impl Session {
             if !self.state.lock().await.asked.insert(key) {
                 continue;
             }
+            let Some(session) = (agent.sessions.lock().ok()).and_then(|s| s.get(&self.id).cloned())
+            else {
+                return;
+            };
             let (agent, client, bot, call) =
                 (agent.clone(), client.clone(), bot.to_owned(), call.clone());
-            let session = self.id.clone();
             tokio::spawn(async move { ask(&agent, &session, &client, &bot, &call).await });
         }
     }
@@ -2136,145 +2566,291 @@ impl Session {
 }
 
 impl Session {
-    /// Put each question the lead's tasks have open to the person as a
-    /// form, "From TASK", whose pick answers it in that task: those open
-    /// now, then each as it is asked, from tasks the lead starts since
-    /// too. On a connection of its own, which follows only the calls of
-    /// the lead and its tasks, from now; once the daemon drops it, it is
-    /// made again and what is open read again.
-    async fn watch_tasks(self: Arc<Self>, agent: &Arc<Agent>, (lead, lead_id): (String, i64)) {
-        loop {
-            let _ = self.tasks_asked(agent, &lead, lead_id).await;
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    }
-
-    async fn tasks_asked(
-        &self,
-        agent: &Arc<Agent>,
-        lead: &str,
-        lead_id: i64,
-    ) -> Result<(), String> {
-        let (client, mut events) = Client::connect(&agent.options.socket)
-            .await
-            .map_err(|e| e.to_string())?;
-        let since = now_ms();
-        // Only the calls, and for the lead also its turns' ends.
-        let follow = |bot: &str| {
-            json!({"bot": bot, "since_ms": since,
-                "kinds": ["tool_started", "tool_completed", "turn_finished"]})
+    /// The lead's tasks that still matter when its session comes, as its
+    /// subagents: each running, or with a question open, from tasks that
+    /// ran in the last week.
+    async fn adopt_tasks(self: &Arc<Self>, agent: &Arc<Agent>, client: &Client, lead_id: i64) {
+        let Ok(tasks) = tasks_of(client, lead_id).await else {
+            return;
         };
-        client
-            .request("follow", follow(lead))
-            .await
-            .map_err(|e| e.to_string())?;
-        // The tasks followed, by name, each the identity it is now: a
-        // follow is by name, and a bot made later under it is not the task.
-        let mut watched: HashMap<String, i64> = HashMap::new();
-        // Followed before they are read, so none asked between is missed.
-        let tasks = tasks_of(&client, lead_id).await?;
-        for task in &tasks {
-            if let (Some(bot), Some(id)) = (task["name"].as_str(), task["bot_id"].as_i64())
-                && watched.insert(bot.to_owned(), id).is_none()
-            {
-                (client.request("follow", follow(bot)).await).map_err(|e| e.to_string())?;
-            }
-        }
-        for task in tasks.iter().filter(|task| lately(task, since)) {
-            self.task_asked(agent, &client, task).await;
-        }
-        // The lead's `start_task` calls started, and the tasks' asks, by
-        // task and call.
-        let (mut starting, mut asking) = (HashSet::new(), HashSet::new());
-        while let Some(event) = events.recv().await {
-            if event["event"] == "follow_lagged" {
-                break;
-            }
-            let Some(bot) = event["bot"].as_str() else {
+        let now = now_ms();
+        for task in tasks.iter().filter(|task| lately(task, now)) {
+            let Some(name) = task["name"].as_str() else {
                 continue;
             };
-            let data = &event["data"];
-            let call = data["call_id"].as_str().unwrap_or("").to_owned();
-            let done = data["failed"] != true && data["denied"] != true;
-            let kind = event["event"].as_str().unwrap_or("");
-            if bot == lead {
-                match kind {
-                    "tool_started" if data["name"] == crate::served::START => {
-                        starting.insert(call);
-                        continue;
-                    }
-                    // A task started: followed from now on.
-                    "tool_completed" if starting.remove(&call) && done => {}
-                    // One whose start came before this followed: the
-                    // lead's turn ends after it.
-                    "turn_finished" => {}
-                    _ => continue,
-                }
-                for task in tasks_of(&client, lead_id).await? {
-                    let (Some(bot), Some(id)) = (task["name"].as_str(), task["bot_id"].as_i64())
-                    else {
-                        continue;
-                    };
-                    match watched.insert(bot.to_owned(), id) {
-                        Some(was) if was == id => continue,
-                        Some(_) => {}
-                        None => {
-                            (client.request("follow", follow(bot)).await)
-                                .map_err(|e| e.to_string())?;
-                        }
-                    }
-                    // Its questions may have come before it was followed.
-                    self.task_asked(agent, &client, &task).await;
-                }
+            let running = task["running_turn"].as_i64().is_some();
+            // One closed, by itself or its lead, with no turn since, is
+            // done: it has nothing open.
+            if crate::resolved::done(crate::resolved::closed(task), running) {
                 continue;
             }
-            // A task's question put, or its turn over, which takes in one
-            // whose ask began before this followed: read what it has open,
-            // if it is still the task followed.
-            let key = (bot.to_owned(), call);
-            if kind == "tool_started" && data["name"] == asks::TOOL {
-                asking.insert(key);
-                continue;
-            }
-            let asked = kind == "tool_completed" && asking.remove(&key) && done;
-            let ended = kind == "turn_finished";
-            if (asked || ended)
-                && let Some(&id) = watched.get(bot)
-                && let Ok(task) = client
-                    .request("inspect", json!({"bot": bot, "bot_id": id}))
-                    .await
-                && task["created_by_id"].as_i64() == Some(lead_id)
-            {
-                self.task_asked(agent, &client, &task).await;
+            if running || !open_asks(client, name).await.is_empty() {
+                self.adopt(agent, client, name, None).await;
             }
         }
-        client.close().await;
-        Ok(())
     }
 
-    /// The questions `task`, as `bots` or `inspect` gives it, has open,
-    /// each put to the person once.
-    async fn task_asked(&self, agent: &Arc<Agent>, client: &Client, task: &Value) {
-        let (Some(bot), Some(bot_id)) = (task["name"].as_str(), task["bot_id"].as_i64()) else {
+    /// Show `task`, a task the lead started, as the lead session's
+    /// subagent: announced, its brief as the lead's message to it, then
+    /// followed in a session of its own, which takes only `session/cancel`
+    /// and answers to what Sonny asks there. `call`, the lead's
+    /// `start_task` call that started it, with what it said, links to it.
+    async fn adopt(
+        self: &Arc<Self>,
+        agent: &Arc<Agent>,
+        client: &Client,
+        task: &str,
+        call: Option<(String, String)>,
+    ) {
+        let Ok(record) = client.request("inspect", json!({"bot": task})).await else {
             return;
         };
-        // One closed, by itself or its lead, with no turn since, is done:
-        // it has nothing open.
-        let running = task["running_turn"].as_i64();
-        if crate::resolved::done(crate::resolved::closed(task), running.is_some()) {
+        let Some(bot_id) = record["bot_id"].as_i64() else {
+            return;
+        };
+        let child = lead_session(task, bot_id, client.store());
+        let workspace = record["workspace"].as_str().unwrap_or_default().to_owned();
+        let Some(lead) = (self.state.lock().await.bound.as_ref()).map(|b| b.bot.clone()) else {
+            return;
+        };
+        let known = self
+            .children
+            .lock()
+            .map_or(true, |c| c.contains_key(&child));
+        let out = &agent.out;
+        if !known {
+            let cwd = Some(&workspace).filter(|w| Path::new(w).is_absolute());
+            let announced = json!({"sessionId": child, "title": task, "cwd": cwd,
+                "capabilities": {"cancel": {}}});
+            if let Ok(mut children) = self.children.lock() {
+                children.insert(child.clone(), announced.clone());
+            }
+            let mut update = announced;
+            update["sessionUpdate"] = json!("subagent_update");
+            out.update(&self.id, update);
+        }
+        if let Some((call, said)) = call {
+            out.update(
+                &self.id,
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                "content": [text_content(&said), {"type": "session", "sessionId": child}]}),
+            );
+        }
+        if known {
             return;
         }
-        for ask in open_asks(client, bot).await {
-            if !(self.state.lock().await.asked).insert(format!("{bot} {}", ask.id)) {
-                continue;
-            }
-            let asked = (agent.out).asking("elicitation/create", task_form(&self.id, bot, &ask));
-            let (agent, session, task) = (
-                agent.clone(),
-                self.id.clone(),
-                (bot.to_owned(), Some(bot_id)),
+        let session = Arc::new(Session {
+            id: child.clone(),
+            cwd: PathBuf::from(&workspace),
+            parent: Some((self.id.clone(), lead)),
+            state: AsyncMutex::new(State::default()),
+            follower: Mutex::new(None),
+            switching: AsyncMutex::new(()),
+            children: Mutex::new(HashMap::new()),
+        });
+        if let Ok(mut sessions) = agent.sessions.lock() {
+            sessions.insert(child.clone(), session.clone());
+        }
+        // Its brief, the first message it was sent, as the lead's to it.
+        if let Some((first, brief)) = brief(client, task).await {
+            session.state.lock().await.sent.insert(first);
+            out.update(
+                &child,
+                json!({"sessionUpdate": "session_message", "messageId": user_id(task, Some(first)),
+                "senderSessionId": self.id, "content": [{"type": "text", "text": brief}]}),
             );
-            tokio::spawn(async move { elicit(asked, &agent, &session, task, &ask).await });
+        }
+        let pinned = t3::Pinned {
+            bot: task.to_owned(),
+            bot_id: Some(bot_id),
+            store: client.store().map(str::to_owned),
+        };
+        if bind_task(session.clone(), agent.clone(), pinned)
+            .await
+            .is_err()
+        {
+            // Not followed: its state is not known.
+            let mut state = session.state.lock().await;
+            let mut now = state.snapshot(&HashMap::new());
+            now["state"] = json!("unknown");
+            session.say_state(agent, &mut state, now);
+            return;
+        }
+        // One that worked before it was shown: its last reply.
+        if session.state.lock().await.running.is_none() {
+            session.say_last(agent).await;
+        }
+        let mut state = session.state.lock().await;
+        session.report(agent, &mut state);
+    }
+
+    /// Replay the bot's history, from its start, as the session's: the
+    /// messages, the bot's replies and its calls as they ended. What only
+    /// described its state then (its states, notices, options) is not
+    /// history.
+    async fn replay(&self, out: &Out) {
+        let (client, bot) = {
+            let state = self.state.lock().await;
+            let Some(bound) = &state.bound else { return };
+            (bound.client.clone(), bound.bot.clone())
+        };
+        // Each message by the node a turn took it in at.
+        let mut numbers: HashMap<i64, i64> = HashMap::new();
+        let mut after = json!(0);
+        loop {
+            let Ok(page) = client
+                .request(
+                    "messages",
+                    json!({"bot": bot, "after": after, "limit": 128}),
+                )
+                .await
+            else {
+                break;
+            };
+            for listed in page["messages"].as_array().into_iter().flatten() {
+                if let (Some(node), Some(message)) =
+                    (listed["node"].as_i64(), listed["message"].as_i64())
+                {
+                    numbers.insert(node, message);
+                }
+            }
+            after = page["next_after"].clone();
+            if after.is_null() {
+                break;
+            }
+        }
+        let mut entries = Vec::new();
+        let _ = crate::said::walk(&client, &bot, 0, |turn, entry| {
+            entries.push((turn, entry.clone()));
+            false
+        })
+        .await;
+        entries.reverse();
+        let workspace = (self.state.lock().await.bound.as_ref())
+            .map(|b| b.workspace.clone())
+            .unwrap_or_default();
+        let mut history = History {
+            out,
+            session: &self.id,
+            bot: &bot,
+            workspace: &workspace,
+            calls: HashMap::new(),
+            parts: HashMap::new(),
+        };
+        for (turn, entry) in &entries {
+            let node = entry["node"].as_i64();
+            let number = node.and_then(|node| numbers.get(&node).copied());
+            for item in crate::responses(&entry["item"]) {
+                history.item(*turn, &item, number);
+            }
+        }
+    }
+}
+
+/// A task's session bound to its task, behind a box: a lead's session
+/// that binds adopts its tasks, whose sessions bind.
+fn bind_task(
+    session: Arc<Session>,
+    agent: Arc<Agent>,
+    task: t3::Pinned,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+    Box::pin(async move { session.bind(&agent, Some(task), &project::Pick::Last).await })
+}
+
+/// A bot's history as it is replayed: its calls not ended yet, and the
+/// part of each turn its words are in.
+struct History<'a> {
+    out: &'a Out,
+    session: &'a str,
+    bot: &'a str,
+    workspace: &'a str,
+    calls: HashMap<String, (i64, String, Value)>,
+    parts: HashMap<i64, u32>,
+}
+
+impl History<'_> {
+    fn item(&mut self, turn: i64, item: &Value, message: Option<i64>) {
+        let part = *self.parts.get(&turn).unwrap_or(&0);
+        match item["type"].as_str() {
+            Some("function_call") => {
+                self.parts.insert(turn, part + 1);
+                let (Some(call), Some(name)) = (item["call_id"].as_str(), item["name"].as_str())
+                else {
+                    return;
+                };
+                let arguments = (item["arguments"].as_str())
+                    .and_then(|arguments| serde_json::from_str(arguments).ok())
+                    .unwrap_or(Value::Null);
+                if name == reactions::TOOL {
+                    return;
+                }
+                if name == plan::TOOL {
+                    self.out
+                        .replayed(self.session, plan_update(self.bot, &arguments));
+                    return;
+                }
+                let shown = shown_id(Some(turn), call);
+                self.out.replayed(
+                    self.session,
+                    tool_call(&shown, name, &arguments, "in_progress"),
+                );
+                self.calls
+                    .insert(call.to_owned(), (turn, name.to_owned(), arguments));
+            }
+            Some("function_call_output") => {
+                let Some(call) = item["call_id"].as_str() else {
+                    return;
+                };
+                let Some((turn, name, arguments)) = self.calls.remove(call) else {
+                    return;
+                };
+                let (shown, failed) = crate::output(item);
+                let shown_call = shown_id(Some(turn), call);
+                let ran = Ran {
+                    call: &shown_call,
+                    name: &name,
+                    arguments: &arguments,
+                    shown: &shown,
+                    result: Some(item),
+                    failed,
+                    workspace: self.workspace,
+                };
+                // The file as it is now is not the one the call left: an
+                // edit replays as what it said.
+                let content = ended_content(self.out, self.session, &ran, false);
+                let status = if failed { "failed" } else { "completed" };
+                self.out.replayed(
+                    self.session,
+                    json!({"sessionUpdate": "tool_call_update", "toolCallId": shown_call,
+                    "status": status, "content": content}),
+                );
+            }
+            _ if item["role"] == "user" => {
+                let text = crate::text(item);
+                if text.is_empty() || reactions::is_reaction(&text) {
+                    return;
+                }
+                let Some(message) = message else { return };
+                self.out.replayed(
+                    self.session,
+                    json!({"sessionUpdate": "user_message",
+                    "messageId": user_id(self.bot, Some(message)),
+                    "content": [{"type": "text", "text": text}]}),
+                );
+            }
+            _ if item["role"] == "assistant" => {
+                let text = crate::text(item);
+                if text.is_empty() {
+                    return;
+                }
+                self.out.replayed(
+                    self.session,
+                    json!({"sessionUpdate": "agent_message",
+                    "messageId": message_id(self.bot, Some(turn), part),
+                    "content": [{"type": "text", "text": text}]}),
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -2314,14 +2890,6 @@ fn lately(task: &Value, now: i64) -> bool {
 fn now_ms() -> i64 {
     (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
         .map_or(0, |d| d.as_millis() as i64)
-}
-
-/// A task's question, as a form that says whose it is.
-fn task_form(session: &str, task: &str, ask: &asks::Ask) -> Value {
-    let mut params = form(session, ask, None);
-    let message = params["message"].as_str().unwrap_or_default();
-    params["message"] = json!(format!("From {task}\n\n{message}"));
-    params
 }
 
 /// The form field a question's pick is in.
@@ -2446,8 +3014,10 @@ fn for_person(call: &Value) -> bool {
     asked || (call["gates"].as_array()).is_some_and(|gates| gates.iter().any(|g| g == "manual"))
 }
 
-/// Put one call to the person, and answer it with their choice.
-async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Value) {
+/// Put one call to the person, and answer it with their choice. While
+/// they choose, the work it holds up waits on them (`requires_action`);
+/// one a message lifted is background work, which waits on no one.
+async fn ask(agent: &Arc<Agent>, session: &Arc<Session>, client: &Client, bot: &str, call: &Value) {
     let id = call["call_id"].as_str().unwrap_or("");
     let name = call["name"].as_str().unwrap_or("tool");
     // A long call is listed cut: the person is shown the whole of it, read
@@ -2466,8 +3036,14 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
             .ok()
             .and_then(|read| agent_client::approver::call_arguments(&read["items"][0]["item"], id)),
     };
-    let shown = shown_id(call["turn"].as_i64(), id);
-    let mut update = tool_call(&shown, name, arguments.as_ref().unwrap_or(&Value::Null));
+    let turn = call["turn"].as_i64();
+    let shown = shown_id(turn, id);
+    let mut update = tool_call(
+        &shown,
+        name,
+        arguments.as_ref().unwrap_or(&Value::Null),
+        "pending",
+    );
     if let Value::Object(fields) = &mut update {
         fields.remove("sessionUpdate");
     }
@@ -2482,15 +3058,29 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
             title = format!("{title} (its whole call could not be read, so it can only be denied)")
         }
     }
-    let answer = agent
-        .out
-        .ask(
-            "session/request_permission",
-            json!({"sessionId": session, "title": title, "toolCall": update, "options": options}),
-        )
-        .await;
-    // No choice, as when the client gave up on it: the call waits for an
-    // answer from anywhere else.
+    let holds = (!call["handle"].is_string()).then_some(turn).flatten();
+    let (request, answer) = agent.out.reserve();
+    {
+        let mut state = session.state.lock().await;
+        let call = (turn, id.to_owned());
+        state.asking.insert(request, Waiting { holds, call });
+        session.report(agent, &mut state);
+    }
+    agent.out.request(
+        request,
+        "session/request_permission",
+        json!({"sessionId": session.id, "title": title,
+            "subject": {"type": "tool_call", "toolCall": update}, "options": options}),
+    );
+    let answer = Out::answer_to(answer).await;
+    {
+        let mut state = session.state.lock().await;
+        if state.asking.remove(&request).is_some() {
+            session.report(agent, &mut state);
+        }
+    }
+    // No choice, as when the client gave up on it or it was taken back:
+    // the call waits for an answer from anywhere else.
     let decision = match answer.as_ref().map(|a| &a["outcome"]) {
         Some(outcome) if outcome["outcome"] == "selected" && outcome["optionId"] == "allow" => {
             "allow"
@@ -2507,14 +3097,6 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
     };
     // Through the thread's connection as it is now: the one the call was
     // listed on may have dropped while the person chose.
-    let Some(session) = agent
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|s| s.get(session).cloned())
-    else {
-        return;
-    };
     let client = (session.state.lock().await.bound.as_ref()).map(|b| b.client.clone());
     let sent = match client {
         Some(client) => client
@@ -2739,21 +3321,7 @@ async fn open_task(
             .request("inspect", json!({"bot": bot}))
             .await
             .map_err(|e| e.to_string())?;
-        // Its first message is its brief, whether or not a turn has taken
-        // it in yet: a task may wait for room to start.
-        let messages = client
-            .request("messages", json!({"bot": bot, "after": 0, "limit": 1}))
-            .await
-            .map_err(|e| e.to_string())?;
-        let first = &messages["messages"][0]["message"];
-        let prompts = client
-            .request("prompts", json!({"bot": bot, "turn": first}))
-            .await
-            .map_err(|e| e.to_string())?;
-        let brief = prompts["prompts"][0]["text"]
-            .as_str()
-            .ok_or("the task has no brief")?
-            .to_owned();
+        let (_, brief) = brief(client, &bot).await.ok_or("the task has no brief")?;
         let workspace = record["workspace"].as_str().unwrap_or_default();
         let message = t3::expect(&bot, &brief, at.thread)?;
         let child = json!({"task": message, "title": name, "clientRequestId": bot});
@@ -2863,8 +3431,9 @@ fn shown_id(turn: Option<i64>, call: &str) -> String {
     }
 }
 
-/// The update that shows a call: what it does, in a few words.
-fn tool_call(call: &str, name: &str, arguments: &Value) -> Value {
+/// The update that shows a call, created or brought to `status`: what it
+/// does, in a few words.
+fn tool_call(call: &str, name: &str, arguments: &Value, status: &str) -> Value {
     let path = arguments["path"].as_str();
     let (kind, title) = match name {
         "shell" => (
@@ -2880,15 +3449,22 @@ fn tool_call(call: &str, name: &str, arguments: &Value) -> Value {
         "wait" => ("other", "Wait".to_owned()),
         _ => ("other", name.to_owned()),
     };
-    let mut update = json!({"sessionUpdate": "tool_call", "toolCallId": call, "title": title.trim(),
-        "name": name, "kind": kind, "status": "in_progress", "rawInput": arguments});
+    let mut update = json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+        "title": title.trim(), "name": name, "kind": kind, "status": status, "rawInput": arguments});
     if let Some(path) = path {
         update["locations"] = json!([{"path": path}]);
     }
     update
 }
 
-/// A `plan` call's steps, as the protocol's plan.
+/// A `plan` call's steps, as the protocol's plan: the bot's one plan,
+/// which each call replaces.
+fn plan_update(bot: &str, arguments: &Value) -> Value {
+    json!({"sessionUpdate": "plan_update", "plan": {"type": "items",
+        "planId": format!("{bot}-plan"), "entries": plan_entries(arguments)}})
+}
+
+/// A `plan` call's steps, as the protocol's plan entries.
 fn plan_entries(arguments: &Value) -> Vec<Value> {
     arguments["steps"]
         .as_array()
@@ -2905,6 +3481,255 @@ fn plan_entries(arguments: &Value) -> Vec<Value> {
             json!({"content": content, "priority": "medium", "status": status})
         })
         .collect()
+}
+
+/// How a turn ended, as the protocol's stop reason, and the error it
+/// carries when it failed.
+fn stop_reason(data: &Value) -> (&'static str, Option<Value>) {
+    match data["status"].as_str().unwrap_or("") {
+        "interrupted" | "cancelled" => ("cancelled", None),
+        "failed" if data["error"] == "provider_refusal" => ("refusal", None),
+        "failed" => {
+            let message = (data["detail"].as_str())
+                .or(data["error"].as_str())
+                .unwrap_or("the turn failed");
+            ("error", Some(json!({"code": FAILED, "message": message})))
+        }
+        _ if data["limit"] == "rounds" => ("max_turn_requests", None),
+        _ => ("end_turn", None),
+    }
+}
+
+/// The id of a message the bot was sent, by its number, as the daemon
+/// names it (`BOT/N`): a prompt's, and the same one when it is replayed.
+fn user_id(bot: &str, message: Option<i64>) -> String {
+    match message {
+        Some(message) => format!("{bot}/{message}"),
+        None => crate::unique(&format!("{bot}/sent")),
+    }
+}
+
+/// A prompt's `idempotencyKey`, when it has one: 1 to 255 characters.
+fn idempotency(params: &Value) -> Result<Option<&str>, String> {
+    match &params["idempotencyKey"] {
+        Value::Null => Ok(None),
+        Value::String(key) if (1..=255).contains(&key.chars().count()) => Ok(Some(key)),
+        _ => Err("idempotencyKey must be 1 to 255 characters".into()),
+    }
+}
+
+/// The daemon's request id for a prompt's idempotency key: one way, so
+/// the key itself is kept nowhere.
+fn keyed(key: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key.as_bytes());
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("acp-{hex}")
+}
+
+/// Whether a prompt holds only what Sonny takes: words and links, which
+/// every agent takes, and the pictures and files it says it takes.
+fn accepted_blocks(prompt: &Value) -> Result<(), String> {
+    let blocks = prompt.as_array().filter(|blocks| !blocks.is_empty());
+    let Some(blocks) = blocks else {
+        return Err("prompt must be a list of one or more blocks".into());
+    };
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text" | "resource_link" | "image" | "resource") => {}
+            other => {
+                return Err(format!(
+                    "Sonny takes no {} block",
+                    other.unwrap_or("untyped")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A call that ended, as its final update shows it.
+struct Ran<'a> {
+    /// The id the client knows it by.
+    call: &'a str,
+    name: &'a str,
+    arguments: &'a Value,
+    /// What it said, as the person reads it.
+    shown: &'a str,
+    /// Its result as the bot's history keeps it.
+    result: Option<&'a Value>,
+    failed: bool,
+    /// The bot's folder, which its paths are in.
+    workspace: &'a str,
+}
+
+/// What an ended call shows: a command that exited as a terminal, with
+/// its output and exit status; an edit as the diff it made, read from the
+/// file as it is now when `now` says the call is the last to touch it;
+/// anything else as what it said.
+fn ended_content(out: &Out, session: &str, ran: &Ran<'_>, now: bool) -> Vec<Value> {
+    if ran.name == "shell"
+        && let Some(exit) = ran.result.and_then(exit_status)
+    {
+        let command = ran.arguments["command"].as_str();
+        let cwd = Path::new(ran.workspace).join(ran.arguments["workdir"].as_str().unwrap_or(""));
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(cut(ran.shown));
+        let mut terminal = json!({"sessionUpdate": "terminal_update", "terminalId": ran.call,
+            "command": command, "output": {"data": data}, "exitStatus": exit});
+        if cwd.is_absolute() {
+            terminal["cwd"] = json!(cwd);
+        }
+        out.update(session, terminal);
+        return vec![json!({"type": "terminal", "terminalId": ran.call})];
+    }
+    if !ran.failed
+        && let Some(diff) = edit_diff(ran.name, ran.arguments, ran.workspace, now)
+    {
+        return vec![diff];
+    }
+    vec![text_content(&cut(ran.shown))]
+}
+
+/// A command's exit status from its result, when it ran to its end: one
+/// still running, or left running in the background, has none yet.
+fn exit_status(result: &Value) -> Option<Value> {
+    let raw = match &result["output"] {
+        Value::String(raw) => raw.clone(),
+        _ => return None,
+    };
+    let ended: Value = serde_json::from_str(&raw).ok()?;
+    if ended["running"] == true {
+        return None;
+    }
+    let code = ended.get("exit_code")?;
+    Some(json!({"exitCode": code}))
+}
+
+/// The diff an edit made, as the protocol's diff: the files it changed,
+/// and as `git diff` would show them, every path whole. `now`: the file
+/// as it is now is the one the edit left, so the lines it changed are
+/// placed in it; else only which files it changed.
+fn edit_diff(name: &str, arguments: &Value, workspace: &str, now: bool) -> Option<Value> {
+    let whole = |path: &str| Path::new(workspace).join(path).display().to_string();
+    match name {
+        "edit" => {
+            let path = whole(arguments["path"].as_str()?);
+            let mut diff = json!({"type": "diff",
+                "changes": [{"operation": "modify", "path": path, "fileType": "text"}]});
+            if now {
+                let edit = crate::transcript::edit_lines(arguments, workspace);
+                if let Some(start) = edit.start {
+                    let (old, new): (Vec<&str>, Vec<&str>) =
+                        (edit.old.lines().collect(), edit.new.lines().collect());
+                    let quoted = quoted_path(&path);
+                    let mut text = format!(
+                        "diff --git {quoted} {quoted}\n--- {quoted}\n+++ {quoted}\n@@ -{} +{} @@\n",
+                        span(start, old.len()),
+                        span(start, new.len())
+                    );
+                    for line in old {
+                        text.push_str(&format!("-{line}\n"));
+                    }
+                    for line in new {
+                        text.push_str(&format!("+{line}\n"));
+                    }
+                    diff["patch"] = json!({"format": "git_patch", "text": text});
+                }
+            }
+            Some(diff)
+        }
+        "apply_patch" => {
+            let patch = arguments["input"].as_str()?;
+            let files = crate::transcript::patch_sections(patch, workspace);
+            if files.is_empty() {
+                return None;
+            }
+            let mut changes = Vec::new();
+            let mut text = String::new();
+            for file in &files {
+                let path = whole(&file.path);
+                let old = file.moved_from.as_deref().map(whole);
+                let mut change = json!({"operation": file.operation(), "path": path});
+                if let Some(old) = &old {
+                    change["oldPath"] = json!(old);
+                }
+                changes.push(change);
+                let (before, after) = (old.as_deref().unwrap_or(&path), path.as_str());
+                let (before, after) = (quoted_path(before), quoted_path(after));
+                text.push_str(&format!("diff --git {before} {after}\n"));
+                match file.operation() {
+                    "add" => text.push_str(&format!(
+                        "new file mode 100644\n--- /dev/null\n+++ {after}\n"
+                    )),
+                    "delete" => text.push_str(&format!(
+                        "deleted file mode 100644\n--- {before}\n+++ /dev/null\n"
+                    )),
+                    "move" => text.push_str(&format!(
+                        "rename from {before}\nrename to {after}\n--- {before}\n+++ {after}\n"
+                    )),
+                    _ => text.push_str(&format!("--- {before}\n+++ {after}\n")),
+                }
+                text.push_str(&file.hunks);
+            }
+            let mut diff = json!({"type": "diff", "changes": changes});
+            // Its chunks carry no line numbers: placed in the files as they
+            // are now, which only the last call to touch them left.
+            if now {
+                diff["patch"] = json!({"format": "git_patch", "text": text});
+            }
+            Some(diff)
+        }
+        _ => None,
+    }
+}
+
+/// A hunk's side as a unified diff numbers it: `START,COUNT`, an empty
+/// side placed after the line before it.
+fn span(start: usize, count: usize) -> String {
+    match count {
+        0 => format!("{},0", start.saturating_sub(1)),
+        _ => format!("{start},{count}"),
+    }
+}
+
+/// A path as Git writes one in a patch: quoted, with C escapes, when it
+/// has a quote, a backslash, a control character or a byte past ASCII.
+fn quoted_path(path: &str) -> String {
+    let plain = path
+        .bytes()
+        .all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\');
+    if plain {
+        return path.to_owned();
+    }
+    let mut quoted = String::from("\"");
+    for b in path.bytes() {
+        match b {
+            b'"' => quoted.push_str("\\\""),
+            b'\\' => quoted.push_str("\\\\"),
+            b'\t' => quoted.push_str("\\t"),
+            b'\n' => quoted.push_str("\\n"),
+            0x20..0x7f => quoted.push(b as char),
+            _ => quoted.push_str(&format!("\\{b:03o}")),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// A task's brief, the first message it was sent, by its number: whether
+/// or not a turn has taken it in yet, as a task may wait for room.
+async fn brief(client: &Client, bot: &str) -> Option<(i64, String)> {
+    let messages = client
+        .request("messages", json!({"bot": bot, "after": 0, "limit": 1}))
+        .await
+        .ok()?;
+    let first = messages["messages"][0]["message"].as_i64()?;
+    let prompts = client
+        .request("prompts", json!({"bot": bot, "turn": first}))
+        .await
+        .ok()?;
+    Some((first, prompts["prompts"][0]["text"].as_str()?.to_owned()))
 }
 
 fn text_content(text: &str) -> Value {
@@ -3236,16 +4061,33 @@ mod tests {
         assert_eq!(status, ["completed", "in_progress", "pending", "pending"]);
         assert_eq!(entries[1]["content"], "Write");
         assert_eq!(entries[3]["content"], "Ship");
+        // The bot's one plan, which each call replaces.
+        let update = plan_update("calc.lead", &json!({"steps": ["[x] Read"]}));
+        assert_eq!(update["sessionUpdate"], "plan_update");
+        assert_eq!(
+            (&update["plan"]["type"], &update["plan"]["planId"]),
+            (&json!("items"), &json!("calc.lead-plan"))
+        );
     }
 
     #[test]
     fn a_call_says_what_it_does() {
-        let shell = tool_call("c1", "shell", &json!({"command": "cargo test\necho done"}));
+        let shell = tool_call(
+            "c1",
+            "shell",
+            &json!({"command": "cargo test\necho done"}),
+            "pending",
+        );
         assert_eq!(
             (shell["kind"].as_str(), shell["title"].as_str()),
             (Some("execute"), Some("cargo test"))
         );
-        let edit = tool_call("c2", "edit", &json!({"path": "/src/a.rs"}));
+        // Version 2 has no `tool_call`: the first update makes the call.
+        assert_eq!(
+            (&shell["sessionUpdate"], &shell["status"]),
+            (&json!("tool_call_update"), &json!("pending"))
+        );
+        let edit = tool_call("c2", "edit", &json!({"path": "/src/a.rs"}), "in_progress");
         assert_eq!(edit["locations"], json!([{"path": "/src/a.rs"}]));
         assert_eq!(edit["title"], "Edit /src/a.rs");
     }
@@ -3259,7 +4101,7 @@ mod tests {
             .collect();
         assert_eq!(values, ["default", "calc.lead", "calc.lead.billing"]);
         assert_eq!(
-            (&picker["id"], &picker["currentValue"]),
+            (&picker["configId"], &picker["currentValue"]),
             (&json!("agent"), &json!("default"))
         );
         // A thread on a bot of another folder still names it.
@@ -3350,15 +4192,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tasks_question_says_whose_it_is_and_only_lately_ones_are_read() {
-        let ask = asks::call(
-            "ask:3/c1",
-            &json!({"question": "Ship it?", "why": "", "options": [{"label": "Yes"}, {"label": "No"}]}),
-        )
-        .unwrap();
-        let put = task_form("s", "calc.fix", &ask);
-        assert_eq!(put["message"], "From calc.fix\n\nShip it?");
-        assert!(put.get("toolCallId").is_none());
+    fn only_tasks_that_ran_lately_are_adopted() {
         let now = 10 * LATELY_MS;
         assert!(lately(&json!({"running_turn": 4}), now));
         assert!(lately(
@@ -3407,5 +4241,603 @@ mod tests {
         let cut = cut(&long);
         assert!(cut.len() <= OUTPUT_BYTES + 4);
         assert!(cut.ends_with('…'));
+    }
+
+    /// An agent for tests, its daemon nowhere: what it writes is kept.
+    fn test_agent() -> Arc<Agent> {
+        let dir = std::env::temp_dir().join(crate::unique("acp-test"));
+        Agent::new(dir.join("store"), dir.join("socket"), None)
+    }
+
+    fn written(agent: &Agent) -> Vec<Value> {
+        std::mem::take(&mut *agent.out.written.lock().unwrap())
+    }
+
+    /// The updates among what was written, each with its session.
+    fn updates(written: &[Value]) -> Vec<(String, Value)> {
+        (written.iter())
+            .filter(|m| m["method"] == "session/update")
+            .map(|m| {
+                let session = m["params"]["sessionId"].as_str().unwrap_or("").to_owned();
+                (session, m["params"]["update"].clone())
+            })
+            .collect()
+    }
+
+    /// A session of `bot`, on `client`, in the agent's list.
+    fn bound_session(
+        agent: &Agent,
+        id: &str,
+        client: Arc<Client>,
+        bot: &str,
+        parent: Option<(&str, &str)>,
+    ) -> Arc<Session> {
+        let session = Arc::new(Session {
+            id: id.to_owned(),
+            cwd: PathBuf::from("/w"),
+            parent: parent.map(|(s, b)| (s.to_owned(), b.to_owned())),
+            state: AsyncMutex::new(State {
+                bound: Some(Bound {
+                    bot: bot.to_owned(),
+                    bot_id: Some(1),
+                    client,
+                    project: None,
+                    workspace: "/w".into(),
+                    moving: None,
+                    model: "openai/gpt-6".into(),
+                    effort: None,
+                }),
+                ..State::default()
+            }),
+            follower: Mutex::new(None),
+            switching: AsyncMutex::new(()),
+            children: Mutex::new(HashMap::new()),
+        });
+        (agent.sessions.lock().unwrap()).insert(id.to_owned(), session.clone());
+        session
+    }
+
+    fn event(kind: &str, bot: &str, turn: i64, data: Value) -> Value {
+        json!({"event": kind, "bot": bot, "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn the_handshake_is_version_2_or_none() {
+        let agent = test_agent();
+        let request = |method: &str, params: Value| json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        // Nothing before `initialize`.
+        agent
+            .clone()
+            .request(request("session/list", json!({})))
+            .await;
+        assert_eq!(written(&agent)[0]["error"]["code"], INVALID_REQUEST);
+        // An older version is refused with the versions Sonny speaks.
+        agent
+            .clone()
+            .request(request("initialize", json!({"protocolVersion": 1})))
+            .await;
+        let refused = &written(&agent)[0]["error"];
+        assert_eq!(refused["code"], UNSUPPORTED_VERSION);
+        assert_eq!(refused["data"], json!({"requested": 1, "supported": [2]}));
+        for bad in [json!("2"), json!(70000), Value::Null] {
+            agent
+                .clone()
+                .request(request("initialize", json!({"protocolVersion": bad})))
+                .await;
+            assert_eq!(written(&agent)[0]["error"]["code"], INVALID_PARAMS);
+        }
+        // A newer one gets version 2, in its shape.
+        let asked = json!({"protocolVersion": 3, "info": {"name": "c", "version": "1"},
+            "capabilities": {"elicitation": {"form": {}}}});
+        agent.clone().request(request("initialize", asked)).await;
+        let result = written(&agent)[0]["result"].clone();
+        assert_eq!(result["protocolVersion"], 2);
+        assert_eq!(result["info"]["name"], "sonny");
+        assert_eq!(
+            result["capabilities"],
+            json!({"session": {"prompt": {"image": {}, "embeddedContext": {}}}})
+        );
+        assert!(agent.forms.load(Ordering::Relaxed));
+        // A session not open is the protocol's not-found, naming it; one
+        // closed already closes again; an unknown method is not found.
+        let prompt = json!({"sessionId": "s9", "prompt": [{"type": "text", "text": "hi"}]});
+        agent
+            .clone()
+            .request(request("session/prompt", prompt))
+            .await;
+        let missing = &written(&agent)[0]["error"];
+        assert_eq!(
+            (&missing["code"], &missing["data"]),
+            (&json!(SESSION_NOT_FOUND), &json!({"sessionId": "s9"}))
+        );
+        agent
+            .clone()
+            .request(request("session/close", json!({"sessionId": "s9"})))
+            .await;
+        assert_eq!(written(&agent)[0]["result"], json!({}));
+        agent
+            .clone()
+            .request(request("session/load", json!({})))
+            .await;
+        assert_eq!(written(&agent)[0]["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_tasks_session_takes_only_a_cancel() {
+        let agent = test_agent();
+        agent.initialized.store(true, Ordering::Relaxed);
+        let client = crate::tests::daemon_answering(|_| json!({})).await;
+        bound_session(
+            &agent,
+            "calc.fix#9",
+            client,
+            "calc.fix",
+            Some(("s1", "calc.lead")),
+        );
+        for method in [
+            "session/prompt",
+            "session/set_config_option",
+            "session/close",
+        ] {
+            let asked = json!({"jsonrpc": "2.0", "id": 1, "method": method,
+                "params": {"sessionId": "calc.fix#9", "prompt": [{"type": "text", "text": "x"}]}});
+            agent.clone().request(asked).await;
+            assert_eq!(
+                written(&agent)[0]["error"]["code"],
+                INVALID_PARAMS,
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_reports_its_work_as_the_sessions_state() {
+        let agent = test_agent();
+        let shell = json!({"stdout": "a\n", "stderr": "", "exit_code": 0, "success": true});
+        let history = vec![
+            (
+                6,
+                7,
+                json!({"type": "function_call_output", "call_id": "c1",
+                "output": shell.to_string()}),
+            ),
+            (
+                5,
+                7,
+                json!({"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "calc.fix finished"}]}),
+            ),
+        ];
+        let client = crate::tests::daemon_answering(move |asked| {
+            crate::tests::history_read(&history, asked).unwrap_or(json!({}))
+        })
+        .await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        let bot = "calc.lead";
+        // A turn the bot took on its own, as the lookout woke it.
+        session
+            .on(&agent, &event("accepted", bot, 7, json!({"node": 5})))
+            .await;
+        let arguments = json!({"command": "ls"}).to_string();
+        let started = json!({"call_id": "c1", "name": "shell", "arguments": arguments});
+        session
+            .on(&agent, &event("tool_started", bot, 7, started))
+            .await;
+        let done = json!({"call_id": "c1", "node": 6});
+        session
+            .on(&agent, &event("tool_completed", bot, 7, done))
+            .await;
+        let ended = json!({"status": "completed"});
+        session
+            .on(&agent, &event("turn_finished", bot, 7, ended))
+            .await;
+        let updates: Vec<Value> = updates(&written(&agent))
+            .into_iter()
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            updates[0],
+            json!({"sessionUpdate": "state_update", "state": "running", "background": []})
+        );
+        assert_eq!(
+            updates[1],
+            json!({"sessionUpdate": "user_message", "messageId": "calc.lead/7",
+                "content": [{"type": "text", "text": "calc.fix finished"}]})
+        );
+        assert_eq!(
+            (
+                &updates[2]["sessionUpdate"],
+                &updates[2]["toolCallId"],
+                &updates[2]["status"]
+            ),
+            (
+                &json!("tool_call_update"),
+                &json!("7/c1"),
+                &json!("in_progress")
+            )
+        );
+        // A command that exited is a terminal: its output and exit status.
+        assert_eq!(
+            updates[3],
+            json!({"sessionUpdate": "terminal_update", "terminalId": "7/c1", "command": "ls",
+                "cwd": "/w/", "output": {"data": "YQo="}, "exitStatus": {"exitCode": 0}})
+        );
+        assert_eq!(
+            updates[4],
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "7/c1",
+                "status": "completed", "content": [{"type": "terminal", "terminalId": "7/c1"}]})
+        );
+        assert_eq!(
+            updates[5],
+            json!({"sessionUpdate": "state_update", "state": "idle", "background": [],
+                "stopReason": "end_turn"})
+        );
+        assert_eq!(updates.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_message_the_session_sent_is_not_shown_again() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|_| json!({})).await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        session.state.lock().await.sent.insert(7);
+        session
+            .on(
+                &agent,
+                &event("accepted", "calc.lead", 7, json!({"node": 5})),
+            )
+            .await;
+        let first = updates(&written(&agent));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1["state"], "running");
+        // A turn that failed ends with its error; a stopped one cancelled,
+        // its calls still shown running with it.
+        session.state.lock().await.calls.insert(
+            (Some(7), "c2".into()),
+            ("read".into(), json!({"path": "a"})),
+        );
+        let failed = json!({"status": "failed", "error": "provider_error", "detail": "boom"});
+        session
+            .on(&agent, &event("turn_finished", "calc.lead", 7, failed))
+            .await;
+        let updates = updates(&written(&agent));
+        assert_eq!(
+            updates[0].1,
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "7/c2", "status": "failed"})
+        );
+        assert_eq!(updates[1].1["stopReason"], "error");
+        assert_eq!(
+            updates[1].1["error"],
+            json!({"code": FAILED, "message": "boom"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_a_message_lifted_is_still_asked_after_its_turn() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|_| json!({})).await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        {
+            let mut state = session.state.lock().await;
+            state.running = Some(7);
+            state.gated.insert((Some(7), "c1".into()), 4);
+            state.asking.insert(
+                1,
+                Waiting {
+                    holds: Some(7),
+                    call: (Some(7), "c1".into()),
+                },
+            );
+        }
+        let lifted = json!({"call_id": "c1"});
+        session
+            .on(&agent, &event("call_lifted", "calc.lead", 7, lifted))
+            .await;
+        session
+            .on(
+                &agent,
+                &event(
+                    "turn_finished",
+                    "calc.lead",
+                    7,
+                    json!({"status": "completed"}),
+                ),
+            )
+            .await;
+        let state = session.state.lock().await;
+        assert_eq!(state.asking[&1].holds, None);
+        let said = written(&agent);
+        assert!(!said.iter().any(|m| m["method"] == "$/cancel_request"));
+        let [.., (_, end)] = &updates(&said)[..] else {
+            panic!("no update")
+        };
+        assert_eq!(end["stopReason"], "end_turn");
+        assert_eq!(
+            end["background"],
+            json!([{"type": "tool_call", "toolCallId": "7/c1"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_work_shows_on_its_leads_session_too() {
+        let agent = test_agent();
+        let history = vec![(
+            5,
+            3,
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "Fix the cart"}]}),
+        )];
+        let client = crate::tests::daemon_answering(move |asked| {
+            crate::tests::history_read(&history, asked).unwrap_or(json!({}))
+        })
+        .await;
+        let lead = bound_session(&agent, "s1", client.clone(), "calc.lead", None);
+        (lead.children.lock().unwrap()).insert(
+            "calc.fix#9".into(),
+            json!({"sessionId": "calc.fix#9", "title": "calc.fix"}),
+        );
+        let task = bound_session(
+            &agent,
+            "calc.fix#9",
+            client,
+            "calc.fix",
+            Some(("s1", "calc.lead")),
+        );
+        let accepted = json!({"node": 5, "from": {"bot": "calc.lead", "turn": 2}});
+        task.on(&agent, &event("accepted", "calc.fix", 3, accepted))
+            .await;
+        // The lead's session's state follows, with the task as its
+        // background work.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let updates = updates(&written(&agent));
+        let of = |session: &str| -> Vec<Value> {
+            (updates.iter())
+                .filter(|(s, _)| s == session)
+                .map(|(_, u)| u.clone())
+                .collect()
+        };
+        let task = of("calc.fix#9");
+        assert_eq!(task[0]["state"], "running");
+        // The lead's message to it is the lead's, not the person's.
+        assert_eq!(
+            task[1],
+            json!({"sessionUpdate": "session_message", "messageId": "calc.fix/3",
+                "senderSessionId": "s1", "content": [{"type": "text", "text": "Fix the cart"}]})
+        );
+        assert_eq!(
+            of("s1"),
+            [
+                json!({"sessionUpdate": "subagent_update", "sessionId": "calc.fix#9",
+                    "state": {"state": "running", "background": []}}),
+                json!({"sessionUpdate": "state_update", "state": "idle",
+                    "background": [{"type": "subagent", "sessionId": "calc.fix#9"}]}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_call_waiting_on_the_person_holds_the_work_up() {
+        let mut state = State {
+            running: Some(7),
+            ..State::default()
+        };
+        let none = HashMap::new();
+        assert_eq!(state.snapshot(&none)["state"], "running");
+        state.asking.insert(
+            1,
+            Waiting {
+                holds: Some(7),
+                call: (Some(7), "c0".into()),
+            },
+        );
+        assert_eq!(state.snapshot(&none)["state"], "requires_action");
+        // One a message lifted is background work: it holds nothing up,
+        // and is listed once it is shown.
+        state.asking.clear();
+        state.asking.insert(
+            2,
+            Waiting {
+                holds: None,
+                call: (Some(6), "c1".into()),
+            },
+        );
+        let lifted = (Some(6), "c1".to_owned());
+        state.lifted.insert(lifted.clone());
+        state.calls.insert(lifted, ("shell".into(), json!({})));
+        state.running = None;
+        let children = HashMap::from([
+            ("t#1".to_owned(), json!({"state": {"state": "running"}})),
+            ("t#2".to_owned(), json!({"state": {"state": "idle"}})),
+        ]);
+        assert_eq!(
+            state.snapshot(&children),
+            json!({"state": "idle", "background": [
+                {"type": "tool_call", "toolCallId": "6/c1"},
+                {"type": "subagent", "sessionId": "t#1"}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_replays_its_history_as_it_ended() {
+        let agent = test_agent();
+        let said = |role: &str, text: &str| {
+            let kind = if role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
+            json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]})
+        };
+        // Newest first, as the daemon reads it.
+        let history = vec![
+            (14, 3, said("assistant", "Done")),
+            (
+                13,
+                3,
+                json!({"type": "function_call_output", "call_id": "c1", "output": "fn a"}),
+            ),
+            (
+                12,
+                3,
+                json!({"type": "function_call", "call_id": "c1", "name": "read",
+                "arguments": "{\"path\":\"a.rs\"}"}),
+            ),
+            (11, 3, said("assistant", "On it")),
+            (10, 3, said("user", "Fix it")),
+        ];
+        let client = crate::tests::daemon_answering(move |asked| {
+            if asked["op"] == "messages" {
+                return json!({"messages": [{"message": 3, "node": 10}], "next_after": null});
+            }
+            crate::tests::history_read(&history, asked).unwrap_or(json!({}))
+        })
+        .await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        agent.out.hold("s1");
+        // Live work meanwhile waits for the replay.
+        agent
+            .out
+            .update("s1", json!({"sessionUpdate": "agent_message_chunk"}));
+        session.replay(&agent.out).await;
+        agent
+            .out
+            .replayed("s1", json!({"sessionUpdate": "replay_complete"}));
+        agent.out.release("s1");
+        let kinds: Vec<Value> = updates(&written(&agent))
+            .into_iter()
+            .map(|(_, u)| {
+                json!([
+                    u["sessionUpdate"],
+                    u.get("messageId").or(u.get("toolCallId")),
+                    u.get("status")
+                ])
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                json!(["user_message", "calc.lead/3", null]),
+                json!(["agent_message", "calc.lead-3-0", null]),
+                json!(["tool_call_update", "3/c1", "in_progress"]),
+                json!(["tool_call_update", "3/c1", "completed"]),
+                json!(["agent_message", "calc.lead-3-1", null]),
+                json!(["replay_complete", null, null]),
+                json!(["agent_message_chunk", null, null]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_turn_ends_as_the_protocol_names_it() {
+        let ends = |data: Value| stop_reason(&data).0;
+        assert_eq!(ends(json!({"status": "completed"})), "end_turn");
+        assert_eq!(
+            ends(json!({"status": "completed", "limit": "rounds"})),
+            "max_turn_requests"
+        );
+        assert_eq!(ends(json!({"status": "interrupted"})), "cancelled");
+        assert_eq!(
+            ends(json!({"status": "failed", "error": "provider_refusal"})),
+            "refusal"
+        );
+        let (reason, error) = stop_reason(&json!({"status": "failed", "error": "stale_turn"}));
+        assert_eq!(
+            (reason, error),
+            (
+                "error",
+                Some(json!({"code": FAILED, "message": "stale_turn"}))
+            )
+        );
+    }
+
+    #[test]
+    fn a_prompt_is_checked_before_it_goes() {
+        assert_eq!(idempotency(&json!({})), Ok(None));
+        assert_eq!(idempotency(&json!({"idempotencyKey": "k"})), Ok(Some("k")));
+        for refused in [json!(""), json!("k".repeat(256)), json!(7)] {
+            assert!(idempotency(&json!({"idempotencyKey": refused})).is_err());
+        }
+        // The same key is the same request, and the key is not in it.
+        let key = "4f1c-secret";
+        assert_eq!(keyed(key), keyed(key));
+        assert_ne!(keyed(key), keyed("other"));
+        assert!(!keyed(key).contains("secret"));
+        assert!(
+            accepted_blocks(&json!([{"type": "text", "text": "a"},
+            {"type": "resource_link", "uri": "file:///a"}]))
+            .is_ok()
+        );
+        assert!(accepted_blocks(&json!([])).is_err());
+        assert!(accepted_blocks(&json!([{"type": "audio", "data": "AA=="}])).is_err());
+        assert_eq!(user_id("calc.lead", Some(12)), "calc.lead/12");
+    }
+
+    #[test]
+    fn a_command_has_an_exit_status_once_it_ended() {
+        let result = |output: Value| json!({"output": output.to_string()});
+        assert_eq!(
+            exit_status(&result(json!({"exit_code": 2, "stdout": ""}))),
+            Some(json!({"exitCode": 2}))
+        );
+        assert_eq!(
+            exit_status(&result(json!({"exit_code": null, "timed_out": true}))),
+            Some(json!({"exitCode": null}))
+        );
+        assert_eq!(
+            exit_status(&result(json!({"running": true, "output": "x"}))),
+            None
+        );
+        assert_eq!(exit_status(&result(json!({"handle": "proc:3"}))), None);
+    }
+
+    #[test]
+    fn an_edit_is_the_diff_it_made() {
+        let dir = std::env::temp_dir().join(crate::unique("acp-diff"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_str().unwrap();
+        std::fs::write(dir.join("a.rs"), "one\ntwo changed\nthree\n").unwrap();
+        let edit = json!({"path": "a.rs", "old": "two", "new": "two changed"});
+        let diff = edit_diff("edit", &edit, root, true).unwrap();
+        let path = format!("{root}/a.rs");
+        assert_eq!(
+            diff["changes"],
+            json!([{"operation": "modify", "path": path, "fileType": "text"}])
+        );
+        assert_eq!(
+            diff["patch"]["text"],
+            format!(
+                "diff --git {path} {path}\n--- {path}\n+++ {path}\n@@ -2,1 +2,1 @@\n-two\n+two changed\n"
+            )
+        );
+        // Replayed, the file is not the one it left: which file, no lines.
+        assert!(edit_diff("edit", &edit, root, false).unwrap()["patch"].is_null());
+        std::fs::write(dir.join("b.rs"), "fn b() {}\nfn c() {}\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: b.rs\n@@\n-fn b() {old}\n+fn b() {}\n fn c() {}\n\
+            *** Add File: n.rs\n+new\n*** Delete File: gone.rs\n\
+            *** Update File: old.rs\n*** Move to: moved.rs\n@@\n x\n*** End Patch";
+        let diff = edit_diff("apply_patch", &json!({"input": patch}), root, true).unwrap();
+        assert_eq!(
+            diff["changes"],
+            json!([{"operation": "modify", "path": format!("{root}/b.rs")},
+                {"operation": "add", "path": format!("{root}/n.rs")},
+                {"operation": "delete", "path": format!("{root}/gone.rs")},
+                {"operation": "move", "path": format!("{root}/moved.rs"),
+                    "oldPath": format!("{root}/old.rs")}])
+        );
+        let text = diff["patch"]["text"].as_str().unwrap();
+        assert!(text.starts_with(&format!(
+            "diff --git {root}/b.rs {root}/b.rs\n--- {root}/b.rs\n+++ {root}/b.rs\n@@ -1,2 +1,2 @@\n"
+        )));
+        assert!(text.contains(&format!(
+            "new file mode 100644\n--- /dev/null\n+++ {root}/n.rs\n"
+        )));
+        assert!(text.contains(&format!("--- {root}/gone.rs\n+++ /dev/null\n")));
+        assert!(text.contains(&format!(
+            "rename from {root}/old.rs\nrename to {root}/moved.rs\n"
+        )));
+        assert!(!text.contains(" a/") && !text.contains(" b/"));
+        assert_eq!(quoted_path("/a b/c.rs"), "/a b/c.rs");
+        assert_eq!(quoted_path("/a\"b/é"), "\"/a\\\"b/\\303\\251\"");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -801,7 +801,7 @@ left open closes with its window.
 
 ### T3 Code
 
-`sonny acp` speaks the Agent Client Protocol on stdio so [T3 Code](https://github.com/pingdotgg/t3code) can run Sonny as a local provider:
+`sonny acp` speaks the Agent Client Protocol on stdio, version 2 only (the v2 Preview, schema `v2.0.0-beta.4`), so [T3 Code](https://github.com/pingdotgg/t3code) can run Sonny as a local provider:
 
 1. In T3 Code **Settings**, add a manual local **ACP Registry** provider.
 2. Set executable to `sonny` (or the full path from `command -v sonny`) with argument `acp`.
@@ -837,13 +837,16 @@ window does, once whichever window answers first. Questions still open when
 a thread reopens come again: a question stays open until you pick or the
 lead closes it, as in the window. One you dismiss stays open. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
-the agent started (the protocol's version 2 draft, which T3 Code speaks).
+the agent started. Sonny speaks the protocol's version 2 only, as its v2
+Preview defines it (schema `v2.0.0-beta.4`): a client asking for version 1 is
+told version 2 is the one supported.
 Each task the lead starts opens as a T3 Code thread with the task's brief as
 its first message; that thread is the task's, so it shows the task's work and
 steers it. A task started while your prompt runs is the lead thread's child,
 nested under it, opened with T3 Code's `delegate_task` (T3 Code opens it in
 the lead's folder; the task still works in its own worktree), and your
-prompt's answer waits until it is open. T3 Code's message that a child ended
+prompt's work does not show as ended until it is open, since T3 Code takes
+children only while the work runs. T3 Code's message that a child ended
 starts no turn: the lead hears of its tasks from the lookout. A task started
 in a turn the lead took on its own, which T3 Code takes no child of, opens as
 a thread of its own with `t3_thread_launch`, in the task's worktree (in the
@@ -873,9 +876,10 @@ its lead gave the task.
 
 `sonny acp` works with any ACP client or chat bridge:
 
-- **Session discovery & switching:** Offers an `Agent` picker (`Default` or any folder lead). `session/list` returns leads (and tasks with `_meta.lead` when given a folder) keyed by lineage ID (`calc.lead.billing#7@…`); `session/resume` opens leads or tasks (`start_task` attaches `_meta.task`).
+- **Session discovery & switching:** Offers an `Agent` picker (`Default` or any folder lead). `session/list` returns leads keyed by lineage ID (`calc.lead.billing#7@…`); `session/resume` reopens one, replaying its history first when asked to with `replayFrom: {"type": "start"}`.
+- **Work as v2 shows it:** A prompt is answered with its `messageId` once it is in; the work's state comes as `state_update` (`running`, `requires_action`, `idle` with its `stopReason`), with calls a message lifted and working tasks as its `background`. Tasks the lead starts are its session's subagents. A command's output comes as a terminal once it ended; an edit comes as a diff.
 - **Multi-user attribution:** Pass `_meta.person` (`[A-Za-z0-9._-]`, 1–128 chars) on prompts and approval answers. The lead sees `[Written by ana.lopez.]`, and the Auto reviewer never treats another person's words as your consent.
-- **Questions & reactions:** Clients advertising `elicitation.form` receive structured forms for the lead and its tasks. Bidirectional emoji reactions use Sonny's `_sonny/react` extension (`{"sessionId", "emoji", "remove"?}` notifications and `{"sessionId", "messageId", "emoji", "remove"?}` requests).
+- **Questions & reactions:** Clients advertising `elicitation.form` receive structured forms for the lead, and for each task in that task's subagent session. Bidirectional emoji reactions use Sonny's `_sonny/react` extension (`{"sessionId", "emoji", "remove"?}` notifications and `{"sessionId", "messageId", "emoji", "remove"?}` requests).
 
 <details>
 <summary><strong>Full details: other ACP clients</strong></summary>
@@ -895,14 +899,35 @@ by an id that names the lead, its identity and its store's lineage
 made again under its name, or a lead of another store, is not the one
 listed, and is refused.
 
-A task the lead starts is a session too. The `start_task` call that started
-it is updated with the task's id, title and folder in its
-`_meta.task` (`{"sessionId": "calc.fix#9@…", "title": "calc.fix", "cwd": …}`),
-and `session/resume` with that id opens the task, where prompts go to it,
-not to the lead. `session/list` with a folder lists each of its leads
-followed by the tasks it started, each task naming its lead's id in
-`_meta.lead`; listed without one, it names leads only. No other bot opens
-by an id: one no lead started is refused.
+A session's prompt is answered with the `messageId` of the message it made
+as soon as the lead has it, as version 2 answers: whether it started a turn,
+joined the one running as a steer, or waits in line, the lead takes it as
+Sonny's window sends it. The work shows as the session's `state_update`:
+`running`, `requires_action` while a call of it waits for the person, then
+`idle` with its `stopReason` (`end_turn`, `cancelled`, `refusal`,
+`max_turn_requests`, or `error` with what failed). A prompt's
+`idempotencyKey` makes a second send of it the same message. A call a
+message lifted out of its turn goes on as the session's `background` work,
+as does each task while it works. Messages the lead takes from others, as
+the lookout's notes, show as `user_message` with their own `messageId`. A
+`shell` call's output comes as a terminal (`terminal_update`) once the
+command ended, with its exit status; Sonny does not stream it while it
+runs. An `edit` or `apply_patch` call comes as a diff: the files it changed
+and, live, a `git_patch` of the lines. `session/close` stops following the
+lead and withdraws what it asked there; the lead works on, as when Sonny's
+window closes, since the protocol's close would stop it. `session/resume`
+with `replayFrom: {"type": "start"}` replays the lead's history first: its
+messages, its replies, and its calls as they ended, then
+`replay_complete`, then where it stands now.
+
+A task the lead starts is the lead session's subagent: a `subagent_update`
+names its session (`calc.fix#9@…`), title and folder, the `start_task` call
+links to it, and the task's own session opens with its brief as the lead's
+message to it, then shows its work and states. It takes only
+`session/cancel`, which stops its turn; prompts go to the lead. Tasks that
+still matter when a lead's session comes (running, or with a question
+open, from tasks that ran in the last week) show the same way. `session/list`
+names leads only, and a task's id is not resumed on its own.
 
 A client several people write through names who wrote each prompt in its
 `_meta.person`, a name as the daemon takes one (1 to 128 of
@@ -916,12 +941,9 @@ questions that names someone goes to the lead as their words: it reads
 them, but only your own pick answers the question in Sonny's windows.
 Questions come as forms only to a client that says it fills them in
 (`elicitation.form`); one without forms still shows each as the `ask` call.
-A lead's thread also gets its tasks' questions, as Sonny's lead window pins
-them: each form starts `From calc.fix`, and a pick answers in that task,
-the same answer its own window sends, so it takes it once. Those open when
-the thread comes (from tasks that ran in the last week) come first, then
-each as it is asked, from tasks the lead starts later too. T3 Code shows
-a task's questions in that task's own thread instead.
+A task's questions come in its subagent session, and a pick answers in that
+task, the same answer its own window sends, so it takes it once. T3 Code
+shows a task's questions in that task's own thread.
 
 Reactions go both ways, through Sonny's `_sonny/react` extension. When the
 lead reacts to the person's newest message with `react`, the client gets a

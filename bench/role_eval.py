@@ -653,7 +653,7 @@ def determinable(home, request):
     writable without asking, and the sandbox is the boundary."""
     if not request or request.get('arguments_cut') or request.get('arguments_omitted'):
         return False
-    call = request.get('toolCall') or request
+    call = (request.get('subject') or {}).get('toolCall') or request.get('toolCall') or request
     arguments = call.get('rawInput') if 'rawInput' in call else call.get('arguments')
     if not isinstance(arguments, dict):
         return False
@@ -718,6 +718,46 @@ def changed_outside(since, root, limit=200):
     return found
 
 
+def hello(name):
+    """`initialize` as a client of ACP version 2 names itself. An arm on
+    a build from before version 2 reads `clientCapabilities` and
+    `clientInfo` instead, so both are sent."""
+    return {'protocolVersion': 2, 'capabilities': {}, 'info': {'name': name, 'version': '1'},
+            'clientCapabilities': {}, 'clientInfo': {'name': name}}
+
+
+def call_started(update, started):
+    """Whether `update` starts a call as `sonny acp` shows it: version 2's
+    first `tool_call_update` of the call, which names it, or an earlier
+    build's `tool_call`. `started` keeps the calls seen."""
+    kind, call = update.get('sessionUpdate'), update.get('toolCallId')
+    if kind == 'tool_call' or (kind == 'tool_call_update' and 'name' in update and call not in started):
+        started.add(call)
+        return True
+    return False
+
+
+def lead_sessions(rows):
+    """The sessions the person's prompts in `rows` of `acp.jsonl` went
+    to: the lead's, which is what the person sees. A task the lead starts
+    shows in a subagent session of its own (ACP version 2)."""
+    return {((row.get('sent') or {}).get('params') or {}).get('sessionId') for row in rows
+            if (row.get('sent') or {}).get('method') == 'session/prompt'} - {None}
+
+
+def seen_by_person(m, sessions):
+    """Whether message `m` of `acp.jsonl` is a `session/update` on one of
+    `sessions`, the lead's (any session when no prompt named one)."""
+    return m.get('method') == 'session/update' and (not sessions or m['params'].get('sessionId') in sessions)
+
+
+def prompted(rows):
+    """The ids of the messages the person's prompts made, from the
+    answers in `rows` of `acp.jsonl`: version 2 shows each as a
+    `user_message` too, which is theirs, not a note that woke the lead."""
+    return {((row.get('m') or {}).get('result') or {}).get('messageId') for row in rows} - {None}
+
+
 class Acp:
     """One `sonny acp` process, driven as T3 Code drives it, logging every
     line it writes, allowing a call it asks the person about only when its
@@ -738,6 +778,13 @@ class Acp:
         self.log = open(log, 'a')
         self.lock = threading.Lock()
         self.answers, self.next = {}, 0
+        # Lines read, the count when each request went, and each request's
+        # method and session: a prompt is done when the work it joined
+        # ended, which ACP version 2 says after it answers.
+        self.read_lines, self.sent = 0, {}
+        self.asked = {}
+        # Each end of a session's work: (line, time, session, update).
+        self.ends = []
         # When each answer came, for a prompt left out while the day goes on.
         self.at = {}
         self.last = time.monotonic()
@@ -751,10 +798,15 @@ class Acp:
     def read(self):
         for line in self.p.stdout:
             self.last = time.monotonic()
+            self.read_lines += 1
             self.log.write(json.dumps({'t': time.time(), 'm': json.loads(line)}) + '\n')
             self.log.flush()
             m = json.loads(line)
-            if m.get('method') == 'session/request_permission':
+            update = (m.get('params') or {}).get('update') or {}
+            if m.get('method') == 'session/update' and update.get('sessionUpdate') == 'state_update' \
+                    and 'stopReason' in update:
+                self.ends.append((self.read_lines, time.time(), m['params'].get('sessionId'), update))
+            elif m.get('method') == 'session/request_permission':
                 params = m.get('params') or {}
                 # Without an allow, Sonny could not read the whole call.
                 offered = {o.get('optionId') for o in params.get('options', [])}
@@ -771,23 +823,43 @@ class Acp:
         self.next += 1
         rid = self.next
         self.log.write(json.dumps({'t': time.time(), 'sent': {'method': method, 'params': params}}) + '\n')
+        self.sent[rid], self.asked[rid] = self.read_lines, (method, (params or {}).get('sessionId'))
         self.write({'id': rid, 'method': method, 'params': params})
         if not wait:
             return rid
         return self.collect(rid, method, timeout)
 
+    def done(self, rid):
+        """Request `rid`'s answer once it is done, else None. A prompt
+        answered with its `messageId` (ACP version 2) is done when the work
+        it joined ended: its answer then says how, as the `stopReason` and
+        `error` of that end, and `at` when."""
+        answer = self.answers.get(rid)
+        method, session = self.asked.get(rid, (None, None))
+        if answer is None or method != 'session/prompt' or 'messageId' not in (answer.get('result') or {}):
+            return answer
+        end = next((e for e in self.ends if e[0] > self.sent[rid] and e[2] == session), None)
+        if end is None:
+            return None
+        _, at, _, update = end
+        self.at[rid] = at
+        result = {**answer['result'], 'stopReason': update.get('stopReason')}
+        if update.get('error'):
+            result['error'] = update['error']
+        return {**answer, 'result': result}
+
     def collect(self, rid, method='session/prompt', timeout=1800):
-        """The answer to request `rid`, once it comes."""
+        """The answer to request `rid`, once it is done."""
         deadline = time.monotonic() + timeout
         served = time.monotonic()
-        while rid not in self.answers:
+        while (answer := self.done(rid)) is None:
             if time.monotonic() > deadline or self.p.poll() is not None:
                 raise RuntimeError(f'{method}: no answer')
             if time.monotonic() - served > self.SERVE:
                 self.tasks()
                 served = time.monotonic()
             time.sleep(.2)
-        return self.answers[rid]
+        return answer
 
     def close(self):
         if self.p.poll() is None:
@@ -917,7 +989,7 @@ def run(arm, n, bins, model, spec=None):
 
     try:
         acp = Acp(sonny, env, repo, log, home, lambda: allow_waiting(env, agent, home, waited))
-        acp.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 'role-eval'}})
+        acp.ask('initialize', hello('role-eval'))
         session = acp.ask('session/new', {'cwd': str(repo), 'mcpServers': []})['result']['sessionId']
         # A prompt sent mid-burst, still out: its step and request.
         out_prompt = None
@@ -932,11 +1004,11 @@ def run(arm, n, bins, model, spec=None):
         def heard_back():
             # The prompt out mid-burst, once answered: the seconds it took.
             nonlocal out_prompt
-            if out_prompt and out_prompt[1] in acp.answers:
+            if out_prompt and (done := acp.done(out_prompt[1])) is not None:
                 asked, rid = out_prompt
                 out_prompt = None
                 timeline[asked - 1]['answered'] = round(acp.at[rid] - timeline[asked - 1]['t'])
-                answered(asked, acp.answers[rid])
+                answered(asked, done)
 
         for step, s in enumerate(DAY, 1):
             timeline.append({'step': step, 't': time.time(), 'say': s.get('say'), 'plant': s.get('plant')})
@@ -1134,6 +1206,7 @@ def transcript(out):
     or the note that woke the lead) and what the lead said and called."""
     rows = [json.loads(line) for line in open(out / 'acp.jsonl')]
     parts, current = [], None
+    theirs, started, sessions = prompted(rows), set(), lead_sessions(rows)
 
     def begin(kind, text):
         nonlocal current
@@ -1147,18 +1220,16 @@ def transcript(out):
             continue
         m = row.get('m')
         # The eval's own answers to asks carry no message.
-        if m is None:
-            continue
-        if m.get('method') != 'session/update':
+        if m is None or not seen_by_person(m, sessions):
             continue
         u = m['params']['update']
         kind = u.get('sessionUpdate')
-        if kind == 'user_message':
+        if kind == 'user_message' and u.get('messageId') not in theirs:
             begin('note', ''.join(c.get('text', '') for c in u.get('content', [])))
         elif kind == 'agent_message_chunk' and current is not None:
             mid = u.get('messageId', '')
             current['said'][mid] = current['said'].get(mid, '') + u['content'].get('text', '')
-        elif kind == 'tool_call' and current is not None:
+        elif call_started(u, started) and current is not None:
             current['calls'].append({'name': u.get('name') or u.get('title'), 'input': u.get('rawInput')})
     (out / 'transcript.json').write_text(json.dumps(parts, indent=1))
     lines = []

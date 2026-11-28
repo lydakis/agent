@@ -130,24 +130,25 @@ def read(out):
     was made in, its arguments and how it was answered; and what the lead
     said at each step."""
     calls, order, said = {}, [], collections.defaultdict(str)
-    step = 0
-    for line in open(out / 'acp.jsonl'):
-        row = json.loads(line)
+    step, started = 0, set()
+    rows = [json.loads(line) for line in open(out / 'acp.jsonl')]
+    sessions = role_eval.lead_sessions(rows)
+    for row in rows:
         if 'sent' in row:
             if row['sent']['method'] == 'session/prompt':
                 step += 1
             continue
         m = row.get('m') or {}
-        if m.get('method') != 'session/update':
+        if not role_eval.seen_by_person(m, sessions):
             continue
         u = m['params']['update']
         kind = u.get('sessionUpdate')
         if kind == 'agent_message_chunk':
             said[step] += (u.get('content') or {}).get('text', '')
-        elif kind == 'tool_call' and u.get('name') == 'margin':
+        elif role_eval.call_started(u, started) and u.get('name') == 'margin':
             calls[u['toolCallId']] = {'step': step, 'args': u.get('rawInput') or {}, 'status': None, 'answer': ''}
             order.append(u['toolCallId'])
-        elif kind == 'tool_call_update' and u.get('toolCallId') in calls and u.get('status'):
+        if kind == 'tool_call_update' and u.get('toolCallId') in calls and u.get('status'):
             call = calls[u['toolCallId']]
             call['status'] = u['status']
             call['answer'] = ''.join(c.get('content', {}).get('text', '') for c in u.get('content') or [])

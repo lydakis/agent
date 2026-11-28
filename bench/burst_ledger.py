@@ -271,17 +271,19 @@ def person_approvals(store, lead):
 def lead_view(acp_log):
     """From `acp.jsonl`: the notes the lead got, its calls and its words to
     the person, each with when."""
+    from . import role_eval  # which imports this module
     notes, calls, said, chunks = [], [], [], {}
-    for line in open(acp_log):
-        row = json.loads(line)
+    rows = [json.loads(line) for line in open(acp_log)]
+    theirs, started, sessions = role_eval.prompted(rows), set(), role_eval.lead_sessions(rows)
+    for row in rows:
         m = row.get('m') or {}
-        if m.get('method') != 'session/update':
+        if not role_eval.seen_by_person(m, sessions):
             continue
         u = m['params']['update']
         kind, t = u.get('sessionUpdate'), row['t']
-        if kind == 'user_message':
+        if kind == 'user_message' and u.get('messageId') not in theirs:
             notes.append((t, ''.join(c.get('text', '') for c in u.get('content', []))))
-        elif kind == 'tool_call':
+        elif role_eval.call_started(u, started):
             calls.append((t, u.get('name') or u.get('title') or '', json.dumps(u.get('rawInput'))))
         elif kind == 'agent_message_chunk':
             mid = u.get('messageId', '')

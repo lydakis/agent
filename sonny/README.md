@@ -187,4 +187,4 @@ Run `sonny acp` as a local ACP provider in T3 Code to open project leads and nes
 
 ### Other ACP clients
 
-`sonny acp` speaks the Agent Client Protocol for any compatible editor or chat bridge, including multi-user attribution and reactions. See [ACP client details](REFERENCE.md#other-acp-clients).
+`sonny acp` speaks the Agent Client Protocol, version 2 only, for any compatible editor or chat bridge: tasks show as the lead's subagents, a session comes back with its history, and it carries multi-user attribution and reactions. See [ACP client details](REFERENCE.md#other-acp-clients).

@@ -322,7 +322,7 @@ every = "{every}s"
     acp = shown = None
     try:
         acp = role_eval.Acp(sonny, env, repo, out / 'acp.jsonl', home)
-        acp.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 'lead-cache'}})
+        acp.ask('initialize', role_eval.hello('lead-cache'))
         session = acp.ask('session/new', {'cwd': str(repo), 'mcpServers': []})['result']['sessionId']
         acp.ask('session/prompt', {'sessionId': session, 'prompt': [
             {'type': 'text', 'text': 'SUBSCRIBE to the feed source and steer on each event.'}]})

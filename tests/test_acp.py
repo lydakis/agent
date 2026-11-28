@@ -76,6 +76,10 @@ class Thread:
             env=env, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         test.addCleanup(self.close)
         self.messages = queue.Queue()
+        # Every message read so far, in order.
+        self.log = []
+        # Where the log stood when each request went.
+        self.sent_at = {}
         self.next = 0
         threading.Thread(target=self.read, daemon=True).start()
 
@@ -96,6 +100,7 @@ class Thread:
 
     def ask(self, method, params):
         self.next += 1
+        self.sent_at[self.next] = len(self.log)
         self.send({'id': self.next, 'method': method, 'params': params})
         return self.next
 
@@ -112,6 +117,7 @@ class Thread:
             except queue.Empty:
                 continue
             seen.append(message)
+            self.log.append(message)
             if done(message):
                 return seen
 
@@ -119,15 +125,58 @@ class Thread:
     def resumed(test, env, cwd, session):
         """A new process reopening `session`: its answer."""
         thread = Thread(test, env, cwd)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        thread.init()
         answered = thread.answer_of(thread.ask('session/resume', {'sessionId': session, 'cwd': str(cwd),
                                                                    'mcpServers': []}))
         thread.close()
         return answered
 
+    def init(self, capabilities=None, name=None):
+        """The handshake, on version 2: its answer."""
+        params = {'protocolVersion': 2, 'capabilities': capabilities or {}}
+        if name:
+            params['info'] = {'name': name, 'version': '1'}
+        answered, _ = self.answer_of(self.ask('initialize', params))
+        return answered
+
     def answer_of(self, request):
         seen = self.until(lambda m: m.get('id') == request and 'method' not in m)
         return seen[-1], [m['params']['update'] for m in seen if m.get('method') == 'session/update']
+
+    def updates(self, session):
+        """The updates read so far on `session`."""
+        return [m['params']['update'] for m in self.log
+                if m.get('method') == 'session/update' and m['params']['sessionId'] == session]
+
+    def ended(self, request, session):
+        """A prompt answered once its message is in, then the work it
+        joined, on `session`, to its end: the answer, the session's updates
+        from when it was sent, and the state that says how the work ended,
+        the first end after the session showed the prompt's message (which
+        a command Sonny answers itself ends before its answer)."""
+        seen = self.log[self.sent_at.get(request, len(self.log)):]
+
+        def finished():
+            answers = [m for m in seen if m.get('id') == request and 'method' not in m]
+            if not answers:
+                return None
+            if 'error' in answers[0]:
+                return answers[0], None
+            mine = [m['params']['update'] for m in seen
+                    if m.get('method') == 'session/update' and m['params']['sessionId'] == session]
+            shown = [i for i, u in enumerate(mine) if u['sessionUpdate'] in ('user_message', 'session_message')
+                     and u.get('messageId') == answers[0]['result']['messageId']]
+            ends = [u for u in mine[shown[0]:] if u['sessionUpdate'] == 'state_update' and 'stopReason' in u] \
+                if shown else []
+            return (answers[0], ends[0]) if ends else None
+
+        got = finished()
+        while got is None:
+            seen += self.until(lambda _: True)
+            got = finished()
+        updates = [m['params']['update'] for m in seen
+                   if m.get('method') == 'session/update' and m['params']['sessionId'] == session]
+        return got[0], updates, got[1]
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -160,10 +209,9 @@ class AcpTests(ModelFixture):
 
     def open(self, cwd):
         thread = Thread(self, self.env, cwd)
-        initialized, _ = thread.answer_of(thread.ask('initialize', {
-            'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 't3-code'}}))
+        initialized = thread.init(name='t3-code')
         self.assertEqual(initialized['result']['protocolVersion'], 2)
-        self.assertEqual(initialized['result']['agentInfo']['name'], 'sonny')
+        self.assertEqual(initialized['result']['info']['name'], 'sonny')
         opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(cwd), 'mcpServers': []}))
         self.opened = opened
         return thread, opened['result']['sessionId']
@@ -171,9 +219,10 @@ class AcpTests(ModelFixture):
     def adopt(self, thread, session, name='lead'):
         """The thread's first words, `/switch NAME`: it is that lead of the
         folder, which starts no turn."""
-        answered, updates = thread.answer_of(thread.ask('session/prompt', {
-            'sessionId': session, 'prompt': self.wrapped(f'/switch {name}')}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, updates, end = thread.ended(thread.ask('session/prompt', {
+            'sessionId': session, 'prompt': self.wrapped(f'/switch {name}')}), session)
+        self.assertEqual(list(answered['result']), ['messageId'])
+        self.assertEqual(end['stopReason'], 'end_turn')
         bot = 'calc.lead' if name == 'lead' else f'calc.lead.{name}'
         self.assertEqual([u['content']['text'] for u in updates if u['sessionUpdate'] == 'agent_message_chunk'],
                          [f'This thread is {bot}.'])
@@ -199,11 +248,17 @@ class AcpTests(ModelFixture):
         # The call waits for the person, who is asked in the thread.
         [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
                    if m.get('method') == 'session/request_permission']
-        self.assertEqual(asked['params']['toolCall']['name'], 'start_task')
+        # Its subject is the call, as the session shows it.
+        self.assertEqual(asked['params']['subject']['type'], 'tool_call')
+        self.assertEqual(asked['params']['subject']['toolCall']['name'], 'start_task')
         self.assertEqual([o['kind'] for o in asked['params']['options']], ['allow_once', 'reject_once'])
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
-        answered, updates = thread.answer_of(prompt)
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, updates, end = thread.ended(prompt, session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
+        # Answered once its message was in, by that message.
+        self.assertRegex(answered['result']['messageId'], r'^calc\.lead/\d+$')
+        self.assertIn(answered['result']['messageId'],
+                      [u['messageId'] for u in updates if u['sessionUpdate'] == 'user_message'])
         # The tool host that answered it is the daemon's, not the thread's,
         # as is the lookout.
         companions = self.daemon.request('companions')['result']['companions']
@@ -215,15 +270,15 @@ class AcpTests(ModelFixture):
         for companion in companions:
             self.assertTrue(os.path.samefile(companion['command'], self.sonny.resolve()))
             self.assertEqual(companion['env']['SONNY_PROGRAM'], str(self.sonny.resolve()))
-        # The task was T3 Code's child of this prompt before it was answered.
+        # The task was T3 Code's child of this work before it ended.
         delegated = self.t3.calls.get_nowait()
         kinds = [u['sessionUpdate'] for u in updates]
         self.assertEqual(kinds[-1], 'state_update')
         self.assertEqual(updates[-1]['state'], 'idle')
-        [started] = [u for u in updates if u['sessionUpdate'] == 'tool_call']
+        calls = [u for u in updates if u['sessionUpdate'] == 'tool_call_update']
+        started = calls[0]
         self.assertEqual((started['title'], started['kind']), ('start_task', 'other'))
-        [ended] = [u for u in updates if u['sessionUpdate'] == 'tool_call_update' and 'status' in u]
-        self.assertEqual(ended['status'], 'completed')
+        [ended] = [u for u in calls if u.get('status') == 'completed']
         self.assertIn('Started calc.fix', ended['content'][0]['content']['text'])
         # The lead's words after the call reach the client: its own, or its
         # answer to the lookout note that joins the turn when the task ends.
@@ -252,9 +307,9 @@ class AcpTests(ModelFixture):
         # That thread, which T3 Code opens in the lead's folder, is the
         # task's, not the folder's lead: it answers with the task's work.
         child, child_session = self.open(repo)
-        answered, updates = child.answer_of(child.ask('session/prompt', {
-            'sessionId': child_session, 'prompt': self.wrapped(brief)}))
-        self.assertEqual(answered['result']['stopReason'], 'end_turn')
+        answered, updates, end = child.ended(child.ask('session/prompt', {
+            'sessionId': child_session, 'prompt': self.wrapped(brief)}), child_session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         said = [u for u in updates if u['sessionUpdate'] == 'agent_message_chunk']
         self.assertTrue(said)
         # Its answer, shown whether the task ended before the thread came or
@@ -272,12 +327,13 @@ class AcpTests(ModelFixture):
                          ['calc.fix', 'calc.lead'])
         # T3 Code tells the lead's thread its child ended; the lead hears of
         # its task from the lookout, so that message starts no turn.
-        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped(
-            'Delegated task node-1 reached a terminal state. Use task_status with taskId node-1 to read the result.')}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, _, end = thread.ended(thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped(
+            'Delegated task node-1 reached a terminal state. Use task_status with taskId node-1 to read the result.')}),
+            session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         self.assertEqual(len(self.daemon.request('turns', bot='calc.lead')['result']['turns']), 1)
 
-    def test_a_prompt_that_steers_is_answered_when_the_turn_it_joined_ends(self):
+    def test_a_prompt_that_steers_is_answered_once_it_is_in_and_the_work_ends_once(self):
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('start_task', inherit=False)],
@@ -287,23 +343,27 @@ class AcpTests(ModelFixture):
         self.t3.delegating = False
         self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
         first = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
-        [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
-                   if m.get('method') == 'session/request_permission']
-        # A second prompt while the turn runs steers it: the first prompt's
-        # words are in, and the second waits on the turn that takes it in.
+        seen = thread.until(lambda m: m.get('method') == 'session/request_permission')
+        [asked] = [m for m in seen if m.get('method') == 'session/request_permission']
+        # The first prompt was answered once its words were in, and the
+        # work waits on the person.
+        [answered] = [m for m in seen if m.get('id') == first and 'method' not in m]
+        opener = answered['result']['messageId']
+        states = [m['params']['update']['state'] for m in seen if m.get('method') == 'session/update'
+                  and m['params']['update']['sessionUpdate'] == 'state_update']
+        self.assertEqual(states[-1], 'requires_action')
+        # A second prompt while the turn runs steers it: it too is answered
+        # once it is in, and the work the two are in ends once.
         second = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('and the tests')})
-        answered, _ = thread.answer_of(first)
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
-        # The steer lifts the call's wait out of the turn, which ends; the
-        # person allows it after, as a person does.
-        deadline = time.monotonic() + 30
-        while self.daemon.request('inspect', bot='calc.lead')['result'].get('running_turn') is not None:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.05)
+        answered, updates, end = thread.ended(second, session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
+        self.assertNotEqual(answered['result']['messageId'], opener)
+        # The steer lifted the call's wait out of the turn, which ended: the
+        # call waits on as the session's background work, and the person
+        # allows it after, as a person does.
+        call = asked['params']['subject']['toolCall']['toolCallId']
+        self.assertEqual(end['background'], [{'type': 'tool_call', 'toolCallId': call}])
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
-        answered, updates = thread.answer_of(second)
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
-        self.assertIn('idle', [u.get('state') for u in updates if u['sessionUpdate'] == 'state_update'])
         # One turn ran; the second prompt was taken into it.
         turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
         self.assertEqual([t['status'] for t in turns], ['completed'])
@@ -363,8 +423,9 @@ class AcpTests(ModelFixture):
             self.assertLess(time.monotonic(), deadline, 'the prompt never reached the daemon')
             time.sleep(.05)
         thread.send({'method': 'session/cancel', 'params': {'sessionId': session}})
-        answered, _ = thread.answer_of(prompt)
-        self.assertEqual(answered['result'], {'stopReason': 'cancelled'})
+        answered, _, end = thread.ended(prompt, session)
+        self.assertIn('messageId', answered['result'])
+        self.assertEqual(end['stopReason'], 'cancelled')
         [sent] = self.daemon.request('messages', bot='calc.lead')['result']['messages']
         self.assertEqual((sent['status'], sent['turn']), ('withdrawn', None))
         self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
@@ -390,11 +451,12 @@ class AcpTests(ModelFixture):
             time.sleep(0.05)
         # A thread that comes back, with no turn running, puts it again.
         back = Thread(self, self.env, repo)
-        back.answer_of(back.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        back.init()
         back.ask('session/resume', {'sessionId': session, 'cwd': str(repo), 'mcpServers': []})
         [again] = [m for m in back.until(lambda m: m.get('method') == 'session/request_permission')
                    if m.get('method') == 'session/request_permission']
-        self.assertEqual(again['params']['toolCall']['toolCallId'], asked['params']['toolCall']['toolCallId'])
+        self.assertEqual(again['params']['subject']['toolCall']['toolCallId'],
+                         asked['params']['subject']['toolCall']['toolCallId'])
 
     def test_a_thread_that_opens_leaves_the_tool_host_another_build_runs_and_its_scripts(self):
         """Row 29 of code mode: a client of a newer build started the tool
@@ -448,9 +510,9 @@ class AcpTests(ModelFixture):
         # streamed, is said once.
         self.model.history_reasoning = {'type': 'reasoning', 'id': 'rs_1',
                                         'summary': [{'type': 'summary_text', 'text': 'Thought.'}]}
-        answered, updates = thread.answer_of(thread.ask('session/prompt', {'sessionId': session,
-                                                                            'prompt': self.wrapped('hello')}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, updates, end = thread.ended(thread.ask('session/prompt', {'sessionId': session,
+                                                                            'prompt': self.wrapped('hello')}), session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         self.assertEqual(''.join(u['content']['text'] for u in updates
                                  if u['sessionUpdate'] == 'agent_message_chunk'), 'reply:hello')
         self.model.history_reasoning = None
@@ -459,10 +521,12 @@ class AcpTests(ModelFixture):
         self.daemon.request('submit', bot='calc.lead', request_id='lookout-1', prompt='fix finished')
         seen = thread.until(lambda m: m.get('params', {}).get('update', {}).get('state') == 'idle')
         updates = [m['params']['update'] for m in seen]
-        self.assertEqual(updates[0], {'sessionUpdate': 'state_update', 'state': 'running'})
+        self.assertEqual(updates[0], {'sessionUpdate': 'state_update', 'state': 'running', 'background': []})
         [said] = [u for u in updates if u['sessionUpdate'] == 'user_message']
         self.assertEqual(said['content'], [{'type': 'text', 'text': 'fix finished'}])
+        self.assertRegex(said['messageId'], r'^calc\.lead/\d+$')
         self.assertTrue([u for u in updates if u['sessionUpdate'] == 'agent_message_chunk'])
+        self.assertEqual(updates[-1]['stopReason'], 'end_turn')
 
     def test_the_model_picked_in_the_thread_is_the_leads(self):
         repo = self.repo()
@@ -475,9 +539,10 @@ class AcpTests(ModelFixture):
         self.model.context_window = 1_000_000
         thread, session = self.open(repo)
         option, effort = self.opened['result']['configOptions']
-        # T3 Code reads `id` even on version 2, which names it `configId`.
-        self.assertEqual((option['id'], option['configId'], option['category'], option['currentValue']),
-                         ('model', 'model', 'model', 'default'))
+        # Named by `configId`, as version 2 names it.
+        self.assertNotIn('id', option)
+        self.assertEqual((option['configId'], option['category'], option['currentValue']),
+                         ('model', 'model', 'default'))
         self.assertEqual([c['value'] for c in option['options']],
                          ['default', 'openai/synthetic-model', 'openai/other-model', 'openai/newer-model',
                           'anthropic/claude-x'])
@@ -488,7 +553,7 @@ class AcpTests(ModelFixture):
                           'X · anthropic'])
         self.assertEqual(option['options'][2]['description'], 'faster (openai/other-model)')
         self.assertEqual(option['options'][3]['description'], 'openai/newer-model')
-        self.assertEqual((effort['id'], effort['category'], effort['currentValue']),
+        self.assertEqual((effort['configId'], effort['category'], effort['currentValue']),
                          ('effort', 'thought_level', 'default'))
         self.assertEqual([c['value'] for c in effort['options']],
                          ['default', 'low', 'medium', 'high', 'xhigh'])
@@ -496,9 +561,9 @@ class AcpTests(ModelFixture):
         picked, _ = thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'model', 'type': 'id', 'value': 'openai/other-model'}))
         self.assertEqual(picked['result']['configOptions'][0]['currentValue'], 'openai/other-model')
-        answered, updates = thread.answer_of(thread.ask('session/prompt', {'sessionId': session,
-                                                                            'prompt': self.wrapped('hello')}))
-        self.assertEqual(answered.get('result'), {'stopReason': 'end_turn'}, answered)
+        answered, updates, end = thread.ended(thread.ask('session/prompt', {'sessionId': session,
+                                                                            'prompt': self.wrapped('hello')}), session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         lead = self.daemon.request('inspect', bot='calc.lead')['result']
         self.assertEqual((lead['provider'], lead['model']), ('openai', 'other-model'))
         # A lead's thread offers its family's models only.
@@ -531,9 +596,9 @@ class AcpTests(ModelFixture):
         for option, value in (('model', 'openai/other-model'), ('effort', 'low')):
             other.answer_of(other.ask('session/set_config_option', {
                 'sessionId': again, 'configId': option, 'type': 'id', 'value': value}))
-        answered, _ = other.answer_of(other.ask('session/prompt', {'sessionId': again,
-                                                                    'prompt': self.wrapped('again')}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, _, end = other.ended(other.ask('session/prompt', {'sessionId': again,
+                                                                    'prompt': self.wrapped('again')}), again)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         lead = self.daemon.request('inspect', bot='calc.lead')['result']
         self.assertEqual((lead['model'], lead['effort']), ('synthetic-model', 'high'))
         made = self.daemon.request('inspect', bot='calc.lead.again')['result']
@@ -542,9 +607,9 @@ class AcpTests(ModelFixture):
         # asking for a lead the folder has not is refused.
         third, session = self.open(repo)
         self.adopt(third, session, 'again')
-        answered, _ = third.answer_of(third.ask('session/prompt', {'sessionId': session,
-                                                                    'prompt': self.wrapped('and more')}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, _, end = third.ended(third.ask('session/prompt', {'sessionId': session,
+                                                                    'prompt': self.wrapped('and more')}), session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         self.assertEqual(len(self.daemon.request('turns', bot='calc.lead.again')['result']['turns']), 2)
         fourth, session = self.open(repo)
         refused, _ = fourth.answer_of(fourth.ask('session/prompt', {'sessionId': session,
@@ -565,28 +630,27 @@ class AcpTests(ModelFixture):
             self.assertIn('result', self.daemon.request('create', bot=bot, **made))
         env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
         thread = Thread(self, env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
-                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        thread.init(name='slack-bridge')
         opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
         session = opened['result']['sessionId']
         picker = opened['result']['configOptions'][-1]
-        self.assertEqual((picker['id'], picker['currentValue']), ('agent', 'default'))
+        self.assertEqual((picker['configId'], picker['currentValue']), ('agent', 'default'))
         self.assertEqual([c['value'] for c in picker['options']], ['default', 'calc.lead', 'calc.lead.billing'])
         # Picked before the first prompt: that prompt goes to that lead.
         picked, _ = thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.billing'}))
         self.assertEqual(picked['result']['configOptions'][-1]['currentValue'], 'calc.lead.billing')
         hello = [{'type': 'text', 'text': 'hello'}]
-        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, _, end = thread.ended(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}), session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         self.assertEqual(len(self.daemon.request('turns', bot='calc.lead.billing')['result']['turns']), 1)
         self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
         # Picked once the thread is a lead's: it moves to the one picked.
         moved, _ = thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
         self.assertEqual(moved['result']['configOptions'][-1]['currentValue'], 'calc.lead')
-        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, _, end = thread.ended(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}), session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         self.assertEqual(len(self.daemon.request('turns', bot='calc.lead')['result']['turns']), 1)
         refused, _ = thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.gone'}))
@@ -608,7 +672,7 @@ class AcpTests(ModelFixture):
         # A listed lead reopens, as that lead even once a session of that id
         # was moved to another.
         reopened = Thread(self, env, repo)
-        reopened.answer_of(reopened.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        reopened.init()
         answered, _ = reopened.answer_of(reopened.ask('session/resume', {'sessionId': first, 'cwd': str(repo),
                                                                           'mcpServers': []}))
         self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.lead')
@@ -626,65 +690,105 @@ class AcpTests(ModelFixture):
         other = f'{lead}@{"0" * 16 if store != "0" * 16 else "1" * 16}'
         self.assertIn('another store', self.resume(repo, other)['error']['message'])
 
-    def test_a_task_the_lead_starts_is_a_thread_a_client_opens(self):
-        """Any client, not only T3 Code: a task the lead starts comes with
-        the session id that opens it, `session/list` lists it under its
-        lead, and `session/resume` opens it, as it opens no other bot."""
+    def test_a_task_the_lead_starts_is_a_subagent_of_its_session(self):
+        """Any client but T3 Code: a task the lead starts is the lead
+        session's subagent, announced on it, linked from the call that
+        started it, and followed in a session of its own that opens with
+        the lead's brief and takes only a cancel; it is background work of
+        the lead's session while it works. `session/list` lists leads only,
+        and a lead's session comes back with its history replayed."""
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('start_task', inherit=False)])
         env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
         thread = Thread(self, env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
-                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        thread.init(name='slack-bridge')
         opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
         session = opened['result']['sessionId']
         thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
         self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'fix', 'brief': 'Fix calc.py.'})]
-        answered, updates = thread.answer_of(thread.ask('session/prompt', {
-            'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, updates, end = thread.ended(thread.ask('session/prompt', {
+            'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]}), session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
+        prompted = answered['result']['messageId']
         fix = self.daemon.request('inspect', bot='calc.fix')['result']
-        lead_id = self.daemon.request('inspect', bot='calc.lead')['result']['bot_id']
-        # The call that started it names it, before the prompt is answered.
-        [task] = [u['_meta']['task'] for u in updates
-                  if u['sessionUpdate'] == 'tool_call_update' and 'task' in u.get('_meta', {})]
-        name, store = task['sessionId'].rsplit('@', 1)
+        # Announced on the lead's session, by an id of its name, identity
+        # and store.
+        [announced] = [u for u in updates if u['sessionUpdate'] == 'subagent_update' and 'title' in u]
+        child = announced['sessionId']
+        name, store = child.rsplit('@', 1)
         self.assertEqual(name, f'calc.fix#{fix["bot_id"]}')
         self.assertRegex(store, r'^[0-9a-f]{16}$')
-        self.assertEqual((task['title'], task['cwd']), ('calc.fix', fix['workspace']))
-        # Listed by folder under its lead, which it names; in all, leads only.
-        listed, _ = thread.answer_of(thread.ask('session/list', {'cwd': str(repo)}))
-        sessions = listed['result']['sessions']
-        self.assertEqual([(s['title'], s.get('_meta')) for s in sessions],
-                         [('calc.lead', None), ('calc.fix', {'lead': f'calc.lead#{lead_id}@{store}'})])
-        self.assertEqual((sessions[1]['sessionId'], sessions[1]['cwd']), (task['sessionId'], fix['workspace']))
-        listed, _ = thread.answer_of(thread.ask('session/list', {}))
-        self.assertEqual([s['title'] for s in listed['result']['sessions']], ['calc.lead'])
-        # It opens as the task, and a prompt there is the task's.
-        reopened = Thread(self, env, repo)
-        reopened.answer_of(reopened.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
-        answered, _ = reopened.answer_of(reopened.ask('session/resume', {
-            'sessionId': task['sessionId'], 'cwd': str(repo), 'mcpServers': []}))
-        self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.fix')
-        # The task's own turn, on its brief, may still run, and a prompt
-        # sent meanwhile joins it as a steer: wait for its end first.
-        [brief] = self.daemon.request('turns', bot='calc.fix')['result']['turns']
-        ended = self.daemon.followers['calc.fix'].finished(brief['turn'], timeout=30)
-        self.assertEqual(ended['data']['status'], 'completed', ended)
-        before = len(self.daemon.request('turns', bot='calc.fix')['result']['turns'])
-        answered, _ = reopened.answer_of(reopened.ask('session/prompt', {
-            'sessionId': task['sessionId'], 'prompt': [{'type': 'text', 'text': 'how is it going?'}]}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
-        self.assertEqual(len(self.daemon.request('turns', bot='calc.fix')['result']['turns']), before + 1)
-        reopened.close()
-        # A bot no lead started does not open, by any id.
-        self.daemon.request('create', bot='calc.loose', workspace=str(repo), model='openai/synthetic-model',
-                            instructions='Loose.')
-        loose = self.daemon.request('inspect', bot='calc.loose')['result']['bot_id']
-        refused = self.resume(repo, f'calc.loose#{loose}@{store}')
-        self.assertIn('does not know', refused['error']['message'])
+        self.assertEqual((announced['title'], announced['cwd'], announced['capabilities']),
+                         ('calc.fix', fix['workspace'], {'cancel': {}}))
+        # The call that started it links to it.
+        linked = [c for u in updates if u['sessionUpdate'] == 'tool_call_update'
+                  for c in u.get('content') or [] if c.get('type') == 'session']
+        self.assertEqual(linked, [{'type': 'session', 'sessionId': child}])
+        # Its session opens with the brief, as the lead's message to it,
+        # and its work ends there as any session's does.
+        deadline = time.monotonic() + 30
+        def shown_done(updates):
+            states = [u['state'] for u in updates if u['sessionUpdate'] == 'state_update']
+            said = [u for u in updates if u['sessionUpdate'] == 'agent_message_chunk']
+            return said and states and states[-1] == 'idle'
+        while not shown_done(thread.updates(child)):
+            self.assertLess(time.monotonic(), deadline, thread.updates(child))
+            try:
+                thread.log.append(thread.messages.get(timeout=1))
+            except queue.Empty:
+                pass
+        mine = thread.updates(child)
+        [brief] = [u for u in mine if u['sessionUpdate'] == 'session_message']
+        self.assertEqual(brief['senderSessionId'], session)
+        self.assertRegex(brief['messageId'], r'^calc\.fix/\d+$')
+        self.assertIn('Fix calc.py.', brief['content'][0]['text'])
+        self.assertTrue([u for u in mine if u['sessionUpdate'] == 'agent_message_chunk'])
+        # Its state shows on the lead's session too.
+        mirrored = [u['state']['state'] for u in thread.updates(session)
+                    if u['sessionUpdate'] == 'subagent_update' and 'state' in u]
+        self.assertEqual(mirrored[-1], 'idle')
+        # It takes a cancel, and nothing else.
+        refused, _ = thread.answer_of(thread.ask('session/prompt', {
+            'sessionId': child, 'prompt': [{'type': 'text', 'text': 'how is it going?'}]}))
+        self.assertEqual(refused['error']['code'], -32602)
+        closed, _ = thread.answer_of(thread.ask('session/close', {'sessionId': child}))
+        self.assertEqual(closed['error']['code'], -32602)
+        # Listed: leads only, by folder and in all; a task's id does not
+        # open a session of its own.
+        for params in ({'cwd': str(repo)}, {}):
+            listed, _ = thread.answer_of(thread.ask('session/list', params))
+            self.assertEqual([s['title'] for s in listed['result']['sessions']], ['calc.lead'])
+        self.assertEqual(self.resume(repo, child)['error']['code'], -32602)
+        lead = listed['result']['sessions'][0]['sessionId']
+        thread.close()
+        # The lead's session comes back with its history, as it ended, then
+        # where it stands now, before it is answered.
+        back = Thread(self, env, repo)
+        back.init()
+        resumed = back.ask('session/resume', {'sessionId': lead, 'cwd': str(repo), 'mcpServers': [],
+                                              'replayFrom': {'type': 'start'}})
+        answered, replayed = back.answer_of(resumed)
+        self.assertIn('configOptions', answered['result'])
+        kinds = [u['sessionUpdate'] for u in replayed]
+        done = kinds.index('replay_complete')
+        self.assertEqual(kinds[-1], 'state_update')
+        self.assertEqual(replayed[-1]['state'], 'idle')
+        history = replayed[:done]
+        [said] = [u for u in history if u['sessionUpdate'] == 'user_message' and u['messageId'] == prompted]
+        self.assertEqual(said['content'], [{'type': 'text', 'text': 'script'}])
+        self.assertEqual(said['messageId'], prompted)
+        [started] = [u for u in history if u['sessionUpdate'] == 'tool_call_update' and u.get('name') == 'start_task']
+        self.assertEqual([u['status'] for u in history if u['sessionUpdate'] == 'tool_call_update'
+                          and u['toolCallId'] == started['toolCallId']], ['in_progress', 'completed'])
+        # The lead's replies whole, each as one message.
+        self.assertTrue([u for u in history if u['sessionUpdate'] == 'agent_message'])
+        self.assertNotIn('state_update', kinds[:done])
+        # Only from the start.
+        refused, _ = back.answer_of(back.ask('session/resume', {
+            'sessionId': lead, 'cwd': str(repo), 'mcpServers': [], 'replayFrom': {'type': 'message', 'messageId': prompted}}))
+        self.assertEqual(refused['error']['code'], -32602)
 
     def test_a_client_names_who_wrote_each_prompt_and_who_answered_for_a_call(self):
         """A client several people write through, as a team's chat bridge:
@@ -696,8 +800,7 @@ class AcpTests(ModelFixture):
                             approve=['start_task'], approver='manual', settings=SONNY_MADE)
         env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
         thread = Thread(self, env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
-                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        thread.init(name='slack-bridge')
         opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
         session = opened['result']['sessionId']
         thread.answer_of(thread.ask('session/set_config_option', {
@@ -718,8 +821,8 @@ class AcpTests(ModelFixture):
         self.assertRegex(content[1]['text'], rf'^\[Message calc\.lead/\d+, written by ana\.{SENT}\]$')
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'deny'},
                                                    '_meta': {'person': 'bo'}}})
-        answered, _ = thread.answer_of(prompt)
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, _, end = thread.ended(prompt, session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
         [denied] = [e['data'] for e in events if e['event'] == 'tool_completed']
         self.assertEqual([(v['by'], v['allow']) for v in denied['approvals']], [('bo', False)])
@@ -736,27 +839,24 @@ class AcpTests(ModelFixture):
                             model='openai/synthetic-model', instructions='Lead.')
         env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
         thread = Thread(self, env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
-                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        thread.init(name='slack-bridge')
         opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
         session = opened['result']['sessionId']
         thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
         script = [{'type': 'text', 'text': 'script'}]
         self.model.call_script = [('react', {'emoji': '👀'})]
-        prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': script})
-        seen = thread.until(lambda m: m.get('id') == prompt and 'method' not in m)
-        self.assertEqual(seen[-1].get('result'), {'stopReason': 'end_turn'}, seen[-1])
-        self.assertEqual([m['params'] for m in seen if m.get('method') == '_sonny/react'],
+        answered, updates, end = thread.ended(thread.ask('session/prompt', {'sessionId': session, 'prompt': script}),
+                                              session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
+        self.assertEqual([m['params'] for m in thread.log if m.get('method') == '_sonny/react'],
                          [{'sessionId': session, 'emoji': '👀', 'remove': False}])
 
-        def reply(seen):
-            [said] = {m['params']['update']['messageId'] for m in seen if m.get('method') == 'session/update'
-                      and m['params']['update']['sessionUpdate'] == 'agent_message_chunk'}
+        def reply(updates):
+            [said] = {u['messageId'] for u in updates if u['sessionUpdate'] == 'agent_message_chunk'}
             return said
-        older = reply(seen)
-        again = thread.ask('session/prompt', {'sessionId': session, 'prompt': script})
-        last = reply(thread.until(lambda m: m.get('id') == again and 'method' not in m))
+        older = reply(updates)
+        last = reply(thread.ended(thread.ask('session/prompt', {'sessionId': session, 'prompt': script}), session)[1])
 
         def react(params):
             answered, _ = thread.answer_of(thread.ask('_sonny/react', {'sessionId': session, **params}))
@@ -775,8 +875,8 @@ class AcpTests(ModelFixture):
         while not self.model.requests.empty():
             self.model.requests.get_nowait()
         hello = [{'type': 'text', 'text': 'hello'}]
-        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, _, end = thread.ended(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}), session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         said = [part['text'] for item in self.model.requests.get(timeout=5)['input'] if item.get('role') == 'user'
                 for part in item['content'] if part.get('type') == 'input_text']
         # The older reply quoted; the last, which a teammate reacted to, not.
@@ -813,19 +913,18 @@ class AcpTests(ModelFixture):
                                    asked('Which cache?', 'None', 'Redis')]]
         # Asked while no client that fills in forms follows the lead.
         thread = Thread(self, env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        thread.init()
         opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
         session = opened['result']['sessionId']
-        prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]})
-        seen = thread.until(lambda m: m.get('id') == prompt and 'method' not in m)
-        self.assertEqual(seen[-1].get('result'), {'stopReason': 'end_turn'}, seen[-1])
-        self.assertNotIn('elicitation/create', [m.get('method') for m in seen])
+        answered, _, end = thread.ended(thread.ask('session/prompt', {
+            'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]}), session)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
+        self.assertNotIn('elicitation/create', [m.get('method') for m in thread.log])
         thread.close()
         # A client that does, reopening the thread: both are put to it, the
         # oldest first.
         thread = Thread(self, env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2,
-                                                   'clientCapabilities': {'elicitation': {'form': {}}}}))
+        thread.init({'elicitation': {'form': {}}})
         thread.answer_of(thread.ask('session/resume', {'sessionId': session, 'cwd': str(repo), 'mcpServers': []}))
         forms = []
 
@@ -891,7 +990,7 @@ class AcpTests(ModelFixture):
         thread.send({'id': live['id'], 'result': {'action': 'accept', 'content': {'pick': '2'},
                                                   '_meta': {'person': 'Ana Lopez'}}})
         hello = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'hello'}]})
-        thread.until(lambda m: m.get('id') == hello and 'method' not in m)
+        thread.ended(hello, session)
         later = []
         while True:
             try:
@@ -901,11 +1000,11 @@ class AcpTests(ModelFixture):
         self.assertTrue(any('hello' in request for request in later))
         self.assertFalse(any('script-1): Which queue' in request for request in later))
 
-    def test_the_tasks_questions_come_to_the_leads_thread_as_forms(self):
-        """As Sonny's lead window pins them: a client that fills in forms,
-        on a lead's thread, gets each question the lead's tasks have open,
-        from before it came, asked live, and from a task the lead starts
-        since, each saying whose it is; a pick answers it in that task."""
+    def test_the_tasks_questions_come_to_its_subagent_session_as_forms(self):
+        """A client that fills in forms, on a lead's session, gets each
+        question the lead's tasks put, in the task's subagent session: one
+        still open from before it came, asked live, and from a task the
+        lead starts since; a pick answers it in that task."""
         repo = self.repo()
         made = {'workspace': str(repo), 'model': 'openai/synthetic-model'}
         self.daemon.request('create', bot='calc.lead', instructions='Lead.',
@@ -951,10 +1050,17 @@ class AcpTests(ModelFixture):
                      if m.get('method') == 'elicitation/create']
             return put
 
+        def child(thread, task):
+            [announced] = [m['params']['update']['sessionId'] for m in thread.log
+                           if m.get('method') == 'session/update'
+                           and m['params']['update']['sessionUpdate'] == 'subagent_update'
+                           and m['params']['update'].get('title') == task]
+            return announced
+
         # Asked while no client that fills in forms follows the lead (one
         # that does not has Sonny's tools served).
         thread = Thread(self, env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        thread.init()
         listed, _ = thread.answer_of(thread.ask('session/list', {'cwd': str(repo)}))
         self.assertIn('result', listed, listed)
         lead = listed['result']['sessions'][0]['sessionId']
@@ -963,13 +1069,16 @@ class AcpTests(ModelFixture):
         ran('calc.fix', 'script')
         thread.close()
         thread = Thread(self, env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2,
-                                                   'clientCapabilities': {'elicitation': {'form': {}}}}))
+        thread.init({'elicitation': {'form': {}}})
         thread.answer_of(thread.ask('session/resume', {'sessionId': lead, 'cwd': str(repo), 'mcpServers': []}))
-        # Each it has open, the oldest first.
+        # Each it has open, the oldest first, in the session of the task
+        # that asked, which shows as the lead's subagent since it has a
+        # question open.
         database, cache = form(thread), form(thread)
-        self.assertEqual(database['params']['message'], 'From calc.fix\n\nWhich database?\n\nIt decides the schema.')
-        self.assertTrue(cache['params']['message'].startswith('From calc.fix\n\nWhich cache?'))
+        fix = child(thread, 'calc.fix')
+        self.assertEqual((database['params']['sessionId'], cache['params']['sessionId']), (fix, fix))
+        self.assertEqual(database['params']['message'], 'Which database?\n\nIt decides the schema.')
+        self.assertTrue(cache['params']['message'].startswith('Which cache?'))
         self.assertNotIn('toolCallId', database['params'])
         thread.send({'id': database['id'], 'result': {'action': 'accept', 'content': {'pick': '2'}}})
         [answer] = until_answered('calc.fix', 1)
@@ -980,23 +1089,26 @@ class AcpTests(ModelFixture):
         # lookout's notes of the questions.
         self.assertEqual([t['request_id'] for t in self.daemon.request('turns', bot='calc.lead')['result']['turns']
                           if not t['request_id'].startswith('lookout-')], [])
-        # Asked live.
+        # Asked live, on the call that put it.
         self.model.call_script.append(asked('Which queue?', 'None', 'SQS'))
         ran('calc.fix', 'script')
         queue_form = form(thread)
-        self.assertTrue(queue_form['params']['message'].startswith('From calc.fix\n\nWhich queue?'))
+        self.assertEqual(queue_form['params']['sessionId'], fix)
+        self.assertTrue(queue_form['params']['message'].startswith('Which queue?'))
+        self.assertRegex(queue_form['params']['toolCallId'], r'^\d+/script-')
         thread.send({'id': queue_form['id'], 'result': {'action': 'accept', 'content': {'pick': '1'}}})
         self.assertIn('Which queue?\n\nNone', until_answered('calc.fix', 3)[-1])
         # Asked by a task the lead started after the thread came.
         self.model.call_script = [('start_task', {'title': 'Fix the sums', 'name': 'check', 'brief': 'Check calc.py.', 'reason': 'A check apart from the fix.'})]
-        answered, updates = thread.answer_of(thread.ask('session/prompt', {
-            'sessionId': lead, 'prompt': [{'type': 'text', 'text': 'script'}]}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        answered, updates, end = thread.ended(thread.ask('session/prompt', {
+            'sessionId': lead, 'prompt': [{'type': 'text', 'text': 'script'}]}), lead)
+        self.assertEqual(end['stopReason'], 'end_turn', answered)
         self.assertIn('calc.check', [b['name'] for b in self.daemon.request('bots')['result']['bots']], updates)
         self.model.call_script = [asked('Which colour?', 'Red', 'Blue')]
         ran('calc.check', 'script')
         colour = form(thread)
-        self.assertTrue(colour['params']['message'].startswith('From calc.check\n\nWhich colour?'))
+        self.assertEqual(colour['params']['sessionId'], child(thread, 'calc.check'))
+        self.assertTrue(colour['params']['message'].startswith('Which colour?'))
         # Another bot made under a task's name, after it is gone, is not
         # that task: its questions are its own.
         self.assertIn('result', self.daemon.request('delete', bot='calc.fix'))
@@ -1005,17 +1117,18 @@ class AcpTests(ModelFixture):
         self.model.call_script = [asked('Which secret?', 'One', 'Two')]
         ran('calc.fix', 'script')
         hello = thread.ask('session/prompt', {'sessionId': lead, 'prompt': [{'type': 'text', 'text': 'hello'}]})
-        seen = thread.until(lambda m: m.get('id') == hello and 'method' not in m)
-        self.assertNotIn('elicitation/create', [m.get('method') for m in seen])
+        thread.ended(hello, lead)
+        self.assertNotIn('Which secret?', [m['params']['message'].split('\n')[0] for m in thread.log
+                                           if m.get('method') == 'elicitation/create'])
 
     def test_t3_code_threads_pick_their_lead_by_words_not_by_an_option(self):
         """T3 Code carries option picks over to the next thread it opens."""
         thread, _ = self.open(self.repo())
-        self.assertEqual([o['id'] for o in self.opened['result']['configOptions']], ['model', 'effort'])
+        self.assertEqual([o['configId'] for o in self.opened['result']['configOptions']], ['model', 'effort'])
 
     def resume(self, cwd, session):
         thread = Thread(self, self.env, cwd)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        thread.init()
         answered, _ = thread.answer_of(thread.ask('session/resume', {'sessionId': session, 'cwd': str(cwd),
                                                                       'mcpServers': []}))
         thread.close()
@@ -1042,7 +1155,7 @@ class AcpTests(ModelFixture):
     def test_a_thread_sonny_does_not_know_does_not_come_back(self):
         repo = self.repo()
         thread = Thread(self, self.env, repo)
-        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        thread.init()
         refused, _ = thread.answer_of(thread.ask('session/resume', {'sessionId': 'sonny-gone', 'cwd': str(repo),
                                                                      'mcpServers': []}))
         self.assertIn('sonny-gone', refused['error']['message'])

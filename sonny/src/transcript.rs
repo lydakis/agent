@@ -3367,6 +3367,12 @@ fn current(path: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// An edit's change as whole lines, numbered where the file now has them,
+/// as an edit is drawn.
+pub(crate) fn edit_lines(arguments: &Value, workspace: &str) -> crate::diff::Edit {
+    diff(arguments, workspace)
+}
+
 /// An edit as diffs.com draws one: the whole lines it touched, the words
 /// that changed within them, and two lines either side, numbered where
 /// the file now has them when the new text can be found there.
@@ -3443,6 +3449,53 @@ fn patch_files(patch: &str) -> Vec<String> {
 /// file as it is now, after the patch; a deleted file shows no lines.
 fn as_unified(patch: &str, workspace: &str) -> String {
     let mut out = String::new();
+    for file in patch_sections(patch, workspace) {
+        match file.kind {
+            Patched::Add => out.push_str(&format!("--- /dev/null\n+++ {}\n", file.path)),
+            Patched::Delete => out.push_str(&format!(
+                "--- {}\n+++ /dev/null\n@@ -1,0 +0,0 @@\n",
+                file.path
+            )),
+            Patched::Update => out.push_str(&format!("--- {0}\n+++ {0}\n", file.path)),
+        }
+        out.push_str(&file.hunks);
+    }
+    out
+}
+
+/// What a patch does to one file.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Patched {
+    Add,
+    Delete,
+    Update,
+}
+
+/// One file of a patch: what it does, the path it is at after (the path
+/// it was moved from too), and its chunks as a unified diff's, numbered.
+pub(crate) struct PatchFile {
+    pub kind: Patched,
+    pub path: String,
+    pub moved_from: Option<String>,
+    pub hunks: String,
+}
+
+impl PatchFile {
+    /// What it does, as the Agent Client Protocol names it.
+    pub(crate) fn operation(&self) -> &'static str {
+        match (self.kind, &self.moved_from) {
+            (Patched::Add, _) => "add",
+            (Patched::Delete, _) => "delete",
+            (Patched::Update, Some(_)) => "move",
+            (Patched::Update, None) => "modify",
+        }
+    }
+}
+
+/// A patch's files, each with its chunks placed where their new side is
+/// in the file as it is now, after the patch; a deleted file has none.
+pub(crate) fn patch_sections(patch: &str, workspace: &str) -> Vec<PatchFile> {
+    let mut files = Vec::new();
     let mut lines = patch.lines().peekable();
     let ends = |line: &str| line.starts_with("*** ") && line != "*** End of File";
     while let Some(line) = lines.next() {
@@ -3450,24 +3503,33 @@ fn as_unified(patch: &str, workspace: &str) -> String {
             let added: Vec<&str> = std::iter::from_fn(|| lines.next_if(|l| !ends(l)))
                 .map(|l| l.strip_prefix('+').unwrap_or(l))
                 .collect();
-            out.push_str(&format!("--- /dev/null\n+++ {}\n", path.trim()));
-            out.push_str(&format!("@@ -0,0 +1,{} @@\n", added.len()));
+            let mut hunks = format!("@@ -0,0 +1,{} @@\n", added.len());
             for line in added {
-                out.push_str(&format!("+{line}\n"));
+                hunks.push_str(&format!("+{line}\n"));
             }
+            files.push(PatchFile {
+                kind: Patched::Add,
+                path: path.trim().to_owned(),
+                moved_from: None,
+                hunks,
+            });
         } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
-            out.push_str(&format!(
-                "--- {}\n+++ /dev/null\n@@ -1,0 +0,0 @@\n",
-                path.trim()
-            ));
+            files.push(PatchFile {
+                kind: Patched::Delete,
+                path: path.trim().to_owned(),
+                moved_from: None,
+                hunks: String::new(),
+            });
         } else if let Some(path) = line.strip_prefix("*** Update File: ") {
             let mut path = path.trim().to_owned();
+            let mut moved_from = None;
             if let Some(to) = lines.next_if(|l| l.starts_with("*** Move to: ")) {
+                moved_from = Some(path);
                 path = to["*** Move to: ".len()..].trim().to_owned();
             }
             let now = current(&std::path::Path::new(workspace).join(&path)).unwrap_or_default();
             let now: Vec<&str> = now.lines().collect();
-            out.push_str(&format!("--- {path}\n+++ {path}\n"));
+            let mut hunks = String::new();
             // Each chunk's lines, then its place: the line where its new
             // side starts now, and that less what earlier chunks added.
             let mut chunks: Vec<Vec<String>> = Vec::new();
@@ -3500,20 +3562,26 @@ fn as_unified(patch: &str, workspace: &str) -> String {
                 from = start + new.len();
                 let old_start = (start as isize - grown).max(0) as usize;
                 grown += new.len() as isize - old as isize;
-                out.push_str(&format!(
+                hunks.push_str(&format!(
                     "@@ -{},{old} +{},{} @@\n",
                     old_start + 1,
                     start + 1,
                     new.len()
                 ));
                 for line in chunk {
-                    out.push_str(&line);
-                    out.push('\n');
+                    hunks.push_str(&line);
+                    hunks.push('\n');
                 }
             }
+            files.push(PatchFile {
+                kind: Patched::Update,
+                path,
+                moved_from,
+                hunks,
+            });
         }
     }
-    out
+    files
 }
 
 /// Line comparisons placing one file's chunks may make. Drawing waits on
