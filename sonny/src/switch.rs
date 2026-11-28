@@ -74,86 +74,107 @@ pub struct Picker {
     pub current: String,
 }
 
+/// The agents in `bots` (the daemon's `bots` rows), ordered for a window
+/// of `current` in folder `workspace`, of project `project` or of none,
+/// and the one to pick: `beside` when listed, else the first that is not
+/// `current`. Those `waits` names wait on the person, as [`crate::needs`]
+/// reads it; `title` gives each one's. Read beside the window, a list of
+/// thousands built off its keys.
+#[allow(clippy::too_many_arguments)]
+pub fn listed(
+    bots: &[Value],
+    waits: impl Fn(&str) -> bool,
+    mut title: impl FnMut(&Value) -> Option<String>,
+    current: &str,
+    project: Option<&str>,
+    workspace: &str,
+    beside: Option<&str>,
+) -> (Vec<Agent>, usize) {
+    let home = project
+        .map(str::to_owned)
+        .or_else(|| crate::project::lead_project(current).map(str::to_owned))
+        .map(|home| format!("{home}."));
+    let rank = |name: &str, bot: &Value| {
+        let here = bot["workspace"].as_str() == Some(workspace);
+        let ours = home.as_deref().is_some_and(|home| name.starts_with(home));
+        let lead = crate::project::is_lead(name);
+        match (lead && here, ours, lead) {
+            (true, ..) => 0,
+            (_, true, _) => 1,
+            (_, _, true) => 2,
+            _ => 3,
+        }
+    };
+    let mut rows: Vec<(u8, bool, &str, &Value)> = (bots.iter())
+        // Side chats go once idle; they are never switched to, nor
+        // Sonny's own bots, nor a workflow's workers.
+        .filter(|bot| bot["expire_ms"].is_null())
+        .filter_map(|bot| {
+            let name = bot["name"].as_str()?;
+            let kept = !crate::project::is_internal(name) && !crate::workflow::is_worker(name);
+            kept.then(|| (rank(name, bot), !name.ends_with(".lead"), name, bot))
+        })
+        .collect();
+    // Each row's place worked out once, not at each comparison.
+    rows.sort_unstable_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    let agents: Vec<Agent> = rows
+        .into_iter()
+        .map(|(rank, _, name, bot)| {
+            let state = state(bot, waits(name));
+            // Another project's folder tells it apart; this project's
+            // are this folder or its copies, which say nothing more.
+            let folder = (bot["workspace"].as_str())
+                .filter(|w| rank > 1 && *w != workspace)
+                .map(|folder| crate::footer::fish(&crate::tilde(folder)));
+            Agent {
+                name: name.to_owned(),
+                title: title(bot).unwrap_or_default(),
+                about: Agent::about(&state, folder.as_deref()),
+                state,
+                folder,
+                ended: (bot["running_turn"].is_null())
+                    .then(|| bot["last"]["turn"].as_i64())
+                    .flatten(),
+            }
+        })
+        .collect();
+    let pick = (agents.iter())
+        .position(|agent| Some(agent.name.as_str()) == beside)
+        .or_else(|| agents.iter().position(|agent| agent.name != current))
+        .unwrap_or(0);
+    (agents, pick)
+}
+
+/// Each agent by its name only, as the list finds them: what an agent is
+/// doing is no name of it.
+fn names(agents: &[Agent]) -> Vec<(String, String)> {
+    (agents.iter())
+        .map(|agent| (agent.name.clone(), String::new()))
+        .collect()
+}
+
 impl Picker {
-    /// The agents in `bots` (the daemon's `bots` rows), ordered for a
-    /// window of `current` in folder `workspace`, of project `project` or
-    /// of none; `beside` picked when listed. Those `waits` names wait on
-    /// the person, as [`crate::needs`] reads it; `title` gives each one's.
+    /// The agents in `bots`, ordered and picked as [`listed`] does.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bots: &[Value],
         waits: impl Fn(&str) -> bool,
-        mut title: impl FnMut(&Value) -> Option<String>,
+        title: impl FnMut(&Value) -> Option<String>,
         current: &str,
         project: Option<&str>,
         workspace: &str,
         beside: Option<&str>,
         picks: Picks,
     ) -> Self {
-        let home = project
-            .map(str::to_owned)
-            .or_else(|| crate::project::lead_project(current).map(str::to_owned));
-        let rank = |bot: &Value| {
-            let name = bot["name"].as_str().unwrap_or("");
-            let here = bot["workspace"].as_str() == Some(workspace);
-            let ours = home
-                .as_deref()
-                .is_some_and(|home| name.starts_with(&format!("{home}.")));
-            let lead = crate::project::is_lead(name);
-            match (lead && here, ours, lead) {
-                (true, ..) => 0,
-                (_, true, _) => 1,
-                (_, _, true) => 2,
-                _ => 3,
-            }
-        };
-        let mut rows: Vec<&Value> = (bots.iter())
-            // Side chats go once idle; they are never switched to, nor
-            // Sonny's own bots, nor a workflow's workers.
-            .filter(|bot| bot["expire_ms"].is_null())
-            .filter(|bot| {
-                bot["name"].as_str().is_some_and(|n| {
-                    !crate::project::is_internal(n) && !crate::workflow::is_worker(n)
-                })
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            (rank(a).cmp(&rank(b))).then_with(|| {
-                let first = |bot: &Value| !bot["name"].as_str().unwrap_or("").ends_with(".lead");
-                (first(a).cmp(&first(b))).then(a["name"].as_str().cmp(&b["name"].as_str()))
-            })
-        });
-        let agents: Vec<Agent> = rows
-            .into_iter()
-            .map(|bot| {
-                let state = state(bot, waits(bot["name"].as_str().unwrap_or("")));
-                // Another project's folder tells it apart; this project's
-                // are this folder or its copies, which say nothing more.
-                let folder = (bot["workspace"].as_str())
-                    .filter(|w| rank(bot) > 1 && *w != workspace)
-                    .map(|folder| crate::footer::fish(&crate::tilde(folder)));
-                Agent {
-                    name: bot["name"].as_str().unwrap_or("").to_owned(),
-                    title: title(bot).unwrap_or_default(),
-                    about: Agent::about(&state, folder.as_deref()),
-                    state,
-                    folder,
-                    ended: (bot["running_turn"].is_null())
-                        .then(|| bot["last"]["turn"].as_i64())
-                        .flatten(),
-                }
-            })
-            .collect();
-        let pick = (agents.iter())
-            .position(|agent| Some(agent.name.as_str()) == beside)
-            .or_else(|| agents.iter().position(|agent| agent.name != current))
-            .unwrap_or(0);
-        // Found by name only: what an agent is doing is no name of it.
-        let names = (agents.iter())
-            .map(|agent| (agent.name.clone(), String::new()))
-            .collect();
+        let (agents, pick) = listed(bots, waits, title, current, project, workspace, beside);
+        Self::of(agents, pick, picks, current)
+    }
+
+    /// `agents` as [`listed`] gave them, `pick` picked.
+    pub fn of(agents: Vec<Agent>, pick: usize, picks: Picks, current: &str) -> Self {
         Self {
-            list: crate::list::Picker::new(names, pick).weighed(picks),
+            list: crate::list::Picker::new(names(&agents), pick).weighed(picks),
             agents,
             current: current.to_owned(),
         }
@@ -188,6 +209,25 @@ impl Picker {
         (self.list.shown().iter())
             .map(|(at, found)| (&self.agents[*at], found.clone()))
             .collect()
+    }
+
+    /// The rows drawn, with `room` rows free above the composer: the
+    /// row the first of them is among `rows()`, and the columns the
+    /// longest name shown takes, as [`crate::list::lines_of`] pads them.
+    /// Only those drawn are gathered, of a list of thousands.
+    pub fn drawn(&self, room: usize) -> (Vec<(&Agent, Vec<usize>)>, usize, usize) {
+        use unicode_width::UnicodeWidthStr;
+        let shown = self.list.shown();
+        let window = crate::list::window(shown.len(), self.at(), room);
+        let wide = (shown.iter())
+            .map(|(at, _)| self.agents[*at].name.width())
+            .max()
+            .unwrap_or(0);
+        let first = window.start;
+        let rows = (shown[window].iter())
+            .map(|(at, found)| (&self.agents[*at], found.clone()))
+            .collect();
+        (rows, first, wide)
     }
 
     /// Where the pick is among `rows()`.
@@ -401,5 +441,39 @@ mod tests {
         );
         assert_eq!(names(&picker)[0], "blog.lead");
         assert_eq!(names(&picker).len(), 7);
+    }
+
+    fn part(bots: &[Value]) -> (Vec<Agent>, usize) {
+        listed(
+            bots,
+            |_| false,
+            |_| None,
+            "shop.lead",
+            Some("shop"),
+            "/w/shop",
+            None,
+        )
+    }
+
+    #[test]
+    fn only_the_rows_drawn_are_gathered() {
+        let bots: Vec<Value> = (0..500)
+            .map(|n| json!({"name": format!("shop.t{n:03}"), "workspace": "/w/shop"}))
+            .collect();
+        let (agents, pick) = part(&bots);
+        let mut picker = Picker::of(agents, pick, Picks::default(), "shop.lead");
+        let (rows, first, wide) = picker.drawn(30);
+        assert_eq!(
+            (rows.len(), first, wide),
+            (crate::list::ROWS, 0, "shop.t000".len())
+        );
+        for _ in 0..20 {
+            picker.event(&ratatui::crossterm::event::Event::Key(
+                ratatui::crossterm::event::KeyCode::Down.into(),
+            ));
+        }
+        let (rows, first, _) = picker.drawn(30);
+        assert_eq!(first, 20 + 1 - crate::list::ROWS);
+        assert_eq!(rows.last().unwrap().0.name, "shop.t020");
     }
 }
