@@ -340,37 +340,6 @@ impl Picker {
         self.pick = (self.at() + 1) % len;
     }
 
-    /// `rows` in place of those listed, as a list read in parts fills
-    /// in: `pick` picked as [`Picker::new`] picks while the person moved
-    /// nothing; else the row they picked stays picked where it is still
-    /// shown, or the best row is. Whether their pick stayed.
-    pub fn refill(&mut self, rows: Vec<(String, String)>, pick: usize) -> bool {
-        let untouched = self.filter.is_empty() && self.pick == self.first;
-        let chosen = (self.chosen()).map(|at| self.rows[at].0.clone());
-        self.first = pick.min(rows.len().saturating_sub(1));
-        self.rows = rows;
-        self.ranked.take();
-        if untouched {
-            self.pick = self.first;
-            return false;
-        }
-        let shown = self.shown();
-        let still =
-            chosen.and_then(|name| (shown.iter()).position(|(at, _)| self.rows[*at].0 == name));
-        self.pick = match (still, self.filter.is_empty()) {
-            (Some(at), _) => at,
-            (None, true) => self.first,
-            (None, false) => 0,
-        };
-        still.is_some()
-    }
-
-    /// Ranked by what the person picked before too, from now on.
-    pub fn weigh(&mut self, picks: crate::fuzzy::Picks) {
-        self.picks = Some(picks);
-        self.ranked.take();
-    }
-
     /// Narrowed to `filter`, the best row picked; with nothing typed, the
     /// row picked when the list opened.
     pub fn narrow(&mut self, filter: String) {

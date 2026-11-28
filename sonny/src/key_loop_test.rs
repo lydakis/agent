@@ -851,13 +851,6 @@ async fn commands_that_read_the_daemon_never_hold_the_window() {
         }
         at_once(at.elapsed(), HELD);
         assert!(app.input.is_empty(), "{command}");
-        // `/switch` alone opens its list at once, saying it reads: the
-        // person closes it and goes on.
-        if command == "/switch" {
-            assert!(app.agents.as_ref().is_some_and(|agents| agents.reading));
-            app.key(key(KeyCode::Esc)).await;
-            assert!(app.agents.is_none());
-        }
     }
     let at = Instant::now();
     app.press_row("react/2").await;
@@ -883,7 +876,7 @@ async fn commands_that_read_the_daemon_never_hold_the_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_switch_list_opens_at_once_and_fills_in_as_it_is_read() {
+async fn a_list_read_beside_the_window_opens_only_if_the_person_waits_for_it() {
     async fn type_in(app: &mut App, line: &str) {
         for c in line.chars() {
             app.key(key(KeyCode::Char(c))).await;
@@ -891,25 +884,20 @@ async fn the_switch_list_opens_at_once_and_fills_in_as_it_is_read() {
     }
     let (client, _events, _tell, _asked, socket) =
         held_daemon(Duration::from_millis(300), kept("A reply"), json!([])).await;
-    // Every agent: the list opens at once, saying it reads, and typing
-    // narrows it while it fills in; once read, it says so no more.
+    // Waited for: the list opens.
     let mut app = window(client.clone(), socket.clone());
     type_in(&mut app, "/switch").await;
     app.key(key(KeyCode::Enter)).await;
-    assert!(app.agents.as_ref().is_some_and(|agents| agents.reading));
-    type_in(&mut app, "zz").await;
-    assert!(app.input.is_empty());
     app.beside_done().await;
-    let agents = app.agents.as_ref().expect("the list stays open");
-    assert!(!agents.reading);
-    assert_eq!(agents.filter(), "zz");
-    // Closed before it was read: it opens no more.
+    assert!(app.agents.is_some());
+    // Typed on meanwhile: what was typed stays where it was typed.
     let mut app = window(client, socket);
     type_in(&mut app, "/switch").await;
     app.key(key(KeyCode::Enter)).await;
-    app.key(key(KeyCode::Esc)).await;
+    type_in(&mut app, "hi").await;
     app.beside_done().await;
     assert!(app.agents.is_none());
+    assert_eq!(app.input.trim(), "hi");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

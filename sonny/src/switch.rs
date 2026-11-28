@@ -72,8 +72,6 @@ pub struct Picker {
     list: crate::list::Picker,
     /// The agent this window is.
     pub current: String,
-    /// The list is still being read: what shows is what came so far.
-    pub reading: bool,
 }
 
 /// The agents in `bots` (the daemon's `bots` rows), ordered for a window
@@ -179,32 +177,6 @@ impl Picker {
             list: crate::list::Picker::new(names(&agents), pick).weighed(picks),
             agents,
             current: current.to_owned(),
-            reading: false,
-        }
-    }
-
-    /// The list open before anything of it is read, saying it is reading.
-    pub fn reading(current: &str) -> Self {
-        Self {
-            reading: true,
-            ..Self::of(Vec::new(), 0, Picks::default(), current)
-        }
-    }
-
-    /// `agents` in place of those listed, as the list is read in parts:
-    /// what was typed still narrows it, and the agent the person picked
-    /// stays picked where it is still listed. `whole` once the last part
-    /// came; `picks` once read.
-    pub fn refill(&mut self, agents: Vec<Agent>, pick: usize, picks: Option<Picks>, whole: bool) {
-        if let Some(picks) = picks {
-            self.list.weigh(picks);
-        }
-        let kept = self.list.refill(names(&agents), pick);
-        self.agents = agents;
-        self.reading = !whole;
-        let filter = self.list.filter().to_owned();
-        if !kept && !filter.is_empty() {
-            self.narrow(filter);
         }
     }
 
@@ -484,58 +456,12 @@ mod tests {
     }
 
     #[test]
-    fn a_list_read_in_parts_fills_in_under_what_the_person_did() {
-        let every = bots();
-        let shop: Vec<Value> = (every.iter())
-            .filter(|bot| bot["name"].as_str().unwrap().starts_with("shop."))
-            .cloned()
-            .collect();
-        // Open before anything is read; the project's own come first.
-        let mut picker = Picker::reading("shop.lead");
-        assert!(picker.reading && picker.rows().is_empty() && picker.chosen().is_none());
-        let (agents, pick) = part(&shop);
-        picker.refill(agents, pick, None, false);
-        assert!(picker.reading);
-        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.ok"));
-        // Untouched, the whole list picks as a list read at once does.
-        let (agents, pick) = part(&every);
-        let mut whole = Picker::reading("shop.lead");
-        whole.refill(agents, pick, None, true);
-        let (agents, pick) = part(&every);
-        picker.refill(agents, pick, None, true);
-        assert!(!picker.reading);
-        assert_eq!(names(&picker), names(&whole));
-        assert_eq!(picker.chosen(), whole.chosen());
-        // Moved by the person, their pick stays where it was, and what
-        // they typed still narrows.
-        let mut picker = Picker::reading("shop.lead");
-        let (agents, pick) = part(&shop);
-        picker.refill(agents, pick, None, false);
-        picker.narrow("web".into());
-        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.web"));
-        let (agents, pick) = part(&every);
-        picker.refill(agents, pick, None, true);
-        assert_eq!(picker.filter(), "web");
-        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.web"));
-        // Typed for one not read yet: the best row once it is.
-        let mut picker = Picker::reading("shop.lead");
-        let (agents, pick) = part(&shop);
-        picker.refill(agents, pick, None, false);
-        picker.narrow("notes".into());
-        assert_eq!(picker.chosen(), None);
-        let (agents, pick) = part(&every);
-        picker.refill(agents, pick, None, true);
-        assert_eq!(picker.chosen().as_deref(), Some("notes"));
-    }
-
-    #[test]
     fn only_the_rows_drawn_are_gathered() {
         let bots: Vec<Value> = (0..500)
             .map(|n| json!({"name": format!("shop.t{n:03}"), "workspace": "/w/shop"}))
             .collect();
         let (agents, pick) = part(&bots);
-        let mut picker = Picker::reading("shop.lead");
-        picker.refill(agents, pick, None, true);
+        let mut picker = Picker::of(agents, pick, Picks::default(), "shop.lead");
         let (rows, first, wide) = picker.drawn(30);
         assert_eq!(
             (rows.len(), first, wide),
