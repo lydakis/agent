@@ -2895,19 +2895,7 @@ struct Passed {
 /// Every bot the daemon has, page by page; `None` when a page could not
 /// be read.
 async fn every_bot(client: &Client) -> Option<Vec<Value>> {
-    let mut bots = Vec::new();
-    let mut after = json!("");
-    loop {
-        let page = (client)
-            .request("bots", json!({"after": after, "limit": 256}))
-            .await
-            .ok()?;
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        match &page["next_after"] {
-            Value::Null => return Some(bots),
-            next => after = next.clone(),
-        }
-    }
+    every_row(client, json!({})).await.ok()
 }
 
 /// One pass of a `/permissions` pick over the agents `lead` made and
@@ -6239,13 +6227,14 @@ type Again = (u64, (Vec<(i64, Value)>, bool), PageRead);
 enum Switching {
     /// The agent named, found.
     To(String),
-    /// Every agent, to list, narrowed by what was typed: what waits on the
-    /// person, the tasks' titles and the picks kept.
+    /// Every agent, to list, narrowed by what was typed: ordered and
+    /// titled beside the window, the agents listed closed, and the picks
+    /// kept.
     List {
         typed: String,
-        bots: Vec<Value>,
-        held: std::collections::HashSet<String>,
-        titles: Box<crate::title::Titles>,
+        agents: Vec<switch::Agent>,
+        pick: usize,
+        closed: std::collections::HashSet<String>,
         picks: Box<fuzzy::Picks>,
     },
     /// What the window says instead.
@@ -8014,18 +8003,28 @@ fn lead_and_lineage(bots: &[Value], lead: &str) -> std::collections::HashSet<Str
 
 /// Every bot named `pattern`, every page of them; none when a page could
 /// not be read.
-async fn bots_named(client: &Client, pattern: &str) -> Option<Vec<Value>> {
+/// Every row of the `bots` listing `ask` names, page after page, each
+/// page's rows taken as they came.
+async fn every_row(client: &Client, ask: Value) -> agent_client::Result<Vec<Value>> {
     let mut bots = Vec::new();
     let mut after = Value::Null;
     loop {
-        let asked = json!({"name": pattern, "limit": 256, "after": after});
-        let page = client.request("bots", asked).await.ok()?;
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        after = page["next_after"].clone();
+        let mut asked = ask.clone();
+        asked["limit"] = json!(256);
+        asked["after"] = after;
+        let mut page = client.request("bots", asked).await?;
+        if let Value::Array(rows) = page["bots"].take() {
+            bots.extend(rows);
+        }
+        after = page["next_after"].take();
         if after.is_null() {
-            return Some(bots);
+            return Ok(bots);
         }
     }
+}
+
+async fn bots_named(client: &Client, pattern: &str) -> Option<Vec<Value>> {
+    every_row(client, json!({"name": pattern})).await.ok()
 }
 
 /// What a lead's windows are named from: its project, the lead, what
@@ -22753,10 +22752,17 @@ impl App {
 
     /// `/switch`'s reads, beside the window, which answers meanwhile: the
     /// first of `names` that is an agent, else every agent, to list
-    /// narrowed by `typed` ([`App::switch_came`]).
+    /// narrowed by `typed` ([`App::switch_came`]), ordered and titled
+    /// beside the window too.
     fn switching(&mut self, typed: &str, names: Vec<String>) {
         let (client, woken, me) = (self.client.clone(), self.woken.clone(), self.bot.clone());
         let (store, picks_kept, typed) = (self.store(), self.picks_kept, typed.to_owned());
+        // Who this window is and follows, for the rows' order and marks.
+        let waiting: std::collections::HashSet<String> = (self.fleet.as_ref())
+            .map(|fleet| fleet.needs.waiting().map(str::to_owned).collect())
+            .unwrap_or_default();
+        let (project, workspace, beside) =
+            (self.project.clone(), self.workspace.clone(), self.beside());
         let (send, receive) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let read = async {
@@ -22770,44 +22776,51 @@ impl App {
                         Err(error) => return Switching::Failed(error.to_string()),
                     }
                 }
-                let mut bots = Vec::new();
-                let mut after = Value::Null;
-                loop {
-                    let asked = json!({"limit": 256, "after": after});
-                    let page = match client.request("bots", asked).await {
-                        Ok(page) => page,
-                        Err(error) => return Switching::Failed(error.to_string()),
-                    };
-                    bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-                    after = page["next_after"].clone();
-                    if after.is_null() {
-                        break;
-                    }
-                }
+                let bots = match every_row(&client, json!({})).await {
+                    Ok(bots) => bots,
+                    Err(error) => return Switching::Failed(error.to_string()),
+                };
                 // What waits on the person, as `/status` says it: a call on
                 // their approval, read now, or a question this window follows.
-                let held = (needs::listing(&client, None).await)
+                let mut held: std::collections::HashSet<String> = (needs::listing(&client, None)
+                    .await)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|held| held.bot)
                     .collect();
-                let kept = tokio::task::spawn_blocking(move || {
+                held.extend(waiting);
+                // Thousands of rows are ordered and titled off the window's
+                // keys.
+                let built = tokio::task::spawn_blocking(move || {
                     let picks = match picks_kept {
                         true => fuzzy::Picks::load("agents"),
                         false => fuzzy::Picks::default(),
                     };
-                    (crate::title::Titles::read(&store), picks)
+                    let mut titles = crate::title::Titles::read(&store);
+                    let (agents, pick) = switch::listed(
+                        &bots,
+                        |bot| held.contains(bot),
+                        |bot| titles.of(bot),
+                        &me,
+                        project.as_deref(),
+                        &workspace,
+                        beside.as_deref(),
+                    );
+                    let closed = (bots.iter())
+                        .filter(|bot| !bot["closed_ms"].is_null())
+                        .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
+                        .collect();
+                    Switching::List {
+                        typed,
+                        agents,
+                        pick,
+                        closed,
+                        picks: Box::new(picks),
+                    }
                 });
-                let Ok((titles, picks)) = kept.await else {
-                    return Switching::Failed("the list was dropped".into());
-                };
-                Switching::List {
-                    typed,
-                    bots,
-                    held,
-                    titles: Box::new(titles),
-                    picks: Box::new(picks),
-                }
+                built
+                    .await
+                    .unwrap_or_else(|_| Switching::Failed("the list was dropped".into()))
             };
             let _ = send.send(read.await);
             woken.notify_one();
@@ -22832,7 +22845,7 @@ impl App {
         if matches!(read, Switching::List { .. }) && asked != self.acted {
             return;
         }
-        let (typed, bots, held, mut titles, picks) = match read {
+        let (typed, agents, pick, closed, picks) = match read {
             Switching::To(bot) => {
                 self.switch_window(bot);
                 return;
@@ -22843,33 +22856,16 @@ impl App {
             }
             Switching::List {
                 typed,
-                bots,
-                held,
-                titles,
+                agents,
+                pick,
+                closed,
                 picks,
-            } => (typed, bots, held, *titles, *picks),
+            } => (typed, agents, pick, closed, *picks),
         };
-        let fleet = self.fleet.as_ref();
-        let waits =
-            |bot: &str| held.contains(bot) || fleet.is_some_and(|fleet| fleet.needs.waits(bot));
-        let beside = self.beside();
-        let mut picker = switch::Picker::new(
-            &bots,
-            waits,
-            |bot| titles.of(bot),
-            &self.bot,
-            self.project.as_deref(),
-            &self.workspace,
-            beside.as_deref(),
-            picks,
-        );
+        let mut picker = switch::Picker::of(agents, pick, picks, &self.bot);
         if !typed.is_empty() {
             picker.narrow(typed);
         }
-        let closed: std::collections::HashSet<String> = (bots.iter())
-            .filter(|bot| !bot["closed_ms"].is_null())
-            .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
-            .collect();
         self.switch_asks(&mut picker, &closed);
         self.agents = Some(picker);
     }
@@ -24354,7 +24350,10 @@ impl App {
                 return;
             }
             if let Some(agents) = &self.agents {
-                let items: Vec<list::Item> = (agents.rows().into_iter())
+                let room = composer.y as usize;
+                // Only the rows drawn are built, of a list of thousands.
+                let (drawn, first, wide) = agents.drawn(room);
+                let items: Vec<list::Item> = (drawn.into_iter())
                     .map(|(agent, found)| {
                         list::Item::new(agent.name.clone(), agent.about.clone())
                             .title(agent.title.clone())
@@ -24363,10 +24362,10 @@ impl App {
                             .found(&found)
                     })
                     .collect();
-                let room = composer.y as usize;
+                let signed = !items.is_empty();
                 over(
                     frame,
-                    list::lines(&items, agents.at(), width, room),
+                    list::lines_of(&items, first, agents.at(), (wide, signed), width),
                     composer,
                 );
                 let (line, cursor) = agents.line("type to narrow");
