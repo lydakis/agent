@@ -952,6 +952,9 @@ struct State {
     /// Words since the last call, by kind, and the part of the turn they
     /// are in: a new message after each call.
     part: u32,
+    /// The running turn's calls so far, each of which ends a reply: the
+    /// bot's words after one are its next.
+    parted: HashSet<String>,
     /// The words of this part sent as they streamed.
     streamed: String,
     /// The calls shown running, by turn and call: a later turn may use a
@@ -1019,6 +1022,16 @@ struct State {
 const REPLIES: usize = 64;
 
 impl State {
+    /// Call `call` of `turn` was announced: started, lifted or ended,
+    /// denied ones too. Of the running turn, the bot's next words are a
+    /// reply of their own, as a replay counts the turn's calls.
+    fn parted(&mut self, turn: Option<i64>, call: &str) {
+        if turn.is_some() && turn == self.running && self.parted.insert(call.to_owned()) {
+            self.part += 1;
+            self.streamed.clear();
+        }
+    }
+
     /// Whether message `message`, which a turn took in, is still to be
     /// shown: not when this session showed it as it sent it.
     fn unseen(&mut self, message: i64) -> bool {
@@ -1310,18 +1323,22 @@ impl Session {
         // newest node the events before the live cursor name is where the
         // replay ends and the live follow takes over.
         let mut written = None;
-        // Each turn's replies so far, as the live follow numbers them: one
-        // more with each call it started.
-        let mut parts: HashMap<i64, u32> = HashMap::new();
+        // Each turn's calls so far, as the live follow counts them: each
+        // ends a reply.
+        let mut parts: HashMap<i64, HashSet<String>> = HashMap::new();
         let cursor = live(&mut events, |event| {
             let data = &event["data"];
             written = written.max(data["node"].as_i64());
             if let Some(turn) = event["turn"].as_i64() {
                 match event["event"].as_str() {
                     Some("accepted") => {
-                        parts.insert(turn, 0);
+                        parts.insert(turn, HashSet::new());
                     }
-                    Some("tool_started") => *parts.entry(turn).or_default() += 1,
+                    Some("tool_started" | "tool_completed" | "call_lifted") => {
+                        if let Some(call) = data["call_id"].as_str() {
+                            parts.entry(turn).or_default().insert(call.to_owned());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1421,9 +1438,10 @@ impl Session {
                 state.agent = None;
             }
             state.running = running;
-            state.part = running
-                .and_then(|turn| parts.get(&turn).copied())
-                .unwrap_or(0);
+            state.parted = running
+                .and_then(|turn| parts.remove(&turn))
+                .unwrap_or_default();
+            state.part = state.parted.len() as u32;
             state.calls = calls;
             state.lifted = lifted;
             state.gated = gated;
@@ -2217,6 +2235,7 @@ impl Session {
                 // A steer joins the running turn, whose calls go on.
                 if state.running != turn {
                     state.part = 0;
+                    state.parted.clear();
                     state.streamed.clear();
                     state.end_calls(out, id, None);
                 }
@@ -2303,8 +2322,7 @@ impl Session {
             }
             "tool_started" => {
                 let (call, name, arguments) = started_call(&client, &bot, data).await;
-                state.part += 1;
-                state.streamed.clear();
+                state.parted(turn, &call);
                 // The bot's reaction to the person's newest message here, as
                 // a client may show it; one in another bot is that bot's.
                 if name == reactions::TOOL {
@@ -2335,6 +2353,7 @@ impl Session {
             // turn's answer to it is its handle, and it ends later.
             "call_lifted" => {
                 let key = (turn, data["call_id"].as_str().unwrap_or("").to_owned());
+                state.parted(turn, &key.1);
                 // Its question to the person, if any, waits on with it.
                 for waiting in state.asking.values_mut() {
                     if waiting.call == key {
@@ -2348,6 +2367,7 @@ impl Session {
             }
             "tool_completed" | "lifted_ended" => {
                 let call = data["call_id"].as_str().unwrap_or("").to_owned();
+                state.parted(turn, &call);
                 let key = (turn, call.clone());
                 let lifted = event["event"] == "lifted_ended";
                 if !lifted && state.lifted.contains(&key) {
@@ -2929,6 +2949,7 @@ impl Session {
             workspace: &workspace,
             calls: HashMap::new(),
             parts: HashMap::new(),
+            replies: Vec::new(),
         };
         let mut next = 0;
         while next < nodes.len() {
@@ -2946,17 +2967,30 @@ impl Session {
             }
             next += items.len();
             for entry in &items {
-                let node = entry["node"].as_i64();
-                let Some(turn) = node.and_then(|node| turns.get(&node)) else {
+                let Some(node) = entry["node"].as_i64() else {
+                    continue;
+                };
+                let Some(turn) = turns.get(&node) else {
                     continue;
                 };
                 // The message it holds by its handle, the bot it was sent
                 // to and its number: a fork's history keeps its source's.
                 let handle = entry["handle"].as_str();
                 for item in crate::responses(&entry["item"]) {
-                    history.item(*turn, &item, handle);
+                    history.item(*turn, node, &item, handle);
                 }
             }
+        }
+        // Older than any the live follow showed meanwhile.
+        let mut state = self.state.lock().await;
+        let by = state.bound.as_ref().and_then(|bound| bound.bot_id);
+        let live: Vec<_> = state.replies.drain(..).collect();
+        let replayed = (history.replies.into_iter()).map(|(id, node, first)| (id, by, node, first));
+        for reply in replayed.chain(live) {
+            if state.replies.len() == REPLIES {
+                state.replies.pop_front();
+            }
+            state.replies.push_back(reply);
         }
         Ok(())
     }
@@ -2981,10 +3015,13 @@ struct History<'a> {
     workspace: &'a str,
     calls: HashMap<String, (i64, String, Value)>,
     parts: HashMap<i64, u32>,
+    /// The bot's replies shown, oldest first, by id, node and first line:
+    /// a client may react to them as to live ones.
+    replies: Vec<(String, i64, String)>,
 }
 
 impl History<'_> {
-    fn item(&mut self, turn: i64, item: &Value, message: Option<&str>) {
+    fn item(&mut self, turn: i64, node: i64, item: &Value, message: Option<&str>) {
         let part = *self.parts.get(&turn).unwrap_or(&0);
         match item["type"].as_str() {
             Some("function_call") => {
@@ -3058,12 +3095,13 @@ impl History<'_> {
                 if text.is_empty() {
                     return;
                 }
+                let id = message_id(self.bot, Some(turn), part);
                 self.out.replayed(
                     self.session,
                     json!({"sessionUpdate": "agent_message",
-                    "messageId": message_id(self.bot, Some(turn), part),
-                    "content": [{"type": "text", "text": text}]}),
+                    "messageId": id, "content": [{"type": "text", "text": text}]}),
                 );
+                self.replies.push((id, node, first_line(&text)));
             }
             _ => {}
         }
@@ -4878,6 +4916,8 @@ mod tests {
             .expect("the call ends");
         assert_eq!(ended["status"], "failed");
         assert_eq!(ended["title"], "rm -rf build");
+        // Its words after it are its next reply, as a replay counts them.
+        assert_eq!(session.state.lock().await.part, 1);
     }
 
     #[test]
@@ -5127,6 +5167,17 @@ mod tests {
                 json!(["agent_message", "calc.lead-3-1", null]),
                 json!(["replay_complete", null, null]),
                 json!(["agent_message_chunk", null, null]),
+            ]
+        );
+        // Its replies may be reacted to, as live ones.
+        let replies: Vec<(String, i64)> = (session.state.lock().await.replies.iter())
+            .map(|(id, _, node, _)| (id.clone(), *node))
+            .collect();
+        assert_eq!(
+            replies,
+            [
+                ("calc.lead-3-0".to_owned(), 11),
+                ("calc.lead-3-1".to_owned(), 14)
             ]
         );
         // Only up to where the live follow began: what came after is live.
