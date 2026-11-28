@@ -72,18 +72,39 @@ impl Item {
 /// `ROWS` rows around the pick, fewer when only `room` rows are free above
 /// the composer, so the pick is always among those drawn.
 pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line<'static>> {
-    let shown = items.len().min(ROWS).min(room.saturating_sub(1));
-    let first = (pick + 1)
-        .saturating_sub(shown)
-        .min(items.len().saturating_sub(shown));
     let wide = items
         .iter()
         .map(|item| item.name.width())
         .max()
         .unwrap_or(0);
     let signed = items.iter().any(|item| item.sign.is_some());
+    let shown = window(items.len(), pick, room);
+    let first = shown.start;
+    lines_of(&items[shown], first, pick, (wide, signed), width)
+}
+
+/// Which of `len` rows [`lines`] draws with `pick` picked and `room` rows
+/// free: a long list builds only the rows it shows.
+pub fn window(len: usize, pick: usize, room: usize) -> std::ops::Range<usize> {
+    let shown = len.min(ROWS).min(room.saturating_sub(1));
+    let first = (pick + 1)
+        .saturating_sub(shown)
+        .min(len.saturating_sub(shown));
+    first..first + shown
+}
+
+/// [`lines`] of the rows [`window`] gave, `items` from the row `first`
+/// on, each name padded to `wide` columns, a sign's place kept where
+/// `signed`, as every row of the list measures them.
+pub fn lines_of(
+    items: &[Item],
+    first: usize,
+    pick: usize,
+    (wide, signed): (usize, bool),
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut out = vec![Line::default()];
-    for (at, item) in items.iter().enumerate().skip(first).take(shown) {
+    for (at, item) in (first..).zip(items) {
         let mark = match item.current {
             true => "• ",
             false => "  ",

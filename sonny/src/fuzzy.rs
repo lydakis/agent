@@ -37,6 +37,14 @@ fn breaks(c: char) -> bool {
 
 /// How `name` matches `typed`, ignoring case, if it does.
 pub fn find(name: &str, typed: &str) -> Option<Found> {
+    // Nothing typed: every name whole, with nothing lowered for it.
+    if typed.is_empty() {
+        return Some(Found {
+            tier: Tier::Whole,
+            spread: 0,
+            at: Vec::new(),
+        });
+    }
     // Each lowered char keeps the place of the char it came from, as some
     // lower into more than one.
     let (lowered, from): (Vec<char>, Vec<usize>) = (name.chars().enumerate())
