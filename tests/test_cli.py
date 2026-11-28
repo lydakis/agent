@@ -2150,7 +2150,7 @@ class CliTests(ModelFixture):
         # their folder, or Sonny's above it, neither reads nor replaces one.
         home = self.path/'home'
         programs = home/'.agent'/'sonny'/'programs'
-        program = programs/'agent-browser'/'agent-browser-linux-x64'
+        program = programs/'agent-browser'/'bin'/'agent-browser-linux-x64'
         program.parent.mkdir(parents=True)
         program.write_text('#!/bin/sh\necho pinned\n')
         env = {**clean_env(), 'HOME': str(home)}

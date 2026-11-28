@@ -150,18 +150,30 @@ def browser(program):
             names.add(owner.group(1))
             shown.setdefault(owner.group(1), set()).update(flags(body))
             continue
+        # A line indented further goes on with the line above it: its
+        # flags are that command's (`webmcp invoke <tool>`, then `--params`
+        # on the next line).
+        last = None
         for line in body:
             word = re.match(r"^  ([a-z][a-z0-9]*)(\s.*|$)", line)
             if word:
-                names.add(word.group(1))
-                shown.setdefault(word.group(1), set()).update(flags([word.group(2)]))
+                last = word.group(1)
+                names.add(last)
+                shown.setdefault(last, set()).update(flags([word.group(2)]))
+            elif last and re.match(r"^   +\S", line):
+                shown[last].update(flags([line]))
+            else:
+                last = None
     # The flags a line runs a command with are that command's too, since a
     # command's own help can leave some out.
     for line in (text + skill).splitlines():
         runs = RUNS.match(line)
         if runs:
             shown.setdefault(runs.group(1), set()).update(flags([runs.group(2)]))
+    # And any other word of its whole help that has a help of its own, as
+    # those its prose names do (`press/keydown/keyup`).
     words = names | set(shown) | set(re.findall(r"`([a-z][a-z0-9]*)`", text + skill))
+    words |= set(re.findall(r"(?<![\w-])[a-z][a-z0-9]*(?![\w-])", text))
     seen = set()
     while words - seen:
         name = min(words - seen)

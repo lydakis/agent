@@ -57,8 +57,9 @@ jobs:
         # check needs; their native programs are what it runs. npm names
         # the architecture as their packages do (x64, arm64).
         # agent-browser's is in the package npm installs for this machine
-        # beside it (@agent-browser/cli-linux-ARCH-gnu, from 0.43.0);
-        # agent-desktop's in its own bin/.
+        # beside it (@agent-browser/cli-linux-ARCH-gnu, from 0.43.0), and
+        # its skills, which its help is listed with, in its own package;
+        # agent-desktop's program in its own bin/.
         run: |
           mkdir -p .local/upstream
           npm install --prefix .local/upstream --no-save --ignore-scripts agent-browser@latest agent-desktop@latest
@@ -70,6 +71,7 @@ jobs:
           echo "BROWSER_PROGRAM=$browser" >> "$GITHUB_ENV"
           echo "DESKTOP_PROGRAM=$desktop" >> "$GITHUB_ENV"
           echo "MACHINE=linux-$arch" >> "$GITHUB_ENV"
+          echo "AGENT_BROWSER_SKILLS_DIR=$modules/agent-browser/skill-data" >> "$GITHUB_ENV"
       - name: List what they document
         run: |
           python3 sonny/upstream/inventory.py list agent-browser "$BROWSER_PROGRAM" > .local/upstream/agent-browser.txt
@@ -95,15 +97,10 @@ jobs:
             {
               cat "$news"
               echo
-              echo "Sonny's tool refuses each of these until it lists it. Add those agents should have to its lists in \`sonny/src/\` (or decide not to), then refresh \`sonny/upstream/$program.txt\` with \`python3 sonny/upstream/inventory.py list $program <native program>\` and move its pin in \`sonny/src/trusted.rs\` to that version and its npm integrity in the same pull request, which closes this. Run this workflow on that branch: it installs the pins on Linux x64 and ARM."
+              echo "Sonny's tool refuses each of these until it lists it. Add those agents should have to its lists in \`sonny/src/\` (or decide not to), then refresh \`sonny/upstream/$program.txt\` with \`python3 sonny/upstream/inventory.py list $program <native program>\` and move its pin in \`sonny/src/trusted.rs\` to that version, with the npm integrity of each platform's package, in the same pull request, which closes this. Run this workflow on that branch: it installs the pins on Linux x64 and ARM."
               echo
               echo "Found on $MACHINE by [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
             } > "$news.issue"
-            if [ "$program" = agent-browser ]; then
-              # Its pin is older than the layout it publishes now.
-              echo >> "$news.issue"
-              echo "From 0.43.0 agent-browser publishes each platform's program in a package of its own, \`@agent-browser/cli-PLATFORM\` (\`-gnu\` on Linux), holding \`bin/agent-browser\`, and none in its own tarball. Sonny's installer in \`sonny/src/trusted.rs\` fetches the program from agent-browser's own tarball, so moving the pin past 0.42 means it fetching this platform's package, against an integrity pinned for each platform." >> "$news.issue"
-            fi
             gh issue create --title "$title" --body-file "$news.issue"
           done
       - name: Check what the tools pass is still there
