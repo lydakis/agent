@@ -1204,7 +1204,9 @@ impl Session {
         state.reported = Some(plain);
         let mut update = now.clone();
         update["sessionUpdate"] = json!("state_update");
-        if state.opening > 0 && now["state"] == "idle" {
+        // Held from the work's end, and after it, in order, so what came
+        // later is not overtaken by it.
+        if state.opening > 0 && (now["state"] == "idle" || !state.held.is_empty()) {
             state.held.push(update);
         } else {
             agent.out.update(&self.id, update);
@@ -2884,8 +2886,14 @@ impl Session {
             return;
         }
         // Its brief, the first message it was sent, as the lead's to it.
-        if let Some((first, brief)) = brief(client, task).await {
-            session.state.lock().await.sent.insert(first);
+        if let Some((first, brief, waiting)) = brief(client, task).await {
+            let mut state = session.state.lock().await;
+            state.sent.insert(first);
+            // One in line is the subagent's to take back on cancel.
+            if waiting {
+                state.queued.insert(first);
+            }
+            drop(state);
             out.update(
                 &child,
                 json!({"sessionUpdate": "session_message", "messageId": user_id(task, Some(first)),
@@ -3591,7 +3599,7 @@ async fn open_task(
             .request("inspect", json!({"bot": bot}))
             .await
             .map_err(|e| e.to_string())?;
-        let (_, brief) = brief(client, &bot).await.ok_or("the task has no brief")?;
+        let (_, brief, _) = brief(client, &bot).await.ok_or("the task has no brief")?;
         let workspace = record["workspace"].as_str().unwrap_or_default();
         let message = t3::expect(&bot, &brief, at.thread)?;
         let child = json!({"task": message, "title": name, "clientRequestId": bot});
@@ -3993,17 +4001,26 @@ fn quoted_path(path: &str) -> String {
 
 /// A task's brief, the first message it was sent, by its number: whether
 /// or not a turn has taken it in yet, as a task may wait for room.
-async fn brief(client: &Client, bot: &str) -> Option<(i64, String)> {
+async fn brief(client: &Client, bot: &str) -> Option<(i64, String, bool)> {
     let messages = client
         .request("messages", json!({"bot": bot, "after": 0, "limit": 1}))
         .await
         .ok()?;
     let first = messages["messages"][0]["message"].as_i64()?;
+    // Still in line, as when the daemon has no room for it yet.
+    let waiting = matches!(
+        messages["messages"][0]["status"].as_str(),
+        Some("queued" | "ready")
+    );
     let prompts = client
         .request("prompts", json!({"bot": bot, "turn": first}))
         .await
         .ok()?;
-    Some((first, prompts["prompts"][0]["text"].as_str()?.to_owned()))
+    Some((
+        first,
+        prompts["prompts"][0]["text"].as_str()?.to_owned(),
+        waiting,
+    ))
 }
 
 fn text_content(text: &str) -> Value {
@@ -4904,6 +4921,37 @@ mod tests {
         let said = written(&agent);
         assert!(said.iter().any(|m| m["method"] == "$/cancel_request"));
         assert!(session.state.lock().await.forms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn states_held_while_a_task_thread_opens_keep_their_order() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|_| json!({})).await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        let mut state = session.state.lock().await;
+        state.opening = 1;
+        session.say_state(
+            &agent,
+            &mut state,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+        );
+        session.say_state(&agent, &mut state, json!({"state": "running"}));
+        assert!(written(&agent).is_empty());
+        let held: Vec<Value> = state.held.iter().map(|u| u["state"].clone()).collect();
+        assert_eq!(held, [json!("idle"), json!("running")]);
+    }
+
+    #[tokio::test]
+    async fn a_brief_still_in_line_says_so() {
+        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
+            Some("messages") => json!({"messages": [{"message": 4, "status": "queued"}]}),
+            _ => json!({"prompts": [{"text": "Fix it"}]}),
+        })
+        .await;
+        assert_eq!(
+            brief(&client, "calc.fix").await,
+            Some((4, "Fix it".into(), true))
+        );
     }
 
     #[tokio::test]
