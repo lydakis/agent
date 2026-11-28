@@ -209,6 +209,16 @@ impl Out {
     fn withdraw(&self, id: i64) {
         let waiting = self.waiting.lock().ok().and_then(|mut w| w.remove(&id));
         drop(waiting);
+        // One still held was never sent: it is dropped, not taken back.
+        if let Ok(mut held) = self.held.lock() {
+            for kept in held.values_mut() {
+                let unsent = |m: &Value| m["id"] == id && m.get("method").is_some();
+                if let Some(at) = kept.iter().position(unsent) {
+                    kept.remove(at);
+                    return;
+                }
+            }
+        }
         self.write(&json!({"jsonrpc": "2.0", "method": "$/cancel_request",
             "params": {"requestId": id}}));
     }
@@ -2478,6 +2488,28 @@ impl Session {
                     tokio::spawn(async move { lead.adopt(&agent, &client, &task, linked).await });
                     return;
                 }
+                // A task of the lead's it woke with a message: its
+                // subagent too, if it is not one yet.
+                if name == "send_message"
+                    && !failed
+                    && agent.t3.is_none()
+                    && self.parent.is_none()
+                    && let Some(to) = (arguments["to"].as_str())
+                        .map(str::trim)
+                        .filter(|to| !project::is_lead(to))
+                    && let Some(lead) = this.clone()
+                    && let Some(lead_id) = state.bound.as_ref().and_then(|b| b.bot_id)
+                {
+                    let (agent, client, to) = (agent.clone(), client.clone(), to.to_owned());
+                    tokio::spawn(async move {
+                        if let Ok(record) = client.request("inspect", json!({"bot": to})).await
+                            && record["created_by_id"].as_i64() == Some(lead_id)
+                            && task(&record)
+                        {
+                            lead.adopt(&agent, &client, &to, None).await;
+                        }
+                    });
+                }
                 // A task the lead started opens as a thread of its own.
                 if started
                     && let Some(project) = project
@@ -2755,6 +2787,11 @@ impl Session {
         let Some(bot_id) = record["bot_id"].as_i64() else {
             return;
         };
+        if !(agent.sessions.lock())
+            .is_ok_and(|s| s.get(&self.id).is_some_and(|o| Arc::ptr_eq(o, self)))
+        {
+            return;
+        }
         // Its own under this session: another session on the same lead
         // follows the task in a session of its own.
         let child = format!("{}/{}", self.id, lead_session(task, bot_id, client.store()));
@@ -2797,8 +2834,17 @@ impl Session {
             switching: AsyncMutex::new(()),
             children: Mutex::new(HashMap::new()),
         });
-        if let Ok(mut sessions) = agent.sessions.lock() {
-            sessions.insert(child.clone(), session.clone());
+        // Only while this session is open: one closed or replaced since
+        // has no subagents.
+        let registered = agent.sessions.lock().is_ok_and(|mut sessions| {
+            let open = (sessions.get(&self.id)).is_some_and(|open| Arc::ptr_eq(open, self));
+            if open {
+                sessions.insert(child.clone(), session.clone());
+            }
+            open
+        });
+        if !registered {
+            return;
         }
         // Its brief, the first message it was sent, as the lead's to it.
         if let Some((first, brief)) = brief(client, task).await {
@@ -4773,6 +4819,34 @@ mod tests {
         .await;
         let session = bound_session(&agent, "s1", client, "calc.lead", None);
         assert!(session.replay(&agent.out).await.is_err());
+    }
+
+    #[test]
+    fn a_request_withdrawn_while_held_is_never_sent() {
+        let agent = test_agent();
+        agent.out.hold("s1");
+        let (id, _answer) = agent.out.reserve();
+        agent
+            .out
+            .request(id, "session/request_permission", json!({"sessionId": "s1"}));
+        agent.out.withdraw(id);
+        agent.out.release("s1");
+        assert_eq!(written(&agent), Vec::<Value>::new());
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_adopts_no_task() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
+            Some("inspect") => json!({"name": "calc.fix", "bot_id": 9, "workspace": "/w"}),
+            _ => json!({}),
+        })
+        .await;
+        let session = bound_session(&agent, "s1", client.clone(), "calc.lead", None);
+        agent.sessions.lock().unwrap().remove("s1");
+        session.adopt(&agent, &client, "calc.fix", None).await;
+        assert_eq!(agent.sessions.lock().unwrap().len(), 0);
+        assert_eq!(written(&agent), Vec::<Value>::new());
     }
 
     #[tokio::test]
