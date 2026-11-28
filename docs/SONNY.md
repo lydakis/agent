@@ -2116,8 +2116,10 @@ pages, an open card's refresh and the reads Sonny repeats every few seconds
 too, as Codex's TUI sends its ops and hears back as events. A reconnect's
 catching up (what came since the last item drawn, the turn still running, its
 approvals and companions) is read beside the loop too, and drawn when it has
-all come. Opening a card (its first read) and `/switch` still read before they
-show.
+all come. Going to another agent, a window's start and drawing the conversation
+again (`/verbose`, a theme) show at once and say `reading…` until their read
+comes ([below](#what-a-read-shows)); `/commons` and `/status` read beside the
+loop too.
 
 The window holds only the event it is showing, as Codex's TUI takes one at a
 time. The rest wait in the connection's own queue (4,096 events or 8 MiB), so a fast
@@ -2134,6 +2136,32 @@ and the person types on while the reply streams:
 ![Before: with the daemon's answers held, Enter freezes the window, the steer still in the composer](sonny/keys-held-daemon-main.png)
 
 </details>
+
+### What a read shows
+
+Whatever waits on a read says so where its answer will appear, from the key
+until the answer lands: one muted word, `reading…`, and after two seconds its
+time, `reading… 3s`, counted by the second as the running row counts a turn.
+No spinner. One function, `reading.rs`, draws it, and the empty sentence and
+the failure (`✗ could not read usage: why`) that can take its place.
+
+- Going to another agent (`/switch NAME`, Projects, alt+arrows, ctrl+g) and a
+  window's start draw the new window at once: its composer, and `reading…`
+  where the conversation will be. `/switch NAME` draws it while it asks for
+  the agent, and Esc there stays on this one.
+- `/verbose` and a theme draw the cleared window with `reading…` on its first
+  row, and read the conversation beside the loop.
+- Read back to the first row while older rows are read, the top row says
+  `reading…` until they come.
+
+Reads the person did not ask for (a card's refresh, the reads repeated every
+few seconds) show nothing. A test walks every command and every key that goes
+to another agent with the daemon's every reply held, and fails on a key that
+draws nothing new or says none before its read.
+
+![Before and after, dark, light and NO_COLOR: a window starting with every reply held 4 s, past two seconds](sonny/reading-start-3s.png)
+
+![Before and after: Page Up to the first row read while the older page is out](sonny/reading-scroll.png)
 
 ## Checks
 

@@ -87,6 +87,7 @@ mod project;
 mod projects;
 mod prompt;
 mod reactions;
+mod reading;
 mod recall;
 mod repick;
 mod resolved;
@@ -342,6 +343,9 @@ static ARGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// What **Projects** read in the window `/switch` left, for the window it
 /// opened in its place: its page opens on them.
 static PROJECTS_LEFT: std::sync::Mutex<Option<Box<ProjectsKept>>> = std::sync::Mutex::new(None);
+/// When the key that took the window to another agent was pressed, for
+/// the window opened in its place: its sign counts from then.
+static OPENED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
 /// [`ARGS`]: the process's own until a window opened in another's place.
 fn args() -> Vec<String> {
@@ -375,6 +379,80 @@ fn let_screen_go() {
     term::restore();
     let _ = disable_raw_mode();
 }
+/// A window's first frame, drawn as soon as its agent is known and until
+/// the window draws whole: the composer on that agent, and the sign on the
+/// conversation's first row, its time counted past two seconds (the
+/// Rulebook's Reading). It covers whatever the screen held, a window left
+/// by going to another agent included.
+struct Opening {
+    /// Cleared once the window draws: nothing draws the opening after.
+    live: Arc<std::sync::Mutex<bool>>,
+}
+
+impl Opening {
+    /// The opening on agent `name`, read since `since`: drawn now, and
+    /// again each second once its sign carries its time.
+    fn start(name: &str, since: Instant) -> Self {
+        let live = Arc::new(std::sync::Mutex::new(true));
+        draw_opening(name, since);
+        let (still, name) = (live.clone(), name.to_owned());
+        tokio::spawn(async move {
+            let mut next = since + reading::CLOCK_AFTER;
+            loop {
+                tokio::time::sleep_until(next.into()).await;
+                let still = still.lock().unwrap_or_else(|e| e.into_inner());
+                if !*still {
+                    return;
+                }
+                draw_opening(&name, since);
+                next += Duration::from_secs(1);
+            }
+        });
+        Self { live }
+    }
+
+    /// The window draws from now: the opening is not drawn again.
+    fn end(&self) {
+        *self.live.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// The opening's one frame (see [`Opening`]).
+fn draw_opening(name: &str, since: Instant) {
+    let Ok(mut terminal) = Terminal::new(frames::Backend::screen()) else {
+        return;
+    };
+    let _ = frames::frame(|| {
+        wipe(&mut terminal)?;
+        terminal.draw(|frame| opening(frame, name, since))?;
+        Ok(())
+    });
+}
+
+/// The opening drawn on `frame`: the sign where the conversation's first
+/// row goes, over the composer on agent `name`.
+fn opening(frame: &mut ratatui::Frame, name: &str, since: Instant) {
+    let area = frame.area();
+    if area.height < 6 || area.width < 20 {
+        return;
+    }
+    let row = |y: u16| Rect::new(0, y, area.width, 1);
+    let sign = Line::from(vec![Span::raw("  "), reading::sign(since)]);
+    frame.render_widget(Paragraph::new(sign), row(area.height - 5));
+    let composer = Line::from(vec![
+        Span::raw("  "),
+        Span::raw("› ").bold(),
+        Span::raw(format!("Message {}", spoken(name))).dim(),
+    ]);
+    frame.render_widget(Paragraph::new(composer), row(area.height - 3));
+}
+
 /// Into the alternate screen with the mouse, which Sonny owns while it
 /// runs, or out of it, the keys told apart on the screen it is on, and the
 /// terminal's colour-scheme reports heard while it is there.
@@ -4318,6 +4396,16 @@ async fn run() -> Result<bool, String> {
     let held = SCREEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
+    // From the key that went to another agent, else from now.
+    let since =
+        (OPENED_AT.lock().unwrap_or_else(|e| e.into_inner()).take()).unwrap_or_else(Instant::now);
+    // Opened in another's place, on an agent named: the window becomes its
+    // at once, reading (the Rulebook's Reading). A side chat opens on its
+    // window's alternate screen and an agent in another's pane draws there.
+    let ours = options.side.is_none() && !options.embedded;
+    let mut opening = (options.bot.as_deref())
+        .filter(|_| held && ours)
+        .map(|bot| Opening::start(bot, since));
     // What Sonny does as it starts, done once.
     if !held {
         // The program this window runs, so one installed over it later is
@@ -4400,6 +4488,20 @@ async fn run() -> Result<bool, String> {
             resume::report(&reopen(&name), &dir);
         }
     }
+    // The screen, the terminal asked what it draws, once: a window opened
+    // in another's place keeps them. Up as soon as the agent is known, so
+    // the window says it is reading while the rest is read.
+    if !held {
+        enable_raw_mode().map_err(|e| e.to_string())?;
+        SCREEN_HELD.store(true, std::sync::atomic::Ordering::Relaxed);
+        term::detect();
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+        keys_apart(true);
+        own_screen(true);
+    }
+    if ours && opening.is_none() {
+        opening = Some(Opening::start(&name, since));
+    }
     // The daemon's `stats` names this window's connections by its agent.
     let _ = client.label(&name).await;
     // Everything after now arrives live; history is read from the bot's
@@ -4416,28 +4518,18 @@ async fn run() -> Result<bool, String> {
         trigger::cleanup_by_default(&bot, &options.store, &options.socket);
     }
 
-    // The screen, the terminal asked what it draws, once: a window opened
-    // in another's place keeps them.
-    let held = SCREEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
-    if !held {
-        enable_raw_mode().map_err(|e| e.to_string())?;
-        SCREEN_HELD.store(true, std::sync::atomic::Ordering::Relaxed);
-        term::detect();
-        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-        keys_apart(true);
-        own_screen(true);
-    }
     let mut terminal = Terminal::new(frames::Backend::screen()).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
-    if !held {
+    if !held && !ours {
         let _ = wipe(&mut terminal);
     }
     let mut app = App::new(client, &name, &bot, options.clone());
-    // The window this one opened in place of stays on the screen until
-    // this one's first frame clears it and draws whole, in one update; its
-    // **Projects** open on what it read.
+    // The opening, or the window this one opened in place of, stays on the
+    // screen until this one's first frame clears it and draws whole, in
+    // one update; **Projects** open on what the window before read.
+    app.stale = true;
+    app.opening = opening;
     if held {
-        app.stale = true;
         app.projects_kept = PROJECTS_LEFT
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -6514,6 +6606,8 @@ type ContextRead = Result<context::Parts, String>;
 /// What a read for an open card found ([`App::reread`]).
 enum CardRead {
     Commands(Result<Value, String>),
+    /// What `/commons` read of its folder, beside the window.
+    Commons(Box<Option<commons::Read>>),
     /// What the audit read, with the request it asked: a filter changed
     /// meanwhile leaves it unshown.
     Audit(Value, Result<Value, String>),
@@ -7335,6 +7429,14 @@ struct App {
     /// What the terminal shows may not be the frame last drawn, so the
     /// next draw writes every cell again.
     stale: bool,
+    /// The window's opening, drawn until this window's first frame.
+    opening: Option<Opening>,
+    /// `/switch NAME` reading which agent it names: the window shows that
+    /// agent's opening meanwhile, from the key (the Rulebook's Reading).
+    switching_to: Option<(String, Instant)>,
+    /// When the conversation, cleared to be drawn again, was asked for:
+    /// its first row says it is reading until it comes.
+    repainting: Option<Instant>,
     /// The links last written over the screen, written again only when
     /// they or what is under them change.
     links_written: screen::Written,
@@ -7538,6 +7640,11 @@ struct App {
     /// from, what the daemon listed there, and the page read.
     older_read:
         Option<tokio::sync::oneshot::Receiver<(i64, agent_client::Result<Value>, PageRead)>>,
+    /// When the page being read before the oldest drawn was asked for.
+    older_since: Instant,
+    /// The conversation read again for [`App::repaint`], beside the loop,
+    /// and what to do with it once it comes.
+    repaint_read: Option<(tokio::sync::oneshot::Receiver<Option<History>>, Repainted)>,
     /// The page being read again ([`App::draw_again`]): its id, what
     /// newer calls it returned to, and the page.
     again: Option<tokio::sync::oneshot::Receiver<Again>>,
@@ -9557,6 +9664,9 @@ impl App {
             compact_next: record["compaction_requested"] == true,
             repaint: false,
             stale: false,
+            opening: None,
+            switching_to: None,
+            repainting: None,
             links_written: screen::Written::default(),
             first_node: None,
             older: None,
@@ -9633,6 +9743,8 @@ impl App {
             sending: 0,
             unsent_rows: 0,
             older_read: None,
+            older_since: Instant::now(),
+            repaint_read: None,
             again: None,
             verbose: false,
             words_only: false,
@@ -9957,7 +10069,9 @@ impl App {
                 }
                 // Taken only as fast as they are heard: the rest wait in
                 // the connection's own bounded queue.
-                event = events.recv(), if self.down.is_none() && !self.cut && self.unheard.is_none() => {
+                // While the conversation is read again, what comes waits to
+                // be drawn after it.
+                event = events.recv(), if self.down.is_none() && !self.cut && self.unheard.is_none() && self.repaint_read.is_none() => {
                     // The project's follow shares the connection: what it
                     // brings wakes the window once it has something new.
                     if let Some(event) = &event
@@ -10089,16 +10203,10 @@ impl App {
                 }
             }
             keyed |= self.status_filled().await;
-            if self.pane.as_ref().is_some_and(pane::Pane::is_card)
-                && self.watch.as_ref().is_some_and(|w| {
-                    w.read.elapsed() > STATUS_AGAIN
-                        || w.usage.as_ref().is_some_and(usage::View::due)
-                        || w.audit.as_ref().is_some_and(audit::View::due)
-                        || w.background
-                            .as_ref()
-                            .is_some_and(background::View::commands_due)
-                })
-            {
+            // A card's read is taken as soon as it is in, and another made
+            // once one is due.
+            let came = self.card_read.as_ref().is_some_and(|job| job.is_finished());
+            if self.pane.as_ref().is_some_and(pane::Pane::is_card) && (came || self.card_due()) {
                 self.reread().await;
             }
             if self.retry.is_some_and(|at| at <= Instant::now()) {
@@ -10128,6 +10236,7 @@ impl App {
             self.switch_came();
             self.side_came();
             self.first_came().await;
+            changed |= self.repaint_came().await;
             self.reached();
             self.switch_asked();
             self.follow_place().await;
@@ -10223,7 +10332,9 @@ impl App {
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() {
                 self.repaint = false;
-                self.repaint(terminal).await?;
+                self.repaint(terminal)?;
+                // The cleared window, with its sign, drawn at once.
+                changed = true;
             }
         }
     }
@@ -10458,6 +10569,7 @@ impl App {
             self.switch_came();
             self.side_came();
             self.first_came().await;
+            self.repaint_came().await;
             // Read every few seconds, it wakes no one: waited on here.
             if let Some(job) = self.raising.take() {
                 self.approvals_raised(job.await.expect("the calls below were read"));
@@ -10469,6 +10581,7 @@ impl App {
                 && self.unheard.is_none()
                 && self.raising.is_none()
                 && self.context_reading.is_none()
+                && self.repaint_read.is_none()
                 && self.switch_reading.is_none()
                 && self.siding.is_empty()
                 && self.reading_first.is_empty()
@@ -10959,9 +11072,11 @@ impl App {
 
     /// The conversation drawn again in the background's new colours, or
     /// in the view just picked, once no turn is running: the screen
-    /// cleared, and the bot's items read again as on attach. The pages of
-    /// older items above are drawn again only as the view nears them.
-    async fn repaint(&mut self, terminal: &mut Terminal<impl Drawn>) -> Result<(), String> {
+    /// cleared, and the bot's items read again as on attach, beside the
+    /// loop, its first row saying it is reading until they come
+    /// ([`App::repaint_came`]). The pages of older items above are drawn
+    /// again only as the view nears them.
+    fn repaint(&mut self, terminal: &mut Terminal<impl Drawn>) -> Result<(), String> {
         // The pages of older items above stay, as blank rows drawn again
         // as the view nears them: only the newest rows are drawn now.
         let pages = self.screen.pages();
@@ -10995,23 +11110,69 @@ impl App {
         self.seen_node = 0;
         self.bar = None;
         self.barred = false;
-        if let Some(newest) = newest {
+        let (after, every, then) = match (newest, self.first_node) {
             // What calls older than the oldest page returned stays its own.
-            let unpaired = std::mem::take(&mut self.unpaired);
-            self.history_since(newest, true).await;
-            self.unpaired = unpaired;
-            self.screen.prepend_blank(pages);
-            return Ok(());
-        }
-        // Back to the first node this window drew, not only the newest page.
-        match self.first_node {
-            Some(first) => {
-                self.commit_welcome();
-                self.history_since(first - 1, true).await;
+            (Some(newest), _) => (
+                newest,
+                true,
+                Repainted::Pages(pages, std::mem::take(&mut self.unpaired)),
+            ),
+            // Back to the first node this window drew, not only the newest page.
+            (None, Some(first)) => (first - 1, true, Repainted::First),
+            (None, None) => {
+                let after = self.options.side.unwrap_or(0);
+                (after, after > 0, Repainted::Attach)
             }
-            None => self.history().await,
-        }
+        };
+        let (client, bot, woken) = (self.client.clone(), self.bot.clone(), self.woken.clone());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut history = read_since(&client, &bot, after, every).await;
+            if let Some(history) = &mut history {
+                let first = (history.nodes.first()).and_then(|node| history.turns.get(node));
+                let turns: Vec<i64> = first.copied().into_iter().collect();
+                history.page = Some(read_gap(&client, &bot, &history.nodes, &turns).await);
+            }
+            let _ = send.send(history);
+            woken.notify_one();
+        });
+        self.repaint_read = Some((receive, then));
+        self.repainting = Some(Instant::now());
         Ok(())
+    }
+
+    /// The conversation [`App::repaint`] read, once it came: drawn as on
+    /// attach, the sign on its first row gone.
+    async fn repaint_came(&mut self) -> bool {
+        let Some((reading, _)) = &mut self.repaint_read else {
+            return false;
+        };
+        let read = match reading.try_recv() {
+            Ok(read) => read,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(_) => None,
+        };
+        let Some((_, then)) = self.repaint_read.take() else {
+            return false;
+        };
+        self.repainting = None;
+        let Some(history) = read else {
+            self.notice = Some("could not read the conversation".into());
+            return true;
+        };
+        match then {
+            Repainted::Pages(pages, unpaired) => {
+                self.draw_since(history).await;
+                self.unpaired = unpaired;
+                self.screen.prepend_blank(pages);
+            }
+            Repainted::First => {
+                self.commit_welcome();
+                self.draw_since(history).await;
+            }
+            Repainted::Attach => self.draw_since(history).await,
+        }
+        true
     }
 
     /// The page of items before the oldest drawn, read beside the loop
@@ -11058,6 +11219,7 @@ impl App {
             woken.notify_one();
         });
         self.older_read = Some(receive);
+        self.older_since = Instant::now();
     }
 
     /// The page [`App::older`] read, drawn above the rest, the view left
@@ -16233,11 +16395,6 @@ impl App {
     }
 
     async fn status(&mut self) {
-        // Where each task's window sits as of now, not as when the card was
-        // last open: windows closed for room and opened since included.
-        if let Some(fleet) = &self.fleet {
-            fleet.layout.places_now(PLACES_NOW).await;
-        }
         // The card draws at once, and its rows as soon as they are listed:
         // each history read beside the loop fills in its row. What an
         // earlier window read is taken on the first open here; what this
@@ -16257,7 +16414,11 @@ impl App {
             take: self.status_read.is_empty(),
             keep: std::mem::take(&mut self.reads_unkept),
         };
-        let job = self.read_status_beside(Some(fill));
+        // Where each task's window sits as of now, not as when the card was
+        // last open: windows closed for room and opened since included,
+        // read beside the loop with the rest.
+        let now = (self.fleet.as_ref()).map(|fleet| fleet.layout.places_now(PLACES_NOW));
+        let job = self.read_status_beside(Some(fill), now);
         self.filling = Some((filling, job));
         self.watch = Some(Watch {
             project: self.scope().project,
@@ -16566,15 +16727,8 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            commons: Some({
-                let mut view = commons::View::open(&home, project.clone());
-                view.set_present(board_view::Present {
-                    project: project.clone(),
-                    bots: self.kept_rows.open(),
-                    profiles: self.kept_rows.profiles.clone(),
-                });
-                view
-            }),
+            // Its folder read beside the window, from now.
+            commons: Some(commons::View::unread(&home, project.clone())),
             memory: None,
             sky: None,
             picked: None,
@@ -16588,6 +16742,36 @@ impl App {
             finding: None,
         });
         self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
+        if let Some(job) = self.card_read.take() {
+            job.abort();
+        }
+        self.read_commons();
+    }
+
+    /// `/commons`' folder read beside the window, the agents the window's
+    /// count knows of its project with it: a holder it no longer lists,
+    /// or lists done, is closed.
+    fn read_commons(&mut self) {
+        let (bots, profiles) = (self.kept_rows.open(), self.kept_rows.profiles.clone());
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        let Some(view) = &mut watch.commons else {
+            return;
+        };
+        view.set_present(board_view::Present {
+            project: watch.project.clone(),
+            bots,
+            profiles,
+        });
+        let read = view.reader();
+        watch.read = Instant::now();
+        let woken = self.woken.clone();
+        self.card_read = Some(tokio::spawn(async move {
+            let read = tokio::task::spawn_blocking(read).await.ok();
+            woken.notify_one();
+            CardRead::Commons(Box::new(read))
+        }));
     }
 
     /// Every agent the daemon keeps, lit up live as they talk: `/sky` in
@@ -16631,11 +16815,27 @@ impl App {
         }
     }
 
+    /// Whether the open card is due a read again.
+    fn card_due(&self) -> bool {
+        self.watch.as_ref().is_some_and(|w| {
+            w.read.elapsed() > STATUS_AGAIN
+                || w.usage.as_ref().is_some_and(usage::View::due)
+                || w.audit.as_ref().is_some_and(audit::View::due)
+                || w.background
+                    .as_ref()
+                    .is_some_and(background::View::commands_due)
+        })
+    }
+
     async fn reread(&mut self) {
         if let Some(job) = self.card_read.take_if(|job| job.is_finished())
             && let Ok(read) = job.await
         {
             self.card_came(read);
+            // Taken as it came: the next read waits until one is due.
+            if !self.card_due() {
+                return;
+            }
         }
         // One read at a time, beside the loop.
         if self.card_read.is_some() {
@@ -16680,18 +16880,12 @@ impl App {
             watch.read = Instant::now();
             return;
         }
-        if let Some(watch) = &mut self.watch
-            && let Some(view) = &mut watch.commons
+        if self
+            .watch
+            .as_ref()
+            .is_some_and(|watch| watch.commons.is_some())
         {
-            // What the window's count already knows of its project's
-            // agents: a holder it no longer lists, or lists done, is closed.
-            view.set_present(board_view::Present {
-                project: watch.project.clone(),
-                bots: self.kept_rows.open(),
-                profiles: self.kept_rows.profiles.clone(),
-            });
-            view.reload();
-            watch.read = Instant::now();
+            self.read_commons();
             return;
         }
         if let Some(watch) = &mut self.watch
@@ -16741,12 +16935,17 @@ impl App {
         }
         // The card's rows read again once it has filled in.
         if self.filling.is_none() {
-            self.card_read = Some(self.read_status_beside(None));
+            self.card_read =
+                Some(self.read_status_beside(None, None::<std::future::Ready<mux::Places>>));
         }
     }
 
     /// `/status` read again beside the loop: its alerts, then its rows.
-    fn read_status_beside(&mut self, fill: Option<Fill>) -> tokio::task::JoinHandle<CardRead> {
+    fn read_status_beside(
+        &mut self,
+        fill: Option<Fill>,
+        places_now: Option<impl std::future::Future<Output = mux::Places> + Send + 'static>,
+    ) -> tokio::task::JoinHandle<CardRead> {
         let (client, woken) = (self.client.clone(), self.woken.clone());
         let readers = self.readers.clone();
         let (store, scope, turns) = (self.options.store.clone(), self.scope(), self.turns.clone());
@@ -16762,6 +16961,10 @@ impl App {
         let logs = tilde(&format!("{}.companions", self.store().display()));
         let temp_due = (self.temp_read.as_ref()).is_none_or(|(at, _)| at.elapsed() >= TEMP_READ);
         tokio::spawn(async move {
+            let places = match places_now {
+                Some(now) => now.await,
+                None => places,
+            };
             let view = StatusView {
                 bot: &bot,
                 asks: &asks,
@@ -16828,6 +17031,11 @@ impl App {
             return;
         };
         match read {
+            CardRead::Commons(read) => {
+                if let (Some(view), Some(read)) = (&mut watch.commons, *read) {
+                    view.read_came(read);
+                }
+            }
             CardRead::Commands(read) => {
                 if let Some(view) = &mut watch.background {
                     view.commands_loaded(read);
@@ -19456,6 +19664,21 @@ impl App {
         // The terminal answering: its colors, or its light and dark.
         if let Event::Reply(reply) = &event {
             term::heard(reply);
+            return;
+        }
+        // Going to another agent, its opening shown: Esc stays here, and
+        // no other key reaches the window left behind.
+        if self.switching_to.is_some()
+            && matches!(event, Event::Key(_) | Event::Paste(_) | Event::Mouse(_))
+        {
+            if let Event::Key(pressed) = &event
+                && pressed.code == KeyCode::Esc
+                && pressed.kind == event::KeyEventKind::Press
+            {
+                self.switching_to = None;
+                self.switch_reading = None;
+                self.stale = true;
+            }
             return;
         }
         self.heard = true;
@@ -23247,6 +23470,7 @@ impl App {
     /// narrowed by `typed` ([`App::switch_came`]), ordered and titled
     /// beside the window too.
     fn switching(&mut self, typed: &str, names: Vec<String>) {
+        let shown_name = names.first().cloned();
         let (client, woken, me) = (self.client.clone(), self.woken.clone(), self.bot.clone());
         let (store, picks_kept, typed) = (self.store(), self.picks_kept, typed.to_owned());
         // Who this window is and follows, for the rows' order and marks.
@@ -23318,6 +23542,11 @@ impl App {
             woken.notify_one();
         });
         self.switch_reading = Some((self.acted, receive));
+        // An agent named: the window is its at once, reading which one.
+        if let Some(name) = shown_name {
+            self.switching_to = Some((name, Instant::now()));
+            self.stale = true;
+        }
     }
 
     /// What `/switch` read, once it came: the window goes to the agent
@@ -23333,12 +23562,18 @@ impl App {
             Err(_) => Switching::Failed("the list was dropped".into()),
         };
         self.switch_reading = None;
+        // The window shown again, drawn whole, unless it goes.
+        let opened = self.switching_to.take().map(|(_, since)| since);
+        if opened.is_some() {
+            self.stale = true;
+        }
         // The list opens over the composer: not once the person moved on.
         if matches!(read, Switching::List { .. }) && asked != self.acted {
             return;
         }
         let (typed, agents, pick, closed, picks) = match read {
             Switching::To(bot) => {
+                *OPENED_AT.lock().unwrap_or_else(|e| e.into_inner()) = opened;
                 self.switch_window(bot);
                 return;
             }
@@ -23493,6 +23728,11 @@ impl App {
             embed::open_here(&bot, std::mem::take(&mut self.land_after));
             return;
         }
+        // The window opened in its place counts its sign from the key.
+        OPENED_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Instant::now);
         self.switch_to = Some(bot);
         self.quit = true;
     }
@@ -24090,6 +24330,22 @@ impl App {
     /// (cleared first); every frame shown whole, or not written at all
     /// when it changes nothing ([`frames`]).
     fn draw(&mut self, terminal: &mut Terminal<impl Drawn>) -> std::io::Result<()> {
+        // From the first frame, the window draws itself.
+        if let Some(opening) = self.opening.take() {
+            opening.end();
+        }
+        // Going to another agent: its opening, until the window goes or
+        // comes back, then drawn whole.
+        if let Some((name, since)) = &self.switching_to {
+            let stale = std::mem::take(&mut self.stale);
+            return frames::frame(|| {
+                if stale {
+                    wipe(terminal)?;
+                }
+                terminal.draw(|frame| opening(frame, name, *since))?;
+                Ok(())
+            });
+        }
         let stale = std::mem::take(&mut self.stale);
         frames::frame(|| {
             if stale {
@@ -24624,6 +24880,7 @@ impl App {
                     frame.set_cursor_position(cursor);
                 }
             }
+            let whole = history;
             let history = ratatui::layout::Rect {
                 y: history.bottom().saturating_sub(rows as u16),
                 width: column,
@@ -24632,6 +24889,34 @@ impl App {
             };
             if self.projects.is_none() {
                 self.screen.render(history, frame.buffer_mut(), file);
+                // The conversation read again, or read back to its first
+                // row while older rows are read: the sign, muted, on the
+                // row above the first if there is room, else on the first
+                // when it is blank, keeping its background. It never
+                // covers a written row.
+                let since = match self.repainting {
+                    Some(since) => Some(since),
+                    None => (self.older_read.is_some() && self.screen.at_first_row())
+                        .then_some(self.older_since),
+                };
+                if let Some(since) = since.filter(|_| whole.height > 0) {
+                    let y = match history.y > whole.y {
+                        true => history.y - 1,
+                        false => history.y,
+                    };
+                    let row = Rect {
+                        y,
+                        height: 1,
+                        ..history
+                    };
+                    let buffer = frame.buffer_mut();
+                    let blank = row
+                        .positions()
+                        .all(|at| buffer.cell(at).is_none_or(|cell| cell.symbol() == " "));
+                    if blank {
+                        frame.render_widget(Paragraph::new(reading::line(since)), row);
+                    }
+                }
                 if let Some(eyes) = &mut self.eyes
                     && let Some(y) = self.screen.drawn_at(screen::Tag::Eyes)
                 {
@@ -26530,6 +26815,16 @@ async fn read_gap(client: &Arc<Client>, bot: &str, nodes: &[i64], turns: &[i64])
         page.rest = Some(rest);
     }
     page
+}
+
+/// What [`App::repaint`] does with the conversation once it is read:
+/// put back the pages of older items above, as blank rows, and what
+/// calls older than them returned; go back to the first node the window
+/// drew; or draw it as on attach.
+enum Repainted {
+    Pages(Vec<(u64, usize)>, Vec<(i64, Value)>),
+    First,
+    Attach,
 }
 
 /// The bot's items after a node, as [`read_since`] read them for

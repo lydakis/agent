@@ -1522,6 +1522,11 @@ impl Screen {
         self.back = self.back.saturating_add_signed(rows).min(most);
     }
 
+    /// The view shows the first row drawn: as far back as it goes.
+    pub fn at_first_row(&self) -> bool {
+        self.back >= self.most(self.area.height as usize)
+    }
+
     /// How far back the view can go with `height` rows: to the first row.
     fn most(&self, height: usize) -> usize {
         self.shown.len().saturating_sub(height)

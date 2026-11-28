@@ -1327,9 +1327,15 @@ impl Worker {
     /// a view that opens: what was last read may be from long before,
     /// with windows closed and opened since. Waits at most `limit`, for
     /// a multiplexer slow to answer, and then gives what was last read.
-    pub async fn places_now(&self, limit: Duration) -> Places {
+    /// The read is asked for at the call; what it gives is awaited
+    /// wherever the caller likes, beside the window's loop included.
+    pub fn places_now(
+        &self,
+        limit: Duration,
+    ) -> impl std::future::Future<Output = Places> + Send + 'static {
         let (read, now) = tokio::sync::oneshot::channel();
         let kept = self.places.clone();
+        let last = self.places.clone();
         let _ = self.work.send(Work::Job(Box::new(move |layout| {
             let places = layout.places();
             if let Ok(mut kept) = kept.lock() {
@@ -1337,9 +1343,11 @@ impl Worker {
             }
             let _ = read.send(places);
         })));
-        match tokio::time::timeout(limit, now).await {
-            Ok(Ok(places)) => places,
-            _ => self.places.lock().map(|p| p.clone()).unwrap_or_default(),
+        async move {
+            match tokio::time::timeout(limit, now).await {
+                Ok(Ok(places)) => places,
+                _ => last.lock().map(|p| p.clone()).unwrap_or_default(),
+            }
         }
     }
 

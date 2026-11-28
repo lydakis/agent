@@ -853,6 +853,11 @@ async fn commands_that_read_the_daemon_never_hold_the_window() {
         }
         at_once(at.elapsed(), HELD);
         assert!(app.input.is_empty(), "{command}");
+        // The window showing the agent named while it reads which one is
+        // left with Esc, as the person would.
+        if app.switching_to.is_some() {
+            app.key(key(KeyCode::Esc)).await;
+        }
     }
     let at = Instant::now();
     app.press_row("react/2").await;
@@ -933,4 +938,130 @@ async fn a_side_chat_asked_for_is_sent_before_the_window_quits() {
             && (asked["prompt"].as_str()).is_some_and(|prompt| prompt.contains("what is left?"))
     });
     assert!(submitted, "{:?}", asked.lock().unwrap());
+}
+
+/// The places the Rulebook's Reading has not reached yet (28 Nov): each
+/// is taken off as its change lands, and the walk below then holds it.
+/// `/side` and `/context` open their views in the views' change, and the
+/// `/switch` list says it reads in `/switch`'s own.
+const READING_NOT_BUILT: &[&str] = &["/side", "/context", "/switch"];
+
+/// Writes are not in the rule (the Rulebook's Reading): a pause, a stop or
+/// a resume says what it did when the daemon answers.
+const WRITES: &[&str] = &["/resume"];
+
+/// What the probe shows now, every row.
+fn screen_now(frames: &Mutex<Vec<(Instant, String, String)>>) -> String {
+    (frames.lock().unwrap().last())
+        .map(|(_, _, whole)| whole.clone())
+        .unwrap_or_default()
+}
+
+/// Every command in the commands' table and every key that takes the
+/// window to another agent, with every reply the daemon gives held back
+/// (the Rulebook's Reading): the key is taken at once, a new frame shows
+/// at once, and no empty sentence is drawn before a read lands. A command
+/// added to the table is walked here with nothing added to this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_command_and_key_to_another_agent_shows_at_once_and_never_none() {
+    let mut keys: Vec<(String, Vec<Event>)> = (COMMANDS.iter())
+        .map(|(name, _)| {
+            let mut typed: Vec<Event> = name.chars().map(|c| key(KeyCode::Char(c))).collect();
+            typed.push(key(KeyCode::Enter));
+            (name.to_string(), typed)
+        })
+        .collect();
+    let alt = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::ALT));
+    let ctrl = |c: char| {
+        Event::Key(event::KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL,
+        ))
+    };
+    let named = "/switch other".chars().map(|c| key(KeyCode::Char(c)));
+    keys.push((
+        "/switch other".into(),
+        named.chain([key(KeyCode::Enter)]).collect(),
+    ));
+    keys.push(("alt+→".into(), vec![alt(KeyCode::Right)]));
+    keys.push(("alt+←".into(), vec![alt(KeyCode::Left)]));
+    keys.push(("alt+n".into(), vec![alt(KeyCode::Char('n'))]));
+    keys.push(("ctrl+g".into(), vec![ctrl('g')]));
+    keys.push((
+        "← enter".into(),
+        vec![key(KeyCode::Left), key(KeyCode::Enter)],
+    ));
+    let mut failed = Vec::new();
+    for (name, pressed) in keys {
+        if READING_NOT_BUILT.contains(&name.as_str()) || WRITES.contains(&name.as_str()) {
+            continue;
+        }
+        let (client, _events, _tell, _asked, socket) =
+            held_daemon(HELD, kept("A reply"), json!([])).await;
+        let mut app = window(client, socket);
+        // Another agent to go to, for the keys that go to one: the
+        // project's lead and a task in the pane's list, or one open beside.
+        let row = |name: &str, group: status::Group| status::Row {
+            name: name.into(),
+            bot: format!("calc.{name}"),
+            state: "idle".into(),
+            group,
+            maker: "calc.lead".into(),
+            ..status::Row::default()
+        };
+        let rows = [
+            row("lead", status::Group::Idle),
+            row("fix", status::Group::Working),
+        ];
+        if name.starts_with("alt+") {
+            app.margin
+                .set_agents(status::agents("calc", &rows), &app.bot);
+        }
+        if name == "ctrl+g" {
+            let mut pane = pane::Pane::card("calc.fix", STATUS_KEYS);
+            pane.as_agent("calc.fix", false);
+            app.open_pane(pane);
+        }
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let probe = Probe {
+            screen: ratatui::backend::TestBackend::new(120, 36),
+            frames: frames.clone(),
+        };
+        let mut terminal = Terminal::new(probe).unwrap();
+        app.draw(&mut terminal).unwrap();
+        let before = screen_now(&frames);
+        let empties = reading::empties();
+        let at = Instant::now();
+        for event in pressed {
+            app.key(event).await;
+            // A card's first read is one look round away, as the loop
+            // reads a card that has a view to read.
+            if app.pane.as_ref().is_some_and(pane::Pane::is_card) && app.watch.is_some() {
+                app.reread().await;
+            }
+            app.draw(&mut terminal).unwrap();
+        }
+        let took = at.elapsed();
+        let after = screen_now(&frames);
+        // The window goes at once (to the agent, whose window draws its
+        // opening the moment it starts, or for good).
+        let went = app.quit;
+        let mut wrong = Vec::new();
+        if took >= HELD / 2 {
+            wrong.push(format!("waited {took:?}"));
+        }
+        if !went && after == before {
+            wrong.push("drew nothing new".to_owned());
+        }
+        if reading::empties() != empties {
+            wrong.push("said none before its read".to_owned());
+        }
+        if !wrong.is_empty() {
+            failed.push(format!(
+                "{name}: {}\n{before}\n----\n{after}",
+                wrong.join(", ")
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n\n"));
 }
