@@ -21765,8 +21765,10 @@ impl App {
         self.unsettled.extend(gone);
         self.asks.retain(still);
         self.unpinned.retain(still);
+        // An answer whose question closed is let go once nothing can take
+        // it back: one still in line is read until it is taken or ends.
         self.task_answers
-            .retain(|answer| keys.contains(&answer.key));
+            .retain(|answer| keys.contains(&answer.key) || answer.turn.is_some());
         for ask in open {
             let key = ask.key();
             let known = (self.asks.iter().chain(&self.unpinned)).any(|have| have.key() == key)
@@ -39726,13 +39728,16 @@ mod tests {
         );
         assert!(app.asks.is_empty());
         // The fleet reads it open until the task takes the answer: it is
-        // not pinned again meanwhile, and once closed there it is let go.
+        // not pinned again meanwhile, and once closed there it is let go;
+        // its answer is still read until the task is known to have taken it.
         app.pin_task_asks();
         assert!(app.asks.is_empty());
         let fleet = app.fleet.as_mut().unwrap();
         fleet.needs.asked("calc.ask", None);
         app.pin_task_asks();
-        assert!(app.task_answers.is_empty() && app.asks.is_empty());
+        assert!(app.asks.is_empty());
+        assert_eq!(app.task_answers.len(), 1);
+        app.task_answers.clear();
         // Read late, an older question goes where it was asked, before the
         // lead's own newer one, which keeps the focus.
         let own = asks::call(&asks::id(5, "c9"), &json!({"question": "Tag it?"})).unwrap();
@@ -39836,6 +39841,9 @@ mod tests {
         fleet.needs.asked("calc.ask", None);
         app.pin_task_asks();
         assert!(app.asks.is_empty());
+        // Its question closed, its answer is still read until the task
+        // is known to have taken it.
+        assert_eq!(app.task_answers.len(), 1);
         // Back on the lead: its history drawn from the start.
         app.seen_node = 0;
         app.pending.clear();
@@ -39862,12 +39870,6 @@ mod tests {
         );
         assert!(app.asks.is_empty());
         // An answer taken back unread answered nothing: not kept.
-        app.task_answers.push(TaskAnswer {
-            key: key.into(),
-            bot: "calc.ask".into(),
-            turn: Some(3),
-            checked: Instant::now(),
-        });
         app.task_answers_read(vec![(
             "calc.ask".into(),
             3,
