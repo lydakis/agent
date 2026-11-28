@@ -717,7 +717,11 @@ class AcpTests(ModelFixture):
         # and store.
         [announced] = [u for u in updates if u['sessionUpdate'] == 'subagent_update' and 'title' in u]
         child = announced['sessionId']
-        name, store = child.rsplit('@', 1)
+        # Its own under this session, which another session on the lead
+        # does not share.
+        mine, task = child.split('/', 1)
+        self.assertEqual(mine, session)
+        name, store = task.rsplit('@', 1)
         self.assertEqual(name, f'calc.fix#{fix["bot_id"]}')
         self.assertRegex(store, r'^[0-9a-f]{16}$')
         self.assertEqual((announced['title'], announced['cwd'], announced['capabilities']),

@@ -778,13 +778,13 @@ class Acp:
         self.log = open(log, 'a')
         self.lock = threading.Lock()
         self.answers, self.next = {}, 0
-        # Lines read, the count when each request went, and each request's
-        # method and session: a prompt is done when the work it joined
-        # ended, which ACP version 2 says after it answers.
-        self.read_lines, self.sent = 0, {}
-        self.asked = {}
-        # Each end of a session's work: (line, time, session, update).
-        self.ends = []
+        # Lines read, and each request's method and session: a prompt is
+        # done when the work it joined ended, which ACP version 2 says after
+        # it answers.
+        self.read_lines, self.asked = 0, {}
+        # Each end of a session's work: (line, time, session, update); and
+        # the line each message showed at, by session and message id.
+        self.ends, self.shown = [], {}
         # When each answer came, for a prompt left out while the day goes on.
         self.at = {}
         self.last = time.monotonic()
@@ -806,6 +806,8 @@ class Acp:
             if m.get('method') == 'session/update' and update.get('sessionUpdate') == 'state_update' \
                     and 'stopReason' in update:
                 self.ends.append((self.read_lines, time.time(), m['params'].get('sessionId'), update))
+            elif m.get('method') == 'session/update' and update.get('sessionUpdate') == 'user_message':
+                self.shown.setdefault((m['params'].get('sessionId'), update.get('messageId')), self.read_lines)
             elif m.get('method') == 'session/request_permission':
                 params = m.get('params') or {}
                 # Without an allow, Sonny could not read the whole call.
@@ -823,7 +825,7 @@ class Acp:
         self.next += 1
         rid = self.next
         self.log.write(json.dumps({'t': time.time(), 'sent': {'method': method, 'params': params}}) + '\n')
-        self.sent[rid], self.asked[rid] = self.read_lines, (method, (params or {}).get('sessionId'))
+        self.asked[rid] = (method, (params or {}).get('sessionId'))
         self.write({'id': rid, 'method': method, 'params': params})
         if not wait:
             return rid
@@ -832,13 +834,17 @@ class Acp:
     def done(self, rid):
         """Request `rid`'s answer once it is done, else None. A prompt
         answered with its `messageId` (ACP version 2) is done when the work
-        it joined ended: its answer then says how, as the `stopReason` and
-        `error` of that end, and `at` when."""
+        it joined ended, the first end after the session showed its
+        message: its answer then says how, as the `stopReason` and `error`
+        of that end, and `at` when."""
         answer = self.answers.get(rid)
         method, session = self.asked.get(rid, (None, None))
         if answer is None or method != 'session/prompt' or 'messageId' not in (answer.get('result') or {}):
             return answer
-        end = next((e for e in self.ends if e[0] > self.sent[rid] and e[2] == session), None)
+        shown = self.shown.get((session, answer['result']['messageId']))
+        if shown is None:
+            return None
+        end = next((e for e in self.ends if e[0] > shown and e[2] == session), None)
         if end is None:
             return None
         _, at, _, update = end

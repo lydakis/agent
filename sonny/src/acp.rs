@@ -637,6 +637,7 @@ impl Agent {
             parent: None,
             state: AsyncMutex::new(State {
                 leads,
+                replaying: replay,
                 ..State::default()
             }),
             follower: Mutex::new(None),
@@ -929,6 +930,11 @@ struct State {
     /// This session's messages no turn has taken in yet: a cancel takes
     /// them back.
     queued: HashSet<i64>,
+    /// Whether the session replays its history once it is bound, and the
+    /// bot's newest node when its follow began, the last one the replay
+    /// shows: what comes after shows live.
+    replaying: bool,
+    upto: Option<i64>,
     /// The last of the bot's kept events this thread handled, to follow on
     /// from when its stream drops.
     cursor: i64,
@@ -962,6 +968,20 @@ struct State {
 const REPLIES: usize = 64;
 
 impl State {
+    /// Take back what this session asked the person about `call`, whose
+    /// gate is decided: whether it asked anything.
+    fn settle_asks(&mut self, out: &Out, call: &(Option<i64>, String)) -> bool {
+        let moot: Vec<i64> = (self.asking.iter())
+            .filter(|(_, waiting)| waiting.call == *call)
+            .map(|(request, _)| *request)
+            .collect();
+        for request in &moot {
+            self.asking.remove(request);
+            out.withdraw(*request);
+        }
+        !moot.is_empty()
+    }
+
     /// A turn's calls are over with it, but for those a message lifted:
     /// each still shown running ends as `ended` says, `failed` or
     /// `cancelled`, or is let go of unsaid.
@@ -1208,6 +1228,13 @@ impl Session {
                 (lead.bot, None, Some(lead.project), moving, lead.new)
             }
         };
+        if self.state.lock().await.replaying {
+            let newest = client
+                .request("history_nodes", json!({"bot": bot, "limit": 1}))
+                .await
+                .map_err(|e| e.to_string())?;
+            self.state.lock().await.upto = Some(newest["nodes"][0]["node"].as_i64().unwrap_or(0));
+        }
         client
             .request("follow", json!({"bot": bot, "after": 0}))
             .await
@@ -2191,6 +2218,9 @@ impl Session {
                     tool_call(&shown_id(turn, &call), &name, &arguments, "in_progress"),
                 );
                 state.gated.remove(&(turn, call.clone()));
+                // Allowed elsewhere: what this session asked is moot.
+                state.settle_asks(out, &(turn, call.clone()));
+                self.report(agent, &mut state);
                 state.calls.insert((turn, call), (name, arguments));
             }
             // A call a message lifted goes on in the background: its
@@ -2216,6 +2246,11 @@ impl Session {
                     return;
                 }
                 let gated = state.gated.remove(&key);
+                // Decided, here or elsewhere: what this session asked is
+                // moot.
+                if state.settle_asks(out, &key) {
+                    self.report(agent, &mut state);
+                }
                 // Its approval is decided: a call of a later turn under the
                 // same id is put to the person afresh.
                 let prompted = asked_key(turn, &call, "");
@@ -2608,7 +2643,9 @@ impl Session {
         let Some(bot_id) = record["bot_id"].as_i64() else {
             return;
         };
-        let child = lead_session(task, bot_id, client.store());
+        // Its own under this session: another session on the same lead
+        // follows the task in a session of its own.
+        let child = format!("{}/{}", self.id, lead_session(task, bot_id, client.store()));
         let workspace = record["workspace"].as_str().unwrap_or_default().to_owned();
         let Some(lead) = (self.state.lock().await.bound.as_ref()).map(|b| b.bot.clone()) else {
             return;
@@ -2719,13 +2756,34 @@ impl Session {
                 break;
             }
         }
-        let mut entries = Vec::new();
-        let _ = crate::said::walk(&client, &bot, 0, |turn, entry| {
-            entries.push((turn, entry.clone()));
-            false
-        })
-        .await;
-        entries.reverse();
+        // Its nodes up to where the live follow took over, newest first as
+        // the daemon lists them: only their ids are kept, and the items
+        // are read a page at a time, oldest first.
+        let upto = self.state.lock().await.upto;
+        let mut nodes: Vec<(i64, i64)> = Vec::new();
+        let mut from = Value::Null;
+        loop {
+            let Ok(page) = client
+                .request(
+                    "history_nodes",
+                    json!({"bot": bot, "from": from, "limit": 200}),
+                )
+                .await
+            else {
+                break;
+            };
+            nodes.extend(
+                (page["nodes"].as_array().into_iter().flatten())
+                    .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
+                    .filter(|(node, _)| upto.is_none_or(|upto| *node <= upto)),
+            );
+            from = page["next_from"].clone();
+            if from.is_null() {
+                break;
+            }
+        }
+        nodes.reverse();
+        let turns: HashMap<i64, i64> = nodes.iter().copied().collect();
         let workspace = (self.state.lock().await.bound.as_ref())
             .map(|b| b.workspace.clone())
             .unwrap_or_default();
@@ -2737,11 +2795,32 @@ impl Session {
             calls: HashMap::new(),
             parts: HashMap::new(),
         };
-        for (turn, entry) in &entries {
-            let node = entry["node"].as_i64();
-            let number = node.and_then(|node| numbers.get(&node).copied());
-            for item in crate::responses(&entry["item"]) {
-                history.item(*turn, &item, number);
+        let mut next = 0;
+        while next < nodes.len() {
+            let chunk: Vec<i64> = (nodes[next..(next + 100).min(nodes.len())].iter())
+                .map(|(node, _)| *node)
+                .collect();
+            let Ok(read) = client
+                .request("history_items", json!({"bot": bot, "nodes": chunk}))
+                .await
+            else {
+                return;
+            };
+            // Fewer than asked when they are large.
+            let items = read["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                return;
+            }
+            next += items.len();
+            for entry in &items {
+                let node = entry["node"].as_i64();
+                let Some(turn) = node.and_then(|node| turns.get(&node)) else {
+                    continue;
+                };
+                let number = node.and_then(|node| numbers.get(&node).copied());
+                for item in crate::responses(&entry["item"]) {
+                    history.item(*turn, &item, number);
+                }
             }
         }
     }
@@ -4559,6 +4638,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_allowed_elsewhere_is_no_longer_asked_here() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|_| json!({})).await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        {
+            let mut state = session.state.lock().await;
+            state.running = Some(7);
+            state.asking.insert(
+                1,
+                Waiting {
+                    holds: Some(7),
+                    call: (Some(7), "c2".into()),
+                },
+            );
+        }
+        let started = json!({"call_id": "c2", "name": "read", "arguments": "{\"path\":\"a\"}"});
+        session
+            .on(&agent, &event("tool_started", "calc.lead", 7, started))
+            .await;
+        assert!(session.state.lock().await.asking.is_empty());
+        let said = written(&agent);
+        assert!(said.iter().any(|m| m["method"] == "$/cancel_request"));
+        let states: Vec<Value> = (updates(&said).into_iter())
+            .filter(|(_, u)| u["sessionUpdate"] == "state_update")
+            .map(|(_, u)| u["state"].clone())
+            .collect();
+        assert_eq!(states, [json!("running")]);
+    }
+
+    #[tokio::test]
     async fn a_tasks_work_shows_on_its_leads_session_too() {
         let agent = test_agent();
         let history = vec![(
@@ -4725,6 +4834,11 @@ mod tests {
                 json!(["agent_message_chunk", null, null]),
             ]
         );
+        // Only up to where the live follow began: what came after is live.
+        session.state.lock().await.upto = Some(13);
+        session.replay(&agent.out).await;
+        let last = updates(&written(&agent)).pop().map(|(_, u)| u);
+        assert_eq!(last.map(|u| u["status"].clone()), Some(json!("completed")));
     }
 
     #[test]

@@ -164,7 +164,8 @@ class BlindTests(unittest.TestCase):
 
     def test_a_version_2_prompt_is_done_when_its_work_ends(self):
         # Answered once its message is in, the prompt is done when its
-        # session's work ends, as that end says; a task's end is not it.
+        # session's work ends after showing its message, as that end says;
+        # an earlier turn's end, or a task's, is not it.
         with tempfile.TemporaryDirectory() as tmp:
             sonny = Path(tmp) / 'sonny'
             sonny.write_text(
@@ -175,6 +176,9 @@ class BlindTests(unittest.TestCase):
                 '"sessionUpdate": "state_update", "state": "idle", "background": [], **more}}})\n'
                 'for line in sys.stdin:\n'
                 '    rid = json.loads(line)["id"]\n'
+                '    end("s1", stopReason="end_turn")\n'
+                '    say({"method": "session/update", "params": {"sessionId": "s1", "update": {'
+                '"sessionUpdate": "user_message", "messageId": "shop.lead/1", "content": []}}})\n'
                 '    say({"id": rid, "result": {"messageId": "shop.lead/1"}})\n'
                 '    time.sleep(.5)\n'
                 '    end("task", stopReason="end_turn")\n'
