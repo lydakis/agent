@@ -9486,6 +9486,17 @@ impl App {
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.answered = answered::Answered::load(self.reactions_key.as_deref());
+        // Answers kept here that may still be taken back unread are read
+        // again, as when they were sent.
+        let due = Instant::now().checked_sub(Duration::from_secs(3));
+        for (key, bot, sent) in self.answered.unsettled() {
+            self.task_answers.push(TaskAnswer {
+                key,
+                bot,
+                turn: Some(sent),
+                checked: due.unwrap_or_else(Instant::now),
+            });
+        }
         self.open_on_picked();
         self.history().await;
         // What was sent and still waits, wherever it was sent from.
@@ -20798,7 +20809,7 @@ impl App {
             checked: Instant::now(),
         });
         self.close_ask(&ask, &prompt);
-        self.keep_answer(&ask);
+        self.keep_answer(&ask, reply["message"].as_i64());
         if let Some(whole) = sent_as {
             self.close_ask(&whole, &prompt);
         }
@@ -20807,8 +20818,9 @@ impl App {
 
     /// The answer just given here to `ask`, a question of an agent below,
     /// kept by this window's agent where its card was drawn, as its card
-    /// now says it: a replay draws it there again.
-    fn keep_answer(&mut self, ask: &asks::Ask) {
+    /// now says it: a replay draws it there again. `sent` is the message
+    /// it went as, which the task may still take back unread.
+    fn keep_answer(&mut self, ask: &asks::Ask, sent: Option<i64>) {
         let key = ask.key();
         let Some(asks::State::Answered(answer)) = self.settled.get(&key).cloned() else {
             return;
@@ -20819,6 +20831,7 @@ impl App {
             what: answered::What::Ask {
                 ask: ask.clone(),
                 answer,
+                sent,
             },
         };
         if let Err(error) = self.answered.keep(entry) {
@@ -20869,7 +20882,7 @@ impl App {
     fn draw_kept_answer(&mut self, entry: answered::Entry) {
         let answered::Entry { after, what } = entry;
         match what {
-            answered::What::Ask { ask, answer } => {
+            answered::What::Ask { ask, answer, .. } => {
                 let key = ask.key();
                 if (self.asks.iter().chain(&self.unpinned)).any(|open| open.key() == key) {
                     return;
@@ -21087,6 +21100,10 @@ impl App {
             ) {
                 // Taken, or ended some other way: nothing to read again.
                 self.task_answers[at].turn = None;
+                let key = self.task_answers[at].key.clone();
+                if let Err(error) = self.answered.delivered(&key) {
+                    self.notice = Some(error);
+                }
             }
         }
         if released {
@@ -39584,6 +39601,10 @@ mod tests {
         let key = "@calc.ask/ask:2/q1";
         assert!(app.answered.has(key));
         assert_eq!(app.answered.within(3, 3).len(), 1);
+        // Kept with the message it went as, which a window that opens the
+        // lead before the task takes it reads again.
+        let unsettled = vec![(key.to_owned(), "calc.ask".to_owned(), 3)];
+        assert_eq!(app.answered.unsettled(), unsettled);
         // The task took it: the fleet reads it closed.
         let fleet = app.fleet.as_mut().unwrap();
         fleet.needs.asked("calc.ask", None);

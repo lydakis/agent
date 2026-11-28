@@ -29,7 +29,14 @@ pub struct Entry {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum What {
     /// A task's question, and the answer as its card says it.
-    Ask { ask: asks::Ask, answer: String },
+    Ask {
+        ask: asks::Ask,
+        answer: String,
+        /// The message the answer went as, while the task may still take
+        /// it back unread: a window that opens the agent reads it again,
+        /// and lets the answer go if it never reached the task.
+        sent: Option<i64>,
+    },
     /// A call of an agent below held for the person: the agent, the turn
     /// and the call, what it was, the request's rows as written out, and
     /// what came of it, the person's verdict here until the call's own.
@@ -121,6 +128,35 @@ impl Answered {
         })
     }
 
+    /// The questions whose answers may still be taken back unread: each
+    /// one's key, its task and the message its answer went as.
+    pub fn unsettled(&self) -> Vec<(String, String, i64)> {
+        (self.entries.iter())
+            .filter_map(|entry| match &entry.what {
+                What::Ask {
+                    ask,
+                    sent: Some(sent),
+                    ..
+                } => Some((ask.key(), ask.task.as_ref()?.bot.clone(), *sent)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The answer to the question at `key` reached its task: nothing
+    /// takes it back now.
+    pub fn delivered(&mut self, key: &str) -> Result<(), String> {
+        self.change(|entries| {
+            let mut changed = false;
+            for entry in entries.iter_mut().filter(|entry| entry.key() == key) {
+                if let What::Ask { sent, .. } = &mut entry.what {
+                    changed |= sent.take().is_some();
+                }
+            }
+            changed
+        })
+    }
+
     /// The answer to the question at `key` let go: it never reached the
     /// task, which took it back unread, so nothing was answered.
     pub fn forget(&mut self, key: &str) -> Result<(), String> {
@@ -193,6 +229,7 @@ mod tests {
             what: What::Ask {
                 ask: ask(bot, id),
                 answer: answer.into(),
+                sent: None,
             },
         }
     }
@@ -228,8 +265,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sonny-forgotten-{}", std::process::id()));
         let file = dir.join("k.json");
         let mut here = Answered::in_file(file.clone());
-        here.keep(entry(3, "shop.fix", "t1/c1", "Yes")).unwrap();
+        let mut sent = entry(3, "shop.fix", "t1/c1", "Yes");
+        if let What::Ask { sent, .. } = &mut sent.what {
+            *sent = Some(7);
+        }
+        here.keep(sent).unwrap();
+        here.keep(entry(5, "shop.fix", "t2/c1", "No")).unwrap();
+        // Read again by the next window to open the agent, as it may still
+        // be taken back unread.
+        let next = Answered::in_file(file.clone());
+        let unsettled = vec![("@shop.fix/t1/c1".to_owned(), "shop.fix".to_owned(), 7)];
+        assert_eq!(next.unsettled(), unsettled);
         here.forget("@shop.fix/t1/c1").unwrap();
+        here.delivered("@shop.fix/t2/c1").unwrap();
+        assert!(Answered::in_file(file.clone()).unsettled().is_empty());
+        here.forget("@shop.fix/t2/c1").unwrap();
         assert!(
             Answered::in_file(file)
                 .within(i64::MIN, i64::MAX)
