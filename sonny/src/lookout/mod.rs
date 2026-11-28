@@ -448,6 +448,23 @@ async fn node_text(client: &Client, bot: &str, node: i64) -> String {
         .unwrap_or_default()
 }
 
+/// The words of `bot`'s message at its history node, or of its turn's
+/// record while it still waits in line.
+async fn words(client: &Client, bot: &str, turn: i64, node: Option<i64>) -> String {
+    match node {
+        Some(node) => node_text(client, bot, node).await,
+        None => client
+            .request(
+                "prompts",
+                json!({"bot": bot, "turn": turn, "bytes": sources::TEXT_BYTES}),
+            )
+            .await
+            .ok()
+            .and_then(|read| Some(read["prompts"][0]["text"].as_str()?.to_owned()))
+            .unwrap_or_default(),
+    }
+}
+
 /// What a pending event of the agent source needs read: the words written,
 /// the reply a turn ended with and who asked for it, or the call waiting.
 async fn read(client: &Client, pending: &activity::Pending) -> activity::Read {
@@ -455,18 +472,7 @@ async fn read(client: &Client, pending: &activity::Pending) -> activity::Read {
     let (task, turn) = (pending.task.as_str(), pending.turn);
     match &pending.kind {
         Kind::Words { from, node, brief } => {
-            let text = match node {
-                Some(node) => node_text(client, task, *node).await,
-                None => client
-                    .request(
-                        "prompts",
-                        json!({"bot": task, "turn": turn, "bytes": sources::TEXT_BYTES}),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|read| Some(read["prompts"][0]["text"].as_str()?.to_owned()))
-                    .unwrap_or_default(),
-            };
+            let text = words(client, task, turn, *node).await;
             // Words with no sender that repeat the subscriber's own brief
             // are a client's sending of it, not the person's.
             let someone = match (from == activity::PERSON, brief) {
@@ -477,6 +483,11 @@ async fn read(client: &Client, pending: &activity::Pending) -> activity::Read {
             };
             Read::Words { text, someone }
         }
+        // The answer is read where it went, in the agent that asked.
+        Kind::Answered { asker, node } => Read::Words {
+            text: words(client, asker, turn, *node).await,
+            someone: false,
+        },
         Kind::Reply {
             node,
             completed,
@@ -516,7 +527,7 @@ async fn read(client: &Client, pending: &activity::Pending) -> activity::Read {
 fn unread(pending: &activity::Pending) -> activity::Read {
     use activity::{Kind, Read};
     match &pending.kind {
-        Kind::Words { .. } => Read::Words {
+        Kind::Words { .. } | Kind::Answered { .. } => Read::Words {
             text: String::new(),
             someone: false,
         },
@@ -755,6 +766,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         watchers: HashMap::new(),
         started: true,
         rewriting: HashSet::new(),
+        answers: activity::Answers::default(),
     };
     println!(
         "{}",
@@ -925,6 +937,9 @@ struct Service {
     /// The `follows` and `commons` calls under way, by bot, turn and
     /// ID, whose end means the files the lookout reads changed.
     rewriting: HashSet<(String, i64, String)>,
+    /// The person's answers on their way into the agents that asked, told
+    /// to those who follow an agent above each.
+    answers: activity::Answers,
 }
 
 /// Who made whom among the bots the daemon lists, kept as the listing
@@ -1220,6 +1235,7 @@ impl Service {
                     // as an informer hands a change to the handlers that
                     // asked for its object; a bot made or deleted, to all.
                     let hearing = self.hearing(&event);
+                    let answer = self.answers.event(&event);
                     self.track(&event, !hearing.is_empty(), cursor);
                     // The replay is over: no subscriber's mark is ahead.
                     if event["event"] == "follow_live" {
@@ -1229,6 +1245,9 @@ impl Service {
                         }
                     }
                     self.hand(&event, &hearing, cursor, live);
+                    if let Some(answer) = answer {
+                        self.hand_answer(&event, answer, &hearing, cursor, live);
+                    }
                     if let (Some("created" | "forked" | "deleted"), Some(bot)) =
                         (event["event"].as_str(), event["bot"].as_str())
                     {
@@ -2072,6 +2091,63 @@ impl Service {
         }
     }
 
+    /// The person's answer to a question `event`'s agent asked, reaching
+    /// it now at `turn` (and history `node`): told to the lookouts that
+    /// watch an agent above it, each on the nearest of those it watches,
+    /// as the question went up. One that hears the asker itself
+    /// (`hearing`) hears the answer there, as its words.
+    fn hand_answer(
+        &mut self,
+        event: &Value,
+        (turn, node): (i64, Option<i64>),
+        hearing: &[String],
+        cursor: Option<i64>,
+        live: bool,
+    ) {
+        let Some(asker) = event["bot"].as_str() else {
+            return;
+        };
+        let above = self.makers(asker);
+        let mut told: HashSet<&str> = hearing.iter().map(String::as_str).collect();
+        for (at, bot) in above.iter().enumerate() {
+            for name in self.watchers.get(bot).into_iter().flatten() {
+                if !told.insert(name) {
+                    continue;
+                }
+                let Some(lookout) = self.lookouts.get_mut(name) else {
+                    continue;
+                };
+                if lookout.told_before(cursor, live) {
+                    continue;
+                }
+                let maker = above.get(at + 1).map(String::as_str);
+                lookout.answer_below(bot, maker, asker, turn, node, cursor.unwrap_or(0));
+                if live
+                    && let Some(at) = cursor
+                    && lookout.untold()
+                {
+                    lookout.from.get_or_insert(at);
+                }
+            }
+        }
+    }
+
+    /// The agents above `bot`, nearest first: who made it, who made that,
+    /// and on up, as the daemon lists them.
+    fn makers(&self, bot: &str) -> Vec<String> {
+        let mut above: Vec<String> = Vec::new();
+        let mut at = bot.to_owned();
+        while let Some(by) = (self.records.get(&at)).and_then(|record| record["created_by"].as_str())
+        {
+            if by == bot || above.iter().any(|seen| seen == by) {
+                break;
+            }
+            above.push(by.to_owned());
+            at = by.to_owned();
+        }
+        above
+    }
+
     /// Each subscriber's own mark, from what its lookout holds now or what
     /// the last lookout kept: up to it, its news was told. The stream
     /// starts again before the oldest news any of them has not told, and
@@ -2815,6 +2891,33 @@ impl Lookout {
                 activity::Out::Read(pending) => self.due.push(pending),
             }
         }
+    }
+
+    /// The person answered a question `asker` asked, at `turn` (and history
+    /// `node`), at `order` in the stream: news on `topic`, the agent above
+    /// it this subscriber watches, once the stream is news to it.
+    fn answer_below(
+        &mut self,
+        topic: &str,
+        maker: Option<&str>,
+        asker: &str,
+        turn: i64,
+        node: Option<i64>,
+        order: i64,
+    ) {
+        if !self.live {
+            return;
+        }
+        self.due.push(activity::Pending {
+            task: topic.to_owned(),
+            maker: maker.map(str::to_owned),
+            turn,
+            order,
+            kind: activity::Kind::Answered {
+                asker: asker.to_owned(),
+                node,
+            },
+        });
     }
 
     /// The subscriptions that hear an event now: for the agent source,
@@ -4116,7 +4219,7 @@ mod tests {
     /// asked unknown.
     fn says(text: &str) -> impl Fn(&activity::Pending) -> activity::Read + '_ {
         move |pending| match &pending.kind {
-            activity::Kind::Words { .. } => activity::Read::Words {
+            activity::Kind::Words { .. } | activity::Kind::Answered { .. } => activity::Read::Words {
                 text: text.to_owned(),
                 someone: false,
             },
@@ -4153,6 +4256,85 @@ mod tests {
             quiet: None,
             about: None,
         }
+    }
+
+    #[test]
+    fn an_answer_below_a_lead_reaches_who_follows_the_lead_by_name_once() {
+        let records = [
+            json!({"name": "home.lead"}),
+            json!({"name": "calc.lead"}),
+            json!({"name": "calc.parser", "created_by": "calc.lead"}),
+            json!({"name": "calc.parser-tests", "created_by": "calc.parser"}),
+        ];
+        let mut service = service(PathBuf::from("/nonexistent"), &records);
+        let mut superlead = Lookout::new("home.lead");
+        superlead.subs = vec![sub("leads", &[], &["calc.lead"])];
+        let mut lead = Lookout::new("calc.lead");
+        lead.subs = vec![subs::Sub::lead("calc.lead", "calc")];
+        for (name, mut lookout) in [("home.lead", superlead), ("calc.lead", lead)] {
+            lookout.roots(&service.records, &service.made);
+            lookout.live = true;
+            lookout.replay_over = true;
+            service.lookouts.insert(name.into(), lookout);
+        }
+        service.index();
+        assert!(service.lookouts["home.lead"].watches("calc.lead"));
+        assert!(!service.lookouts["home.lead"].watches("calc.parser"));
+        let answered = "You asked (ask:4/c1): Which grammar?\n\nThe spec";
+        let mut feed = |service: &mut Service, event: Value, cursor: i64| {
+            let event = at(event, cursor);
+            let hearing = service.hearing(&event);
+            let answer = service.answers.event(&event);
+            service.hand(&event, &hearing, Some(cursor), true);
+            if let Some(answer) = answer {
+                service.hand_answer(&event, answer, &hearing, Some(cursor), true);
+            }
+            for lookout in service.lookouts.values_mut() {
+                read_due(lookout, says(answered));
+            }
+        };
+        let heard = |service: &Service, name: &str| -> Vec<(String, String)> {
+            (service.lookouts[name].heard.iter())
+                .map(|heard| {
+                    let kind = heard.event.fields["type"].as_str().unwrap_or("").to_owned();
+                    (kind, heard.event.topic.clone().unwrap_or_default())
+                })
+                .collect()
+        };
+        // The person answers the lead's task: who follows the lead by name
+        // hears it on the lead, quoted from the task; the lead, which
+        // watches the task, hears the task's own words and not again.
+        let answer = json!({"request_id": "answer-0a1b", "node": 12});
+        feed(&mut service, ev("calc.parser", 5, "accepted", answer.clone()), 30);
+        assert_eq!(heard(&service, "home.lead"), [("answered".into(), "calc.lead".into())]);
+        let told = &service.lookouts["home.lead"].heard[0].event;
+        assert_eq!(told.quote, Some(("calc.parser".into(), 5)));
+        assert_eq!(told.fields["asker"], "calc.parser");
+        assert_eq!(told.fields["from"], activity::PERSON);
+        assert_eq!(told.fields["text"], answered);
+        assert!(!told.text.contains("The spec"), "the daemon quotes it");
+        assert!(!told.steer);
+        assert_eq!(heard(&service, "calc.lead"), [("wrote".into(), "calc.parser".into())]);
+        // From a task's own task, steered in: still once, on the lead.
+        let steer = json!({"request_id": "answer-2c3d", "delivery": "steer"});
+        let queued = json!({"bot": "calc.parser-tests", "turn": null, "message": 8,
+            "event": "queued", "data": steer});
+        feed(&mut service, queued, 31);
+        assert_eq!(heard(&service, "home.lead").len(), 1, "told once it is taken in");
+        let steered = json!({"message": 8, "node": 20});
+        feed(&mut service, ev("calc.parser-tests", 7, "steered", steered), 32);
+        let superlead = heard(&service, "home.lead");
+        assert_eq!(superlead.len(), 2);
+        assert_eq!(superlead[1], ("answered".into(), "calc.lead".into()));
+        let told = &service.lookouts["home.lead"].heard[1].event;
+        assert_eq!(told.quote, Some(("calc.parser-tests".into(), 8)));
+        assert_eq!(told.fields["maker"], json!(null));
+        // The person's other words, and an agent's, are no answer.
+        let plain = json!({"request_id": "r-9", "node": 30});
+        feed(&mut service, ev("calc.parser", 9, "accepted", plain), 33);
+        let agent = json!({"request_id": "answer-ffff", "from": {"bot": "calc.lead", "turn": 2}});
+        feed(&mut service, ev("calc.parser", 10, "accepted", agent), 34);
+        assert_eq!(heard(&service, "home.lead").len(), 2);
     }
 
     #[test]
@@ -4459,6 +4641,7 @@ mod tests {
             watchers: HashMap::new(),
             started: false,
             rewriting: HashSet::new(),
+            answers: activity::Answers::default(),
             senders: HashMap::new(),
             askers: HashMap::new(),
         }
