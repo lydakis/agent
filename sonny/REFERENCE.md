@@ -74,7 +74,8 @@ each other and the daemon through their tools (`send_message`, `wait`,
 ## Projects and leads
 
 ```sh
-sonny                              # Open this folder's last-messaged lead (creates one if needed)
+sonny                              # Open what [sonny] opens says: this folder's last-messaged lead (creates one if needed), the default, or one agent from any folder
+sonny . | sonny DIR                # Open that folder's lead, whatever [sonny] opens says
 sonny --model PROVIDER/MODEL       # Same, choosing the model on first creation
 sonny --lead NAME                  # Open a specific peer lead in this folder
 sonny --new-lead [NAME]            # Create a new peer lead (auto-numbered as lead.2 if omitted)
@@ -86,12 +87,14 @@ sonny --agent NAME                 # Open any specific agent directly
 - **Git repositories:** Sonny resolves the nearest `.agents/project.toml` in the repo (or creates one at the repo root), so running inside `src/` or a task worktree reaches the main checkout's lead. Subfolders become separate projects once they have their own `.agents/project.toml` (created by `new_project`).
 - **Outside git:** The current directory is its own project.
 - **Umbrella folders:** Setting `subfolders = "project"` in `.agents/project.toml` routes subfolders without their own project file (including nested git repos) to that parent lead.
-- Sonny refuses to create a lead inside `~/.agent` task folders.
+- Sonny refuses to create a lead inside `~/.agent` task folders, or in your home folder itself (`home_folder:`); a lead made there before still opens, and the folders below are folders like any other.
+- `[sonny] opens = "work.lead"` (or picked in `sonny setup` or `/config`) makes a bare `sonny` open that agent from any folder, making nothing; one that is not there is said in one line and nothing opens. `"folder"`, the default, is this folder's lead.
 
 <details>
 <summary><strong>Full details: projects and leads</strong></summary>
 
-    sonny                                    # this folder's lead, the one last written to
+    sonny                                    # this folder's lead, the one last written to, or what [sonny] opens names
+    sonny . | sonny DIR                      # that folder's lead, whatever [sonny] opens says
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --lead NAME                        # another of the folder's leads
     sonny --new-lead [NAME]                  # a new lead for the folder
@@ -111,7 +114,25 @@ them that has no project file of its own, a repository among them, opens
 that project's lead (the nearest project above decides; the home folder's
 file never does). A lead made below another project's folder says which
 lead holds the folder above. Sonny refuses to make a lead in a task's own
-folder under `~/.agent`.
+folder under `~/.agent`, and in the home folder itself, whose `.agents` is
+your own (skills, profiles, memory), as git makes no repository outside
+one: `home_folder: ~ is your home folder, not a project`. A lead made there
+before still opens, and the folders below it are folders like any other;
+the new_project tool refuses the home folder too.
+
+A bare `sonny` opens what `[sonny] opens` says, as a browser's "on
+startup" setting picks its first page: `"folder"`, the default, the lead of
+the folder it runs in, as above; or an agent by its whole name, such as
+`"work.lead"`, from any folder, making nothing, as `sonny --agent NAME`
+does. An agent named that is not there is said
+(`work.lead is not there; sonny . opens this folder's lead`) and nothing
+opens: it never falls back to the folder. `sonny .` or `sonny DIR` opens
+that folder's lead whatever the setting, as `code .` does; `--lead` and
+`--new-lead` are the start folder's leads either way, and a folder named as
+one of Sonny's commands is `./status`. Setup asks for it after the model
+(this folder's lead, each lead on the daemon, or a name typed), `sonny
+setup --opens folder|AGENT` sets it without asking, and `/config` steps it
+between the folder and the agent its window shows.
 
 </details>
 
@@ -611,6 +632,7 @@ Settings live in `~/.agent/config.toml` (editable via `/config`) and can be over
 | Margin behavior & limits | `[sonny] margin_opens`, `margin_notes`, `margin_note_lines` | — | `"always"` (`unless-closed`, `never`); `6` notes; `40` rows |
 | Custom margin notes | `[sonny.notes.NAME]` | — | `markdown`, `live`, `title` |
 | Where agent links open | `[sonny] agent_opens` | — | `"tab"` or `"beside"` |
+| What a bare `sonny` opens | `[sonny] opens` | — | `"folder"` (this folder's lead) or an agent's whole name |
 | Task tab policy | `[sonny] task_tabs`, `most_task_tabs` | — | `"asked"` (`every`); `32` tabs (`0` = unlimited) |
 | Task worktree retention | `[sonny] task_worktrees` | — | `15` (min `1`; oldest idle clean worktrees pruned) |
 | Decision deadline | `[sonny] ask_wait_minutes` | — | `60` (`0` = always wait) |

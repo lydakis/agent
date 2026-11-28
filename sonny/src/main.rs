@@ -514,13 +514,19 @@ struct Options {
     /// window's own, handed from each of its agents to the next and kept
     /// nowhere else.
     before: Option<String>,
+    /// The agent is the one `[sonny] opens` names, a bare `sonny` opening
+    /// it: one that is not there is said, and nothing opens.
+    by_setting: bool,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--agent NAME [--new [--folder DIR]] | --lead NAME | --new-lead [NAME]]\n\
+     \x20      [DIR | --agent NAME [--new [--folder DIR]] | --lead NAME | --new-lead [NAME]]\n\
      With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
-     first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
+     first time; --lead opens another of the folder's leads, --new-lead makes one. A bare\n\
+     sonny opens what [sonny] opens says: this folder's lead, the default, or one agent from\n\
+     any folder; sonny . or sonny DIR opens that folder's lead either way. Sonny makes no\n\
+     project in your home folder. Its\n\
      tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
      for the project's agents, /switch to open any agent, /new to start one.\n\
      Agents start tasks, put windows where the person looks, make projects\n\
@@ -3616,6 +3622,7 @@ fn parse() -> Result<Options, String> {
     let (mut side, mut embedded) = (None, false);
     let (mut window_place, mut send, mut draft, mut reopened) = (None, None, None, false);
     let (mut land, mut before) = (false, None);
+    let mut folder = None;
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -3654,8 +3661,33 @@ fn parse() -> Result<Options, String> {
             // Unlisted: how a window hands on the agent it showed, for
             // `ctrl+6` to go back to.
             "--before" => before = Some(value()?),
+            // A folder, `.` or DIR: its lead, whatever `opens` says.
+            dir if !dir.starts_with('-') && folder.is_none() => folder = Some(dir.to_owned()),
             _ => return Err(usage()),
         }
+    }
+    let mut by_setting = false;
+    match folder {
+        // A folder and an agent named are two answers to one question.
+        Some(_) if bot.is_some() || new => return Err(usage()),
+        // As `cd DIR && sonny`, in folder mode: whatever the window or the
+        // terminal's multiplexer runs again opens from it.
+        Some(dir) => std::env::set_current_dir(&dir).map_err(|e| format!("{dir}: {e}"))?,
+        // Bare: what `[sonny] opens` says, which is `--agent NAME` when it
+        // names one, for every window it opens in this one's place too. A
+        // config that does not read opens the folder's lead, as every
+        // setting stands at its default until it reads, and is said there.
+        None if bot.is_none() && lead == project::Pick::Last => {
+            let opens = agent_client::config::load().map(|c| c.sonny.opens);
+            if let Some(name) = opens.ok().and_then(setting_agent) {
+                let mut given = self::args();
+                given.extend(["--agent".into(), name.clone()]);
+                *ARGS.lock().unwrap_or_else(|e| e.into_inner()) = given;
+                bot = Some(name);
+                by_setting = true;
+            }
+        }
+        None => {}
     }
     let (store, socket) = daemon_paths(store, socket)?;
     Ok(Options {
@@ -3677,7 +3709,28 @@ fn parse() -> Result<Options, String> {
         reopened,
         land,
         before,
+        by_setting,
     })
+}
+
+/// The agent a bare `sonny` opens by `[sonny] opens`, from any folder;
+/// none for the folder's lead.
+fn setting_agent(opens: agent_client::config::Opens) -> Option<String> {
+    match opens {
+        agent_client::config::Opens::Agent(name) => Some(name),
+        agent_client::config::Opens::Folder => None,
+    }
+}
+
+/// `bot`, named by `[sonny] opens`, is there: never the folder's lead in
+/// its place, so `sonny` means one thing.
+async fn setting_agent_there(client: &Client, bot: &str) -> Result<(), String> {
+    match project::find(client, bot).await? {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "{bot} is not there; sonny . opens this folder's lead"
+        )),
+    }
 }
 
 /// What runs this Sonny again on `bot`, from the same folder: `sonny`
@@ -3685,8 +3738,12 @@ fn parse() -> Result<Options, String> {
 /// setting, naming `bot` when the folder would not open it on its own, and
 /// with the daemon the environment named.
 fn reopen(bot: &str) -> Vec<String> {
+    reopen_from(&args(), bot)
+}
+
+/// [`reopen`], for a Sonny `given` these arguments.
+fn reopen_from(given: &[String], bot: &str) -> Vec<String> {
     let mut command = vec!["sonny".to_owned()];
-    let given = args();
     let mut args = given.iter().skip(1).cloned().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3698,6 +3755,12 @@ fn reopen(bot: &str) -> Vec<String> {
             "--new-lead" => {
                 args.next_if(|next| !next.starts_with("--"));
             }
+            "--store" | "--socket" | "--model" | "--rex-host" | "--side" => {
+                command.push(arg);
+                command.extend(args.next());
+            }
+            // The folder `sonny DIR` opened in, which this one runs in.
+            dir if !dir.starts_with('-') => {}
             _ => command.push(arg),
         }
     }
@@ -4190,6 +4253,9 @@ async fn run() -> Result<bool, String> {
         Some(bot) => {
             if options.new {
                 create(&client, &options, bot).await?;
+            }
+            if options.by_setting {
+                setting_agent_there(&client, bot).await?;
             }
             // Sonny on a project's lead is that lead's Sonny, wherever it
             // was opened, as by `show_agent` in the project's own home.
@@ -20136,7 +20202,7 @@ impl App {
         }
         if prompt == "/config" {
             self.input.clear();
-            match config::View::open() {
+            match config::View::open(&self.bot) {
                 Ok(view) => self.config = Some(view),
                 Err(error) => self.notice = Some(error),
             }
@@ -27639,6 +27705,7 @@ mod tests {
             reopened: false,
             land: false,
             before: None,
+            by_setting: false,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -45078,5 +45145,50 @@ mod tests {
             .flat_map(|at| [format!("• Steered calc.t{at}"), format!("└ Check {at}.")])
             .collect();
         assert_eq!(calls, want);
+    }
+
+    #[test]
+    fn a_bare_sonny_opens_the_agent_the_setting_names_and_a_folder_its_lead() {
+        use agent_client::config::Opens;
+        assert_eq!(setting_agent(Opens::Folder), None);
+        assert_eq!(
+            setting_agent(Opens::Agent("work.lead".into())).as_deref(),
+            Some("work.lead")
+        );
+        let given = |args: &[&str]| -> Vec<String> {
+            std::iter::once("sonny")
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect()
+        };
+        // Opened by the setting, as `--agent NAME`: reopened on the agent
+        // by its name, whatever folder the terminal is in.
+        let again = reopen_from(&given(&["--no-sound", "--agent", "work.lead"]), "work.lead");
+        assert_eq!(again[..4], ["sonny", "--no-sound", "--agent", "work.lead"]);
+        // `sonny DIR` runs in DIR: what runs it again leaves the folder
+        // out, its other values in, and names the lead as the folder does.
+        let again = reopen_from(
+            &given(&["--model", "a/b", "../app", "--no-sound"]),
+            "app.lead.fix",
+        );
+        assert_eq!(
+            again[..6],
+            ["sonny", "--model", "a/b", "--no-sound", "--lead", "fix"]
+        );
+        assert!(!again.iter().any(|arg| arg == "../app"), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_the_setting_names_that_is_not_there_is_said_and_nothing_opens() {
+        let client = daemon_answering(|asked| match asked["name"].as_str() {
+            Some("work.lead") => json!({"bots": [{"name": "work.lead"}]}),
+            _ => json!({"bots": []}),
+        })
+        .await;
+        assert_eq!(setting_agent_there(&client, "work.lead").await, Ok(()));
+        assert_eq!(
+            setting_agent_there(&client, "gone.lead").await,
+            Err("gone.lead is not there; sonny . opens this folder's lead".into())
+        );
     }
 }

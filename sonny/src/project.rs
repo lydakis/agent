@@ -787,7 +787,20 @@ pub async fn open(
     model: Option<&str>,
     pick: &Pick,
 ) -> Result<Lead, String> {
-    let (project, dir) = folder_project(dir)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    open_in(client, dir, model, pick, home.as_deref()).await
+}
+
+/// [`open`], with `home` the home folder.
+async fn open_in(
+    client: &Client,
+    dir: &Path,
+    model: Option<&str>,
+    pick: &Pick,
+    home: Option<&Path>,
+) -> Result<Lead, String> {
+    let dir = folder_in(&dir.canonicalize().map_err(|e| e.to_string())?, home)?;
+    let project = default_name(&dir)?;
     let first = format!("{project}.lead");
     let chosen = match pick {
         Pick::Made { profile, .. } => profile.as_deref(),
@@ -831,7 +844,7 @@ pub async fn open(
                 return Err(format!("lead_missing: {project} has no lead {name} yet"));
             }
         }
-        create(client, &dir, model, None, chosen).await?;
+        create(client, &dir, model, None, chosen, home).await?;
         return Ok(Lead {
             project,
             bot: first,
@@ -860,7 +873,7 @@ pub async fn open(
                 ));
             }
             // Made by another thread since the look above: theirs.
-            if !create(client, &dir, model, Some(&bot), chosen).await? {
+            if !create(client, &dir, model, Some(&bot), chosen, home).await? {
                 return Err(format!(
                     "lead_exists: {bot} is there already; /switch {} opens it",
                     lead_short(&bot)
@@ -1008,6 +1021,14 @@ fn folder_in(dir: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
     Ok(folder)
 }
 
+/// Whether `dir` (canonical) is the home folder itself, where no project
+/// is made, as git makes no repository outside one: its `.agents` is the
+/// person's own (skills, profiles, memory). A lead made there before
+/// still opens; the folders below are folders like any other.
+fn is_home(dir: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|home| home.canonicalize().unwrap_or_else(|_| home.to_owned()) == dir)
+}
+
 /// The project folder above `folder` that keeps the folders below it as
 /// its own (`subfolders = "project"`), when `folder` has no project file:
 /// the nearest project above decides, looking no higher than the home
@@ -1035,7 +1056,8 @@ fn above(dir: &Path) -> Option<String> {
     Some(format!("{name}.lead"))
 }
 
-async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
+/// The agent named `bot`, when the daemon keeps one.
+pub async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
     let page = client
         .request("bots", json!({"name": bot, "limit": 1}))
         .await
@@ -1078,14 +1100,22 @@ async fn newest(client: &Client) -> Result<Option<String>, String> {
 }
 
 /// Make the folder's first lead, or `bot`, another lead of it: whether
-/// this made it, not found it there already.
+/// this made it, not found it there already. None is made in `home`.
 async fn create(
     client: &Client,
     dir: &Path,
     model: Option<&str>,
     bot: Option<&str>,
     chosen: Option<&str>,
+    home: Option<&Path>,
 ) -> Result<bool, String> {
+    if is_home(dir, home) {
+        return Err(
+            "home_folder: ~ is your home folder, not a project; run sonny in a \
+                    project's folder, or set opens to an agent"
+                .into(),
+        );
+    }
     // What it was made without is said where it opens, as each window
     // reviews its instructions.
     let role = role_or_shipped(dir, chosen, &mut Vec::new())?;
@@ -1205,6 +1235,12 @@ async fn make(
 /// already), its lead opened in a workspace of its own.
 pub async fn add(caller: &str, model: Option<&str>, arguments: &Value) -> Result<Value, String> {
     let (dir, mut picks) = picks(arguments, model)?;
+    if is_home(&dir, std::env::var_os("HOME").as_deref().map(Path::new)) {
+        return Err(format!(
+            "home_folder: {} is the person's home folder, not a project; name a project's folder",
+            dir.display()
+        ));
+    }
     let config = agent_client::config::load()?;
     if picks.effort.is_none() {
         picks.effort = config.sonny.lead_effort;
@@ -1636,6 +1672,77 @@ mod tests {
         assert!(error.starts_with("task_folder: "), "{error}");
         assert!(error.contains("sonny --agent ws.fix"), "{error}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn only_the_home_folder_itself_is_home() {
+        let base = std::env::temp_dir().join(format!("sonny-is-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join("code/app")).unwrap();
+        // The home folder by another name is the home folder.
+        std::os::unix::fs::symlink(&home, base.join("link")).unwrap();
+        let real = home.canonicalize().unwrap();
+        assert!(is_home(&real, Some(&home)));
+        assert!(is_home(&real, Some(&base.join("link"))));
+        // A folder below it is a folder like any other, its own project.
+        let app = real.join("code/app");
+        assert!(!is_home(&app, Some(&home)));
+        assert_eq!(folder_in(&app, Some(&home)).unwrap(), app);
+        assert!(!is_home(&real, None));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn no_project_is_made_in_the_home_folder_but_a_lead_there_opens() {
+        let base = std::env::temp_dir().join(format!("sonny-home-lead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let open = |leads: Value, pick: Pick| {
+            let home = home.clone();
+            async move {
+                let client =
+                    crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+                        Some("bots") => leads.clone(),
+                        _ => json!({"error": {"code": "unexpected", "message": "asked"}}),
+                    })
+                    .await;
+                open_in(&client, &home, Some("a/b"), &pick, Some(&home)).await
+            }
+        };
+        // None there: refused, and nothing written in the home folder.
+        let error = open(json!({"bots": []}), Pick::Last).await.err().unwrap();
+        assert!(
+            error.starts_with("home_folder: ~ is your home folder"),
+            "{error}"
+        );
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+        // One made there before opens, as it always did.
+        let lead = json!({"bots": [{"name": "home.lead", "workspace": home}]});
+        let opened = open(lead.clone(), Pick::Last).await.unwrap();
+        assert_eq!((opened.bot.as_str(), opened.new), ("home.lead", false));
+        // Another lead is not made there either.
+        let error = open(lead, Pick::New(Some("fix".into())))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with("home_folder: "), "{error}");
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn new_project_refuses_the_home_folder() {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        // Refused before any daemon is reached.
+        let named = json!({"folder": home, "title": "Home"});
+        let error = add("work.lead", Some("a/b"), &named).await.unwrap_err();
+        assert!(error.starts_with("home_folder: "), "{error}");
+        assert!(error.contains("the person's home folder"), "{error}");
     }
 
     #[test]

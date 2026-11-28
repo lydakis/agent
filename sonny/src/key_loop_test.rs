@@ -238,6 +238,7 @@ fn window(client: Arc<Client>, socket: PathBuf) -> App {
         reopened: false,
         land: false,
         before: None,
+        by_setting: false,
     };
     App::new(client, "b", &json!({"name": "b"}), options)
 }
