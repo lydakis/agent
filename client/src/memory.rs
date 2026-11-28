@@ -30,8 +30,9 @@ const LIMIT: usize = 16 * 1024;
 /// How much of an index a new agent's instructions take, and `show` gives:
 /// its head ([`head`]), every fact in the index's order with descriptions
 /// shortened to fit, or past that names alone and a line saying how many
-/// facts it leaves out, which `search` finds. Both indexes' heads fit an
-/// agent's instructions (60 KiB) beside its AGENTS.md files and role.
+/// facts it leaves out, which `search` finds. In an agent's instructions
+/// (60 KiB) a head takes less when AGENTS.md files and the role leave less
+/// ([`head_within`]).
 pub const HEAD: usize = 16 * 1024;
 /// Days a `work` fact may go unsaved before the cleanup is asked to retire
 /// it: work under way is saved again as it moves.
@@ -957,26 +958,39 @@ fn render_index(dir: &Path, facts: &[Fact]) -> String {
 /// ending in `…`, down to names alone; else names alone from the top, as
 /// many as fit, then how many facts it leaves out and how to find them.
 pub fn head(index: &str, folder: &Path) -> String {
-    if index.len() <= HEAD {
-        let filled = filled_lines(index, folder);
-        if filled.len() <= HEAD {
-            return filled;
-        }
-    }
-    head_of(index, Some(folder))
+    head_within(index, folder, HEAD).unwrap_or_default()
 }
 
-/// [`head`], each live fact filled from `folder` when there is one, and
-/// only the lines it may show: one pass reads lines until names alone, the
-/// shortest step, pass [`HEAD`], and the rest are only counted.
-fn head_of(index: &str, folder: Option<&Path>) -> String {
-    if index.len() <= HEAD && folder.is_none() {
+/// [`head`] in at most `room` bytes, or [`HEAD`] when that is less: the
+/// room an agent's instructions still have, so a head shortens by the
+/// same steps rather than being left out. `None` when not even the line
+/// saying how many facts it leaves out fits.
+pub fn head_within(index: &str, folder: &Path, room: usize) -> Option<String> {
+    let room = room.min(HEAD);
+    if index.len() <= room {
+        let filled = filled_lines(index, folder);
+        if filled.len() <= room {
+            return Some(filled);
+        }
+    }
+    let head = head_of(index, Some(folder), room);
+    // A head is what fits, never nothing: an index with any text that
+    // shows none of it is left out, as one past the room is.
+    (head.len() <= room && (!head.trim().is_empty() || index.trim().is_empty())).then_some(head)
+}
+
+/// [`head`] in at most `room` bytes, each live fact filled from `folder`
+/// when there is one, and only the lines it may show: one pass reads lines
+/// until names alone, the shortest step, pass `room`, and the rest are
+/// only counted.
+fn head_of(index: &str, folder: Option<&Path>, room: usize) -> String {
+    if index.len() <= room && folder.is_none() {
         return index.to_owned();
     }
     let steps = crate::policy::SUMMARY_STEPS;
     let mut sizes = [0; STEPS];
     // Each line read, and where it ends in the index.
-    let mut lines = Vec::with_capacity(index.len().min(HEAD) / 32);
+    let mut lines = Vec::with_capacity(index.len().min(room) / 32);
     let mut read = 0;
     let mut most = MOST;
     // Where live facts fill from, when anything fills them.
@@ -989,21 +1003,21 @@ fn head_of(index: &str, folder: Option<&Path>) -> String {
         if let Some(filled) = fill.and_then(|folder| filled(&line, folder)) {
             line = Line::keeping(filled, most);
         }
-        line.size(&mut sizes);
+        line.size(&mut sizes, room);
         // A step past the head cannot fit: only those still sized count
         // characters.
         most = (steps.iter().zip(sizes))
-            .filter_map(|(&chars, size)| (size <= HEAD).then_some(chars))
+            .filter_map(|(&chars, size)| (size <= room).then_some(chars))
             .max()
             .unwrap_or_default();
         lines.push((line, read));
-        if sizes[STEPS - 1] > HEAD {
+        if sizes[STEPS - 1] > room {
             break;
         }
     }
     let step = |chars| steps.iter().position(|&at| at == chars).unwrap_or_default();
-    if let Some(chars) = crate::policy::summary_step(HEAD, |chars| sizes[step(chars)]) {
-        let mut kept = String::with_capacity(HEAD);
+    if let Some(chars) = crate::policy::summary_step(room, |chars| sizes[step(chars)]) {
+        let mut kept = String::with_capacity(room);
         for (line, _) in &lines {
             line.push(&mut kept, chars);
         }
@@ -1011,11 +1025,11 @@ fn head_of(index: &str, folder: Option<&Path>) -> String {
     }
     // Names from the top while they fit beside the closing line, the
     // lines read being more than that; the rest only counted.
-    let room = HEAD - 256;
-    let mut kept = String::with_capacity(HEAD);
+    let names = room.saturating_sub(CLOSING);
+    let mut kept = String::with_capacity(room);
     let mut shown = 0;
     for (line, end) in &lines {
-        if kept.len() + line.len(0) > room {
+        if kept.len() + line.len(0) > names {
             break;
         }
         line.push(&mut kept, 0);
@@ -1035,6 +1049,10 @@ fn head_of(index: &str, folder: Option<&Path>) -> String {
     }
     kept
 }
+
+/// What a head keeps for its closing line, how many facts it leaves out:
+/// more than the line takes with any count.
+const CLOSING: usize = 256;
 
 /// How many bytes an index's head takes with names alone, every fact
 /// listed: past [`HEAD`], the nightly cleanup folds facts by subject.
@@ -1252,8 +1270,8 @@ impl<'a> Line<'a> {
     }
 
     /// Add to each step's size in `sizes` the bytes [`Line::push`] writes
-    /// at it, for each step not yet past [`HEAD`].
-    fn size(&self, sizes: &mut [usize; STEPS]) {
+    /// at it, for each step not yet past `room`.
+    fn size(&self, sizes: &mut [usize; STEPS], room: usize) {
         let Some((fact, description)) = self.fact() else {
             for size in sizes {
                 *size += self.whole.len();
@@ -1262,7 +1280,7 @@ impl<'a> Line<'a> {
         };
         let steps = crate::policy::SUMMARY_STEPS;
         for (size, chars) in sizes.iter_mut().zip(steps) {
-            if *size > HEAD {
+            if *size > room {
                 continue;
             }
             *size += match (chars, self.cut(description, chars)) {
@@ -1424,7 +1442,7 @@ fn in_head(index: &str, name: &str) -> bool {
     if index.len() <= HEAD {
         return true;
     }
-    let head = head_of(index, None);
+    let head = head_of(index, None, HEAD);
     let line = format!("- {name} (");
     head.lines().any(|shown| shown.starts_with(&line))
 }
@@ -2625,7 +2643,7 @@ mod tests {
         );
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
         assert!(index.len() > HEAD && index.contains(&format!("fact-{:03}", n - 1)));
-        let top = head_of(&index, None);
+        let top = head_of(&index, None, HEAD);
         assert!(top.len() <= HEAD, "{}", top.len());
         let shown = top.lines().filter(|line| line.starts_with("- ")).count();
         assert!(
@@ -4036,7 +4054,7 @@ mod tests {
         let facts = facts_of(148, 0, 441);
         let index = render_index(dir, &facts);
         assert!(index.len() > HEAD * 3, "{}", index.len());
-        let top = head_of(&index, None);
+        let top = head_of(&index, None, HEAD);
         assert!(top.len() <= HEAD, "{}", top.len());
         // Every fact, in the index's order, a reference fact among them,
         // which sorts last.
@@ -4061,14 +4079,14 @@ mod tests {
             at_step(&index, chars);
             at_step(&wide, chars);
         }
-        let wide_top = head_of(&wide, None);
+        let wide_top = head_of(&wide, None, HEAD);
         assert!(wide_top.len() <= HEAD && named(&wide_top) == named(&index));
         // An index that fits is given whole, and a head changes only when
         // the index does, so a new agent's instructions stay cached.
         let small = render_index(dir, &facts[..20]);
         assert!(small.len() <= HEAD);
-        assert_eq!(head_of(&small, None), small);
-        assert_eq!(head_of(&index, None), top);
+        assert_eq!(head_of(&small, None, HEAD), small);
+        assert_eq!(head_of(&index, None, HEAD), top);
     }
 
     #[test]
@@ -4080,7 +4098,7 @@ mod tests {
         let index = render_index(dir, &facts);
         assert!(names_only(&index) > HEAD);
         assert_eq!(names_only(&index), at_step(&index, 0));
-        let top = head_of(&index, None);
+        let top = head_of(&index, None, HEAD);
         assert!(top.len() <= HEAD, "{}", top.len());
         // The index's first facts, work first, by names alone.
         let all = named(&index);
@@ -4333,5 +4351,46 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_head_fits_the_room_it_is_given_down_to_its_closing_line() {
+        let folder = Path::new("/nowhere");
+        let mut index = "# Memory in /u\n\n".to_owned();
+        for n in 0..33 {
+            index += &format!(
+                "- fact-{n:02} (project, verified 2026-11-05): {}\n",
+                "a description of some length ".repeat(9)
+            );
+        }
+        // At HEAD and past it, the head is the one a new agent gets.
+        assert_eq!(
+            head_within(&index, folder, HEAD).unwrap(),
+            head(&index, folder)
+        );
+        assert_eq!(head_within(&index, folder, usize::MAX).unwrap(), index);
+        // Less room: descriptions cut alike, then names alone, then names
+        // from the top and how many it leaves out.
+        let mut last = index.len();
+        for room in [8000, 4000, 1000, 400] {
+            let head = head_within(&index, folder, room).unwrap();
+            assert!(head.len() <= room && head.len() <= last, "{room}: {head}");
+            assert!(head.contains("- fact-00 ("), "{room}: {head}");
+            last = head.len();
+        }
+        assert!(head_within(&index, folder, 4000).unwrap().contains("…\n"));
+        let names = head_within(&index, folder, 1000).unwrap();
+        assert!(names.contains("- fact-00 (project, verified 2026-11-05)\n"));
+        assert!(names.contains("more facts are in this folder's MEMORY.md"));
+        // Room for the closing line alone, then not even that.
+        let closing = head_within(&index, folder, 200).unwrap();
+        assert!(closing.len() <= 200);
+        assert!(
+            closing.trim().starts_with("33 more facts are in"),
+            "{closing}"
+        );
+        assert_eq!(head_within(&index, folder, 60), None);
+        // An empty index is an empty head, whatever the room.
+        assert_eq!(head_within("", folder, 0).as_deref(), Some(""));
     }
 }
