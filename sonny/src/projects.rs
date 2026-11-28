@@ -103,6 +103,18 @@ pub enum Pick {
     Pin(String),
 }
 
+/// A line under the head of **Projects**: one drawn as it is, with the
+/// row it shows and where its name is a link, or the shown row at this
+/// place, drawn only once in view.
+enum Body {
+    Line(
+        Line<'static>,
+        Option<usize>,
+        Option<(std::ops::Range<usize>, String)>,
+    ),
+    Shown(usize),
+}
+
 /// A row the pick can be on, in the page's order: the pinned agents (by
 /// their place among the pins), then the projects and the fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -716,52 +728,58 @@ impl View {
         let rows = self.rows(now);
         let picked = self.picked_row(&rows);
         let pins = self.pins_shown();
+        // Under the head, the pinned rows and the projects scroll as one
+        // list, so neither hides the other on a short screen.
+        let mut body: Vec<Body> = Vec::new();
         if !pins.is_empty() {
-            out.push(Line::from(vec![Span::raw(" "), Span::raw("Pinned").dim()]));
-            self.drawn.push(None);
+            body.push(Body::Line(
+                Line::from(vec![Span::raw(" "), Span::raw("Pinned").dim()]),
+                None,
+                None,
+            ));
             let lines = self.pin_rows(&pins, width.saturating_sub(1));
-            for (i, (mut line, link)) in lines.into_iter().enumerate() {
-                if let Some((columns, bot)) = link {
-                    self.linked.push((out.len(), columns, bot));
-                }
-                if Some(i) == picked {
-                    crate::list::pick(&mut line);
-                }
-                out.push(line);
-                self.drawn.push(Some(i));
+            for (i, (line, link)) in lines.into_iter().enumerate() {
+                body.push(Body::Line(line, Some(i), link));
             }
-            out.push(Line::default());
-            self.drawn.push(None);
+            body.push(Body::Line(Line::default(), None, None));
         }
+        let shown = match self.read {
+            true => self.shown(now),
+            false => Vec::new(),
+        };
+        let first = pins.len();
+        let projects_at = body.len();
         if !self.read {
-            out.push(Line::from(" reading…").dim());
-            self.drawn.push(None);
-            return out;
-        }
-        let shown = self.shown(now);
-        if shown.is_empty() {
+            body.push(Body::Line(Line::from(" reading…").dim(), None, None));
+        } else if shown.is_empty() {
             let said = match &self.finding {
                 Some(find) if find.typed() && pins.is_empty() => {
-                    format!(" nothing here matches {}", find.query)
+                    Some(format!(" nothing here matches {}", find.query))
                 }
-                Some(find) if find.typed() => return out,
-                _ => " no project yet".to_owned(),
+                Some(find) if find.typed() => None,
+                _ => Some(" no project yet".to_owned()),
             };
-            out.push(Line::from(said).dim());
-            return out;
+            if let Some(said) = said {
+                body.push(Body::Line(Line::from(said).dim(), None, None));
+            }
+        } else {
+            body.extend((0..shown.len()).map(Body::Shown));
         }
-        let first = pins.len();
-        let picked = picked.and_then(|at| at.checked_sub(first));
-        let rows = height.saturating_sub(out.len()).max(1);
+        // Where the pick is drawn among them.
+        let picked_at = picked.map(|at| match at.checked_sub(first) {
+            None => 1 + at,
+            Some(at) => projects_at + at,
+        });
+        let room_rows = height.saturating_sub(out.len()).max(1);
         // The pick stays in view, unless the wheel moved the rows since.
-        if let Some(at) = picked.filter(|_| !self.scrolled) {
+        if let Some(at) = picked_at.filter(|_| !self.scrolled) {
             if at < self.top {
                 self.top = at;
-            } else if at >= self.top + rows {
-                self.top = at + 1 - rows;
+            } else if at >= self.top + room_rows {
+                self.top = at + 1 - room_rows;
             }
         }
-        self.top = self.top.min(shown.len().saturating_sub(rows));
+        self.top = self.top.min(body.len().saturating_sub(room_rows));
         let labels: Vec<usize> = (shown.iter())
             .map(|row| match row {
                 Shown::Project(at, depth) => label_width(&self.projects[*at], *depth),
@@ -780,23 +798,35 @@ impl View {
         let widest = counted.iter().copied().max().unwrap_or(0);
         let column =
             (labels.iter().copied().max().unwrap_or(0)).min(room.saturating_sub(2 + widest));
-        for (i, row) in shown.iter().enumerate().skip(self.top).take(rows) {
-            let mut line = match *row {
-                Shown::Fold(n, open) => {
-                    let sign = if open { "▾" } else { "▸" };
-                    let noun = if n == 1 { "project" } else { "projects" };
-                    Line::from(vec![
-                        Span::raw(" "),
-                        Span::raw(format!("{sign} {n} idle {noun}")).dim(),
-                    ])
+        let top = self.top;
+        for (at, part) in body.into_iter().enumerate().skip(top).take(room_rows) {
+            let (mut line, row) = match part {
+                Body::Line(line, row, link) => {
+                    if let Some((columns, bot)) = link {
+                        self.linked.push((out.len(), columns, bot));
+                    }
+                    (line, row)
                 }
-                Shown::Project(at, depth) => self.row(at, depth, column, room),
+                Body::Shown(i) => {
+                    let line = match shown[i] {
+                        Shown::Fold(n, open) => {
+                            let sign = if open { "▾" } else { "▸" };
+                            let noun = if n == 1 { "project" } else { "projects" };
+                            Line::from(vec![
+                                Span::raw(" "),
+                                Span::raw(format!("{sign} {n} idle {noun}")).dim(),
+                            ])
+                        }
+                        Shown::Project(at, depth) => self.row(at, depth, column, room),
+                    };
+                    (line, Some(first + i))
+                }
             };
-            if Some(i) == picked {
+            if Some(at) == picked_at {
                 crate::list::pick(&mut line);
             }
             out.push(line);
-            self.drawn.push(Some(first + i));
+            self.drawn.push(row);
         }
         out
     }
@@ -1565,6 +1595,32 @@ mod tests {
             &text(&mut view, 80)[4..],
             [" nothing here matches ledger.lx"]
         );
+    }
+
+    #[test]
+    fn on_a_short_screen_the_pinned_rows_and_the_projects_scroll_as_one() {
+        let mut view = pinned();
+        let short = |view: &mut View| -> Vec<String> {
+            (view.lines(80, 9, NOW).iter())
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect()
+        };
+        // Five rows under the head: the pick goes down to the fold, which
+        // is drawn, the pinned rows scrolled away above it.
+        for _ in 0..12 {
+            key(&mut view, KeyCode::Down);
+        }
+        let drawn = short(&mut view);
+        assert_eq!(drawn.len(), 9);
+        assert_eq!(drawn.last().unwrap(), " ▸ 4 idle projects");
+        assert!(!drawn.iter().any(|line| line.contains("Pinned")));
+        // Back up to the first pin: it is drawn again.
+        for _ in 0..12 {
+            key(&mut view, KeyCode::Up);
+        }
+        let drawn = short(&mut view);
+        assert_eq!(view.pick, Some(Pick::Pin("tally.readme".into())));
+        assert!(drawn.contains(&" 1 ? Check the README examples  tally.readme".to_owned()));
     }
 
     #[test]

@@ -218,7 +218,8 @@ unpins for you: a done agent keeps its row and mark, and one not there any
 more keeps its row in muted words, its number answered `NAME is not
 there`, until `p` clears it. With nothing pinned the section is not drawn.
 The pins are one small file beside the store (`STORE.pinned`, a name a
-line), shared by every window and replaced whole by a rename; a window
+line), shared by every window and replaced whole by a rename under a
+lock beside it; a window
 reads it as it starts and as Projects opens, and writes it, beside the
 window, never while drawing or taking a key. Their marks and titles come
 from what Projects already reads.

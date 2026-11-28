@@ -104,9 +104,9 @@ fn write(file: &Path, names: &[String]) -> Result<(), String> {
 /// replaced with what they came to, unless none changed it: so another
 /// window's pins made meanwhile are kept. The pins as they stand after.
 fn changed(file: &Path, changes: &[Change]) -> Vec<String> {
-    // One window's changes reach the file one at a time.
-    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    // Every window's changes reach the file one at a time, read to
+    // replace, under a lock beside it that each takes in turn.
+    let _one = (!changes.is_empty()).then(|| lock(file)).flatten();
     let mut names = read(file);
     let was = names.clone();
     for change in changes {
@@ -116,6 +116,21 @@ fn changed(file: &Path, changes: &[Change]) -> Vec<String> {
         let _ = write(file, &names);
     }
     names
+}
+
+/// The lock beside `file` (`FILE.lock`), held while it is read and
+/// replaced; none where it can't be opened, and the change goes ahead.
+fn lock(file: &Path) -> Option<std::fs::File> {
+    let mut path = file.as_os_str().to_owned();
+    path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(PathBuf::from(path))
+        .ok()?;
+    lock.lock().ok()?;
+    Some(lock)
 }
 
 /// A window's pins: the names as it last knew them, read and written
@@ -216,6 +231,18 @@ impl Pins {
         std::mem::take(&mut self.moved)
     }
 
+    /// The write under way, and the changes waiting on it, made before
+    /// the window goes, so a pin it answered is in the file for the next.
+    pub async fn flush(&mut self) {
+        if let Some(job) = self.job.take() {
+            let _ = job.await;
+        }
+        let changes = std::mem::take(&mut self.waiting);
+        if let (false, Some(file)) = (changes.is_empty(), self.file.clone()) {
+            let _ = tokio::task::spawn_blocking(move || changed(&file, &changes)).await;
+        }
+    }
+
     /// The read or write under way, and any that waits on it, run to
     /// their end, what they found taken as [`Pins::landed`] takes it.
     #[cfg(test)]
@@ -262,6 +289,42 @@ mod tests {
         assert_eq!(apply(&mut names, &Change::Pin("d.x".into())), Came::Full);
         assert_eq!(Came::Full.said(), "9 pinned · unpin one first");
         assert_eq!(names.len(), MOST);
+    }
+
+    #[test]
+    fn windows_pinning_at_once_each_keep_their_pin() {
+        let dir = std::env::temp_dir().join(format!("sonny-pins-at-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("state.sqlite.pinned");
+        let windows: Vec<_> = (0..MOST)
+            .map(|n| {
+                let file = file.clone();
+                std::thread::spawn(move || changed(&file, &[Change::Pin(format!("p.{n}"))]))
+            })
+            .collect();
+        for window in windows {
+            window.join().unwrap();
+        }
+        assert_eq!(read(&file).len(), MOST);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_pin_waiting_on_a_write_is_written_before_the_window_goes() {
+        let dir = std::env::temp_dir().join(format!("sonny-pins-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let woken = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut pins = Pins::new(&store);
+        pins.toggle("a.lead", &woken);
+        // The first write is under way: these wait on it.
+        pins.toggle("b.lead", &woken);
+        pins.toggle("c.x", &woken);
+        pins.flush().await;
+        assert_eq!(read(&file(&store)), ["a.lead", "b.lead", "c.x"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

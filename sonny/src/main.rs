@@ -722,9 +722,10 @@ struct ProjectsOpen {
     waiting: std::collections::HashSet<String>,
     /// The rows' version the last read counted ([`elsewhere::Rows`]).
     version: Option<u64>,
-    /// Whether the pins changed since the last read counted: each
-    /// project that holds a pin found or let go is counted again.
-    pins_moved: bool,
+    /// The pins the last read counted with: once they are not this
+    /// window's, each project that holds a pin found or let go is counted
+    /// again, though the page closed between.
+    pins: Vec<String>,
     /// Where the page and the pane beside it were drawn, for the mouse.
     page: Rect,
     side: Rect,
@@ -765,6 +766,7 @@ struct ProjectsKept {
     whole: bool,
     waiting: std::collections::HashSet<String>,
     version: Option<u64>,
+    pins: Vec<String>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
     /// The project picked to go to, as the page showed it: the window
     /// opened on its lead shows its counts and agents from its first
@@ -796,6 +798,7 @@ impl ProjectsKept {
         self.whole = read.whole;
         self.waiting = read.waiting;
         self.version = Some(read.version);
+        self.pins = read.pins;
     }
 }
 
@@ -888,7 +891,7 @@ impl App {
             whole: kept.whole,
             waiting: kept.waiting,
             version: kept.version,
-            pins_moved: false,
+            pins: kept.pins,
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -914,6 +917,7 @@ impl App {
             whole: open.whole,
             waiting: std::mem::take(&mut open.waiting),
             version: open.version,
+            pins: std::mem::take(&mut open.pins),
             job: open.job.take(),
             picked: None,
         };
@@ -1093,6 +1097,7 @@ impl App {
                     open.whole = read.whole;
                     open.waiting = read.waiting;
                     open.version = Some(read.version);
+                    open.pins = read.pins;
                 }
                 _ => open.version = None,
             }
@@ -1105,11 +1110,12 @@ impl App {
         };
         // Every agent's row, once in and moved since the last read (or the
         // questions open did, or the last read was short).
+        let pins = self.pins.names();
         let again = |rows: &elsewhere::Rows| {
             Some(rows.version) != open.version
                 || waiting != open.waiting
                 || !open.whole
-                || open.pins_moved
+                || open.pins != pins
         };
         let Some((version, listed)) = shared.rows(|rows| {
             rows.filter(|rows| again(rows)).map(|rows| {
@@ -1122,7 +1128,6 @@ impl App {
             return set;
         };
         open.read_at = Some(Instant::now());
-        open.pins_moved = false;
         let (client, woken) = (self.client.clone(), self.woken.clone());
         let store = self.options.store.clone();
         let (bot, asks, approvals) = (self.bot.clone(), self.asks.clone(), self.approvals.clone());
@@ -1140,9 +1145,11 @@ impl App {
                 waiting,
                 version,
                 // The pins no agent listed is: not there any more.
-                gone: (pins.into_iter())
-                    .filter(|pin| !listed.iter().any(|agent| agent.name == *pin))
+                gone: (pins.iter())
+                    .filter(|pin| !listed.iter().any(|agent| agent.name == **pin))
+                    .cloned()
                     .collect(),
+                pins,
             });
             woken.notify_one();
             read
@@ -1248,7 +1255,6 @@ impl App {
         let came = self.pins.toggle(bot, &self.woken);
         if let Some(open) = &mut self.projects {
             open.view.set_pins(self.pins.names().to_vec(), now_ms());
-            open.pins_moved = true;
         }
         came
     }
@@ -1266,7 +1272,6 @@ impl App {
         }
         if let Some(open) = &mut self.projects {
             open.view.set_pins(self.pins.names().to_vec(), now_ms());
-            open.pins_moved = true;
         }
         true
     }
@@ -1311,6 +1316,8 @@ struct ProjectsRead {
     waiting: std::collections::HashSet<String>,
     /// The rows' version it counted ([`elsewhere::Rows`]).
     version: u64,
+    /// The pins it counted with.
+    pins: Vec<String>,
     /// The pinned agents it did not find listed.
     gone: Vec<String>,
 }
@@ -9763,6 +9770,8 @@ impl App {
                 for siding in std::mem::take(&mut self.siding) {
                     let _ = siding.await;
                 }
+                // And the pins it answered: the next window reads them.
+                self.pins.flush().await;
                 return Ok(());
             }
             let every = tick_every(self.moving(), heard.elapsed());
@@ -31626,7 +31635,7 @@ mod tests {
             whole: true,
             waiting: Default::default(),
             version: None,
-            pins_moved: false,
+            pins: Vec::new(),
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -31667,6 +31676,7 @@ mod tests {
                 waiting: Default::default(),
                 version: 7,
                 gone: Vec::new(),
+                pins: Vec::new(),
             })
         });
         while !job.is_finished() {
@@ -31681,7 +31691,7 @@ mod tests {
             whole: true,
             waiting: Default::default(),
             version: None,
-            pins_moved: false,
+            pins: Vec::new(),
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -31709,6 +31719,7 @@ mod tests {
                     waiting: Default::default(),
                     version: 7,
                     gone: Vec::new(),
+                    pins: Vec::new(),
                 })
             })),
             ..Default::default()
@@ -31826,7 +31837,7 @@ mod tests {
         let open = app.projects.as_ref().unwrap();
         assert_eq!(open.view.pins(), ["tally.lead"]);
         // The next read counts the project again, to find the pin's row.
-        assert!(open.pins_moved);
+        assert_ne!(open.pins, app.pins.names());
         assert_eq!(app.notice, None);
         // A pin not there any more: its number is answered, the page stays.
         app.toggle_pin("tally.gone");
@@ -42563,7 +42574,7 @@ mod tests {
                 whole: true,
                 waiting: Default::default(),
                 version: None,
-                pins_moved: false,
+                pins: Vec::new(),
                 page: Rect::default(),
                 side: Rect::default(),
             }));
