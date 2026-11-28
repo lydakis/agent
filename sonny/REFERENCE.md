@@ -2327,7 +2327,7 @@ Sonny declares tools answered by `sonny-tool-host` ([docs/SONNY.md#tool-host](..
 
 ### Browser and desktop tools
 
-Sonny installs and runs its own integrity-verified copies of `agent-browser` (`0.41.1`) and `agent-desktop` (`1.0.2`) under `~/.agent/sonny/programs/` (hidden from every sandbox), with sockets isolated in walled `~/.agent/run/sonny/`.
+Sonny installs and runs its own integrity-verified copies of `agent-browser` (`0.45.0`) and `agent-desktop` (`1.0.2`) under `~/.agent/sonny/programs/` (hidden from every sandbox), with sockets isolated in walled `~/.agent/run/sonny/`.
 
 - **`browser`:** Runs each agent in its own session, wraps page text in untrusted-content markers, returns inline screenshots (up to 20/call), blocks extension/plugin/clipboard/DevTools escapes and writes outside the workspace, and routes `[sonny] browser_confirm` actions (`eval`, `download`, `upload`, `state`), vault logins, and offline-agent calls through the agent's approval gate.
 - **`desktop`:** Runs `agent-desktop` serialized across agents (read-only snapshots/screenshots run immediately; clicks, typing, app launches, and clipboard actions wait for approval once). On macOS, grant Accessibility and Screen Recording directly to Sonny's `agent-desktop` copy (`permissions --guide` opens Settings; re-grant after upgrades since it is unsigned).
@@ -2402,7 +2402,10 @@ a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
 With agent-browser installed, Sonny also writes its `agent-browser` skill
 the same way, as `agent-browser skills get agent-browser` prints it for
-the version installed, and removes it when agent-browser is gone. Agents
+the version installed, and removes it when agent-browser is gone. That
+skill points to the guide the program serves, `skills get core`, and its
+references, which the `browser` tool runs too (`skills get` and `skills
+list` only), from the skills Sonny installs beside its copy. Agents
 drive it through the `browser` tool, which the tool host answers outside
 their sandbox: it runs the skill's commands in each agent's own browser
 session, its answers read from agent-browser's JSON, and a screenshot
@@ -2439,8 +2442,10 @@ is not signed by a developer, so macOS forgets the grant when it is
 upgraded, and asks again.
 Neither tool runs an agent-browser or agent-desktop on your `PATH`.
 Sonny installs its own, at the versions its tools list the commands of
-(agent-browser 0.41.1, agent-desktop 1.0.2), from their npm releases
-checked against the integrity it pins, into
+(agent-browser 0.45.0, agent-desktop 1.0.2), from their npm releases
+checked against the integrities it pins (agent-browser's program from the
+package it publishes for each platform, `@agent-browser/cli-PLATFORM`, and
+its skills from its own), into
 `~/.agent/sonny/programs/NAME/`: `sonny setup` installs them, and `sonny
 upgrade` brings them to the versions the new Sonny pins (agent-desktop only
 where there is a desktop). The daemon keeps that folder from every

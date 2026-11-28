@@ -15,33 +15,70 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// A program Sonny installs: its npm package, the version its tools list
-/// the commands of (`sonny/upstream/NAME.txt`), and that release's npm
-/// integrity, which its tarball must match.
+/// the commands of (`sonny/upstream/NAME.txt`), that release's npm
+/// integrity, which its tarball must match, and where its native program
+/// for each platform is.
 pub struct Pin {
     pub name: &'static str,
     pub version: &'static str,
     integrity: &'static str,
+    natives: Natives,
+}
+
+/// Where a pin's native programs are.
+enum Natives {
+    /// In its own package, each platform's as `bin/NAME-PLATFORM`.
+    Own,
+    /// Each platform's in a package of its own, as `bin/NAME`: the
+    /// platform, the package, and its tarball's npm integrity.
+    Each(&'static [(&'static str, &'static str, &'static str)]),
 }
 
 /// The programs, pinned. Moving one is moving its list in
 /// `sonny/upstream/` with it.
 pub const PINS: [Pin; 2] = [
-    // Its own tarball holds every platform's program up to 0.42. From
-    // 0.43.0 each platform's is in a package of its own,
-    // `@agent-browser/cli-PLATFORM` (`-gnu` on Linux), as `bin/agent-browser`:
-    // a pin past 0.42 is installed from that package, with an integrity
-    // pinned for each platform.
+    // Its own package holds its skills; each platform's program is in
+    // `@agent-browser/cli-PLATFORM` (`-gnu` on Linux), the one its
+    // `optionalDependencies` has npm install on that platform.
     Pin {
         name: "agent-browser",
-        version: "0.41.1",
-        integrity: "sha512-9DhCeIhcpxu3Mj+f25Bolk6N+BT5SpOttRSZw0Ytz5MZ8zpKeVp2bv9Zxo1gajlvZE3l//rOoiRdq+qTYHBg1Q==",
+        version: "0.45.0",
+        integrity: "sha512-lzdtbRwTthLy/2FyxYBWpiI7rg6CGojoVjym1UP59hWwdTYDGSO13XwzQiEvYaInvDstHmNC5UBW7rXp6vMXMA==",
+        natives: Natives::Each(&[
+            (
+                "darwin-arm64",
+                "@agent-browser/cli-darwin-arm64",
+                "sha512-5oXJso0waXDJ4JhRlf0HMFWPfzCVGCDsAmQKrN05cDluqCCUj55ImWK0XEtiFkjwdJDpHJIJV3f6OOJD+K85Bg==",
+            ),
+            (
+                "darwin-x64",
+                "@agent-browser/cli-darwin-x64",
+                "sha512-ILY9co+hxsupMFvKsh+qi3+5I2QiDM44eEgf/3S8scKpP4rVX/vXEk6gScJQ9fw4qQyg37A58JLqbVSZbKUsbw==",
+            ),
+            (
+                "linux-arm64",
+                "@agent-browser/cli-linux-arm64-gnu",
+                "sha512-CpYFt3QaKtnKoytgXHt/pdQjN5ZSC179YrXXhLATEGxNhyJgfuSyHGPrAtfSJ1EKDEWwhcf7Lm1yn7UKBiT8XQ==",
+            ),
+            (
+                "linux-x64",
+                "@agent-browser/cli-linux-x64-gnu",
+                "sha512-3Ep+BDxFHLEqPElw/68w1OWJNs+/ucQ9RvJ47O2weqsXCLvjiDF2pmVhteXcMgbH0hUI3QK6+LG3/2ZIuC2jBQ==",
+            ),
+        ]),
     },
     Pin {
         name: "agent-desktop",
         version: "1.0.2",
         integrity: "sha512-k2Qi3f0y1U60YaJOw1dob3EO55P/DuH4HK3WKdI9sMZLjVxpGZAzuG50rIWuIqS0JIVy07g+0pp9Of2JDjTX0w==",
+        natives: Natives::Own,
     },
 ];
+
+/// What of a pin's own package is kept beside its program, as npm lays the
+/// package out, when the package has it: agent-browser's skills, which it
+/// serves from `skill-data/` and `skills/` beside the `bin/` it runs from.
+const KEPT: [&str; 2] = ["skills", "skill-data"];
 
 /// The file in a program's folder naming the version installed there.
 const VERSION: &str = "VERSION";
@@ -60,21 +97,21 @@ fn platform() -> String {
     format!("{os}-{arch}")
 }
 
-/// What runs: `origin`, and beside a native program the others of its
-/// package it starts, for this platform, by name from its folder, as
-/// agent-desktop starts its helper.
+/// What runs: `origin`, and beside it the others of its package it
+/// starts, for this platform, by name from its folder, as agent-desktop
+/// starts its helper: `NAME-*-PLATFORM`.
 fn files(program: &str, origin: &Path) -> Vec<PathBuf> {
     let mut files = vec![origin.to_path_buf()];
     let suffix = format!("-{}", platform());
-    let native = (origin.file_name().and_then(OsStr::to_str))
-        .is_some_and(|name| name == format!("{program}{suffix}"));
-    if let (true, Some(dir)) = (native, origin.parent()) {
+    if let Some(dir) = origin.parent() {
         let mut beside: Vec<PathBuf> = (std::fs::read_dir(dir).into_iter().flatten().flatten())
             .map(|entry| entry.path())
             .filter(|path| path != origin && path.is_file())
             .filter(|path| {
                 (path.file_name().and_then(OsStr::to_str)).is_some_and(|name| {
-                    name.starts_with(&format!("{program}-")) && name.ends_with(&suffix)
+                    name.starts_with(&format!("{program}-"))
+                        && name.ends_with(&suffix)
+                        && name != format!("{program}{suffix}")
                 })
             })
             .collect();
@@ -92,9 +129,12 @@ fn programs() -> PathBuf {
 }
 
 /// The program `name` runs as, in `programs`: its native program for
-/// this platform.
+/// this platform, in `bin/` as in its npm package.
 fn at(programs: &Path, name: &str) -> PathBuf {
-    programs.join(name).join(format!("{name}-{}", platform()))
+    programs
+        .join(name)
+        .join("bin")
+        .join(format!("{name}-{}", platform()))
 }
 
 /// Whether Sonny's copy of `name` is installed.
@@ -136,20 +176,20 @@ pub fn bring_up(say: &dyn Fn(&str)) -> Vec<String> {
         .filter(|pin| installed(&programs, pin.name).as_deref() != Some(pin.version))
         .filter_map(|pin| {
             say(&format!("Installing {} {}", pin.name, pin.version));
-            let url = url(pin);
-            install(&programs, pin, &|archive: &Path| download(&url, archive))
-                .err()
-                .map(|error| format!("{} {}: {error}", pin.name, pin.version))
+            install(&programs, pin, &|package, archive| {
+                download(&url(package, pin.version), archive)
+            })
+            .err()
+            .map(|error| format!("{} {}: {error}", pin.name, pin.version))
         })
         .collect()
 }
 
-/// Where npm serves `pin`'s tarball.
-fn url(pin: &Pin) -> String {
-    format!(
-        "https://registry.npmjs.org/{0}/-/{0}-{1}.tgz",
-        pin.name, pin.version
-    )
+/// Where npm serves `package`'s tarball at `version`: a scoped package's
+/// is named without its scope.
+fn url(package: &str, version: &str) -> String {
+    let base = package.rsplit('/').next().unwrap_or(package);
+    format!("https://registry.npmjs.org/{package}/-/{base}-{version}.tgz")
 }
 
 /// Fetch `url` to `to`.
@@ -167,15 +207,15 @@ fn download(url: &str, to: &Path) -> Result<(), String> {
     }
 }
 
-/// Install `pin` in `programs`, its tarball fetched by `fetch`: checked
-/// against its integrity, its native programs for this platform unpacked
-/// beside one another, and the folder moved into place whole, so a copy
-/// running keeps running as it was.
-fn install(
-    programs: &Path,
-    pin: &Pin,
-    fetch: &dyn Fn(&Path) -> Result<(), String>,
-) -> Result<(), String> {
+/// What fetches a package's tarball, by its npm name, to a file.
+type Fetch<'a> = &'a dyn Fn(&str, &Path) -> Result<(), String>;
+
+/// Install `pin` in `programs`, each tarball fetched by `fetch` and checked
+/// against its integrity: its program for this platform in `bin/` with the
+/// others of its package it starts beside it, what [`KEPT`] names of its
+/// own package beside `bin/`, and the folder moved into place whole, so a
+/// copy running keeps running as it was.
+fn install(programs: &Path, pin: &Pin, fetch: Fetch) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(programs).map_err(io(programs))?;
     std::fs::set_permissions(programs, std::fs::Permissions::from_mode(0o700))
@@ -188,44 +228,71 @@ fn install(
     result
 }
 
-fn unpack(
-    programs: &Path,
-    pin: &Pin,
-    fetch: &dyn Fn(&Path) -> Result<(), String>,
-    work: &Path,
-) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let archive = work.join("package.tgz");
-    fetch(&archive)?;
-    if integrity(&archive)? != pin.integrity {
-        return Err("its tarball does not match the integrity Sonny pins".into());
+/// `package`'s tarball, fetched, checked against `integrity` and unpacked
+/// in `into`: its folder, `into/package`.
+fn fetched(package: &str, integrity: &str, fetch: Fetch, into: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(into).map_err(io(into))?;
+    let archive = into.join("package.tgz");
+    fetch(package, &archive)?;
+    if self::integrity(&archive)? != integrity {
+        return Err(format!(
+            "{package}'s tarball does not match the integrity Sonny pins"
+        ));
     }
     let unpacked = std::process::Command::new("tar")
         .arg("-xzf")
         .arg(&archive)
         .arg("-C")
-        .arg(work)
-        .arg("package/bin")
+        .arg(into)
+        .arg("package")
         .stdin(std::process::Stdio::null())
         .status()
         .map_err(|e| format!("tar: {e}"))?;
-    let origin = work
-        .join("package/bin")
-        .join(format!("{}-{}", pin.name, platform()));
-    if !unpacked.success() || !origin.is_file() {
-        return Err(format!(
-            "its tarball has no {} for {}",
-            pin.name,
-            platform()
-        ));
+    match unpacked.success() {
+        true => Ok(into.join("package")),
+        false => Err(format!("{package}'s tarball does not unpack")),
+    }
+}
+
+fn unpack(programs: &Path, pin: &Pin, fetch: Fetch, work: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let platform = platform();
+    let own = fetched(pin.name, pin.integrity, fetch, &work.join("own"))?;
+    let (package, origin) = match pin.natives {
+        Natives::Own => (pin.name, own.join(format!("bin/{}-{platform}", pin.name))),
+        Natives::Each(natives) => {
+            let Some((_, package, integrity)) = natives.iter().find(|(p, ..)| *p == platform)
+            else {
+                return Err(format!("Sonny pins no {} for {platform}", pin.name));
+            };
+            let native = fetched(package, integrity, fetch, &work.join("native"))?;
+            (*package, native.join("bin").join(pin.name))
+        }
+    };
+    if !origin.is_file() {
+        return Err(format!("{package} has no {} for {platform}", pin.name));
     }
     let made = work.join(pin.name);
-    std::fs::create_dir_all(&made).map_err(io(&made))?;
-    std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o700)).map_err(io(&made))?;
-    for file in files(pin.name, &origin) {
-        let to = made.join(file.file_name().unwrap_or_default());
+    let bin = made.join("bin");
+    std::fs::create_dir_all(&bin).map_err(io(&bin))?;
+    for dir in [&made, &bin] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(io(dir))?;
+    }
+    // The program by the name it runs as, `NAME-PLATFORM`, whatever its
+    // package calls it; the others by their own.
+    for (n, file) in files(pin.name, &origin).into_iter().enumerate() {
+        let to = match n {
+            0 => at(work, pin.name),
+            _ => bin.join(file.file_name().unwrap_or_default()),
+        };
         std::fs::rename(&file, &to).map_err(io(&to))?;
         std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o700)).map_err(io(&to))?;
+    }
+    for kept in KEPT {
+        let from = own.join(kept);
+        if from.is_dir() {
+            std::fs::rename(&from, made.join(kept)).map_err(io(&from))?;
+        }
     }
     let version = made.join(VERSION);
     std::fs::write(&version, format!("{}\n", pin.version)).map_err(io(&version))?;
@@ -288,13 +355,14 @@ mod tests {
         std::fs::canonicalize(dir).unwrap()
     }
 
-    /// An npm tarball holding `files` under `package/bin`, and its
-    /// integrity.
+    /// An npm tarball holding `files`, by their paths in its package, and
+    /// its integrity.
     fn tarball(root: &Path, files: &[(&str, &str)]) -> (PathBuf, String) {
-        let bin = root.join("made/package/bin");
-        std::fs::create_dir_all(&bin).unwrap();
+        let package = root.join("made/package");
         for (name, text) in files {
-            std::fs::write(bin.join(name), text).unwrap();
+            let file = package.join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
         }
         let archive = root.join("package.tgz");
         let made = std::process::Command::new("tar")
@@ -310,13 +378,46 @@ mod tests {
         (archive, sum)
     }
 
-    fn pin(integrity: &str) -> Pin {
+    /// A pin of `tool` 1.2.3, its own tarball of `integrity`.
+    fn pin(integrity: &str, natives: Natives) -> Pin {
         Pin {
             name: "tool",
             version: "1.2.3",
             // Leaked: a test's pin lives as long as the pins it stands for.
             integrity: Box::leak(integrity.to_owned().into_boxed_str()),
+            natives,
         }
+    }
+
+    /// What fetches each package's tarball from `archives`, by name.
+    fn from<'a>(
+        archives: &'a [(&'a str, &'a Path)],
+    ) -> impl Fn(&str, &Path) -> Result<(), String> + 'a {
+        move |package, to| {
+            let (_, archive) = (archives.iter())
+                .find(|(name, _)| *name == package)
+                .ok_or(format!("no {package}"))?;
+            std::fs::copy(archive, to)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// What `dir` holds, every file by its path in it.
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut left = vec![dir.to_path_buf()];
+        while let Some(at) = left.pop() {
+            for entry in std::fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                match path.is_dir() {
+                    true => left.push(path),
+                    false => found.push(path.strip_prefix(dir).unwrap().display().to_string()),
+                }
+            }
+        }
+        found.sort();
+        found
     }
 
     #[test]
@@ -326,65 +427,158 @@ mod tests {
         let (archive, sum) = tarball(
             &root,
             &[
-                (&format!("tool-{platform}"), "main"),
-                (&format!("tool-helper-{platform}"), "helper"),
-                ("tool-win32-x64.exe", "other"),
-                ("tool", "#!/usr/bin/env node"),
+                (&format!("bin/tool-{platform}"), "main"),
+                (&format!("bin/tool-helper-{platform}"), "helper"),
+                ("bin/tool-win32-x64.exe", "other"),
+                ("bin/tool", "#!/usr/bin/env node"),
+                ("scripts/postinstall.js", "fetch()"),
             ],
         );
         let programs = root.join("programs");
-        let fetch = |to: &Path| {
-            std::fs::copy(&archive, to)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
-        install(&programs, &pin(&sum), &fetch).unwrap();
+        let archives = [("tool", archive.as_path())];
+        let fetch = from(&archives);
+        install(&programs, &pin(&sum, Natives::Own), &fetch).unwrap();
         let program = at(&programs, "tool");
         assert_eq!(std::fs::read_to_string(&program).unwrap(), "main");
         assert_eq!(installed(&programs, "tool").as_deref(), Some("1.2.3"));
-        let mut copied: Vec<String> = std::fs::read_dir(programs.join("tool"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        copied.sort();
         let mut wanted = [
             VERSION.to_owned(),
-            format!("tool-helper-{platform}"),
-            format!("tool-{platform}"),
+            format!("bin/tool-helper-{platform}"),
+            format!("bin/tool-{platform}"),
         ];
         wanted.sort();
-        assert_eq!(copied, wanted);
+        assert_eq!(listing(&programs.join("tool")), wanted);
         use std::os::unix::fs::PermissionsExt;
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!((mode(&programs), mode(&program)), (0o700, 0o700));
         // Installed again over itself: one folder, nothing left beside it.
-        install(&programs, &pin(&sum), &fetch).unwrap();
+        install(&programs, &pin(&sum, Natives::Own), &fetch).unwrap();
         let left: Vec<_> = std::fs::read_dir(&programs).unwrap().collect();
         assert_eq!(left.len(), 1);
         // A tarball that is not the pinned one installs nothing, and leaves
         // what was installed.
         std::fs::write(&archive, "swapped").unwrap();
-        let refused = install(&programs, &pin(&sum), &fetch).unwrap_err();
+        let refused = install(&programs, &pin(&sum, Natives::Own), &fetch).unwrap_err();
         assert!(refused.contains("does not match"), "{refused}");
         assert_eq!(std::fs::read_to_string(&program).unwrap(), "main");
         // One without this platform's program installs nothing either.
         let other = root.join("other");
-        std::fs::create_dir_all(&other).unwrap();
-        let (archive, sum) = tarball(&other, &[("tool-win32-x64.exe", "other")]);
-        let fetch = |to: &Path| {
-            std::fs::copy(&archive, to)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
-        let refused = install(&other.join("programs"), &pin(&sum), &fetch).unwrap_err();
+        let (archive, sum) = tarball(&other, &[("bin/tool-win32-x64.exe", "other")]);
+        let archives = [("tool", archive.as_path())];
+        let refused = install(
+            &other.join("programs"),
+            &pin(&sum, Natives::Own),
+            &from(&archives),
+        )
+        .unwrap_err();
         assert!(refused.contains("has no tool for"), "{refused}");
         assert!(!at(&other.join("programs"), "tool").exists());
+    }
+
+    #[test]
+    fn a_program_in_its_platform_s_own_package_runs_with_its_package_s_skills() {
+        // agent-browser's layout: `@scope/cli-PLATFORM` holds `bin/tool`,
+        // and its own package the skills it serves from beside `bin/`.
+        let root = temp();
+        let (own, own_sum) = tarball(
+            &root.join("own"),
+            &[
+                ("bin/tool.js", "launcher"),
+                ("skills/tool/SKILL.md", "stub"),
+                ("skill-data/core/SKILL.md", "guide"),
+                ("scripts/postinstall.js", "fetch()"),
+            ],
+        );
+        let (native, native_sum) = tarball(&root.join("native"), &[("bin/tool", "native")]);
+        let natives: &'static [(&str, &str, &str)] = Box::leak(Box::new([(
+            Box::leak(platform().into_boxed_str()) as &str,
+            "@tool/cli-here",
+            Box::leak(native_sum.clone().into_boxed_str()) as &str,
+        )]));
+        let archives = [
+            ("tool", own.as_path()),
+            ("@tool/cli-here", native.as_path()),
+        ];
+        let programs = root.join("programs");
+        install(
+            &programs,
+            &pin(&own_sum, Natives::Each(natives)),
+            &from(&archives),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(at(&programs, "tool")).unwrap(),
+            "native"
+        );
+        assert_eq!(
+            listing(&programs.join("tool")),
+            [
+                VERSION.to_owned(),
+                format!("bin/tool-{}", platform()),
+                "skill-data/core/SKILL.md".to_owned(),
+                "skills/tool/SKILL.md".to_owned(),
+            ]
+        );
+        // The platform's package is checked as the pin's own is.
+        let refused = install(
+            &programs,
+            &pin(
+                &own_sum,
+                Natives::Each(Box::leak(Box::new([(
+                    natives[0].0,
+                    "@tool/cli-here",
+                    "sha512-x",
+                )]))),
+            ),
+            &from(&archives),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("@tool/cli-here's tarball does not match"),
+            "{refused}"
+        );
+        // A platform it pins none for installs nothing.
+        let refused = install(
+            &programs,
+            &pin(&own_sum, Natives::Each(&[])),
+            &from(&archives),
+        )
+        .unwrap_err();
+        assert!(refused.contains("pins no tool for"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(at(&programs, "tool")).unwrap(),
+            "native"
+        );
+        // A scoped package's tarball is named without its scope.
+        assert_eq!(
+            url("@tool/cli-here", "1.2.3"),
+            "https://registry.npmjs.org/@tool/cli-here/-/cli-here-1.2.3.tgz"
+        );
+        assert_eq!(
+            url("agent-desktop", "1.0.2"),
+            "https://registry.npmjs.org/agent-desktop/-/agent-desktop-1.0.2.tgz"
+        );
     }
 
     #[test]
     fn the_pins_are_npm_integrities_of_the_versions_the_tools_list() {
         for pin in &PINS {
             assert!(pin.integrity.starts_with("sha512-"), "{}", pin.name);
+            // A package for each platform Sonny is built for: the Mac's two,
+            // and Linux x86_64 and aarch64.
+            if let Natives::Each(natives) = pin.natives {
+                let mut platforms: Vec<&str> = natives.iter().map(|(p, ..)| *p).collect();
+                platforms.sort();
+                assert_eq!(
+                    platforms,
+                    ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"],
+                    "{}",
+                    pin.name
+                );
+                for (_, package, integrity) in natives {
+                    assert!(integrity.starts_with("sha512-"), "{package}");
+                }
+            }
             let listed = std::fs::read_to_string(
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("upstream")
@@ -406,8 +600,8 @@ mod tests {
     fn the_pinned_programs_install_from_npm_and_run_here() {
         let programs = temp().join("programs");
         for pin in &PINS {
-            let url = url(pin);
-            let fetch = |archive: &Path| download(&url, archive);
+            let fetch =
+                |package: &str, archive: &Path| download(&url(package, pin.version), archive);
             if let Err(error) = install(&programs, pin, &fetch) {
                 panic!("{} {} on {}: {error}", pin.name, pin.version, platform());
             }
@@ -416,6 +610,25 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .output()
                 .unwrap();
+            // agent-browser serves its skills from those installed beside
+            // it: the one Sonny installs, and the guide it points to.
+            if pin.name == "agent-browser" {
+                for skill in ["agent-browser", "core"] {
+                    let served = std::process::Command::new(at(&programs, pin.name))
+                        .args(["skills", "get", skill])
+                        .env_remove("AGENT_BROWSER_SKILLS_DIR")
+                        .env("HOME", programs.join("no-home"))
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .unwrap();
+                    let text = String::from_utf8_lossy(&served.stdout);
+                    assert!(
+                        text.starts_with("---\n"),
+                        "skill {skill} on {}: {served:?}",
+                        platform()
+                    );
+                }
+            }
             let said = String::from_utf8_lossy(&ran.stdout);
             assert!(
                 ran.status.success(),

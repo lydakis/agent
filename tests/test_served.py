@@ -29,7 +29,7 @@ def platform():
 def sonny_program(home, name, origin=None):
     """Where Sonny runs its own `name` from in `home`, with `origin`'s
     native program linked there when given."""
-    path = home / '.agent/sonny/programs' / name / f'{name}-{platform()}'
+    path = home / '.agent/sonny/programs' / name / 'bin' / f'{name}-{platform()}'
     if origin:
         path.parent.mkdir(parents=True, exist_ok=True)
         launcher = Path(origin).resolve()

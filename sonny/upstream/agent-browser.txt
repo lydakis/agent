@@ -1,4 +1,4 @@
-# agent-browser 0.41.1
+# agent-browser 0.45.0
 a11y --selector
 a11y --tags
 a11y -s
@@ -14,7 +14,9 @@ auth --username
 auth --username-selector
 batch --bail
 batch --omit-command
+click --button
 click --human
+click --modifiers
 click --new-tab
 close --all
 command a11y
@@ -41,8 +43,10 @@ command download
 command drag
 command errors
 command eval
+command exit
 command fill
 command find
+command flow
 command focus
 command forward
 command frame
@@ -53,6 +57,7 @@ command hover
 command inspect
 command install
 command is
+command key
 command keyboard
 command keydown
 command keyup
@@ -107,21 +112,28 @@ cookies --secure
 cookies --url
 dashboard --allowed-origins
 dashboard --port
+dblclick --button
+dblclick --human
+dblclick --modifiers
 diff --baseline
 diff --compact
 diff --depth
 diff --full
+diff --interactive
 diff --output
 diff --screenshot
 diff --selector
 diff --threshold
+diff --urls
 diff --wait-until
 diff -b
 diff -c
 diff -d
+diff -i
 diff -o
 diff -s
 diff -t
+diff -u
 doctor --fix
 doctor --offline
 doctor --quick
@@ -132,6 +144,17 @@ eval --stdin
 eval -b
 find --exact
 find --name
+flow --allow-write
+flow --description
+flow --fields
+flow --from
+flow --limit
+flow --origin
+flow --output
+flow --param
+flow --timeout
+flow --to
+flow --where
 global --action-policy
 global --allow-file-access
 global --allowed-domains
@@ -139,7 +162,9 @@ global --annotate
 global --args
 global --auto-connect
 global --ca-cert
+global --capture
 global --cdp
+global --cdp-headers
 global --color-scheme
 global --config
 global --confirm-actions
@@ -163,6 +188,7 @@ global --json
 global --max-output
 global --model
 global --namespace
+global --no-auto-connect
 global --no-auto-dialog
 global --no-ca-cert
 global --no-pin-tab
@@ -173,6 +199,7 @@ global --provider
 global --proxy
 global --proxy-bypass
 global --quiet
+global --relaunch
 global --restore
 global --restore-check-fn
 global --restore-check-text
@@ -227,16 +254,19 @@ record --contact-sheet
 record --contact-sheet-threshold
 record --cursor
 record --fps
+screenshot --draft
 screenshot --full
 screenshot --if-changed
 screenshot --threshold
 screenshot -f
 scroll --selector
 scroll -s
+select --by
 session --prefix
 session --scope
 skills --all
 skills --full
+skills --ref
 snapshot --compact
 snapshot --delta
 snapshot --depth
@@ -253,6 +283,8 @@ state --all
 state --older-than
 stream --port
 tab --label
+type --clear
+type --delay
 wait --download
 wait --fn
 wait --load
@@ -262,3 +294,4 @@ wait --url
 webmcp --detach
 webmcp --frame
 webmcp --params
+webmcp --timeout

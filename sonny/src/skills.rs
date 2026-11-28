@@ -106,6 +106,8 @@ fn install_browser() {
     let refresh = move || {
         let served = std::process::Command::new(program)
             .args(["skills", "get", NAME])
+            // As its copy serves it, from the skills installed beside it.
+            .env_remove("AGENT_BROWSER_SKILLS_DIR")
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output();
