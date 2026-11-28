@@ -6507,8 +6507,9 @@ type FirstRead = (
     u64,
     tokio::sync::oneshot::Receiver<Result<String, String>>,
 );
-/// The agent's record, and the compaction it names ([`App::context_came`]).
-type ContextRead = Result<(Value, Option<Value>), String>;
+/// What fills the agent's context as its record and the compaction it
+/// names say ([`App::context_came`]).
+type ContextRead = Result<context::Parts, String>;
 
 /// What a read for an open card found ([`App::reread`]).
 enum CardRead {
@@ -16349,7 +16350,22 @@ impl App {
                     }
                     Some(version) => compaction_named(&socket, version).await,
                 };
-                Ok((record, compacted))
+                // What Sonny puts after the instructions it composes, read
+                // here, beside the window: from the agent's folder, and
+                // from its starter's, where a task's role is read from.
+                let starter = match record["created_by"].as_str() {
+                    Some(by) => (client.request("inspect", json!({"bot": by})).await.ok())
+                        .and_then(|starter| starter["workspace"].as_str().map(str::to_owned)),
+                    None => None,
+                };
+                let folders: Vec<&str> = [record["workspace"].as_str(), starter.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let ends = context::ends(&folders);
+                let mut parts = context::Parts::from_record(&record, &ends);
+                parts.compacted = compacted;
+                Ok(parts)
             };
             let _ = send.send(read.await);
             woken.notify_one();
@@ -16373,16 +16389,14 @@ impl App {
         if asked != self.acted {
             return;
         }
-        let (record, compacted) = match read {
-            Ok(read) => read,
+        let mut parts = match read {
+            Ok(parts) => parts,
             Err(error) => {
                 self.notice = Some(error);
                 return;
             }
         };
-        let mut parts = context::Parts::from_record(&record);
         (parts.used, parts.window) = (self.context, self.window);
-        parts.compacted = compacted;
         // Laid now as the pane lays a card, and again by a frame that
         // finds the pane another width.
         let wide = pane::width(self.full_width, kept(self.full_width));

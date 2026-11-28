@@ -14,6 +14,10 @@
 //! its own shape (`▣` instructions, `▦` tools, `▨` a summary, `■` the
 //! conversation, `□` free), so the grid reads with no color; its hue
 //! repeats it, as the usage chart's fills do.
+//!
+//! Under them, the instructions part by part, as Claude Code lists its
+//! memory files and skills: read back from the text by the headings
+//! composing writes ([`agent_client::policy::sections`]).
 use ratatui::style::{Color, Stylize};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -31,6 +35,9 @@ pub struct Parts {
     pub window: Option<u64>,
     /// Its instructions' bytes.
     pub instructions: u64,
+    /// What its instructions hold, part by part, as composing wrote them:
+    /// none when no client composed them.
+    pub pieces: Vec<Piece>,
     /// The tools it declares (Sonny's and MCP's): how many, their bytes.
     pub declared: (usize, u64),
     /// The daemon's own tools it may call, by name; their schemas are the
@@ -43,13 +50,91 @@ pub struct Parts {
     pub compacted: Option<Value>,
 }
 
+/// A part of an agent's instructions: what it is, what it holds when
+/// that says more, and its bytes.
+#[derive(Debug, PartialEq)]
+pub struct Piece {
+    pub label: &'static str,
+    pub about: Option<String>,
+    pub bytes: u64,
+}
+
+/// What Sonny puts after the instructions it composes, each with what it
+/// is called: a lead's task rule, a workflow worker's rules, and the task
+/// role of the project of each of `folders`: the agent's own and the one
+/// of the agent that started it, where a task's role is read from, as its
+/// worktree may not hold the lead's uncommitted roles.
+pub fn ends(folders: &[&str]) -> Vec<(&'static str, String)> {
+    let mut ends = vec![
+        ("Task rule", agent_client::project::tasks_rule(false)),
+        ("Task rule", agent_client::project::tasks_rule(true)),
+        ("Workflow", crate::workflow::told_text().to_owned()),
+    ];
+    for dir in folders.iter().map(std::path::Path::new) {
+        let told =
+            crate::project::read(dir).and_then(|info| crate::project::as_task(dir, &info, ""));
+        if let Ok(told) = told
+            && !ends.iter().any(|(_, end)| *end == told)
+        {
+            ends.push(("Task role", told));
+        }
+    }
+    ends
+}
+
+/// `instructions` in its parts ([`agent_client::policy::sections`]), each
+/// named as the person knows it; none when no client composed them.
+fn pieces(instructions: &str, ends: &[(&'static str, String)]) -> Vec<Piece> {
+    use agent_client::policy::Section;
+    let texts: Vec<&str> = ends.iter().map(|(_, text)| text.as_str()).collect();
+    let sections = agent_client::policy::sections(instructions, &texts);
+    if matches!(sections.as_slice(), [(Section::Given, _)]) {
+        return Vec::new();
+    }
+    let path = |path: &std::path::Path| crate::tilde(&path.to_string_lossy());
+    (sections.into_iter())
+        .map(|(section, bytes)| {
+            let (label, about) = match section {
+                Section::Preamble => ("Preamble", None),
+                Section::Agents(file) => ("AGENTS.md", Some(path(&file))),
+                Section::Skills(n) => ("Skills", Some(format!("{n} listed"))),
+                Section::Profiles(n) => ("Profiles", Some(format!("{n} listed"))),
+                // The person's, else a project's, as Sonny keeps them.
+                Section::Memory(dir) if dir.ends_with(".agents/memory") => ("Your memory", None),
+                Section::Memory(dir)
+                    if dir
+                        .parent()
+                        .is_some_and(|up| up.ends_with(".agents/memory/projects")) =>
+                {
+                    let name = dir
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned());
+                    ("Project memory", name)
+                }
+                Section::Memory(dir) => ("Memory", Some(path(&dir))),
+                Section::Role(name) => ("Role", Some(name)),
+                Section::End(at) => (ends[at].0, None),
+                Section::Given => ("Given", None),
+            };
+            Piece {
+                label,
+                about,
+                bytes: bytes as u64,
+            }
+        })
+        .collect()
+}
+
 impl Parts {
-    /// The agent's record as `inspect` answers it.
-    pub fn from_record(record: &Value) -> Self {
+    /// The agent's record as `inspect` answers it, and what Sonny puts
+    /// after instructions it composes ([`ends`]).
+    pub fn from_record(record: &Value, ends: &[(&'static str, String)]) -> Self {
         let declared = record["declared"].as_array().map_or(0, Vec::len);
         let declared_bytes = record["declared"].to_string().len() as u64;
+        let instructions = record["instructions"].as_str().unwrap_or_default();
         Parts {
-            instructions: record["instructions"].as_str().map_or(0, str::len) as u64,
+            instructions: instructions.len() as u64,
+            pieces: pieces(instructions, ends),
             declared: (declared, if declared == 0 { 0 } else { declared_bytes }),
             built_in: record["tools"].as_array().map_or(0, Vec::len),
             compaction: record["compaction"].is_i64(),
@@ -300,6 +385,28 @@ pub fn card(name: &str, parts: &Parts, width: usize) -> Vec<Line<'static>> {
         }
         None => lines.extend(beside.into_iter().map(indent)),
     }
+    // The instructions part by part, under the grid and its list, as
+    // Claude Code's `/context` lists its memory files and skills.
+    if !parts.pieces.is_empty() {
+        lines.push(Line::default());
+        let mut heading = vec![Span::raw(" ")];
+        if drawn.is_some() {
+            heading.extend([Part::Instructions.cell(), Span::raw(" ")]);
+        }
+        heading.push(Span::raw("Instructions"));
+        lines.push(Line::from(heading));
+        for piece in &parts.pieces {
+            let about = match &piece.about {
+                Some(about) => format!("{about}, {}", kb(piece.bytes)),
+                None => kb(piece.bytes),
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!(" └ {:<15}", piece.label)),
+                Span::raw(format!("{:>8}", format!("≈{}", count(tokens(piece.bytes))))),
+                Span::raw(format!("  {about}")).dim(),
+            ]));
+        }
+    }
     if let Some(data) = &parts.compacted {
         lines.push(Line::default());
         let mut said = format!(
@@ -355,7 +462,7 @@ mod tests {
     fn the_card_counts_each_part_and_leaves_the_conversation_the_rest() {
         let record = json!({"instructions": "x".repeat(8_000), "tools": ["shell", "apply_patch"],
             "declared": [{"name": "browser", "description": "y".repeat(3_000)}]});
-        let mut parts = Parts::from_record(&record);
+        let mut parts = Parts::from_record(&record, &[]);
         parts.used = Some(50_000);
         parts.window = Some(200_000);
         parts.compacted = Some(json!({"summary_bytes": 4_000, "covered_turns": [1, 12],
@@ -465,9 +572,91 @@ mod tests {
     }
 
     #[test]
+    fn the_instructions_are_listed_part_by_part_under_the_grid() {
+        let rule = agent_client::project::tasks_rule(false);
+        let instructions = format!(
+            "{}\n\n# Instructions from /w/shop/AGENTS.md\n\nBe brief.\
+             \n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n\
+             \n- deploy: How to ship (/w/shop/.agents/skills/deploy/SKILL.md)\
+             \n- review: How to review (/w/shop/.agents/skills/review/SKILL.md)\
+             \n\n# Memory in /h/.agents/memory\n\n- short-replies (feedback, verified 2026-11-28): x\
+             \n\n# Memory in /h/.agents/memory/projects/shop\n\n- release (work, verified 2026-11-28)\
+             \n\n# Role: lead\n\n{}\n\n{rule}",
+            agent_client::policy::PREAMBLE,
+            "You lead. ".repeat(200),
+        );
+        let record = json!({"instructions": instructions, "tools": [], "declared": []});
+        let mut parts = Parts::from_record(&record, &ends(&[]));
+        (parts.used, parts.window) = (Some(20_000), Some(200_000));
+        let shown = text(&card("shop.lead", &parts, 100));
+        let at = (shown.iter())
+            .position(|row| row == " ▣ Instructions")
+            .unwrap_or_else(|| panic!("{shown:?}"));
+        let rows: Vec<&str> = (shown[at + 1..].iter())
+            .take_while(|row| row.starts_with(" └ "))
+            .map(String::as_str)
+            .collect();
+        let labels: Vec<&str> = (rows.iter())
+            .map(|row| row[" └ ".len()..].split("  ").next().unwrap().trim())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Preamble",
+                "AGENTS.md",
+                "Skills",
+                "Your memory",
+                "Project memory",
+                "Role",
+                "Task rule"
+            ],
+            "{rows:?}"
+        );
+        assert!(rows[1].ends_with("/w/shop/AGENTS.md, 50 B"), "{}", rows[1]);
+        assert!(rows[2].contains("2 listed, "), "{}", rows[2]);
+        assert!(rows[4].ends_with("  shop, 84 B"), "{}", rows[4]);
+        assert!(rows[5].ends_with("≈504  lead, 2.0 KB"), "{}", rows[5]);
+        // Its parts add up to the whole, which the list above says.
+        let sum: u64 = parts.pieces.iter().map(|piece| piece.bytes).sum();
+        assert_eq!(sum, parts.instructions);
+        // Instructions no client composed are said whole, in the list only.
+        let given = json!({"instructions": "You review.", "tools": [], "declared": []});
+        let shown = text(&card(
+            "shop.check",
+            &Parts::from_record(&given, &ends(&[])),
+            100,
+        ));
+        assert!(!shown.iter().any(|row| row.contains("└")), "{shown:?}");
+    }
+
+    #[test]
+    fn a_tasks_role_is_found_in_the_folder_of_the_agent_that_started_it() {
+        let root = std::env::temp_dir().join(format!("sonny-context-ends-{}", std::process::id()));
+        let (lead, worktree) = (root.join("shop"), root.join("worktree"));
+        std::fs::create_dir_all(lead.join(".agents/agents")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        // The lead's own task role, not committed, so not in the worktree.
+        std::fs::write(
+            lead.join(".agents/agents/task.md"),
+            "---\nname: task\n---\nShip small changes.",
+        )
+        .unwrap();
+        let instructions = format!("{}\n\nShip small changes.", agent_client::policy::PREAMBLE);
+        let record = json!({"instructions": instructions, "tools": [], "declared": []});
+        let (lead, worktree) = (lead.to_str().unwrap(), worktree.to_str().unwrap());
+        let last = |folders: &[&str]| {
+            let parts = Parts::from_record(&record, &ends(folders));
+            parts.pieces.last().map(|piece| piece.label)
+        };
+        assert_eq!(last(&[worktree]), Some("Preamble"));
+        assert_eq!(last(&[worktree, lead]), Some("Task role"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_compaction_named_and_not_found_is_not_said_to_be_none() {
         let record = json!({"instructions": "", "tools": [], "declared": [], "compaction": 9});
-        let mut parts = Parts::from_record(&record);
+        let mut parts = Parts::from_record(&record, &[]);
         parts.used = Some(1_000);
         let shown = text(&card("shop.side", &parts, 100));
         assert!(
@@ -481,8 +670,10 @@ mod tests {
 
     #[test]
     fn before_any_call_it_says_so_and_counts_what_the_first_reads() {
-        let parts =
-            Parts::from_record(&json!({"instructions": "abcd", "tools": [], "declared": []}));
+        let parts = Parts::from_record(
+            &json!({"instructions": "abcd", "tools": [], "declared": []}),
+            &[],
+        );
         let shown = text(&card("calc.fix", &parts, 100));
         assert!(shown[1].starts_with(" No model call yet"));
         assert!(
