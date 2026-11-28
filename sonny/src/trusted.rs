@@ -26,6 +26,11 @@ pub struct Pin {
 /// The programs, pinned. Moving one is moving its list in
 /// `sonny/upstream/` with it.
 pub const PINS: [Pin; 2] = [
+    // Its own tarball holds every platform's program up to 0.42. From
+    // 0.43.0 each platform's is in a package of its own,
+    // `@agent-browser/cli-PLATFORM` (`-gnu` on Linux), as `bin/agent-browser`:
+    // a pin past 0.42 is installed from that package, with an integrity
+    // pinned for each platform.
     Pin {
         name: "agent-browser",
         version: "0.41.1",
@@ -131,15 +136,20 @@ pub fn bring_up(say: &dyn Fn(&str)) -> Vec<String> {
         .filter(|pin| installed(&programs, pin.name).as_deref() != Some(pin.version))
         .filter_map(|pin| {
             say(&format!("Installing {} {}", pin.name, pin.version));
-            let url = format!(
-                "https://registry.npmjs.org/{0}/-/{0}-{1}.tgz",
-                pin.name, pin.version
-            );
+            let url = url(pin);
             install(&programs, pin, &|archive: &Path| download(&url, archive))
                 .err()
                 .map(|error| format!("{} {}: {error}", pin.name, pin.version))
         })
         .collect()
+}
+
+/// Where npm serves `pin`'s tarball.
+fn url(pin: &Pin) -> String {
+    format!(
+        "https://registry.npmjs.org/{0}/-/{0}-{1}.tgz",
+        pin.name, pin.version
+    )
 }
 
 /// Fetch `url` to `to`.
@@ -384,6 +394,40 @@ mod tests {
             assert_eq!(
                 listed.lines().next(),
                 Some(format!("# {} {}", pin.name, pin.version).as_str())
+            );
+        }
+    }
+
+    /// Each pin, fetched from npm and installed as `sonny setup` and
+    /// `sonny upgrade` install it, runs on this machine and says its
+    /// version. The Upstream workflow runs this on Linux x64 and ARM.
+    #[test]
+    #[ignore = "downloads the pinned releases: cargo test -p sonny pinned_programs -- --ignored"]
+    fn the_pinned_programs_install_from_npm_and_run_here() {
+        let programs = temp().join("programs");
+        for pin in &PINS {
+            let url = url(pin);
+            let fetch = |archive: &Path| download(&url, archive);
+            if let Err(error) = install(&programs, pin, &fetch) {
+                panic!("{} {} on {}: {error}", pin.name, pin.version, platform());
+            }
+            let ran = std::process::Command::new(at(&programs, pin.name))
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&ran.stdout);
+            assert!(
+                ran.status.success(),
+                "{} on {}: {ran:?}",
+                pin.name,
+                platform()
+            );
+            assert!(
+                said.contains(pin.version),
+                "{} on {}: {said}",
+                pin.name,
+                platform()
             );
         }
     }

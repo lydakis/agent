@@ -5,9 +5,11 @@ drops one shows as a line added or taken away.
     python3 sonny/upstream/inventory.py list agent-desktop PROGRAM > list.txt
     python3 sonny/upstream/inventory.py news agent-desktop PROGRAM list.txt
 
-PROGRAM is the native program, the npm package's bin/agent-*-linux-x64:
-the lists in this folder are made on Linux, since a help can differ by
-operating system. A line is `command NAME` (or `command NAME SUB` for
+PROGRAM is the native program for Linux: agent-desktop's
+bin/agent-desktop-linux-ARCH, and agent-browser's bin/agent-browser in
+@agent-browser/cli-linux-ARCH-gnu, the package it ships each platform's
+in from 0.43.0. The lists in this folder are made on Linux, since a help
+can differ by operating system. A line is `command NAME` (or `command NAME SUB` for
 agent-desktop's subcommands), `NAME FLAG` for a flag of that command, or
 `global FLAG` for one every command takes. What the help and skill name is
 what is listed, since a flag that neither names is one no agent is taught.
