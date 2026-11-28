@@ -62,7 +62,7 @@ const IN_LINE: [&str; 3] = ["queued", "attached", "ready"];
 const WORKFLOW: &str = include_str!("../../agents/workflow.md");
 
 /// [`WORKFLOW`] without its front matter.
-fn told_text() -> &'static str {
+pub(crate) fn told_text() -> &'static str {
     agent_client::policy::front_matter(WORKFLOW).1.trim()
 }
 

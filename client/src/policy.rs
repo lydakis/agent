@@ -879,9 +879,7 @@ fn fit(kind: Kind, entries: Vec<Entry>, room: usize) -> (String, Vec<Entry>) {
     for entry in &mut kept {
         entry.summary.clear();
     }
-    let note = |left: usize| {
-        format!("\n- {left} more not listed, for room; list the folders above to see them all.")
-    };
+    let note = |left: usize| format!("\n- {left}{NOT_LISTED}");
     let mut listed = block(&kept, 0);
     while !kept.is_empty() && listed.len() + note(total - kept.len()).len() > room {
         let gone = kept.pop().expect("an entry");
@@ -893,6 +891,10 @@ fn fit(kind: Kind, entries: Vec<Entry>, room: usize) -> (String, Vec<Entry>) {
     listed.push_str(&note(total - kept.len()));
     (listed, kept)
 }
+
+/// How a list's last row, after the entries it names, says how many it
+/// leaves out.
+const NOT_LISTED: &str = " more not listed, for room; list the folders above to see them all.";
 
 fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
     // Visit the winning directory first, so a later directory can only add
@@ -1759,6 +1761,109 @@ fn compose(
     })
 }
 
+/// A part of a bot's instructions as [`instructions`] composes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Section {
+    /// [`PREAMBLE`].
+    Preamble,
+    /// An AGENTS.md file, by the path its heading names.
+    Agents(PathBuf),
+    /// The skills list, with how many skills it names.
+    Skills(usize),
+    /// The profiles list, with how many roles it names.
+    Profiles(usize),
+    /// A memory index's head, by the folder its heading names.
+    Memory(PathBuf),
+    /// The role, by its name.
+    Role(String),
+    /// The text of the caller's `ends` at this index, which the client
+    /// put after what composing wrote.
+    End(usize),
+    /// Instructions composing did not write: given whole.
+    Given,
+}
+
+/// The heading a memory index starts with ([`crate::memory`]'s
+/// `render_index`), after the blank line [`append_memory`] puts first.
+const MEMORY_HEADING: &str = "\n\n# Memory in ";
+
+/// `text`, a bot's instructions, in the parts composing wrote, each with
+/// its bytes, heading and the blank line before it included, so they add
+/// up to the whole: read back by the headings composing writes, in the
+/// order it writes them, so a heading out of that order is the text of
+/// the part it is in. `ends` are what the client may have put after
+/// what composing wrote, after a blank line, as Sonny's leads are given
+/// their project's task rule. Instructions that do not start with
+/// [`PREAMBLE`] are one [`Section::Given`].
+pub fn sections(text: &str, ends: &[&str]) -> Vec<(Section, usize)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if !text.starts_with(PREAMBLE) {
+        return vec![(Section::Given, text.len())];
+    }
+    // The first of `ends` the text closes with, after a blank line.
+    let end = ends.iter().enumerate().find_map(|(at, end)| {
+        let end = end.trim();
+        let before = text.strip_suffix(end)?.strip_suffix("\n\n")?;
+        (!end.is_empty() && before.len() >= PREAMBLE.len()).then_some((at, before.len()))
+    });
+    let composed = &text[..end.map_or(text.len(), |(_, len)| len)];
+    let line = |from: usize| {
+        let rest = &composed[from..];
+        rest[..rest.find('\n').unwrap_or(rest.len())].to_owned()
+    };
+    let lists = [Kind::Skills.header(), Kind::Profiles.header()];
+    // Each part's start and what it is, in the order composing writes them.
+    let mut starts = vec![(0, Section::Preamble)];
+    let mut order = 0;
+    for (at, _) in composed.match_indices("\n\n# ") {
+        let rest = &composed[at..];
+        let (rank, section) = if rest.starts_with(AGENTS_HEADING) {
+            (1, Section::Agents(line(at + AGENTS_HEADING.len()).into()))
+        } else if rest.starts_with(lists[0].as_str()) {
+            (2, Section::Skills(0))
+        } else if rest.starts_with(lists[1].as_str()) {
+            (3, Section::Profiles(0))
+        } else if rest.starts_with(MEMORY_HEADING) {
+            (4, Section::Memory(line(at + MEMORY_HEADING.len()).into()))
+        } else if rest.starts_with(ROLE_HEADING) {
+            (5, Section::Role(line(at + ROLE_HEADING.len())))
+        } else {
+            continue;
+        };
+        // AGENTS.md files and memory indexes come one after another; each
+        // list and the role once.
+        let again = matches!(rank, 1 | 4);
+        if rank < order || (rank == order && !again) {
+            continue;
+        }
+        order = rank;
+        starts.push((at, section));
+    }
+    let mut parts = Vec::with_capacity(starts.len() + 1);
+    for (at, (start, section)) in starts.iter().enumerate() {
+        let stop = starts.get(at + 1).map_or(composed.len(), |next| next.0);
+        let body = &composed[*start..stop];
+        // A list's entries, each a row, the note of those left out not one.
+        let listed = || {
+            (body.lines())
+                .filter(|row| row.starts_with("- ") && !row.ends_with(NOT_LISTED))
+                .count()
+        };
+        let section = match section {
+            Section::Skills(_) => Section::Skills(listed()),
+            Section::Profiles(_) => Section::Profiles(listed()),
+            other => other.clone(),
+        };
+        parts.push((section, stop - start));
+    }
+    if let Some((at, len)) = end {
+        parts.push((Section::End(at), text.len() - len));
+    }
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2326,6 +2431,93 @@ mod tests {
         assert_eq!(composed.sources, Vec::new());
         assert!(composed.skills.is_empty() && !composed.text.contains("# Skills"));
         assert!(composed.text.starts_with(PREAMBLE));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn instructions_read_back_in_the_parts_composing_wrote_adding_up_to_the_whole() {
+        let root = temp("sections");
+        let agents = root.join(".agents");
+        for dir in ["skills/deploy", "skills/review", "agents"] {
+            std::fs::create_dir_all(agents.join(dir)).unwrap();
+        }
+        let rules = "Be brief.\n\n# Style\n\nShort lines.";
+        std::fs::write(root.join("AGENTS.md"), rules).unwrap();
+        std::fs::write(agents.join("AGENTS.md"), "Also this.").unwrap();
+        for name in ["deploy", "review"] {
+            std::fs::write(
+                agents.join(format!("skills/{name}/SKILL.md")),
+                format!("---\nname: {name}\ndescription: How to {name}\n---\nSteps."),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            agents.join("agents/reviewer.md"),
+            "---\ndescription: Reviews\n---\nYou review.",
+        )
+        .unwrap();
+        let person = root.join("person.md");
+        // A heading of an earlier part inside a later one is its text.
+        let saved =
+            "# Memory in /m\n\n- a (user, verified 2026-11-28): x\n\n# Instructions from /x\n\ny\n";
+        std::fs::write(&person, saved).unwrap();
+        let project = root.join("project.md");
+        let index = "# Memory in /m/projects/shop\n\n- b (work, verified 2026-11-28)\n";
+        std::fs::write(&project, index).unwrap();
+        // An earlier part's heading in the role is the role's.
+        let role = Profile::parse(
+            "lead",
+            None,
+            "Lead.\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n",
+        );
+        let composed = instructions(&root, Some(&role), &[person, project]).unwrap();
+        let rule = "Every task works in this folder.";
+        let text = format!("{}\n\n{rule}", composed.text);
+        let parts = sections(&text, &["Another end.", rule]);
+        let named: Vec<&Section> = parts.iter().map(|(section, _)| section).collect();
+        assert_eq!(
+            named,
+            [
+                &Section::Preamble,
+                &Section::Agents(root.join("AGENTS.md")),
+                &Section::Agents(root.join(".agents/AGENTS.md")),
+                &Section::Skills(2),
+                &Section::Profiles(1),
+                &Section::Memory("/m".into()),
+                &Section::Memory("/m/projects/shop".into()),
+                &Section::Role("lead".into()),
+                &Section::End(1),
+            ]
+        );
+        let bytes: Vec<usize> = parts.iter().map(|(_, bytes)| *bytes).collect();
+        assert_eq!(bytes.iter().sum::<usize>(), text.len());
+        assert_eq!(bytes[0], PREAMBLE.len());
+        assert_eq!(
+            bytes[1],
+            agents_header(&root.join("AGENTS.md")).len() + rules.len()
+        );
+        assert_eq!(bytes[6], 2 + index.trim().len());
+        assert_eq!(bytes[8], 2 + rule.len());
+        // No end of theirs: the role runs to the end.
+        let parts = sections(&composed.text, &["Another end."]);
+        assert_eq!(parts.last().unwrap().0, Section::Role("lead".into()));
+        let sum: usize = parts.iter().map(|(_, bytes)| bytes).sum();
+        assert_eq!(sum, composed.text.len());
+        // A list cut for room counts the entries it names, not its note.
+        let first = Entry {
+            summary: String::new(),
+            ..composed.skills[0].clone()
+        };
+        let room = Kind::Skills.header().len()
+            + entry_row(&first).len()
+            + format!("\n- 1{NOT_LISTED}").len();
+        let (list, kept) = fit(Kind::Skills, composed.skills.clone(), room);
+        assert_eq!(kept.len(), 1, "{list}");
+        let cut = format!("{PREAMBLE}{list}");
+        assert_eq!(sections(&cut, &[])[1], (Section::Skills(1), list.len()));
+        // Instructions given whole are one part; none, none.
+        assert_eq!(sections("You review.", &[]), [(Section::Given, 11)]);
+        assert_eq!(sections("", &[]), []);
         let _ = std::fs::remove_dir_all(&root);
     }
 
