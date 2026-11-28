@@ -24365,9 +24365,9 @@ impl App {
                         ..history
                     };
                     let buffer = frame.buffer_mut();
-                    let blank = row.positions().all(|at| {
-                        buffer.cell(at).is_none_or(|cell| cell.symbol() == " ")
-                    });
+                    let blank = row
+                        .positions()
+                        .all(|at| buffer.cell(at).is_none_or(|cell| cell.symbol() == " "));
                     if blank {
                         frame.render_widget(Paragraph::new(reading::line(since)), row);
                     }
