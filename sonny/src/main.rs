@@ -509,6 +509,11 @@ struct Options {
     /// `enter` on its row in `/status`): what it needs is brought into
     /// view once known.
     land: bool,
+    /// The agent the window this one opened in place of showed
+    /// (`/switch`, `alt+n`, `ctrl+6`, ...): where `ctrl+6` goes. The
+    /// window's own, handed from each of its agents to the next and kept
+    /// nowhere else.
+    before: Option<String>,
 }
 
 fn usage() -> String {
@@ -1049,6 +1054,32 @@ impl App {
                 self.switch_window(to);
             }
         }
+    }
+
+    /// `ctrl+6`: the window becomes the agent it showed before, as
+    /// `/switch` makes it, with what is typed as `alt+n` takes it; pressed
+    /// there, it comes back. Asked of the daemon beside the window first,
+    /// so one removed since is said and the window stays.
+    fn go_back(&mut self) {
+        let Some(before) = (self.options.before.clone()).filter(|before| *before != self.bot)
+        else {
+            self.notice = Some("no agent before this one".into());
+            return;
+        };
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let read = match client.request("inspect", json!({"bot": before})).await {
+                Ok(_) => Switching::Back(before),
+                Err(error) if error.code == "bot_not_found" => {
+                    Switching::Failed(format!("{before} is not there"))
+                }
+                Err(error) => Switching::Failed(error.to_string()),
+            };
+            let _ = send.send(read);
+            woken.notify_one();
+        });
+        self.switch_reading = Some((self.acted, receive));
     }
 
     /// While **Projects** is open, every project read again once its
@@ -2895,19 +2926,7 @@ struct Passed {
 /// Every bot the daemon has, page by page; `None` when a page could not
 /// be read.
 async fn every_bot(client: &Client) -> Option<Vec<Value>> {
-    let mut bots = Vec::new();
-    let mut after = json!("");
-    loop {
-        let page = (client)
-            .request("bots", json!({"after": after, "limit": 256}))
-            .await
-            .ok()?;
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        match &page["next_after"] {
-            Value::Null => return Some(bots),
-            next => after = next.clone(),
-        }
-    }
+    every_row(client, json!({})).await.ok()
 }
 
 /// One pass of a `/permissions` pick over the agents `lead` made and
@@ -3596,7 +3615,7 @@ fn parse() -> Result<Options, String> {
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
     let (mut window_place, mut send, mut draft, mut reopened) = (None, None, None, false);
-    let mut land = false;
+    let (mut land, mut before) = (false, None);
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -3632,6 +3651,9 @@ fn parse() -> Result<Options, String> {
             // Unlisted: how going to an agent that needs the person lands
             // on what it needs.
             "--land" => land = true,
+            // Unlisted: how a window hands on the agent it showed, for
+            // `ctrl+6` to go back to.
+            "--before" => before = Some(value()?),
             _ => return Err(usage()),
         }
     }
@@ -3654,6 +3676,7 @@ fn parse() -> Result<Options, String> {
         draft,
         reopened,
         land,
+        before,
     })
 }
 
@@ -3669,7 +3692,7 @@ fn reopen(bot: &str) -> Vec<String> {
         match arg.as_str() {
             "--new" | "--reopened" | "--land" => {}
             "--folder" | "--lead" | "--agent" | "--window-place" | "--send-file"
-            | "--draft-file" => {
+            | "--draft-file" | "--before" => {
                 args.next();
             }
             "--new-lead" => {
@@ -4497,6 +4520,8 @@ async fn run() -> Result<bool, String> {
         if app.land_after {
             args.push("--land".into());
         }
+        // The agent this window showed, for `ctrl+6` there to come back to.
+        args.extend(["--before".into(), app.bot.clone()]);
         // The next window's own arguments, as a Sonny started on it has.
         let mut given = vec![std::env::args().next().unwrap_or_else(|| "sonny".into())];
         given.extend(args);
@@ -4520,6 +4545,10 @@ async fn run() -> Result<bool, String> {
         }
         let mut args = reopen(&app.bot).split_off(1);
         args.push("--reopened".into());
+        // The same window: `ctrl+6` goes where it went before.
+        if let Some(before) = &app.options.before {
+            args.extend(["--before".into(), before.clone()]);
+        }
         if let Some(place) = place {
             args.extend(["--window-place".into(), mux::Place::encode(&place)]);
         }
@@ -5729,7 +5758,7 @@ const ZEN_ENDS: &str = "End zen and hear what was kept";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
-const SHORTCUTS: [(&str, &str); 25] = [
+const SHORTCUTS: [(&str, &str); 26] = [
     ("enter", "send, or steer the running turn"),
     ("tab", "queue for after the running turn"),
     ("↑↓", "earlier prompts, past the first or last row"),
@@ -5750,6 +5779,7 @@ const SHORTCUTS: [(&str, &str); 25] = [
         "with nothing typed, the agent above or below",
     ),
     ("alt+n", "the next agent that needs you"),
+    ("ctrl+6", "back to the agent before; again to return"),
     ("ctrl+\\", "keys to the pane and back"),
     ("ctrl+[ ctrl+]", "hide the pane, show it again"),
     ("ctrl+g", "open the pane's agent in the main view"),
@@ -6239,13 +6269,17 @@ type Again = (u64, (Vec<(i64, Value)>, bool), PageRead);
 enum Switching {
     /// The agent named, found.
     To(String),
-    /// Every agent, to list, narrowed by what was typed: what waits on the
-    /// person, the tasks' titles and the picks kept.
+    /// The agent this window showed before, there still: gone back to
+    /// with what is typed, as `alt+n` goes ([`App::go_back`]).
+    Back(String),
+    /// Every agent, to list, narrowed by what was typed: ordered and
+    /// titled beside the window, the agents listed closed, and the picks
+    /// kept.
     List {
         typed: String,
-        bots: Vec<Value>,
-        held: std::collections::HashSet<String>,
-        titles: Box<crate::title::Titles>,
+        agents: Vec<switch::Agent>,
+        pick: usize,
+        closed: std::collections::HashSet<String>,
         picks: Box<fuzzy::Picks>,
     },
     /// What the window says instead.
@@ -8014,18 +8048,28 @@ fn lead_and_lineage(bots: &[Value], lead: &str) -> std::collections::HashSet<Str
 
 /// Every bot named `pattern`, every page of them; none when a page could
 /// not be read.
-async fn bots_named(client: &Client, pattern: &str) -> Option<Vec<Value>> {
+/// Every row of the `bots` listing `ask` names, page after page, each
+/// page's rows taken as they came.
+async fn every_row(client: &Client, ask: Value) -> agent_client::Result<Vec<Value>> {
     let mut bots = Vec::new();
     let mut after = Value::Null;
     loop {
-        let asked = json!({"name": pattern, "limit": 256, "after": after});
-        let page = client.request("bots", asked).await.ok()?;
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        after = page["next_after"].clone();
+        let mut asked = ask.clone();
+        asked["limit"] = json!(256);
+        asked["after"] = after;
+        let mut page = client.request("bots", asked).await?;
+        if let Value::Array(rows) = page["bots"].take() {
+            bots.extend(rows);
+        }
+        after = page["next_after"].take();
         if after.is_null() {
-            return Some(bots);
+            return Ok(bots);
         }
     }
+}
+
+async fn bots_named(client: &Client, pattern: &str) -> Option<Vec<Value>> {
+    every_row(client, json!({"name": pattern})).await.ok()
 }
 
 /// What a lead's windows are named from: its project, the lead, what
@@ -19626,6 +19670,10 @@ impl App {
                     }
                     // The next agent that needs the person, typed or not.
                     KeyCode::Char('n') if alt && self.projects_here() => self.next_needing(),
+                    // The agent this window showed before, typed or not.
+                    // A plain terminal sends ctrl+6 as control with 6;
+                    // some report it as ctrl+^.
+                    KeyCode::Char('6' | '^') if ctrl && self.projects_here() => self.go_back(),
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
@@ -22753,10 +22801,17 @@ impl App {
 
     /// `/switch`'s reads, beside the window, which answers meanwhile: the
     /// first of `names` that is an agent, else every agent, to list
-    /// narrowed by `typed` ([`App::switch_came`]).
+    /// narrowed by `typed` ([`App::switch_came`]), ordered and titled
+    /// beside the window too.
     fn switching(&mut self, typed: &str, names: Vec<String>) {
         let (client, woken, me) = (self.client.clone(), self.woken.clone(), self.bot.clone());
         let (store, picks_kept, typed) = (self.store(), self.picks_kept, typed.to_owned());
+        // Who this window is and follows, for the rows' order and marks.
+        let waiting: std::collections::HashSet<String> = (self.fleet.as_ref())
+            .map(|fleet| fleet.needs.waiting().map(str::to_owned).collect())
+            .unwrap_or_default();
+        let (project, workspace, beside) =
+            (self.project.clone(), self.workspace.clone(), self.beside());
         let (send, receive) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let read = async {
@@ -22770,44 +22825,51 @@ impl App {
                         Err(error) => return Switching::Failed(error.to_string()),
                     }
                 }
-                let mut bots = Vec::new();
-                let mut after = Value::Null;
-                loop {
-                    let asked = json!({"limit": 256, "after": after});
-                    let page = match client.request("bots", asked).await {
-                        Ok(page) => page,
-                        Err(error) => return Switching::Failed(error.to_string()),
-                    };
-                    bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-                    after = page["next_after"].clone();
-                    if after.is_null() {
-                        break;
-                    }
-                }
+                let bots = match every_row(&client, json!({})).await {
+                    Ok(bots) => bots,
+                    Err(error) => return Switching::Failed(error.to_string()),
+                };
                 // What waits on the person, as `/status` says it: a call on
                 // their approval, read now, or a question this window follows.
-                let held = (needs::listing(&client, None).await)
+                let mut held: std::collections::HashSet<String> = (needs::listing(&client, None)
+                    .await)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|held| held.bot)
                     .collect();
-                let kept = tokio::task::spawn_blocking(move || {
+                held.extend(waiting);
+                // Thousands of rows are ordered and titled off the window's
+                // keys.
+                let built = tokio::task::spawn_blocking(move || {
                     let picks = match picks_kept {
                         true => fuzzy::Picks::load("agents"),
                         false => fuzzy::Picks::default(),
                     };
-                    (crate::title::Titles::read(&store), picks)
+                    let mut titles = crate::title::Titles::read(&store);
+                    let (agents, pick) = switch::listed(
+                        &bots,
+                        |bot| held.contains(bot),
+                        |bot| titles.of(bot),
+                        &me,
+                        project.as_deref(),
+                        &workspace,
+                        beside.as_deref(),
+                    );
+                    let closed = (bots.iter())
+                        .filter(|bot| !bot["closed_ms"].is_null())
+                        .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
+                        .collect();
+                    Switching::List {
+                        typed,
+                        agents,
+                        pick,
+                        closed,
+                        picks: Box::new(picks),
+                    }
                 });
-                let Ok((titles, picks)) = kept.await else {
-                    return Switching::Failed("the list was dropped".into());
-                };
-                Switching::List {
-                    typed,
-                    bots,
-                    held,
-                    titles: Box::new(titles),
-                    picks: Box::new(picks),
-                }
+                built
+                    .await
+                    .unwrap_or_else(|_| Switching::Failed("the list was dropped".into()))
             };
             let _ = send.send(read.await);
             woken.notify_one();
@@ -22832,8 +22894,13 @@ impl App {
         if matches!(read, Switching::List { .. }) && asked != self.acted {
             return;
         }
-        let (typed, bots, held, mut titles, picks) = match read {
+        let (typed, agents, pick, closed, picks) = match read {
             Switching::To(bot) => {
+                self.switch_window(bot);
+                return;
+            }
+            Switching::Back(bot) => {
+                self.carry_draft = true;
                 self.switch_window(bot);
                 return;
             }
@@ -22843,33 +22910,16 @@ impl App {
             }
             Switching::List {
                 typed,
-                bots,
-                held,
-                titles,
+                agents,
+                pick,
+                closed,
                 picks,
-            } => (typed, bots, held, *titles, *picks),
+            } => (typed, agents, pick, closed, *picks),
         };
-        let fleet = self.fleet.as_ref();
-        let waits =
-            |bot: &str| held.contains(bot) || fleet.is_some_and(|fleet| fleet.needs.waits(bot));
-        let beside = self.beside();
-        let mut picker = switch::Picker::new(
-            &bots,
-            waits,
-            |bot| titles.of(bot),
-            &self.bot,
-            self.project.as_deref(),
-            &self.workspace,
-            beside.as_deref(),
-            picks,
-        );
+        let mut picker = switch::Picker::of(agents, pick, picks, &self.bot);
         if !typed.is_empty() {
             picker.narrow(typed);
         }
-        let closed: std::collections::HashSet<String> = (bots.iter())
-            .filter(|bot| !bot["closed_ms"].is_null())
-            .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
-            .collect();
         self.switch_asks(&mut picker, &closed);
         self.agents = Some(picker);
     }
@@ -24354,7 +24404,10 @@ impl App {
                 return;
             }
             if let Some(agents) = &self.agents {
-                let items: Vec<list::Item> = (agents.rows().into_iter())
+                let room = composer.y as usize;
+                // Only the rows drawn are built, of a list of thousands.
+                let (drawn, first, wide) = agents.drawn(room);
+                let items: Vec<list::Item> = (drawn.into_iter())
                     .map(|(agent, found)| {
                         list::Item::new(agent.name.clone(), agent.about.clone())
                             .title(agent.title.clone())
@@ -24363,10 +24416,10 @@ impl App {
                             .found(&found)
                     })
                     .collect();
-                let room = composer.y as usize;
+                let signed = !items.is_empty();
                 over(
                     frame,
-                    list::lines(&items, agents.at(), width, room),
+                    list::lines_of(&items, first, agents.at(), (wide, signed), width),
                     composer,
                 );
                 let (line, cursor) = agents.line("type to narrow");
@@ -27585,6 +27638,7 @@ mod tests {
             draft: None,
             reopened: false,
             land: false,
+            before: None,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -31202,6 +31256,178 @@ mod tests {
         app.zen = Some("the rounding".into());
         app.key(alt_n).await;
         assert_eq!(app.notice, None);
+    }
+
+    fn ctrl(c: char) -> Event {
+        Event::Key(event::KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL,
+        ))
+    }
+
+    /// A daemon that knows `calc.lead`, `calc.readme`, `calc.halves` and
+    /// `calc.divide`, and no other.
+    async fn calc_daemon() -> Arc<Client> {
+        daemon_answering(|asked| match asked["op"].as_str() {
+            Some("inspect") => match asked["bot"].as_str() {
+                Some("calc.lead" | "calc.readme" | "calc.halves" | "calc.divide") => {
+                    json!({"name": asked["bot"]})
+                }
+                _ => json!({"error": "bot_not_found", "detail": "no such bot"}),
+            },
+            _ => json!({}),
+        })
+        .await
+    }
+
+    /// `bot`'s window in project `calc`, opened in place of one that
+    /// showed `before`, as [`run`] opens it with `--before`.
+    fn calc_window(client: &Arc<Client>, bot: &str, before: Option<&str>) -> App {
+        let mut app = app(client.clone());
+        app.bot = bot.into();
+        app.project = Some("calc".into());
+        app.workspace = "/w/calc".into();
+        app.options.before = before.map(str::to_owned);
+        app
+    }
+
+    /// The window `left` went to, opened in its place: `run` hands it the
+    /// agent `left` showed.
+    fn opened_after(left: &mut App, client: &Arc<Client>) -> App {
+        let to = left.switch_to.take().expect("the window went to an agent");
+        calc_window(client, &to, Some(&left.bot))
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_goes_back_to_the_agent_before_and_again_comes_back() {
+        let client = calc_daemon().await;
+        let mut lead = calc_window(&client, "calc.lead", None);
+        lead.input.set("/switch halves");
+        lead.submit().await;
+        lead.beside_done().await;
+        let mut halves = opened_after(&mut lead, &client);
+        assert_eq!(halves.bot, "calc.halves");
+        halves.key(ctrl('6')).await;
+        halves.beside_done().await;
+        assert_eq!(halves.switch_to.as_deref(), Some("calc.lead"));
+        assert!(halves.quit);
+        // Again, from there: back to the one it came from.
+        let mut back = opened_after(&mut halves, &client);
+        assert_eq!(back.bot, "calc.lead");
+        back.key(ctrl('6')).await;
+        back.beside_done().await;
+        assert_eq!(back.switch_to.as_deref(), Some("calc.halves"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_after_steps_goes_to_the_one_just_before_not_the_first() {
+        use crate::status::{Agents, Group, Listed};
+        let client = calc_daemon().await;
+        let listed = ["lead", "readme", "halves", "divide"].map(|name| Listed {
+            bot: format!("calc.{name}"),
+            name: name.into(),
+            title: String::new(),
+            state: "working".into(),
+            group: Group::Working,
+            lead: name == "lead",
+            helpers: Vec::new(),
+            run: None,
+            of: 0,
+            agents: Vec::new(),
+        });
+        let agents = Agents {
+            project: "calc".into(),
+            listed: listed.to_vec(),
+            ..Agents::default()
+        };
+        let alt_right = Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        let mut window = calc_window(&client, "calc.lead", None);
+        for to in ["calc.readme", "calc.halves", "calc.divide"] {
+            window.margin.set_agents(agents.clone(), &window.bot);
+            window.key(alt_right.clone()).await;
+            window = opened_after(&mut window, &client);
+            assert_eq!(window.bot, to);
+        }
+        window.key(ctrl('6')).await;
+        window.beside_done().await;
+        assert_eq!(window.switch_to.as_deref(), Some("calc.halves"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_with_words_typed_goes_and_carries_them_as_alt_n_does() {
+        let client = calc_daemon().await;
+        let mut app = calc_window(&client, "calc.halves", Some("calc.lead"));
+        app.input.set("fix it");
+        app.key(ctrl('6')).await;
+        // Nothing typed by the key.
+        assert_eq!(&*app.input, "fix it");
+        app.beside_done().await;
+        assert_eq!(app.switch_to.as_deref(), Some("calc.lead"));
+        // The words go on to the next window, as `alt+n` takes them.
+        assert!(app.carry_draft);
+        assert_eq!(&*app.input, "fix it");
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_with_none_before_says_so() {
+        let client = calc_daemon().await;
+        let mut app = calc_window(&client, "calc.lead", None);
+        app.key(ctrl('6')).await;
+        app.beside_done().await;
+        assert_eq!(app.notice.as_deref(), Some("no agent before this one"));
+        assert!(app.switch_to.is_none() && !app.quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_to_an_agent_removed_names_it_and_the_window_stays() {
+        let client = calc_daemon().await;
+        let mut app = calc_window(&client, "calc.lead", Some("calc.gone"));
+        app.input.set("fix it");
+        app.key(ctrl('6')).await;
+        app.beside_done().await;
+        assert_eq!(app.notice.as_deref(), Some("calc.gone is not there"));
+        assert!(app.switch_to.is_none() && !app.quit);
+        assert_eq!(&*app.input, "fix it");
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_and_ctrl_caret_both_go_back() {
+        let client = calc_daemon().await;
+        for key in [ctrl('6'), ctrl('^')] {
+            let mut app = calc_window(&client, "calc.halves", Some("calc.lead"));
+            app.key(key).await;
+            app.beside_done().await;
+            assert_eq!(app.switch_to.as_deref(), Some("calc.lead"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_does_nothing_in_zen_a_side_chat_or_an_agent_shown_beside() {
+        let client = calc_daemon().await;
+        let ways: [fn(&mut App); 3] = [
+            |app| app.zen = Some("the rounding".into()),
+            |app| app.options.side = Some(1),
+            |app| app.options.embedded = true,
+        ];
+        for way in ways {
+            let mut app = calc_window(&client, "calc.halves", Some("calc.lead"));
+            way(&mut app);
+            app.key(ctrl('6')).await;
+            app.beside_done().await;
+            assert!(app.switch_to.is_none() && !app.quit);
+            assert!(app.switch_reading.is_none());
+            assert_eq!(app.notice, None);
+            assert!(app.input.is_empty());
+        }
+    }
+
+    #[test]
+    fn ctrl_6_is_on_the_keys_sheet() {
+        assert!(
+            SHORTCUTS
+                .iter()
+                .any(|(key, does)| *key == "ctrl+6" && does.contains("before"))
+        );
     }
 
     #[tokio::test]
