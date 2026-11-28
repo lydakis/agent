@@ -656,6 +656,7 @@ impl Agent {
             .ok()
             .and_then(|mut sessions| sessions.insert(id.clone(), session.clone()));
         if let Some(old) = replaced {
+            old.drop_children(self);
             old.stop(&self.out);
         }
         // A thread comes back as the bot it was, or not at all.
@@ -1244,8 +1245,13 @@ impl Session {
         // lead is starting still opens its thread when it is done.
         let (mut started, mut lifted) = (HashMap::new(), HashSet::new());
         let (mut gated, mut answering) = (HashMap::new(), HashSet::new());
+        // Each history node is written with an event naming it, so the
+        // newest node the events before the live cursor name is where the
+        // replay ends and the live follow takes over.
+        let mut written = None;
         let cursor = live(&mut events, |event| {
             let data = &event["data"];
+            written = written.max(data["node"].as_i64());
             let call = (
                 event["turn"].as_i64(),
                 data["call_id"].as_str().unwrap_or("").to_owned(),
@@ -1283,6 +1289,12 @@ impl Session {
             async {}
         })
         .await;
+        {
+            let mut state = self.state.lock().await;
+            if state.replaying {
+                state.upto = state.upto.max(written);
+            }
+        }
         let record = client
             .request("inspect", json!({"bot": bot, "bot_id": expected}))
             .await
@@ -2732,31 +2744,6 @@ impl Session {
             let Some(bound) = &state.bound else { return };
             (bound.client.clone(), bound.bot.clone())
         };
-        // Each message by the node a turn took it in at.
-        let mut numbers: HashMap<i64, i64> = HashMap::new();
-        let mut after = json!(0);
-        loop {
-            let Ok(page) = client
-                .request(
-                    "messages",
-                    json!({"bot": bot, "after": after, "limit": 128}),
-                )
-                .await
-            else {
-                break;
-            };
-            for listed in page["messages"].as_array().into_iter().flatten() {
-                if let (Some(node), Some(message)) =
-                    (listed["node"].as_i64(), listed["message"].as_i64())
-                {
-                    numbers.insert(node, message);
-                }
-            }
-            after = page["next_after"].clone();
-            if after.is_null() {
-                break;
-            }
-        }
         // Its nodes up to where the live follow took over, newest first as
         // the daemon lists them: only their ids are kept, and the items
         // are read a page at a time, oldest first.
@@ -2818,9 +2805,11 @@ impl Session {
                 let Some(turn) = node.and_then(|node| turns.get(&node)) else {
                     continue;
                 };
-                let number = node.and_then(|node| numbers.get(&node).copied());
+                // The message it holds by its handle, the bot it was sent
+                // to and its number: a fork's history keeps its source's.
+                let handle = entry["handle"].as_str();
                 for item in crate::responses(&entry["item"]) {
-                    history.item(*turn, &item, number);
+                    history.item(*turn, &item, handle);
                 }
             }
         }
@@ -2849,7 +2838,7 @@ struct History<'a> {
 }
 
 impl History<'_> {
-    fn item(&mut self, turn: i64, item: &Value, message: Option<i64>) {
+    fn item(&mut self, turn: i64, item: &Value, message: Option<&str>) {
         let part = *self.parts.get(&turn).unwrap_or(&0);
         match item["type"].as_str() {
             Some("function_call") => {
@@ -2914,7 +2903,7 @@ impl History<'_> {
                 self.out.replayed(
                     self.session,
                     json!({"sessionUpdate": "user_message",
-                    "messageId": user_id(self.bot, Some(message)),
+                    "messageId": message,
                     "content": [{"type": "text", "text": text}]}),
                 );
             }
@@ -4794,12 +4783,19 @@ mod tests {
             ),
             (11, 3, said("assistant", "On it")),
             (10, 3, said("user", "Fix it")),
+            // Forked from another lead: its prompt is that lead's message.
+            (9, 2, said("user", "Start")),
         ];
         let client = crate::tests::daemon_answering(move |asked| {
-            if asked["op"] == "messages" {
-                return json!({"messages": [{"message": 3, "node": 10}], "next_after": null});
+            let mut read = crate::tests::history_read(&history, asked).unwrap_or(json!({}));
+            for item in read["items"].as_array_mut().into_iter().flatten() {
+                match item["node"].as_i64() {
+                    Some(10) => item["handle"] = json!("calc.lead/3"),
+                    Some(9) => item["handle"] = json!("calc.old/2"),
+                    _ => {}
+                }
             }
-            crate::tests::history_read(&history, asked).unwrap_or(json!({}))
+            read
         })
         .await;
         let session = bound_session(&agent, "s1", client, "calc.lead", None);
@@ -4826,6 +4822,7 @@ mod tests {
         assert_eq!(
             kinds,
             [
+                json!(["user_message", "calc.old/2", null]),
                 json!(["user_message", "calc.lead/3", null]),
                 json!(["agent_message", "calc.lead-3-0", null]),
                 json!(["tool_call_update", "3/c1", "in_progress"]),
