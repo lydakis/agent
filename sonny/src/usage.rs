@@ -4,7 +4,9 @@
 //! stepped in and how, how many are done (closed), without them by how long
 //! a task worked and by its role, and that share the period before), by
 //! agent (or project), by model, and by what started the turns: the
-//! commons, a trigger, the margin, or a prompt. Daemon reads each time the
+//! commons, a trigger, the margin, or a prompt; and last the Daemon block,
+//! how much the daemon got through in the period and, from its `stats`
+//! read on a connection of its own beside the rest, how it runs now. Daemon reads each time the
 //! view changes and every minute while it is open: `usage`, and for the
 //! tasks `bots`, `usage` by their names, the person's `messages` and the
 //! calls they decided in `audit`, this period and the one before, and each
@@ -196,12 +198,17 @@ pub struct View {
     /// Rows scrolled past on its own screen, inline; the pane scrolls
     /// itself.
     pub scroll: usize,
+    /// The daemon's own state from its last two `stats` reads, which a
+    /// read beside the window fills in ([`stats`]).
+    daemon: Arc<std::sync::Mutex<Readings>>,
 }
 
 struct Read {
     since: i64,
     bucket: i64,
     buckets: usize,
+    /// When it came back.
+    now: i64,
     all: bool,
     period: Period,
     usage: Value,
@@ -219,6 +226,7 @@ impl View {
             at: None,
             prices: Vec::new(),
             scroll: 0,
+            daemon: Arc::default(),
         }
     }
 
@@ -228,10 +236,12 @@ impl View {
     }
 
     /// The `usage` request for what it shows, at `now`, and the window
-    /// it asks for.
+    /// it asks for. It asks by the hour whatever the period, so the
+    /// busiest hour is one rule for all three; the chart sums the hours
+    /// into its bars.
     pub fn query(&self, now: i64) -> (Value, (i64, i64, usize)) {
         let (since, bucket, buckets) = self.period.window(now);
-        let mut query = json!({"since_ms": since, "bucket_ms": bucket, "limit": 256});
+        let mut query = json!({"since_ms": since, "bucket_ms": HOUR, "limit": 256});
         if !self.all {
             query["name"] = json!(self.scope.glob);
         }
@@ -275,6 +285,7 @@ impl View {
                     since,
                     bucket,
                     buckets,
+                    now: epoch_ms(),
                     all: self.all,
                     period: self.period,
                     usage,
@@ -430,6 +441,8 @@ impl View {
                 out.push(Line::default());
                 out.extend(tasks.lines(read.period, width));
             }
+            out.push(Line::default());
+            out.extend(self.daemon(read, width));
             return out;
         }
         let input = total.fresh + total.cached;
@@ -546,7 +559,143 @@ impl View {
             out.push(Line::default());
             out.extend(self.bars("By what started it", &origins, &total, width, false));
         }
+        out.push(Line::default());
+        out.extend(self.daemon(read, width));
         out
+    }
+
+    /// The Daemon block: what it did in the period, where its finished
+    /// turns' time went, and its state now, from its last two `stats`
+    /// reads, the whole daemon's whatever the card shows.
+    fn daemon(&self, read: &Read, width: usize) -> Vec<Line<'static>> {
+        let usage = &read.usage;
+        let count = |value: &Value| value.as_u64().unwrap_or(0);
+        let turns = count(&usage["turns"]);
+        // The calls and the time are the finished turns' with a timed
+        // call, as `usage` keeps them in `time`.
+        let time = &usage["time"];
+        let timed = count(&time["turns"]);
+        let (model_calls, tool_calls) = (count(&time["timed_rounds"]), count(&time["tool_calls"]));
+        let mut head = format!("  {} turns", thousands(turns));
+        if timed > 0 {
+            head.push_str(&format!(
+                " · {} model calls · {} tool calls",
+                thousands(model_calls),
+                thousands(tool_calls)
+            ));
+        }
+        let mut out = vec![fit(
+            vec![Span::raw("Daemon").bold(), Span::raw(head).dim()],
+            width,
+        )];
+        if turns > 0 {
+            out.push(Line::default());
+            let hours = ((read.now - read.since) as f64 / HOUR as f64).max(1.0);
+            let busiest = (usage["series"].as_array().into_iter().flatten())
+                .map(|hour| count(&hour["turns"]))
+                .max()
+                .unwrap_or(0);
+            // The names give way first, down to the longest, then the
+            // columns from the right, each whole.
+            let columns = [
+                (13, "in the period"),
+                (14, "each hour"),
+                (16, "busiest hour"),
+            ];
+            let name = (width.saturating_sub(43)).clamp(15, NAME);
+            let kept = (1..=3)
+                .rev()
+                .find(|n| name + columns[..*n].iter().map(|(w, _)| w).sum::<usize>() <= width)
+                .unwrap_or(1);
+            let heads: String = (columns[..kept].iter())
+                .map(|(w, head)| format!("{head:>w$}"))
+                .collect();
+            out.push(fit(
+                vec![
+                    Span::raw(format!("{:<name$}", "What it did")).bold(),
+                    Span::raw(heads).dim(),
+                ],
+                width,
+            ));
+            let mut did = vec![("turns", turns, Some(busiest))];
+            if timed > 0 {
+                did.push(("model calls", model_calls, None));
+                did.push(("tool calls", tool_calls, None));
+            }
+            for (label, sum, most) in did {
+                let cells = [
+                    thousands(sum),
+                    per(sum as f64 / hours),
+                    most.map(thousands).unwrap_or_default(),
+                ];
+                let mut row = format!("  {label:<w$}", w = name - 2);
+                for ((w, _), cell) in columns[..kept].iter().zip(cells) {
+                    row.push_str(&format!("{cell:>w$}"));
+                }
+                out.push(fit(vec![Span::raw(row.trim_end().to_owned())], width));
+            }
+            if timed > 0 && timed < turns {
+                let note = format!(
+                    "  calls are counted in the {} turns that ended",
+                    thousands(timed)
+                );
+                out.push(fit(vec![Span::raw(note).dim()], width));
+            }
+        }
+        // Each part of the finished turns' time, as a share of it; what
+        // none of them records, its own row; never scaled to make 100.
+        let whole = count(&time["turn_ms"]);
+        if timed > 0 && whole > 0 {
+            let mut parts = vec![
+                ("the model", count(&time["model_ms"])),
+                ("tools", count(&time["tool_ms"])),
+                ("waiting on a provider's limit", count(&time["paced_ms"])),
+                ("summaries", count(&time["summary_ms"])),
+                ("the daemon", count(&time["daemon_ms"])),
+            ];
+            let rest = whole.saturating_sub(parts.iter().map(|(_, ms)| ms).sum());
+            if rest > 0 {
+                parts.push(("the rest", rest));
+            }
+            out.push(Line::default());
+            out.push(fit(
+                vec![Span::raw("Where a turn's time went").bold()],
+                width,
+            ));
+            let name = (NAME - 2).min(width.saturating_sub(2 + 4 + 6)).max(8);
+            let room = width.saturating_sub(2 + name + 6).min(22);
+            for (part, ms) in parts {
+                let mut spans = vec![Span::raw(format!(
+                    "  {:<name$}",
+                    crate::transcript::cut(part, name)
+                ))];
+                spans.extend(meter(ms, whole, room));
+                spans.push(Span::raw(format!(" {:>5}", share(ms, whole))));
+                out.push(fit(spans, width));
+            }
+        }
+        out.push(Line::default());
+        out.extend(self.readings().lines(width));
+        out
+    }
+
+    /// What the daemon's last two `stats` reads found, as they stand.
+    fn readings(&self) -> Readings {
+        self.daemon
+            .lock()
+            .map(|kept| kept.clone())
+            .unwrap_or_default()
+    }
+
+    /// Where [`stats`] keeps what it reads for this view, and whether a
+    /// read for it should start now: one at a time.
+    pub fn stats_due(&self) -> Option<Arc<std::sync::Mutex<Readings>>> {
+        let mut kept = self.daemon.lock().ok()?;
+        if kept.asked {
+            return None;
+        }
+        kept.asked = true;
+        Some(self.daemon.clone())
     }
 
     /// The stacked bars over time, with the most a bar holds at the top
@@ -780,6 +929,297 @@ fn speeds(models: &[Row], total: &Spent, width: usize) -> Vec<Line<'static>> {
         ]));
     }
     out
+}
+
+/// The name column of the Daemon block's rows.
+const NAME: usize = 32;
+
+/// What the daemon counts since it started that the Daemon block reads
+/// as a rate: requests answered, writes the store committed, and events
+/// sent to the sessions that follow them.
+const RATES: [&str; 3] = ["requests", "store writes", "events sent"];
+
+/// What one `stats` read said of the daemon: how long it had been up,
+/// each of [`RATES`] and the processor time it spent since it started,
+/// and its levels then. A figure the daemon reported as null, or a limit
+/// it has none of (0), is none.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Reading {
+    uptime_ms: u64,
+    counts: [Option<u64>; 3],
+    cpu_ms: Option<u64>,
+    turns: Option<u64>,
+    turn_limit: Option<u64>,
+    paced: Option<u64>,
+    commands: Option<u64>,
+    command_limit: Option<u64>,
+    rss: Option<u64>,
+    peak: Option<u64>,
+}
+
+impl Reading {
+    /// From a `stats` reply; none without its uptime, which every rate is
+    /// read against.
+    pub fn of(stats: &Value) -> Option<Self> {
+        let process = &stats["process"];
+        let requests = (stats["commands"]["ops"].as_object()).map(|ops| {
+            ops.values()
+                .map(|op| op["count"].as_u64().unwrap_or(0))
+                .sum()
+        });
+        let limit = |value: &Value| value.as_u64().filter(|limit| *limit > 0);
+        Some(Self {
+            uptime_ms: process["uptime_ms"].as_u64()?,
+            counts: [
+                requests,
+                stats["store"]["groups"]["jobs"].as_u64(),
+                stats["hub"]["delivered"].as_u64(),
+            ],
+            cpu_ms: (process["cpu_user_ms"].as_u64())
+                .zip(process["cpu_system_ms"].as_u64())
+                .map(|(user, system)| user + system),
+            turns: stats["active_turns"].as_u64(),
+            turn_limit: limit(&stats["active_limit"]),
+            paced: stats["paced_turns"].as_u64(),
+            commands: stats["running_processes"].as_u64(),
+            command_limit: limit(&stats["process_limit"]),
+            rss: process["rss_bytes"].as_u64(),
+            peak: process["peak_rss_bytes"].as_u64(),
+        })
+    }
+
+    /// Whether the daemon started again after `before` was read: it has
+    /// been up less long, or a count fell.
+    fn restarted(&self, before: &Self) -> bool {
+        let fell = |now: Option<u64>, then: Option<u64>| now.zip(then).is_some_and(|(n, t)| n < t);
+        self.uptime_ms < before.uptime_ms
+            || (self.counts.iter().zip(before.counts)).any(|(now, then)| fell(*now, then))
+            || fell(self.cpu_ms, before.cpu_ms)
+    }
+}
+
+/// The daemon's last two `stats` reads, the earlier none until a second
+/// lands or once the daemon started again between them; the last read's
+/// error; and whether a read is under way.
+#[derive(Clone, Debug, Default)]
+pub struct Readings {
+    last: Option<Reading>,
+    before: Option<Reading>,
+    error: Option<String>,
+    asked: bool,
+}
+
+impl Readings {
+    /// What a `stats` read came back with.
+    pub fn came(&mut self, read: Result<Value, String>) {
+        self.asked = false;
+        let reading = match read {
+            Ok(stats) => Reading::of(&stats).ok_or_else(|| "no uptime".to_owned()),
+            Err(error) => Err(error),
+        };
+        match reading {
+            Ok(reading) => {
+                self.error = None;
+                self.before = self.last.take().filter(|last| !reading.restarted(last));
+                self.last = Some(reading);
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    /// The Right now table at `width`.
+    fn lines(&self, width: usize) -> Vec<Line<'static>> {
+        let mut head = vec![
+            Span::raw("Right now").bold(),
+            Span::raw("  the whole daemon").dim(),
+        ];
+        let Some(last) = &self.last else {
+            head.push(
+                Span::raw(match &self.error {
+                    Some(error) => format!(" · could not read it: {error}"),
+                    None => " · reading…".to_owned(),
+                })
+                .dim(),
+            );
+            return vec![fit(head, width)];
+        };
+        head.push(Span::raw(format!(" · up {}", up(last.uptime_ms))).dim());
+        let mut out = vec![fit(head, width)];
+        let mut rows: Vec<(&str, String, String)> = Vec::new();
+        let mut row = |name, value, note| rows.push((name, value, note));
+        // A count's rate between the last two reads, and since the daemon
+        // started; only that until a second read lands.
+        let up_s = last.uptime_ms as f64 / 1000.0;
+        let between = |now: Option<u64>, then: Option<u64>| {
+            let before = self.before.as_ref()?;
+            let ms = last
+                .uptime_ms
+                .checked_sub(before.uptime_ms)
+                .filter(|ms| *ms > 0)?;
+            Some((now? - then?) as f64 * 1000.0 / ms as f64)
+        };
+        for (at, name) in RATES.iter().enumerate() {
+            let Some(sum) = last.counts[at] else { continue };
+            let since = sum as f64 / up_s.max(0.001);
+            let then = self.before.as_ref().and_then(|before| before.counts[at]);
+            let (value, note) = match between(Some(sum), then) {
+                Some(rate) => (rate, format!("{} a second since it started", per(since))),
+                None => (since, "since it started".to_owned()),
+            };
+            row(name, format!("{} a second", per(value)), note);
+        }
+        if let Some(turns) = last.turns {
+            let value = match last.turn_limit {
+                Some(limit) => format!("{turns} of {limit}"),
+                None => turns.to_string(),
+            };
+            let note = match last.paced {
+                Some(paced) if paced > 0 => format!("{paced} more wait on a provider's limit"),
+                _ => String::new(),
+            };
+            row("turns running", value, note);
+        }
+        if let Some(commands) = last.commands {
+            let value = match last.command_limit {
+                Some(limit) => format!("{commands} of {limit}"),
+                None => commands.to_string(),
+            };
+            row("commands running", value, String::new());
+        }
+        // The processor time it spent as a share of one core's, read as
+        // the counts are.
+        if let Some(cpu) = last.cpu_ms {
+            let since = cpu as f64 * 100.0 / last.uptime_ms.max(1) as f64;
+            let then = self.before.as_ref().and_then(|before| before.cpu_ms);
+            let (value, note) = match between(Some(cpu), then) {
+                Some(share) => (share / 10.0, format!("{} since it started", core(since))),
+                None => (since, "since it started".to_owned()),
+            };
+            row("processor", format!("{} of one core", core(value)), note);
+        }
+        if let Some(rss) = last.rss {
+            // The kernel counts the peak and the resident set apart: the
+            // most is never less than it uses now.
+            let note = last
+                .peak
+                .map(|peak| format!("most {}", megabytes(peak.max(rss))));
+            row("memory", megabytes(rss), note.unwrap_or_default());
+        }
+        // The names give way to the notes, down to the longest name; a
+        // note that still does not fit is left out whole.
+        let notes = (rows.iter().map(|(_, _, note)| note.width()))
+            .max()
+            .unwrap_or(0);
+        let name = (width.saturating_sub(2 + 15 + 3 + notes)).clamp(17, NAME - 5);
+        for (label, value, note) in rows {
+            let mut spans = vec![Span::raw(format!("  {label:<name$}{value:>15}"))];
+            if !note.is_empty() && 2 + name + 15 + 3 + note.width() <= width {
+                spans.push(Span::raw(format!("   {note}")).dim());
+            }
+            out.push(fit(spans, width));
+        }
+        out
+    }
+}
+
+/// The daemon's state, read with `stats` on a connection of its own to
+/// `socket`, so its reply never waits behind the window's reads, into
+/// `kept`; `woken` once it is there.
+pub async fn stats(
+    socket: PathBuf,
+    kept: Arc<std::sync::Mutex<Readings>>,
+    woken: Arc<tokio::sync::Notify>,
+) {
+    let read = match agent_client::Client::connect(&socket).await {
+        Ok((client, _events)) => {
+            (client.request("stats", json!({})).await).map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    if let Ok(mut kept) = kept.lock() {
+        kept.came(read);
+    }
+    woken.notify_one();
+}
+
+/// `spans` cut to `width`: the span that runs over it cut short, those
+/// after it left out.
+fn fit(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut used = 0;
+    let mut out = Vec::new();
+    for span in spans {
+        let wide = span.content.width();
+        if used + wide <= width {
+            used += wide;
+            out.push(span);
+            continue;
+        }
+        let room = width - used;
+        if room > 1 {
+            let cut = crate::transcript::cut(span.content.trim_end(), room);
+            out.push(Span::styled(cut, span.style));
+        }
+        break;
+    }
+    Line::from(out)
+}
+
+/// How many of something a unit of time, in a few characters: whole from
+/// ten on, to a tenth under it.
+fn per(n: f64) -> String {
+    match n {
+        n if n >= 9.95 => thousands(n.round() as u64),
+        n if n > 0.0 && n < 0.05 => "<0.1".to_owned(),
+        n => format!("{n:.1}").trim_end_matches(".0").to_owned(),
+    }
+}
+
+/// A share of one core, as a whole percent, or under one when it is.
+fn core(percent: f64) -> String {
+    match percent {
+        p if p > 0.0 && p < 0.5 => "<1%".to_owned(),
+        p => format!("{:.0}%", p),
+    }
+}
+
+/// `part` of `of` as a whole percent, or under one when it is some.
+fn share(part: u64, of: u64) -> String {
+    match percent(part, of).as_str() {
+        "0%" if part > 0 => "<1%".to_owned(),
+        said => said.to_owned(),
+    }
+}
+
+/// Bytes in megabytes, or gigabytes from a thousand of them.
+fn megabytes(bytes: u64) -> String {
+    let mb = bytes as f64 / 1_048_576.0;
+    match mb {
+        mb if mb < 1000.0 => format!("{} MB", mb.round() as u64),
+        mb => format!("{:.1} GB", mb / 1024.0),
+    }
+}
+
+/// How long the daemon has been up, in its two largest units: 45s, 12m,
+/// 3h 20m, 2d 4h.
+fn up(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86_400 => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+        _ => format!("{}d {}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+fn thousands(n: u64) -> String {
+    crate::background::thousands(n)
+}
+
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 /// A time in milliseconds, in a few characters.
@@ -2232,10 +2672,258 @@ mod tests {
         view.key(KeyEvent::from(KeyCode::Right));
         view.key(KeyEvent::from(KeyCode::Right));
         let (query, window) = view.query(now);
-        assert_eq!((query["bucket_ms"].as_i64(), window.2), (Some(DAY), 30));
+        // Read by the hour whatever the period, the chart's bars days.
+        assert_eq!(
+            (query["bucket_ms"].as_i64(), window.1, window.2),
+            (Some(HOUR), DAY, 30)
+        );
         // Enter opens nothing here and never closes it; Esc does.
         assert_eq!(view.key(KeyEvent::from(KeyCode::Enter)), Key::Stay);
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
+    }
+
+    /// A synthetic `usage` reply for the Daemon block: 9,214 turns in
+    /// the period, those that ended with their calls and time, by the
+    /// hour from `since`.
+    fn daemon_usage(since: i64) -> Value {
+        json!({
+            "turns": 9214, "input_tokens": 4000, "cached_input_tokens": 3000, "output_tokens": 300,
+            "bots": [], "other_bots": null, "models": [], "origins": [],
+            "time": {
+                "turns": 9180, "turn_ms": 1_000_000, "model_ms": 610_000, "tool_ms": 310_000,
+                "paced_ms": 60_000, "summary_ms": 15_000, "daemon_ms": 2_000,
+                "tool_calls": 148_300, "timed_rounds": 61_480,
+            },
+            "series": [
+                {"at_ms": since, "turns": 40, "input_tokens": 10, "output_tokens": 1},
+                {"at_ms": since + 5 * HOUR, "turns": 212, "input_tokens": 10, "output_tokens": 1},
+                {"at_ms": since + 6 * HOUR, "turns": 90, "input_tokens": 10, "output_tokens": 1},
+            ],
+        })
+    }
+
+    /// A synthetic `stats` reply, up `uptime_s` seconds with `requests`
+    /// answered.
+    fn daemon_stats(uptime_s: u64, requests: u64) -> Value {
+        json!({
+            "active_turns": 27, "active_limit": 64, "paced_turns": 3,
+            "running_processes": 14, "process_limit": 32,
+            "commands": {"ops": {"usage": {"count": requests / 2}, "submit": {"count": requests - requests / 2}}},
+            "store": {"jobs": 99_999, "groups": {"count": 10, "jobs": uptime_s * 6}},
+            "hub": {"delivered": uptime_s * 190, "dropped": 0},
+            "process": {
+                "uptime_ms": uptime_s * 1000, "cpu_user_ms": uptime_s * 60, "cpu_system_ms": uptime_s * 30,
+                "rss_bytes": 412u64 << 20, "peak_rss_bytes": 655u64 << 20,
+            },
+        })
+    }
+
+    fn block(card: &str) -> Vec<&str> {
+        card.lines()
+            .skip_while(|line| !line.starts_with("Daemon"))
+            .collect()
+    }
+
+    #[test]
+    fn the_daemon_block_says_what_it_did_and_where_a_turns_time_went() {
+        let mut view = View::new(scope());
+        // A week: read by the hour, the busiest hour the most turns any
+        // hour had; the chart's bars sum six hours each.
+        view.key(KeyEvent::from(KeyCode::Right));
+        let (query, window) = view.query(1_800_000_000_000);
+        assert_eq!(query["bucket_ms"], HOUR);
+        view.loaded(window, Ok(daemon_usage(window.0)), Vec::new());
+        let read = view.read.as_mut().unwrap();
+        read.now = read.since + 168 * HOUR;
+        let card = text(&view.card(90));
+        assert_eq!(
+            block(&card)[..13],
+            [
+                "Daemon  9,214 turns · 61,480 model calls · 148,300 tool calls",
+                "",
+                "What it did                     in the period     each hour    busiest hour",
+                "  turns                                 9,214            55             212",
+                "  model calls                          61,480           366",
+                "  tool calls                          148,300           883",
+                "  calls are counted in the 9,180 turns that ended",
+                "",
+                "Where a turn's time went",
+                "  the model                     █████████████░░░░░░░░░   61%",
+                "  tools                         ███████░░░░░░░░░░░░░░░   31%",
+                "  waiting on a provider's limit █░░░░░░░░░░░░░░░░░░░░░    6%",
+                "  summaries                     ░░░░░░░░░░░░░░░░░░░░░░    2%",
+            ],
+            "{card}"
+        );
+        // The daemon's own time under one percent; what none of the parts
+        // records, its own row, nothing scaled to make 100.
+        assert!(
+            card.contains("  the daemon                    ░░░░░░░░░░░░░░░░░░░░░░   <1%"),
+            "{card}"
+        );
+        assert!(
+            card.contains("  the rest                      ░░░░░░░░░░░░░░░░░░░░░░   <1%"),
+            "{card}"
+        );
+        // The chart's first bar sums its six hours, the first and the
+        // sixth (22 tokens), and reaches the top; the next holds one (11).
+        let lines: Vec<&str> = card.lines().collect();
+        assert!(lines[4].starts_with("22 ┤██    "), "{card}");
+        assert!(lines[8].starts_with("   │██ ██ "), "{card}");
+        // Until `stats` lands, the card draws and its last table reads.
+        assert!(
+            card.ends_with("Right now  the whole daemon · reading…"),
+            "{card}"
+        );
+    }
+
+    #[test]
+    fn a_period_with_no_timed_turns_says_nothing_of_calls_or_time() {
+        let mut view = View::new(scope());
+        let (_, window) = view.query(1_800_000_000_000);
+        let mut usage = daemon_usage(window.0);
+        usage["time"] = json!({"turns": 0, "turn_ms": 0, "tool_calls": 0, "timed_rounds": 0});
+        view.loaded(window, Ok(usage), Vec::new());
+        let card = text(&view.card(90));
+        assert_eq!(block(&card)[0], "Daemon  9,214 turns", "{card}");
+        assert!(!card.contains("model calls"), "{card}");
+        assert!(!card.contains("Where a turn's time went"), "{card}");
+        // No turns at all: the state now, nothing of the period.
+        let mut view = View::new(scope());
+        view.loaded(
+            window,
+            Ok(json!({"turns": 0, "bots": [], "models": []})),
+            Vec::new(),
+        );
+        view.daemon.lock().unwrap().came(Ok(daemon_stats(100, 50)));
+        let card = text(&view.card(90));
+        assert!(card.contains("No turns in the last 24 hours."), "{card}");
+        assert_eq!(
+            block(&card)[..3],
+            ["Daemon  0 turns", "", "Right now  the whole daemon · up 1m"],
+            "{card}"
+        );
+    }
+
+    #[test]
+    fn right_now_reads_a_rate_between_two_reads_and_starts_over_when_the_daemon_does() {
+        let mut readings = Readings::default();
+        // One read: each rate since it started, and only that.
+        readings.came(Ok(daemon_stats(187_200, 3_931_200)));
+        assert_eq!(
+            text(&readings.lines(90)).lines().collect::<Vec<_>>(),
+            [
+                "Right now  the whole daemon · up 2d 4h",
+                "  requests                       21 a second   since it started",
+                "  store writes                    6 a second   since it started",
+                "  events sent                   190 a second   since it started",
+                "  turns running                     27 of 64   3 more wait on a provider's limit",
+                "  commands running                  14 of 32",
+                "  processor                   9% of one core   since it started",
+                "  memory                              412 MB   most 655 MB",
+            ]
+        );
+        // A minute on: what it counted between the two over the time
+        // between them, by its own clock.
+        let mut later = daemon_stats(187_260, 3_931_200 + 60 * 38);
+        later["hub"]["delivered"] = json!(187_200 * 190 + 60 * 410);
+        later["process"]["cpu_system_ms"] = json!(187_200 * 30 + 60 * 120);
+        later["process"]["cpu_user_ms"] = json!(187_200 * 60);
+        readings.came(Ok(later));
+        let lines = text(&readings.lines(90));
+        assert!(
+            lines.contains(
+                "  requests                       38 a second   21 a second since it started"
+            ),
+            "{lines}"
+        );
+        assert!(
+            lines.contains(
+                "  events sent                   410 a second   190 a second since it started"
+            ),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("  processor                  12% of one core   9% since it started"),
+            "{lines}"
+        );
+        // Started again since: no rate across it, until a second read.
+        readings.came(Ok(daemon_stats(30, 300)));
+        let lines = text(&readings.lines(90));
+        assert!(lines.contains("· up 30s"), "{lines}");
+        assert!(
+            lines.contains("  requests                       10 a second   since it started"),
+            "{lines}"
+        );
+        // A count that fell is a start too, however long it says it ran.
+        readings.came(Ok(daemon_stats(31, 100)));
+        assert!(text(&readings.lines(90)).contains("3.2 a second   since it started"));
+        // What the daemon reports as null leaves its row or cell out, and
+        // a limit of none (0) says no `of`.
+        let mut bare = daemon_stats(100, 100);
+        bare["process"]["rss_bytes"] = Value::Null;
+        bare["process"]["cpu_user_ms"] = Value::Null;
+        bare["process_limit"] = json!(0);
+        bare["paced_turns"] = json!(0);
+        bare["hub"] = Value::Null;
+        let mut readings = Readings::default();
+        readings.came(Ok(bare));
+        let lines = text(&readings.lines(90));
+        assert!(!lines.contains("memory"), "{lines}");
+        assert!(!lines.contains("processor"), "{lines}");
+        assert!(!lines.contains("events sent"), "{lines}");
+        assert!(
+            lines.contains("  turns running                     27 of 64\n"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("  commands running                        14"),
+            "{lines}"
+        );
+        // A read that failed says so, and the next one fills it in.
+        let mut readings = Readings::default();
+        readings.came(Err("connection refused".into()));
+        assert_eq!(
+            text(&readings.lines(90)),
+            "Right now  the whole daemon · could not read it: connection refused"
+        );
+    }
+
+    #[test]
+    fn one_stats_read_at_a_time() {
+        let view = View::new(scope());
+        let kept = view.stats_due().expect("the first read starts");
+        assert!(view.stats_due().is_none());
+        kept.lock().unwrap().came(Ok(daemon_stats(10, 10)));
+        assert!(view.stats_due().is_some());
+    }
+
+    #[test]
+    fn no_row_of_the_daemon_block_is_wider_than_the_card() {
+        let mut view = View::new(scope());
+        let (_, window) = view.query(1_800_000_000_000);
+        view.loaded(window, Ok(daemon_usage(window.0)), Vec::new());
+        let mut readings = view.daemon.lock().unwrap();
+        readings.came(Ok(daemon_stats(187_200, 3_931_200)));
+        readings.came(Ok(daemon_stats(187_260, 3_933_480)));
+        drop(readings);
+        // Narrower than it is laid out for, a name gives way, then a column
+        // or a note goes whole: nothing in it is cut short.
+        for width in [64, 72, 80] {
+            let card = text(&view.card(width));
+            assert!(!block(&card).iter().any(|line| line.contains('…')), "{card}");
+            assert!(card.contains("busiest hour") == (width >= 58), "{card}");
+        }
+        for width in 20..=100 {
+            let card = view.card(width);
+            for line in block(&text(&card)) {
+                assert!(
+                    line.width() <= width,
+                    "{} columns in {width}: {line:?}",
+                    line.width()
+                );
+            }
+        }
     }
 
     fn prices(sheet: &str) -> Vec<(String, Prices)> {

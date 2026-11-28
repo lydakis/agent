@@ -16626,6 +16626,12 @@ impl App {
                     .as_millis() as i64;
                 let (ask, window) = view.ask(now);
                 let selection = view.selection();
+                // The daemon's own state, on a connection of its own: the
+                // card draws without it, and its block fills in once it
+                // lands.
+                if let Some(kept) = view.stats_due() {
+                    tokio::spawn(usage::stats(socket.clone(), kept, woken.clone()));
+                }
                 self.card_read = Some(tokio::spawn(async move {
                     let read = usage::read(client, socket, ask, store).await;
                     // The price sheet as its file says now, so an edit shows
