@@ -9926,16 +9926,10 @@ impl App {
                 }
             }
             keyed |= self.status_filled().await;
-            if self.pane.as_ref().is_some_and(pane::Pane::is_card)
-                && self.watch.as_ref().is_some_and(|w| {
-                    w.read.elapsed() > STATUS_AGAIN
-                        || w.usage.as_ref().is_some_and(usage::View::due)
-                        || w.audit.as_ref().is_some_and(audit::View::due)
-                        || w.background
-                            .as_ref()
-                            .is_some_and(background::View::commands_due)
-                })
-            {
+            // A card's read is taken as soon as it is in, and another made
+            // once one is due.
+            let came = self.card_read.as_ref().is_some_and(|job| job.is_finished());
+            if self.pane.as_ref().is_some_and(pane::Pane::is_card) && (came || self.card_due()) {
                 self.reread().await;
             }
             if self.retry.is_some_and(|at| at <= Instant::now()) {
@@ -16501,11 +16495,27 @@ impl App {
         }
     }
 
+    /// Whether the open card is due a read again.
+    fn card_due(&self) -> bool {
+        self.watch.as_ref().is_some_and(|w| {
+            w.read.elapsed() > STATUS_AGAIN
+                || w.usage.as_ref().is_some_and(usage::View::due)
+                || w.audit.as_ref().is_some_and(audit::View::due)
+                || w.background
+                    .as_ref()
+                    .is_some_and(background::View::commands_due)
+        })
+    }
+
     async fn reread(&mut self) {
         if let Some(job) = self.card_read.take_if(|job| job.is_finished())
             && let Ok(read) = job.await
         {
             self.card_came(read);
+            // Taken as it came: the next read waits until one is due.
+            if !self.card_due() {
+                return;
+            }
         }
         // One read at a time, beside the loop.
         if self.card_read.is_some() {
@@ -24335,8 +24345,10 @@ impl App {
             if self.projects.is_none() {
                 self.screen.render(history, frame.buffer_mut(), file);
                 // The conversation read again, or read back to its first
-                // row while older rows are read: the sign on the row above
-                // the first, if there is room, else on it until they come.
+                // row while older rows are read: the sign, muted, on the
+                // row above the first if there is room, else on the first
+                // when it is blank, keeping its background. It never
+                // covers a written row.
                 let since = match self.repainting {
                     Some(since) => Some(since),
                     None => (self.older_read.is_some() && self.screen.at_first_row())
@@ -24352,8 +24364,13 @@ impl App {
                         height: 1,
                         ..history
                     };
-                    frame.render_widget(ratatui::widgets::Clear, row);
-                    frame.render_widget(Paragraph::new(reading::line(since)), row);
+                    let buffer = frame.buffer_mut();
+                    let blank = row.positions().all(|at| {
+                        buffer.cell(at).is_none_or(|cell| cell.symbol() == " ")
+                    });
+                    if blank {
+                        frame.render_widget(Paragraph::new(reading::line(since)), row);
+                    }
                 }
                 if let Some(eyes) = &mut self.eyes
                     && let Some(y) = self.screen.drawn_at(screen::Tag::Eyes)
