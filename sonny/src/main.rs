@@ -79,6 +79,7 @@ mod needs;
 mod new;
 mod pane;
 mod picker;
+mod pinned;
 mod place;
 mod plan;
 mod project;
@@ -726,6 +727,10 @@ struct ProjectsOpen {
     waiting: std::collections::HashSet<String>,
     /// The rows' version the last read counted ([`elsewhere::Rows`]).
     version: Option<u64>,
+    /// The pins the last read counted with: once they are not this
+    /// window's, each project that holds a pin found or let go is counted
+    /// again, though the page closed between.
+    pins: Vec<String>,
     /// Where the page and the pane beside it were drawn, for the mouse.
     page: Rect,
     side: Rect,
@@ -766,6 +771,9 @@ struct ProjectsKept {
     whole: bool,
     waiting: std::collections::HashSet<String>,
     version: Option<u64>,
+    pins: Vec<String>,
+    /// The pins the last read did not find listed.
+    gone: Vec<String>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
     /// The project picked to go to, as the page showed it: the window
     /// opened on its lead shows its counts and agents from its first
@@ -797,6 +805,8 @@ impl ProjectsKept {
         self.whole = read.whole;
         self.waiting = read.waiting;
         self.version = Some(read.version);
+        self.pins = read.pins;
+        self.gone = read.gone;
     }
 }
 
@@ -840,6 +850,10 @@ impl App {
     async fn open_projects(&mut self) {
         let here = self.scope().lead;
         let mut view = projects::View::new(&here).showing(&self.bot);
+        // The pins as this window knows them, so a number goes at once;
+        // read again beside it, as another window may have pinned since.
+        view.set_pins(self.pins.names().to_vec(), now_ms());
+        self.pins.read_again(&self.woken);
         // What it read when last open shows at once, and is read again
         // from a new snapshot: only what moved since is.
         let kept = match self.projects_kept.take() {
@@ -848,6 +862,7 @@ impl App {
                 if !kept.projects.is_empty() {
                     view.set(std::mem::take(&mut kept.projects), now_ms());
                 }
+                view.set_gone(std::mem::take(&mut kept.gone));
                 *kept
             }
             // The projects as any window last showed them show at once,
@@ -885,6 +900,7 @@ impl App {
             whole: kept.whole,
             waiting: kept.waiting,
             version: kept.version,
+            pins: kept.pins,
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -910,6 +926,8 @@ impl App {
             whole: open.whole,
             waiting: std::mem::take(&mut open.waiting),
             version: open.version,
+            pins: std::mem::take(&mut open.pins),
+            gone: open.view.take_gone(),
             job: open.job.take(),
             picked: None,
         };
@@ -1110,10 +1128,12 @@ impl App {
             match job.await {
                 Ok(Some(read)) => {
                     open.view.set(read.projects, now_ms());
+                    open.view.set_gone(read.gone);
                     open.state = read.state;
                     open.whole = read.whole;
                     open.waiting = read.waiting;
                     open.version = Some(read.version);
+                    open.pins = read.pins;
                 }
                 _ => open.version = None,
             }
@@ -1126,8 +1146,12 @@ impl App {
         };
         // Every agent's row, once in and moved since the last read (or the
         // questions open did, or the last read was short).
+        let pins = self.pins.names();
         let again = |rows: &elsewhere::Rows| {
-            Some(rows.version) != open.version || waiting != open.waiting || !open.whole
+            Some(rows.version) != open.version
+                || waiting != open.waiting
+                || !open.whole
+                || open.pins != pins
         };
         let Some((version, listed)) = shared.rows(|rows| {
             rows.filter(|rows| again(rows)).map(|rows| {
@@ -1143,10 +1167,11 @@ impl App {
         let (client, woken) = (self.client.clone(), self.woken.clone());
         let store = self.options.store.clone();
         let (bot, asks, approvals) = (self.bot.clone(), self.asks.clone(), self.approvals.clone());
+        let pins = self.pins.names().to_vec();
         let mut state = std::mem::take(&mut open.state);
         open.job = Some(tokio::spawn(async move {
             let read = read_projects(
-                &client, &store, &listed, &bot, &asks, &approvals, &waiting, &mut state,
+                &client, &store, &listed, &bot, &asks, &approvals, &waiting, &pins, &mut state,
             )
             .await
             .map(|(projects, whole)| ProjectsRead {
@@ -1155,6 +1180,12 @@ impl App {
                 whole,
                 waiting,
                 version,
+                // The pins no agent listed is: not there any more.
+                gone: (pins.iter())
+                    .filter(|pin| !listed.iter().any(|agent| agent.name == **pin))
+                    .cloned()
+                    .collect(),
+                pins,
             });
             woken.notify_one();
             read
@@ -1189,6 +1220,25 @@ impl App {
                         open.view.scroll(mouse.kind == MouseEventKind::ScrollDown);
                         return;
                     }
+                    // A pinned agent's name goes to it, as a name does
+                    // everywhere; a right click takes the other route.
+                    MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right))
+                        if open.page.contains(at)
+                            && let Some(bot) = (open.view.links().iter())
+                                .find(|(line, columns, _)| {
+                                    *line == (mouse.row - open.page.y) as usize
+                                        && columns
+                                            .contains(&((mouse.column - open.page.x) as usize))
+                                })
+                                .map(|(_, _, bot)| bot.clone()) =>
+                    {
+                        let link = format!("{}{bot}", links::AGENT);
+                        if let Some(link) = clicked(&link, button == MouseButton::Right) {
+                            self.close_projects();
+                            self.follow(&link);
+                        }
+                        return;
+                    }
                     MouseEventKind::Down(MouseButton::Left) if open.page.contains(at) => {
                         open.view.click((mouse.row - open.page.y) as usize, now)
                     }
@@ -1214,6 +1264,13 @@ impl App {
         match act {
             projects::Act::Stay => {}
             projects::Act::Close => self.close_projects(),
+            // A pin shows as its row; only a tenth is answered.
+            projects::Act::Pin(bot) => {
+                if let came @ pinned::Came::Full = self.toggle_pin(&bot) {
+                    self.notice = Some(came.said());
+                }
+            }
+            projects::Act::Gone(bot) => self.notice = Some(format!("{bot} is not there")),
             projects::Act::Go(lead) => {
                 let picked = (self.projects.as_ref())
                     .and_then(|open| open.view.picked())
@@ -1226,6 +1283,33 @@ impl App {
                 self.switch_picked(lead);
             }
         }
+    }
+
+    /// `bot` pinned, or unpinned where it is: at once in this window and
+    /// in **Projects** if open, and in the pins' file beside the window.
+    fn toggle_pin(&mut self, bot: &str) -> pinned::Came {
+        let came = self.pins.toggle(bot, &self.woken);
+        if let Some(open) = &mut self.projects {
+            open.view.set_pins(self.pins.names().to_vec(), now_ms());
+        }
+        came
+    }
+
+    /// The pins read when the window starts, and what a read or write of
+    /// them beside the window found once it lands: **Projects**, if open,
+    /// shows them. Whether they changed.
+    fn pins_tick(&mut self) -> bool {
+        if !self.pins_read && self.options.side.is_none() {
+            self.pins_read = true;
+            self.pins.read_again(&self.woken);
+        }
+        if !self.pins.landed(&self.woken) {
+            return false;
+        }
+        if let Some(open) = &mut self.projects {
+            open.view.set_pins(self.pins.names().to_vec(), now_ms());
+        }
+        true
     }
 
     /// Where **Projects** and the pane beside it go in `area`: two
@@ -1268,6 +1352,10 @@ struct ProjectsRead {
     waiting: std::collections::HashSet<String>,
     /// The rows' version it counted ([`elsewhere::Rows`]).
     version: u64,
+    /// The pins it counted with.
+    pins: Vec<String>,
+    /// The pinned agents it did not find listed.
+    gone: Vec<String>,
 }
 
 /// The pattern that names every project's agents: a project's are
@@ -1293,6 +1381,7 @@ async fn read_projects(
     asks: &[asks::Ask],
     approvals: &[Value],
     waiting: &std::collections::HashSet<String>,
+    pins: &[String],
     state: &mut ProjectsState,
 ) -> Option<(Vec<projects::Project>, bool)> {
     let now = std::time::SystemTime::now()
@@ -1356,7 +1445,13 @@ async fn read_projects(
             .map(|bot| bot.name.as_str())
             .collect();
         let titled = titles.named(&lead.name, lead.bot_id, lead.workspace.as_deref());
-        let mark = project_mark(&theirs, &asking, titled.as_deref());
+        // Its pinned agents, whose rows it keeps: one pinned or unpinned
+        // since counts it again.
+        let pinned: Vec<&str> = (theirs.iter())
+            .filter(|bot| pins.contains(&bot.name))
+            .map(|bot| bot.name.as_str())
+            .collect();
+        let mark = project_mark(&theirs, &asking, &pinned, titled.as_deref());
         std::hash::Hash::hash(&(&lead.name, mark), &mut shown);
         let keeps = !theirs
             .iter()
@@ -1430,6 +1525,15 @@ async fn read_projects(
             false => spoken(&lead.name),
         };
         let agents = status::agents(if title.is_empty() { &called } else { &title }, &read.rows);
+        // Each pinned agent's row as counted: its mark and its title.
+        let pinned = (read.rows.iter())
+            .filter(|row| row.run.is_none() && pinned.contains(&row.bot.as_str()))
+            .map(|row| projects::Pin {
+                bot: row.bot.clone(),
+                title: row.title.clone(),
+                state: row.state.clone(),
+            })
+            .collect();
         let project = projects::Project {
             lead: lead.name.clone(),
             name: called,
@@ -1440,6 +1544,7 @@ async fn read_projects(
             state: projects::pressing(&read.rows),
             last,
             agents,
+            pinned,
         };
         found.push(project.clone());
         if keeps && read.whole {
@@ -1472,7 +1577,12 @@ async fn read_projects(
 /// The mark of what a project is counted from ([`ProjectRead`]): every
 /// field of its agents as listed (whether each is closed, done, among
 /// them), those waiting on the person, and its file's title.
-fn project_mark(agents: &[standing::Agent], asking: &[&str], title: Option<&str>) -> u64 {
+fn project_mark(
+    agents: &[standing::Agent],
+    asking: &[&str],
+    pinned: &[&str],
+    title: Option<&str>,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut mark = std::hash::DefaultHasher::new();
     for agent in agents {
@@ -1500,6 +1610,7 @@ fn project_mark(agents: &[standing::Agent], asking: &[&str], title: Option<&str>
         (model, provider, workspace, profile, closed).hash(&mut mark);
     }
     asking.hash(&mut mark);
+    pinned.hash(&mut mark);
     title.hash(&mut mark);
     mark.finish()
 }
@@ -5705,7 +5816,7 @@ fn unknown_command(prompt: &str) -> Option<String> {
 /// the slash: name and what it does, in the Sonny Rulebook's order (talk,
 /// agents, this agent, work without you, every project, Sonny). Each
 /// has one name.
-const COMMANDS: [(&str, &str); 27] = [
+const COMMANDS: [(&str, &str); 28] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/zen", "Talk about one thing and keep the rest for later"),
     ("/reply", "Quote one of the agent's replies to answer it"),
@@ -5714,6 +5825,7 @@ const COMMANDS: [(&str, &str); 27] = [
     ("/status", "Show this project's agents"),
     ("/projects", "Show every project and go to one"),
     ("/switch", "Open any agent in this window"),
+    ("/pin", "Pin this agent at the top of projects"),
     ("/new", "Start a lead or a task here"),
     (
         "/memory",
@@ -5755,6 +5867,9 @@ const COMMANDS: [(&str, &str); 27] = [
 
 /// `/zen`'s line while zen is on.
 const ZEN_ENDS: &str = "End zen and hear what was kept";
+
+/// `/pin`'s line while this window's agent is pinned.
+const UNPIN: &str = "Unpin this agent";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
@@ -7248,6 +7363,12 @@ struct App {
     /// What **Projects** read, kept once it closes: it opens again on
     /// what it showed, and reads only the projects that moved since.
     projects_kept: Option<Box<ProjectsKept>>,
+    /// The agents pinned at the top of **Projects**, as this window knows
+    /// them: read when the window starts and when **Projects** opens,
+    /// beside the window.
+    pins: pinned::Pins,
+    /// Whether the pins were read since the window started.
+    pins_read: bool,
     /// The project's agents as last read, kept current by `follower`,
     /// with their [`rows_mark`] once counted; the count holds it while it
     /// runs, so there is one copy.
@@ -9171,7 +9292,9 @@ impl App {
             record["provider"].as_str().unwrap_or("?"),
             record["model"].as_str().unwrap_or("?")
         );
+        let pins = pinned::Pins::new(&options.store);
         Self {
+            pins,
             client,
             bot: bot.to_owned(),
             project: None,
@@ -9384,6 +9507,7 @@ impl App {
             follower: None,
             projects: None,
             projects_kept: None,
+            pins_read: false,
             listed: None,
             listed_lead: None,
             rows_mark: None,
@@ -9695,6 +9819,8 @@ impl App {
                 for siding in std::mem::take(&mut self.siding) {
                     let _ = siding.await;
                 }
+                // And the pins it answered: the next window reads them.
+                self.pins.flush().await;
                 return Ok(());
             }
             let every = tick_every(self.moving(), heard.elapsed());
@@ -9920,6 +10046,7 @@ impl App {
             self.recheck_task_answers().await;
             self.settle_task_asks().await;
             self.count_agents().await;
+            changed |= self.pins_tick();
             changed |= self.projects_tick().await;
             self.elsewhere_tick();
             self.read_references().await;
@@ -17405,11 +17532,14 @@ impl App {
             return Vec::new();
         }
         // `/resume` is listed only while the agents are paused; `/zen`
-        // says it ends zen while it is on.
+        // says it ends zen while it is on; `/pin` is not offered in a side
+        // chat, and says it unpins while this agent is pinned.
         let listed: Vec<(&'static str, &'static str)> = (COMMANDS.iter())
             .filter(|(name, _)| *name != "/resume" || self.paused.is_some())
+            .filter(|(name, _)| *name != "/pin" || self.options.side.is_none())
             .map(|&(name, about)| match name {
                 "/zen" if self.zen.is_some() => (name, ZEN_ENDS),
+                "/pin" if self.pins.has(&self.bot) => (name, UNPIN),
                 _ => (name, about),
             })
             .collect();
@@ -18172,6 +18302,20 @@ impl App {
                         watch.stop = Some(run.to_owned());
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    // `p` on an agent picked in the pane's list of the
+                    // project's agents pins it, or unpins it: its row
+                    // stays as it is, as a pin shows in **Projects** alone.
+                    KeyCode::Char('p')
+                        if !ctrl
+                            && !key.modifiers.contains(KeyModifiers::ALT)
+                            && pane.is_margin()
+                            && let Some(bot) = (pane.screen.picked_link())
+                                .and_then(|link| link.strip_prefix(screen::BUTTON))
+                                .and_then(|what| what.strip_prefix("task/")) =>
+                    {
+                        let bot = bot.to_owned();
+                        self.notice = Some(self.toggle_pin(&bot).said());
+                    }
                     // The picture or drawing shown, opened bigger outside Sonny.
                     KeyCode::Char('o')
                         if let Some(path) = pane.bigger().map(std::path::Path::to_path_buf) =>
@@ -20074,6 +20218,16 @@ impl App {
                     self.notice = Some("/projects shows in the main window".into())
                 }
                 _ => self.open_projects().await,
+            }
+            return;
+        }
+        if prompt == "/pin" {
+            self.input.clear();
+            if self.options.side.is_some() {
+                self.notice = Some("/pin is for the agent itself, not a side chat".into());
+            } else {
+                let bot = self.bot.clone();
+                self.notice = Some(self.toggle_pin(&bot).said());
             }
             return;
         }
@@ -31503,10 +31657,19 @@ mod tests {
             state: &mut ProjectsState,
         ) -> Vec<String> {
             let waiting = waiting.iter().map(|bot| bot.to_string()).collect();
-            let (found, whole) =
-                read_projects(client, store, listed, "x.lead", &[], &[], &waiting, state)
-                    .await
-                    .unwrap();
+            let (found, whole) = read_projects(
+                client,
+                store,
+                listed,
+                "x.lead",
+                &[],
+                &[],
+                &waiting,
+                &[],
+                state,
+            )
+            .await
+            .unwrap();
             assert!(whole);
             assert!(asked.lock().unwrap().is_empty(), "a history was read");
             if let Some(writing) = state.writing.take() {
@@ -31619,6 +31782,7 @@ mod tests {
             &[],
             &[],
             &waiting,
+            &[],
             &mut state,
         )
         .await
@@ -31641,6 +31805,7 @@ mod tests {
             &[],
             &[],
             &waiting,
+            &[],
             &mut state,
         )
         .await
@@ -31656,6 +31821,7 @@ mod tests {
             &[],
             &[],
             &waiting,
+            &[],
             &mut state,
         )
         .await
@@ -31700,6 +31866,7 @@ mod tests {
             whole: true,
             waiting: Default::default(),
             version: None,
+            pins: Vec::new(),
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -31739,6 +31906,8 @@ mod tests {
                 whole: true,
                 waiting: Default::default(),
                 version: 7,
+                gone: Vec::new(),
+                pins: Vec::new(),
             })
         });
         while !job.is_finished() {
@@ -31753,6 +31922,7 @@ mod tests {
             whole: true,
             waiting: Default::default(),
             version: None,
+            pins: Vec::new(),
             page: Rect::default(),
             side: Rect::default(),
         }));
@@ -31779,6 +31949,8 @@ mod tests {
                     whole: true,
                     waiting: Default::default(),
                     version: 7,
+                    gone: Vec::new(),
+                    pins: Vec::new(),
                 })
             })),
             ..Default::default()
@@ -31793,6 +31965,244 @@ mod tests {
         assert!(kept.job.is_none());
         assert_eq!(kept.version, Some(7));
         assert_eq!(kept.projects[0].lead, "alpha.lead");
+    }
+
+    /// A window of `bot` whose pins are kept beside `store`.
+    async fn pinning(bot: &str, store: &std::path::Path) -> App {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.bot = bot.into();
+        app.pins = pinned::Pins::new(store);
+        app
+    }
+
+    #[tokio::test]
+    async fn pin_in_a_task_s_window_then_left_and_its_number_in_another_opens_it() {
+        let dir = std::env::temp_dir().join(unique("pins"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        // Another window, open before the pin.
+        let mut lead = pinning("tally.lead", &store).await;
+        lead.pins_tick();
+        lead.pins.settled(&lead.woken.clone()).await;
+        let mut task = pinning("tally.readme", &store).await;
+        task.input.set("/pin");
+        task.submit().await;
+        assert_eq!(task.notice.as_deref(), Some("pinned as 1 · ← 1 opens it"));
+        task.pins.settled(&task.woken.clone()).await;
+        assert_eq!(pinned::read(&pinned::file(&store)), ["tally.readme"]);
+        // `←` with nothing typed, then `1`: the window is the task's,
+        // once Projects read the pins as it opened.
+        lead.key(pressed(KeyCode::Left)).await;
+        assert!(lead.projects.is_some());
+        lead.pins.settled(&lead.woken.clone()).await;
+        assert!(lead.pins_tick());
+        assert_eq!(
+            lead.projects.as_ref().unwrap().view.pins(),
+            ["tally.readme"]
+        );
+        lead.key(pressed(KeyCode::Char('1'))).await;
+        assert!(lead.projects.is_none());
+        assert_eq!(lead.switch_to.as_deref(), Some("tally.readme"));
+        // In the task's own window, `/pin` again unpins.
+        task.input.set("/pin");
+        task.submit().await;
+        assert_eq!(task.notice.as_deref(), Some("unpinned"));
+        task.pins.settled(&task.woken.clone()).await;
+        assert!(pinned::read(&pinned::file(&store)).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pin_reads_unpin_while_pinned_a_tenth_is_refused_and_a_side_chat_has_none() {
+        let mut app = pinning("shop.fix", std::path::Path::new("")).await;
+        let pin = |app: &App| {
+            (app.menu().into_iter())
+                .find(|(name, _, _)| *name == "/pin")
+                .map(|(_, about, _)| about)
+        };
+        app.input.set("/pi");
+        assert_eq!(pin(&app), Some("Pin this agent at the top of projects"));
+        app.input.set("/pin");
+        app.submit().await;
+        app.input.set("/pi");
+        assert_eq!(pin(&app), Some(UNPIN));
+        // Nine pinned: a tenth is answered, and nine stay.
+        let mut full = pinning("shop.tenth", std::path::Path::new("")).await;
+        for n in 1..=9 {
+            full.toggle_pin(&format!("shop.t{n}"));
+        }
+        full.input.set("/pin");
+        full.submit().await;
+        assert_eq!(full.notice.as_deref(), Some("9 pinned · unpin one first"));
+        assert_eq!(full.pins.names().len(), 9);
+        assert!(!full.pins.has("shop.tenth"));
+        // Not offered in a side chat, and answered there.
+        let mut side = pinning("shop.fix", std::path::Path::new("")).await;
+        side.options.side = Some(1);
+        side.input.set("/pi");
+        assert_eq!(pin(&side), None);
+        side.input.set("/pin");
+        side.submit().await;
+        assert_eq!(
+            side.notice.as_deref(),
+            Some("/pin is for the agent itself, not a side chat")
+        );
+        assert!(side.pins.names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn p_in_projects_pins_a_lead_and_a_number_not_there_is_answered() {
+        let mut app = pinning("tally.lead", std::path::Path::new("")).await;
+        app.open_projects().await;
+        let tally = projects::Project {
+            lead: "tally.lead".into(),
+            name: "tally".into(),
+            title: "Tally invoices".into(),
+            last: now_ms(),
+            ..Default::default()
+        };
+        let open = app.projects.as_mut().unwrap();
+        open.view.set(vec![tally], now_ms());
+        app.key(pressed(KeyCode::Char('p'))).await;
+        assert_eq!(app.pins.names(), ["tally.lead"]);
+        let open = app.projects.as_ref().unwrap();
+        assert_eq!(open.view.pins(), ["tally.lead"]);
+        // The next read counts the project again, to find the pin's row.
+        assert_ne!(open.pins, app.pins.names());
+        assert_eq!(app.notice, None);
+        // A pin not there any more: its number is answered, the page stays.
+        app.toggle_pin("tally.gone");
+        let open = app.projects.as_mut().unwrap();
+        open.view.set_gone(vec!["tally.gone".into()]);
+        app.key(pressed(KeyCode::Char('2'))).await;
+        assert!(app.projects.is_some());
+        assert_eq!(app.notice.as_deref(), Some("tally.gone is not there"));
+        // Closed and opened again, it is still not there, before any read.
+        app.close_projects();
+        app.open_projects().await;
+        app.notice = None;
+        app.key(pressed(KeyCode::Char('2'))).await;
+        assert!(app.projects.is_some());
+        assert_eq!(app.notice.as_deref(), Some("tally.gone is not there"));
+        // p on the project's row again unpins its lead.
+        app.key(pressed(KeyCode::Char('p'))).await;
+        assert_eq!(app.pins.names(), ["tally.gone"]);
+    }
+
+    #[tokio::test]
+    async fn p_in_the_pane_s_list_pins_the_picked_task_and_its_row_stays() {
+        let mut app = pinning("calc.lead", std::path::Path::new("")).await;
+        let row = |name: &str, bot: &str, title: &str| status::Row {
+            name: name.into(),
+            bot: bot.into(),
+            title: title.into(),
+            state: "working".into(),
+            group: status::Group::Working,
+            ..Default::default()
+        };
+        let rows = [
+            row("lead", "calc.lead", ""),
+            row("halves", "calc.halves", "Round half cents to even"),
+        ];
+        app.margin
+            .set_agents(status::agents("Calculator", &rows), "calc.lead");
+        app.margin_back();
+        let mut terminal =
+            Terminal::new(Shot(ratatui::backend::TestBackend::new(150, 30))).unwrap();
+        app.draw(&mut terminal).unwrap();
+        let before = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        app.pane_keys = true;
+        // ↓ picks the lead's name, then the task's.
+        app.key(pressed(KeyCode::Down)).await;
+        app.key(pressed(KeyCode::Down)).await;
+        assert_eq!(
+            app.pane.as_ref().unwrap().screen.picked_link(),
+            Some("sonny:task/calc.halves")
+        );
+        app.key(pressed(KeyCode::Char('p'))).await;
+        assert_eq!(app.pins.names(), ["calc.halves"]);
+        assert_eq!(app.notice.as_deref(), Some("pinned as 1 · ← 1 opens it"));
+        assert!(app.pane_keys);
+        // Its row there does not change: a pin shows in Projects alone.
+        assert_eq!(
+            app.margin.lines(60, std::path::Path::new("/"), None).0,
+            before
+        );
+        app.key(pressed(KeyCode::Char('p'))).await;
+        assert!(app.pins.names().is_empty());
+        assert_eq!(app.notice.as_deref(), Some("unpinned"));
+    }
+
+    #[tokio::test]
+    async fn a_read_finds_each_pin_s_mark_and_title_and_counts_a_project_again_once_pinned() {
+        let client = daemon_answering(|_| json!({"approvals": [], "nodes": [], "items": []})).await;
+        let home = std::env::temp_dir().join(unique("pinned-read"));
+        let store = home.join("state.sqlite");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = |name: &str, id: i64, maker: Option<&str>, closed: bool| {
+            Arc::new(standing::Agent {
+                name: name.into(),
+                bot_id: Some(id),
+                head: Some(1),
+                created_by: maker.map(str::to_owned),
+                closed,
+                workspace: Some(home.to_string_lossy().into_owned()),
+                last: Some(standing::Ended {
+                    turn: 1,
+                    status: "completed".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let listed = vec![
+            agent("tally.lead", 1, None, false),
+            agent("tally.halves", 2, Some("tally.lead"), true),
+        ];
+        let waiting = Default::default();
+        let mut state = ProjectsState::default();
+        let (found, _) = read_projects(
+            &client,
+            &store,
+            &listed,
+            "x.lead",
+            &[],
+            &[],
+            &waiting,
+            &[],
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(found[0].pinned.is_empty());
+        let mark = state.each["tally.lead"].mark;
+        // Pinned since: the project is counted again, and the done task's
+        // row found with its mark; the lead's too.
+        let pins = ["tally.halves".to_owned(), "tally.lead".to_owned()];
+        let (found, _) = read_projects(
+            &client,
+            &store,
+            &listed,
+            "x.lead",
+            &[],
+            &[],
+            &waiting,
+            &pins,
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_ne!(state.each["tally.lead"].mark, mark);
+        let mut pinned = found[0].pinned.clone();
+        pinned.sort_by(|a, b| a.bot.cmp(&b.bot));
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0].bot, "tally.halves");
+        assert_eq!(pinned[0].state, "done");
+        assert_eq!(pinned[1].bot, "tally.lead");
+        if let Some(writing) = state.writing.take() {
+            writing.await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -31834,7 +32244,7 @@ mod tests {
                 .collect()
         };
         let all = listed(&app);
-        assert_eq!(all.len(), 26);
+        assert_eq!(all.len(), 27);
         assert_eq!(
             all[0],
             ("/side", "Start a side chat with a copy of this agent")
@@ -42402,6 +42812,7 @@ mod tests {
                 whole: true,
                 waiting: Default::default(),
                 version: None,
+                pins: Vec::new(),
                 page: Rect::default(),
                 side: Rect::default(),
             }));
