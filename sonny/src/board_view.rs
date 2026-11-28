@@ -656,12 +656,18 @@ pub fn section_heading(state: State, n: usize, open: bool) -> Line<'static> {
 }
 
 /// Whether an item answers a find on a board's page: its title, its
-/// holder or a label says what was typed (`crate::find::says`).
+/// holder, a label, who paused it or what its pause said says what was
+/// typed (`crate::find::says`).
 pub fn found_on_page(item: &Item, query: &str) -> bool {
     let labels: Vec<String> = (item.labels.iter())
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     ([item.title.as_str(), item.holder.as_deref().unwrap_or("")].into_iter())
+        .chain(
+            [item.paused_by.as_deref(), item.paused_why.as_deref()]
+                .into_iter()
+                .flatten(),
+        )
         .chain(labels.iter().map(String::as_str))
         .any(|words| crate::find::says(query, words))
 }
@@ -1803,6 +1809,29 @@ pub(crate) mod tests {
         );
         press(&mut view, KeyCode::Esc);
         assert!(view.on_page(), "esc drops the find before the page");
+        // Paused work answers for what it waits on and who paused it.
+        act(
+            home,
+            "shop.lead",
+            "flaky",
+            "pause",
+            "Waits on PR #12 merging",
+        );
+        view.reload();
+        for query in ["PR #12", "lead"] {
+            ctrl_f(&mut view);
+            typed(&mut view, query);
+            let lines = card(&mut view, 80);
+            assert!(
+                lines.iter().any(|l| l.contains("Fix the flaky error test")),
+                "{query}: {lines:#?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.contains("Add typed errors")),
+                "{query}: {lines:#?}"
+            );
+            press(&mut view, KeyCode::Esc);
+        }
         press(&mut view, KeyCode::Esc);
         assert!(!view.on_page());
         let _ = std::fs::remove_dir_all(home);
