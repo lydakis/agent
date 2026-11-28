@@ -1143,9 +1143,58 @@ async fn make(
     chosen: Option<&str>,
 ) -> Result<Value, String> {
     let instructions = folder(dir, role, &memory(dir)?)?.text;
-    // Gated and confined from the start, as a new lead's mode makes it,
-    // whoever opens it first.
-    let mode = crate::approvals::default();
+    // Writing its own state folder, by the name it is made under.
+    let lead = (bot.map(str::to_owned)).or_else(|| {
+        let info = read(dir).ok()?;
+        info["lead"].as_str().map(str::to_owned)
+    });
+    let state = lead.as_deref().and_then(crate::state::folder);
+    // As in `create`: a config that does not read is said where the lead
+    // opens, and the defaults stand until it reads.
+    let config = agent_client::config::load().unwrap_or_default();
+    let given = Given {
+        config: &config,
+        rules: crate::rules::given(),
+        mode: crate::approvals::default(),
+        providers: client.providers(),
+    };
+    let policy = lead_policy(
+        &given,
+        dir,
+        role,
+        picks,
+        state.as_deref(),
+        chosen,
+        instructions,
+    );
+    agent_client::project::create(client, dir, &policy, client.providers(), picks, bot).await
+}
+
+/// What a lead is made with that is the person's: their config, their
+/// command rules, the row a new lead's mode is, and the providers' tools.
+struct Given<'a> {
+    config: &'a agent_client::config::Config,
+    rules: Option<agent_client::rules::Policy>,
+    mode: &'static str,
+    providers: &'a Value,
+}
+
+/// A lead's policy, for `agent_client::project::create`: its role's
+/// model, tools and `instructions`, Sonny's tools a lead declares, gated
+/// and confined from the start as a new lead's mode makes it, whoever
+/// opens it first, and the settings every agent Sonny makes starts with
+/// ([`crate::starts_with`]), so its first turn already goes by the
+/// person's rules and model tables. Its model's `cache_ttl` and its
+/// project's `namespace` go on where the model and name are settled.
+fn lead_policy(
+    given: &Given<'_>,
+    dir: &Path,
+    role: &agent_client::policy::Profile,
+    picks: &agent_client::project::Picks,
+    state: Option<&str>,
+    chosen: Option<&str>,
+    instructions: String,
+) -> Value {
     let tools: Vec<String> = match &role.tools {
         Some(tools) => tools.clone(),
         // The tools the client will give it; one the gate names that the
@@ -1153,7 +1202,7 @@ async fn make(
         None => {
             let model = picks.model.as_deref().or(role.model.as_deref());
             agent_client::default_tools(
-                client.providers(),
+                given.providers,
                 model.unwrap_or(""),
                 picks.web_search,
                 &picks.web_search_off,
@@ -1163,31 +1212,11 @@ async fn make(
             .collect()
         }
     };
-    // Writing its own state folder, by the name it is made under.
-    let lead = (bot.map(str::to_owned)).or_else(|| {
-        let info = read(dir).ok()?;
-        info["lead"].as_str().map(str::to_owned)
-    });
-    let state = lead.as_deref().and_then(crate::state::folder);
-    let mut settings = crate::approvals::sandbox(mode, dir, state.as_deref());
+    let settings = crate::starts_with(given.config, given.rules.as_ref(), given.mode, dir, state);
     let held = crate::served::Role::LEAD.within(&json!(settings));
     let declare = json!(crate::declared::tools(held));
-    let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
-    if let Some(state) = &state {
-        settings.insert("env".into(), json!({crate::state::VAR: state}));
-    }
-    // As in `create`: a config that does not read is said where the lead
-    // opens, and the defaults stand until it reads.
-    let config = agent_client::config::load().unwrap_or_default();
-    settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
-    settings.insert("steps_only".into(), crate::exec::steps_only(&config));
-    if let Some(ms) = config.hold_ms {
-        settings.insert("hold_ms".into(), json!(ms));
-    }
-    if let Some(outputs) = crate::outputs() {
-        settings.insert("outputs".into(), json!(outputs));
-    }
-    let policy = json!({
+    let gate = crate::approvals::gate(given.mode, &crate::approvals::gateable(&tools, &declare));
+    json!({
         "instructions": instructions,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "model": role.model,
@@ -1196,8 +1225,7 @@ async fn make(
         "gate": gate,
         "settings": settings,
         "profile": chosen,
-    });
-    agent_client::project::create(client, dir, &policy, client.providers(), picks, bot).await
+    })
 }
 
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
@@ -1317,6 +1345,56 @@ fn picks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new lead, made for a folder or by `new_project`, starts with what
+    /// every agent Sonny makes starts with: the person's command rules and
+    /// model tables are its from its first turn, not only once the tool host
+    /// next reads a changed config (#404).
+    #[test]
+    fn a_new_lead_starts_with_the_person_s_rules_and_model_tables() {
+        let mut config = agent_client::config::Config::default();
+        config
+            .speeds
+            .insert("openai/gpt-6.2-*".into(), vec!["fast".into()]);
+        config.context_windows.insert("openai/*".into(), 400_000);
+        config.hold_ms = Some(1_500);
+        let mut rules = agent_client::rules::Policy::default();
+        crate::rules::parse(
+            &mut rules,
+            "synthetic.rules",
+            r#"prefix_rule(pattern = ["cargo", "test"])"#,
+        )
+        .unwrap();
+        let given = Given {
+            config: &config,
+            rules: Some(rules.clone()),
+            mode: "auto",
+            providers: &json!({}),
+        };
+        let role = agent_client::policy::Profile {
+            name: "lead".into(),
+            path: None,
+            model: None,
+            tools: None,
+            sandbox: None,
+            body: String::new(),
+        };
+        let picks = agent_client::project::Picks {
+            model: Some("openai/gpt-6.2-astra".into()),
+            ..Default::default()
+        };
+        let dir = Path::new("/work/synthetic-shop");
+        let state = Some("/state/synthetic-shop.lead");
+        let policy = lead_policy(&given, dir, &role, &picks, state, None, "Lead.".into());
+        let settings = &policy["settings"];
+        assert_eq!(settings["rules"], json!(rules));
+        assert_eq!(settings["speeds"], json!({"openai/gpt-6.2-*": ["fast"]}));
+        assert_eq!(settings["context_windows"], json!({"openai/*": 400_000}));
+        assert_eq!(settings["hold_ms"], json!(1_500));
+        // One way in: the same settings an agent `made` starts with.
+        let made = crate::starts_with(&config, Some(&rules), "auto", dir, state);
+        assert_eq!(*settings, Value::Object(made));
+    }
 
     #[test]
     fn a_lead_is_one_no_agent_made_whatever_its_name() {

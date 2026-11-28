@@ -4869,7 +4869,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
 /// person's `--new` or a trigger's `--start`. Its tools and Sonny's, gated
 /// and sandboxed as the default row confines them, and the
 /// person's settings for its model. One way in, so no kind of agent gets
-/// another policy by being made elsewhere (#404).
+/// another policy by being made elsewhere (#404): a lead takes the same
+/// settings ([`starts_with`]).
 pub(crate) fn made(
     client: &Client,
     asked: &mut Value,
@@ -4882,7 +4883,7 @@ pub(crate) fn made(
     // writing `state`, the state folder of the agent that makes it, or its
     // own.
     let mode = approvals::default();
-    let mut settings = approvals::sandbox(mode, workspace, state);
+    let mut settings = starts_with(&config, rules::given().as_ref(), mode, workspace, state);
     let role = served::Role::TASK.within(&json!(settings));
     let declare = json!(declared::tools(role));
     let tools = agent_client::default_tools(
@@ -4894,35 +4895,12 @@ pub(crate) fn made(
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
-    // Named in its shell too; one another bot makes takes its maker's.
-    if let Some(state) = &state {
-        settings.insert("env".into(), json!({state::VAR: state}));
-    }
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
-    }
-    if let Some(outputs) = outputs() {
-        settings.insert("outputs".into(), json!(outputs));
-    }
-    settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
-    settings.insert("steps_only".into(), crate::exec::steps_only(&config));
-    if let Some(ms) = config.hold_ms {
-        settings.insert("hold_ms".into(), json!(ms));
     }
     // The agents of its project, which its agent tools list and name.
     if let Some(namespace) = asked["bot"].as_str().and_then(project::namespace) {
         settings.insert("namespace".into(), json!(namespace));
-    }
-    // The command rules in ~/.agent/rules, which the daemon applies.
-    if let Some(rules) = rules::given() {
-        settings.insert("rules".into(), json!(rules));
-    }
-    // The tiers and windows the person says models have; the tool host
-    // sends them again as they change ([`tool_host`]).
-    for (key, table) in agent_client::config::model_tables(&config) {
-        if !table.is_null() {
-            settings.insert(key.into(), table);
-        }
     }
     asked["settings"] = Value::Object(settings);
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
@@ -4931,6 +4909,46 @@ pub(crate) fn made(
         fields.extend(approvals::gate(mode, &tools));
     }
     Ok(())
+}
+
+/// The settings every agent Sonny makes starts with, whichever way it is
+/// made, a lead included ([`made`], `project::make`): confined as the row
+/// `mode` confines it in `workspace`, writing `state`, and the person's
+/// settings as `config` and the command `rules` give them. Its model's
+/// `cache_ttl` and its project's `namespace` go on with the model and name
+/// it is made with.
+pub(crate) fn starts_with(
+    config: &agent_client::config::Config,
+    rules: Option<&agent_client::rules::Policy>,
+    mode: &str,
+    workspace: &Path,
+    state: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut settings = approvals::sandbox(mode, workspace, state);
+    // Named in its shell too; one another bot makes takes its maker's.
+    if let Some(state) = &state {
+        settings.insert("env".into(), json!({state::VAR: state}));
+    }
+    if let Some(outputs) = outputs() {
+        settings.insert("outputs".into(), json!(outputs));
+    }
+    settings.insert("trailer".into(), json!(crate::stamp::trailer(config)));
+    settings.insert("steps_only".into(), crate::exec::steps_only(config));
+    if let Some(ms) = config.hold_ms {
+        settings.insert("hold_ms".into(), json!(ms));
+    }
+    // The command rules in ~/.agent/rules, which the daemon applies.
+    if let Some(rules) = rules {
+        settings.insert("rules".into(), json!(rules));
+    }
+    // The tiers and windows the person says models have; the tool host
+    // sends them again as they change ([`tool_host`]).
+    for (key, table) in agent_client::config::model_tables(config) {
+        if !table.is_null() {
+            settings.insert(key.into(), table);
+        }
+    }
+    settings
 }
 
 /// The prompt-cache lifetime Sonny gives the model of `bot`, as `inspect`
