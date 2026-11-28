@@ -9,6 +9,7 @@
 //! short `└` look at the result, and a status row says how long the turn
 //! has run and how to stop it.
 mod acp;
+mod answered;
 mod approvals;
 mod asked;
 mod asks;
@@ -6978,6 +6979,13 @@ struct App {
     cards: HashMap<String, (u64, asks::Ask, bool)>,
     /// How many cards were drawn, which numbers the next.
     card_count: u64,
+    /// The questions of agents below answered from this agent's windows,
+    /// kept beside its reactions so a replay draws each where it was
+    /// ([`answered`]).
+    answered: answered::Answered,
+    /// The node each question of an agent below was drawn after here, by
+    /// key: where an answer to it given here is kept.
+    drawn_after: HashMap<String, i64>,
     /// How many cards were kept at the last look for ones trimmed away.
     cards_kept: usize,
     /// Where the questions stand that were answered or closed, by key,
@@ -9350,6 +9358,8 @@ impl App {
             unpinned: Vec::new(),
             cards: HashMap::new(),
             card_count: 0,
+            answered: answered::Answered::default(),
+            drawn_after: HashMap::new(),
             cards_kept: 0,
             settled: HashMap::new(),
             unsettled: Vec::new(),
@@ -9643,6 +9653,18 @@ impl App {
         self.recall = recall::Recall::load(attach::MOST_BYTES);
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
+        self.answered = answered::Answered::load(self.reactions_key.as_deref());
+        // Answers kept here that may still be taken back unread are read
+        // again, as when they were sent.
+        let due = Instant::now().checked_sub(Duration::from_secs(3));
+        for (key, bot, sent) in self.answered.unsettled() {
+            self.task_answers.push(TaskAnswer {
+                key,
+                bot,
+                turn: Some(sent),
+                checked: due.unwrap_or_else(Instant::now),
+            });
+        }
         self.open_on_picked();
         self.history().await;
         // What was sent and still waits, wherever it was sent from.
@@ -11144,6 +11166,7 @@ impl App {
         let bar = (self.bar.take(), std::mem::take(&mut self.barred));
         if paged.first {
             self.commit_welcome();
+            self.draw_answers_before(paged.nodes.first().copied());
         }
         let unpaired = self
             .draw_nodes(&paged.nodes, &paged.turns, true, after, None, Some(page))
@@ -14143,6 +14166,11 @@ impl App {
         if !every {
             self.commit_welcome();
         }
+        // The page starts the history: answers kept before its first node
+        // go first.
+        if from_start && self.older.is_none() {
+            self.draw_answers_before(nodes.first().copied());
+        }
         let unpaired = (self.draw_nodes(&nodes, &turns, false, Vec::new(), caught_up, page)).await;
         if from_start {
             self.unpaired = unpaired;
@@ -14315,6 +14343,20 @@ impl App {
             self.turn_hints.turn = Some(turn);
             began.insert(turn);
         }
+        // The answers given here to agents below, each drawn after the
+        // node it was drawn after live: those before the first node, by
+        // the page that starts the history ([`App::draw_answers_before`]),
+        // and those past the last, by the newest page.
+        let mut kept: std::collections::VecDeque<answered::Entry> = match nodes.first() {
+            Some(&first) => {
+                let last = match older {
+                    true => nodes.last().copied().unwrap_or(first),
+                    false => i64::MAX,
+                };
+                self.answered.within(first, last).into()
+            }
+            None => Default::default(),
+        };
         // A chunk read at a time, what it held let go before the next.
         let mut chunks = nodes.chunks(DRAW_CHUNK);
         let mut after = Some(after);
@@ -14363,6 +14405,12 @@ impl App {
                         (false, true) => self.commit_words(at, lines, false),
                         (false, false) => self.commit_said(at, lines),
                     }
+                }
+                while let Some(entry) = kept.pop_front_if(|entry| entry.after < node) {
+                    if let Some((at, lines)) = said.take() {
+                        self.commit_said(at, lines);
+                    }
+                    self.draw_kept_answer(entry);
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
@@ -14548,6 +14596,9 @@ impl App {
         }
         if let Some((at, lines)) = said {
             self.commit_said(at, lines);
+        }
+        for entry in kept {
+            self.draw_kept_answer(entry);
         }
         // The newest page's turn, still running, ends its hints when it
         // ends: the page's end is not the turn's. An older page ending in
@@ -17448,25 +17499,22 @@ impl App {
                     call["call_id"].as_str().unwrap_or_default(),
                 ) =>
             {
-                let decided = match decision.as_str() {
-                    "allow" => transcript::Decided::Allowed { you: true, kept },
-                    _ => transcript::Decided::Denied { you: true },
-                };
-                if let Some(written) = self.written.get_mut(&self.aside_key(&call)) {
-                    match (&mut written.decided, decided) {
-                        // Its own verdict came first and is final: what the
-                        // person kept is only added to an allow.
-                        (
-                            Some(transcript::Decided::Allowed { kept: heard, .. }),
-                            transcript::Decided::Allowed { kept, .. },
-                        ) if written.heard => {
-                            if heard.is_none() {
-                                *heard = kept;
-                            }
-                        }
-                        _ if written.heard => {}
-                        (_, decided) => written.decided = Some(decided),
-                    }
+                self.decide_written(&call, &decision, kept);
+            }
+            // A call below whose rows here the screen let go: what was
+            // answered is still kept, and said under it as for one's own.
+            Ok(_) if !own && self.written.contains_key(&self.aside_key(&call)) => {
+                self.decide_written(&call, &decision, kept.clone());
+                if decision == "allow" {
+                    let name = call["name"].as_str().unwrap_or("tool");
+                    let lines = transcript::allowed(
+                        name,
+                        &call["arguments"],
+                        kept.as_deref(),
+                        &self.workspace,
+                        self.width,
+                    );
+                    self.commit(lines);
                 }
             }
             Ok(_) if decision == "allow" => {
@@ -20963,10 +21011,138 @@ impl App {
             checked: Instant::now(),
         });
         self.close_ask(&ask, &prompt);
+        self.keep_answer(&ask, reply["message"].as_i64());
         if let Some(whole) = sent_as {
             self.close_ask(&whole, &prompt);
         }
         self.fleet_said(format!("your answer went to {}", task.name));
+    }
+
+    /// The answer just given here to `ask`, a question of an agent below,
+    /// kept by this window's agent where its card was drawn, as its card
+    /// now says it: a replay draws it there again. `sent` is the message
+    /// it went as, which the task may still take back unread.
+    fn keep_answer(&mut self, ask: &asks::Ask, sent: Option<i64>) {
+        let key = ask.key();
+        let Some(asks::State::Answered(answer)) = self.settled.get(&key).cloned() else {
+            return;
+        };
+        let after = (self.drawn_after.get(&key).copied()).unwrap_or(self.seen_node);
+        let entry = answered::Entry {
+            after,
+            what: answered::What::Ask {
+                ask: ask.clone(),
+                answer,
+                sent,
+            },
+        };
+        if let Err(error) = self.answered.keep(entry) {
+            self.notice = Some(error);
+        }
+    }
+
+    /// The answers kept here drawn after nodes before `first`, the first
+    /// node of the history; every one when it has none yet.
+    fn draw_answers_before(&mut self, first: Option<i64>) {
+        let before = first.map_or(i64::MAX, |first| first - 1);
+        for entry in self.answered.within(i64::MIN, before) {
+            self.draw_kept_answer(entry);
+        }
+    }
+
+    /// An answer kept here ([`App::keep_answer`]) drawn in its place in a
+    /// replay, folded as it was left: one still pinned here is drawn by
+    /// its pin.
+    /// The person answered `call` here, written out by this window: its
+    /// copy says so until the call's own verdict, and an agent's below is
+    /// kept here too ([`App::keep_call_answer`]).
+    fn decide_written(&mut self, call: &Value, decision: &str, kept: Option<String>) {
+        let decided = match decision {
+            "allow" => transcript::Decided::Allowed { you: true, kept },
+            _ => transcript::Decided::Denied { you: true },
+        };
+        let key = self.aside_key(call);
+        if let Some(written) = self.written.get_mut(&key) {
+            match (&mut written.decided, decided) {
+                // Its own verdict came first and is final: what the
+                // person kept is only added to an allow.
+                (
+                    Some(transcript::Decided::Allowed { kept: heard, .. }),
+                    transcript::Decided::Allowed { kept, .. },
+                ) if written.heard => {
+                    if heard.is_none() {
+                        *heard = kept;
+                    }
+                }
+                _ if written.heard => {}
+                (_, decided) => written.decided = Some(decided),
+            }
+        }
+        self.keep_call_answer(&key, true);
+    }
+
+    fn draw_kept_answer(&mut self, entry: answered::Entry) {
+        let answered::Entry { after, what } = entry;
+        match what {
+            answered::What::Ask { ask, answer, .. } => {
+                let key = ask.key();
+                if (self.asks.iter().chain(&self.unpinned)).any(|open| open.key() == key) {
+                    return;
+                }
+                self.settled
+                    .insert(key.clone(), asks::State::Answered(answer));
+                self.commit_ask(&ask);
+                self.drawn_after.insert(key, after);
+            }
+            answered::What::Call {
+                bot,
+                turn,
+                call,
+                name,
+                arguments,
+                rows,
+                decided,
+                heard,
+                at_ms,
+            } => {
+                let key = (bot.clone(), turn, call.clone());
+                // Still drawn here, its own copy stands.
+                if (self.written.get(&key)).is_some_and(|written| self.drawn(written.tag)) {
+                    return;
+                }
+                let tag = self.written_count;
+                self.written_count += 1;
+                let written = Written {
+                    tag,
+                    gap: self.any_history,
+                    rows: rows.into_iter().map(|row| Line::from(row).dim()).collect(),
+                    name,
+                    arguments,
+                    from: Some(bot.clone()),
+                    decided: Some(decided),
+                    heard,
+                    folded: true,
+                    open: false,
+                    at_ms,
+                };
+                let (shown, marks) = self.written_rows(&written);
+                let at = self.pending.len();
+                self.commit_after(shown, false);
+                (self.marks).extend(marks.into_iter().map(|(row, mark)| (at + row, mark)));
+                let mark = screen::Mark::Tag(screen::Tag::Request(tag));
+                (self.marks).extend((at..self.pending.len()).map(|row| (row, mark.clone())));
+                self.drawn_after
+                    .insert(answered::call_key(&bot, turn, &call), after);
+                self.written.insert(key, written);
+            }
+        }
+    }
+
+    /// Whether the request tagged `tag` is drawn here, on the screen or
+    /// on its way there.
+    fn drawn(&self, tag: u64) -> bool {
+        let tag = screen::Tag::Request(tag);
+        self.screen.has(tag) || (self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag))
     }
 
     /// The tasks' questions that left the pins with no answer from here,
@@ -21114,7 +21290,11 @@ impl App {
                 continue;
             };
             if asks::undelivered(&row) {
-                self.task_answers.remove(at);
+                let answer = self.task_answers.remove(at);
+                // Taken back unread, it answered nothing: not kept here.
+                if let Err(error) = self.answered.forget(&answer.key) {
+                    self.notice = Some(error);
+                }
                 released = true;
             } else if !matches!(
                 row["status"].as_str(),
@@ -21122,6 +21302,10 @@ impl App {
             ) {
                 // Taken, or ended some other way: nothing to read again.
                 self.task_answers[at].turn = None;
+                let key = self.task_answers[at].key.clone();
+                if let Err(error) = self.answered.delivered(&key) {
+                    self.notice = Some(error);
+                }
             }
         }
         if released {
@@ -21434,6 +21618,11 @@ impl App {
         let tag = self.card_count;
         self.card_count += 1;
         self.forget_trimmed_cards();
+        // A question of an agent below is drawn after the newest node
+        // drawn here: where an answer to it from here is kept.
+        if ask.task.is_some() {
+            self.drawn_after.insert(key.clone(), self.seen_node);
+        }
         self.cards.insert(key, (tag, ask.clone(), false));
         let state = self.card_state(ask);
         let (rows, marks) = self.card_lines(ask, &state, false);
@@ -21730,8 +21919,10 @@ impl App {
         self.unsettled.extend(gone);
         self.asks.retain(still);
         self.unpinned.retain(still);
+        // An answer whose question closed is let go once nothing can take
+        // it back: one still in line is read until it is taken or ends.
         self.task_answers
-            .retain(|answer| keys.contains(&answer.key));
+            .retain(|answer| keys.contains(&answer.key) || answer.turn.is_some());
         for ask in open {
             let key = ask.key();
             let known = (self.asks.iter().chain(&self.unpinned)).any(|have| have.key() == key)
@@ -23425,6 +23616,12 @@ impl App {
             let head = self.pending.len() - count;
             self.marks.push((head, screen::Mark::Buttons(buttons)));
         }
+        // A call of an agent below is drawn after the newest node drawn
+        // here: where an answer to it from here is kept.
+        if let Some(bot) = &from {
+            let kept = answered::call_key(bot, key.1, &key.2);
+            self.drawn_after.insert(kept, self.seen_node);
+        }
         self.written.insert(
             key,
             Written {
@@ -23475,6 +23672,18 @@ impl App {
         let Some(written) = self.written.get(key) else {
             return;
         };
+        let (rows, marks) = self.written_rows(written);
+        let tag = screen::Tag::Request(written.tag);
+        self.flush();
+        if !self.screen.replace_tagged(tag, rows, marks) {
+            // Trimmed away: nothing of it is left to fold.
+            self.written.remove(key);
+        }
+    }
+
+    /// The rows of a folded request, with the marks on them by row: its
+    /// verdict, and the request whole under it while open.
+    fn written_rows(&self, written: &Written) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
         let decided = (written.decided.clone()).unwrap_or(transcript::Decided::Gone);
         let line = transcript::decided(
             &written.name,
@@ -23504,12 +23713,7 @@ impl App {
             marks.extend(buttons.map(|buttons| (rows.len(), screen::Mark::Buttons(buttons))));
             rows.extend(open);
         }
-        let tag = screen::Tag::Request(written.tag);
-        self.flush();
-        if !self.screen.replace_tagged(tag, rows, marks) {
-            // Trimmed away: nothing of it is left to fold.
-            self.written.remove(key);
-        }
+        (rows, marks)
     }
 
     /// What came of a call written out here, as an event of `bot`'s says
@@ -23581,6 +23785,43 @@ impl App {
         // gone first: drawn again to say it.
         if written.folded && written.decided.is_some() {
             self.draw_written(&key);
+        }
+        // Answered here, what is kept says its own verdict now.
+        self.keep_call_answer(&key, false);
+    }
+
+    /// What came of the call below at `key`, answered here, kept by this
+    /// window's agent where its request was written out ([`answered`]):
+    /// a replay draws it there, folded. Kept once the person answers
+    /// (`answered`), and kept again as the call's own verdict comes.
+    fn keep_call_answer(&mut self, key: &CallKey, answered: bool) {
+        let Some(written) = self.written.get(key) else {
+            return;
+        };
+        let (Some(bot), Some(decided)) = (&written.from, &written.decided) else {
+            return;
+        };
+        let kept = answered::call_key(bot, key.1, &key.2);
+        if !answered && !self.answered.has(&kept) {
+            return;
+        }
+        let after = (self.drawn_after.get(&kept).copied()).unwrap_or(self.seen_node);
+        let entry = answered::Entry {
+            after,
+            what: answered::What::Call {
+                bot: bot.clone(),
+                turn: key.1,
+                call: key.2.clone(),
+                name: written.name.clone(),
+                arguments: written.arguments.clone(),
+                rows: written.rows.iter().map(Line::to_string).collect(),
+                decided: decided.clone(),
+                heard: written.heard,
+                at_ms: written.at_ms,
+            },
+        };
+        if let Err(error) = self.answered.keep(entry) {
+            self.notice = Some(error);
         }
     }
 
@@ -23684,6 +23925,8 @@ impl App {
                     self.draw_written(&key);
                 }
             }
+            // Answered here, what is kept says its own verdict now.
+            self.keep_call_answer(&key, false);
         }
     }
 
@@ -39183,8 +39426,132 @@ mod tests {
         app.raise_approvals_through().await;
         app.flush();
         let texts = app.screen.texts();
+        let denied = "✗ The reviewer denied cargo publish · shop.fix".to_owned();
+        assert!(texts.contains(&denied), "{texts:?}");
+        // Answered here, it is kept by the lead, with the call's own
+        // verdict: drawn again from the start, as coming back to the lead
+        // after another agent does, it is there, folded to that verdict.
+        assert!(app.answered.has(&answered::call_key("shop.fix", 4, "c1")));
+        app.screen = screen::Screen::default();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(
+            texts.iter().filter(|text| **text == denied).count(),
+            1,
+            "{texts:?}"
+        );
+    }
+
+    /// A call below answered after the screen let its rows go is kept all
+    /// the same; and kept before its own verdict came, drawn again from the
+    /// start, it still reads that verdict from the trail once it comes.
+    #[tokio::test]
+    async fn a_tasks_request_answered_with_its_rows_gone_or_its_verdict_unheard_is_kept() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        // The lead wrote on: the request's rows went off the screen.
+        app.screen = screen::Screen::default();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
+        let kept = answered::call_key("shop.fix", 4, "c1");
+        assert!(app.answered.has(&kept));
+        app.flush();
+        // Closed before its verdict came, and opened again.
+        app.raised.clear();
+        app.written.clear();
+        app.screen = screen::Screen::default();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(
+            texts,
+            ["✓ You allowed cargo publish · shop.fix"],
+            "{texts:?}"
+        );
+        // The reviewer's gate denied it meanwhile: read from the trail.
+        app.raise_approvals_through().await;
+        app.flush();
+        let denied = "✗ The reviewer denied cargo publish · shop.fix".to_owned();
+        let texts = app.screen.texts();
+        assert!(texts.contains(&denied), "{texts:?}");
+        app.screen = screen::Screen::default();
+        app.written.clear();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        assert_eq!(app.screen.texts(), [denied]);
+    }
+
+    /// A call below answered here is kept where it was written out: drawn
+    /// again from the start, it is folded to what came of it there, its
+    /// request whole a click away; one answered elsewhere is not kept.
+    #[tokio::test]
+    async fn a_tasks_request_answered_here_stays_in_the_leads_history() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.seen_node = 12;
+        for call in ["c1", "c2"] {
+            app.raised
+                .push(json!({"bot": "shop.fix", "turn": 4, "call_id": call,
+                "name": "shell", "gates": ["manual"], "arguments": {"command": "cargo test"}}));
+        }
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
+        // The other answered in its own window: its verdict heard here.
+        app.raised.retain(|call| call["call_id"] == "c2");
+        app.heard_verdict(
+            "shop.fix",
+            Some(4),
+            &json!({"call_id": "c1",
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}),
+        );
+        app.raised.clear();
+        app.heard_verdict(
+            "shop.fix",
+            Some(4),
+            &json!({"call_id": "c2",
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}),
+        );
+        app.fold_written();
+        assert!(app.answered.has(&answered::call_key("shop.fix", 4, "c1")));
+        assert!(!app.answered.has(&answered::call_key("shop.fix", 4, "c2")));
+        assert_eq!(app.answered.within(12, 12).len(), 1);
+        app.screen = screen::Screen::default();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(texts, ["✓ You allowed cargo test · shop.fix"], "{texts:?}");
+        // A click opens the request whole under it.
+        let tag = app.written[&("shop.fix".to_owned(), 4, "c1".to_owned())].tag;
+        app.press(&format!("request/{tag}")).await;
+        app.flush();
+        let texts = app.screen.texts();
         assert!(
-            texts.contains(&"✗ The reviewer denied cargo publish · shop.fix".to_owned()),
+            texts.len() > 1 && texts[1..].iter().any(|text| text.contains("cargo test")),
             "{texts:?}"
         );
     }
@@ -39771,13 +40138,16 @@ mod tests {
         );
         assert!(app.asks.is_empty());
         // The fleet reads it open until the task takes the answer: it is
-        // not pinned again meanwhile, and once closed there it is let go.
+        // not pinned again meanwhile, and once closed there it is let go;
+        // its answer is still read until the task is known to have taken it.
         app.pin_task_asks();
         assert!(app.asks.is_empty());
         let fleet = app.fleet.as_mut().unwrap();
         fleet.needs.asked("calc.ask", None);
         app.pin_task_asks();
-        assert!(app.task_answers.is_empty() && app.asks.is_empty());
+        assert!(app.asks.is_empty());
+        assert_eq!(app.task_answers.len(), 1);
+        app.task_answers.clear();
         // Read late, an older question goes where it was asked, before the
         // lead's own newer one, which keeps the focus.
         let own = asks::call(&asks::id(5, "c9"), &json!({"question": "Tag it?"})).unwrap();
@@ -39816,6 +40186,106 @@ mod tests {
         app.pin_task_asks();
         assert_eq!(whose(app.asking()), "calc.ask");
         assert_eq!(app.asks.len(), 1);
+    }
+
+    /// A task's question answered in its lead's window stays there: drawn
+    /// again from the start, as coming back to the lead after another
+    /// agent does, its card is where it was, after the lead's node it was
+    /// drawn after, folded to the answer given. One its task took back
+    /// unread answered nothing and is not kept.
+    #[tokio::test]
+    async fn a_tasks_question_answered_in_its_leads_window_stays_in_its_history() {
+        let asked = json!({"question": "Ship it?", "why": "w",
+            "options": [{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]});
+        let (client, events) = daemon_with_events(json!({}), move |asked_for| {
+            let bot = asked_for["bot"].as_str().unwrap_or("");
+            match (asked_for["op"].as_str().unwrap_or(""), bot) {
+                ("bots", _) => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 9},
+                    {"name": "calc.ask", "bot_id": 3, "created_by": "calc.lead", "head": 7},
+                ]}),
+                ("submit", _) => json!({"message": 3, "turn": 3}),
+                ("history_nodes", "calc.ask") => json!({"nodes": [{"node": 7, "turn": 2}]}),
+                ("history_nodes", _) => {
+                    json!({"nodes": [{"node": 9, "turn": 1}, {"node": 3, "turn": 1}]})
+                }
+                ("turns", "calc.ask") => json!({"turns": [{"turn": 2, "status": "completed"}]}),
+                ("history_items", "calc.ask") => json!({"items": [{"node": 7, "item": {
+                    "type": "function_call", "name": "ask", "call_id": "q1",
+                    "arguments": asked.to_string()}}]}),
+                ("history_items", _) => json!({"items": [
+                    {"node": 3, "item": {"role": "user", "content": [
+                        {"type": "input_text", "text": "Plan the release"}]}},
+                    {"node": 9, "item": {"role": "assistant", "content": [
+                        {"type": "output_text", "text": "The release is planned."}]}},
+                ]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        fleet.reconcile().await;
+        while !fleet.unread.is_empty() {
+            fleet.rescan_through().await;
+        }
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.fleet = Some(fleet);
+        // Drawn live after the lead's node 3.
+        app.seen_node = 3;
+        app.pin_task_asks();
+        assert_eq!(app.asks.len(), 1);
+        app.input.set("2");
+        app.submit().await;
+        app.beside_done().await;
+        assert!(app.asks.is_empty());
+        let key = "@calc.ask/ask:2/q1";
+        assert!(app.answered.has(key));
+        assert_eq!(app.answered.within(3, 3).len(), 1);
+        // Kept with the message it went as, which a window that opens the
+        // lead before the task takes it reads again.
+        let unsettled = vec![(key.to_owned(), "calc.ask".to_owned(), 3)];
+        assert_eq!(app.answered.unsettled(), unsettled);
+        // The task took it: the fleet reads it closed.
+        let fleet = app.fleet.as_mut().unwrap();
+        fleet.needs.asked("calc.ask", None);
+        app.pin_task_asks();
+        assert!(app.asks.is_empty());
+        // Its question closed, its answer is still read until the task
+        // is known to have taken it.
+        assert_eq!(app.task_answers.len(), 1);
+        // Back on the lead: its history drawn from the start.
+        app.seen_node = 0;
+        app.pending.clear();
+        app.history().await;
+        app.pin_task_asks();
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        let at = |text: &str| rows.iter().position(|row| row.contains(text));
+        let (Some(said), Some(card), Some(reply)) = (
+            at("Plan the release"),
+            at("Ship it?"),
+            at("The release is planned."),
+        ) else {
+            panic!("{rows:#?}");
+        };
+        assert!(said < card && card < reply, "{rows:#?}");
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("Ship it?")).count(),
+            1,
+            "{rows:#?}"
+        );
+        assert_eq!(
+            app.card_state(&app.cards[key].1),
+            asks::State::Answered("No".into())
+        );
+        assert!(app.asks.is_empty());
+        // An answer taken back unread answered nothing: not kept.
+        app.task_answers_read(vec![(
+            "calc.ask".into(),
+            3,
+            json!({"status": "withdrawn", "turn": null}),
+        )]);
+        assert!(!app.answered.has(key));
     }
 
     /// A card says where its question stands as that changes: open past

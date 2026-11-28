@@ -2545,7 +2545,8 @@ pub fn allowed(
 
 /// What came of a request written out for the person, once it waits no
 /// more: whose verdict it was, or that none came.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum Decided {
     /// Allowed, by the person (`you`) or the reviewer; with the command
     /// the person always allows from now on, when they did.
